@@ -67,8 +67,8 @@ fn samples() -> usize {
     if cfg!(debug_assertions) { 8 } else { 60 }
 }
 
-/// p95 of `samples` full frames at 118x36.
-fn p95_frame(model: &AppModel, samples: usize) -> Duration {
+/// One percentile of `samples` full frames at 118x36.
+fn percentile_frame(model: &AppModel, samples: usize, percentile: usize) -> Duration {
     let backend = TestBackend::new(118, 36);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     let mut timings = Vec::with_capacity(samples);
@@ -82,7 +82,15 @@ fn p95_frame(model: &AppModel, samples: usize) -> Duration {
         timings.push(start.elapsed());
     }
     timings.sort_unstable();
-    timings[(samples * 95 / 100).min(samples - 1)]
+    timings[(samples * percentile / 100).min(samples - 1)]
+}
+
+fn p50_frame(model: &AppModel, samples: usize) -> Duration {
+    percentile_frame(model, samples, 50)
+}
+
+fn p95_frame(model: &AppModel, samples: usize) -> Duration {
+    percentile_frame(model, samples, 95)
 }
 
 /// Measures the first draw of a newly constructed 10k-row model. Model and
@@ -110,6 +118,8 @@ fn cached_viewport_render_stays_bounded_through_10k_rows() {
     // Warm the allocator/terminal once so the first sample is not the
     // benchmark.
     let _ = p95_frame(&replayed(64), 3);
+    let immediate_draw_p50 = p50_frame(&replayed(1_000), samples());
+    println!("immediate semantic-edge draw p50 @ 1000 rows = {immediate_draw_p50:?}");
 
     let mut table = Vec::new();
     for rows in [1_000_usize, 3_000, 5_000, 10_000] {
