@@ -101,13 +101,13 @@ pub fn inspect_pdf(bytes: &[u8]) -> Result<PdfMetadata, PdfError> {
     }
 }
 
-/// Page-tree inspection through `lopdf` for PDFs the minimal parser cannot
-/// read (object streams, xref streams). `lopdf` has panic paths on exotic
-/// inputs, so it runs under `catch_unwind`; a panic means "no answer here",
-/// never a crash.
+/// Page-tree inspection through the `lopdf` backend re-exported by
+/// `pdf_extract` for PDFs the minimal parser cannot read (object streams, xref
+/// streams). `lopdf` has panic paths on exotic inputs, so it runs under
+/// `catch_unwind`; a panic means "no answer here", never a crash.
 fn inspect_real_world(bytes: &[u8]) -> Option<PdfMetadata> {
     std::panic::catch_unwind(|| {
-        let document = lopdf::Document::load_mem(bytes).ok()?;
+        let document = pdf_extract::Document::load_mem(bytes).ok()?;
         let pages = u32::try_from(document.get_pages().len()).ok()?;
         (pages > 0).then_some(PdfMetadata {
             pages,
@@ -129,8 +129,8 @@ fn extract_pages_real_world(
     internal_pages: Option<usize>,
 ) -> Option<ExtractedPdfText> {
     std::panic::catch_unwind(|| {
-        // This must stay `pdf_extract::Document`: the direct `lopdf` dependency
-        // is a different version and cannot cross `output_doc_page`'s API.
+        // Keep inspection and extraction on the same re-exported document type
+        // so `output_doc_page` never crosses a dependency-version boundary.
         let mut document = pdf_extract::Document::load_mem(bytes).ok()?;
         if document.is_encrypted() {
             document.decrypt("").ok()?;
@@ -1137,6 +1137,91 @@ pub const CRATE_NAME: &str = "haider-pdf";
 mod tests {
     use super::*;
 
+    const PARITY_CORPUS: &[(&str, &[u8])] = &[
+        (
+            "qoi-specification",
+            include_bytes!("../tests/corpus/qoi-specification.pdf"),
+        ),
+        (
+            "lopdf-unicode",
+            include_bytes!("../tests/corpus/lopdf-unicode.pdf"),
+        ),
+        (
+            "lopdf-incremental",
+            include_bytes!("../tests/corpus/lopdf-incremental.pdf"),
+        ),
+        (
+            "pdfjs-encrypted",
+            include_bytes!("../tests/corpus/pdfjs-encrypted.pdf"),
+        ),
+    ];
+
+    fn mutation_cases(name: &str, source: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let mut cases = vec![(format!("{name}/original"), source.to_vec())];
+        for step in 1..=24 {
+            let end = source.len().saturating_mul(step) / 25;
+            cases.push((format!("{name}/truncate-{step:02}"), source[..end].to_vec()));
+        }
+        for step in 1..=64 {
+            let offset = source.len().saturating_mul(step) / 65;
+            let mut mutated = source.to_vec();
+            if let Some(byte) = mutated.get_mut(offset) {
+                *byte ^= 0x5a;
+            }
+            cases.push((format!("{name}/flip-{step:02}"), mutated));
+        }
+        for step in 1..=16 {
+            let offset = source.len().saturating_mul(step) / 17;
+            for width in [1, 4, 16] {
+                let mut mutated = source.to_vec();
+                let end = offset.saturating_add(width).min(mutated.len());
+                mutated[offset..end].fill(0);
+                cases.push((format!("{name}/zero-{step:02}-{width}"), mutated));
+            }
+        }
+        let mut prefixed = b"untrusted prefix\n".to_vec();
+        prefixed.extend_from_slice(source);
+        cases.push((format!("{name}/prefixed"), prefixed));
+        let mut suffixed = source.to_vec();
+        suffixed.extend_from_slice(b"\nuntrusted suffix");
+        cases.push((format!("{name}/suffixed"), suffixed));
+        cases
+    }
+
+    fn stable_hash(mut hash: u64, bytes: &[u8]) -> u64 {
+        for byte in bytes {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3);
+        }
+        hash
+    }
+
+    #[test]
+    fn corpus_outcomes_match_the_preconvergence_baseline() {
+        let mut checked = 0_usize;
+        let mut inspection_hash = 0xcbf2_9ce4_8422_2325_u64;
+        let mut extraction_hash = 0xcbf2_9ce4_8422_2325_u64;
+        for (source_name, source) in PARITY_CORPUS {
+            for (case_name, bytes) in mutation_cases(source_name, source) {
+                checked += 1;
+                let inspection = inspect_pdf(&bytes);
+                inspection_hash = stable_hash(inspection_hash, case_name.as_bytes());
+                inspection_hash =
+                    stable_hash(inspection_hash, format!("{inspection:?}").as_bytes());
+                let extraction = std::panic::catch_unwind(|| extract_text_bounded(&bytes));
+                assert!(
+                    extraction.is_ok(),
+                    "untrusted corpus input escaped panic containment for {case_name}"
+                );
+                extraction_hash = stable_hash(extraction_hash, case_name.as_bytes());
+                extraction_hash =
+                    stable_hash(extraction_hash, format!("{extraction:?}").as_bytes());
+            }
+        }
+        assert_eq!(checked, 556);
+        assert_eq!(inspection_hash, 0x6874_ad90_be8e_7ae9);
+        assert_eq!(extraction_hash, 0xd0d5_16d8_8ef7_261a);
+    }
+
     fn fixture(contents: &[&str], encrypted: bool) -> Vec<u8> {
         let page_ids: Vec<_> = (0..contents.len()).map(|index| 3 + index as u32).collect();
         let content_ids: Vec<_> = (0..contents.len())
@@ -1171,6 +1256,17 @@ mod tests {
         }
         pdf.push_str("%%EOF\n");
         pdf.into_bytes()
+    }
+
+    fn fixture_with_filter(content: &str, filter: &str) -> Vec<u8> {
+        let mut pdf = fixture(&[content], false);
+        let marker = b">>\nstream";
+        let insertion = pdf
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("content stream dictionary");
+        pdf.splice(insertion..insertion, format!("/Filter /{filter} ").bytes());
+        pdf
     }
 
     fn streamed_bound(page_texts: &[String]) -> Option<ExtractedPdfText> {
@@ -1244,6 +1340,37 @@ mod tests {
         let error = extract_text_bounded(&encrypted).expect_err("encrypted fails");
         assert_eq!(error.kind, PdfErrorKind::Encrypted);
         assert!(error.message.contains("remove the password"));
+    }
+
+    #[test]
+    fn every_daemon_mapped_error_kind_has_a_corpus_witness() {
+        let cases = [
+            (
+                "encrypted",
+                include_bytes!("../tests/corpus/pdfjs-encrypted.pdf").to_vec(),
+                PdfErrorKind::Encrypted,
+            ),
+            (
+                "no-extractable-text",
+                fixture(&["q 100 0 0 100 0 0 cm /Im0 Do Q"], false),
+                PdfErrorKind::NoExtractableText,
+            ),
+            ("malformed", b"not a pdf".to_vec(), PdfErrorKind::Malformed),
+            (
+                "unsupported",
+                fixture_with_filter("q 100 0 0 100 0 0 cm /Im0 Do Q", "Crypt"),
+                PdfErrorKind::Unsupported,
+            ),
+            (
+                "decompression-limit",
+                fixture(&[&" ".repeat(MAX_PDF_STREAM_BYTES + 1)], false),
+                PdfErrorKind::DecompressionLimit,
+            ),
+        ];
+        for (name, bytes, expected) in cases {
+            let error = extract_text_bounded(&bytes).expect_err(name);
+            assert_eq!(error.kind, expected, "wrong error kind for {name}");
+        }
     }
 
     #[test]
