@@ -10,6 +10,8 @@ use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::state::RunState;
 #[cfg(unix)]
 use std::fs::{OpenOptions, TryLockError};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::io;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut};
@@ -222,6 +224,46 @@ fn process_is_alive(pid: u32) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[cfg(target_os = "linux")]
+fn staged_process_thread_count(pid: u32) -> io::Result<Option<usize>> {
+    std::fs::read_dir(format!("/proc/{pid}/task"))?
+        .try_fold(0_usize, |count, entry| {
+            entry.map(|_| count.saturating_add(1))
+        })
+        .map(Some)
+}
+
+#[cfg(target_os = "macos")]
+fn staged_process_thread_count(pid: u32) -> io::Result<Option<usize>> {
+    let output = match Command::new("/bin/ps")
+        .args(["-M", "-p", &pid.to_string(), "-o", "pid="])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr
+            .to_ascii_lowercase()
+            .contains("operation not permitted")
+        {
+            return Ok(None);
+        }
+        return Err(io::Error::other(format!(
+            "ps thread probe failed with {}: {stderr}",
+            output.status
+        )));
+    }
+    Ok(Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count(),
+    ))
 }
 
 #[cfg(unix)]
@@ -1152,6 +1194,93 @@ fn one_shot_reaps_only_the_daemon_it_spawned_on_success_and_bootstrap_failure() 
     assert!(!failure_endpoint.exists(), "owned socket must be removed");
     assert!(!bootstrap_failure.profile.join("lock.owner").exists());
     wait_for_profile_lock(&bootstrap_failure.profile, true);
+}
+
+/// Regression guard for the measured +1.04 ms cost of accidentally restoring
+/// a multi-threaded Tokio runtime to `haider run`. The daemon is already
+/// resident, so this observes only the staged CLI: main + its blocking JSONL
+/// adapter worker, with no cold owned-child waiter in the steady-state window.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn staged_run_with_resident_daemon_has_two_steady_state_threads() {
+    let haider_binary = PathBuf::from(env!("CARGO_BIN_EXE_haider"));
+    let warmed = Command::new(&haider_binary)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("warm staged CLI binary");
+    assert!(warmed.success(), "staged CLI warm-up failed: {warmed}");
+
+    let delayed_fake = concat!(
+        r#"[{"step":"delay","ms":750},{"step":"emit_text","text":"done"},"#,
+        r#"{"step":"finish","reason":"end_turn"}]"#,
+    );
+    let mut resident = haider();
+    resident
+        .env("HAIDER_TEST_FAKE_PROVIDER", delayed_fake)
+        .args(["status", "--json"]);
+    let status = resident.output().expect("start resident daemon");
+    assert!(
+        status.status.success(),
+        "resident status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let workspace = resident._profile_root.path().join("workspace");
+    let mut command = Command::new(&haider_binary);
+    command
+        .current_dir(workspace)
+        .env("HAIDER_PROFILE_DIR", &resident.profile)
+        .env("HOME", resident._profile_root.path())
+        .env("USERPROFILE", resident._profile_root.path())
+        .env("HAIDER_DISCOVERY_DISABLED", "1")
+        .env("HAIDER_TEST_FAKE_PROVIDER", delayed_fake)
+        .args(["run", "--provider", "fake", "--jsonl", "thread guard"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("start staged run thread probe");
+    let pid = child.id();
+    let observation_deadline = Instant::now() + Duration::from_secs(10);
+    let first_steady_sample = loop {
+        assert!(
+            child.try_wait().expect("poll staged run").is_none(),
+            "staged run exited before its steady-state thread sample"
+        );
+        match staged_process_thread_count(pid).expect("sample staged run threads") {
+            None => break None,
+            Some(1) => {}
+            Some(count) => break Some(count),
+        }
+        assert!(
+            Instant::now() < observation_deadline,
+            "staged run never started its output adapter thread"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    if let Some(first) = first_steady_sample {
+        assert_eq!(first, 2, "unexpected staged run steady-state thread count");
+        for _ in 0..10 {
+            thread::sleep(Duration::from_millis(10));
+            assert_eq!(
+                staged_process_thread_count(pid).expect("resample staged run threads"),
+                Some(2),
+                "staged run must remain main + one output-adapter worker"
+            );
+        }
+    } else {
+        eprintln!("macOS sandbox denied ps thread inspection; staged thread guard skipped locally");
+    }
+
+    let output = child.wait_with_output().expect("staged run exits");
+    assert!(
+        output.status.success(),
+        "staged run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// An attached one-shot has no ownership token and must leave the exact

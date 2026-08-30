@@ -3,7 +3,7 @@
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use haider_client::{
     ConnectError, DaemonLifetime, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL,
@@ -14,6 +14,7 @@ use haider_client::{
     run_headless_with_session_config_and_event_mode, stop_headless_run,
 };
 use haider_protocol::EventPayload;
+use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorCode;
 use haider_protocol::headless::RunBudgetV1;
 use haider_protocol::ids::RunId;
@@ -33,6 +34,8 @@ pub(crate) const EX_CANCELLED: u8 = 130;
 
 const OUTPUT_BUFFER: usize = 64;
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const JSONL_FLUSH_INTERVAL: Duration = Duration::from_millis(3);
+const JSONL_FLUSH_ENVELOPES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunOutput {
@@ -765,7 +768,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         ..EnsureOptions::default()
     };
     let event_mode = match options.output {
-        RunOutput::Jsonl => HeadlessEventMode::Stream,
+        RunOutput::Jsonl => HeadlessEventMode::StreamWithoutResultLedger,
         RunOutput::Json => HeadlessEventMode::FullRecordSet,
         RunOutput::Print => HeadlessEventMode::Summary,
     };
@@ -1343,7 +1346,12 @@ fn adapt_events_to(
     mut stderr: impl Write,
 ) -> io::Result<()> {
     let mut announced = false;
-    while let Some(event) = events.blocking_recv() {
+    let mut stdout_dirty = false;
+    let mut stdout_unflushed_envelopes = 0_usize;
+    let mut last_stdout_flush = Instant::now();
+    let mut next_event = events.blocking_recv();
+    while let Some(event) = next_event {
+        let mut flush_stdout = false;
         match event {
             HeadlessEvent::Accepted {
                 session_id,
@@ -1359,6 +1367,9 @@ fn adapt_events_to(
                         serde_json::to_writer(&mut stdout, &accepted).map_err(io::Error::other)?;
                         stdout.write_all(b"\n")?;
                         stdout.flush()?;
+                        stdout_dirty = false;
+                        stdout_unflushed_envelopes = 0;
+                        last_stdout_flush = Instant::now();
                     }
                     RunOutput::Json => {
                         // Single-JSON stdout remains exactly one document; the
@@ -1383,7 +1394,11 @@ fn adapt_events_to(
                     serde_json::to_writer(&mut stdout, envelope.as_ref())
                         .map_err(io::Error::other)?;
                     stdout.write_all(b"\n")?;
-                    stdout.flush()?;
+                    stdout_dirty = true;
+                    stdout_unflushed_envelopes = stdout_unflushed_envelopes.saturating_add(1);
+                    flush_stdout = is_terminal_run_state(envelope.as_ref())
+                        || stdout_unflushed_envelopes >= JSONL_FLUSH_ENVELOPES
+                        || last_stdout_flush.elapsed() >= JSONL_FLUSH_INTERVAL;
                 }
             }
             HeadlessEvent::PermissionDenied(denial) => {
@@ -1395,8 +1410,47 @@ fn adapt_events_to(
                 stderr.flush()?;
             }
         }
+
+        if flush_stdout && stdout_dirty {
+            stdout.flush()?;
+            stdout_dirty = false;
+            stdout_unflushed_envelopes = 0;
+            last_stdout_flush = Instant::now();
+        }
+
+        next_event = match events.try_recv() {
+            Ok(event) => Some(event),
+            Err(mpsc::error::TryRecvError::Empty) => {
+                if stdout_dirty {
+                    stdout.flush()?;
+                    stdout_dirty = false;
+                    stdout_unflushed_envelopes = 0;
+                    last_stdout_flush = Instant::now();
+                }
+                events.blocking_recv()
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => None,
+        };
+    }
+    if stdout_dirty {
+        stdout.flush()?;
     }
     Ok(())
+}
+
+fn is_terminal_run_state(envelope: &RawEnvelope) -> bool {
+    envelope
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        == Some("run_state")
+        && matches!(
+            envelope
+                .payload
+                .get("state")
+                .and_then(serde_json::Value::as_str),
+            Some("done" | "errored" | "cancelled")
+        )
 }
 
 pub(crate) fn write_final(
@@ -1615,6 +1669,24 @@ pub(crate) fn exit_code_for_error(error: &HeadlessRunError) -> u8 {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct FlushCountingWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for FlushCountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes = self.flushes.saturating_add(1);
+            Ok(())
+        }
+    }
 
     /// `--model` selects the model used by session.create. It must not also
     /// schedule a redundant post-create session.select_model mutation after
@@ -1845,6 +1917,57 @@ mod tests {
             })
         );
         assert_eq!(lines[1]["event_id"], "event-order");
+        assert!(stderr.is_empty());
+    }
+
+    /// MUTATION CHECK: restore `flush()` after every envelope. The four-row
+    /// batch then performs four flushes instead of the accepted+terminal pair.
+    #[test]
+    fn jsonl_adapter_flushes_a_queued_batch_at_acceptance_and_terminal() {
+        fn envelope(seq: u64, state: &str) -> RawEnvelope {
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "event_id": format!("event-flush-{seq}"),
+                "seq": seq,
+                "session_id": "session-flush",
+                "run_id": "run-flush",
+                "device_id": "device-flush",
+                "authority_epoch": 1,
+                "worker_generation": 1,
+                "committed_at_ms": seq,
+                "render": {"ui": true, "durable": true, "prompt": "omit"},
+                "payload": {"type": "run_state", "state": state},
+            }))
+            .expect("raw flush envelope")
+        }
+
+        let (sender, receiver) = mpsc::channel(4);
+        sender
+            .try_send(HeadlessEvent::Accepted {
+                session_id: haider_protocol::ids::SessionId::new("session-flush"),
+                head_seq: 1,
+            })
+            .expect("accepted queues");
+        for (seq, state) in [(1, "thinking"), (2, "streaming"), (3, "done")] {
+            sender
+                .try_send(HeadlessEvent::Envelope(Box::new(envelope(seq, state))))
+                .expect("envelope queues");
+        }
+        drop(sender);
+
+        let mut stdout = FlushCountingWriter::default();
+        let mut stderr = Vec::new();
+        adapt_events_to(RunOutput::Jsonl, receiver, &mut stdout, &mut stderr)
+            .expect("adapter succeeds");
+
+        assert_eq!(
+            stdout.flushes, 2,
+            "accepted and terminal flush exactly once"
+        );
+        assert_eq!(
+            stdout.bytes.iter().filter(|byte| **byte == b'\n').count(),
+            4
+        );
         assert!(stderr.is_empty());
     }
 
