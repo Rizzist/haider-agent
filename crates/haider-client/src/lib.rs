@@ -42,8 +42,8 @@ pub mod workflow_graph_rpc;
 pub use checkpoint::{CheckpointClientError, checkpoints, redo, rollback_turn, undo};
 pub use client::{
     ClientCloseOutcome, ClientConfig, ClientError, ConnectError, Connected, ConnectionState,
-    DisconnectReason, MenuAnswerRequest, PING_INTERVAL, PONG_DEADLINE, PeerCredentials,
-    PendingResponse, RpcClient, connect,
+    ConnectionUsage, DisconnectReason, MenuAnswerRequest, PING_INTERVAL, PONG_DEADLINE,
+    PeerCredentials, PendingResponse, RpcClient, connect,
 };
 pub use graph::{
     GraphAbandonResult, GraphClientError, GraphInspectPage, GraphPinResult, GraphRunSetOpenResult,
@@ -70,8 +70,8 @@ pub use lockdown::{
     provider_lockdown, provider_lockdown_available, provider_set_trust_response,
 };
 pub use observe::{
-    DescendantLiveAttachment, DescendantView, ObserveClient, ObserveError, observe_stream_all,
-    observe_stream_session, observe_stream_session_after,
+    DescendantLiveAttachment, DescendantView, ObserveClient, ObserveError, ObserveStatusSnapshot,
+    observe_stream_all, observe_stream_session, observe_stream_session_after,
 };
 pub use peer::{
     PeerClientError, PeerDelivery, PeerDeliveryReason, PeerDescriptor, PeerEvent,

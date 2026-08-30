@@ -7,17 +7,18 @@ use std::time::Duration;
 
 use haider_client::{
     EnsureError, EnsureOptions, HeadlessBlockingReason, HeadlessEvent, HeadlessFailureCode,
-    HeadlessImageAttachment, HeadlessOutcome, HeadlessRunError, HeadlessRunRequest, ProfileEnv,
-    ResolvedProfile, resolve_profile, run_headless,
+    HeadlessImageAttachment, HeadlessOutcome, HeadlessRunError, HeadlessRunRequest,
+    HeadlessSessionConfig, ProfileEnv, ResolvedProfile, resolve_profile, run_headless,
+    run_headless_with_session_config,
 };
 use haider_rpc::haider_protocol::EventPayload;
-use haider_rpc::haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
+use haider_rpc::haider_protocol::credential::AuthMethod;
 use haider_rpc::haider_protocol::envelope::{
     PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_rpc::haider_protocol::error::ErrorCode;
 use haider_rpc::haider_protocol::ids::{
-    ArtifactRef, CredentialAlias, DeviceId, EventId, ItemId, MenuId, RunId, SessionId,
+    ArtifactRef, DeviceId, EventId, ItemId, MenuId, RunId, SessionId,
 };
 use haider_rpc::haider_protocol::item::{ItemEvent, TurnItem};
 use haider_rpc::haider_protocol::menu::{
@@ -30,8 +31,8 @@ use haider_rpc::haider_protocol::state::{RunState, WaitReason};
 use haider_rpc::{
     AttachMode, AttachState, AttachmentId, CancelStatus, Capability, CapabilitySet,
     DEFAULT_FRAME_LIMIT, LifecyclePhase, ProviderApiFamilyWire, ProviderAvailabilityWire,
-    ProviderDefaultWire, ProviderSummaryWire, RequestBody, RequestId, ResponseBody,
-    SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
+    ProviderSummaryWire, RequestBody, RequestId, ResponseBody, SubmitDisposition,
+    WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -126,6 +127,10 @@ fn profile() -> (tempfile::TempDir, ResolvedProfile) {
 fn welcome(profile: &ResolvedProfile) -> Welcome {
     let mut features = haider_client::required_live_features();
     features.insert(haider_rpc::FEATURE_AUTONOMOUS_INTERACTION_V1.to_owned());
+    features.insert(haider_rpc::FEATURE_SESSION_CONFIG_V1.to_owned());
+    features.insert(haider_rpc::FEATURE_SESSION_CREATE_ADMISSION_V1.to_owned());
+    features.insert(haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1.to_owned());
+    features.insert(haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned());
     Welcome {
         protocol: WIRE_PROTOCOL_VERSION,
         instance_id: "headless-test-peer".into(),
@@ -354,21 +359,6 @@ async fn run_with_events(
     (result, events)
 }
 
-fn active_account(provider: &str) -> CredentialDescriptor {
-    CredentialDescriptor {
-        alias: CredentialAlias::new("active-account"),
-        provider: provider.into(),
-        base_url: None,
-        auth_method: AuthMethod::OAuth,
-        identity: "active@example.com".into(),
-        status: CredentialStatus::Ok,
-        active: true,
-        label: None,
-        account_identity: None,
-        created_at_ms: None,
-    }
-}
-
 #[tokio::test]
 async fn headless_pin_feature_is_required_before_session_mutation() {
     let (_root, profile) = profile();
@@ -441,64 +431,30 @@ fn provider_summary_fixture(
     }
 }
 
-async fn serve_flagless_done(
-    peer: &mut Peer,
-    default_model: Option<&str>,
-    models: &[&str],
-    expected_model: &str,
-) {
-    let provider = "openai-oauth";
-    let (account_request, account_body) = peer.request().await;
-    assert_eq!(account_body, RequestBody::AccountList { provider: None });
-    peer.respond(
-        account_request,
-        ResponseBody::AccountList {
-            descriptors: vec![active_account(provider)],
-            revision: Some(4),
-            provider_active: Vec::new(),
-            // Deliberately misleading: bootstrap must consult provider.list's
-            // coherent provider summary, like the TUI, not this additive seam.
-            provider_defaults: vec![ProviderDefaultWire {
-                provider: provider.into(),
-                model: "wrong-account-list-default".into(),
-            }],
-            availability: None,
-        },
-    )
-    .await;
-
-    let (provider_request, provider_body) = peer.request().await;
-    assert_eq!(
-        provider_body,
-        RequestBody::ProviderList {
-            provider: Some(provider.into())
-        }
-    );
-    peer.respond(
-        provider_request,
-        ResponseBody::ProviderList {
-            providers: vec![provider_summary_fixture(provider, default_model, models)],
-            revision: 4,
-            availability: None,
-        },
-    )
-    .await;
-
+async fn serve_flagless_done(peer: &mut Peer, expected_provider: &str, expected_model: &str) {
     let (create_request, create_body) = peer.request().await;
     let RequestBody::SessionCreateWithPermissionOverrides {
         provider: created_provider,
         model: created_model,
         permission_overrides,
+        resolve_provider,
+        resolve_model,
+        effort,
+        fast,
         ..
     } = create_body
     else {
-        panic!("bootstrap must be followed by session.create");
+        panic!("headless admission must begin with session.create");
     };
-    assert_eq!(created_provider, provider);
-    assert_eq!(created_model, expected_model);
+    assert!(created_provider.is_empty());
+    assert!(created_model.is_empty());
+    assert!(resolve_provider);
+    assert!(resolve_model);
     assert_eq!(permission_overrides, None);
+    assert_eq!(effort, None);
+    assert_eq!(fast, None);
     let (session_id, attachment_id) =
-        respond_create_and_attach(peer, create_request, provider, expected_model).await;
+        respond_create_and_attach(peer, create_request, expected_provider, expected_model).await;
     let (submit_request, run_id) = accept_submit(peer, &session_id).await;
     peer.respond(
         submit_request,
@@ -524,20 +480,14 @@ async fn serve_flagless_done(
     .await;
 }
 
-/// MUTATION CHECK: drop account.list, hardcode anthropic, consume the
-/// account.list default seam, or skip provider default resolution. Expected
-/// RUNTIME failure: peer request order or the pinned create body differs.
+/// MUTATION CHECK: restore account.list/provider.list bootstrap or resolve
+/// provider/model client-side. Expected runtime failure: the first request is
+/// not the one atomic create body pinned below.
 #[tokio::test]
 async fn flagless_bootstrap_creates_on_active_provider_and_published_default_model() {
     let (_root, profile) = profile();
     let peer = spawn_peer(&profile, |mut peer| async move {
-        serve_flagless_done(
-            &mut peer,
-            Some("gpt-active-default"),
-            &["gpt-first", "gpt-active-default"],
-            "gpt-active-default",
-        )
-        .await;
+        serve_flagless_done(&mut peer, "openai-oauth", "gpt-active-default").await;
     });
     let mut run = request(None);
     run.provider = None;
@@ -548,6 +498,67 @@ async fn flagless_bootstrap_creates_on_active_provider_and_published_default_mod
     assert_eq!(result.provider, "openai-oauth");
     assert_eq!(result.model, "gpt-active-default");
     assert_eq!(result.outcome, HeadlessOutcome::Done);
+}
+
+/// MUTATION CHECK: restore post-create select_effort/select_fast requests.
+/// Expected runtime failure: the atomic create body omits either initial
+/// tuning coordinate.
+#[tokio::test]
+async fn initial_headless_tuning_is_part_of_atomic_create() {
+    let (_root, profile) = profile();
+    let peer = spawn_peer(&profile, |mut peer| async move {
+        let (request_id, body) = peer.request().await;
+        let RequestBody::SessionCreateWithPermissionOverrides {
+            provider,
+            model,
+            resolve_provider,
+            resolve_model,
+            effort,
+            fast,
+            ..
+        } = body
+        else {
+            panic!("headless admission must begin with session.create");
+        };
+        assert_eq!(provider, "fake");
+        assert_eq!(model, "fake-model");
+        assert!(!resolve_provider && !resolve_model);
+        assert_eq!(effort.as_deref(), Some("high"));
+        assert_eq!(fast, Some(true));
+        peer.respond(
+            request_id,
+            ResponseBody::Error {
+                code: "fixture_stop".into(),
+                message: "coordinates captured".into(),
+                retryable: false,
+                data: None,
+            },
+        )
+        .await;
+    });
+    let (sender, _receiver) = mpsc::channel(1);
+    let error = run_headless_with_session_config(
+        &profile,
+        EnsureOptions::default(),
+        request(None),
+        HeadlessSessionConfig {
+            effort: Some("high".into()),
+            fast: Some(true),
+            ..HeadlessSessionConfig::default()
+        },
+        sender,
+    )
+    .await
+    .expect_err("fixture refuses after inspecting create");
+    peer.await.expect("peer");
+    assert!(matches!(
+        error,
+        HeadlessRunError::Rpc {
+            stage: "session.create",
+            ref code,
+            ..
+        } if code == "fixture_stop"
+    ));
 }
 
 /// MUTATION CHECK: stop routing `HeadlessRunRequest.model` through the shared
@@ -632,43 +643,33 @@ async fn configured_provider_model_selector_reaches_create_as_bare_wire_id() {
     assert_eq!(result.model, "deepseek-v4-flash");
 }
 
-/// MUTATION CHECK: restore catalog-first fallback. Expected RUNTIME failure:
-/// the peer sees an unexpected session.create instead of the exact typed
-/// no-default bootstrap refusal.
+/// MUTATION CHECK: restore the client-side account/provider collection
+/// bootstrap. Expected runtime failure: the first frame is not the atomic
+/// create, or the daemon's typed refusal is not preserved.
 #[tokio::test]
-async fn flagless_bootstrap_without_published_default_is_typed_even_with_catalog() {
+async fn daemon_resolved_default_without_published_model_is_typed() {
     let (_root, profile) = profile();
     let peer = spawn_peer(&profile, |mut peer| async move {
-        let (account_request, account_body) = peer.request().await;
-        assert_eq!(account_body, RequestBody::AccountList { provider: None });
+        let (request_id, body) = peer.request().await;
+        let RequestBody::SessionCreateWithPermissionOverrides {
+            provider,
+            model,
+            resolve_provider,
+            resolve_model,
+            ..
+        } = body
+        else {
+            panic!("headless admission must begin with session.create");
+        };
+        assert!(provider.is_empty() && model.is_empty());
+        assert!(resolve_provider && resolve_model);
         peer.respond(
-            account_request,
-            ResponseBody::AccountList {
-                descriptors: vec![active_account("openai-oauth")],
-                revision: Some(4),
-                provider_active: Vec::new(),
-                provider_defaults: Vec::new(),
-                availability: None,
-            },
-        )
-        .await;
-        let (provider_request, provider_body) = peer.request().await;
-        assert_eq!(
-            provider_body,
-            RequestBody::ProviderList {
-                provider: Some("openai-oauth".into())
-            }
-        );
-        peer.respond(
-            provider_request,
-            ResponseBody::ProviderList {
-                providers: vec![provider_summary_fixture(
-                    "openai-oauth",
-                    None,
-                    &["canonical-other"],
-                )],
-                revision: 4,
-                availability: None,
+            request_id,
+            ResponseBody::Error {
+                code: haider_client::ERROR_CODE_NO_DEFAULT_MODEL.into(),
+                message: "provider `openai-oauth` publishes no default model".into(),
+                retryable: false,
+                data: None,
             },
         )
         .await;
@@ -688,7 +689,7 @@ async fn flagless_bootstrap_without_published_default_is_typed_even_with_catalog
     assert!(matches!(
         error,
         HeadlessRunError::Bootstrap {
-            stage: "provider.list",
+            stage: "session.create",
             code: haider_client::ERROR_CODE_NO_DEFAULT_MODEL,
             retryable: false,
             ..
@@ -696,23 +697,33 @@ async fn flagless_bootstrap_without_published_default_is_typed_even_with_catalog
     ));
 }
 
-/// MUTATION CHECK: fall back to profile defaults or continue to provider.list
-/// when account.list has nothing active. Expected RUNTIME failure: the exact
-/// typed no_active_account bootstrap error is not returned before create.
+/// MUTATION CHECK: restore account.list bootstrap or lose the daemon's typed
+/// no-active-account refusal. Expected runtime failure: the first request or
+/// the preserved error coordinates differ.
 #[tokio::test]
 async fn flagless_bootstrap_without_active_account_is_typed() {
     let (_root, profile) = profile();
     let peer = spawn_peer(&profile, |mut peer| async move {
         let (request_id, body) = peer.request().await;
-        assert_eq!(body, RequestBody::AccountList { provider: None });
+        let RequestBody::SessionCreateWithPermissionOverrides {
+            provider,
+            model,
+            resolve_provider,
+            resolve_model,
+            ..
+        } = body
+        else {
+            panic!("headless admission must begin with session.create");
+        };
+        assert!(provider.is_empty() && model.is_empty());
+        assert!(resolve_provider && resolve_model);
         peer.respond(
             request_id,
-            ResponseBody::AccountList {
-                descriptors: Vec::new(),
-                revision: Some(1),
-                provider_active: Vec::new(),
-                provider_defaults: Vec::new(),
-                availability: None,
+            ResponseBody::Error {
+                code: haider_client::ERROR_CODE_NO_ACTIVE_ACCOUNT.into(),
+                message: "no active daemon account is configured".into(),
+                retryable: false,
+                data: None,
             },
         )
         .await;
@@ -732,7 +743,7 @@ async fn flagless_bootstrap_without_active_account_is_typed() {
     assert!(matches!(
         error,
         HeadlessRunError::Bootstrap {
-            stage: "account.list",
+            stage: "session.create",
             code: haider_client::ERROR_CODE_NO_ACTIVE_ACCOUNT,
             retryable: false,
             ..
@@ -2753,6 +2764,7 @@ fn override_feature_is_required_only_when_a_flag_is_present() {
     });
     let mut expected = haider_client::required_live_features();
     expected.insert(haider_rpc::FEATURE_AUTONOMOUS_INTERACTION_V1.to_owned());
+    expected.insert(haider_rpc::FEATURE_SESSION_CREATE_ADMISSION_V1.to_owned());
     assert_eq!(no_flags, expected);
     assert_eq!(
         flags

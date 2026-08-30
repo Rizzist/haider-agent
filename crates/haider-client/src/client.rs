@@ -2,7 +2,7 @@
 //!
 //! One [`RpcClient`] owns one negotiated connection: a bounded writer task, a
 //! reader task that correlates `Response` frames to pending requests by
-//! `RequestId`, an R9 heartbeat task (`Ping` every 15 s; a ping unmatched for
+//! `RequestId`, an R9 heartbeat task (`Ping` after each 15 s cadence; a ping unmatched for
 //! 45 s declares the connection dead), and a bounded event channel for
 //! everything that is not a correlated response. Reconnection is a caller
 //! primitive: the client never reconnects silently — it reports a typed
@@ -81,6 +81,16 @@ pub struct ClientConfig {
     pub request_timeout: Duration,
     pub ping_interval: Duration,
     pub pong_deadline: Duration,
+    /// Whether this connection will consume asynchronous events and remain
+    /// alive long enough to need heartbeat liveness.
+    pub connection_usage: ConnectionUsage,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConnectionUsage {
+    #[default]
+    LongLived,
+    OneShot,
 }
 
 impl Default for ClientConfig {
@@ -96,6 +106,7 @@ impl Default for ClientConfig {
             request_timeout: REQUEST_TIMEOUT,
             ping_interval: PING_INTERVAL,
             pong_deadline: PONG_DEADLINE,
+            connection_usage: ConnectionUsage::LongLived,
         }
     }
 }
@@ -504,10 +515,16 @@ impl RpcClient {
         // limit; clamp outbound encoding to it.
         let outbound_limit = config.frame_limit.min(welcome.frame_limit as usize).max(1);
         let (outbound, outbound_rx) = mpsc::channel::<Zeroizing<Vec<u8>>>(OUTBOUND_CAPACITY);
-        let (events_tx, events_rx) = mpsc::channel::<WireFrame>(EVENT_CAPACITY);
+        let (events_tx, events_rx) = match config.connection_usage {
+            ConnectionUsage::LongLived => {
+                let (sender, receiver) = mpsc::channel::<WireFrame>(EVENT_CAPACITY);
+                (Some(sender), Some(receiver))
+            }
+            ConnectionUsage::OneShot => (None, None),
+        };
         let (reader_half, writer_half) = haider_platform::split(stream);
 
-        let tasks = vec![
+        let mut tasks = vec![
             tokio::spawn(run_reader(
                 reader_half,
                 decoder,
@@ -521,19 +538,21 @@ impl RpcClient {
                 },
             )),
             tokio::spawn(run_writer(writer_half, outbound_rx, Arc::clone(&shared))),
-            tokio::spawn(run_heartbeat(
+        ];
+        if config.connection_usage == ConnectionUsage::LongLived {
+            tasks.push(tokio::spawn(run_heartbeat(
                 Arc::clone(&shared),
                 outbound.clone(),
                 outbound_limit,
                 encoding,
                 config.ping_interval,
                 config.pong_deadline,
-            )),
-        ];
+            )));
+        }
         Ok(Self {
             shared,
             outbound,
-            events: StdMutex::new(Some(events_rx)),
+            events: StdMutex::new(events_rx),
             outbound_limit,
             encoding,
             request_timeout: config.request_timeout,
@@ -826,7 +845,7 @@ async fn run_reader(
     mut decoder: uds_codec::Decoder,
     leftovers: VecDeque<WireFrame>,
     shared: Arc<Shared>,
-    events: mpsc::Sender<WireFrame>,
+    events: Option<mpsc::Sender<WireFrame>>,
     outbound: mpsc::Sender<Zeroizing<Vec<u8>>>,
     codec: NegotiatedCodec,
 ) {
@@ -835,7 +854,7 @@ async fn run_reader(
         route_frame(
             frame,
             &shared,
-            &events,
+            events.as_ref(),
             &outbound,
             codec.frame_limit,
             codec.encoding,
@@ -869,7 +888,7 @@ async fn run_reader(
                     route_frame(
                         frame,
                         &shared,
-                        &events,
+                        events.as_ref(),
                         &outbound,
                         codec.frame_limit,
                         codec.encoding,
@@ -888,7 +907,7 @@ async fn run_reader(
 async fn route_frame(
     frame: WireFrame,
     shared: &Arc<Shared>,
-    events: &mpsc::Sender<WireFrame>,
+    events: Option<&mpsc::Sender<WireFrame>>,
     outbound: &mpsc::Sender<Zeroizing<Vec<u8>>>,
     outbound_limit: usize,
     encoding: WireEncoding,
@@ -920,7 +939,7 @@ async fn route_frame(
         WireFrame::ProtocolError(error) => {
             let fatal = error.fatal;
             let forwarded = WireFrame::ProtocolError(error.clone());
-            if events.try_send(forwarded).is_err() {
+            if events.is_some_and(|events| events.try_send(forwarded).is_err()) {
                 shared.lost_events.fetch_add(1, Ordering::Relaxed);
             }
             if fatal {
@@ -928,7 +947,7 @@ async fn route_frame(
             }
         }
         binding @ WireFrame::ResidentSessionBinding { .. } => {
-            if events.try_send(binding).is_err() {
+            if events.is_some_and(|events| events.try_send(binding).is_err()) {
                 shared.lost_events.fetch_add(1, Ordering::Relaxed);
                 shared.fail(DisconnectReason::Protocol(
                     "resident session binding could not reach the authoritative event channel"
@@ -940,7 +959,7 @@ async fn route_frame(
             // Uncorrelated traffic must never block response correlation:
             // a full event channel drops the frame and the consumer's
             // seq-cursor reattach discipline recovers the gap.
-            if events.try_send(other).is_err() {
+            if events.is_some_and(|events| events.try_send(other).is_err()) {
                 shared.lost_events.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -996,7 +1015,7 @@ async fn run_heartbeat(
     pong_deadline: Duration,
 ) {
     let mut state = shared.state.subscribe();
-    let mut ticker = tokio::time::interval(ping_interval);
+    let mut ticker = tokio::time::interval_at(Instant::now() + ping_interval, ping_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut next_nonce: u64 = 1;
     let mut unacked: VecDeque<(u64, Instant)> = VecDeque::new();
@@ -1072,7 +1091,7 @@ mod tests {
                 binding_token: None,
             },
             &shared,
-            &events,
+            Some(&events),
             &outbound,
             DEFAULT_FRAME_LIMIT,
             WireEncoding::Json,

@@ -509,7 +509,18 @@ impl std::error::Error for DaemonSpawnError {
 /// Spawns the sibling daemon with its fixed argv/stdout/stderr contract and
 /// the platform's detach + inheritance hygiene.
 pub fn spawn_daemon(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
-    spawn_daemon_with_stderr(spec, false, None, None)
+    spawn_daemon_with_stderr(spec, false, None, None, None)
+}
+
+/// Test/diagnostic variant of [`spawn_daemon`] that gives a real daemon an
+/// isolated machine-user home. Production launchers inherit the user's home;
+/// subprocess tests must not read or mutate that global lockdown state.
+#[doc(hidden)]
+pub fn spawn_daemon_with_machine_user_home(
+    spec: DaemonSpawn<'_>,
+    machine_user_home: &Path,
+) -> Result<Child, DaemonSpawnError> {
+    spawn_daemon_with_stderr(spec, false, None, None, Some(machine_user_home))
 }
 
 /// Spawns a daemon with a private one-shot readiness notification.
@@ -521,7 +532,7 @@ pub fn spawn_daemon_with_readiness(
     let coordinate = prepared
         .child_coordinate()
         .map_err(DaemonSpawnError::Readiness)?;
-    let child = spawn_daemon_with_stderr(spec, false, Some((&token, coordinate)), None)?;
+    let child = spawn_daemon_with_stderr(spec, false, Some((&token, coordinate)), None, None)?;
     Ok(SpawnedDaemon {
         child,
         readiness: prepared.into_receiver(),
@@ -546,6 +557,7 @@ pub fn spawn_daemon_with_readiness_and_liveness(
         false,
         Some((&readiness_token, readiness_coordinate)),
         Some((&liveness_token, liveness_coordinate)),
+        None,
     )?;
     Ok((
         SpawnedDaemon {
@@ -564,7 +576,7 @@ pub fn spawn_daemon_with_readiness_and_liveness(
 /// cannot block on a full pipe.
 #[doc(hidden)]
 pub fn spawn_daemon_with_piped_stderr(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
-    spawn_daemon_with_stderr(spec, true, None, None)
+    spawn_daemon_with_stderr(spec, true, None, None, None)
 }
 
 fn spawn_daemon_with_stderr(
@@ -572,6 +584,7 @@ fn spawn_daemon_with_stderr(
     pipe_stderr: bool,
     readiness: Option<(&str, ReadinessChildCoordinate)>,
     liveness: Option<(&str, LivenessChildCoordinate)>,
+    machine_user_home: Option<&Path>,
 ) -> Result<Child, DaemonSpawnError> {
     // The daemon creates this directory only after it owns the profile lock.
     // Merely naming it here keeps a launcher killed before `exec` from
@@ -603,6 +616,11 @@ fn spawn_daemon_with_stderr(
         .stdout(Stdio::from(log))
         .stderr(stderr);
     command.env(DAEMON_LOG_PATH_ENV, spec.log_path);
+    if let Some(machine_user_home) = machine_user_home {
+        command
+            .env("HOME", machine_user_home)
+            .env("USERPROFILE", machine_user_home);
+    }
     if let Some((token, _)) = readiness.as_ref() {
         command.arg(DAEMON_READINESS_ARG).arg(*token);
     }

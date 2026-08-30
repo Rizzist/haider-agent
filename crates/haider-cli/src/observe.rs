@@ -70,7 +70,7 @@ pub(crate) struct StatusDocument {
     pub update: UpdateView,
     pub features: Vec<String>,
     pub account: Option<AccountView>,
-    pub session_count: usize,
+    pub session_count: u64,
     pub profile_path: String,
     pub runtime_dir: String,
     pub adoption_available: Vec<haider_rpc::AccountAdoptionAvailable>,
@@ -504,34 +504,21 @@ pub(crate) async fn status_command(rest: &[String]) -> ExitCode {
         Ok(profile) => profile,
         Err(code) => return code,
     };
-    let observer = match ObserveClient::connect(&profile, !options.no_spawn).await {
+    let observer = match ObserveClient::connect_one_shot(&profile, !options.no_spawn).await {
         Ok(observer) => observer,
         Err(error) => return observe_failure("status", &error),
     };
-    let account = match observer.active_account().await {
-        Ok(account) => account.map(|descriptor| AccountView {
-            provider: descriptor.provider,
-            alias: descriptor.alias.as_str().to_owned(),
-        }),
+    let snapshot = match observer.status_snapshot().await {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             let _ = observer.close();
             return observe_failure("status", &error);
         }
     };
-    let session_count = match observer.session_ids().await {
-        Ok(sessions) => sessions.len(),
-        Err(error) => {
-            let _ = observer.close();
-            return observe_failure("status", &error);
-        }
-    };
-    let adoption_available = match observer.account_adoption_available().await {
-        Ok(notices) => notices,
-        Err(error) => {
-            let _ = observer.close();
-            return observe_failure("status", &error);
-        }
-    };
+    let account = snapshot.active_account.map(|descriptor| AccountView {
+        provider: descriptor.provider,
+        alias: descriptor.alias.as_str().to_owned(),
+    });
     let welcome = observer.welcome().clone();
     let _ = observer.close();
     let update = stamp_update_view(&profile.store_dir);
@@ -545,10 +532,10 @@ pub(crate) async fn status_command(rest: &[String]) -> ExitCode {
         update,
         features: welcome.features.into_iter().collect(),
         account,
-        session_count,
+        session_count: snapshot.session_count,
         profile_path: profile.store_dir.display().to_string(),
         runtime_dir: profile.runtime_dir.display().to_string(),
-        adoption_available,
+        adoption_available: snapshot.adoption_available,
     };
     if options.json {
         write_document(&document)

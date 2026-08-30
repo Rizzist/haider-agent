@@ -6,7 +6,7 @@
 
 #![allow(clippy::expect_used)]
 
-use haider_platform::{DaemonSpawn, allocate_daemon_log_path, spawn_daemon};
+use haider_platform::{DaemonSpawn, allocate_daemon_log_path, spawn_daemon_with_machine_user_home};
 use haider_store::Store;
 use std::path::{Path, PathBuf};
 use std::process::Child;
@@ -15,13 +15,17 @@ const ALREADY_RUNNING_EXIT: i32 = 75;
 
 fn spawn_contender(store_dir: &Path, runtime_dir: &Path, profile_id: &str) -> (Child, PathBuf) {
     let log_path = allocate_daemon_log_path(store_dir).expect("allocate per-process daemon log");
-    let child = spawn_daemon(DaemonSpawn {
-        binary: Path::new(env!("CARGO_BIN_EXE_haiderd")),
-        profile_id,
-        store_dir,
-        runtime_dir,
-        log_path: &log_path,
-    })
+    let machine_user_home = store_dir.parent().expect("store has a test root");
+    let child = spawn_daemon_with_machine_user_home(
+        DaemonSpawn {
+            binary: Path::new(env!("CARGO_BIN_EXE_haiderd")),
+            profile_id,
+            store_dir,
+            runtime_dir,
+            log_path: &log_path,
+        },
+        machine_user_home,
+    )
     .expect("spawn real daemon contender");
     (child, log_path)
 }

@@ -4032,6 +4032,23 @@ impl Store {
         Ok(ids.into_iter().map(SessionId::new).collect())
     }
 
+    /// Counts durable sessions without materializing their identifiers.
+    pub fn session_count(&self) -> StoreResult<u64> {
+        let connection = self.connection()?;
+        let count = connection
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(map_sqlite_error)?;
+        u64::try_from(count).map_err(|_| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "session count is outside the supported range",
+                false,
+            )
+        })
+    }
+
     /// Reads an opaque projection checkpoint. Missing rows are cache misses;
     /// malformed rows are reported as corruption so callers can replay the
     /// authoritative journal without silently losing checkpoint capability.

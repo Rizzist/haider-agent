@@ -169,6 +169,7 @@ fn test_config(root: &tempfile::TempDir, profile: &str) -> DaemonConfig {
     // Hermetic: direct spawns here bypass support::ready's guard; never
     // probe the developer machine's real credential stores (A2 auto-adopt).
     config.discovery_disabled = true;
+    config.lockdown_root_override = Some(root.path().join(".haider").join("lockdown"));
     config
 }
 
@@ -210,6 +211,16 @@ fn child_command(config: &DaemonConfig) -> Command {
         // Under gate load that wedged shutdown (gate116/117: the two
         // child-process lifecycle tests were the only flakes).
         .env("HAIDER_DISCOVERY_DISABLED", "1")
+        // Lockdown is machine-user global rather than profile-local. A real
+        // daemon child must not escape this fixture into the developer home.
+        .env(
+            "HOME",
+            config.store_dir.parent().expect("store has test root"),
+        )
+        .env(
+            "USERPROFILE",
+            config.store_dir.parent().expect("store has test root"),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

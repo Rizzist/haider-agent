@@ -702,6 +702,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "ssh.shell_resize",
         "ssh.test",
         "ssh.update",
+        "status.snapshot",
         "tools.inventory",
         "transcription.secret_get",
         "transcription.secret_set",
@@ -724,8 +725,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        124,
-        "123 v0.0.966 methods plus one additive agent.cancel method"
+        125,
+        "123 v0.0.966 methods plus agent.cancel and status.snapshot"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -771,8 +772,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     assert_eq!(fixture.contract, "haider-client-wire/v1");
     assert_eq!(
         fixture.methods.len(),
-        64,
-        "the supplemental fixture must contain the 64 methods absent from the union transcript"
+        65,
+        "the supplemental fixture must contain the 65 methods absent from the union transcript"
     );
     for pair in fixture.methods {
         assert_eq!(wire_method(&pair.request), pair.request_method);
@@ -1973,6 +1974,10 @@ fn legacy_session_create_defaults_permission_overrides_to_none() {
                 cache_policy: None,
                 interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
                 ssh_scope: None,
+                resolve_provider: false,
+                resolve_model: false,
+                effort: None,
+                fast: None,
             },
         }
     );

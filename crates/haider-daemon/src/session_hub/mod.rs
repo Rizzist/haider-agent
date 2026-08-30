@@ -5112,6 +5112,27 @@ impl SessionHub {
         Ok(session_ids)
     }
 
+    async fn roster_session_count(&self) -> Result<u64, SessionHubError> {
+        let candidates = lock(&self.inner.fork_candidates)?
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let total = self.inner.store.session_count().await?;
+        let mut hidden = 0_u64;
+        for candidate in candidates {
+            if self
+                .inner
+                .store
+                .session_metadata(&candidate)
+                .await?
+                .is_some()
+            {
+                hidden = hidden.saturating_add(1);
+            }
+        }
+        Ok(total.saturating_sub(hidden))
+    }
+
     fn is_roster_visible(&self, session_id: &SessionId) -> Result<bool, SessionHubError> {
         Ok(!lock(&self.inner.fork_candidates)?.contains(session_id))
     }

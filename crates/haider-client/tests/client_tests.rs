@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use haider_client::{
-    ClientCloseOutcome, ClientConfig, ConnectError, ConnectionState, DisconnectReason, EnsureError,
-    EnsureOptions, ProfileEnv, ShellExecError, ShellExecRequest, connect, ensure_daemon,
-    resolve_profile, shell_exec,
+    ClientCloseOutcome, ClientConfig, ConnectError, ConnectionState, ConnectionUsage,
+    DisconnectReason, EnsureError, EnsureOptions, ProfileEnv, ShellExecError, ShellExecRequest,
+    connect, ensure_daemon, resolve_profile, shell_exec,
 };
 use haider_protocol::ids::SessionId;
 use haider_rpc::{
@@ -455,9 +455,55 @@ async fn silent_server_trips_the_pong_deadline_on_paused_time() {
         .await
         .expect("pong deadline must fire within the paused-time bound");
     assert_eq!(reason, DisconnectReason::PongTimeout);
-    // The first ping goes out immediately; its 45 s deadline is checked on
-    // the 15 s tick cadence, so death lands at exactly 45 virtual seconds.
-    assert_eq!(started.elapsed(), Duration::from_secs(45));
+    // The first ping waits one cadence (15 s); its 45 s deadline is checked
+    // on that cadence, so death lands at exactly 60 virtual seconds.
+    assert_eq!(started.elapsed(), Duration::from_secs(60));
+}
+
+/// MUTATION CHECK: allocate the event channel or start the heartbeat for a
+/// one-shot client. Expected runtime failure: `take_events` returns a receiver
+/// or the fake peer observes heartbeat traffic during virtual quiescence.
+#[tokio::test(start_paused = true)]
+async fn one_shot_connection_arms_neither_events_nor_heartbeat() {
+    let dir = short_dir();
+    let endpoint = dir.path().join("one-shot.sock");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let traffic = Arc::new(AtomicUsize::new(0));
+    let observed_traffic = Arc::clone(&traffic);
+    let _daemon = spawn_fake_daemon(
+        &endpoint,
+        accepted,
+        HelloReply::Welcome(welcome("profile-x", BTreeSet::new())),
+        move |mut stream, mut decoder| {
+            let observed_traffic = Arc::clone(&observed_traffic);
+            async move {
+                loop {
+                    let frames = read_frames(&mut stream, &mut decoder).await;
+                    if frames.is_empty() {
+                        return;
+                    }
+                    observed_traffic.fetch_add(frames.len(), Ordering::SeqCst);
+                }
+            }
+        },
+    );
+    let connected = connect(
+        &endpoint,
+        ClientConfig {
+            connection_usage: ConnectionUsage::OneShot,
+            ping_interval: Duration::from_secs(1),
+            pong_deadline: Duration::from_secs(3),
+            ..ClientConfig::default()
+        },
+    )
+    .await
+    .expect("connect one-shot client");
+    assert!(connected.client.take_events().is_none());
+    tokio::time::sleep(Duration::from_secs(300)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(traffic.load(Ordering::SeqCst), 0);
+    assert_eq!(connected.client.state(), ConnectionState::Connected);
+    assert_live_peer_notified(connected.client.close());
 }
 
 #[tokio::test(start_paused = true)]

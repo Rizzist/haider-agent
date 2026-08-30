@@ -354,8 +354,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        103,
-        "102 v0.0.966 features plus agent_cancel_v1"
+        105,
+        "102 v0.0.966 features plus agent_cancel_v1 and two v0.0.967 admission/status features"
     );
     assert_eq!(
         welcome_features(),
@@ -411,6 +411,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_INPUT_MIRROR_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_ATTACH_SEALED_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_CONFIG_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_CREATE_ADMISSION_V1.to_owned(),
             haider_rpc::FEATURE_WIRE_MSGPACK_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_LIST_WATCH_V1.to_owned(),
             FEATURE_PROVIDER_CONFIGURE_V1.to_owned(),
@@ -439,6 +440,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_AUTONOMOUS_INTERACTION_V1.to_owned(),
             haider_rpc::FEATURE_STATUS_SEGMENT_STRUCTURED_V1.to_owned(),
             haider_rpc::FEATURE_STATUS_SEGMENT_V1.to_owned(),
+            haider_rpc::FEATURE_STATUS_SNAPSHOT_V1.to_owned(),
             haider_rpc::FEATURE_STORE_HEALTH_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_OBSERVE_BATCH_V1.to_owned(),
             haider_rpc::FEATURE_RESIDENT_TURN_SUBMIT_V1.to_owned(),
