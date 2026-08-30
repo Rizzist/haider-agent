@@ -330,6 +330,7 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         metadata: metadata.clone(),
         agent_type: None,
         lockdown: false,
+        auto_hermetic: false,
     };
     let request = SpawnSubagent {
         task: "test branch pin".into(),
@@ -508,6 +509,7 @@ impl ProviderFactory for FixedProviderFactory {
             model: metadata.model.clone(),
             context_window: None,
             account_alias: None,
+            active_no_auth: false,
             initial_rotation: None,
             rotation_budget_consumed: false,
             attempt_resolver: None,
@@ -646,6 +648,7 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
                 call_id: "message-running-spawn-call".into(),
                 agent_type: None,
                 lockdown: false,
+                auto_hermetic: false,
                 metadata: SessionMetadataV1 {
                     cwd: workspace_text.clone(),
                     provider: "fake".into(),
@@ -894,6 +897,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                 call_id: "message-idle-spawn-call".into(),
                 agent_type: None,
                 lockdown: false,
+                auto_hermetic: false,
                 metadata: SessionMetadataV1 {
                     cwd: workspace.clone(),
                     provider: "fake".into(),
@@ -1102,6 +1106,7 @@ async fn only_own_children_are_messageable_with_typed_error() {
                 call_id: "message-owner-call".into(),
                 agent_type: None,
                 lockdown: false,
+                auto_hermetic: false,
                 metadata: SessionMetadataV1 {
                     cwd: workspace,
                     provider: "fake".into(),

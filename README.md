@@ -93,6 +93,14 @@ discovers its live `/v1/models` inventory before making it selectable:
 $ haider account add local-router --base-url http://127.0.0.1:8000 --no-auth --api-family openai
 ```
 
+When that no-auth provider is the active session provider and no stored key is
+active for it, Haider automatically reuses provider lockdown with a no-egress
+tool envelope and skips the client startup update check. Inspect the decision
+with `haider provider show local-router`; set `HAIDER_AUTO_HERMETIC=0` to opt
+out of only the automatic policy. `HAIDER_NO_UPDATE_CHECK=1` remains an
+independent hard disable. Explicit `--lockdown` composes with this policy and
+never weakens its no-egress tool floor.
+
 For a hosted endpoint, keep the key out of command arguments and source it
 from an environment variable. The value is staged directly into the daemon
 vault and is never printed in JSON or terminal output:

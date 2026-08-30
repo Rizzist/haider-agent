@@ -500,6 +500,8 @@ fn lockdown_overlay_and_refusal_keep_their_own_visual_taxonomy() {
     model.lockdown_overlay = true;
     model.lockdown_status = Some(haider_rpc::LockdownStatusWire {
         provider: Some("research".into()),
+        activation: None,
+        reason: None,
         tools_allowed: vec!["fs_read".into(), "web_search".into()],
         quota_used: 4_096,
         quota_limit: 1_073_741_824,

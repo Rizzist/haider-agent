@@ -93,6 +93,7 @@ impl ProviderFactory for FakeFactory {
             model: metadata.model.clone(),
             context_window: None,
             account_alias: None,
+            active_no_auth: false,
             initial_rotation: None,
             rotation_budget_consumed: false,
             attempt_resolver: None,

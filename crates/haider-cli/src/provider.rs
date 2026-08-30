@@ -231,6 +231,25 @@ async fn execute(
                     "default model: {}",
                     provider.default_model.as_deref().unwrap_or("-")
                 );
+                if let Some(activation) = envelope.activation {
+                    let (label, value) = match activation {
+                        haider_rpc::LockdownActivationWire::Configured => {
+                            ("enforcement", "configured lockdown")
+                        }
+                        haider_rpc::LockdownActivationWire::AutoHermetic => {
+                            ("enforcement", "auto-hermetic")
+                        }
+                        haider_rpc::LockdownActivationWire::AutoHermeticEligible => {
+                            ("policy", "auto-hermetic when active")
+                        }
+                        haider_rpc::LockdownActivationWire::Unknown => ("enforcement", "unknown"),
+                        _ => ("enforcement", "unknown"),
+                    };
+                    println!("{label}: {value}");
+                }
+                if let Some(reason) = envelope.reason.as_deref() {
+                    println!("reason: {reason}");
+                }
                 println!("allowed tools: {}", envelope.tools_allowed.join(", "));
                 println!(
                     "quota: {} / {} bytes",

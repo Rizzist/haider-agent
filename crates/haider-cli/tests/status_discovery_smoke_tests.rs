@@ -72,6 +72,12 @@ fn assert_real_sibling_artifacts() -> (PathBuf, PathBuf) {
 #[test]
 fn built_status_json_completes_with_enabled_discovery() {
     let (haider, _haiderd) = assert_real_sibling_artifacts();
+    #[cfg(unix)]
+    let root = tempfile::Builder::new()
+        .prefix("hs-")
+        .tempdir_in("/tmp")
+        .expect("fresh short status smoke root");
+    #[cfg(not(unix))]
     let root = tempfile::tempdir().expect("fresh status smoke root");
     let profile = root.path().join("profile");
     let workspace = root.path().join("workspace");

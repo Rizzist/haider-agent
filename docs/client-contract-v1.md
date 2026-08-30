@@ -113,8 +113,10 @@ published here for independent implementations, not as permission to diverge.
    `haider-profile-id-v1\n` followed by the canonical UTF-8 store path, with no
    separator added after the path.
 4. Select a runtime root: `HAIDER_RUNTIME_DIR` when set (for gates/CI), else a
-   verified owner-private `$XDG_RUNTIME_DIR/haider` on Linux, a verified
-   `$TMPDIR/haider` or `$PREFIX/tmp/haider` on Unix, the per-UID
+   verified owner-private `$XDG_RUNTIME_DIR/haider` on Linux, then the resolved
+   user home joined with `.haider/runtime`. Only an invocation with an explicit
+   profile store and no available user home proceeds to a verified
+   `$TMPDIR/haider` or `$PREFIX/tmp/haider`, the per-UID
    `/tmp/haider-<effective-uid>` fallback, or the Windows process temporary
    directory joined with `haider`. The actual runtime directory is always the
    root plus the first 20 hex characters of `profile_id`; it is mode `0700`
@@ -126,6 +128,10 @@ published here for independent implementations, not as permission to diverge.
    the UTF-8 `profile_id`, take the first 32 hex characters, and form
    `\\.\pipe\haider-<32hex>`; the profile-scoped filesystem runtime still
    holds its pid and temporary files.
+6. Validate the longest bind/staging address during profile resolution. A
+   selected HOME/XDG path that exceeds the platform IPC limit is a typed fatal
+   error naming the observed path/length/limit and recommending a shorter
+   owner-private `HAIDER_RUNTIME_DIR`; it MUST NOT silently escape to `/tmp`.
 
 The endpoint name is the discovery mechanism. Do not scan the runtime
 directory and do not parse lock files. Connect first. Only a missing or
@@ -3167,7 +3173,8 @@ absent and never emulates the calls.
 `provider.set_trust` carries `command_id`, provider name, `full | lockdown`,
 and `expected_revision`; success returns the complete provider summary and new
 management revision. `lockdown.status` optionally names a provider and returns
-`provider`, `tools_allowed`, `quota_used`, and `quota_limit`.
+`provider`, optional `activation` and `reason`, `tools_allowed`, `quota_used`,
+and `quota_limit`.
 `lockdown.set_quota` carries a command id and nonnegative byte limit and returns
 the same status shape. The quota is shared across profiles and providers.
 
@@ -3177,6 +3184,36 @@ render or enable Full capabilities. Observation digests and child rows may
 carry an optional `lockdown` object; absence from an older daemon is unknown,
 not proof of Full trust. Enforcement remains daemon-owned regardless of what
 a client renders.
+
+At an active session/turn boundary, an enabled non-built-in provider with an
+injected endpoint, a supported Chat Completions or Anthropic Messages family,
+no advertised auth methods, and **no active stored credential** is the exact
+automatic-hermetic trigger. Merely configuring such a provider is insufficient;
+the selected session provider must be that provider. The automatic branch uses
+the existing lockdown turn binding and provider-fallback fence, but its tool
+list is stricter: filesystem read/search/write within lockdown scope,
+request-input, todo, and plan only. Web, peer, SSH, process, and subagent routes
+are absent and independently refused at dispatch.
+Explicit configured lockdown composes with this automatic floor; because its
+ordinary envelope permits bounded web tools, it MUST NOT replace or weaken the
+stricter auto-hermetic envelope.
+
+Provider-only `lockdown.status(<provider>)` and provider-show JSON/text report
+`activation: auto_hermetic_eligible` and state that the policy applies when
+selected; this is not evidence of an active session. Active-session observation
+reports `activation: auto_hermetic` and the active reason. Exact
+`HAIDER_AUTO_HERMETIC=0` disables this automatic branch without weakening an
+explicitly configured lockdown. The client suppresses its on-open update check
+when an explicitly opened initial session reports active auto-hermetic, or when
+a new session will use a default provider whose status reports eligibility. A
+session picker has no active provider and does not scan unrelated profiles.
+If that active-provider lookup is unavailable, the automatic check fails
+closed and the CLI prints why it was suppressed; lookup failure never permits
+release-discovery egress.
+Manual update checks remain operator actions. `HAIDER_NO_UPDATE_CHECK=1` and
+`--no-update-check` remain independent hard disables and compose with this
+policy. Daemon tracing remains local and opt-in; the automatic policy does not
+enable telemetry.
 
 Native Pipe clients consume raw self-sufficient `lockdown.refused`,
 `lockdown.quota`, and `provider.trust_changed` payloads. Refusal includes

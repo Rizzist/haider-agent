@@ -49,6 +49,10 @@
 //! documented on [`DaemonState`] and enforced by the state publisher.
 
 mod accounts;
+mod auto_hermetic;
+#[cfg(test)]
+#[path = "auto_hermetic_tests.rs"]
+mod auto_hermetic_tests;
 mod cache_policy;
 #[cfg(test)]
 mod cache_policy_tests;

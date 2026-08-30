@@ -125,6 +125,18 @@ fn profile(store: &Path, runtime_root: &Path) -> ResolvedProfile {
     .expect("resolve isolated profile")
 }
 
+fn private_home_profile(home: &Path) -> ResolvedProfile {
+    resolve_profile(&ProfileEnv {
+        profile_dir: None,
+        home: Some(home.to_path_buf()),
+        user_profile: Some(home.to_path_buf()),
+        model: None,
+        runtime_dir: None,
+        xdg_runtime_dir: None,
+    })
+    .expect("resolve private-HOME profile")
+}
+
 fn pid_path(profile: &ResolvedProfile) -> PathBuf {
     profile.runtime_dir.join(haider_daemon::DAEMON_PID_FILE)
 }
@@ -220,6 +232,26 @@ fn spawn_helper(
     }
     let child = command.spawn().expect("spawn ephemeral client helper");
     ChildGuard::new(child)
+}
+
+fn spawn_private_home_helper(home: &Path, marker: &Path) -> ChildGuard {
+    let mut command =
+        Command::new(std::env::current_exe().expect("locate integration test executable"));
+    command
+        .args(["--exact", "ephemeral_client_process_helper", "--nocapture"])
+        .env(HELPER_ENV, "1")
+        .env(HELPER_MARKER_ENV, marker)
+        .env(HELPER_DAEMON_ENV, env!("CARGO_BIN_EXE_haiderd"))
+        .env_remove("HAIDER_PROFILE_DIR")
+        .env_remove("HAIDER_RUNTIME_DIR")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("HAIDER_DISCOVERY_DISABLED", "1")
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    ChildGuard::new(command.spawn().expect("spawn private-HOME client helper"))
 }
 
 fn kill_helper(child: &mut ChildGuard) {
@@ -815,6 +847,124 @@ fn two_profiles_have_disjoint_runtime_trees_and_writes() {
         .trim()
         .parse::<u32>()
         .expect("second daemon PID");
+    kill_helper(&mut first_helper);
+    kill_helper(&mut second_helper);
+    wait_for_cleanup(
+        &runtime,
+        &first,
+        Some(&mut first_helper),
+        Some(first_daemon_pid),
+    );
+    wait_for_cleanup(
+        &runtime,
+        &second,
+        Some(&mut second_helper),
+        Some(second_daemon_pid),
+    );
+}
+
+/// A1 hermetic default: two cold instances given only distinct private homes
+/// resolve, spawn, rendezvous, and clean up without using or adopting the
+/// legacy per-UID temporary runtime. Both helpers are alive concurrently.
+#[test]
+fn two_private_home_instances_are_self_contained_and_never_adopt_each_other() {
+    let _guard = process_test_guard();
+    let runtime = runtime();
+    let root = test_root();
+    let first_home = root.path().join("home-a");
+    let second_home = root.path().join("home-b");
+    let first = private_home_profile(&first_home);
+    let second = private_home_profile(&second_home);
+    assert_ne!(first.profile_id, second.profile_id);
+    assert_ne!(first.runtime_dir, second.runtime_dir);
+
+    let legacy_root =
+        PathBuf::from("/tmp").join(format!("haider-{}", haider_client::effective_uid()));
+    for profile in [&first, &second] {
+        let scope = profile
+            .runtime_dir
+            .file_name()
+            .expect("profile runtime scope");
+        assert!(
+            !legacy_root.join(scope).exists(),
+            "fixture profile must not pre-exist in the legacy runtime"
+        );
+    }
+
+    let first_marker = first_home.join("helper-ready");
+    let second_marker = second_home.join("helper-ready");
+    let mut first_helper = spawn_private_home_helper(&first_home, &first_marker);
+    let mut second_helper = spawn_private_home_helper(&second_home, &second_marker);
+    wait_for_helper(
+        &runtime,
+        &first,
+        &first_marker,
+        &mut first_helper,
+        "first private-HOME readiness",
+    );
+    wait_for_helper(
+        &runtime,
+        &second,
+        &second_marker,
+        &mut second_helper,
+        "second private-HOME readiness",
+    );
+
+    let first_connection = connect_until_ready(&runtime, &first, Some(&mut first_helper), None);
+    let second_connection = connect_until_ready(&runtime, &second, Some(&mut second_helper), None);
+    assert_eq!(first_connection.welcome.profile_id, first.profile_id);
+    assert_eq!(second_connection.welcome.profile_id, second.profile_id);
+    assert_ne!(
+        first_connection.welcome.profile_id,
+        second_connection.welcome.profile_id
+    );
+    assert_close_started(first_connection.client.close());
+    assert_close_started(second_connection.client.close());
+
+    for (home, profile) in [(&first_home, &first), (&second_home, &second)] {
+        let canonical_home = home.canonicalize().expect("canonical private HOME");
+        assert!(profile.store_dir.starts_with(canonical_home));
+        assert!(profile.runtime_dir.starts_with(home));
+        assert!(profile.endpoint_path.starts_with(home));
+        assert!(profile.store_dir.join("store.sqlite").is_file());
+        assert!(profile.store_dir.join("lock").is_file());
+        assert!(profile.store_dir.join("lock.owner").is_file());
+        assert!(profile.store_dir.join(DAEMON_LOG_FILE).is_file());
+        assert!(pid_path(profile).is_file());
+        assert!(profile.runtime_dir.join("tmp").is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt as _;
+            assert!(
+                std::fs::symlink_metadata(&profile.endpoint_path)
+                    .expect("socket metadata")
+                    .file_type()
+                    .is_socket()
+            );
+        }
+
+        let scope = profile
+            .runtime_dir
+            .file_name()
+            .expect("profile runtime scope");
+        assert!(
+            !legacy_root.join(scope).exists(),
+            "private HOME must never escape to the legacy runtime"
+        );
+    }
+
+    let first_daemon_pid = std::fs::read_to_string(pid_path(&first))
+        .expect("first daemon PID file")
+        .trim()
+        .parse::<u32>()
+        .expect("first daemon PID");
+    let second_daemon_pid = std::fs::read_to_string(pid_path(&second))
+        .expect("second daemon PID file")
+        .trim()
+        .parse::<u32>()
+        .expect("second daemon PID");
+    assert_ne!(first_daemon_pid, second_daemon_pid);
+
     kill_helper(&mut first_helper);
     kill_helper(&mut second_helper);
     wait_for_cleanup(

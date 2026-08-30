@@ -142,6 +142,7 @@ fn digest(
                     .to_owned(),
                 provider: None,
                 lockdown_bound: None,
+                lockdown_auto_hermetic_bound: None,
                 lockdown: None,
             },
             ObserveSubagentWire {
@@ -155,6 +156,7 @@ fn digest(
                     .to_owned(),
                 provider: None,
                 lockdown_bound: None,
+                lockdown_auto_hermetic_bound: None,
                 lockdown: None,
             },
         ],

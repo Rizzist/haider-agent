@@ -109,9 +109,14 @@ pub(crate) struct SpawnCoordinates {
     /// narrows to the type's capabilities (least privilege).
     pub(crate) agent_type: Option<haider_protocol::loom::LoomAgentType>,
     /// Provider ceiling resolved by the parent dispatcher before any spawn
-    /// side effect. This exact bit is persisted and pins the child's first
-    /// run, closing a trust-toggle race between establishment and launch.
+    /// side effect. A restrictive bit is persisted and pins the child's first
+    /// run, closing a trust-downgrade race between establishment and launch.
+    /// Full is intentionally not pre-bound: the child's actually resolved
+    /// no-auth account may still require the stricter automatic floor.
     pub(crate) lockdown: bool,
+    /// Exact strict variant of the lockdown ceiling. A boolean-only replay
+    /// would restore ordinary lockdown and silently re-enable gateway tools.
+    pub(crate) auto_hermetic: bool,
 }
 
 pub(crate) struct MessageCoordinates {
@@ -354,6 +359,7 @@ impl DelegationHandle {
             // child session metadata remains the execution authority.
             "provider": coordinates.metadata.provider,
             "lockdown": child_lockdown,
+            "auto_hermetic": coordinates.auto_hermetic,
         });
         if let Some(attached) = &workflow {
             manifest_coordinates["child_graph"] =
@@ -511,20 +517,31 @@ impl DelegationHandle {
             .and_then(|coordinates| coordinates.get("lockdown"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        self.hub
-            .bind_lockdown_turn(
-                &record.child_session_id,
-                &record.child_run_id,
-                &coordinates.metadata.provider,
-                persisted_lockdown,
-            )
-            .map_err(|error| {
-                HaiderError::new(
-                    ErrorCode::Internal,
-                    format!("cannot bind child provider ceiling: {error}"),
-                    true,
+        let persisted_auto_hermetic = manifest
+            .coordinates
+            .as_ref()
+            .and_then(|coordinates| coordinates.get("auto_hermetic"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if persisted_lockdown {
+            self.hub
+                .bind_lockdown_turn(
+                    &record.child_session_id,
+                    &record.child_run_id,
+                    &coordinates.metadata.provider,
+                    crate::auto_hermetic::ProviderLockdownPolicy::from_binding(
+                        persisted_lockdown,
+                        persisted_auto_hermetic,
+                    ),
                 )
-            })?;
+                .map_err(|error| {
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        format!("cannot bind child provider ceiling: {error}"),
+                        true,
+                    )
+                })?;
+        }
         self.hub
             .notify_roster_session(record.child_session_id.clone());
         if let Some(attached) = workflow {

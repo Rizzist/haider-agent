@@ -165,6 +165,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -826,7 +827,7 @@ impl WeakSessionHub {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LockdownTurnBinding {
     provider: String,
-    lockdown: bool,
+    policy: crate::auto_hermetic::ProviderLockdownPolicy,
 }
 
 struct HubInner {
@@ -966,12 +967,15 @@ struct HubInner {
     /// the client search). Deliberately IN-MEMORY: "for the session" is a
     /// runtime scope — a daemon restart retries the capability once.
     web_degrade: Mutex<HashMap<SessionId, crate::worker::WebCapabilityDegrade>>,
-    /// Daemon-authoritative provider ceiling frozen at the first observer of
-    /// a run boundary. Hooks can observe the committed acceptance before the
-    /// worker starts, so both paths race through one atomic map entry instead
-    /// of independently reading mutable provider trust. A trust toggle can
-    /// therefore change the next run, never an in-flight run.
+    /// Daemon-authoritative provider ceiling frozen from the account adapter
+    /// the worker actually resolved. Hooks can observe the committed
+    /// acceptance first, but wait on `lockdown_turn_bound` instead of deriving
+    /// authority from a mutable management snapshot.
     lockdown_turns: Mutex<HashMap<(SessionId, RunId), LockdownTurnBinding>>,
+    /// Wakes hook dispatch after the worker publishes the resolved-account
+    /// ceiling. `Notify` is paired with a check-before-wait loop so a binding
+    /// committed just before subscription cannot be missed.
+    lockdown_turn_bound: Notify,
     /// Ephemeral compiled-prompt acceleration. Journal bytes remain the
     /// authority; the cache is discarded with this daemon generation.
     prompt_history: PromptHistoryCache,
@@ -2185,6 +2189,7 @@ impl SessionHub {
             monitors: crate::monitor::MonitorService::default(),
             web_degrade: Mutex::new(HashMap::new()),
             lockdown_turns: Mutex::new(HashMap::new()),
+            lockdown_turn_bound: Notify::new(),
             prompt_history: PromptHistoryCache::default(),
             turn_setup_reductions: TurnSetupReductionCache::default(),
         });
@@ -2463,31 +2468,75 @@ impl SessionHub {
     /// Returns the live provider policy used only when opening a new run
     /// boundary. Missing account infrastructure is retained as Full for
     /// isolated hub tests; once the account facade is installed, an unknown
-    /// provider fails closed as lockdown.
-    pub(crate) fn provider_lockdown_policy(&self, provider: &str) -> Result<bool, SessionHubError> {
+    /// provider fails closed as lockdown. The automatic branch is evaluated
+    /// only for this active provider, never by scanning unrelated profiles.
+    pub(crate) fn provider_lockdown_policy_detail(
+        &self,
+        provider: &str,
+    ) -> Result<crate::auto_hermetic::ProviderLockdownPolicy, SessionHubError> {
         let Some(accounts) = self.accounts()? else {
-            return Ok(false);
+            return Ok(crate::auto_hermetic::ProviderLockdownPolicy::Full);
         };
         let view = accounts.management.read().ok_or_else(|| {
             SessionHubError::Task("provider trust snapshot is unavailable".to_owned())
         })?;
-        Ok(view
+        let summary = view
             .providers
             .iter()
-            .find(|summary| summary.provider == provider)
-            .is_none_or(|summary| !matches!(summary.trust, haider_rpc::ProviderTrustWire::Full)))
+            .find(|summary| summary.provider == provider);
+        let has_active_credential = view
+            .descriptors
+            .iter()
+            .any(|descriptor| descriptor.provider == provider && descriptor.active);
+        Ok(crate::auto_hermetic::provider_policy(
+            summary,
+            has_active_credential,
+        ))
     }
 
-    /// Atomically freezes one provider ceiling for a run. The hook engine and
-    /// worker can reach a newly committed acceptance in either order; the
-    /// first snapshot wins and later callers for the same run reuse it.
+    /// Policy for the account adapter already selected for a turn. The
+    /// resolver supplies `active_no_auth`; the management view supplies only
+    /// the immutable provider shape and explicit trust floor.
+    pub(crate) fn provider_lockdown_policy_for_active(
+        &self,
+        provider: &str,
+        active_no_auth: bool,
+    ) -> Result<crate::auto_hermetic::ProviderLockdownPolicy, SessionHubError> {
+        if active_no_auth {
+            let frozen = crate::auto_hermetic::provider_policy_for_active(None, true);
+            if frozen.is_auto_hermetic() {
+                return Ok(frozen);
+            }
+        }
+        let Some(accounts) = self.accounts()? else {
+            return Ok(crate::auto_hermetic::ProviderLockdownPolicy::Full);
+        };
+        let view = accounts.management.read().ok_or_else(|| {
+            SessionHubError::Task("provider trust snapshot is unavailable".to_owned())
+        })?;
+        let summary = view
+            .providers
+            .iter()
+            .find(|summary| summary.provider == provider);
+        Ok(crate::auto_hermetic::provider_policy_for_active(
+            summary,
+            active_no_auth,
+        ))
+    }
+
+    /// Atomically freezes one provider ceiling for a run from an authoritative
+    /// turn input. The worker normally supplies the selected account fact;
+    /// replayed child manifests can supply an already-frozen parent ceiling.
+    /// A later exact auto-hermetic proposal may only narrow an older ordinary
+    /// lockdown binding; no proposal can widen a bound run.
     pub(crate) fn bind_lockdown_turn(
         &self,
         session_id: &SessionId,
         run_id: &RunId,
         provider: &str,
-        proposed_lockdown: bool,
-    ) -> Result<bool, SessionHubError> {
+        proposed_policy: crate::auto_hermetic::ProviderLockdownPolicy,
+    ) -> Result<crate::auto_hermetic::ProviderLockdownPolicy, SessionHubError> {
+        let (proposed_lockdown, proposed_auto_hermetic) = proposed_policy.binding_bits();
         let durable = match crate::lockdown::global() {
             Ok(manager) => {
                 let profile_id = self.inner.store.cached_profile_installation_id();
@@ -2499,6 +2548,7 @@ impl SessionHub {
                             run_id.as_str(),
                             provider,
                             proposed_lockdown,
+                            proposed_auto_hermetic,
                         )
                         .map_err(|error| SessionHubError::Task(error.to_string()))?,
                 )
@@ -2508,21 +2558,55 @@ impl SessionHub {
             #[cfg(not(test))]
             Err(error) => return Err(SessionHubError::Task(error.to_string())),
         };
-        let (provider, lockdown) =
-            durable.unwrap_or_else(|| (provider.to_owned(), proposed_lockdown));
+        let (provider, lockdown, auto_hermetic) = durable.unwrap_or_else(|| {
+            (
+                provider.to_owned(),
+                proposed_lockdown,
+                proposed_auto_hermetic,
+            )
+        });
+        let policy =
+            crate::auto_hermetic::ProviderLockdownPolicy::from_binding(lockdown, auto_hermetic);
         let mut turns = lock(&self.inner.lockdown_turns)?;
         let key = (session_id.clone(), run_id.clone());
-        if let Some(binding) = turns.get(&key) {
+        if let Some(binding) = turns.get_mut(&key) {
             if binding.provider != provider {
                 return Err(SessionHubError::Task(format!(
                     "lockdown turn binding conflict for {session_id}/{run_id}: stored provider `{}`, requested `{provider}`",
                     binding.provider
                 )));
             }
-            return Ok(binding.lockdown);
+            if policy.is_auto_hermetic() && !binding.policy.is_auto_hermetic() {
+                binding.policy = policy;
+            }
+            self.inner.lockdown_turn_bound.notify_waiters();
+            return Ok(binding.policy);
         }
-        turns.insert(key, LockdownTurnBinding { provider, lockdown });
-        Ok(lockdown)
+        turns.insert(key, LockdownTurnBinding { provider, policy });
+        self.inner.lockdown_turn_bound.notify_waiters();
+        Ok(policy)
+    }
+
+    /// Waits for the worker's resolved-account ceiling without allowing the
+    /// hook engine to invent one from mutable account-management state. A
+    /// bounded `None` result is fail-closed at the caller.
+    pub(crate) async fn wait_bound_lockdown_run(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+        timeout: Duration,
+    ) -> Result<Option<(String, crate::auto_hermetic::ProviderLockdownPolicy)>, SessionHubError>
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.inner.lockdown_turn_bound.notified();
+            if let Some(binding) = self.bound_lockdown_run(session_id, run_id)? {
+                return Ok(Some(binding));
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.bound_lockdown_run(session_id, run_id);
+            }
+        }
     }
 
     /// Returns a frozen run's provider and ceiling. Headless runs may pin a
@@ -2532,10 +2616,11 @@ impl SessionHub {
         &self,
         session_id: &SessionId,
         run_id: &RunId,
-    ) -> Result<Option<(String, bool)>, SessionHubError> {
+    ) -> Result<Option<(String, crate::auto_hermetic::ProviderLockdownPolicy)>, SessionHubError>
+    {
         let key = (session_id.clone(), run_id.clone());
         if let Some(binding) = lock(&self.inner.lockdown_turns)?.get(&key).cloned() {
-            return Ok(Some((binding.provider, binding.lockdown)));
+            return Ok(Some((binding.provider, binding.policy)));
         }
         let binding = match crate::lockdown::global() {
             Ok(manager) => {
@@ -2549,16 +2634,24 @@ impl SessionHub {
             #[cfg(not(test))]
             Err(error) => return Err(SessionHubError::Task(error.to_string())),
         };
-        if let Some((provider, lockdown)) = binding.as_ref() {
+        if let Some((provider, lockdown, auto_hermetic)) = binding.as_ref() {
             lock(&self.inner.lockdown_turns)?.insert(
                 key,
                 LockdownTurnBinding {
                     provider: provider.clone(),
-                    lockdown: *lockdown,
+                    policy: crate::auto_hermetic::ProviderLockdownPolicy::from_binding(
+                        *lockdown,
+                        *auto_hermetic,
+                    ),
                 },
             );
         }
-        Ok(binding)
+        Ok(binding.map(|(provider, lockdown, auto_hermetic)| {
+            (
+                provider,
+                crate::auto_hermetic::ProviderLockdownPolicy::from_binding(lockdown, auto_hermetic),
+            )
+        }))
     }
 
     /// Marks the run whose boundary is now executing as the direct-control
@@ -2599,14 +2692,23 @@ impl SessionHub {
     pub(crate) fn bound_session_lockdown(
         &self,
         session_id: &SessionId,
-    ) -> Result<Option<(String, bool)>, SessionHubError> {
+    ) -> Result<Option<(String, crate::auto_hermetic::ProviderLockdownPolicy)>, SessionHubError>
+    {
         match crate::lockdown::global() {
             Ok(manager) => {
                 let profile_id = self.inner.store.cached_profile_installation_id();
                 Ok(manager
                     .active_session_binding(profile_id, session_id.as_str())
                     .map_err(|error| SessionHubError::Task(error.to_string()))?
-                    .map(|(_, provider, lockdown)| (provider, lockdown)))
+                    .map(|(_, provider, lockdown, auto_hermetic)| {
+                        (
+                            provider,
+                            crate::auto_hermetic::ProviderLockdownPolicy::from_binding(
+                                lockdown,
+                                auto_hermetic,
+                            ),
+                        )
+                    }))
             }
             // Isolated hub tests may omit the process-global manager. In that
             // configuration `activate_lockdown_turn` prunes the local map to
@@ -2617,7 +2719,7 @@ impl SessionHub {
             Err(_) => Ok(lock(&self.inner.lockdown_turns)?
                 .iter()
                 .find(|((candidate, _), _)| candidate == session_id)
-                .map(|(_, binding)| (binding.provider.clone(), binding.lockdown))),
+                .map(|(_, binding)| (binding.provider.clone(), binding.policy))),
             #[cfg(not(test))]
             Err(error) => Err(SessionHubError::Task(error.to_string())),
         }

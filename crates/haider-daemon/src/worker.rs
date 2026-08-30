@@ -185,6 +185,9 @@ pub struct ResolvedTurnProvider {
     pub context_window: Option<u64>,
     /// Stamped into usage until an automatic pre-event rotation changes it.
     pub account_alias: Option<String>,
+    /// True only when provider construction selected the synthesized custom
+    /// no-auth account rather than a stored credential.
+    pub active_no_auth: bool,
     /// Factory-time alternate committed before the first provider call.
     pub initial_rotation: Option<haider_protocol::credential::RotationEvent>,
     /// The initial resolution already spent the logical turn's one hop.
@@ -302,31 +305,31 @@ impl std::fmt::Debug for DaemonProviderPairSwitchCommitter {
 #[async_trait]
 impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
     async fn commit(&self, switch: &ProviderPairSwitch) -> Result<(), HaiderError> {
-        let source_lockdown = self
+        let live_source_policy = self
+            .store
+            .hub()
+            .provider_lockdown_policy_detail(&switch.from_provider)
+            .map_err(hub_error)?;
+        let source_policy = self
             .store
             .hub()
             .bound_lockdown_run(self.store.session_id(), &switch.run_id)
             .map_err(hub_error)?
-            .map_or_else(
-                || {
-                    self.store
-                        .hub()
-                        .provider_lockdown_policy(&switch.from_provider)
-                        .map_err(hub_error)
-                },
-                |(_, lockdown)| Ok(lockdown),
-            )?;
-        let target_lockdown = self
+            .map_or(live_source_policy, |(_, policy)| policy);
+        let source_lockdown = source_policy.is_lockdown();
+        let target_policy = self
             .store
             .hub()
-            .provider_lockdown_policy(&switch.to_provider)
+            .provider_lockdown_policy_detail(&switch.to_provider)
             .map_err(hub_error)?;
+        let target_lockdown = target_policy.is_lockdown();
         if !lockdown_pair_switch_allowed(switch, source_lockdown, target_lockdown) {
-            let provider = if target_lockdown {
-                &switch.to_provider
+            let (provider, policy) = if target_lockdown {
+                (&switch.to_provider, target_policy)
             } else {
-                &switch.from_provider
+                (&switch.from_provider, source_policy)
             };
+            let tools_allowed = crate::auto_hermetic::tools_for(policy);
             let reason = "an automatic cross-provider switch cannot replace a turn-scoped lockdown tool pack";
             append_payloads(
                 &self.store,
@@ -339,7 +342,7 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
                         provider: provider.clone(),
                         tool: "provider_pair_switch".to_owned(),
                         reason: reason.to_owned(),
-                        tools_allowed: crate::lockdown::allowed_tool_names(),
+                        tools_allowed: tools_allowed.clone(),
                     },
                 )],
             )
@@ -361,7 +364,7 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
                 "provider": provider,
                 "tool": "provider_pair_switch",
                 "reason": reason,
-                "tools_allowed": crate::lockdown::allowed_tool_names(),
+                "tools_allowed": tools_allowed,
             }));
             return Err(error);
         }
@@ -5128,19 +5131,48 @@ async fn perform_manual_compaction(
     let resolved = dependencies
         .provider_factory
         .resolve_for_turn_with_web(metadata, web_degrade)
-        .await?;
+        .await;
+    let resolved = match resolved {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            if let Err(binding_error) = lease.hub().bind_lockdown_turn(
+                lease.session_id(),
+                &boundary_run_id,
+                &metadata.provider,
+                crate::auto_hermetic::ProviderLockdownPolicy::UnknownProvider,
+            ) {
+                tracing::warn!(
+                    target: "haider.lockdown",
+                    ?binding_error,
+                    "cannot publish fail-closed provider-resolution boundary"
+                );
+            }
+            return Err(error);
+        }
+    };
     if resolved.provider_name != metadata.provider {
+        let _ = lease.hub().bind_lockdown_turn(
+            lease.session_id(),
+            &boundary_run_id,
+            &metadata.provider,
+            crate::auto_hermetic::ProviderLockdownPolicy::UnknownProvider,
+        );
         return Err(HaiderError::new(
             ErrorCode::ProviderError,
             "provider factory returned a different provider than the session",
             false,
         ));
     }
+    let provider_policy = lease
+        .hub()
+        .provider_lockdown_policy_for_active(&resolved.provider_name, resolved.active_no_auth)
+        .map_err(hub_error)?;
     let lockdown = lockdown_turn_snapshot(
         lease.hub(),
         lease.session_id(),
         &boundary_run_id,
         &resolved.provider_name,
+        provider_policy,
     )?;
     lease
         .hub()
@@ -5175,7 +5207,7 @@ async fn perform_manual_compaction(
             web_degrade,
             mobile_use_active,
         ),
-        lockdown.is_some(),
+        lockdown.as_ref().map(|turn| turn.tools_allowed.as_slice()),
     );
     let post_compaction_tools = Arc::clone(&post_compaction_tool_pack.definitions);
     let post_compaction_tool_digest = post_compaction_tool_pack.digest.clone();
@@ -6213,19 +6245,48 @@ async fn start_turn(
     let resolved = dependencies
         .provider_factory
         .resolve_for_turn_with_web(metadata, web_degrade)
-        .await?;
+        .await;
+    let resolved = match resolved {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            if let Err(binding_error) = lease.hub().bind_lockdown_turn(
+                lease.session_id(),
+                &accepted.run_id,
+                &metadata.provider,
+                crate::auto_hermetic::ProviderLockdownPolicy::UnknownProvider,
+            ) {
+                tracing::warn!(
+                    target: "haider.lockdown",
+                    ?binding_error,
+                    "cannot publish fail-closed provider-resolution boundary"
+                );
+            }
+            return Err(error);
+        }
+    };
     if resolved.provider_name != metadata.provider {
+        let _ = lease.hub().bind_lockdown_turn(
+            lease.session_id(),
+            &accepted.run_id,
+            &metadata.provider,
+            crate::auto_hermetic::ProviderLockdownPolicy::UnknownProvider,
+        );
         return Err(HaiderError::new(
             ErrorCode::ProviderError,
             "provider factory returned a different provider than the session",
             false,
         ));
     }
+    let provider_policy = lease
+        .hub()
+        .provider_lockdown_policy_for_active(&resolved.provider_name, resolved.active_no_auth)
+        .map_err(hub_error)?;
     let lockdown = lockdown_turn_snapshot(
         lease.hub(),
         lease.session_id(),
         &accepted.run_id,
         &resolved.provider_name,
+        provider_policy,
     )?;
     lease
         .hub()
@@ -6500,7 +6561,7 @@ async fn start_turn(
             provider_name: &resolved.provider_name,
             provider_request_state: &provider_request_state,
             grant: provider_grant_snapshot,
-            lockdown: lockdown.is_some(),
+            lockdown_tools: lockdown.as_ref().map(|turn| turn.tools_allowed.as_slice()),
             registry_revision: tool_registry_revision,
             mobile_use_active,
         },
@@ -9605,12 +9666,6 @@ struct ProviderToolPackRevision {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum LockdownToolPackRevision {
-    Full,
-    Lockdown,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct ToolPackModeRevision {
     mobile_use_active: bool,
 }
@@ -9619,7 +9674,7 @@ struct ToolPackModeRevision {
 struct TurnToolPackCacheKey {
     provider: ProviderToolPackRevision,
     grant: ToolPackGrantRevision,
-    lockdown: LockdownToolPackRevision,
+    lockdown_tools: Option<Vec<String>>,
     registry: ToolRegistryRevision,
     mode: ToolPackModeRevision,
 }
@@ -11021,7 +11076,7 @@ struct TurnToolPackInputs<'a> {
     provider_name: &'a str,
     provider_request_state: &'a ProviderDerivedRequestState,
     grant: ToolPackGrantSnapshot<'a>,
-    lockdown: bool,
+    lockdown_tools: Option<&'a [String]>,
     registry_revision: Arc<[ToolDefinition]>,
     mobile_use_active: bool,
 }
@@ -11038,11 +11093,7 @@ impl TurnToolPackInputs<'_> {
                     .clone(),
             },
             grant: self.grant.revision.clone(),
-            lockdown: if self.lockdown {
-                LockdownToolPackRevision::Lockdown
-            } else {
-                LockdownToolPackRevision::Full
-            },
+            lockdown_tools: self.lockdown_tools.map(<[String]>::to_vec),
             registry: ToolRegistryRevision(Arc::clone(&self.registry_revision)),
             mode: ToolPackModeRevision {
                 mobile_use_active: self.mobile_use_active,
@@ -11079,7 +11130,7 @@ fn build_turn_tool_packs(inputs: &TurnToolPackInputs<'_>) -> SharedToolPacks {
             inputs.grant.grant,
             inputs.mobile_use_active,
         ),
-        inputs.lockdown,
+        inputs.lockdown_tools,
     );
     let provider_tools = lockdown_tool_definition_pack(
         tool_definition_pack_for_web_names_from_registry(
@@ -11088,7 +11139,7 @@ fn build_turn_tool_packs(inputs: &TurnToolPackInputs<'_>) -> SharedToolPacks {
             inputs.mobile_use_active,
             &inputs.provider_request_state.local_web_tool_names,
         ),
-        inputs.lockdown,
+        inputs.lockdown_tools,
     );
     let provider_fallback_tools = (!inputs
         .provider_request_state
@@ -11104,7 +11155,7 @@ fn build_turn_tool_packs(inputs: &TurnToolPackInputs<'_>) -> SharedToolPacks {
                     .provider_request_state
                     .provider_fallback_local_web_tool_names,
             ),
-            inputs.lockdown,
+            inputs.lockdown_tools,
         );
         (Arc::clone(&pack.definitions), pack.digest.clone())
     });
@@ -11136,7 +11187,7 @@ fn build_turn_tool_packs(inputs: &TurnToolPackInputs<'_>) -> SharedToolPacks {
                 inputs.mobile_use_active,
                 &names,
             ),
-            inputs.lockdown,
+            inputs.lockdown_tools,
         );
         provider_tool_variants.insert(names, (Arc::clone(&pack.definitions), pack.digest.clone()));
     }
@@ -11185,15 +11236,19 @@ fn authorized_tool_definition_pack_for_registry(
 
 fn lockdown_tool_definition_pack(
     pack: Arc<ToolDefinitionPack>,
-    lockdown: bool,
+    lockdown_tools: Option<&[String]>,
 ) -> Arc<ToolDefinitionPack> {
-    if !lockdown {
+    let Some(lockdown_tools) = lockdown_tools else {
         return pack;
-    }
+    };
     let definitions: Arc<[ToolDefinition]> = pack
         .definitions
         .iter()
-        .filter(|definition| crate::lockdown::tool_allowed(&definition.name))
+        .filter(|definition| {
+            lockdown_tools
+                .iter()
+                .any(|allowed| allowed == &definition.name)
+        })
         .cloned()
         .collect::<Vec<_>>()
         .into();
@@ -11208,31 +11263,42 @@ fn lockdown_turn_snapshot(
     session_id: &SessionId,
     run_id: &RunId,
     provider: &str,
+    policy: crate::auto_hermetic::ProviderLockdownPolicy,
 ) -> Result<Option<crate::lockdown::LockdownTurn>, HaiderError> {
-    let proposed = hub.provider_lockdown_policy(provider).map_err(hub_error)?;
-    if !hub
-        .bind_lockdown_turn(session_id, run_id, provider, proposed)
-        .map_err(hub_error)?
-    {
+    let bound_policy = hub
+        .bind_lockdown_turn(session_id, run_id, provider, policy)
+        .map_err(hub_error)?;
+    if !bound_policy.is_lockdown() {
         return Ok(None);
     }
-    crate::lockdown::global()
+    let mut turn = crate::lockdown::global()
         .and_then(|manager| manager.turn(provider))
-        .map(Some)
-        .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))
+        .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+    crate::auto_hermetic::apply_to_turn(&mut turn, bound_policy);
+    Ok(Some(turn))
 }
 
 fn provider_lockdown_snapshot(
     hub: &SessionHub,
     provider: &str,
-) -> Result<Option<crate::lockdown::LockdownTurn>, HaiderError> {
-    if !hub.provider_lockdown_policy(provider).map_err(hub_error)? {
+) -> Result<
+    Option<(
+        crate::lockdown::LockdownTurn,
+        crate::auto_hermetic::ProviderLockdownPolicy,
+    )>,
+    HaiderError,
+> {
+    let policy = hub
+        .provider_lockdown_policy_detail(provider)
+        .map_err(hub_error)?;
+    if !policy.is_lockdown() {
         return Ok(None);
     }
-    crate::lockdown::global()
+    let mut turn = crate::lockdown::global()
         .and_then(|manager| manager.turn(provider))
-        .map(Some)
-        .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))
+        .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+    crate::auto_hermetic::apply_to_turn(&mut turn, policy);
+    Ok(Some((turn, policy)))
 }
 
 const fn lockdown_child_provider_allowed(parent_lockdown: bool, child_lockdown: bool) -> bool {
@@ -13472,7 +13538,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             .map(|execution| &execution.cli_scope)
             .or(self.cli_scope.as_ref());
         if let Some(lockdown) = self.lockdown.as_ref()
-            && !crate::lockdown::tool_allowed(name)
+            && !lockdown.tools_allowed.iter().any(|allowed| allowed == name)
         {
             self.clear_cached_call(run_id, item_id, call_id);
             let reason = "the fixed lockdown envelope does not advertise or dispatch this tool";
@@ -14181,8 +14247,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     )));
                 }
             };
-            let child_lockdown =
+            let child_lockdown_snapshot =
                 provider_lockdown_snapshot(self.output.store.hub(), &child_metadata.provider)?;
+            let child_lockdown = child_lockdown_snapshot.as_ref().map(|(turn, _)| turn);
             if !lockdown_child_provider_allowed(self.lockdown.is_some(), child_lockdown.is_some()) {
                 let Some(lockdown) = self.lockdown.as_ref() else {
                     return Err(HaiderError::new(
@@ -14240,6 +14307,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         metadata: child_metadata,
                         agent_type: typed_record,
                         lockdown: child_lockdown.is_some(),
+                        auto_hermetic: child_lockdown_snapshot
+                            .as_ref()
+                            .is_some_and(|(_, policy)| policy.is_auto_hermetic()),
                     },
                     request,
                 )

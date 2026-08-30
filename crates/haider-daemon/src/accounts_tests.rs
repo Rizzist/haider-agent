@@ -1197,11 +1197,66 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         VaultProvision::Available(vault as Arc<dyn Vault>),
         Arc::new(ProductionAccountBuilder::default()),
     );
+    let resolver = AccountsAttemptResolver::new(
+        factory.clone(),
+        metadata.clone(),
+        ProviderTuning::default(),
+        None,
+        true,
+    );
+    assert!(
+        resolver.lockdown,
+        "the active keyless provider must freeze the no-gateway-fallback fence"
+    );
+    let gateway_decision = resolver
+        .resolve_fallback(
+            &CredentialAlias::new(provider),
+            &haider_provider::ProviderError::new(
+                ProviderErrorKind::QuotaExhausted,
+                "injected endpoint failed",
+            ),
+        )
+        .await
+        .expect("keyless fallback decision");
+    assert!(
+        matches!(gateway_decision, haider_core::ProviderAttemptDecision::Stop),
+        "the active no-auth account must never enter the configured gateway chain"
+    );
+    let poisoned_snapshot = Arc::new(StdMutex::new(Vec::new()));
+    let poison_target = Arc::clone(&poisoned_snapshot);
+    assert!(
+        std::thread::spawn(move || {
+            let _guard = poison_target
+                .lock()
+                .expect("acquire snapshot before poisoning");
+            panic!("poison keyless credential snapshot");
+        })
+        .join()
+        .is_err()
+    );
+    let poisoned_factory = AccountsProviderFactory::new_with_management(
+        poisoned_snapshot,
+        ManagementSnapshot::new(0, Vec::new(), vec![summary.clone()]),
+        VaultProvision::Available(Arc::new(MemoryVault::default()) as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder::default()),
+    );
+    assert!(
+        AccountsAttemptResolver::new(
+            poisoned_factory,
+            metadata.clone(),
+            ProviderTuning::default(),
+            None,
+            true,
+        )
+        .lockdown,
+        "credential-state uncertainty must retain the no-gateway-fallback fence"
+    );
     let resolved = factory
         .resolve_for_turn(&metadata)
         .await
         .expect("keyless dispatch");
     assert_eq!(resolved.provider_name, provider);
+    assert!(resolved.active_no_auth);
     assert_eq!(
         resolved.account_alias.as_deref(),
         Some(provider),
@@ -1236,11 +1291,23 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         VaultProvision::Available(vault as Arc<dyn Vault>),
         Arc::new(ProductionAccountBuilder::default()),
     );
+    let stored_resolver = AccountsAttemptResolver::new(
+        factory.clone(),
+        metadata.clone(),
+        ProviderTuning::default(),
+        None,
+        false,
+    );
+    assert!(
+        !stored_resolver.lockdown,
+        "an active stored key must not be classified as the no-auth account"
+    );
     let resolved = factory
         .resolve_for_turn(&metadata)
         .await
         .expect("stored-key dispatch");
     assert_eq!(resolved.account_alias.as_deref(), Some(alias.as_str()));
+    assert!(!resolved.active_no_auth);
 }
 
 /// LAW (LK1 refusal edge): the keyless fallback is SCOPED — a provider whose
@@ -1766,6 +1833,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
         },
         ProviderTuning::default(),
         None,
+        false,
     );
 
     let decision = resolver
@@ -1868,7 +1936,7 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
         agent_type: None,
     };
     (
-        AccountsAttemptResolver::new(factory, metadata, ProviderTuning::default(), None),
+        AccountsAttemptResolver::new(factory, metadata, ProviderTuning::default(), None, false),
         current,
     )
 }
@@ -2305,7 +2373,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         created_at_ms: 1,
         agent_type: None,
     };
-    let (_, _, openai_access_fingerprint) = factory
+    let (_, _, openai_access_fingerprint, openai_keyless) = factory
         .resolve_provider(
             &metadata(OPENAI_OAUTH_PROVIDER_NAME, "gpt-oauth"),
             &ProviderTuning::default(),
@@ -2316,7 +2384,8 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         openai_access_fingerprint,
         Some(*blake3::hash(b"OPENAI_FACTORY_ACCESS_SENTINEL_18a4").as_bytes())
     );
-    let (_, _, anthropic_access_fingerprint) = factory
+    assert!(!openai_keyless);
+    let (_, _, anthropic_access_fingerprint, anthropic_keyless) = factory
         .resolve_provider(
             &metadata(ANTHROPIC_OAUTH_PROVIDER_NAME, "claude-oauth"),
             &ProviderTuning::default(),
@@ -2324,6 +2393,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         .await
         .expect("Anthropic conservative OAuth handoff");
     assert_eq!(anthropic_access_fingerprint, None);
+    assert!(!anthropic_keyless);
     let openai = factory
         .resolve_for_turn(&metadata(OPENAI_OAUTH_PROVIDER_NAME, "gpt-oauth"))
         .await

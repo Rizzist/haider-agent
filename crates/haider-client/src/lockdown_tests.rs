@@ -35,6 +35,8 @@ fn feature_absence_makes_lockdown_helpers_absent() {
 fn typed_status_and_quota_responses_do_not_parse_prose() {
     let status = LockdownStatusWire {
         provider: Some("research".into()),
+        activation: None,
+        reason: None,
         tools_allowed: vec!["fs_read".into()],
         quota_used: 8,
         quota_limit: 64,
