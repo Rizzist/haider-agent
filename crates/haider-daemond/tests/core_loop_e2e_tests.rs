@@ -302,12 +302,19 @@ async fn submit_turn(
     )
     .await;
     loop {
-        if let WireFrame::Response {
-            body: ResponseBody::TurnSubmit { run_id, .. },
-            ..
-        } = client.next().await
-        {
-            return run_id;
+        match client.next().await {
+            WireFrame::Response {
+                body: ResponseBody::TurnSubmit { run_id, .. },
+                ..
+            } => return run_id,
+            WireFrame::Response {
+                body: ResponseBody::Error { code, message, .. },
+                ..
+            } => panic!("turn.submit `{command_id}` failed ({code}): {message}"),
+            WireFrame::ProtocolError(error) => {
+                panic!("turn.submit `{command_id}` failed: {error}")
+            }
+            _ => {}
         }
     }
 }
@@ -918,10 +925,10 @@ async fn tool_calls_execute_and_continue_over_real_rpc() {
     task.join().await.expect("daemon joins");
 }
 
-/// A1 regression pin: the command leader exits while a background child still
-/// owns stdout. The tool must drain the real inherited pipe, return the child's
-/// bytes, and continue the provider turn; returning only the leader output is a
-/// failure, even when it returns quickly.
+/// Historical regression name retained for the release gate. Foreground
+/// `process_exec` owns its process group, so leader exit must sweep descendants
+/// rather than let `server &` escape the tool's resource and sandbox boundary.
+/// Long-lived commands use the explicit background-process path instead.
 #[tokio::test]
 async fn process_exec_drains_output_from_child_that_outlives_leader() {
     let root = test_root("core-loop-outliving-pipe-");
@@ -974,10 +981,10 @@ async fn process_exec_drains_output_from_child_that_outlives_leader() {
     let events = events_until_terminal(&mut client, &run).await;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     assert!(
-        workspace.join("outliving-child-ran.log").exists(),
-        "background child never outlived the command leader"
+        !workspace.join("outliving-child-ran.log").exists(),
+        "foreground process_exec leaked a descendant after its leader exited"
     );
-    assert_eq!(stdout_bytes(&events), b"leaderchild");
+    assert_eq!(stdout_bytes(&events), b"leader");
     assert!(continuation_seen(&events, "continued-outliving-pipe"));
     assert_eq!(fake.requests().len(), 2);
 
@@ -1912,9 +1919,9 @@ async fn fork_from_prompt_preserves_source_cache_and_privilege_boundaries() {
 
 /// A2 regression shape reported by the owner. The second child run is queued
 /// while the first is live. When run one reaches terminal, run two starts, so
-/// the child session never emits the aggregate Idle settlement that
-/// `mirror_until_child_terminal` currently (incorrectly) requires. The parent
-/// must nevertheless consume run one's terminal report and continue.
+/// the child session emits no aggregate Idle settlement for run one. The
+/// parent must consume run one's durable terminal report after the bounded
+/// best-effort tail and continue.
 #[tokio::test]
 async fn terminal_child_run_without_session_idle_still_releases_parent() {
     const ISOLATION_MARKER: &str = "HAIDER_CORE_LOOP_NO_IDLE_CHILD";
@@ -1955,7 +1962,7 @@ async fn terminal_child_run_without_session_idle_still_releases_parent() {
         },
     ]));
     let child = Arc::new(FakeProvider::new(vec![
-        FakeStep::Delay { ms: 300 },
+        FakeStep::Delay { ms: 800 },
         FakeStep::EmitText {
             text: "first child run terminal report".into(),
         },
@@ -2009,10 +2016,12 @@ async fn terminal_child_run_without_session_idle_still_releases_parent() {
         "delegate then continue",
     )
     .await;
-
     let child_session = tokio::time::timeout(support::DEADLINE, async {
+        let mut attempt = 0_u32;
         loop {
-            let snapshot = fleet(&mut client, &config, session.clone(), "no-idle-fleet-wait").await;
+            let label = format!("no-idle-fleet-wait-{attempt}");
+            attempt = attempt.saturating_add(1);
+            let snapshot = fleet(&mut client, &config, session.clone(), &label).await;
             if let Some(node) = snapshot.roots.first() {
                 break node.session_id.clone();
             }
@@ -2021,8 +2030,23 @@ async fn terminal_child_run_without_session_idle_still_releases_parent() {
     })
     .await
     .expect("spawned child appears in real fleet projection");
+    let mut child_client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "core-loop-e2e",
+        "agent-no-idle-child-client",
+        ClientKind::Headless,
+    )
+    .await;
+    attach_existing(
+        &mut child_client,
+        &config,
+        child_session.clone(),
+        "attach-no-idle-child",
+    )
+    .await;
     let queued_run = submit_turn(
-        &mut client,
+        &mut child_client,
         &config,
         "queued-child-turn",
         child_session.clone(),
@@ -2031,7 +2055,7 @@ async fn terminal_child_run_without_session_idle_still_releases_parent() {
     )
     .await;
     let queued_response = read_session(
-        &mut client,
+        &mut child_client,
         &config,
         child_session.clone(),
         "queued-child-read",
@@ -2042,38 +2066,98 @@ async fn terminal_child_run_without_session_idle_still_releases_parent() {
             && serde_json::from_value::<EventPayload>(envelope.payload.clone())
                 .is_ok_and(|payload| matches!(payload, EventPayload::RunState(RunState::Queued)))
     }));
-
-    let progress = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let WireFrame::Event { envelope, .. } = client.next().await {
-                if envelope.run_id.as_ref() != Some(&parent_run) {
-                    continue;
+    let (parent_events, child_journal) =
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            let mut attempt = 0_u32;
+            loop {
+                let parent_label = format!("no-idle-parent-read-{attempt}");
+                let journal =
+                    read_session(&mut client, &config, session.clone(), &parent_label).await;
+                let events = journal
+                    .into_iter()
+                    .filter(|envelope| envelope.run_id.as_ref() == Some(&parent_run))
+                    .filter_map(|envelope| serde_json::from_value(envelope.payload).ok())
+                    .collect::<Vec<EventPayload>>();
+                let terminal = events
+                    .iter()
+                    .any(|payload| matches!(payload, EventPayload::RunState(RunState::Done)));
+                if terminal && continuation_seen(&events, "parent-progressed-without-child-idle") {
+                    let child_label = format!("no-idle-child-read-{attempt}");
+                    let child_journal = read_session(
+                        &mut child_client,
+                        &config,
+                        child_session.clone(),
+                        &child_label,
+                    )
+                    .await;
+                    break (events, child_journal);
                 }
-                if serde_json::from_value::<EventPayload>(envelope.payload).is_ok_and(|payload| {
-                    continuation_seen(&[payload], "parent-progressed-without-child-idle")
-                }) {
-                    break;
-                }
+                attempt = attempt.saturating_add(1);
+                tokio::task::yield_now().await;
             }
-        }
-    })
-    .await;
+        })
+        .await
+        .expect("durable child terminal releases its parent without aggregate Idle");
 
-    drop(client);
-    if progress.is_ok() {
-        task.shutdown_handle().request("test complete");
-        task.join().await.expect("daemon joins");
-    } else {
-        // The known mutant also ignores daemon shutdown because the owner
-        // waits for the stuck worker. The outer test process owns an 8-second
-        // kill boundary, so this inner diagnostic cannot hang the suite.
-        task.shutdown_handle()
-            .request("bounded failed-test cleanup");
-        drop(task);
-    }
-
+    assert!(continuation_seen(
+        &parent_events,
+        "parent-progressed-without-child-idle"
+    ));
     assert!(
-        progress.is_ok(),
-        "terminal child run did not release its parent without aggregate Idle"
+        parent_events
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::RunState(RunState::Done)))
     );
+    let child_terminal_seq = child_journal
+        .iter()
+        .find_map(|envelope| {
+            if envelope
+                .run_id
+                .as_ref()
+                .is_none_or(|run_id| run_id == &queued_run)
+            {
+                return None;
+            }
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                .is_ok_and(|payload| matches!(payload, EventPayload::RunState(RunState::Done)))
+                .then_some(envelope.seq)
+        })
+        .expect("first child run reaches durable Done");
+    assert!(
+        child_journal.iter().any(|envelope| {
+            envelope.run_id.as_ref() == Some(&queued_run)
+                && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                    |payload| {
+                        matches!(
+                            payload,
+                            EventPayload::RunState(
+                                RunState::Thinking | RunState::Streaming | RunState::RunningTool
+                            )
+                        )
+                    },
+                )
+        }),
+        "queued child run did not keep the session active"
+    );
+    assert!(
+        !child_journal.iter().any(|envelope| {
+            envelope.seq > child_terminal_seq
+                && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                    |payload| {
+                        matches!(
+                            payload,
+                            EventPayload::SessionState(
+                                haider_protocol::state::SessionState::Idle { .. }
+                            )
+                        )
+                    },
+                )
+        }),
+        "child emitted Idle after the first run terminal, invalidating the regression shape"
+    );
+    task.shutdown_handle().request("test complete");
+    tokio::time::timeout(std::time::Duration::from_secs(2), task.join())
+        .await
+        .expect("daemon shutdown stays bounded")
+        .expect("daemon joins");
 }

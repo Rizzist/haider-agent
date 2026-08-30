@@ -1955,10 +1955,15 @@ impl DelegationHandle {
                     continue;
                 };
                 let graph_boundary = graph_rollup_boundary(&payload);
-                if matches!(
-                    &payload,
-                    haider_protocol::EventPayload::SessionState(SessionState::Idle { .. })
-                ) {
+                // A historical Idle may precede the run being mirrored. It is
+                // not evidence that this run settled; only an Idle observed
+                // after its durable terminal can close the best-effort tail.
+                if mirror.child_run_terminal
+                    && matches!(
+                        &payload,
+                        haider_protocol::EventPayload::SessionState(SessionState::Idle { .. })
+                    )
+                {
                     mirror.terminal_idle_seen = true;
                 }
                 let child_run_event = envelope.run_id.as_ref() == Some(&record.child_run_id);
