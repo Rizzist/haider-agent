@@ -712,13 +712,7 @@ pub async fn run_demo(
             // it and the overdue tick fires immediately, keeping the 30fps
             // coalescing behavior.
             _ = frame_tick.tick(), if model.dirty => {
-                hit_map = draw(&mut terminal, &model)?;
-                model.dirty = false;
-                // W5g-7: hover survives a redraw only while the pointer
-                // still resolves to it (subsumes the old identity-vanish
-                // cleanup, and also kills a highlight whose target MOVED
-                // under a stationary pointer).
-                settle_hover_after_draw(&mut model, &hit_map, pointer);
+                present_frame(&mut terminal, &mut model, &mut hit_map, pointer)?;
                 // Demo persistence (TUI4c-13b): a drawn frame means state
                 // changed — save here, coalesced to the frame cadence
                 // (hash-skipped when nothing persisted moved). This is the
@@ -2837,6 +2831,20 @@ fn draw(
     Ok(hits)
 }
 
+fn present_frame(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    model: &mut AppModel,
+    hit_map: &mut Vec<(ratatui::layout::Rect, crate::app::Hit)>,
+    pointer: Option<(u16, u16)>,
+) -> std::io::Result<()> {
+    *hit_map = draw(terminal, model)?;
+    model.dirty = false;
+    // W5g-7: hover survives a redraw only while the pointer still resolves
+    // to it; this applies identically to cadence and semantic-edge frames.
+    settle_hover_after_draw(model, hit_map, pointer);
+    Ok(())
+}
+
 /// Render the model into a scratch buffer at the live terminal size and
 /// extract the selection's text — the copy path's ground truth. Uses the
 /// same pure [`render`] as the screen, so what copies is exactly what a
@@ -3100,6 +3108,257 @@ pub enum LiveExit {
     UpdateInstalled,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PresentedTurn {
+    run: Option<haider_protocol::ids::RunId>,
+    content_seen: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PresentationCursor {
+    session: haider_protocol::ids::SessionId,
+    replay_through_seq: u64,
+    caught_up: bool,
+    last_seq: u64,
+}
+
+/// Runtime-only classifier for the two perception-critical draw edges.
+///
+/// Attach replay is deliberately observed but never accelerated: replay can
+/// contain hundreds of historical turns, and drawing each historical first/
+/// terminal edge would turn hydration into an unbounded redraw burst. The
+/// daemon's `CaughtUp` marker opens the live edge; strict sequence tracking
+/// then makes duplicate, stale, and gapped frames ineligible.
+#[derive(Debug, Default)]
+struct LivePresentationGate {
+    attachments: std::collections::HashMap<haider_rpc::AttachmentId, PresentationCursor>,
+    turns: std::collections::HashMap<haider_protocol::ids::SessionId, PresentedTurn>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ImmediatePresentation {
+    first_content: bool,
+    terminal: bool,
+}
+
+impl ImmediatePresentation {
+    const fn required(self) -> bool {
+        self.first_content || self.terminal
+    }
+}
+
+impl LivePresentationGate {
+    fn observe(
+        &mut self,
+        reply: &crate::live::LiveReply,
+        active_session: Option<&haider_protocol::ids::SessionId>,
+    ) -> ImmediatePresentation {
+        use crate::live::LiveReply;
+
+        match reply {
+            LiveReply::Attached {
+                session,
+                attachment,
+                replay_through_seq,
+                ..
+            } => {
+                self.attachments
+                    .retain(|_, cursor| &cursor.session != session);
+                self.attachments.insert(
+                    attachment.clone(),
+                    PresentationCursor {
+                        session: session.clone(),
+                        replay_through_seq: *replay_through_seq,
+                        caught_up: false,
+                        last_seq: *replay_through_seq,
+                    },
+                );
+            }
+            LiveReply::CaughtUp {
+                attachment,
+                high_water_seq,
+            } => {
+                if let Some(cursor) = self.attachments.get_mut(attachment)
+                    && *high_water_seq >= cursor.replay_through_seq
+                    && *high_water_seq <= cursor.last_seq
+                {
+                    cursor.caught_up = true;
+                }
+            }
+            LiveReply::Event {
+                attachment,
+                session,
+                envelope,
+            } => {
+                let Some(cursor) = self.attachments.get_mut(attachment) else {
+                    return ImmediatePresentation::default();
+                };
+                if &cursor.session != session || &envelope.session_id != session {
+                    return ImmediatePresentation::default();
+                }
+
+                if !cursor.caught_up {
+                    if envelope.seq <= cursor.replay_through_seq {
+                        observe_turn_presentation(&mut self.turns, envelope);
+                    } else if envelope.seq == cursor.last_seq.saturating_add(1) {
+                        // The daemon may transparently extend replay beyond
+                        // the head captured by Attached, then announce that
+                        // raised high-water. Track that contiguous tail so
+                        // CaughtUp(H) can open the live edge, but never
+                        // accelerate one of these replay envelopes.
+                        cursor.last_seq = envelope.seq;
+                        observe_turn_presentation(&mut self.turns, envelope);
+                    }
+                    return ImmediatePresentation::default();
+                }
+                if envelope.seq != cursor.last_seq.saturating_add(1) {
+                    return ImmediatePresentation::default();
+                }
+                cursor.last_seq = envelope.seq;
+                let presentation = observe_turn_presentation(&mut self.turns, envelope);
+                if active_session != Some(session) {
+                    return ImmediatePresentation::default();
+                }
+                return presentation;
+            }
+            LiveReply::Detached { attachment } | LiveReply::Lagged { attachment } => {
+                self.attachments.remove(attachment);
+            }
+            LiveReply::EventsLost { .. }
+            | LiveReply::Disconnected { .. }
+            | LiveReply::Reconnected => self.attachments.clear(),
+            _ => {}
+        }
+        ImmediatePresentation::default()
+    }
+
+    fn observe_commands(&mut self, commands: &[crate::live::LiveCommand]) {
+        for command in commands {
+            if let crate::live::LiveCommand::Detach { attachment } = command {
+                self.attachments.remove(attachment);
+            }
+        }
+    }
+}
+
+fn observe_turn_presentation(
+    turns: &mut std::collections::HashMap<haider_protocol::ids::SessionId, PresentedTurn>,
+    envelope: &haider_protocol::envelope::RawEnvelope,
+) -> ImmediatePresentation {
+    if !envelope.render.ui {
+        return ImmediatePresentation::default();
+    }
+    let event_type = envelope
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str);
+    if !matches!(event_type, Some("run_state" | "item")) {
+        return ImmediatePresentation::default();
+    }
+    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        return ImmediatePresentation::default();
+    };
+    match payload {
+        EventPayload::RunState(state) if state.is_terminal() => {
+            turns.remove(&envelope.session_id);
+            ImmediatePresentation {
+                terminal: true,
+                ..ImmediatePresentation::default()
+            }
+        }
+        EventPayload::RunState(_) => {
+            let presented =
+                turns
+                    .entry(envelope.session_id.clone())
+                    .or_insert_with(|| PresentedTurn {
+                        run: envelope.run_id.clone(),
+                        content_seen: false,
+                    });
+            if presented.run != envelope.run_id {
+                presented.run = envelope.run_id.clone();
+                presented.content_seen = false;
+            }
+            ImmediatePresentation::default()
+        }
+        EventPayload::Item(item) if item_event_has_visible_content(&item) => {
+            let presented =
+                turns
+                    .entry(envelope.session_id.clone())
+                    .or_insert_with(|| PresentedTurn {
+                        run: envelope.run_id.clone(),
+                        content_seen: false,
+                    });
+            if presented.run != envelope.run_id {
+                presented.run = envelope.run_id.clone();
+                presented.content_seen = false;
+            }
+            let first_content = !presented.content_seen;
+            presented.content_seen = true;
+            ImmediatePresentation {
+                first_content,
+                terminal: false,
+            }
+        }
+        EventPayload::Item(_) => ImmediatePresentation::default(),
+        _ => ImmediatePresentation::default(),
+    }
+}
+
+fn item_event_has_visible_content(event: &haider_protocol::item::ItemEvent) -> bool {
+    use haider_protocol::item::{ItemDelta, ItemEvent};
+
+    match event {
+        ItemEvent::Started { item, .. } => turn_item_has_visible_content(item, false),
+        ItemEvent::Completed { item, .. } => turn_item_has_visible_content(item, true),
+        ItemEvent::Delta { delta, .. } => match delta {
+            ItemDelta::Text { text } | ItemDelta::Reasoning { text } => !text.is_empty(),
+            ItemDelta::ToolArgs { fragment } => !fragment.is_empty(),
+            ItemDelta::CommandOutput { chunk_b64, .. } => !chunk_b64.is_empty(),
+        },
+    }
+}
+
+fn turn_item_has_visible_content(item: &haider_protocol::item::TurnItem, completed: bool) -> bool {
+    use haider_protocol::item::TurnItem;
+
+    match item {
+        TurnItem::AgentMessage { text } | TurnItem::IncompleteAgentMessage { text, .. } => {
+            !text.is_empty()
+        }
+        TurnItem::Reasoning { summary } => !summary.is_empty(),
+        TurnItem::ToolCall { .. }
+        | TurnItem::CommandExecution { .. }
+        | TurnItem::FileChange { .. }
+        | TurnItem::ChildSpawn { .. }
+        | TurnItem::ChildResult { .. }
+        | TurnItem::Plan { .. }
+        | TurnItem::ContextCompaction { .. }
+        | TurnItem::Refusal { .. } => true,
+        TurnItem::Extension { kind, .. }
+            if kind == haider_protocol::agent::AGENT_GRAPH_ROLLUP_EXTENSION_KIND =>
+        {
+            false
+        }
+        TurnItem::Extension { .. }
+            if haider_protocol::context::ContextFootprint::from_extension_item(item).is_some() =>
+        {
+            false
+        }
+        // These lifecycle markers are swallowed while open. Their
+        // Completed half becomes a visible projection note.
+        TurnItem::Extension { kind, .. }
+            if kind == haider_protocol::history::COMPACTION_INTENT_EXTENSION_KIND
+                || haider_protocol::cache::CacheEpochTransitionV1::from_extension_item(item)
+                    .is_some() =>
+        {
+            completed
+        }
+        // Image facts, retry markers, and unknown additive extensions
+        // all have an explicit styled/plain fallback row.
+        TurnItem::Extension { .. } => true,
+    }
+}
+
 /// ONE PASS of the live loop's tail — the ordering that makes live mode
 /// correct, in one function that `run_live` and the tests both call.
 ///
@@ -3348,6 +3607,7 @@ pub async fn run_live(
     // revision counter (`status_publish_pass`).
     let mut published_status: Option<PublishedStatus> = None;
     let mut status_revision: u64 = 0;
+    let mut presentation_gate = LivePresentationGate::default();
 
     while !model.should_quit {
         // Issue whatever the driver asked for. `try_send` keeps the UI loop
@@ -3370,6 +3630,7 @@ pub async fn run_live(
         // something ELSE wakes the loop, which a quiet terminal facing a
         // wedged daemon never does (W3c3.1 r2, P2-B).
         let deadline = driver.next_deadline();
+        let mut immediate_presentation = ImmediatePresentation::default();
         tokio::select! {
             input = input_rx.recv() => match input {
                 Some(event) => {
@@ -3406,7 +3667,11 @@ pub async fn run_live(
                 None => break,
             },
             reply = link.replies.recv(), if link_replies_open => match reply {
-                Some(reply) => inbound = Some(reply),
+                Some(reply) => {
+                    immediate_presentation =
+                        presentation_gate.observe(&reply, model.active_session.as_ref());
+                    inbound = Some(reply);
+                }
                 None if update_in_progress => {
                     link_replies_open = false;
                     update_grace = Some(
@@ -3486,16 +3751,21 @@ pub async fn run_live(
             }
             () = wait_until(deadline) => {}
             _ = frame_tick.tick(), if model.dirty => {
-                hit_map = draw(&mut terminal, &model)?;
-                model.dirty = false;
-                // W5g-7: hover survives a redraw only while the pointer
-                // still resolves to it (subsumes identity-vanish cleanup,
-                // and kills a highlight whose target MOVED under a
-                // stationary pointer).
-                settle_hover_after_draw(&mut model, &hit_map, pointer);
+                present_frame(&mut terminal, &mut model, &mut hit_map, pointer)?;
             }
         }
         let pass = live_pass(&mut driver, &mut model, inbound, std::time::Instant::now());
+        // A catch-up tail gap (or any other driver-side continuity failure)
+        // returns a Detach in this same pass. Retire its presentation cursor
+        // before any later frame from that dead route can accelerate a draw.
+        presentation_gate.observe_commands(&pass.commands);
+        // First visible content and terminal run truth are the two human-
+        // perceived latency edges. They move the pending cadence draw here;
+        // all continuing deltas and animation still ride the guarded 33 ms
+        // tick, and a clean model still draws nothing.
+        if immediate_presentation.required() && model.dirty {
+            present_frame(&mut terminal, &mut model, &mut hit_map, pointer)?;
+        }
         pending.extend(pass.commands);
         // Exhaustive over the CLOSED shell vocabulary — adding a variant
         // without an arm here is a compile error, never a silent drop.
@@ -3581,3 +3851,7 @@ pub async fn run_live(
     }
     Ok(LiveExit::Quit)
 }
+
+#[cfg(test)]
+#[path = "runtime_presentation_tests.rs"]
+mod runtime_presentation_tests;
