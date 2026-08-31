@@ -312,6 +312,7 @@ fn metadata(cwd: String) -> SessionMetadataV1 {
         effort: None,
         fast: false,
         cache_policy: Default::default(),
+        context_economy: Default::default(),
         created_at_ms: 1,
         agent_type: None,
     }

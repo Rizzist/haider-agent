@@ -391,6 +391,7 @@ fn live_presentation_gate_matches_visible_and_hidden_extension_rows() {
         soft_threshold_tokens: Some(8_500),
         estimated_turns_to_threshold: Some(4),
         truth: ContextFootprintTruth::Exact,
+        accounting: None,
     };
     assert_eq!(
         gate.observe(

@@ -305,6 +305,18 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.session_metadata(&session_id))).await
     }
 
+    pub async fn persist_context_economy(
+        &self,
+        session_id: SessionId,
+        economy: haider_protocol::context::ContextEconomy,
+    ) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.persist_context_economy(&session_id, &economy))
+        })
+        .await
+    }
+
     /// Loads one opaque, rebuildable session projection checkpoint.
     pub async fn projection_checkpoint(
         &self,
@@ -2513,6 +2525,15 @@ impl StoreHandle for SqliteStoreHandle {
                 Err(error)
             }
         }
+    }
+
+    async fn persist_context_economy(
+        &self,
+        session_id: &SessionId,
+        economy: &haider_protocol::context::ContextEconomy,
+    ) -> Result<(), HaiderError> {
+        self.persist_context_economy(session_id.clone(), economy.clone())
+            .await
     }
 
     async fn read(

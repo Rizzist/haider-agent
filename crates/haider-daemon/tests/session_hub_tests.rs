@@ -140,6 +140,7 @@ fn footprint_envelope(
         soft_threshold_tokens: Some(170_000),
         estimated_turns_to_threshold: None,
         truth: ContextFootprintTruth::Estimated,
+        accounting: None,
     };
     envelope.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
         item_id: ItemId::new(format!("item-{event_id}")),

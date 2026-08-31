@@ -2,9 +2,9 @@
 
 use async_trait::async_trait;
 use haider_core::{
-    ArtifactReader, CommittedRange, ContextCompactor, FinalizationGuard, FinalizationGuardDecision,
-    HarnessActor, HarnessConfig, HarnessHandle, MemoryStore, ProviderAttemptDecision,
-    ProviderAttemptResolver, ProviderPairSwitch, ProviderPairSwitchCause,
+    ArtifactReader, CommittedRange, ContextCompactionRequest, ContextCompactor, FinalizationGuard,
+    FinalizationGuardDecision, HarnessActor, HarnessConfig, HarnessHandle, MemoryStore,
+    ProviderAttemptDecision, ProviderAttemptResolver, ProviderPairSwitch, ProviderPairSwitchCause,
     ProviderPairSwitchCommitter, ProviderPairSwitchTarget, ResolvedProviderAttempt, StoreHandle,
     SubmitCommittedTurn, SubmitTurn, ToolDispatchResult, ToolDispatcher,
     VISION_IMAGE_ESTIMATE_TOKENS, estimate_provider_request_input_tokens,
@@ -12,7 +12,10 @@ use haider_core::{
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::cache::CACHE_REQUEST_ATTEMPT_EXTENSION_KIND;
-use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
+use haider_protocol::context::{
+    CONTEXT_SAVINGS_EXTENSION_KIND, ContextCompactionTier, ContextFootprint, ContextFootprintTruth,
+    ContextSavingsEvent,
+};
 use haider_protocol::credential::{RotationCause, RotationEvent};
 use haider_protocol::envelope::{PromptRender, RawEnvelope};
 use haider_protocol::error::{ErrorCode, HaiderError};
@@ -712,23 +715,29 @@ impl ContextCompactor for FakeContextCompactor {
         &self,
         _run_id: &RunId,
         resume_cause: CompactionResume,
-    ) -> Result<CompactionIntent, HaiderError> {
-        Ok(CompactionIntent {
-            operation_id: "forced-test-compaction".into(),
-            covers_from: NodeId::new("old-root"),
-            covers_to: NodeId::new("old-head"),
-            resume_cause,
+        _messages: &[Message],
+        current_turn_start: usize,
+    ) -> Result<haider_core::PlannedContextCompaction, HaiderError> {
+        Ok(haider_core::PlannedContextCompaction {
+            intent: CompactionIntent {
+                operation_id: "forced-test-compaction".into(),
+                covers_from: NodeId::new("old-root"),
+                covers_to: NodeId::new("old-head"),
+                resume_cause,
+            },
+            covered_message_count: current_turn_start,
         })
     }
 
     async fn compact(
         &self,
-        _run_id: &RunId,
-        _intent: &CompactionIntent,
-        covered_messages: Vec<Message>,
-        _attachments: Vec<haider_provider::ResolvedAttachment>,
-        _latest_compaction_summary_end: Option<usize>,
-    ) -> Result<Message, HaiderError> {
+        request: ContextCompactionRequest<'_>,
+    ) -> Result<haider_core::ContextCompactionOutcome, HaiderError> {
+        let ContextCompactionRequest {
+            covered_messages,
+            economy_before,
+            ..
+        } = request;
         self.calls.fetch_add(1, Ordering::Relaxed);
         let default_expected = [Message::user_text("old history")];
         assert_eq!(
@@ -737,7 +746,15 @@ impl ContextCompactor for FakeContextCompactor {
                 .as_deref()
                 .unwrap_or(&default_expected)
         );
-        Ok(Message::user_text("compacted history"))
+        let (economy, _) = economy_before.record(
+            haider_protocol::context::ContextCompactionTier::Summarize,
+            100,
+            10,
+        );
+        Ok(haider_core::ContextCompactionOutcome {
+            summary: Message::user_text("compacted history"),
+            economy,
+        })
     }
 }
 
@@ -752,26 +769,40 @@ impl ContextCompactor for ShrinkingContextCompactor {
         &self,
         _run_id: &RunId,
         resume_cause: CompactionResume,
-    ) -> Result<CompactionIntent, HaiderError> {
-        Ok(CompactionIntent {
-            operation_id: "hard-fit-test-compaction".into(),
-            covers_from: NodeId::new("old-root"),
-            covers_to: NodeId::new("old-head"),
-            resume_cause,
+        _messages: &[Message],
+        current_turn_start: usize,
+    ) -> Result<haider_core::PlannedContextCompaction, HaiderError> {
+        Ok(haider_core::PlannedContextCompaction {
+            intent: CompactionIntent {
+                operation_id: "hard-fit-test-compaction".into(),
+                covers_from: NodeId::new("old-root"),
+                covers_to: NodeId::new("old-head"),
+                resume_cause,
+            },
+            covered_message_count: current_turn_start,
         })
     }
 
     async fn compact(
         &self,
-        _run_id: &RunId,
-        _intent: &CompactionIntent,
-        covered_messages: Vec<Message>,
-        _attachments: Vec<haider_provider::ResolvedAttachment>,
-        _latest_compaction_summary_end: Option<usize>,
-    ) -> Result<Message, HaiderError> {
+        request: ContextCompactionRequest<'_>,
+    ) -> Result<haider_core::ContextCompactionOutcome, HaiderError> {
+        let ContextCompactionRequest {
+            covered_messages,
+            economy_before,
+            ..
+        } = request;
         self.calls.fetch_add(1, Ordering::Relaxed);
         assert_eq!(covered_messages.len(), 1);
-        Ok(Message::user_text("s"))
+        let (economy, _) = economy_before.record(
+            haider_protocol::context::ContextCompactionTier::Summarize,
+            100,
+            1,
+        );
+        Ok(haider_core::ContextCompactionOutcome {
+            summary: Message::user_text("s"),
+            economy,
+        })
     }
 }
 
@@ -802,26 +833,40 @@ impl ContextCompactor for IneffectiveContextCompactor {
         &self,
         _run_id: &RunId,
         resume_cause: CompactionResume,
-    ) -> Result<CompactionIntent, HaiderError> {
-        Ok(CompactionIntent {
-            operation_id: "ineffective-test-compaction".into(),
-            covers_from: NodeId::new("old-root"),
-            covers_to: NodeId::new("old-head"),
-            resume_cause,
+        _messages: &[Message],
+        current_turn_start: usize,
+    ) -> Result<haider_core::PlannedContextCompaction, HaiderError> {
+        Ok(haider_core::PlannedContextCompaction {
+            intent: CompactionIntent {
+                operation_id: "ineffective-test-compaction".into(),
+                covers_from: NodeId::new("old-root"),
+                covers_to: NodeId::new("old-head"),
+                resume_cause,
+            },
+            covered_message_count: current_turn_start,
         })
     }
 
     async fn compact(
         &self,
-        _run_id: &RunId,
-        _intent: &CompactionIntent,
-        covered_messages: Vec<Message>,
-        _attachments: Vec<haider_provider::ResolvedAttachment>,
-        _latest_compaction_summary_end: Option<usize>,
-    ) -> Result<Message, HaiderError> {
+        request: ContextCompactionRequest<'_>,
+    ) -> Result<haider_core::ContextCompactionOutcome, HaiderError> {
+        let ContextCompactionRequest {
+            covered_messages,
+            economy_before,
+            ..
+        } = request;
         self.calls.fetch_add(1, Ordering::Relaxed);
         assert_eq!(covered_messages.len(), 1);
-        Ok(covered_messages.into_iter().next().expect("covered prefix"))
+        let (economy, _) = economy_before.record(
+            haider_protocol::context::ContextCompactionTier::Summarize,
+            100,
+            100,
+        );
+        Ok(haider_core::ContextCompactionOutcome {
+            summary: covered_messages.into_iter().next().expect("covered prefix"),
+            economy,
+        })
     }
 }
 
@@ -1307,6 +1352,117 @@ async fn soft_threshold_preannounces_compacts_and_publishes_the_reset_before_pro
     assert!(intent.seq < compacting_seq);
     assert!(compacting_seq < *after_seq);
     assert!(*after_seq < streaming_seq);
+}
+
+#[tokio::test]
+async fn fast_mode_structurally_trims_whole_stale_pairs_while_default_mode_does_not() {
+    let mut messages = Vec::new();
+    for ordinal in 0..30 {
+        let call_id = format!("structural-runtime-{ordinal:02}");
+        messages.push(Message::assistant(vec![Block::ToolCall {
+            call_id: call_id.clone(),
+            name: "read_file".into(),
+            args: serde_json::json!({"path": format!("/{ordinal}")}),
+        }]));
+        messages.push(Message::tool_result(
+            &call_id,
+            format!("runtime-output-{ordinal:02}-{}", "r".repeat(8_192)),
+            false,
+        ));
+    }
+    messages.push(Message::user_text("current structural runtime turn"));
+    let estimated_before = estimate_provider_request_input_tokens(&messages, &None, &[], &[]);
+    assert!((60_000..75_000).contains(&estimated_before));
+
+    let fast_provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let fast_store = Arc::new(MemoryStore::new());
+    let mut fast = config();
+    fast.context_window = Some(100_000);
+    fast.reserved_output_tokens = 1_000;
+    fast.context_compaction_v1 = true;
+    fast.structural_context_trimming = true;
+    let fast_handle = HarnessActor::spawn(fast, fast_provider.clone(), fast_store.clone());
+    fast_handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("structural-runtime-fast"),
+            messages: messages.clone(),
+        })
+        .await
+        .expect("fast structural turn accepted")
+        .wait()
+        .await
+        .expect("fast structural turn completes");
+    let fast_requests = fast_provider.requests();
+    let fast_request = &fast_requests[0];
+    assert_eq!(
+        fast_request
+            .messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter(|block| matches!(block, Block::ToolCall { .. }))
+            .count(),
+        24
+    );
+    assert_eq!(
+        fast_request
+            .messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter(|block| matches!(block, Block::ToolResult { .. }))
+            .count(),
+        24
+    );
+    let savings = fast_store
+        .events(&SessionId::new(SESSION))
+        .await
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::Extension { kind, data },
+                ..
+            }) if kind == CONTEXT_SAVINGS_EXTENSION_KIND => {
+                serde_json::from_value::<ContextSavingsEvent>(data).ok()
+            }
+            _ => None,
+        })
+        .expect("durable structural savings event");
+    assert_eq!(savings.tier, ContextCompactionTier::StructuralTrim24);
+    assert_eq!(savings.removed_tool_call_ids.len(), 6);
+    assert!(savings.estimated_tokens_saved > 0);
+
+    let default_provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let mut default = config();
+    default.context_window = Some(100_000);
+    default.reserved_output_tokens = 1_000;
+    default.context_compaction_v1 = true;
+    let default_handle = HarnessActor::spawn(
+        default,
+        default_provider.clone(),
+        Arc::new(MemoryStore::new()),
+    );
+    default_handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("structural-runtime-default"),
+            messages,
+        })
+        .await
+        .expect("default structural turn accepted")
+        .wait()
+        .await
+        .expect("default structural turn completes");
+    assert_eq!(
+        default_provider.requests()[0]
+            .messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter(|block| matches!(block, Block::ToolCall { .. }))
+            .count(),
+        30
+    );
 }
 
 /// MUTATION CHECK: substitute any default model window for `None`. Expected

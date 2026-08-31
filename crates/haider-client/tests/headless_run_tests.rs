@@ -227,6 +227,7 @@ async fn respond_create_and_attach_with_account(
                 effort: None,
                 fast: false,
                 cache_policy: Default::default(),
+                context_economy: Default::default(),
                 created_at_ms: 1,
                 agent_type: None,
             },

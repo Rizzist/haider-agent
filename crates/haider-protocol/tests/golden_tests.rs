@@ -1564,6 +1564,7 @@ fn golden_context_footprint_exact_extension() {
         soft_threshold_tokens: Some(170_000),
         estimated_turns_to_threshold: Some(1),
         truth: ContextFootprintTruth::Exact,
+        accounting: None,
     };
     golden(
         "context_footprint_exact_extension",

@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_core::{
-    ArtifactReader, CommittedRange, MemoryStore, PromptHistoryCompiler, SessionCreateCommand,
-    SessionProjectionCheckpoint, SqliteStoreHandle, StoreHandle, USER_COMMAND_OUTPUT_PREVIEW_BYTES,
+    ArtifactReader, CommittedRange, MemoryStore, PromptCompactionPlanRequest,
+    PromptHistoryCompiler, SessionCreateCommand, SessionProjectionCheckpoint, SqliteStoreHandle,
+    StoreHandle, USER_COMMAND_OUTPUT_PREVIEW_BYTES,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
@@ -5796,4 +5797,796 @@ async fn cancelled_and_errored_runs_keep_their_committed_history() {
         messages.len() > as_if_run_2.len() && messages[..as_if_run_2.len()] == as_if_run_2[..],
         "the cancel boundary preserves the carried-forward prompt prefix"
     );
+}
+
+#[derive(Clone, Copy)]
+enum CompactionProtectedTurn {
+    Skill(usize),
+    Image(usize),
+}
+
+async fn seed_clean_compaction_history(
+    name: &str,
+    protected: Option<CompactionProtectedTurn>,
+) -> (MemoryStore, SessionId, RunId, Vec<String>) {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new(format!("{name}-session"));
+    let mut parent = None::<String>;
+    let mut retained_text = Vec::new();
+    let mut events = Vec::new();
+    for ordinal in 0..5 {
+        let run_id = RunId::new(format!("{name}-run-{ordinal}"));
+        let user_text = format!("{name}-user-{ordinal}");
+        let assistant_text = if ordinal >= 3 {
+            format!("{name}-assistant-{ordinal}-{}", "x".repeat(50_000))
+        } else {
+            format!("{name}-assistant-{ordinal}")
+        };
+        if ordinal >= 3 {
+            retained_text.push(user_text.clone());
+            retained_text.push(assistant_text.clone());
+        }
+        let attachments = match protected {
+            Some(CompactionProtectedTurn::Skill(index)) if index == ordinal => {
+                vec![AttachmentBlock::Skill {
+                    name: "load-bearing-skill".into(),
+                    version_hash: "sha256:skill-version".into(),
+                }]
+            }
+            Some(CompactionProtectedTurn::Image(index)) if index == ordinal => {
+                vec![AttachmentBlock::Image {
+                    artifact: ArtifactRef::new("load-bearing-image"),
+                    mime: "image/png".into(),
+                    width: Some(64),
+                    height: Some(32),
+                }]
+            }
+            _ => Vec::new(),
+        };
+        let user_node = format!("{name}-user-node-{ordinal}");
+        let assistant_node = format!("{name}-assistant-node-{ordinal}");
+        events.extend([
+            envelope(
+                &session_id,
+                &run_id,
+                &format!("{name}-user-event-{ordinal}"),
+                EventPayload::UserMessage {
+                    text: user_text.clone(),
+                    attachments: attachments.clone(),
+                    mode: DeliveryMode::Queue,
+                },
+                PromptRender::Verbatim,
+            ),
+            node(
+                &session_id,
+                &run_id,
+                &user_node,
+                parent.as_deref(),
+                NodeKind::UserTurn {
+                    text: user_text,
+                    attachments,
+                },
+            ),
+            envelope(
+                &session_id,
+                &run_id,
+                &format!("{name}-assistant-event-{ordinal}"),
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: ItemId::new(format!("{name}-assistant-item-{ordinal}")),
+                    item: TurnItem::AgentMessage {
+                        text: assistant_text.clone(),
+                    },
+                }),
+                PromptRender::Verbatim,
+            ),
+            node(
+                &session_id,
+                &run_id,
+                &assistant_node,
+                Some(&user_node),
+                NodeKind::AssistantCommit {
+                    text: assistant_text,
+                    verdict: VerifyVerdict::NotApplicable,
+                },
+            ),
+            envelope(
+                &session_id,
+                &run_id,
+                &format!("{name}-done-{ordinal}"),
+                EventPayload::RunState(RunState::Done),
+                PromptRender::Omit,
+            ),
+        ]);
+        parent = Some(assistant_node);
+    }
+    let current_run = RunId::new(format!("{name}-current-run"));
+    let current_text = format!("{name}-current-user");
+    retained_text.push(current_text.clone());
+    events.extend([
+        envelope(
+            &session_id,
+            &current_run,
+            &format!("{name}-current-user-event"),
+            EventPayload::UserMessage {
+                text: current_text.clone(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &current_run,
+            &format!("{name}-current-user-node"),
+            parent.as_deref(),
+            NodeKind::UserTurn {
+                text: current_text,
+                attachments: Vec::new(),
+            },
+        ),
+    ]);
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append clean compaction history");
+    (store, session_id, current_run, retained_text)
+}
+
+#[tokio::test]
+async fn compaction_split_is_always_a_clean_turn_boundary() {
+    let (store, session_id, current_run, _) =
+        seed_clean_compaction_history("clean-boundary", None).await;
+    let artifacts = TestArtifacts(HashMap::new());
+
+    let planned = PromptHistoryCompiler::plan_compaction(
+        &store,
+        &artifacts,
+        PromptCompactionPlanRequest {
+            session_id: &session_id,
+            branch_id: None,
+            agent_id: None,
+            current_run: &current_run,
+            operation_id: "clean-boundary-operation".into(),
+            resume_cause: CompactionResume::AutoMidTurn,
+        },
+    )
+    .await
+    .expect("plan clean-boundary compaction");
+
+    assert_eq!(
+        planned.intent.covers_from,
+        NodeId::new("clean-boundary-user-node-0")
+    );
+    assert_eq!(
+        planned.intent.covers_to,
+        NodeId::new("clean-boundary-assistant-node-2")
+    );
+    assert_eq!(planned.covered_message_count, 6);
+}
+
+#[tokio::test]
+async fn recent_context_window_stays_verbatim_after_the_summary_boundary() {
+    let (store, session_id, current_run, retained_text) =
+        seed_clean_compaction_history("recent-verbatim", None).await;
+    let artifacts = TestArtifacts(HashMap::new());
+    let planned = PromptHistoryCompiler::plan_compaction(
+        &store,
+        &artifacts,
+        PromptCompactionPlanRequest {
+            session_id: &session_id,
+            branch_id: None,
+            agent_id: None,
+            current_run: &current_run,
+            operation_id: "recent-verbatim-operation".into(),
+            resume_cause: CompactionResume::AutoMidTurn,
+        },
+    )
+    .await
+    .expect("plan recent-window compaction");
+    let projection = PromptHistoryCompiler::compile_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current_run,
+    )
+    .await
+    .expect("compile recent-window projection");
+    let actual = projection[planned.covered_message_count..]
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(actual, retained_text);
+}
+
+#[tokio::test]
+async fn skill_turn_is_never_folded_into_a_summary() {
+    let (store, session_id, current_run, _) =
+        seed_clean_compaction_history("skill-preserved", Some(CompactionProtectedTurn::Skill(1)))
+            .await;
+    let artifacts = TestArtifacts(HashMap::new());
+
+    let planned = PromptHistoryCompiler::plan_compaction(
+        &store,
+        &artifacts,
+        PromptCompactionPlanRequest {
+            session_id: &session_id,
+            branch_id: None,
+            agent_id: None,
+            current_run: &current_run,
+            operation_id: "skill-preserved-operation".into(),
+            resume_cause: CompactionResume::AutoMidTurn,
+        },
+    )
+    .await
+    .expect("plan around protected skill turn");
+
+    assert_eq!(
+        planned.intent.covers_to,
+        NodeId::new("skill-preserved-assistant-node-0")
+    );
+    assert_eq!(planned.covered_message_count, 2);
+}
+
+#[tokio::test]
+async fn image_turn_moves_the_summary_boundary_back_and_stays_whole() {
+    let (store, session_id, current_run, _) =
+        seed_clean_compaction_history("image-preserved", Some(CompactionProtectedTurn::Image(1)))
+            .await;
+    let artifacts = TestArtifacts(HashMap::new());
+
+    let planned = PromptHistoryCompiler::plan_compaction(
+        &store,
+        &artifacts,
+        PromptCompactionPlanRequest {
+            session_id: &session_id,
+            branch_id: None,
+            agent_id: None,
+            current_run: &current_run,
+            operation_id: "image-preserved-operation".into(),
+            resume_cause: CompactionResume::AutoMidTurn,
+        },
+    )
+    .await
+    .expect("plan around protected image turn");
+
+    assert_eq!(
+        planned.intent.covers_to,
+        NodeId::new("image-preserved-assistant-node-0")
+    );
+    assert_eq!(planned.covered_message_count, 2);
+}
+
+#[tokio::test]
+async fn structural_selection_replays_from_the_append_only_journal_after_restart() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("structural-replay-session");
+    let prior_run = RunId::new("structural-replay-prior");
+    let current_run = RunId::new("structural-replay-current");
+    let reused_id_run = RunId::new("structural-replay-reused-id");
+    let replay_run = RunId::new("structural-replay-final");
+    let (_, savings) = haider_protocol::context::ContextEconomy::default()
+        .record_with_removed_tool_calls(
+            haider_protocol::context::ContextCompactionTier::StructuralTrim24,
+            60_000,
+            48_000,
+            vec!["stale-call".into()],
+        );
+    let savings_item = savings.extension_item().expect("savings carrier");
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &prior_run,
+            "structural-replay-user",
+            EventPayload::UserMessage {
+                text: "inspect old tool output".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &prior_run,
+            "structural-replay-user-node",
+            None,
+            NodeKind::UserTurn {
+                text: "inspect old tool output".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &prior_run,
+            "structural-replay-result",
+            EventPayload::ToolResult {
+                call_id: "stale-call".into(),
+                result: BoundedResult {
+                    preview: "complete stale file contents".into(),
+                    truncated: false,
+                    data: None,
+                    artifact: None,
+                    images: Vec::new(),
+                    cursor: None,
+                    status: haider_protocol::tool::ToolResultStatus::Completed,
+                    reason: None,
+                    presentation: None,
+                },
+            },
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &prior_run,
+            "structural-replay-call",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("structural-replay-call-item"),
+                item: TurnItem::ToolCall {
+                    call_id: "stale-call".into(),
+                    name: "read_file".into(),
+                    args: serde_json::json!({"path": "/large.log"}),
+                    status: ToolStatus::Completed,
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &prior_run,
+            "structural-replay-assistant-node",
+            Some("structural-replay-user-node"),
+            NodeKind::AssistantCommit {
+                text: String::new(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ),
+        envelope(
+            &session_id,
+            &prior_run,
+            "structural-replay-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &current_run,
+            "structural-replay-current-user",
+            EventPayload::UserMessage {
+                text: "continue from prose".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &current_run,
+            "structural-replay-current-node",
+            Some("structural-replay-assistant-node"),
+            NodeKind::UserTurn {
+                text: "continue from prose".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        // Crash-window pin: the trim is durable after the current user node,
+        // before any assistant node can anchor it into the tree ancestry.
+        envelope(
+            &session_id,
+            &current_run,
+            "structural-replay-saving",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("structural-replay-saving-item"),
+                item: savings_item,
+            }),
+            PromptRender::Omit,
+        ),
+        node(
+            &session_id,
+            &current_run,
+            "structural-replay-current-assistant-node",
+            Some("structural-replay-current-node"),
+            NodeKind::AssistantCommit {
+                text: String::new(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ),
+        envelope(
+            &session_id,
+            &current_run,
+            "structural-replay-current-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &reused_id_run,
+            "structural-replay-reused-user",
+            EventPayload::UserMessage {
+                text: "reuse a provider-scoped call id".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &reused_id_run,
+            "structural-replay-reused-user-node",
+            Some("structural-replay-current-assistant-node"),
+            NodeKind::UserTurn {
+                text: "reuse a provider-scoped call id".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &reused_id_run,
+            "structural-replay-reused-result",
+            EventPayload::ToolResult {
+                call_id: "stale-call".into(),
+                result: BoundedResult {
+                    preview: "current tool result must survive".into(),
+                    truncated: false,
+                    data: None,
+                    artifact: None,
+                    images: Vec::new(),
+                    cursor: None,
+                    status: haider_protocol::tool::ToolResultStatus::Completed,
+                    reason: None,
+                    presentation: None,
+                },
+            },
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &reused_id_run,
+            "structural-replay-reused-call",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("structural-replay-reused-call-item"),
+                item: TurnItem::ToolCall {
+                    call_id: "stale-call".into(),
+                    name: "current_read_file".into(),
+                    args: serde_json::json!({"path": "/current.log"}),
+                    status: ToolStatus::Completed,
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &reused_id_run,
+            "structural-replay-reused-assistant-node",
+            Some("structural-replay-reused-user-node"),
+            NodeKind::AssistantCommit {
+                text: String::new(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ),
+        envelope(
+            &session_id,
+            &reused_id_run,
+            "structural-replay-reused-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &replay_run,
+            "structural-replay-final-user",
+            EventPayload::UserMessage {
+                text: "compile after the reused id".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &replay_run,
+            "structural-replay-final-user-node",
+            Some("structural-replay-reused-assistant-node"),
+            NodeKind::UserTurn {
+                text: "compile after the reused id".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append structural replay fixture");
+    let raw = StoreHandle::read(&store, &session_id, 0, 100)
+        .await
+        .expect("read raw structural journal");
+    assert!(
+        raw.iter()
+            .any(|envelope| envelope.event_id.as_str() == "structural-replay-call")
+    );
+    assert!(
+        raw.iter()
+            .any(|envelope| envelope.event_id.as_str() == "structural-replay-result")
+    );
+
+    let first = PromptHistoryCompiler::compile(&store, &session_id, None, None, &replay_run)
+        .await
+        .expect("first projection after trim");
+    let restarted = PromptHistoryCompiler::compile(&store, &session_id, None, None, &replay_run)
+        .await
+        .expect("independent restart projection after trim");
+    assert_eq!(first, restarted);
+    let surviving_reused_id_blocks = first
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter(|block| {
+            matches!(
+                block,
+                Block::ToolCall { call_id, .. } | Block::ToolResult { call_id, .. }
+                    if call_id == "stale-call"
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        surviving_reused_id_blocks.len(),
+        2,
+        "restart removes one recorded old occurrence, not every future reuse: {surviving_reused_id_blocks:#?}"
+    );
+    assert!(
+        first
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .any(|block| {
+                matches!(
+                    block,
+                    Block::ToolCall { call_id, name, .. }
+                        if call_id == "stale-call" && name == "current_read_file"
+                )
+            })
+    );
+    assert_eq!(
+        PromptHistoryCompiler::latest_context_economy(&store, &session_id)
+            .await
+            .expect("reduce durable savings")
+            .expect("savings coordinate")
+            .cumulative_estimated_tokens_saved,
+        12_000
+    );
+}
+
+#[tokio::test]
+async fn malformed_context_savings_event_fails_closed_during_restart_replay() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("malformed-context-savings-session");
+    let run_id = RunId::new("malformed-context-savings-run");
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &run_id,
+            "malformed-context-savings-user",
+            EventPayload::UserMessage {
+                text: "current turn".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &run_id,
+            "malformed-context-savings-node",
+            None,
+            NodeKind::UserTurn {
+                text: "current turn".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &run_id,
+            "malformed-context-savings-event",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("malformed-context-savings-item"),
+                item: TurnItem::Extension {
+                    kind: haider_protocol::context::CONTEXT_SAVINGS_EXTENSION_KIND.into(),
+                    data: serde_json::json!({"operation_count": "not-a-number"}),
+                },
+            }),
+            PromptRender::Omit,
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append malformed savings fixture");
+
+    let error = PromptHistoryCompiler::compile(&store, &session_id, None, None, &run_id)
+        .await
+        .expect_err("known authoritative savings kind must not disappear on decode failure");
+    assert_eq!(error.code, haider_protocol::error::ErrorCode::StoreCorrupt);
+    assert!(error.message.contains("context-savings event is malformed"));
+}
+
+#[tokio::test]
+async fn replacement_summary_source_never_contains_the_prior_summary() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("summary-replacement-source-session");
+    let first_run = RunId::new("summary-replacement-first");
+    let second_run = RunId::new("summary-replacement-second");
+    let current_run = RunId::new("summary-replacement-current");
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &first_run,
+            "summary-replacement-first-user",
+            EventPayload::UserMessage {
+                text: "ORIGINAL FIRST TURN".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &first_run,
+            "summary-replacement-first-user-node",
+            None,
+            NodeKind::UserTurn {
+                text: "ORIGINAL FIRST TURN".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &first_run,
+            "summary-replacement-first-answer",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("summary-replacement-first-answer-item"),
+                item: TurnItem::AgentMessage {
+                    text: "ORIGINAL FIRST ANSWER".into(),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &first_run,
+            "summary-replacement-first-answer-node",
+            Some("summary-replacement-first-user-node"),
+            NodeKind::AssistantCommit {
+                text: "ORIGINAL FIRST ANSWER".into(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ),
+        envelope(
+            &session_id,
+            &first_run,
+            "summary-replacement-first-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        node(
+            &session_id,
+            &first_run,
+            "summary-replacement-old-compaction",
+            Some("summary-replacement-first-answer-node"),
+            NodeKind::Compaction {
+                covers_from: NodeId::new("summary-replacement-first-user-node"),
+                covers_to: NodeId::new("summary-replacement-first-answer-node"),
+                summary_artifact: ArtifactRef::new("OLD-SUMMARY-MUST-NOT-BE-READ"),
+                tokens_before: 20_000,
+                tokens_after: 1_000,
+                resume_cause: CompactionResume::ManualIdle,
+            },
+        ),
+        envelope(
+            &session_id,
+            &second_run,
+            "summary-replacement-second-user",
+            EventPayload::UserMessage {
+                text: "ORIGINAL SECOND TURN".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &second_run,
+            "summary-replacement-second-user-node",
+            Some("summary-replacement-old-compaction"),
+            NodeKind::UserTurn {
+                text: "ORIGINAL SECOND TURN".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &second_run,
+            "summary-replacement-second-answer",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("summary-replacement-second-answer-item"),
+                item: TurnItem::AgentMessage {
+                    text: "ORIGINAL SECOND ANSWER".into(),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &second_run,
+            "summary-replacement-second-answer-node",
+            Some("summary-replacement-second-user-node"),
+            NodeKind::AssistantCommit {
+                text: "ORIGINAL SECOND ANSWER".into(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ),
+        envelope(
+            &session_id,
+            &second_run,
+            "summary-replacement-second-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &current_run,
+            "summary-replacement-current-user",
+            EventPayload::UserMessage {
+                text: "CURRENT TURN".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &current_run,
+            "summary-replacement-current-node",
+            Some("summary-replacement-second-answer-node"),
+            NodeKind::UserTurn {
+                text: "CURRENT TURN".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append replacement summary fixture");
+    let source = PromptHistoryCompiler::compile_compaction_source(
+        &store,
+        &session_id,
+        None,
+        None,
+        &current_run,
+        &CompactionIntent {
+            operation_id: "replacement".into(),
+            covers_from: NodeId::new("summary-replacement-first-user-node"),
+            covers_to: NodeId::new("summary-replacement-second-answer-node"),
+            resume_cause: CompactionResume::AutoMidTurn,
+        },
+    )
+    .await
+    .expect("reconstruct original replacement-summary source");
+    let text = source
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text,
+        [
+            "ORIGINAL FIRST TURN",
+            "ORIGINAL FIRST ANSWER",
+            "ORIGINAL SECOND TURN",
+            "ORIGINAL SECOND ANSWER"
+        ]
+    );
+    assert!(!text.iter().any(|value| value.contains("OLD-SUMMARY")));
 }

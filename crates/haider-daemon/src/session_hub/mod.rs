@@ -6952,6 +6952,19 @@ impl StoreHandle for HubStoreHandle {
         self.append_owned_inner(None, envelopes).await
     }
 
+    async fn persist_context_economy(
+        &self,
+        session_id: &SessionId,
+        economy: &haider_protocol::context::ContextEconomy,
+    ) -> Result<(), HaiderError> {
+        self.ensure_session(session_id)?;
+        self.hub
+            .inner
+            .store
+            .persist_context_economy(session_id.clone(), economy.clone())
+            .await
+    }
+
     async fn read(
         &self,
         session_id: &SessionId,

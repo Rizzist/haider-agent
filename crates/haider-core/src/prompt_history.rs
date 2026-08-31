@@ -8,6 +8,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_protocol::EventPayload;
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
+use haider_protocol::context::{CONTEXT_SAVINGS_EXTENSION_KIND, ContextSavingsEvent};
 use haider_protocol::envelope::{PromptRender, RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorAction, ErrorCode, HaiderError};
 use haider_protocol::history::{CompactionIntent, CompactionResume, NodeKind, TreeNode};
@@ -20,7 +21,7 @@ use haider_protocol::pipe::TranscriptProjector;
 use haider_protocol::provider::{Block, PROVIDER_OPAQUE_EXTENSION_KIND};
 use haider_protocol::state::RunState;
 use haider_protocol::task::{TASK_TAIL_BYTES, TaskEventPayload, TaskTerminalState};
-use haider_protocol::tool::BoundedResult;
+use haider_protocol::tool::{AttachmentBlock, BoundedResult};
 use haider_provider::{Message, MessageRole, UserCommandRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -52,6 +53,11 @@ const PROMPT_CHECKPOINT_SHAPE_VERSION: u32 = 1;
 /// `PROMPT_CHECKPOINT_SHAPE_VERSION`.
 const PROMPT_CHECKPOINT_REDUCER_VERSION: &str = "prompt-history-v1";
 pub const USER_COMMAND_OUTPUT_PREVIEW_BYTES: usize = 8 * 1024;
+/// Recent provider-message budget retained verbatim across model summaries.
+/// The unit is the same honest provider-neutral bytes/4 estimate used by the
+/// conversation savings ledger, not an exact model tokenizer.
+pub const COMPACTION_RECENT_ESTIMATED_TOKENS: u64 = 24_000;
+const COMPACTION_MIN_RECENT_PRIOR_TURNS: usize = 2;
 
 /// Read-only CAS port used only when a durable compaction node is projected.
 ///
@@ -64,6 +70,16 @@ pub trait ArtifactReader: Send + Sync {
 
 /// Branch/agent-scoped committed-history compiler.
 pub struct PromptHistoryCompiler;
+
+#[derive(Debug)]
+pub struct PromptCompactionPlanRequest<'a> {
+    pub session_id: &'a SessionId,
+    pub branch_id: Option<&'a BranchId>,
+    pub agent_id: Option<&'a AgentId>,
+    pub current_run: &'a RunId,
+    pub operation_id: String,
+    pub resume_cause: CompactionResume,
+}
 
 /// Daemon-lifetime prompt cache.
 ///
@@ -215,6 +231,47 @@ impl CompiledPromptProjection {
 }
 
 impl PromptHistoryCompiler {
+    /// Reduces the newest durable conversation-savings event. This journal
+    /// fallback heals the narrow crash window between the authoritative event
+    /// append and its redundant `sessions.meta_json` projection update.
+    pub async fn latest_context_economy(
+        store: &dyn StoreHandle,
+        session_id: &SessionId,
+    ) -> Result<Option<haider_protocol::context::ContextEconomy>, HaiderError> {
+        let envelopes = read_all(store, session_id).await?;
+        let mut latest: Option<haider_protocol::context::ContextSavingsEvent> = None;
+        for envelope in envelopes {
+            let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
+                serde_json::from_value::<EventPayload>(envelope.payload)
+            else {
+                continue;
+            };
+            let Some(event) = ContextSavingsEvent::try_from_extension_item(&item)
+                .map_err(|error| corrupt(format!("context-savings event is malformed: {error}")))?
+            else {
+                continue;
+            };
+            if let Some(existing) = &latest {
+                if event.session_operation_count < existing.session_operation_count {
+                    return Err(corrupt("context-savings operation count moved backwards"));
+                }
+                if event.session_operation_count == existing.session_operation_count
+                    && event != *existing
+                {
+                    return Err(corrupt("equal context-savings coordinates disagree"));
+                }
+            }
+            latest = Some(event);
+        }
+        Ok(
+            latest.map(|event| haider_protocol::context::ContextEconomy {
+                cumulative_estimated_tokens_saved: event.session_cumulative_estimated_tokens_saved,
+                operation_count: event.session_operation_count,
+                last_event: Some(event),
+            }),
+        )
+    }
+
     /// Compiles the active durable tree. This entry point is sufficient for an
     /// uncompacted tree; encountering a committed compaction without a CAS
     /// reader is store corruption, never permission to resurrect its prefix.
@@ -456,13 +513,17 @@ impl PromptHistoryCompiler {
     /// durably append the returned intent before private summarization.
     pub async fn plan_compaction(
         store: &dyn StoreHandle,
-        session_id: &SessionId,
-        branch_id: Option<&BranchId>,
-        agent_id: Option<&AgentId>,
-        current_run: &RunId,
-        operation_id: String,
-        resume_cause: CompactionResume,
-    ) -> Result<CompactionIntent, HaiderError> {
+        artifacts: &dyn ArtifactReader,
+        request: PromptCompactionPlanRequest<'_>,
+    ) -> Result<crate::PlannedContextCompaction, HaiderError> {
+        let PromptCompactionPlanRequest {
+            session_id,
+            branch_id,
+            agent_id,
+            current_run,
+            operation_id,
+            resume_cause,
+        } = request;
         let envelopes = read_all(store, session_id).await?;
         let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
         let tree = TreeProjection::build(&envelopes);
@@ -477,29 +538,253 @@ impl PromptHistoryCompiler {
             .iter()
             .position(|entry| entry.run_id.as_ref() == Some(current_run))
             .ok_or_else(|| corrupt(format!("tree ancestry omits current run {current_run}")))?;
-        let covers_to = current_start.checked_sub(1).ok_or_else(|| {
+        let prior_user_turns = ancestry[..current_start]
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                matches!(entry.node.kind, NodeKind::UserTurn { .. }).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if prior_user_turns.len() < COMPACTION_MIN_RECENT_PRIOR_TURNS.saturating_add(1) {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "there is not enough older clean-turn history to compact",
+                false,
+            ));
+        }
+        let full_projection = compile_ancestry(
+            &envelopes,
+            &ancestry,
+            None,
+            Some(artifacts),
+            agent_id,
+            Some(current_run),
+        )
+        .await?;
+        let mut retained_turns = 0_usize;
+        let mut retain_from = current_start;
+        for candidate in prior_user_turns.iter().rev().copied() {
+            retained_turns = retained_turns.saturating_add(1);
+            retain_from = candidate;
+            let covered_projection = compile_ancestry(
+                &envelopes,
+                &ancestry[..candidate],
+                None,
+                Some(artifacts),
+                agent_id,
+                None,
+            )
+            .await?;
+            let retained = full_projection
+                .messages
+                .get(covered_projection.messages.len()..full_projection.current_user_start)
+                .ok_or_else(|| corrupt("clean compaction boundary exceeds active projection"))?;
+            let retained_tokens = serde_json::to_vec(retained)
+                .map(|bytes| {
+                    u64::try_from(bytes.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(3)
+                        / 4
+                })
+                .unwrap_or(u64::MAX);
+            if retained_turns >= COMPACTION_MIN_RECENT_PRIOR_TURNS
+                && retained_tokens >= COMPACTION_RECENT_ESTIMATED_TOKENS
+            {
+                break;
+            }
+        }
+
+        let protected_runs = envelopes
+            .iter()
+            .filter_map(|envelope| {
+                let EventPayload::ToolResult { result, .. } =
+                    serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
+                else {
+                    return None;
+                };
+                (!result.images.is_empty())
+                    .then(|| envelope.run_id.clone())
+                    .flatten()
+            })
+            .collect::<HashSet<_>>();
+        let protected_from = ancestry[..current_start]
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let NodeKind::UserTurn { attachments, .. } = &entry.node.kind else {
+                    return None;
+                };
+                let protected_attachment = attachments.iter().any(|attachment| {
+                    matches!(
+                        attachment,
+                        AttachmentBlock::Image { .. } | AttachmentBlock::Skill { .. }
+                    )
+                });
+                (protected_attachment
+                    || entry
+                        .run_id
+                        .as_ref()
+                        .is_some_and(|run_id| protected_runs.contains(run_id)))
+                .then_some(index)
+            })
+            .min();
+        if let Some(protected_from) = protected_from {
+            retain_from = retain_from.min(protected_from);
+        }
+
+        let latest_prior_compaction = ancestry[..current_start]
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                matches!(entry.node.kind, NodeKind::Compaction { .. }).then_some(index)
+            })
+            .next_back();
+        if latest_prior_compaction.is_some_and(|index| retain_from <= index) {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "protected or recent history reaches an active prior compaction boundary",
+                false,
+            ));
+        }
+        let covers_to = retain_from.checked_sub(1).ok_or_else(|| {
             HaiderError::new(
                 ErrorCode::InvalidArgument,
                 "there is no prior history prefix to compact",
                 false,
             )
         })?;
-        Ok(CompactionIntent {
-            operation_id,
-            covers_from: ancestry[0].node.node.clone(),
-            covers_to: ancestry[covers_to].node.node.clone(),
-            resume_cause,
+        let covered_projection = compile_ancestry(
+            &envelopes,
+            &ancestry[..retain_from],
+            None,
+            Some(artifacts),
+            agent_id,
+            None,
+        )
+        .await?;
+        if covered_projection.messages.is_empty()
+            || covered_projection.messages.len() > full_projection.current_user_start
+        {
+            return Err(corrupt(
+                "compaction planner produced an invalid message boundary",
+            ));
+        }
+        Ok(crate::PlannedContextCompaction {
+            intent: CompactionIntent {
+                operation_id,
+                covers_from: ancestry[0].node.node.clone(),
+                covers_to: ancestry[covers_to].node.node.clone(),
+                resume_cause,
+            },
+            covered_message_count: covered_projection.messages.len(),
         })
     }
 
-    /// Plans an idle compaction over the complete active ancestry.
-    pub async fn plan_idle_compaction(
+    /// Rebuilds the exact original messages named by a compaction intent.
+    /// Active summary artifacts are deliberately ignored, so a replacement
+    /// summary never receives an older summary as input.
+    pub async fn compile_compaction_source(
         store: &dyn StoreHandle,
         session_id: &SessionId,
         branch_id: Option<&BranchId>,
         agent_id: Option<&AgentId>,
+        current_run: &RunId,
+        intent: &CompactionIntent,
+    ) -> Result<Vec<Message>, HaiderError> {
+        let envelopes = read_all(store, session_id).await?;
+        let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
+        let tree = TreeProjection::build(&envelopes);
+        let ancestry = match tree.ancestry_for_run(&envelopes, &lineage, agent_id, current_run)? {
+            Some(ancestry) => ancestry,
+            None => tree
+                .latest_ancestry(&envelopes, &lineage, agent_id, lineage.head.as_ref())?
+                .ok_or_else(|| corrupt("compaction source has no active ancestry"))?,
+        };
+        let from = ancestry
+            .iter()
+            .position(|entry| entry.node.node == intent.covers_from)
+            .ok_or_else(|| corrupt("compaction source is missing covers_from"))?;
+        let to = ancestry
+            .iter()
+            .position(|entry| entry.node.node == intent.covers_to)
+            .ok_or_else(|| corrupt("compaction source is missing covers_to"))?;
+        if from > to {
+            return Err(corrupt("compaction source coverage is reversed"));
+        }
+        let indexed_facts = JournalFactsIndex::build(&envelopes);
+        let mut fragments = HashMap::<Option<BranchId>, Vec<&RawEnvelope>>::new();
+        for envelope in &envelopes {
+            if envelope.agent_id.as_ref() == agent_id {
+                fragments
+                    .entry(envelope.branch_id.clone())
+                    .or_default()
+                    .push(envelope);
+            }
+        }
+        let mut messages = Vec::new();
+        let mut selected = Vec::new();
+        let mut owner = None::<Option<BranchId>>;
+        let mut current_user_seen = false;
+        let mut current_user_start = None;
+        for entry in &ancestry[from..=to] {
+            if owner.as_ref() != Some(&entry.owner_branch) {
+                if let Some(previous_owner) = owner.take() {
+                    flush_verbatim(
+                        &mut selected,
+                        &indexed_facts,
+                        previous_owner.as_ref(),
+                        agent_id,
+                        None,
+                        &mut current_user_seen,
+                        &mut current_user_start,
+                        &mut messages,
+                    )?;
+                }
+                owner = Some(entry.owner_branch.clone());
+            }
+            if let Some(scoped) = fragments.get(&entry.owner_branch) {
+                let start = scoped.partition_point(|envelope| envelope.seq <= entry.fragment_after);
+                let end = scoped.partition_point(|envelope| envelope.seq <= entry.seq);
+                selected.extend(
+                    scoped[start..end]
+                        .iter()
+                        .map(|envelope| (*envelope).clone()),
+                );
+            }
+        }
+        if let Some(owner) = owner {
+            flush_verbatim(
+                &mut selected,
+                &indexed_facts,
+                owner.as_ref(),
+                agent_id,
+                None,
+                &mut current_user_seen,
+                &mut current_user_start,
+                &mut messages,
+            )?;
+        }
+        let boundary = messages.len();
+        let mut projection = CompiledPromptProjection {
+            messages,
+            stable_history_end: boundary,
+            current_user_start: boundary,
+            latest_compaction_summary_end: None,
+        };
+        apply_structural_trim_events(&envelopes, &ancestry, agent_id, None, &mut projection)?;
+        Ok(projection.messages)
+    }
+
+    /// Plans an idle compaction while retaining the same protected recent
+    /// suffix as automatic summarization.
+    pub async fn plan_idle_compaction(
+        store: &dyn StoreHandle,
+        artifacts: &dyn ArtifactReader,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+        agent_id: Option<&AgentId>,
         operation_id: String,
-    ) -> Result<CompactionIntent, HaiderError> {
+    ) -> Result<crate::PlannedContextCompaction, HaiderError> {
         let envelopes = read_all(store, session_id).await?;
         let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
         let tree = TreeProjection::build(&envelopes);
@@ -512,14 +797,91 @@ impl PromptHistoryCompiler {
                     false,
                 )
             })?;
-        Ok(CompactionIntent {
-            operation_id,
-            covers_from: ancestry[0].node.node.clone(),
-            covers_to: ancestry
-                .last()
-                .map(|entry| entry.node.node.clone())
-                .ok_or_else(|| corrupt("history ancestry unexpectedly empty"))?,
-            resume_cause: CompactionResume::ManualIdle,
+        let full_projection =
+            compile_ancestry(&envelopes, &ancestry, None, Some(artifacts), agent_id, None).await?;
+        let mut retain_from = ancestry.len();
+        let protected_runs = envelopes
+            .iter()
+            .filter_map(|envelope| {
+                let EventPayload::ToolResult { result, .. } =
+                    serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
+                else {
+                    return None;
+                };
+                (!result.images.is_empty())
+                    .then(|| envelope.run_id.clone())
+                    .flatten()
+            })
+            .collect::<HashSet<_>>();
+        if let Some(protected_from) = ancestry
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let NodeKind::UserTurn { attachments, .. } = &entry.node.kind else {
+                    return None;
+                };
+                let protected_attachment = attachments.iter().any(|attachment| {
+                    matches!(
+                        attachment,
+                        AttachmentBlock::Image { .. } | AttachmentBlock::Skill { .. }
+                    )
+                });
+                (protected_attachment
+                    || entry
+                        .run_id
+                        .as_ref()
+                        .is_some_and(|run_id| protected_runs.contains(run_id)))
+                .then_some(index)
+            })
+            .min()
+        {
+            retain_from = retain_from.min(protected_from);
+        }
+        let latest_prior_compaction = ancestry
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                matches!(entry.node.kind, NodeKind::Compaction { .. }).then_some(index)
+            })
+            .next_back();
+        if latest_prior_compaction.is_some_and(|index| retain_from <= index) {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "protected history reaches an active prior compaction boundary",
+                false,
+            ));
+        }
+        let covers_to = retain_from.checked_sub(1).ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "there is no clean history prefix to compact",
+                false,
+            )
+        })?;
+        let covered_projection = compile_ancestry(
+            &envelopes,
+            &ancestry[..retain_from],
+            None,
+            Some(artifacts),
+            agent_id,
+            None,
+        )
+        .await?;
+        if covered_projection.messages.is_empty()
+            || covered_projection.messages.len() > full_projection.messages.len()
+        {
+            return Err(corrupt(
+                "idle compaction planner produced an invalid message boundary",
+            ));
+        }
+        Ok(crate::PlannedContextCompaction {
+            intent: CompactionIntent {
+                operation_id,
+                covers_from: ancestry[0].node.node.clone(),
+                covers_to: ancestry[covers_to].node.node.clone(),
+                resume_cause: CompactionResume::ManualIdle,
+            },
+            covered_message_count: covered_projection.messages.len(),
         })
     }
 }
@@ -1038,13 +1400,31 @@ impl CachedPromptSession {
         if is_compaction {
             self.note_compaction(&envelope);
         }
+        let is_context_savings = payload.as_ref().is_some_and(|payload| {
+            let EventPayload::Item(ItemEvent::Completed { item, .. }) = payload else {
+                return false;
+            };
+            matches!(item, TurnItem::Extension { kind, .. } if kind == CONTEXT_SAVINGS_EXTENSION_KIND)
+        });
+        if is_context_savings {
+            let timeline = PromptTimelineKey {
+                branch_id: envelope.branch_id.clone(),
+                agent_id: envelope.agent_id.clone(),
+            };
+            self.append_prefixes.retain(|scope, _| {
+                scope.branch_id != timeline.branch_id || scope.agent_id != timeline.agent_id
+            });
+            self.projections.retain(|key, _| {
+                key.branch_id != timeline.branch_id || key.agent_id != timeline.agent_id
+            });
+        }
         self.render_facts.push_decoded(&envelope, payload.as_ref());
         self.tree_index
             .push(envelope_index, &envelope, payload.as_ref());
         let rows = self.boundary_projector.push(&envelope);
         self.envelopes.push(envelope);
         self.note_boundary_rows(rows);
-        is_compaction
+        is_compaction || is_context_savings
     }
 
     fn indexed_ancestry_for_run(
@@ -2984,12 +3364,163 @@ async fn compile_ancestry(
         )));
     }
     let current_user_start = current_user_start.unwrap_or(messages.len());
-    Ok(CompiledPromptProjection {
+    let mut projection = CompiledPromptProjection {
         stable_history_end: current_user_start,
         current_user_start,
         latest_compaction_summary_end,
         messages,
-    })
+    };
+    apply_structural_trim_events(envelopes, ancestry, agent_id, current_run, &mut projection)?;
+    Ok(projection)
+}
+
+fn apply_structural_trim_events(
+    envelopes: &[RawEnvelope],
+    ancestry: &[TreeEntry],
+    agent_id: Option<&AgentId>,
+    current_run: Option<&RunId>,
+    projection: &mut CompiledPromptProjection,
+) -> Result<(), HaiderError> {
+    let mut fragments = HashMap::<Option<BranchId>, Vec<&RawEnvelope>>::new();
+    for envelope in envelopes {
+        if envelope.agent_id.as_ref() == agent_id {
+            fragments
+                .entry(envelope.branch_id.clone())
+                .or_default()
+                .push(envelope);
+        }
+    }
+    let mut selections = Vec::<(u64, String)>::new();
+    let mut seen_savings_events = HashSet::new();
+    for entry in ancestry {
+        let Some(scoped) = fragments.get(&entry.owner_branch) else {
+            continue;
+        };
+        let start = scoped.partition_point(|envelope| envelope.seq <= entry.fragment_after);
+        let end = scoped.partition_point(|envelope| envelope.seq <= entry.seq);
+        for envelope in &scoped[start..end] {
+            if !seen_savings_events.insert(envelope.seq) {
+                continue;
+            }
+            let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
+                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            else {
+                continue;
+            };
+            if let Some(event) = ContextSavingsEvent::try_from_extension_item(&item)
+                .map_err(|error| corrupt(format!("context-savings event is malformed: {error}")))?
+            {
+                selections.extend(
+                    event
+                        .removed_tool_call_ids
+                        .into_iter()
+                        .map(|call_id| (envelope.seq, call_id)),
+                );
+            }
+        }
+    }
+    // A structural trim commits before the provider request that will create
+    // the next assistant tree node. If the daemon restarts in that interval,
+    // the event is newer than the ancestry head but remains authoritative for
+    // this accepted run's provider view.
+    if let Some(current_run) = current_run {
+        for envelope in envelopes.iter().filter(|envelope| {
+            envelope.agent_id.as_ref() == agent_id && envelope.run_id.as_ref() == Some(current_run)
+        }) {
+            if !seen_savings_events.insert(envelope.seq) {
+                continue;
+            }
+            let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
+                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            else {
+                continue;
+            };
+            if let Some(event) = ContextSavingsEvent::try_from_extension_item(&item)
+                .map_err(|error| corrupt(format!("context-savings event is malformed: {error}")))?
+            {
+                selections.extend(
+                    event
+                        .removed_tool_call_ids
+                        .into_iter()
+                        .map(|call_id| (envelope.seq, call_id)),
+                );
+            }
+        }
+    }
+    selections.sort_by_key(|(seq, _)| *seq);
+    for (_, call_id) in selections {
+        remove_oldest_complete_tool_pair(projection, &call_id);
+    }
+    Ok(())
+}
+
+fn remove_oldest_complete_tool_pair(
+    projection: &mut CompiledPromptProjection,
+    removed_call_id: &str,
+) {
+    let mut pending_call = None;
+    let mut pair = None;
+    'messages: for (message_index, message) in projection.messages.iter().enumerate() {
+        for (block_index, block) in message.blocks.iter().enumerate() {
+            let coordinate = (message_index, block_index);
+            match block {
+                Block::ToolCall { call_id, .. } if call_id == removed_call_id => {
+                    if pending_call.is_some() {
+                        // Live trimming never records an ambiguous pair, so
+                        // restart replay stays conservative instead of
+                        // guessing between two unmatched calls.
+                        return;
+                    }
+                    pending_call = Some(coordinate);
+                }
+                Block::ToolResult {
+                    call_id, images, ..
+                } if call_id == removed_call_id => {
+                    let Some(call) = pending_call else {
+                        continue;
+                    };
+                    if call.0 >= coordinate.0 || !images.is_empty() {
+                        return;
+                    }
+                    pair = Some((call, coordinate));
+                    break 'messages;
+                }
+                _ => {}
+            }
+        }
+    }
+    let Some((call, result)) = pair else {
+        return;
+    };
+    let stable_history_end = projection.stable_history_end;
+    let current_user_start = projection.current_user_start;
+    let latest_summary_end = projection.latest_compaction_summary_end;
+    let mut removed_before_stable = 0_usize;
+    let mut removed_before_current = 0_usize;
+    let mut removed_before_summary = 0_usize;
+    let mut message_index = 0_usize;
+    projection.messages.retain_mut(|message| {
+        let original_index = message_index;
+        message_index = message_index.saturating_add(1);
+        let mut block_index = 0_usize;
+        message.blocks.retain(|_| {
+            let coordinate = (original_index, block_index);
+            block_index = block_index.saturating_add(1);
+            coordinate != call && coordinate != result
+        });
+        let retain = !message.blocks.is_empty();
+        if !retain {
+            removed_before_stable += usize::from(original_index < stable_history_end);
+            removed_before_current += usize::from(original_index < current_user_start);
+            removed_before_summary +=
+                usize::from(latest_summary_end.is_some_and(|end| original_index < end));
+        }
+        retain
+    });
+    projection.stable_history_end = stable_history_end.saturating_sub(removed_before_stable);
+    projection.current_user_start = current_user_start.saturating_sub(removed_before_current);
+    projection.latest_compaction_summary_end =
+        latest_summary_end.map(|end| end.saturating_sub(removed_before_summary));
 }
 
 #[allow(clippy::too_many_arguments)]

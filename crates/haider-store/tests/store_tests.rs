@@ -1,11 +1,12 @@
 #![allow(clippy::expect_used)]
 
+use haider_protocol::context::{ContextCompactionTier, ContextEconomy};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, envelope_weight_bytes,
 };
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, SessionId};
-use haider_store::{Cas, EventStore, SessionProjectionCheckpoint, Store};
+use haider_store::{Cas, EventStore, SessionCreateCommand, SessionProjectionCheckpoint, Store};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::fmt::Debug;
@@ -93,6 +94,62 @@ fn append_read_and_reopen_replay_are_byte_identical() {
     let reopened = must(Store::open(root.path()));
     let replayed = must(reopened.journal_replay(&session));
     assert_eq!(must(serde_json::to_vec(&replayed)), committed_json);
+}
+
+#[test]
+fn context_economy_metadata_survives_reopen_without_rewriting_the_journal() {
+    let root = test_root();
+    let session = SessionId::new("context-economy-reopen");
+    let expected = {
+        let store = must(Store::open(root.path()));
+        must(store.create_session(&SessionCreateCommand {
+            command_id: "context-economy-create".into(),
+            request_digest: "context-economy-digest".into(),
+            request_json: r#"{"session":"context-economy-reopen"}"#.into(),
+            session_id: session.clone(),
+            cwd: "/tmp".into(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4_096,
+            permission_overrides: None,
+            effort: None,
+            fast: true,
+            cache_policy: Default::default(),
+            system_prompt_version: "context-economy-v1".into(),
+            event_id: EventId::new("context-economy-created"),
+            device_id: DeviceId::new("context-economy-device"),
+        }));
+        let journal_before = must(serde_json::to_vec(&must(store.journal_replay(&session))));
+        let (first, _) = ContextEconomy::default().record_with_removed_tool_calls(
+            ContextCompactionTier::StructuralTrim24,
+            60_000,
+            48_000,
+            vec!["old-call".into()],
+        );
+        let (expected, _) = first.record(ContextCompactionTier::Summarize, 48_000, 12_000);
+        must(store.persist_context_economy(&session, &first));
+        must(store.persist_context_economy(&session, &expected));
+        assert_eq!(
+            must(serde_json::to_vec(&must(store.journal_replay(&session)))),
+            journal_before,
+            "metadata projection updates never rewrite an existing envelope"
+        );
+        assert_eq!(
+            must(store.session_metadata(&session))
+                .expect("typed metadata")
+                .context_economy,
+            expected
+        );
+        expected
+    };
+
+    let reopened = must(Store::open(root.path()));
+    assert_eq!(
+        must(reopened.session_metadata(&session))
+            .expect("reopened typed metadata")
+            .context_economy,
+        expected
+    );
 }
 
 /// MUTATION CHECK: make the reader accept only one SQLite storage class.

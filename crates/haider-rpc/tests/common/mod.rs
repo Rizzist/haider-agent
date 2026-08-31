@@ -108,6 +108,7 @@ pub fn transcript() -> Vec<WireFrame> {
         fast: false,
         cache_policy: Default::default(),
         agent_type: None,
+        context_economy: Default::default(),
         created_at_ms: 1_753_500_041_000,
     };
     let metafork_proposal = SessionMetaforkProposal {
@@ -416,6 +417,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     effort: None,
                     fast: false,
                     cache_policy: Default::default(),
+                    context_economy: Default::default(),
                     created_at_ms: 1_753_500_040_000,
                     agent_type: None,
                 },

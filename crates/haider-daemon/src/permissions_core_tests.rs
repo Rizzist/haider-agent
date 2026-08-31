@@ -298,6 +298,7 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
         effort: None,
         fast: false,
         cache_policy: Default::default(),
+        context_economy: Default::default(),
         created_at_ms: 1,
         agent_type: None,
     };
@@ -453,6 +454,7 @@ fn autonomous_effect_defaults_preserve_explicit_grant_precedence() {
         effort: None,
         fast: false,
         cache_policy: Default::default(),
+        context_economy: Default::default(),
         created_at_ms: 1,
         agent_type: None,
     };
@@ -515,6 +517,7 @@ fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
         effort: None,
         fast: false,
         cache_policy: Default::default(),
+        context_economy: Default::default(),
         created_at_ms: 1,
         agent_type: None,
     };

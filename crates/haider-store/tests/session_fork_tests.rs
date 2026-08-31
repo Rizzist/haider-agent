@@ -3,6 +3,7 @@
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
+use haider_protocol::context::{ContextCompactionTier, ContextEconomy};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::history::{NodeKind, TreeNode};
 use haider_protocol::ids::{
@@ -539,6 +540,11 @@ fn session_fork_keeps_parent_byte_identical_and_replays_idempotently() {
     let store = Store::open(root.path()).expect("store");
     let source = SessionId::new("fork-parent");
     create_session(&store, &source);
+    let (source_economy, _) =
+        ContextEconomy::default().record(ContextCompactionTier::Summarize, 50_000, 10_000);
+    store
+        .persist_context_economy(&source, &source_economy)
+        .expect("persist parent context economy");
     let (_, node, seq, user_seq) = source_turn(&store, &source, "keep this history");
     let source_events = store
         .journal_replay(&source)
@@ -603,6 +609,19 @@ fn session_fork_keeps_parent_byte_identical_and_replays_idempotently() {
     );
     assert_eq!(source_bytes(&store, &source), before);
     assert_eq!(source_storage_bytes(root.path(), &source), storage_before);
+    assert!(
+        created.metadata.context_economy.is_empty(),
+        "a fork starts a new savings ledger instead of inheriting the parent's total"
+    );
+    assert_eq!(
+        store
+            .session_metadata(&source)
+            .expect("parent metadata")
+            .expect("typed parent metadata")
+            .context_economy,
+        source_economy,
+        "forking does not mutate the parent's durable accounting"
+    );
     let source_event_ids = store
         .journal_replay(&source)
         .expect("source ids")
