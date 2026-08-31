@@ -1898,18 +1898,15 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
         .expect("durable child record");
     assert_eq!(handle.supervisor_count(), 2);
 
-    // The production TTL is five minutes. Paused time makes it short in wall
-    // time while preserving the exact 300s production budget it wraps.
-    for _ in 0..32 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::advance(Duration::from_secs(5 * 60)).await;
-    for _ in 0..128 {
-        if handle.supervisor_count() == 0 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    // The production TTL is five minutes. Paused-time `sleep` lets every ready
+    // task run before Tokio advances the clock; `advance` plus a fixed yield
+    // count did not fence the supervisors' next-loop timer arm on loaded Linux
+    // runners (same determinism fix as manager_law_tests).
+    let joined_before = handle.joined_supervisor_count();
+    tokio::time::sleep(Duration::from_secs(5 * 60)).await;
+    handle
+        .wait_for_joined_supervisor_count(joined_before.saturating_add(2))
+        .await;
     assert_eq!(
         handle.supervisor_count(),
         0,

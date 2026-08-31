@@ -2613,14 +2613,14 @@ impl WorkerManagerHandle {
     }
 
     #[cfg(test)]
-    fn joined_supervisor_count(&self) -> usize {
+    pub(crate) fn joined_supervisor_count(&self) -> usize {
         // Acquire pairs with the manager's release publication after slot
         // removal, so this witness cannot expose a stale supervisor count.
         self.stats.joined_supervisors.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
-    async fn wait_for_joined_supervisor_count(&self, expected: usize) {
+    pub(crate) async fn wait_for_joined_supervisor_count(&self, expected: usize) {
         while self.joined_supervisor_count() < expected {
             // `notify_one` retains a permit if the manager publishes the
             // JoinSet outcome between the counter check and this await.
