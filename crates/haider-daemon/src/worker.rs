@@ -157,7 +157,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
@@ -165,6 +165,11 @@ use tokio::task::{JoinHandle, JoinSet};
 
 const MANAGER_CAPACITY: usize = 128;
 const SUPERVISOR_CAPACITY: usize = 64;
+/// A live session remains cheaply reusable for five minutes after its worker
+/// reports durable quiescence. Activity cancels the owned timer; queued,
+/// active, cancelling, recovery, and menu-parked work never reports this
+/// state and therefore cannot be retired by absence of a client.
+const SUPERVISOR_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 const COMPUTER_PERMISSION_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 const COMPUTER_PERMISSION_MENU_ORIGIN: &str = "computer-os-permission";
 
@@ -1804,6 +1809,14 @@ pub(crate) struct WorkerManagerHandle {
     commands: mpsc::Sender<ManagerCommand>,
     admission: Arc<std::sync::Mutex<bool>>,
     drain_wake: tokio::sync::watch::Sender<bool>,
+    #[cfg(test)]
+    stats: Arc<WorkerManagerStats>,
+}
+
+#[derive(Default)]
+struct WorkerManagerStats {
+    supervisors: AtomicUsize,
+    joined_supervisors: AtomicUsize,
 }
 
 /// Owner of every supervisor task (R1): one lazy supervisor per session,
@@ -1854,6 +1867,10 @@ enum ManagerCommand {
         pending: Box<PendingShellExec>,
         completed: oneshot::Sender<Result<(), HaiderError>>,
     },
+    Retire {
+        session_id: SessionId,
+        completed: oneshot::Sender<Result<(), HaiderError>>,
+    },
     Shutdown {
         completed: oneshot::Sender<Result<(), HaiderError>>,
     },
@@ -1881,7 +1898,27 @@ enum SupervisorCommand {
         completed: oneshot::Sender<Result<AcceptedCompaction, HaiderError>>,
     },
     ShellExec(Box<PendingShellExec>),
+    Retire {
+        idle_expiry: bool,
+    },
     Shutdown,
+}
+
+enum SupervisorLifecycle {
+    IdleExpired {
+        session_id: SessionId,
+        spawn_nonce: String,
+    },
+    RetirementRefused {
+        session_id: SessionId,
+        spawn_nonce: String,
+    },
+}
+
+struct SupervisorRetirementContext {
+    spawn_nonce: String,
+    lifecycle: mpsc::UnboundedSender<SupervisorLifecycle>,
+    quiescent_retired: Arc<AtomicBool>,
 }
 
 pub(crate) struct PendingShellExec {
@@ -1933,11 +1970,53 @@ struct PendingTurn {
 struct SupervisorSlot {
     sender: mpsc::Sender<SupervisorCommand>,
     task_id: tokio::task::Id,
+    spawn_nonce: String,
+    state: SupervisorSlotState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SupervisorSlotState {
+    Active,
+    Retiring,
+}
+
+enum SupervisorOutcome {
+    Stopped { terminalize_nonterminal: bool },
+    QuiescentRetired,
 }
 
 struct SupervisorExit {
     session_id: SessionId,
-    terminalize_nonterminal: bool,
+    spawn_nonce: String,
+    outcome: SupervisorOutcome,
+}
+
+struct SupervisorIdentity {
+    session_id: SessionId,
+    spawn_nonce: String,
+}
+
+fn worker_spawn_nonce() -> Result<String, HaiderError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("cannot mint worker spawn nonce: {error}"),
+            true,
+        )
+    })?;
+    Ok(hex::encode(bytes))
+}
+
+fn run_state_allows_supervisor_retirement(state: &RunState) -> bool {
+    state.is_terminal()
+}
+
+async fn wait_for_supervisor_idle_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 impl PendingTurn {
@@ -1988,12 +2067,15 @@ impl WorkerManager {
         }
         let (commands, receiver) = mpsc::channel(MANAGER_CAPACITY);
         let (drain_wake, drain_wakes) = tokio::sync::watch::channel(false);
+        let stats = Arc::new(WorkerManagerStats::default());
         let handle = WorkerManagerHandle {
             commands,
             admission: Arc::new(std::sync::Mutex::new(true)),
             drain_wake,
+            #[cfg(test)]
+            stats: Arc::clone(&stats),
         };
-        let task = tokio::spawn(run_manager(hub, dependencies, receiver, drain_wakes));
+        let task = tokio::spawn(run_manager(hub, dependencies, receiver, drain_wakes, stats));
         Self {
             handle,
             task: Some(task),
@@ -2039,9 +2121,9 @@ impl WorkerManager {
     /// terminal event. Startup recovery must decide what the durable prefix
     /// means. This is intentionally distinct from a child-supervisor panic:
     /// the live manager observes those through its JoinSet, terminalizes the
-    /// run, evicts the slot, and retains/increments the session incarnation
-    /// before recreation. Eviction and incarnation are inseparable because a
-    /// same-generation EventIdGenerator namespace must never be reused.
+    /// run, then evicts the slot. Every recreation receives a fresh random
+    /// spawn nonce so a same-generation EventIdGenerator namespace is never
+    /// reused without retaining one counter per historical session.
     pub(crate) async fn crash(mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
@@ -2081,6 +2163,32 @@ impl WorkerManagerHandle {
                 .map_err(manager_try_send)?;
         }
         response.await.map_err(|_| manager_stopped())?
+    }
+
+    /// Retires one session's supervisor through its normal owned join path.
+    /// Deletion calls this after publishing its admission tombstone and
+    /// before stopping the actor that the supervisor needs to unregister its
+    /// lease.
+    pub(crate) async fn retire(&self, session_id: SessionId) -> Result<(), HaiderError> {
+        let (completed, response) = oneshot::channel();
+        self.commands
+            .send(ManagerCommand::Retire {
+                session_id,
+                completed,
+            })
+            .await
+            .map_err(|_| manager_stopped())?;
+        response.await.map_err(|_| manager_stopped())?
+    }
+
+    #[cfg(test)]
+    pub(crate) fn supervisor_count(&self) -> usize {
+        self.stats.supervisors.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn joined_supervisor_count(&self) -> usize {
+        self.stats.joined_supervisors.load(Ordering::Relaxed)
     }
 
     pub(crate) async fn retry(&self, accepted: AcceptedRunRetry) -> Result<(), HaiderError> {
@@ -2330,44 +2438,103 @@ async fn run_manager(
     dependencies: WorkerDependencies,
     mut commands: mpsc::Receiver<ManagerCommand>,
     drain_wakes: tokio::sync::watch::Receiver<bool>,
+    stats: Arc<WorkerManagerStats>,
 ) {
     let mut supervisors = HashMap::<SessionId, SupervisorSlot>::new();
-    let mut incarnations = HashMap::<SessionId, u64>::new();
-    let mut task_sessions = HashMap::<tokio::task::Id, SessionId>::new();
+    let mut task_sessions = HashMap::<tokio::task::Id, SupervisorIdentity>::new();
     let mut tasks = JoinSet::<SupervisorExit>::new();
+    let mut control_tasks = JoinSet::<()>::new();
+    let (lifecycle, mut lifecycle_events) = mpsc::unbounded_channel::<SupervisorLifecycle>();
+    let mut deferred = HashMap::<SessionId, VecDeque<ManagerCommand>>::new();
+    let mut ready = VecDeque::<ManagerCommand>::new();
+    let mut retirement_waiters =
+        HashMap::<SessionId, Vec<oneshot::Sender<Result<(), HaiderError>>>>::new();
     loop {
-        let command = tokio::select! {
-            biased;
-            outcome = tasks.join_next_with_id(), if !tasks.is_empty() => {
-                if let Some(outcome) = outcome {
-                    handle_supervisor_exit(
-                        &hub,
-                        &mut supervisors,
-                        &mut task_sessions,
-                        &mut incarnations,
-                        outcome,
-                    ).await;
+        let command = if let Some(command) = ready.pop_front() {
+            Some(command)
+        } else {
+            tokio::select! {
+                biased;
+                outcome = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                    if let Some(outcome) = outcome
+                        && let Some(exit) = handle_supervisor_exit(
+                            &hub,
+                            &mut supervisors,
+                            &mut task_sessions,
+                            &stats,
+                            outcome,
+                        ).await
+                    {
+                        if let Some(waiters) = retirement_waiters.remove(&exit.session_id) {
+                            for waiter in waiters {
+                                let result = if exit.quiescent_retired {
+                                    Ok(())
+                                } else {
+                                    Err(manager_stopped())
+                                };
+                                let _ = waiter.send(result);
+                            }
+                        }
+                        if let Some(mut pending) = deferred.remove(&exit.session_id) {
+                            ready.append(&mut pending);
+                        }
+                    }
+                    continue;
                 }
-                continue;
+                _ = control_tasks.join_next(), if !control_tasks.is_empty() => {
+                    continue;
+                }
+                event = lifecycle_events.recv() => {
+                    if let Some(event) = event {
+                        handle_supervisor_lifecycle(
+                            event,
+                            &mut supervisors,
+                            &mut control_tasks,
+                            &mut retirement_waiters,
+                            &mut deferred,
+                            &mut ready,
+                        );
+                    }
+                    continue;
+                }
+                command = commands.recv() => command,
             }
-            command = commands.recv() => command,
         };
         let Some(command) = command else {
             break;
         };
+        if let Some(session_id) = manager_command_session(&command).cloned() {
+            let retirement_race = !matches!(command, ManagerCommand::Retire { .. })
+                && supervisors
+                    .get(&session_id)
+                    .is_some_and(|slot| slot.state == SupervisorSlotState::Retiring);
+            let exit_race = supervisors
+                .get(&session_id)
+                .is_some_and(|slot| slot.sender.is_closed());
+            if retirement_race || exit_race {
+                // The old slot remains authoritative until its JoinSet item is
+                // observed. Requeue after that join/removal instead of leaking
+                // the transient closed/retiring state as Busy to the caller.
+                deferred.entry(session_id).or_default().push_back(command);
+                continue;
+            }
+        }
         match command {
             ManagerCommand::Submit {
                 accepted,
                 completed,
             } => {
                 let result = match supervisor_for(
-                    &hub,
-                    &dependencies,
-                    &drain_wakes,
-                    &mut supervisors,
-                    &mut tasks,
-                    &mut task_sessions,
-                    &mut incarnations,
+                    SupervisorSpawnState {
+                        hub: &hub,
+                        dependencies: &dependencies,
+                        drain_wakes: &drain_wakes,
+                        supervisors: &mut supervisors,
+                        tasks: &mut tasks,
+                        task_sessions: &mut task_sessions,
+                        lifecycle: &lifecycle,
+                        stats: &stats,
+                    },
                     accepted.session_id.clone(),
                 )
                 .await
@@ -2386,13 +2553,16 @@ async fn run_manager(
                 completed,
             } => {
                 let result = match supervisor_for(
-                    &hub,
-                    &dependencies,
-                    &drain_wakes,
-                    &mut supervisors,
-                    &mut tasks,
-                    &mut task_sessions,
-                    &mut incarnations,
+                    SupervisorSpawnState {
+                        hub: &hub,
+                        dependencies: &dependencies,
+                        drain_wakes: &drain_wakes,
+                        supervisors: &mut supervisors,
+                        tasks: &mut tasks,
+                        task_sessions: &mut task_sessions,
+                        lifecycle: &lifecycle,
+                        stats: &stats,
+                    },
                     accepted.session_id.clone(),
                 )
                 .await
@@ -2440,13 +2610,16 @@ async fn run_manager(
             ManagerCommand::Recover { mut pending } => {
                 let session_id = pending.accepted.session_id.clone();
                 match supervisor_for(
-                    &hub,
-                    &dependencies,
-                    &drain_wakes,
-                    &mut supervisors,
-                    &mut tasks,
-                    &mut task_sessions,
-                    &mut incarnations,
+                    SupervisorSpawnState {
+                        hub: &hub,
+                        dependencies: &dependencies,
+                        drain_wakes: &drain_wakes,
+                        supervisors: &mut supervisors,
+                        tasks: &mut tasks,
+                        task_sessions: &mut task_sessions,
+                        lifecycle: &lifecycle,
+                        stats: &stats,
+                    },
                     session_id,
                 )
                 .await
@@ -2488,13 +2661,16 @@ async fn run_manager(
                 completed,
             } => {
                 let supervisor = match supervisor_for(
-                    &hub,
-                    &dependencies,
-                    &drain_wakes,
-                    &mut supervisors,
-                    &mut tasks,
-                    &mut task_sessions,
-                    &mut incarnations,
+                    SupervisorSpawnState {
+                        hub: &hub,
+                        dependencies: &dependencies,
+                        drain_wakes: &drain_wakes,
+                        supervisors: &mut supervisors,
+                        tasks: &mut tasks,
+                        task_sessions: &mut task_sessions,
+                        lifecycle: &lifecycle,
+                        stats: &stats,
+                    },
                     session_id.clone(),
                 )
                 .await
@@ -2534,13 +2710,16 @@ async fn run_manager(
                 completed,
             } => {
                 let supervisor = match supervisor_for(
-                    &hub,
-                    &dependencies,
-                    &drain_wakes,
-                    &mut supervisors,
-                    &mut tasks,
-                    &mut task_sessions,
-                    &mut incarnations,
+                    SupervisorSpawnState {
+                        hub: &hub,
+                        dependencies: &dependencies,
+                        drain_wakes: &drain_wakes,
+                        supervisors: &mut supervisors,
+                        tasks: &mut tasks,
+                        task_sessions: &mut task_sessions,
+                        lifecycle: &lifecycle,
+                        stats: &stats,
+                    },
                     session_id,
                 )
                 .await
@@ -2573,13 +2752,16 @@ async fn run_manager(
             }
             ManagerCommand::ShellExec { pending, completed } => {
                 let supervisor = match supervisor_for(
-                    &hub,
-                    &dependencies,
-                    &drain_wakes,
-                    &mut supervisors,
-                    &mut tasks,
-                    &mut task_sessions,
-                    &mut incarnations,
+                    SupervisorSpawnState {
+                        hub: &hub,
+                        dependencies: &dependencies,
+                        drain_wakes: &drain_wakes,
+                        supervisors: &mut supervisors,
+                        tasks: &mut tasks,
+                        task_sessions: &mut task_sessions,
+                        lifecycle: &lifecycle,
+                        stats: &stats,
+                    },
                     pending.accepted.session_id.clone(),
                 )
                 .await
@@ -2595,16 +2777,33 @@ async fn run_manager(
                     .map_err(supervisor_try_send);
                 let _ = completed.send(result);
             }
+            ManagerCommand::Retire {
+                session_id,
+                completed,
+            } => match supervisors.get_mut(&session_id) {
+                None => {
+                    let _ = completed.send(Ok(()));
+                }
+                Some(slot) => {
+                    retirement_waiters
+                        .entry(session_id.clone())
+                        .or_default()
+                        .push(completed);
+                    if slot.state == SupervisorSlotState::Active {
+                        request_supervisor_retirement(slot, false, &mut control_tasks);
+                    }
+                }
+            },
             ManagerCommand::Shutdown { completed } => {
                 for supervisor in supervisors.values() {
                     let _ = supervisor.sender.send(SupervisorCommand::Shutdown).await;
                 }
                 while let Some(outcome) = tasks.join_next_with_id().await {
-                    handle_supervisor_exit(
+                    let _ = handle_supervisor_exit(
                         &hub,
                         &mut supervisors,
                         &mut task_sessions,
-                        &mut incarnations,
+                        &stats,
                         outcome,
                     )
                     .await;
@@ -2619,6 +2818,86 @@ async fn run_manager(
         let _ = supervisor.sender.send(SupervisorCommand::Shutdown).await;
     }
     while tasks.join_next().await.is_some() {}
+}
+
+fn manager_command_session(command: &ManagerCommand) -> Option<&SessionId> {
+    match command {
+        ManagerCommand::Submit { accepted, .. } => Some(&accepted.session_id),
+        ManagerCommand::Retry { accepted, .. } => Some(&accepted.session_id),
+        ManagerCommand::WakeRetry { session_id, .. }
+        | ManagerCommand::Nudge { session_id, .. }
+        | ManagerCommand::Compact { session_id, .. }
+        | ManagerCommand::Retire { session_id, .. } => Some(session_id),
+        ManagerCommand::Recover { pending } => Some(&pending.accepted.session_id),
+        ManagerCommand::ShellExec { pending, .. } => Some(&pending.accepted.session_id),
+        ManagerCommand::Shutdown { .. } => None,
+    }
+}
+
+fn request_supervisor_retirement(
+    slot: &mut SupervisorSlot,
+    idle_expiry: bool,
+    control_tasks: &mut JoinSet<()>,
+) {
+    slot.state = SupervisorSlotState::Retiring;
+    let sender = slot.sender.clone();
+    if matches!(
+        sender.try_send(SupervisorCommand::Retire { idle_expiry }),
+        Err(mpsc::error::TrySendError::Full(_))
+    ) {
+        // A full queue must not strand the slot in Retiring. This owned task
+        // waits for capacity while the manager defers racing submissions; the
+        // supervisor's normal JoinSet outcome remains the retirement fence.
+        control_tasks.spawn(async move {
+            let _ = sender.send(SupervisorCommand::Retire { idle_expiry }).await;
+        });
+    }
+}
+
+fn handle_supervisor_lifecycle(
+    event: SupervisorLifecycle,
+    supervisors: &mut HashMap<SessionId, SupervisorSlot>,
+    control_tasks: &mut JoinSet<()>,
+    retirement_waiters: &mut HashMap<SessionId, Vec<oneshot::Sender<Result<(), HaiderError>>>>,
+    deferred: &mut HashMap<SessionId, VecDeque<ManagerCommand>>,
+    ready: &mut VecDeque<ManagerCommand>,
+) {
+    match event {
+        SupervisorLifecycle::IdleExpired {
+            session_id,
+            spawn_nonce,
+        } => {
+            let Some(slot) = supervisors.get_mut(&session_id) else {
+                return;
+            };
+            if slot.spawn_nonce != spawn_nonce || slot.state != SupervisorSlotState::Active {
+                return;
+            }
+            request_supervisor_retirement(slot, true, control_tasks);
+        }
+        SupervisorLifecycle::RetirementRefused {
+            session_id,
+            spawn_nonce,
+        } => {
+            let Some(slot) = supervisors.get_mut(&session_id) else {
+                return;
+            };
+            if slot.spawn_nonce != spawn_nonce || slot.state != SupervisorSlotState::Retiring {
+                return;
+            }
+            slot.state = SupervisorSlotState::Active;
+            if let Some(waiters) = retirement_waiters.remove(&session_id) {
+                for waiter in waiters {
+                    let _ = waiter.send(Err(manager_busy(
+                        "session worker became nonterminal during retirement",
+                    )));
+                }
+            }
+            if let Some(mut pending) = deferred.remove(&session_id) {
+                ready.append(&mut pending);
+            }
+        }
+    }
 }
 
 async fn terminalize_recovery_feed_failure(
@@ -2786,44 +3065,63 @@ async fn drain_accepted_without_handoff(hub: &SessionHub) -> Result<(), HaiderEr
     Ok(())
 }
 
+struct HandledSupervisorExit {
+    session_id: SessionId,
+    quiescent_retired: bool,
+}
+
 async fn handle_supervisor_exit(
     hub: &SessionHub,
     supervisors: &mut HashMap<SessionId, SupervisorSlot>,
-    task_sessions: &mut HashMap<tokio::task::Id, SessionId>,
-    incarnations: &mut HashMap<SessionId, u64>,
+    task_sessions: &mut HashMap<tokio::task::Id, SupervisorIdentity>,
+    stats: &WorkerManagerStats,
     outcome: Result<(tokio::task::Id, SupervisorExit), tokio::task::JoinError>,
-) {
-    let (task_id, session_id, panicked, terminalize_nonterminal) = match outcome {
+) -> Option<HandledSupervisorExit> {
+    let (task_id, session_id, spawn_nonce, panicked, supervisor_outcome) = match outcome {
         Ok((task_id, exit)) => (
             task_id,
             exit.session_id,
+            exit.spawn_nonce,
             false,
-            exit.terminalize_nonterminal,
+            exit.outcome,
         ),
         Err(error) => {
             let task_id = error.id();
-            let Some(session_id) = task_sessions.get(&task_id).cloned() else {
+            let Some(identity) = task_sessions.get(&task_id) else {
                 tracing::error!(?error, "unknown supervisor task failed");
-                return;
+                return None;
             };
-            (task_id, session_id, error.is_panic(), true)
+            (
+                task_id,
+                identity.session_id.clone(),
+                identity.spawn_nonce.clone(),
+                error.is_panic(),
+                SupervisorOutcome::Stopped {
+                    terminalize_nonterminal: true,
+                },
+            )
         }
     };
+    // Reaching this line is the explicit witness that the manager-owned
+    // JoinSet yielded the task; slot removal and retirement acknowledgements
+    // are deliberately downstream of it.
+    stats.joined_supervisors.fetch_add(1, Ordering::Relaxed);
     task_sessions.remove(&task_id);
     if supervisors
         .get(&session_id)
         .is_some_and(|slot| slot.task_id == task_id)
     {
         supervisors.remove(&session_id);
+        stats.supervisors.fetch_sub(1, Ordering::Relaxed);
     }
-    // EVICTION + INCARNATION are one law: eviction makes later submissions
-    // usable again, while the next `supervisor_for` increments the retained
-    // incarnation before constructing its EventIdGenerator. Never evict
-    // without retaining this counter or a recreated supervisor could collide
-    // with event IDs minted by its predecessor in the same store generation.
-    let incarnation = *incarnations.entry(session_id.clone()).or_insert(1);
+    let (terminalize_nonterminal, quiescent_retired) = match supervisor_outcome {
+        SupervisorOutcome::Stopped {
+            terminalize_nonterminal,
+        } => (terminalize_nonterminal, false),
+        SupervisorOutcome::QuiescentRetired => (false, true),
+    };
     if terminalize_nonterminal
-        && let Err(error) = terminalize_supervisor_exit(hub, &session_id, incarnation).await
+        && let Err(error) = terminalize_supervisor_exit(hub, &session_id, &spawn_nonce).await
     {
         tracing::error!(
             %session_id,
@@ -2832,12 +3130,16 @@ async fn handle_supervisor_exit(
             "exited supervisor work could not be terminalized"
         );
     }
+    Some(HandledSupervisorExit {
+        session_id,
+        quiescent_retired,
+    })
 }
 
 pub(crate) async fn terminalize_supervisor_exit(
     hub: &SessionHub,
     session_id: &SessionId,
-    incarnation: u64,
+    spawn_nonce: &str,
 ) -> Result<(), HaiderError> {
     let lease = hub
         .acquire_worker_lease(session_id.clone())
@@ -2847,13 +3149,13 @@ pub(crate) async fn terminalize_supervisor_exit(
         "panic-worker-{}-{}-{}",
         session_id,
         lease.worker_generation(),
-        incarnation,
+        spawn_nonce,
     ));
     let event_ids = EventIdGenerator::new(format!(
         "panic-event-{}-{}-{}",
         session_id,
         lease.worker_generation(),
-        incarnation,
+        spawn_nonce,
     ));
     let runs = durable_runs(&lease)
         .await?
@@ -2955,17 +3257,31 @@ pub(crate) async fn terminalize_supervisor_exit(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+struct SupervisorSpawnState<'a> {
+    hub: &'a SessionHub,
+    dependencies: &'a WorkerDependencies,
+    drain_wakes: &'a tokio::sync::watch::Receiver<bool>,
+    supervisors: &'a mut HashMap<SessionId, SupervisorSlot>,
+    tasks: &'a mut JoinSet<SupervisorExit>,
+    task_sessions: &'a mut HashMap<tokio::task::Id, SupervisorIdentity>,
+    lifecycle: &'a mpsc::UnboundedSender<SupervisorLifecycle>,
+    stats: &'a WorkerManagerStats,
+}
+
 async fn supervisor_for(
-    hub: &SessionHub,
-    dependencies: &WorkerDependencies,
-    drain_wakes: &tokio::sync::watch::Receiver<bool>,
-    supervisors: &mut HashMap<SessionId, SupervisorSlot>,
-    tasks: &mut JoinSet<SupervisorExit>,
-    task_sessions: &mut HashMap<tokio::task::Id, SessionId>,
-    incarnations: &mut HashMap<SessionId, u64>,
+    state: SupervisorSpawnState<'_>,
     session_id: SessionId,
 ) -> Result<mpsc::Sender<SupervisorCommand>, HaiderError> {
+    let SupervisorSpawnState {
+        hub,
+        dependencies,
+        drain_wakes,
+        supervisors,
+        tasks,
+        task_sessions,
+        lifecycle,
+        stats,
+    } = state;
     if let Some(supervisor) = supervisors.get(&session_id) {
         return if supervisor.sender.is_closed() {
             Err(manager_busy(
@@ -2988,14 +3304,14 @@ async fn supervisor_for(
         .await
         .map_err(hub_error)?;
     let (sender, receiver) = mpsc::channel(SUPERVISOR_CAPACITY);
-    let incarnation = *incarnations
-        .entry(session_id.clone())
-        .and_modify(|incarnation| *incarnation = incarnation.saturating_add(1))
-        .or_insert(1);
+    let spawn_nonce = worker_spawn_nonce()?;
     let task_session_id = session_id.clone();
+    let task_spawn_nonce = spawn_nonce.clone();
     let supervisor_dependencies = dependencies.clone();
     let supervisor_drain_wakes = (*drain_wakes).clone();
+    let supervisor_lifecycle = lifecycle.clone();
     let task = tasks.spawn(async move {
+        let quiescent_retired = Arc::new(AtomicBool::new(false));
         let terminalize_nonterminal = run_supervisor(
             supervisor_dependencies,
             metadata,
@@ -3003,23 +3319,44 @@ async fn supervisor_for(
             receiver,
             cancellation_wakes,
             supervisor_drain_wakes,
-            incarnation,
+            SupervisorRetirementContext {
+                spawn_nonce: task_spawn_nonce.clone(),
+                lifecycle: supervisor_lifecycle,
+                quiescent_retired: Arc::clone(&quiescent_retired),
+            },
         )
         .await;
+        let outcome = if quiescent_retired.load(Ordering::Acquire) {
+            SupervisorOutcome::QuiescentRetired
+        } else {
+            SupervisorOutcome::Stopped {
+                terminalize_nonterminal,
+            }
+        };
         SupervisorExit {
             session_id: task_session_id,
-            terminalize_nonterminal,
+            spawn_nonce: task_spawn_nonce,
+            outcome,
         }
     });
     let task_id = task.id();
-    task_sessions.insert(task_id, session_id.clone());
+    task_sessions.insert(
+        task_id,
+        SupervisorIdentity {
+            session_id: session_id.clone(),
+            spawn_nonce: spawn_nonce.clone(),
+        },
+    );
     supervisors.insert(
         session_id,
         SupervisorSlot {
             sender: sender.clone(),
             task_id,
+            spawn_nonce,
+            state: SupervisorSlotState::Active,
         },
     );
+    stats.supervisors.fetch_add(1, Ordering::Relaxed);
     Ok(sender)
 }
 
@@ -3126,26 +3463,34 @@ async fn run_supervisor(
     mut commands: mpsc::Receiver<SupervisorCommand>,
     mut cancellation_wakes: tokio::sync::watch::Receiver<u64>,
     mut drain_wakes: tokio::sync::watch::Receiver<bool>,
-    incarnation: u64,
+    retirement: SupervisorRetirementContext,
 ) -> bool {
+    let SupervisorRetirementContext {
+        spawn_nonce,
+        lifecycle,
+        quiescent_retired,
+    } = retirement;
     let mut queue = VecDeque::<PendingTurn>::new();
     let mut active: Option<ActiveTurn> = None;
     let device_id = DeviceId::new(format!(
         "worker-{}-{}-{}",
         lease.session_id(),
         lease.worker_generation(),
-        incarnation,
+        spawn_nonce,
     ));
     let event_ids = Arc::new(EventIdGenerator::new(format!(
         "worker-event-{}-{}-{}",
         lease.session_id(),
         lease.worker_generation(),
-        incarnation,
+        spawn_nonce,
     )));
     let mut stopping = false;
     let mut parked_checkpoint = false;
     let mut rescan_needed = false;
     let mut deferred_shell = VecDeque::<PendingShellExec>::new();
+    let mut retire_requested = false;
+    let mut idle_deadline = None::<tokio::time::Instant>;
+    let mut idle_expired = false;
     // The queued-budget scan/timer survives unrelated select re-entry. Only a
     // queue mutation advances the epoch and installs a freshly scanned arm.
     let queue_changed = Arc::new(Notify::new());
@@ -3168,6 +3513,34 @@ async fn run_supervisor(
     }
 
     loop {
+        if retire_requested && active.is_none() {
+            let durably_quiescent = queue.is_empty()
+                && deferred_shell.is_empty()
+                && !rescan_needed
+                && durable_runs(&lease).await.is_ok_and(|runs| {
+                    runs.iter()
+                        .all(|(_, state, _, _, _)| run_state_allows_supervisor_retirement(state))
+                });
+            if durably_quiescent {
+                if let Err(error) = lease.unregister_worker().await {
+                    tracing::error!(
+                        session_id = %lease.session_id(),
+                        ?error,
+                        "quiescent supervisor could not unregister its lease"
+                    );
+                    return true;
+                }
+                quiescent_retired.store(true, Ordering::Release);
+                return false;
+            }
+            let _ = lifecycle.send(SupervisorLifecycle::RetirementRefused {
+                session_id: lease.session_id().clone(),
+                spawn_nonce: spawn_nonce.clone(),
+            });
+            retire_requested = false;
+            idle_deadline = None;
+            idle_expired = false;
+        }
         if active.is_none() {
             queued_budget_arm = None;
         }
@@ -3411,6 +3784,21 @@ async fn run_supervisor(
             }
         }
 
+        if active.is_none()
+            && queue.is_empty()
+            && deferred_shell.is_empty()
+            && !rescan_needed
+            && !stopping
+            && idle_deadline.is_none()
+            && !idle_expired
+            && durable_runs(&lease).await.is_ok_and(|runs| {
+                runs.iter()
+                    .all(|(_, state, _, _, _)| run_state_allows_supervisor_retirement(state))
+            })
+        {
+            idle_deadline = Some(tokio::time::Instant::now() + SUPERVISOR_IDLE_TTL);
+        }
+
         if stopping && active.is_none() {
             break;
         }
@@ -3498,6 +3886,8 @@ async fn run_supervisor(
                 command = commands.recv() => {
                     match command {
                         Some(SupervisorCommand::Submit(pending)) => {
+                            idle_deadline = None;
+                            idle_expired = false;
                             if admit_pending(
                                 &mut queue,
                                 &mut rescan_needed,
@@ -3516,6 +3906,8 @@ async fn run_supervisor(
                             command_id,
                             completed,
                         }) => {
+                            idle_deadline = None;
+                            idle_expired = false;
                             if run_id == active_run {
                                 let _ = turn
                                     .harness
@@ -3533,6 +3925,8 @@ async fn run_supervisor(
                             mode,
                             completed,
                         }) => {
+                            idle_deadline = None;
+                            idle_expired = false;
                             let result = deliver_mid_turn_to_active(
                                 turn,
                                 &active_run,
@@ -3545,6 +3939,8 @@ async fn run_supervisor(
                             let _ = completed.send(result);
                         }
                         Some(SupervisorCommand::Compact { completed, .. }) => {
+                            idle_deadline = None;
+                            idle_expired = false;
                             let _ = completed.send(Err(HaiderError::new(
                                 ErrorCode::Busy,
                                 "manual context compaction is idle-only",
@@ -3552,6 +3948,8 @@ async fn run_supervisor(
                             )));
                         }
                         Some(SupervisorCommand::ShellExec(pending)) => {
+                            idle_deadline = None;
+                            idle_expired = false;
                             // Store admission can observe the turn's durable
                             // terminal a few instructions before this branch
                             // reaps `ActiveTurn`. Preserve that accepted job
@@ -3559,6 +3957,16 @@ async fn run_supervisor(
                             // handoff. Receipt replays for the same run are
                             // response-only duplicates and need one slot.
                             defer_shell_handoff(&mut deferred_shell, *pending);
+                        }
+                        Some(SupervisorCommand::Retire { idle_expiry }) => {
+                            if idle_expiry && !idle_expired {
+                                let _ = lifecycle.send(SupervisorLifecycle::RetirementRefused {
+                                    session_id: lease.session_id().clone(),
+                                    spawn_nonce: spawn_nonce.clone(),
+                                });
+                            } else {
+                                retire_requested = true;
+                            }
                         }
                         Some(SupervisorCommand::Shutdown) | None => {
                             stopping = true;
@@ -3753,8 +4161,8 @@ async fn run_supervisor(
                                 }
                             }
                             // Returning is intentional: the manager observes
-                            // this JoinSet exit, evicts the slot, and retains
-                            // the incarnation counter before a later submit.
+                            // this JoinSet exit and evicts the slot. A later
+                            // submit mints a fresh random spawn namespace.
                             let _ = lease.unregister_worker().await;
                             return true;
                         }
@@ -3922,6 +4330,8 @@ async fn run_supervisor(
             tokio::select! {
                 command = commands.recv() => match command {
                     Some(SupervisorCommand::Submit(pending)) => {
+                        idle_deadline = None;
+                        idle_expired = false;
                         if admit_pending(
                             &mut queue,
                             &mut rescan_needed,
@@ -3935,11 +4345,15 @@ async fn run_supervisor(
                         }
                     }
                     Some(SupervisorCommand::WakeRetry { completed, .. }) => {
+                        idle_deadline = None;
+                        idle_expired = false;
                         // The backoff ended between receipt commit and worker
                         // delivery. Never create/restart a run here.
                         let _ = completed.send(Ok(()));
                     }
                     Some(SupervisorCommand::Nudge { completed, .. }) => {
+                        idle_deadline = None;
+                        idle_expired = false;
                         let _ = completed.send(Err(HaiderError::new(
                             ErrorCode::RunNotActive,
                             "daemon steer found no active run",
@@ -3952,6 +4366,8 @@ async fn run_supervisor(
                         branch_id,
                         completed,
                     }) => {
+                        idle_deadline = None;
+                        idle_expired = false;
                         // Manual compaction is provider work between turns:
                         // it follows the CURRENT model selection exactly like
                         // the next turn would (F1).
@@ -3974,6 +4390,8 @@ async fn run_supervisor(
                         let _ = completed.send(result);
                     }
                     Some(SupervisorCommand::ShellExec(pending)) => {
+                        idle_deadline = None;
+                        idle_expired = false;
                         if let Err(error) = perform_shell_exec(
                             &metadata,
                             &lease,
@@ -3995,6 +4413,16 @@ async fn run_supervisor(
                             return true;
                         }
                     }
+                    Some(SupervisorCommand::Retire { idle_expiry }) => {
+                        if idle_expiry && !idle_expired {
+                            let _ = lifecycle.send(SupervisorLifecycle::RetirementRefused {
+                                session_id: lease.session_id().clone(),
+                                spawn_nonce: spawn_nonce.clone(),
+                            });
+                        } else {
+                            retire_requested = true;
+                        }
+                    }
                     Some(SupervisorCommand::Shutdown) | None => {
                         stopping = true;
                         let last = cancel_durable_queued_turns(
@@ -4011,6 +4439,16 @@ async fn run_supervisor(
                         }
                     }
                 },
+                _ = wait_for_supervisor_idle_deadline(idle_deadline) => {
+                    idle_deadline = None;
+                    if commands.is_empty() {
+                        idle_expired = true;
+                        let _ = lifecycle.send(SupervisorLifecycle::IdleExpired {
+                            session_id: lease.session_id().clone(),
+                            spawn_nonce: spawn_nonce.clone(),
+                        });
+                    }
+                }
                 changed = cancellation_wakes.changed() => {
                     if changed.is_ok()
                         && reconcile_durable_cancellations(
@@ -9741,6 +10179,42 @@ mod manager_law_tests {
         assert!(!cancellation_fences_start(Some(RunState::Queued)));
     }
 
+    /// Durable state, not attachment/client presence, defines the idle clock.
+    /// MUTATION CHECK: allow any one of these nonterminal states and this test
+    /// fails before an active, queued, cancelling, menu, or recovery-shaped
+    /// supervisor can be retired.
+    #[test]
+    fn supervisor_retirement_requires_every_durable_run_to_be_terminal() {
+        for state in [
+            RunState::Queued,
+            RunState::Thinking,
+            RunState::Cancelling,
+            RunState::InputRequired {
+                menu: MenuId::new("retirement-menu"),
+            },
+            RunState::PermissionRequired {
+                menu: MenuId::new("retirement-permission"),
+            },
+        ] {
+            assert!(!run_state_allows_supervisor_retirement(&state), "{state:?}");
+        }
+        for state in [RunState::Done, RunState::Errored, RunState::Cancelled] {
+            assert!(run_state_allows_supervisor_retirement(&state), "{state:?}");
+        }
+    }
+
+    /// MUTATION CHECK: return a fixed nonce (the old per-slot incarnation
+    /// reset) and the first recreated EventId collides exactly.
+    #[test]
+    fn supervisor_recreation_has_a_unique_event_id_namespace() {
+        let first_nonce = worker_spawn_nonce().expect("first nonce");
+        let second_nonce = worker_spawn_nonce().expect("second nonce");
+        let first = EventIdGenerator::new(format!("worker-event-session-1-{first_nonce}")).next();
+        let second = EventIdGenerator::new(format!("worker-event-session-1-{second_nonce}")).next();
+        assert_ne!(first_nonce, second_nonce);
+        assert_ne!(first, second);
+    }
+
     #[test]
     fn recurring_autonomous_workflow_maps_to_a_top_level_typed_error() {
         let error = workflow_unfinished_error(&GraphId::new("graph-typed"), "digest-typed");
@@ -9759,6 +10233,219 @@ mod manager_law_tests {
             error.details.as_ref().expect("typed details")["code"],
             "workflow_unfinished"
         );
+    }
+
+    /// MUTATION CHECK: complete the retirement waiter and remove the manager
+    /// slot before `JoinSet` yields. Recreation then races the old lease and
+    /// this test cannot acquire a fresh supervisor cleanly.
+    #[tokio::test]
+    async fn quiescent_supervisor_retirement_joins_before_slot_recreation() {
+        let root = tempfile::tempdir().expect("temp store");
+        let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+            .await
+            .expect("store");
+        let session_id = SessionId::new("worker-retirement-recreation");
+        hub.create_internal_session(haider_core::SessionCreateCommand {
+            command_id: "worker-retirement-create".into(),
+            request_digest: "worker-retirement-create-digest".into(),
+            request_json: "{}".into(),
+            session_id: session_id.clone(),
+            cwd: std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+                .expect("canonical cwd")
+                .to_string_lossy()
+                .into_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new("worker-retirement-created"),
+            device_id: DeviceId::new("worker-retirement-device"),
+        })
+        .await
+        .expect("session");
+        let manager = WorkerManager::start(
+            hub.clone(),
+            WorkerDependencies::unconfigured_for_tests(),
+            false,
+        );
+        let handle = manager.handle();
+        hub.install_worker_manager(handle.clone()).expect("manager");
+
+        let first = handle
+            .compact(
+                session_id.clone(),
+                "worker-retirement-first".into(),
+                store.worker_generation(),
+                None,
+            )
+            .await
+            .expect_err("unconfigured compaction still creates a supervisor");
+        assert_eq!(first.code, ErrorCode::CredentialMissing);
+        assert_eq!(handle.supervisor_count(), 1);
+
+        let joined_before = handle.joined_supervisor_count();
+        handle
+            .retire(session_id.clone())
+            .await
+            .expect("quiescent retirement joins");
+        assert_eq!(
+            handle.joined_supervisor_count(),
+            joined_before.saturating_add(1),
+            "retirement acknowledgement is downstream of a real JoinSet yield"
+        );
+        assert_eq!(
+            handle.supervisor_count(),
+            0,
+            "the manager removes the slot only after the owned task joined"
+        );
+
+        let second = handle
+            .compact(
+                session_id,
+                "worker-retirement-second".into(),
+                store.worker_generation(),
+                None,
+            )
+            .await
+            .expect_err("a fresh supervisor is recreated transparently");
+        assert_eq!(second.code, ErrorCode::CredentialMissing);
+        assert_eq!(handle.supervisor_count(), 1);
+
+        let retiring_handle = handle.clone();
+        let retiring_session = SessionId::new("worker-retirement-recreation");
+        let retirement =
+            tokio::spawn(async move { retiring_handle.retire(retiring_session).await });
+        tokio::task::yield_now().await;
+        handle
+            .submit(AcceptedTurn {
+                session_id: SessionId::new("worker-retirement-recreation"),
+                run_id: RunId::new("worker-retirement-racing-submit"),
+                accepted_seq: 1,
+                worker_generation: store.worker_generation(),
+                branch_id: None,
+                disposition: haider_core::TurnAdmissionDisposition::Started,
+                first_user_turn: false,
+                pdf_attachments: Vec::new(),
+            })
+            .await
+            .expect("a submit racing retirement never surfaces Busy");
+        retirement
+            .await
+            .expect("retirement task joins")
+            .expect("retirement completes through JoinSet");
+        assert_eq!(
+            handle.supervisor_count(),
+            1,
+            "the racing submit owns a transparently recreated supervisor"
+        );
+
+        manager.shutdown().await.expect("manager shutdown");
+        hub.shutdown().await.expect("hub shutdown");
+        store.close().await.expect("store close");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn durably_quiescent_supervisor_retires_at_the_conservative_idle_ttl() {
+        let root = tempfile::tempdir().expect("temp store");
+        let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+            .await
+            .expect("store");
+        let session_id = SessionId::new("worker-idle-ttl");
+        hub.create_internal_session(haider_core::SessionCreateCommand {
+            command_id: "worker-idle-create".into(),
+            request_digest: "worker-idle-create-digest".into(),
+            request_json: "{}".into(),
+            session_id: session_id.clone(),
+            cwd: std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+                .expect("canonical cwd")
+                .to_string_lossy()
+                .into_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new("worker-idle-created"),
+            device_id: DeviceId::new("worker-idle-device"),
+        })
+        .await
+        .expect("session");
+        let manager = WorkerManager::start(
+            hub.clone(),
+            WorkerDependencies::unconfigured_for_tests(),
+            false,
+        );
+        let handle = manager.handle();
+        hub.install_worker_manager(handle.clone()).expect("manager");
+        let error = handle
+            .compact(
+                session_id.clone(),
+                "worker-idle-compact".into(),
+                store.worker_generation(),
+                None,
+            )
+            .await
+            .expect_err("unconfigured compaction creates then idles a supervisor");
+        assert_eq!(error.code, ErrorCode::CredentialMissing);
+        assert_eq!(handle.supervisor_count(), 1);
+
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(SUPERVISOR_IDLE_TTL - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(handle.supervisor_count(), 1, "the full TTL is required");
+
+        let activity = handle
+            .compact(
+                session_id,
+                "worker-idle-compact-reset".into(),
+                store.worker_generation(),
+                None,
+            )
+            .await
+            .expect_err("new work resets the supervisor's local idle clock");
+        assert_eq!(activity.code, ErrorCode::CredentialMissing);
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            handle.supervisor_count(),
+            1,
+            "the stale pre-activity deadline cannot retire the supervisor"
+        );
+        tokio::time::advance(SUPERVISOR_IDLE_TTL - Duration::from_millis(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            handle.supervisor_count(),
+            1,
+            "activity earns a complete fresh idle TTL"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        for _ in 0..64 {
+            if handle.supervisor_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            handle.supervisor_count(),
+            0,
+            "the manager observes the quiescent JoinSet outcome at the TTL"
+        );
+
+        manager.shutdown().await.expect("manager shutdown");
+        hub.shutdown().await.expect("hub shutdown");
+        store.close().await.expect("store close");
     }
 }
 

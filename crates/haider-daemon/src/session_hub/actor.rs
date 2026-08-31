@@ -1531,13 +1531,25 @@ pub(super) async fn run_session_actor(
                 };
                 let _ = completed.send(result);
             }
-            ActorCommand::UnregisterHarness { lease_id } => {
+            ActorCommand::UnregisterHarness {
+                lease_id,
+                completed,
+            } => {
                 if worker
                     .as_ref()
                     .is_some_and(|current| current.lease_id == lease_id)
                 {
                     worker = None;
                 }
+                let _ = completed.send(());
+            }
+            ActorCommand::FenceIfQuiescent { completed } => {
+                let result = if attachments.is_empty() {
+                    session_is_quiescent(&store, &session_id).await
+                } else {
+                    Ok(false)
+                };
+                let _ = completed.send(result);
             }
             ActorCommand::StopIfQuiescent { completed } => {
                 let result = if attachments.is_empty() {

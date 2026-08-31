@@ -334,12 +334,12 @@ async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
     drop(root);
 }
 
-/// MUTATION CHECK: make `StopIfQuiescent` stop first and let the deleter
+/// MUTATION CHECK: make `FenceIfQuiescent` answer before prior admissions and let the deleter
 /// discover the accepted run afterward. Expected RUNTIME failure: the
 /// barrier reports success or the still-live actor cannot acknowledge the
 /// follow-up lease command.
 #[tokio::test]
-async fn deletion_barrier_preserves_a_prefence_accepted_turn_and_its_actor() {
+async fn delete_during_an_active_turn_waits_for_the_actor_fence() {
     let root = tempfile::tempdir().expect("temp store");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
@@ -397,12 +397,19 @@ async fn deletion_barrier_preserves_a_prefence_accepted_turn_and_its_actor() {
         })
         .await
         .expect("queue pre-fence acceptance");
-    let (completed, quiescent) = oneshot::channel();
+    let (completed, mut quiescent) = oneshot::channel();
     actor
         .commands
-        .send(ActorCommand::StopIfQuiescent { completed })
+        .send(ActorCommand::FenceIfQuiescent { completed })
         .await
         .expect("queue deletion barrier");
+    assert!(
+        matches!(
+            quiescent.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "the deletion fence waits behind the pre-fence active turn"
+    );
     acceptance
         .await
         .expect("acceptance response")
@@ -5451,7 +5458,7 @@ async fn shell_supervisor_exit_keeps_failed_completion_prompt_visible() {
     .await
     .expect("shell acceptance commits");
 
-    crate::worker::terminalize_supervisor_exit(&hub, &session_id, 1)
+    crate::worker::terminalize_supervisor_exit(&hub, &session_id, "panic-test-one")
         .await
         .expect("supervisor exit terminalizes shell");
     let history = haider_core::StoreHandle::read(&store, &session_id, 0, 128)
@@ -5569,7 +5576,7 @@ async fn panic_exit_after_cancelling_closes_item_and_menu_before_cancelled() {
     .await
     .expect("Cancelling commits");
 
-    crate::worker::terminalize_supervisor_exit(&hub, &session_id, 1)
+    crate::worker::terminalize_supervisor_exit(&hub, &session_id, "panic-test-two")
         .await
         .expect("panic exit terminalizes");
     let history = haider_core::StoreHandle::read(&store, &session_id, 0, 128)
@@ -5659,7 +5666,7 @@ async fn panic_exit_reconciles_dispatched_and_parks_effect_unknown() {
     )];
     hub.append(&mut dispatched).await.expect("dispatch commits");
 
-    crate::worker::terminalize_supervisor_exit(&hub, &session_id, 1)
+    crate::worker::terminalize_supervisor_exit(&hub, &session_id, "panic-test-three")
         .await
         .expect("panic exit terminalizes");
     let history = haider_core::StoreHandle::read(&store, &session_id, 0, 128)
