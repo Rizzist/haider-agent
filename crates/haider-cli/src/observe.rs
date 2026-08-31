@@ -545,7 +545,13 @@ pub(crate) fn parse_events_options(rest: &[String]) -> Result<Parsed<EventsOptio
 pub(crate) async fn status_command(rest: &[String]) -> ExitCode {
     let options = match parse_snapshot_options(rest, "status") {
         Ok(Parsed::Run(options)) => options,
-        Ok(Parsed::Help) => return write_help("usage: haider status [--json] [--no-spawn]"),
+        Ok(Parsed::Help) => {
+            return write_help(
+                "usage: haider status [--json] [--no-spawn]\n\
+environment: HAIDER_RUNTIME_DIR overrides the per-user runtime root; on Unix, XDG_RUNTIME_DIR is used next when owner-private.\n\
+JSON filesystem paths are canonical absolute paths; daemon.socket_path is a Windows named-pipe address on Windows.\n",
+            );
+        }
         Err(error) => return usage("status", &error),
     };
     let profile = match profile() {

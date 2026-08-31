@@ -87,6 +87,16 @@ fn built_status_json_completes_with_enabled_discovery() {
     let machine_home = root.path().join("machine-home");
     std::fs::create_dir_all(&workspace).expect("smoke workspace");
     std::fs::create_dir_all(&machine_home).expect("smoke machine-user home");
+    #[cfg(unix)]
+    let xdg_runtime = {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = root.path().join("xdg-runtime");
+        std::fs::create_dir(&path).expect("create private XDG runtime");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("make XDG runtime owner-private");
+        path
+    };
     let codex = root.path().join("codex-auth.json");
     std::fs::write(
         &codex,
@@ -104,15 +114,10 @@ fn built_status_json_completes_with_enabled_discovery() {
         profile: profile.clone(),
     };
 
-    let start_status = |no_spawn: bool| {
-        let mut command = Command::new(&haider);
-        command.args(["status", "--json"]);
-        if no_spawn {
-            command.arg("--no-spawn");
-        }
+    let configure = |command: &mut Command, command_profile: &Path| {
         command
             .current_dir(&workspace)
-            .env("HAIDER_PROFILE_DIR", &profile)
+            .env("HAIDER_PROFILE_DIR", command_profile)
             // The daemon's lockdown ledger is machine-user global. Keep this
             // real-artifact smoke hermetic while discovery paths remain the
             // explicit fixtures below.
@@ -130,12 +135,22 @@ fn built_status_json_completes_with_enabled_discovery() {
             .env("HAIDER_GEMINI_CREDS_PATH", &missing)
             .env("HAIDER_GCLOUD_CONFIG_DIR", &missing)
             .env_remove("HAIDER_RUNTIME_DIR")
-            .env_remove("XDG_RUNTIME_DIR")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start built haider status")
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        command.env("XDG_RUNTIME_DIR", &xdg_runtime);
+        #[cfg(not(unix))]
+        command.env_remove("XDG_RUNTIME_DIR");
+    };
+    let start_status = |no_spawn: bool| {
+        let mut command = Command::new(&haider);
+        command.args(["status", "--json"]);
+        if no_spawn {
+            command.arg("--no-spawn");
+        }
+        configure(&mut command, &profile);
+        command.spawn().expect("start built haider status")
     };
 
     let child = start_status(false);
@@ -161,13 +176,17 @@ fn built_status_json_completes_with_enabled_discovery() {
         .as_str()
         .expect("status socket_path string");
     assert!(Path::new(socket_path).is_absolute());
+    #[cfg(unix)]
+    let xdg_runtime_dir = Some(xdg_runtime.clone());
+    #[cfg(not(unix))]
+    let xdg_runtime_dir = None;
     let resolved = haider_client::resolve_profile(&haider_client::ProfileEnv {
         profile_dir: Some(profile.clone()),
         home: Some(machine_home.clone()),
         user_profile: Some(machine_home.clone()),
         model: None,
         runtime_dir: None,
-        xdg_runtime_dir: None,
+        xdg_runtime_dir,
     })
     .expect("resolve the status fixture profile");
     assert_eq!(
@@ -188,11 +207,44 @@ fn built_status_json_completes_with_enabled_discovery() {
         Some(resolved.runtime_dir.as_path()),
         "status must report the resolved filesystem runtime"
     );
-    #[cfg(unix)]
-    assert!(
-        !Path::new(socket_path).starts_with(&machine_home),
-        "an overlong HOME must report the live short fallback, not the rejected preferred path"
+    assert_eq!(
+        document["profile_path"].as_str().map(Path::new),
+        Some(resolved.store_dir.as_path()),
+        "status profile path must use the canonical resolver identity"
     );
+    assert_eq!(
+        document["daemon"]["pipe_dir"].as_str().map(Path::new),
+        Some(resolved.store_dir.join("pipe").as_path()),
+        "status sidecar directory must share the canonical profile spelling"
+    );
+    #[cfg(unix)]
+    {
+        let canonical_xdg = xdg_runtime
+            .canonicalize()
+            .expect("canonicalize private XDG runtime");
+        assert!(
+            resolved
+                .runtime_dir
+                .starts_with(canonical_xdg.join("haider")),
+            "a fitting private XDG runtime must outrank HOME"
+        );
+        assert_eq!(
+            Path::new(socket_path)
+                .canonicalize()
+                .expect("canonicalize live daemon socket"),
+            Path::new(socket_path),
+            "status socket path must use its canonical filesystem spelling"
+        );
+        let pid_file = document["daemon"]["pid_file_path"]
+            .as_str()
+            .map(PathBuf::from)
+            .expect("status pid_file_path string");
+        assert_eq!(
+            pid_file.canonicalize().expect("canonicalize PID file"),
+            pid_file,
+            "status PID-file path must use its canonical filesystem spelling"
+        );
+    }
     let discovery_deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let output = wait_for_output(start_status(true), STATUS_TIMEOUT);
@@ -216,4 +268,97 @@ fn built_status_json_completes_with_enabled_discovery() {
         );
         std::thread::sleep(Duration::from_millis(25));
     }
+
+    std::fs::write(profile.join("config.json"), "{not json")
+        .expect("damage model config after daemon identity is established");
+    let mut stop = Command::new(&haider);
+    stop.args(["daemon", "stop", "--json", "--timeout", "10s"]);
+    configure(&mut stop, &profile);
+    let output = wait_for_output(stop.spawn().expect("start daemon stop"), STATUS_TIMEOUT);
+    assert!(
+        output.status.success(),
+        "daemon stop failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stopped: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("daemon stop stdout is JSON");
+    assert_eq!(stopped["schema"], "haider.daemon-stop.v1");
+    assert_eq!(stopped["outcome"], "stopped_cleanly");
+    assert_eq!(stopped["daemon"]["pid"], document["daemon"]["pid"]);
+    assert_eq!(stopped["daemon"]["completion"], "graceful");
+    assert_eq!(stopped["daemon"]["process_exited"], true);
+    assert_eq!(
+        stopped["daemon"]["shutdown_acknowledged"], true,
+        "a successful stop must expose the RPC acknowledgement"
+    );
+    assert!(
+        stopped["elapsed_ms"]
+            .as_u64()
+            .is_some_and(|value| value < 10_000),
+        "stop lifecycle must be measured inside the caller deadline: {stopped}"
+    );
+
+    assert!(
+        std::fs::read_dir(&profile)
+            .expect("read stopped profile")
+            .all(|entry| !entry
+                .expect("read stopped profile entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".daemon-stop-")),
+        "the caller must consume its generation-bound completion receipt"
+    );
+
+    let never_created_profile = root.path().join("never-created-profile");
+    let mut absent = Command::new(&haider);
+    absent.args(["daemon", "stop", "--json", "--timeout", "1s"]);
+    configure(&mut absent, &never_created_profile);
+    let output = wait_for_output(absent.spawn().expect("start absent stop"), STATUS_TIMEOUT);
+    assert_eq!(output.status.code(), Some(69));
+    let absent: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("absent stop stdout is JSON");
+    assert_eq!(absent["outcome"], "not_running");
+    assert!(
+        !never_created_profile.exists(),
+        "probing a never-created profile must not create a lock directory"
+    );
+
+    let empty_profile = root.path().join("existing-empty-profile");
+    std::fs::create_dir(&empty_profile).expect("create empty profile");
+    let entries_before = std::fs::read_dir(&empty_profile)
+        .expect("read empty profile before stop")
+        .count();
+    let mut absent = Command::new(&haider);
+    absent.args(["daemon", "stop", "--json", "--timeout", "1s"]);
+    configure(&mut absent, &empty_profile);
+    let output = wait_for_output(
+        absent.spawn().expect("start empty-profile stop"),
+        STATUS_TIMEOUT,
+    );
+    assert_eq!(output.status.code(), Some(69));
+    let entries_after = std::fs::read_dir(&empty_profile)
+        .expect("read empty profile after stop")
+        .count();
+    assert_eq!(
+        entries_after, entries_before,
+        "probing an existing empty profile must not create a lock file"
+    );
+
+    let wedged_profile = root.path().join("wedged-profile");
+    let lease = haider_store::Store::acquire_profile(&wedged_profile)
+        .expect("hold a profile lock without serving an endpoint");
+    let mut wedged = Command::new(&haider);
+    wedged.args(["daemon", "stop", "--json", "--timeout", "100ms"]);
+    configure(&mut wedged, &wedged_profile);
+    let output = wait_for_output(
+        wedged.spawn().expect("start bounded wedged stop"),
+        STATUS_TIMEOUT,
+    );
+    drop(lease);
+    assert_eq!(output.status.code(), Some(124));
+    let wedged: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("wedged stop stdout is JSON");
+    assert_eq!(wedged["outcome"], "did_not_stop");
+    assert_eq!(wedged["phase"], "connect");
 }

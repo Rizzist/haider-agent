@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 pub(crate) mod account;
 pub(crate) mod automation;
+pub(crate) mod daemon;
 pub(crate) mod export;
 pub(crate) mod graph;
 pub(crate) mod hooks;
@@ -308,6 +309,7 @@ async fn dispatch(args: &[String]) -> ExitCode {
         [command, subcommand, rest @ ..] if command == "sessions" && subcommand == "wait-ready" => {
             automation::sessions_wait_ready_command(rest).await
         }
+        [command, rest @ ..] if command == "daemon" => daemon::daemon_command(rest).await,
         [command, rest @ ..] if command == "sessions" => observe::sessions_command(rest).await,
         [command, session_id, subcommand, rest @ ..]
             if command == "session" && subcommand == "config" =>
@@ -387,7 +389,8 @@ async fn dispatch(args: &[String]) -> ExitCode {
                  [--start] | run --status <run-id> | run --stop <run-id> | run --replay <run-id> \
                  [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] \
                  [--allow-writes] [--allow-exec] [--trust-hooks] [--attach <path>]..., \
-                 status [--json] [--no-spawn], sessions [--recovery] [--json] [--no-spawn], \
+                 status [--json] [--no-spawn], daemon stop [--json] [--timeout <duration>], \
+                 sessions [--recovery] [--json] [--no-spawn], \
                  sessions wait-ready --count <n> [--session <id>]... [--timeout <dur>] --json [--no-spawn], \
                  resume [<session-id>], resume <session-id> --json [--timeout <dur>] [--no-spawn], \
                  session <id> [--json|--watch] [--no-spawn], \

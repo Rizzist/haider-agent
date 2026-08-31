@@ -1516,7 +1516,7 @@ async fn drain_deadline_covers_the_finalization_tail() {
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
 
-    task.shutdown_handle().request("expired deadline");
+    task.shutdown_handle().request_graceful();
     assert_eq!(
         task.join().await.expect("daemon joins"),
         ShutdownOutcome::Forced,
@@ -1526,6 +1526,25 @@ async fn drain_deadline_covers_the_finalization_tail() {
     // and the profile lock is released rather than leaked.
     assert!(!config.endpoint_path().exists());
     poll_store_release(&config).await;
+    let receipts = std::fs::read_dir(&config.store_dir)
+        .expect("read forced-shutdown profile")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".daemon-stop-") && name.ends_with(".json")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(receipts.len(), 1, "one exact forced completion receipt");
+    let receipt = serde_json::from_slice::<haider_client::DaemonStopReceipt>(
+        &std::fs::read(receipts[0].path()).expect("read forced completion receipt"),
+    )
+    .expect("decode forced completion receipt");
+    assert_eq!(
+        receipt.completion,
+        haider_client::DaemonStopCompletion::Forced,
+        "an expired finalization deadline must never publish a graceful receipt"
+    );
 }
 
 /// R3/R22, quiet ordering: a replacement that is already in place when cleanup

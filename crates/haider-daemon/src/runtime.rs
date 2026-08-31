@@ -62,12 +62,17 @@ use crate::{
     DaemonConfig, DaemonDependencies, DaemonError, DaemonState, IncumbentDiagnostics, Readiness,
     SessionHub, ShutdownHandle, ShutdownOutcome,
 };
+use haider_client::{
+    DAEMON_STOP_COMPLETION_SCHEMA, DaemonStopCompletion, DaemonStopReceipt,
+    daemon_stop_receipt_path,
+};
 use haider_core::{SqliteStoreHandle, StoreHandle, reconcile_dispatched_effects};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{DeviceId, SessionId};
 use std::fs;
 use std::future::Future;
+use std::io::Write as _;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1548,7 +1553,7 @@ async fn run_inner(
     };
     drain_sender.send_replace(Some(DrainNotice {
         reason,
-        instance_id,
+        instance_id: instance_id.clone(),
         daemon_generation,
         deadline_unix_ms,
         deadline: barrier_deadline,
@@ -1573,19 +1578,37 @@ async fn run_inner(
     // after the full tail: in particular, no manager/hub failure may bypass
     // the account actor's transitive blocking-write join or release the
     // profile lease before finalization.
-    if let Some(error) = listener_error
+    let result = if let Some(error) = listener_error
         .or(worker_error)
         .or(hub_error)
         .or(finalize_error)
     {
-        return Err(error);
-    }
-    states.publish(DaemonState::Stopped);
-    Ok(if forced {
-        ShutdownOutcome::Forced
+        Err(error)
+    } else if forced {
+        Ok(ShutdownOutcome::Forced)
     } else {
-        ShutdownOutcome::Graceful
-    })
+        Ok(ShutdownOutcome::Graceful)
+    };
+    let completion = match &result {
+        Ok(ShutdownOutcome::Graceful) => DaemonStopCompletion::Graceful,
+        Ok(ShutdownOutcome::Forced) => DaemonStopCompletion::Forced,
+        Err(_) => DaemonStopCompletion::Failed,
+    };
+    if shutdown_observer.operator_stop_requested()
+        && let Err(receipt_error) =
+            publish_stop_receipt(config, &instance_id, daemon_generation, completion)
+    {
+        if result.is_ok() {
+            return Err(receipt_error);
+        }
+        eprintln!(
+            "haiderd: shutdown completion receipt failed after daemon error: {receipt_error}"
+        );
+    }
+    if result.is_ok() {
+        states.publish(DaemonState::Stopped);
+    }
+    result
 }
 
 /// Runtime services that may already exist when launcher death arrives before
@@ -2387,6 +2410,69 @@ fn incumbent_diagnostics(config: &DaemonConfig, endpoint_path: &Path) -> Incumbe
         endpoint_path: endpoint_path.to_path_buf(),
         lock_contents,
     }
+}
+
+fn publish_stop_receipt(
+    config: &DaemonConfig,
+    instance_id: &str,
+    generation: u64,
+    completion: DaemonStopCompletion,
+) -> Result<(), DaemonError> {
+    let target =
+        daemon_stop_receipt_path(&config.store_dir, generation, instance_id).ok_or_else(|| {
+            DaemonError::Task {
+                message: "daemon instance identity cannot address a stop receipt".into(),
+            }
+        })?;
+    let staging = config.store_dir.join(format!(
+        ".daemon-stop-{generation}-{instance_id}-{}.tmp",
+        std::process::id()
+    ));
+    let receipt = DaemonStopReceipt {
+        schema: DAEMON_STOP_COMPLETION_SCHEMA.into(),
+        instance_id: instance_id.into(),
+        generation,
+        pid: std::process::id(),
+        completion,
+    };
+    let mut contents = serde_json::to_vec(&receipt).map_err(|error| DaemonError::Task {
+        message: format!("cannot encode daemon stop receipt: {error}"),
+    })?;
+    contents.push(b'\n');
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    haider_platform::configure_file_mode(&mut options, 0o600);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    }
+    let mut file = options
+        .open(&staging)
+        .map_err(|source| DaemonError::io("create daemon stop receipt", &staging, source))?;
+    let publication = file
+        .write_all(&contents)
+        .and_then(|()| haider_platform::sync_file(&file, haider_platform::SyncPolicy::Plain))
+        .and_then(|()| {
+            drop(file);
+            haider_platform::replace_file(&staging, &target)
+        })
+        .and_then(|()| {
+            haider_platform::fs::sync_directory(
+                &config.store_dir,
+                haider_platform::SyncPolicy::Plain,
+            )
+        });
+    if let Err(source) = publication {
+        let _ = fs::remove_file(&staging);
+        return Err(DaemonError::io(
+            "publish daemon stop receipt",
+            target,
+            source,
+        ));
+    }
+    Ok(())
 }
 
 fn random_instance_id() -> Result<String, DaemonError> {

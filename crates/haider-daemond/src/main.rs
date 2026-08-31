@@ -323,6 +323,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedArgs, String> 
     let mut config = match (profile, store_dir, runtime_dir) {
         (Some(profile), Some(store_dir), Some(runtime_dir)) => {
             let env = haider_client::ProfileEnv::capture();
+            let store_dir = haider_client::canonicalize_path_allow_missing(store_dir)
+                .map_err(|error| format!("cannot canonicalize store directory: {error}"))?;
+            let runtime_dir = haider_client::canonicalize_path_allow_missing(runtime_dir)
+                .map_err(|error| format!("cannot canonicalize runtime directory: {error}"))?;
             // The identity flags are explicit, but the release-owned default
             // model still resolves through the ONE shared precedence
             // (HAIDER_MODEL, then <store_dir>/config.json, then packaged).

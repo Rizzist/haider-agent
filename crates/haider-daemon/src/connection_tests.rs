@@ -1596,10 +1596,15 @@ impl PairedClient {
     }
 
     async fn handshake_with(&mut self, capabilities: CapabilitySet) {
+        self.handshake_named_with("paired-connection-test", capabilities)
+            .await;
+    }
+
+    async fn handshake_named_with(&mut self, client_name: &str, capabilities: CapabilitySet) {
         self.send(&WireFrame::Hello(haider_rpc::Hello {
             protocol_min: haider_rpc::WIRE_PROTOCOL_VERSION,
             protocol_max: haider_rpc::WIRE_PROTOCOL_VERSION,
-            client_name: "paired-connection-test".into(),
+            client_name: client_name.into(),
             client_version: "test".into(),
             client_instance_id: "paired-client".into(),
             client_kind: haider_rpc::ClientKind::Headless,
@@ -1658,9 +1663,10 @@ impl PairedClient {
     }
 }
 
-/// MUTATION CHECK: remove the Control gate or the single ShutdownHandle
+/// MUTATION CHECK: remove the Control gate or the graceful ShutdownHandle
 /// request in `handle_frame`. Expected runtime failure: the view-only peer
-/// starts draining, or the control peer never advances the lifecycle watch.
+/// starts draining, the control peer never advances the lifecycle watch, or a
+/// duplicate operator request selects the force-on-second-signal path.
 #[tokio::test]
 async fn daemon_shutdown_rpc_requires_control_and_requests_graceful_once() {
     for (capabilities, accepted) in [
@@ -1672,13 +1678,19 @@ async fn daemon_shutdown_rpc_requires_control_and_requests_graceful_once() {
     ] {
         let (_dir, hub) = liveness_hub().await;
         let (server, client) = UnixStream::pair().expect("socket pair");
-        let (shutdown, shutdown_rx, _observer) = crate::lifecycle::ShutdownHandle::channel();
+        let (shutdown, shutdown_rx, observer) = crate::lifecycle::ShutdownHandle::channel();
         let mut context = liveness_context(hub.clone());
         context.shutdown = shutdown;
         let (_drain_tx, drain_rx) = watch::channel(Option::<DrainNotice>::None);
         let serve_task = tokio::spawn(serve(server, context, drain_rx));
         let mut client = PairedClient::new(client);
-        client.handshake_with(capabilities).await;
+        client
+            .handshake_named_with(haider_client::DAEMON_STOP_CLIENT_NAME, capabilities)
+            .await;
+        assert!(
+            !observer.operator_stop_requested(),
+            "a Ready handshake alone must not register completion interest"
+        );
         client
             .request("shutdown", RequestBody::DaemonShutdown {})
             .await;
@@ -1691,6 +1703,24 @@ async fn daemon_shutdown_rpc_requires_control_and_requests_graceful_once() {
                     body: ResponseBody::DaemonShutdown {},
                     ..
                 }
+            ));
+            assert!(matches!(
+                &*shutdown_rx.borrow(),
+                crate::lifecycle::ShutdownRequest::Graceful { .. }
+            ));
+            assert!(
+                observer.operator_stop_requested(),
+                "the accepted shutdown RPC registers completion interest"
+            );
+            client
+                .request("shutdown-again", RequestBody::DaemonShutdown {})
+                .await;
+            assert!(matches!(
+                client.next().await,
+                Some(WireFrame::Response {
+                    body: ResponseBody::DaemonShutdown {},
+                    ..
+                })
             ));
             assert!(matches!(
                 &*shutdown_rx.borrow(),
@@ -1714,6 +1744,35 @@ async fn daemon_shutdown_rpc_requires_control_and_requests_graceful_once() {
         let _ = serve_task.await.expect("serve joins");
         hub.shutdown().await.expect("hub shutdown");
     }
+
+    let (_dir, hub) = liveness_hub().await;
+    let (server, client) = UnixStream::pair().expect("socket pair");
+    let (shutdown, _shutdown_rx, observer) = crate::lifecycle::ShutdownHandle::channel();
+    let mut context = liveness_context(hub.clone());
+    context.shutdown = shutdown;
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    let (_drain_tx, drain_rx) = watch::channel(Some(DrainNotice {
+        reason: "preexisting drain".into(),
+        instance_id: context.instance_id.clone(),
+        daemon_generation: context.daemon_generation,
+        deadline_unix_ms: 1,
+        deadline,
+    }));
+    let serve_task = tokio::spawn(serve(server, context, drain_rx));
+    let mut client = PairedClient::new(client);
+    client
+        .handshake_named_with(
+            haider_client::DAEMON_STOP_CLIENT_NAME,
+            CapabilitySet::from([Capability::View, Capability::Control]),
+        )
+        .await;
+    assert!(
+        observer.operator_stop_requested(),
+        "a Control-capable stop client joining Draining registers completion interest"
+    );
+    drop(client);
+    let _ = serve_task.await.expect("draining serve joins");
+    hub.shutdown().await.expect("hub shutdown");
 }
 
 /// MUTATION CHECK: pass `None` instead of `binding_token` from `handle_frame`

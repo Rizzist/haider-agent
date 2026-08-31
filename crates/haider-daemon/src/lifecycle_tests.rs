@@ -70,7 +70,7 @@ fn launcher_death_is_retained_as_typed_idle_shutdown_reason() {
 
 #[test]
 fn launcher_death_can_arm_a_bounded_idle_linger() {
-    let (shutdown, receiver, _) = ShutdownHandle::channel();
+    let (shutdown, receiver, observer) = ShutdownHandle::channel();
     let idle_ttl = Duration::from_millis(250);
     assert!(shutdown.request_after_idle(ShutdownReason::ClientVanished, idle_ttl));
     assert!(matches!(
@@ -79,5 +79,30 @@ fn launcher_death_can_arm_a_bounded_idle_linger() {
             reason: ShutdownReason::ClientVanished,
             idle_ttl: observed,
         } if *observed == idle_ttl
+    ));
+    let selected_automatic_request = receiver.borrow().clone();
+
+    shutdown.request_graceful();
+    assert!(observer.operator_stop_requested());
+    assert!(matches!(
+        selected_automatic_request,
+        ShutdownRequest::GracefulAfterIdle {
+            reason: ShutdownReason::ClientVanished,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &*receiver.borrow(),
+        ShutdownRequest::Graceful {
+            reason: ShutdownReason::Message(reason)
+        } if reason == "authenticated daemon.shutdown RPC"
+    ));
+
+    shutdown.request_graceful();
+    assert!(matches!(
+        &*receiver.borrow(),
+        ShutdownRequest::Graceful {
+            reason: ShutdownReason::Message(reason)
+        } if reason == "authenticated daemon.shutdown RPC"
     ));
 }
