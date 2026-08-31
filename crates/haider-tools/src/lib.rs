@@ -70,6 +70,10 @@ pub use filesystem::{
 };
 pub use graph_evidence::{GraphEvidence, graph_evidence_manifest};
 pub use haider_protocol::computer::{ComputerAction, ScreenPoint, ScrollDirection};
+pub use haider_protocol::context::{
+    ElidedText, elide_text_head_tail, mark_text_elision, mark_text_elision_with_items,
+    provider_request_text_projection_bytes,
+};
 pub use haider_protocol::mobile::{
     A11yNode, AppEntry, MobileAction, MobileKey, MobileOutput, MobilePermission, Point, Point4,
     SmsMessage,
@@ -99,7 +103,7 @@ pub use request_input::{RequestInput, RequestInputAnswer, RequestInputKind, Requ
 pub use shell::{
     BuiltinResult, ComposerSubmission, EnvViewEntry, OutputAdapter, REDACTED_ENV_VALUE,
     REDUCED_TOOL_OUTPUT_MAX_BYTES, ReducedToolOutput, ShellSession, UserProcessExec,
-    estimated_tokens, reduce_tool_output,
+    estimated_text_tokens, estimated_tokens, reduce_tool_output,
 };
 pub use spawn_subagent::{SpawnSubagent, spawn_subagent_manifest};
 pub use tasks::{

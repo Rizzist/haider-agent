@@ -72,7 +72,8 @@ fn peer_list_model_view_compacts_without_rewriting_the_raw_journal_value() {
     };
     let (model_preview, model_truncated) = model_tool_result_preview("peer_list", &result);
     assert!(model_preview.len() < result.preview.len());
-    assert!(model_preview.contains("raw result retained in journal"));
+    assert!(model_preview.contains("\"haider_elision_v1\""));
+    assert!(model_preview.ends_with(&raw[raw.len() - 128..]));
     assert!(model_truncated);
     assert_eq!(result.preview, raw);
 }

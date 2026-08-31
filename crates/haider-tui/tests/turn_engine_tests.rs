@@ -618,6 +618,7 @@ fn compaction_beats_carry_the_numbers_and_reenter_the_turn_end_law() {
                 item: haider_protocol::item::TurnItem::ContextCompaction {
                     tokens_before: Some(170_000),
                     tokens_after: Some(12_000),
+                    tokens_estimated: false,
                     ..
                 },
                 ..

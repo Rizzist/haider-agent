@@ -94,7 +94,6 @@ fn e1d_child_grant_cannot_exceed_parent_and_within_ceiling_survives() {
     assert!(!names.contains(&"process_exec"));
 }
 
-#[cfg(unix)]
 #[test]
 fn e1a_worker_maps_denial_anchor_miss_and_nonzero_process_to_failure_status() {
     use haider_protocol::ids::EffectId;
@@ -139,6 +138,8 @@ fn e1a_worker_maps_denial_anchor_miss_and_nonzero_process_to_failure_status() {
         exit_code: Some(1),
         signal: None,
         output_bytes: 0,
+        output_elided_bytes_at_least: 0,
+        source_output_elided_bytes_at_least: 0,
         transcript_digest: format!("blake3:{}", blake3::hash(&[]).to_hex()),
         inline_output: Vec::new(),
         artifact: None,
@@ -151,6 +152,171 @@ fn e1a_worker_maps_denial_anchor_miss_and_nonzero_process_to_failure_status() {
     });
     assert_eq!(failed.status, ToolResultStatus::Failed);
     assert_eq!(failed.reason.as_deref(), Some("process exited with code 1"));
+}
+
+fn process_accounting_fixture(
+    name: &str,
+    output: &str,
+    failed: bool,
+) -> haider_tools::ProcessResult {
+    use base64::Engine as _;
+
+    haider_tools::ProcessResult {
+        call_id: format!("fixture-{name}"),
+        effect: haider_protocol::ids::EffectId::new(format!("effect-{name}")),
+        command_arg_digest: format!("blake3:args-{name}"),
+        workspace_revision: None,
+        status: if failed {
+            haider_protocol::item::ToolStatus::Failed
+        } else {
+            haider_protocol::item::ToolStatus::Completed
+        },
+        exit_code: failed.then_some(1),
+        signal: None,
+        output_bytes: output.len(),
+        output_elided_bytes_at_least: 0,
+        source_output_elided_bytes_at_least: 0,
+        transcript_digest: format!("blake3:{}", blake3::hash(output.as_bytes()).to_hex()),
+        inline_output: vec![haider_tools::ProcessOutputChunk {
+            stream: haider_protocol::item::OutputStream::Stdout,
+            chunk_b64: base64::engine::general_purpose::STANDARD.encode(output),
+        }],
+        artifact: None,
+        escalation_note: None,
+        limit_reached: None,
+        wall_timeout_ms: 60_000,
+        max_output_bytes: 2 * 1024 * 1024,
+        transcript_high_water_bytes: output.len(),
+        lifecycle_events: Vec::new(),
+    }
+}
+
+/// Measures the complete serialized process-result projection, including JSON
+/// escaping and marker/accounting overhead, rather than only reducer payloads.
+#[test]
+fn process_model_boundary_accounting_is_signed_deterministic_and_full_projection() {
+    let listing = (0..100)
+        .map(|index| format!("target/debug/deps/library-{index:03}.rlib"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let grep = "src/lib.rs:9:needle\n".repeat(80);
+    let cargo = concat!(
+        "error[E0425]: cannot find value `missing` in this scope\n",
+        " --> src/main.rs:3:5\n3 | missing();\n  | ^^^^^^^ not found\n",
+        "For more information about this error, try rustc --explain E0425.\n",
+        "error: could not compile `fixture` due to 1 previous error\n",
+    );
+    let file = "plain source line without adapter noise\n".repeat(80);
+    let fixtures = [
+        ("listing", listing, false),
+        ("grep", grep, false),
+        ("cargo", cargo.to_owned(), true),
+        ("3kb-file", file, false),
+    ];
+    let mut total_before = 0u64;
+    let mut total_after = 0u64;
+    let mut total_net = 0i64;
+    for (name, output, failed) in fixtures {
+        let input = process_accounting_fixture(name, &output, failed);
+        let result = crate::worker::process_result(input.clone());
+        let replay = crate::worker::process_result(input);
+        assert_eq!(result, replay, "same input must reproduce exactly: {name}");
+        let value: serde_json::Value =
+            serde_json::from_str(&result.preview).expect("process preview JSON");
+        let (before, after, net) = if let Some(savings_value) = value.get("context_savings_detail")
+        {
+            let savings: haider_protocol::context::OutputSavings =
+                serde_json::from_value(savings_value.clone()).expect("typed savings detail");
+            assert_eq!(savings.scope, "process_result_model_boundary");
+            assert_eq!(
+                savings.output_bytes,
+                u64::try_from(haider_tools::provider_request_text_projection_bytes(
+                    &result.preview,
+                ))
+                .expect("fixture length fits u64")
+            );
+            assert_eq!(
+                savings.estimated_net_tokens_saved,
+                i64::try_from(savings.estimated_tokens_before).expect("fixture tokens fit i64")
+                    - i64::try_from(savings.estimated_tokens_after)
+                        .expect("fixture tokens fit i64")
+            );
+            assert!(
+                value["output"]
+                    .as_str()
+                    .is_some_and(|output| output.lines().any(|line| {
+                        serde_json::from_str::<serde_json::Value>(line)
+                            .ok()
+                            .and_then(|line| line.get("haider_elision_v1").cloned())
+                            .is_some()
+                    })),
+                "{name}: {:?}",
+                value["output"]
+            );
+            (
+                savings.estimated_tokens_before,
+                savings.estimated_tokens_after,
+                savings.estimated_net_tokens_saved,
+            )
+        } else {
+            let tokens = u64::try_from(
+                haider_tools::provider_request_text_projection_bytes(&result.preview)
+                    .saturating_add(3)
+                    / 4,
+            )
+            .expect("fixture tokens fit u64");
+            (tokens, tokens, 0)
+        };
+        total_before = total_before.saturating_add(before);
+        total_after = total_after.saturating_add(after);
+        total_net = total_net.saturating_add(net);
+        eprintln!(
+            "process-boundary fixture={name} before_tokens_estimate={before} after_tokens_estimate={after} net_tokens_saved_estimate={net}"
+        );
+    }
+    assert_eq!(
+        total_net,
+        i64::try_from(total_before).expect("fixture tokens fit i64")
+            - i64::try_from(total_after).expect("fixture tokens fit i64")
+    );
+    assert!(total_net > 0);
+    let saved_per_million_input_tokens = total_net.saturating_mul(1_000_000)
+        / i64::try_from(total_before).expect("fixture tokens fit i64");
+    assert_eq!(
+        (total_before, total_after, total_net),
+        (2_787, 1_041, 1_746)
+    );
+    assert_eq!(saved_per_million_input_tokens, 626_480);
+    eprintln!(
+        "process-boundary cumulative measurement=provider_request_bytes_div_four_v1 before_tokens_estimate={total_before} after_tokens_estimate={total_after} net_tokens_saved_estimate={total_net} saved_per_1m_input_tokens_estimate={saved_per_million_input_tokens}"
+    );
+
+    let diagnostic = format!(
+        "COMMAND cargo test --locked\n{}\nFAILURE: final linker diagnostic\n",
+        (0..2_000)
+            .map(|index| format!("unique progress line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let source = process_accounting_fixture("head-tail", &diagnostic, true);
+    let raw_chunk = source.inline_output[0].chunk_b64.clone();
+    let first = crate::worker::process_result(source.clone());
+    let second = crate::worker::process_result(source);
+    assert_eq!(
+        first.preview, second.preview,
+        "elision must be deterministic"
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&first.preview).expect("process preview JSON");
+    let output = value["output"].as_str().expect("bounded output text");
+    assert!(output.contains("COMMAND cargo test --locked"));
+    assert!(output.contains("FAILURE: final linker diagnostic"));
+    assert!(output.contains("\"haider_elision_v1\""));
+    assert_eq!(
+        raw_chunk,
+        process_accounting_fixture("head-tail", &diagnostic, true).inline_output[0].chunk_b64,
+        "model projection must not mutate the captured output"
+    );
 }
 
 /// MUTATION CHECK: hard-code parent chip projection to `branch_id: None` or

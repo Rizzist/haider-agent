@@ -51,11 +51,14 @@ type DirectoryIdentity = haider_platform::WindowsFileIdentity;
 
 /// Maximum raw payload retained by one pipe-read chunk.
 pub const PROCESS_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
-/// Hard process-output ceiling. Keeping this equal to the adapter-input bound
-/// guarantees every accepted process is reduced from its complete raw result.
+/// Process-output termination threshold. The read that first crosses this
+/// threshold is retained whole in the journal and CAS, so accepted output may
+/// exceed the threshold by at most one [`PROCESS_OUTPUT_CHUNK_BYTES`] read.
+/// The threshold remains 2 MiB and immediately starts group termination.
 pub const PROCESS_MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 /// Bounded raw result retained solely as deterministic adapter input. The
-/// process bound validator prevents diagnostic prefixes from being discarded.
+/// model-facing projection keeps one quarter from the head and three quarters
+/// from the tail. The durable delta stream and CAS spill are not reduced.
 pub const PROCESS_ADAPTER_INPUT_BYTES: usize = PROCESS_MAX_OUTPUT_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,8 +273,9 @@ impl EffectOperation for PreparedProcessExec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessBounds {
     pub max_inline_bytes: usize,
-    /// Hard combined stdout/stderr byte cap. Reaching it terminates the whole
-    /// process group and reports a typed failed process result.
+    /// Combined stdout/stderr termination threshold. The crossing pipe read is
+    /// durably retained whole; reaching it terminates the process group and
+    /// reports a typed failed result.
     pub max_output_bytes: usize,
     /// Hard wall-clock limit from successful spawn through process exit.
     pub wall_timeout: Duration,
@@ -313,6 +317,16 @@ pub struct ProcessResult {
     /// Terminating signal when no conventional exit code exists.
     pub signal: Option<i32>,
     pub output_bytes: usize,
+    /// Bytes observed after the output threshold that could not be retained.
+    /// This is a lower bound because terminating the process can leave unread
+    /// bytes in an OS pipe.
+    pub output_elided_bytes_at_least: usize,
+    /// Bytes observed only after termination had begun and therefore absent
+    /// from the durable command-output delta stream. Unlike
+    /// `output_elided_bytes_at_least`, this excludes ordinary adapter
+    /// head/tail reduction and is the source-incompleteness truth needed by
+    /// direct user-command replay.
+    pub source_output_elided_bytes_at_least: usize,
     /// BLAKE3 of the exact bounded stdout/stderr bytes accepted by the
     /// supervisor, in capture order.
     pub transcript_digest: String,
@@ -998,32 +1012,64 @@ struct BufferedOutput {
     bytes: Vec<u8>,
 }
 
-fn retain_adapter_tail(
-    retained: &mut VecDeque<BufferedOutput>,
-    retained_bytes: &mut usize,
-    stream: OutputStream,
-    bytes: &[u8],
-) {
-    let bytes = if bytes.len() > PROCESS_ADAPTER_INPUT_BYTES {
-        bytes[bytes.len() - PROCESS_ADAPTER_INPUT_BYTES..].to_vec()
-    } else {
-        bytes.to_vec()
-    };
-    *retained_bytes = retained_bytes.saturating_add(bytes.len());
-    retained.push_back(BufferedOutput { stream, bytes });
-    while *retained_bytes > PROCESS_ADAPTER_INPUT_BYTES {
-        let excess = retained_bytes.saturating_sub(PROCESS_ADAPTER_INPUT_BYTES);
-        let Some(front) = retained.front_mut() else {
-            *retained_bytes = 0;
-            break;
-        };
-        if front.bytes.len() <= excess {
-            *retained_bytes = retained_bytes.saturating_sub(front.bytes.len());
-            retained.pop_front();
-        } else {
-            front.bytes.drain(..excess);
-            *retained_bytes = retained_bytes.saturating_sub(excess);
+#[derive(Default)]
+struct AdapterTranscript {
+    head: Vec<BufferedOutput>,
+    head_bytes: usize,
+    tail: VecDeque<BufferedOutput>,
+    tail_bytes: usize,
+}
+
+impl AdapterTranscript {
+    const HEAD_BYTES: usize = PROCESS_ADAPTER_INPUT_BYTES / 4;
+    const TAIL_BYTES: usize = PROCESS_ADAPTER_INPUT_BYTES - Self::HEAD_BYTES;
+
+    fn retain(&mut self, stream: OutputStream, bytes: &[u8]) {
+        let head_remaining = Self::HEAD_BYTES.saturating_sub(self.head_bytes);
+        let head_len = bytes.len().min(head_remaining);
+        if head_len > 0 {
+            self.head.push(BufferedOutput {
+                stream,
+                bytes: bytes[..head_len].to_vec(),
+            });
+            self.head_bytes = self.head_bytes.saturating_add(head_len);
         }
+        let tail = &bytes[head_len..];
+        if tail.is_empty() {
+            return;
+        }
+        let tail = if tail.len() > Self::TAIL_BYTES {
+            &tail[tail.len() - Self::TAIL_BYTES..]
+        } else {
+            tail
+        };
+        self.tail_bytes = self.tail_bytes.saturating_add(tail.len());
+        self.tail.push_back(BufferedOutput {
+            stream,
+            bytes: tail.to_vec(),
+        });
+        while self.tail_bytes > Self::TAIL_BYTES {
+            let excess = self.tail_bytes.saturating_sub(Self::TAIL_BYTES);
+            let Some(front) = self.tail.front_mut() else {
+                self.tail_bytes = 0;
+                break;
+            };
+            if front.bytes.len() <= excess {
+                self.tail_bytes = self.tail_bytes.saturating_sub(front.bytes.len());
+                self.tail.pop_front();
+            } else {
+                front.bytes.drain(..excess);
+                self.tail_bytes = self.tail_bytes.saturating_sub(excess);
+            }
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.head_bytes.saturating_add(self.tail_bytes)
+    }
+
+    fn into_chunks(self) -> Vec<BufferedOutput> {
+        self.head.into_iter().chain(self.tail).collect()
     }
 }
 
@@ -1125,13 +1171,13 @@ async fn supervise_process_with_exit_observation(
     let (_stdout_ready, _stderr_ready) = tokio::join!(stdout_ready, stderr_ready);
 
     let mut transcript = Vec::<BufferedOutput>::new();
-    let mut adapter_transcript = VecDeque::<BufferedOutput>::new();
-    let mut adapter_payload_bytes = 0usize;
+    let mut adapter_transcript = AdapterTranscript::default();
     let mut transcript_payload_bytes = 0usize;
     let mut transcript_high_water_bytes = 0usize;
     let mut spill = None;
     let mut transcript_failed = false;
     let mut output_bytes = 0usize;
+    let mut source_elided_bytes_at_least = 0usize;
     let mut transcript_hasher = blake3::Hasher::new();
     let mut fatal = None;
     let mut cancelled = *cancel.borrow();
@@ -1222,7 +1268,7 @@ async fn supervise_process_with_exit_observation(
             }
             maybe_chunk = captured.recv(), if output_open => {
                 match maybe_chunk {
-                    Some(Captured::Chunk(stream, mut bytes)) => {
+                    Some(Captured::Chunk(stream, bytes)) => {
                         #[cfg(windows)]
                         if process_trace && !first_output_traced {
                             first_output_traced = true;
@@ -1232,25 +1278,28 @@ async fn supervise_process_with_exit_observation(
                             );
                         }
                         if cancelled || limit_reached.is_some() {
+                            source_elided_bytes_at_least =
+                                source_elided_bytes_at_least.saturating_add(bytes.len());
                             continue;
                         }
-                        let remaining = bounds.max_output_bytes.saturating_sub(output_bytes);
-                        let reached_cap = bytes.len() >= remaining;
-                        bytes.truncate(remaining);
+                        // Keep every byte already read in the durable stream
+                        // and CAS spill. The cap is the deterministic point at
+                        // which termination begins, not permission to rewrite
+                        // the journal's raw transcript. Equality is not proof
+                        // of truncation; one more byte (or EOF) decides it.
+                        let reached_cap = !cancelled
+                            && limit_reached.is_none()
+                            && output_bytes.saturating_add(bytes.len())
+                                > bounds.max_output_bytes;
                         transcript_hasher.update(&bytes);
                         transcript_high_water_bytes = transcript_high_water_bytes.max(
                             transcript_payload_bytes
-                                .saturating_add(adapter_payload_bytes)
+                                .saturating_add(adapter_transcript.retained_bytes())
                                 .saturating_add(bytes.len())
                         );
                         output_bytes = output_bytes.saturating_add(bytes.len());
                         if !bytes.is_empty() {
-                            retain_adapter_tail(
-                                &mut adapter_transcript,
-                                &mut adapter_payload_bytes,
-                                stream,
-                                &bytes,
-                            );
+                            adapter_transcript.retain(stream, &bytes);
                             let chunk_b64 = BASE64.encode(&bytes);
                             if let Err(error) = output
                                 .emit(
@@ -1570,10 +1619,13 @@ async fn supervise_process_with_exit_observation(
             None
         }
     };
+    let adapter_retained_bytes = adapter_transcript.retained_bytes();
+    let output_elided_bytes_at_least = source_elided_bytes_at_least
+        .saturating_add(output_bytes.saturating_sub(adapter_retained_bytes));
     let adapter_input = if output_bytes <= bounds.max_inline_bytes {
         transcript
     } else {
-        adapter_transcript.into_iter().collect()
+        adapter_transcript.into_chunks()
     };
     let inline_output = if transcript_failed {
         Vec::new()
@@ -1618,6 +1670,8 @@ async fn supervise_process_with_exit_observation(
             .and_then(std::process::ExitStatus::code),
         signal: exit_status.as_ref().and_then(haider_platform::exit_signal),
         output_bytes,
+        output_elided_bytes_at_least,
+        source_output_elided_bytes_at_least: source_elided_bytes_at_least,
         transcript_digest: format!("blake3:{}", transcript_hasher.finalize().to_hex()),
         inline_output,
         artifact,
@@ -2326,7 +2380,37 @@ mod supervisor_tests {
 
 #[cfg(test)]
 mod shell_command_tests {
-    use super::shell_command;
+    #![allow(clippy::expect_used)]
+
+    use super::{AdapterTranscript, OutputStream, shell_command};
+
+    fn retained_with_chunks(input: &[u8], chunk_bytes: usize) -> Vec<u8> {
+        let mut transcript = AdapterTranscript::default();
+        for chunk in input.chunks(chunk_bytes) {
+            transcript.retain(OutputStream::Stdout, chunk);
+        }
+        transcript
+            .into_chunks()
+            .into_iter()
+            .flat_map(|chunk| chunk.bytes)
+            .collect()
+    }
+
+    #[test]
+    fn adapter_transcript_keeps_deterministic_quarter_head_three_quarter_tail() {
+        let input = (0..super::PROCESS_ADAPTER_INPUT_BYTES + 12_345)
+            .map(|index| u8::try_from(index % 251).expect("fixture byte"))
+            .collect::<Vec<_>>();
+        let expected = input[..AdapterTranscript::HEAD_BYTES]
+            .iter()
+            .chain(&input[input.len() - AdapterTranscript::TAIL_BYTES..])
+            .copied()
+            .collect::<Vec<_>>();
+        let first = retained_with_chunks(&input, 8_192);
+        let different_pipe_partition = retained_with_chunks(&input, 3_071);
+        assert_eq!(first, expected);
+        assert_eq!(different_pipe_partition, expected);
+    }
 
     #[cfg(unix)]
     #[test]

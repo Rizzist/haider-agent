@@ -2282,6 +2282,7 @@ pub fn tree_rows(model: &AppModel) -> Vec<TreeRow> {
                 let haider_protocol::item::TurnItem::ContextCompaction {
                     tokens_before,
                     tokens_after,
+                    tokens_estimated,
                     ..
                 } = &block.item
                 else {
@@ -2289,8 +2290,10 @@ pub fn tree_rows(model: &AppModel) -> Vec<TreeRow> {
                 };
                 let detail = match (tokens_before, tokens_after) {
                     (Some(before), Some(after)) => format!(
-                        "⊟ compacted {} → {}",
+                        "⊟ compacted {}{} → {}{}",
+                        if *tokens_estimated { "~" } else { "" },
                         crate::format::fmt_tok(*before),
+                        if *tokens_estimated { "~" } else { "" },
                         crate::format::fmt_tok(*after)
                     ),
                     _ => "⊟ context compacted".to_owned(),

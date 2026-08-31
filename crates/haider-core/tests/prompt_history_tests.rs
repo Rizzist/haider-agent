@@ -461,6 +461,129 @@ async fn user_command_and_output_reach_the_next_turn_as_one_labeled_record() {
     );
 }
 
+#[tokio::test]
+async fn user_command_output_keeps_raw_delta_but_models_head_marker_and_failure_tail() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("user-command-elision-session");
+    let shell_run = RunId::new("user-command-elision-shell");
+    let current_run = RunId::new("user-command-elision-current");
+    let command_item = ItemId::new("user-command-elision-item");
+    let raw = format!(
+        "HEAD: cargo test --locked\n{}TAIL: linker failed with exit 1\n",
+        (0..2_000)
+            .map(|index| format!("progress line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let origin = UserCommandOriginV1 {
+        origin: CommandExecutionOrigin::UserCommand,
+        command_item_id: command_item.clone(),
+        call_id: "shell-elision".into(),
+    };
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &shell_run,
+            "user-command-elision-origin",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("user-command-elision-origin-item"),
+                item: origin.extension_item().expect("origin item"),
+            }),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &shell_run,
+            "user-command-elision-output",
+            EventPayload::Item(ItemEvent::Delta {
+                item_id: command_item.clone(),
+                delta: ItemDelta::CommandOutput {
+                    stream: OutputStream::Stdout,
+                    chunk_b64: BASE64.encode(&raw),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &shell_run,
+            "user-command-elision-completed",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: command_item,
+                item: TurnItem::CommandExecution {
+                    call_id: "shell-elision".into(),
+                    command: "cargo test --locked".into(),
+                    status: ToolStatus::Failed,
+                    exit_code: Some(1),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &shell_run,
+            "user-command-elision-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &current_run,
+            "user-command-elision-next",
+            EventPayload::UserMessage {
+                text: "diagnose it".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append user command history");
+
+    let stored = StoreHandle::read(&store, &session_id, 0, 64)
+        .await
+        .expect("read raw command journal");
+    let stored_chunk = stored
+        .into_iter()
+        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        .find_map(|payload| match payload {
+            EventPayload::Item(ItemEvent::Delta {
+                delta: ItemDelta::CommandOutput { chunk_b64, .. },
+                ..
+            }) => Some(chunk_b64),
+            _ => None,
+        })
+        .expect("durable command delta");
+    assert_eq!(
+        BASE64.decode(stored_chunk).expect("raw base64"),
+        raw.as_bytes()
+    );
+
+    let first = PromptHistoryCompiler::compile(&store, &session_id, None, None, &current_run)
+        .await
+        .expect("compile compact command view");
+    let second = PromptHistoryCompiler::compile(&store, &session_id, None, None, &current_run)
+        .await
+        .expect("replay compact command view");
+    assert_eq!(first, second, "replay must reproduce identical elision");
+    let Block::Text { text } = &first[0].blocks[0] else {
+        panic!("user command compiles to portable text");
+    };
+    assert!(text.contains("HEAD: cargo test --locked"));
+    assert!(text.contains("TAIL: linker failed with exit 1"));
+    let output_json = text
+        .lines()
+        .find_map(|line| line.strip_prefix("output_json (stdout/stderr in capture order): "))
+        .expect("portable output JSON string");
+    let output_preview: String =
+        serde_json::from_str(output_json).expect("decode portable output JSON string");
+    assert!(output_preview.contains("\"haider_elision_v1\""));
+    assert!(output_preview.contains("\"scope\":\"user_command_output_model_boundary\""));
+    assert!(text.len() < raw.len());
+}
+
 /// Known provenance is authority metadata, so malformed or duplicate markers
 /// must fail closed instead of silently reclassifying a direct command as a
 /// model tool execution.
@@ -4437,6 +4560,117 @@ async fn tool_result_is_presented_after_its_completed_tool_call() {
     assert_eq!(result, call + 1);
 }
 
+#[tokio::test]
+async fn journal_keeps_full_tool_output_while_replay_builds_the_same_compact_model_view() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("raw-tool-journal-session");
+    let prior = RunId::new("raw-tool-journal-prior");
+    let current = RunId::new("raw-tool-journal-current");
+    let raw = format!(
+        "HEAD identifies the command\n{}TAIL diagnostic: assertion failed\n",
+        "boilerplate\n".repeat(2_000)
+    );
+    let durable_result = BoundedResult {
+        preview: raw.clone(),
+        truncated: false,
+        data: None,
+        artifact: None,
+        images: Vec::new(),
+        cursor: None,
+        status: haider_protocol::tool::ToolResultStatus::Completed,
+        reason: None,
+        presentation: None,
+    };
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &prior,
+            "raw-tool-result",
+            EventPayload::ToolResult {
+                call_id: "raw-call".into(),
+                result: durable_result,
+            },
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "raw-tool-call",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("raw-tool-item"),
+                item: TurnItem::ToolCall {
+                    call_id: "raw-call".into(),
+                    name: "peer_list".into(),
+                    args: serde_json::json!({}),
+                    status: ToolStatus::Completed,
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "raw-tool-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &current,
+            "raw-tool-next-user",
+            EventPayload::UserMessage {
+                text: "continue".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append raw tool history");
+
+    let stored = StoreHandle::read(&store, &session_id, 0, 64)
+        .await
+        .expect("read raw tool journal");
+    let stored_preview = stored
+        .into_iter()
+        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        .find_map(|payload| match payload {
+            EventPayload::ToolResult { call_id, result } if call_id == "raw-call" => {
+                Some(result.preview)
+            }
+            _ => None,
+        })
+        .expect("durable raw tool result");
+    assert_eq!(stored_preview, raw);
+    assert!(!stored_preview.contains("haider_elision_v1"));
+
+    let messages = PromptHistoryCompiler::compile(&store, &session_id, None, None, &current)
+        .await
+        .expect("compile model projection");
+    let block = messages
+        .iter()
+        .find_map(|message| message.tool_result_for("raw-call"))
+        .expect("model tool result");
+    let Block::ToolResult {
+        preview, truncated, ..
+    } = block
+    else {
+        panic!("tool-result lookup returns a tool-result block");
+    };
+    assert!(*truncated);
+    assert!(preview.len() <= 8 * 1024);
+    assert!(preview.starts_with("HEAD identifies the command"));
+    assert!(preview.contains("\"haider_elision_v1\""));
+    assert!(preview.ends_with("TAIL diagnostic: assertion failed\n"));
+
+    let replay = PromptHistoryCompiler::compile(&store, &session_id, None, None, &current)
+        .await
+        .expect("replay same model projection");
+    assert_eq!(messages, replay, "model-boundary elision is deterministic");
+}
+
 /// Fable D2-5 pin (restored): only Done history in the requested
 /// branch/agent scope may reach the provider; prompt-marked partial
 /// output is still excluded.
@@ -5576,12 +5810,14 @@ async fn task_facts_reach_the_next_turn_prompt_and_omit_is_the_off_switch() {
         text[1],
         "[background task started] watcher (task-11) — cargo watch -x test"
     );
-    assert_eq!(
-        text[2],
+    assert!(text[2].starts_with(
         "[background task finished] watcher (task-11) exited with code 0 after 42s — \
          900000 output bytes (truncated; full retained output in the task artifact)\n\
-         output tail:\ntest result: ok\n"
-    );
+         output tail:\n"
+    ));
+    assert!(text[2].contains("\"haider_elision_v1\""));
+    assert!(text[2].contains("\"scope\":\"background_task_notice\""));
+    assert!(text[2].ends_with("result: ok\n"));
     assert_eq!(text[3], "how did it go");
     assert_eq!(
         text.len(),

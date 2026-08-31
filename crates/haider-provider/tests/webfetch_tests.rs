@@ -188,8 +188,8 @@ async fn redirect_chains_cap_at_five_hops() {
 }
 
 /// LAW (LW6, size cap + honest truncation): output caps at 96 KiB (or the
-/// caller's smaller `max_bytes`), cuts on a char boundary, and appends the
-/// honest truncation marker; a body under the cap is untouched.
+/// caller's smaller `max_bytes`), keeps a tail-weighted UTF-8-safe view, and
+/// inserts a machine-readable marker; a body under the cap is untouched.
 #[tokio::test]
 async fn output_caps_with_an_honest_truncation_marker() {
     let big = "x".repeat(WEB_FETCH_OUTPUT_CAP_BYTES + 10_000);
@@ -203,30 +203,31 @@ async fn output_caps_with_an_honest_truncation_marker() {
         .await
         .expect("big fetch succeeds");
     assert!(outcome.truncated);
-    assert!(
-        outcome.text.contains(&format!(
-            "[web_fetch: output truncated at {WEB_FETCH_OUTPUT_CAP_BYTES} bytes]"
-        )),
-        "honest marker present"
-    );
-    assert!(outcome.text.len() <= WEB_FETCH_OUTPUT_CAP_BYTES + 128);
+    assert!(outcome.text.contains("\"haider_elision_v1\""));
+    assert!(outcome.text.contains("\"scope\":\"web_fetch_output_cap\""));
+    assert!(outcome.text.ends_with(&"x".repeat(256)));
+    assert!(outcome.text.len() <= WEB_FETCH_OUTPUT_CAP_BYTES);
 
     let outcome = fetch_public_url(&format!("{base}/big"), Some(1024))
         .await
         .expect("capped fetch succeeds");
     assert!(outcome.truncated);
-    assert!(outcome.text.starts_with(&"x".repeat(1024)));
-    assert!(
-        outcome
-            .text
-            .contains("[web_fetch: output truncated at 1024 bytes]")
-    );
+    assert!(outcome.text.starts_with(&"x".repeat(64)));
+    assert!(outcome.text.contains("\"haider_elision_v1\""));
+    assert!(outcome.text.ends_with(&"x".repeat(64)));
+    assert!(outcome.text.len() <= 1024);
 
     let outcome = fetch_public_url(&format!("{base}/small"), None)
         .await
         .expect("small fetch succeeds");
     assert_eq!(outcome.text, "tiny body");
     assert!(!outcome.truncated);
+
+    let error = fetch_public_url(&format!("{base}/big"), Some(1))
+        .await
+        .expect_err("an impossible marker budget is refused");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    assert!(error.message.contains("at least 512"), "{error}");
 }
 
 /// LAW (W-F M6, whole-fetch wall-clock deadline): the per-chunk idle timeout
@@ -320,6 +321,8 @@ async fn source_cap_boundary_truncation_is_off_by_one_honest() {
         .await
         .expect("over-cap fetch succeeds");
     assert!(past.truncated, "one byte past the source cap IS truncated");
+    assert!(past.text.contains("\"haider_elision_v1\""));
+    assert!(past.text.contains("\"omitted_bytes_exact\":false"));
 }
 
 /// LAW (LW6, content-type gate): `text/*` and `application/json` pass;
@@ -398,4 +401,6 @@ async fn oversized_source_is_capped_before_reduction_even_when_it_reduces_small(
         "the raw body exceeded the 4 MiB SOURCE cap, so the fetch is truncated \
          even though the reduced output never approached the 96 KiB output cap"
     );
+    assert!(outcome.text.contains("\"haider_elision_v1\""));
+    assert!(outcome.text.contains("\"omitted_bytes_exact\":false"));
 }

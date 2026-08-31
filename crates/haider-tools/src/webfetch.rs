@@ -16,6 +16,9 @@ use crate::{ToolError, ToolResult};
 
 /// Hard cap the manifest documents for one fetch result.
 pub const WEB_FETCH_TOOL_OUTPUT_CAP_BYTES: u64 = 96 * 1024;
+/// Smallest caller-selected cap that can contain a machine-readable elision
+/// record while retaining useful head and tail content.
+pub const WEB_FETCH_TOOL_MIN_OUTPUT_BYTES: u64 = 512;
 
 /// One validated `web_fetch` request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +72,11 @@ impl WebFetch {
         };
         if host.is_empty() {
             return Err(ToolError::invalid_argument("web_fetch `url` has no host"));
+        }
+        if max_bytes.is_some_and(|bytes| bytes < WEB_FETCH_TOOL_MIN_OUTPUT_BYTES) {
+            return Err(ToolError::invalid_argument(format!(
+                "web_fetch `max_bytes` must be at least {WEB_FETCH_TOOL_MIN_OUTPUT_BYTES} so a truncation marker fits"
+            )));
         }
         Ok(Self {
             url: trimmed.to_owned(),
@@ -184,7 +192,7 @@ pub fn web_fetch_manifest() -> ToolManifest {
                 },
                 "max_bytes": {
                     "type": "integer",
-                    "minimum": 1,
+                    "minimum": WEB_FETCH_TOOL_MIN_OUTPUT_BYTES,
                     "description": "Optional smaller output cap in bytes.",
                 },
             },

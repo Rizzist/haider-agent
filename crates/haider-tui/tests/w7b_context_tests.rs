@@ -204,6 +204,7 @@ fn tree_lists_the_main_line_turns_and_compactions() {
             summary_artifact: haider_protocol::ids::ArtifactRef::new("blake3:tree"),
             tokens_before: Some(160_000),
             tokens_after: Some(30_000),
+            tokens_estimated: false,
         },
     );
     for c in "/tree".chars() {

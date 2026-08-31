@@ -12854,6 +12854,7 @@ fn item_lines<'a>(
         TurnItem::ContextCompaction {
             tokens_before,
             tokens_after,
+            tokens_estimated,
             ..
         } => {
             // Sim CompactRow (tui.js:3919-3924), gold: the additive
@@ -12861,8 +12862,10 @@ fn item_lines<'a>(
             // without numbers keep the honest count-free row.
             let text = match (tokens_before, tokens_after) {
                 (Some(before), Some(after)) => format!(
-                    "⊟ compacted {} → {} · summary retained · originals stay in /tree",
+                    "⊟ compacted {}{} → {}{} · summary retained · originals stay in /tree",
+                    if *tokens_estimated { "~" } else { "" },
                     fmt_tok(*before),
+                    if *tokens_estimated { "~" } else { "" },
                     fmt_tok(*after)
                 ),
                 _ => "⊟ context compacted — summary retained · originals stay in /tree".to_owned(),

@@ -1560,6 +1560,7 @@ pub fn compaction_beats(before: u64, after: u64, manual: bool, seq: u64) -> Vec<
             summary_artifact: haider_protocol::ids::ArtifactRef::new("blake3:demo-compact"),
             tokens_before: Some(before),
             tokens_after: Some(after),
+            tokens_estimated: false,
         },
     })));
     beats.push(Beat::TokensReset(after));

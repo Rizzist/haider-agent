@@ -432,6 +432,7 @@ fn sibling_compaction_and_footprint_never_leak_into_the_active_branch() {
             summary_artifact: haider_protocol::ids::ArtifactRef::new("blake3:abc"),
             tokens_before: Some(1_000),
             tokens_after: Some(60),
+            tokens_estimated: false,
         },
     });
     assert_eq!(

@@ -307,10 +307,7 @@ impl RealWorldAccumulator {
             self.truncated = true;
         }
         if self.truncated {
-            let marker = format!(
-                "[pdf truncated: {} of {total_pages} pages]",
-                self.pages_extracted
-            );
+            let marker = pdf_truncation_marker(self.pages_extracted, total_pages);
             let reserved = marker.chars().count() + 2;
             let keep = MAX_PDF_TOTAL_TEXT_CHARS.saturating_sub(reserved);
             self.output = take_chars(&self.output, keep);
@@ -375,7 +372,7 @@ fn bound_real_world_pages(page_texts: &[String], total_pages: u32) -> Option<Ext
         truncated = true;
     }
     if truncated {
-        let marker = format!("[pdf truncated: {pages_extracted} of {total_pages} pages]");
+        let marker = pdf_truncation_marker(pages_extracted, total_pages);
         let reserved = marker.chars().count() + 2;
         let keep = MAX_PDF_TOTAL_TEXT_CHARS.saturating_sub(reserved);
         output = take_chars(&output, keep);
@@ -511,7 +508,7 @@ fn extract_text_bounded_internal(parsed: &ParsedPdf<'_>) -> Result<ExtractedPdfT
         truncated = true;
     }
     if truncated {
-        let marker = format!("[pdf truncated: {pages_extracted} of {total_pages} pages]");
+        let marker = pdf_truncation_marker(pages_extracted, total_pages);
         let reserved = marker.chars().count() + 2;
         let keep = MAX_PDF_TOTAL_TEXT_CHARS.saturating_sub(reserved);
         output = take_chars(&output, keep);
@@ -528,6 +525,13 @@ fn extract_text_bounded_internal(parsed: &ParsedPdf<'_>) -> Result<ExtractedPdfT
         total_pages,
         truncated,
     })
+}
+
+fn pdf_truncation_marker(pages_extracted: u32, total_pages: u32) -> String {
+    let omitted_pages_at_least = total_pages.saturating_sub(pages_extracted);
+    format!(
+        "{{\"haider_elision_v1\":{{\"scope\":\"pdf_text_extraction\",\"omitted_bytes\":1,\"omitted_bytes_exact\":false,\"omitted_pages_at_least\":{omitted_pages_at_least},\"pages_extracted\":{pages_extracted},\"total_pages\":{total_pages}}}}}"
+    )
 }
 
 fn parse_pdf(bytes: &[u8]) -> Result<ParsedPdf<'_>, PdfError> {
@@ -1381,7 +1385,10 @@ mod tests {
         let extracted = extract_text_bounded(&pdf).expect("bounded extraction");
         assert!(extracted.truncated);
         assert_eq!(extracted.pages_extracted, 1);
-        assert!(extracted.text.ends_with("[pdf truncated: 1 of 2 pages]"));
+        assert!(extracted.text.contains("\"haider_elision_v1\""));
+        assert!(extracted.text.contains("\"pages_extracted\":1"));
+        assert!(extracted.text.contains("\"total_pages\":2"));
+        assert!(!extracted.text.contains("token_estimation_method"));
         assert!(extracted.text.chars().count() <= MAX_PDF_TOTAL_TEXT_CHARS);
         assert!(!extracted.text.contains("unreached"));
     }
@@ -1398,7 +1405,9 @@ mod tests {
 
         assert!(extracted.truncated);
         assert_eq!(extracted.pages_extracted, 5);
-        assert!(extracted.text.ends_with("[pdf truncated: 5 of 5 pages]"));
+        assert!(extracted.text.contains("\"haider_elision_v1\""));
+        assert!(extracted.text.contains("\"pages_extracted\":5"));
+        assert!(extracted.text.contains("\"total_pages\":5"));
         assert!(extracted.text.chars().count() <= MAX_PDF_TOTAL_TEXT_CHARS);
     }
 

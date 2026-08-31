@@ -21,6 +21,43 @@ the same rule and resume strictly after its last fully processed `seq`.
 Unknown additive envelope or payload fields must be ignored. Existing payload
 types and fields retain their meanings.
 
+## Additive context-economy accounting
+
+Model-boundary reductions do not rewrite earlier journal records. Conversation
+compaction appends an ordinary completed parent extension item with
+`kind == "context_savings_v1"`. Tool-output elision appends its additive child
+kind, `context_savings_output_v1`. Both are ordered in one session economy
+ledger and use the sole honesty marker
+`measurement == "provider_request_bytes_div_four_v1"`: their token fields are
+deterministic estimates derived from serialized provider-bound projection
+bytes (including JSON-string escaping for output text), not exact provider or
+billed token counts. The distinct child kind keeps
+the required conversation `tier` backward-compatible; ctx-era consumers safely
+ignore the new kind.
+
+The event's `layer` establishes ownership:
+
+- `tool_output` measures an original tool-output projection to the bounded,
+  model-visible projection. Its `output` child carries byte-level omission and
+  retained-head/tail facts.
+- `conversation` measures the already-bounded transcript to its structurally
+  trimmed or summarized projection and carries a `tier`.
+
+Thus the parent and child layers form consecutive boundaries: raw output →
+bounded transcript → compacted transcript. Merge completed records from both
+kinds by their shared monotonic `session_operation_count`, then sum each
+operation's `estimated_tokens_saved` once; conversation events never re-count
+source bytes that output elision already removed. The monotonic session
+cumulative value is the same sum and survives restart.
+
+Model-visible text elisions contain a standalone JSON line keyed by
+`haider_elision_v1`. Those markers disclose that content is incomplete, what
+scope was affected, and whether omitted byte counts are exact. They deliberately
+contain no token counter and are not an additive accounting stream. The
+extension items and marker fields are additive: they do not change tool-call
+ids, cursor sequencing, or the terminal rule below, and older consumers may
+ignore them.
+
 ## Tool-call identity
 
 The provider's tool-call id is the stable call/result join key; Haider does not
