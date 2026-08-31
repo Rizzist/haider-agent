@@ -309,6 +309,7 @@ fn observe_json_schemas_are_goldened_and_secret_free() {
             alias: "work".into(),
         }),
         session_count: 2,
+        waiting_for_route_count: 1,
         profile_path: "/tmp/haider-profile".into(),
         runtime_dir: "/tmp/haider-runtime/profile-a".into(),
         adoption_available: Vec::new(),

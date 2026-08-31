@@ -93,11 +93,15 @@ use haider_protocol::verify::VerifyVerdict;
 use haider_provider::{
     Message, PROVIDER_DEADLINE_SAFETY_MARGIN, PromptCacheMetadata, Provider, ProviderError,
     ProviderErrorKind, ProviderStream, ProviderStreamItem, ProviderTimeoutReason,
-    ResolvedAttachment, ToolDefinition, TurnRequest, apply_tool_result_image_budget,
-    before_provider_request_deadline, canonical_tool_definitions,
-    canonical_tool_definitions_digest, degrade_tool_result_images_to_placeholders,
-    effective_request_budget, validate_provider_view_prefix,
+    ROUTE_STATE_POLL_INTERVAL, ResolvedAttachment, ToolDefinition, TurnRequest,
+    apply_tool_result_image_budget, before_provider_request_deadline, canonical_tool_definitions,
+    canonical_tool_definitions_digest, deadline_exhausted_error,
+    degrade_tool_result_images_to_placeholders, effective_request_budget,
+    validate_provider_view_prefix,
 };
+
+pub const ROUTE_REPLAY_ATTEMPT_EXTENSION_KIND: &str = "haider.route_replay_attempt.v1";
+pub const ROUTE_REPLAY_EVENT_EXTENSION_KIND: &str = "haider.route_replay_event.v1";
 
 /// Frames one boundary-delivered peer message for the provider tail.
 ///
@@ -983,6 +987,53 @@ pub struct SubmitPartialStreamTurn {
     pub checkpoint: PartialStreamCheckpoint,
 }
 
+/// One incomplete text item retained across a network reconnect or daemon
+/// restart. Its durable item id lets resumed deltas extend the existing row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteWaitTextCheckpoint {
+    pub item_id: ItemId,
+    pub text: String,
+}
+
+/// One provider-authored tool call whose streamed arguments were incomplete
+/// when the route disappeared. Recovery restores the accumulator and filters
+/// the provider's exact replayed prefix before accepting novel argument bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteWaitToolCheckpoint {
+    pub item_id: ItemId,
+    pub call_id: String,
+    pub name: String,
+    pub args: String,
+}
+
+/// One completed local tool effect retained across a daemon restart. A
+/// provider replay restores its transcript blocks without redispatching it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteWaitCompletedToolCheckpoint {
+    pub call_id: String,
+    pub name: String,
+    pub args: serde_json::Value,
+    pub result: Option<BoundedResult>,
+}
+
+/// Durable provider-stream position for a run parked on network reachability.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RouteWaitCheckpoint {
+    pub message: Option<RouteWaitTextCheckpoint>,
+    pub reasoning: Option<RouteWaitTextCheckpoint>,
+    pub tools: Vec<RouteWaitToolCheckpoint>,
+    pub completed_tools: Vec<RouteWaitCompletedToolCheckpoint>,
+    pub structured_events: Vec<StreamEvent>,
+    pub response_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubmitRouteWaitTurn {
+    pub run_id: RunId,
+    pub messages: Vec<Message>,
+    pub checkpoint: RouteWaitCheckpoint,
+}
+
 /// Durable coordinates for one deferred spawn tool reconstructed after a
 /// daemon restart.
 #[derive(Debug, Clone, PartialEq)]
@@ -1542,6 +1593,14 @@ impl HarnessHandle {
             .await
     }
 
+    pub async fn submit_route_wait_turn(
+        &self,
+        request: SubmitRouteWaitTurn,
+    ) -> Result<TurnHandle, HaiderError> {
+        self.submit(TurnSubmission::RouteWait(Box::new(request)))
+            .await
+    }
+
     pub async fn submit_child_wait_turn(
         &self,
         request: SubmitChildWaitTurn,
@@ -1768,6 +1827,7 @@ enum TurnSubmission {
     Committed(SubmitCommittedTurn),
     Checkpoint(Box<SubmitCheckpointTurn>),
     PartialStream(Box<SubmitPartialStreamTurn>),
+    RouteWait(Box<SubmitRouteWaitTurn>),
     ChildWait(Box<SubmitChildWaitTurn>),
 }
 
@@ -2399,70 +2459,88 @@ impl HarnessActor {
             self.config.provider_tool_fallback_tools =
                 canonical_tool_definitions(&self.config.provider_tool_fallback_tools);
         }
-        let (run_id, mut messages, checkpoint, partial_stream, child_wait) = match submit {
-            TurnSubmission::Local(submit) => {
-                let run_id = self.next_run_id();
-                if let Err(error) = self.commit_state(&run_id, RunState::Queued).await {
-                    return self.errored_state_outcome(&run_id, error).await;
-                }
-                if let Err(error) = self
-                    .commit_tree_fragment(
-                        &run_id,
-                        EventPayload::UserMessage {
-                            text: submit.text.clone(),
-                            attachments: Vec::new(),
-                            mode: DeliveryMode::Steer,
-                        },
-                        prompt_verbatim_render(),
-                        NodeKind::UserTurn {
-                            text: submit.text.clone(),
-                            attachments: Vec::new(),
-                        },
+        let (run_id, mut messages, checkpoint, partial_stream, route_wait, child_wait) =
+            match submit {
+                TurnSubmission::Local(submit) => {
+                    let run_id = self.next_run_id();
+                    if let Err(error) = self.commit_state(&run_id, RunState::Queued).await {
+                        return self.errored_state_outcome(&run_id, error).await;
+                    }
+                    if let Err(error) = self
+                        .commit_tree_fragment(
+                            &run_id,
+                            EventPayload::UserMessage {
+                                text: submit.text.clone(),
+                                attachments: Vec::new(),
+                                mode: DeliveryMode::Steer,
+                            },
+                            prompt_verbatim_render(),
+                            NodeKind::UserTurn {
+                                text: submit.text.clone(),
+                                attachments: Vec::new(),
+                            },
+                        )
+                        .await
+                    {
+                        return self.errored_state_outcome(&run_id, error).await;
+                    }
+                    (
+                        run_id,
+                        vec![Message::user_text(submit.text)],
+                        None,
+                        None,
+                        None,
+                        None,
                     )
-                    .await
-                {
-                    return self.errored_state_outcome(&run_id, error).await;
                 }
-                (
-                    run_id,
-                    vec![Message::user_text(submit.text)],
-                    None,
-                    None,
-                    None,
-                )
-            }
-            TurnSubmission::Committed(submit) => (submit.run_id, submit.messages, None, None, None),
-            TurnSubmission::Checkpoint(submit) => {
-                let submit = *submit;
-                (
-                    submit.run_id,
-                    submit.messages,
-                    Some(submit.checkpoint),
-                    None,
-                    None,
-                )
-            }
-            TurnSubmission::PartialStream(submit) => {
-                let submit = *submit;
-                (
-                    submit.run_id,
-                    submit.messages,
-                    None,
-                    Some(submit.checkpoint),
-                    None,
-                )
-            }
-            TurnSubmission::ChildWait(submit) => {
-                let submit = *submit;
-                (
-                    submit.run_id,
-                    submit.messages,
-                    None,
-                    None,
-                    Some(submit.checkpoint),
-                )
-            }
-        };
+                TurnSubmission::Committed(submit) => {
+                    (submit.run_id, submit.messages, None, None, None, None)
+                }
+                TurnSubmission::Checkpoint(submit) => {
+                    let submit = *submit;
+                    (
+                        submit.run_id,
+                        submit.messages,
+                        Some(submit.checkpoint),
+                        None,
+                        None,
+                        None,
+                    )
+                }
+                TurnSubmission::PartialStream(submit) => {
+                    let submit = *submit;
+                    (
+                        submit.run_id,
+                        submit.messages,
+                        None,
+                        Some(submit.checkpoint),
+                        None,
+                        None,
+                    )
+                }
+                TurnSubmission::RouteWait(submit) => {
+                    let submit = *submit;
+                    (
+                        submit.run_id,
+                        submit.messages,
+                        None,
+                        None,
+                        Some(submit.checkpoint),
+                        None,
+                    )
+                }
+                TurnSubmission::ChildWait(submit) => {
+                    let submit = *submit;
+                    (
+                        submit.run_id,
+                        submit.messages,
+                        None,
+                        None,
+                        None,
+                        Some(submit.checkpoint),
+                    )
+                }
+            };
         // The compiler always places the accepted current user message last.
         // Everything before it is the only prefix eligible for mid-turn
         // forced compaction; current-run content remains a verbatim suffix.
@@ -2491,6 +2569,82 @@ impl HarnessActor {
         let mut message: Option<TextAccumulator> = None;
         let mut reasoning: Option<TextAccumulator> = None;
         let mut tools: Vec<ToolAccumulator> = Vec::new();
+        let mut replay = ReplayPrefix::default();
+        if let Some(checkpoint) = route_wait.as_ref() {
+            replay.response_epoch = checkpoint.response_epoch;
+            let has_message_events = checkpoint
+                .structured_events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::TextDelta { .. }));
+            let has_reasoning_events = checkpoint
+                .structured_events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::ReasoningDelta { .. }));
+            if let Some(checkpoint) = checkpoint.message.as_ref() {
+                message = Some(TextAccumulator {
+                    item_id: checkpoint.item_id.clone(),
+                    text: checkpoint.text.clone(),
+                });
+                if !has_message_events {
+                    replay.message_applied.clone_from(&checkpoint.text);
+                }
+            }
+            if let Some(checkpoint) = checkpoint.reasoning.as_ref() {
+                reasoning = Some(TextAccumulator {
+                    item_id: checkpoint.item_id.clone(),
+                    text: checkpoint.text.clone(),
+                });
+                if !has_reasoning_events {
+                    replay.reasoning_applied.clone_from(&checkpoint.text);
+                }
+            }
+            for tool in &checkpoint.tools {
+                tools.push(ToolAccumulator {
+                    item_id: tool.item_id.clone(),
+                    call_id: tool.call_id.clone(),
+                    name: tool.name.clone(),
+                    args: tool.args.clone(),
+                    parsed_args: OnceLock::new(),
+                });
+                if checkpoint.structured_events.is_empty() {
+                    replay.structured_applied.push(StreamEvent::ToolCallStart {
+                        call_id: tool.call_id.clone(),
+                        name: tool.name.clone(),
+                    });
+                    if !tool.args.is_empty() {
+                        replay
+                            .structured_applied
+                            .push(StreamEvent::ToolCallArgsDelta {
+                                call_id: tool.call_id.clone(),
+                                args_fragment: tool.args.clone(),
+                            });
+                    }
+                }
+            }
+            for event in &checkpoint.structured_events {
+                match event {
+                    StreamEvent::TextDelta { text } if has_message_events => {
+                        replay.message_applied.push_str(text);
+                    }
+                    StreamEvent::TextDelta { .. } => {}
+                    StreamEvent::ReasoningDelta { text } if has_reasoning_events => {
+                        replay.reasoning_applied.push_str(text);
+                    }
+                    StreamEvent::ReasoningDelta { .. } => {}
+                    StreamEvent::RefusalDelta { text } => {
+                        replay.refusal_applied.push_str(text);
+                    }
+                    event if is_structured_replay_event(event) => {
+                        replay.record_structured(event.clone());
+                    }
+                    _ => {}
+                }
+            }
+            replay.message.clone_from(&replay.message_applied);
+            replay.reasoning.clone_from(&replay.reasoning_applied);
+            replay.refusal.clone_from(&replay.refusal_applied);
+            replay.structured_expected = normalized_structured_replay(&replay.structured_applied);
+        }
         let mut deferred = Vec::<DeferredAccumulator>::new();
         if let Some(checkpoint) = checkpoint {
             tools.push(ToolAccumulator {
@@ -2727,6 +2881,35 @@ impl HarnessActor {
         let mut pending_previous_cache_request: Option<PreviousCacheRequest> = None;
         let mut previous_cache_request_sent_at: Option<tokio::time::Instant> = None;
         let mut cache_rewarm_pending = self.config.cache_initial_rewarm;
+        if route_wait.is_some() {
+            match self
+                .wait_for_provider_route(&run_id, &cancel, &provider)
+                .await
+            {
+                Ok(()) => thinking_pending = false,
+                Err(DriveError::Cancelled) => {
+                    return self
+                        .cancelled_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    return self
+                        .drive_error_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                            error,
+                        )
+                        .await;
+                }
+            }
+        }
         if let Some(dispatcher) = self.dispatcher.as_ref() {
             match dispatcher.refresh_volatile_context_tail().await {
                 Ok(Some(tail)) => volatile_user_tail = (!tail.is_empty()).then_some(tail),
@@ -2763,6 +2946,88 @@ impl HarnessActor {
         // exactly once, under the finished message.
         let mut server_calls: HashMap<String, (String, serde_json::Value)> = HashMap::new();
         let mut web_sources: Vec<WebSource> = Vec::new();
+        // These are one logical provider response, not one physical transport
+        // attempt. A reconnect keeps them alive while replay filtering skips
+        // already-applied structured events and tool effects.
+        let route_has_message_events = route_wait.as_ref().is_some_and(|checkpoint| {
+            checkpoint
+                .structured_events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::TextDelta { .. }))
+        });
+        let mut assistant_blocks = if route_has_message_events {
+            Vec::new()
+        } else {
+            message.as_ref().map_or_else(Vec::new, |message| {
+                vec![Block::Text {
+                    text: message.text.clone(),
+                }]
+            })
+        };
+        let mut tool_results = Vec::new();
+        let mut refusal_reason = replay.refusal.clone();
+        if let Some(checkpoint) = route_wait.as_ref() {
+            let mut completed_tools = checkpoint
+                .completed_tools
+                .iter()
+                .map(|tool| (tool.call_id.clone(), tool))
+                .collect::<HashMap<_, _>>();
+            for event in &checkpoint.structured_events {
+                match event {
+                    StreamEvent::TextDelta { text } if route_has_message_events => {
+                        assistant_blocks.push(Block::Text { text: text.clone() });
+                    }
+                    StreamEvent::ProviderOpaque { provider, data } => {
+                        assistant_blocks.push(Block::ProviderOpaque {
+                            provider: provider.clone(),
+                            data: data.clone(),
+                        });
+                    }
+                    StreamEvent::ToolCallEnd { call_id } => {
+                        if let Some(tool) = completed_tools.remove(call_id) {
+                            assistant_blocks.push(Block::ToolCall {
+                                call_id: tool.call_id.clone(),
+                                name: tool.name.clone(),
+                                args: tool.args.clone(),
+                            });
+                            if let Some(result) = tool.result.as_ref() {
+                                let projection = model_tool_result_projection(&tool.name, result);
+                                tool_results.push(Message::tool_result_with_images(
+                                    tool.call_id.clone(),
+                                    projection.preview,
+                                    projection.truncated,
+                                    result.images.clone(),
+                                ));
+                            }
+                        }
+                    }
+                    StreamEvent::ServerToolUse {
+                        call_id,
+                        name,
+                        args,
+                    } => {
+                        server_calls.insert(call_id.clone(), (name.clone(), args.clone()));
+                    }
+                    StreamEvent::ServerToolResult { call_id, .. } => {
+                        server_calls.remove(call_id);
+                    }
+                    StreamEvent::WebSources { sources } => {
+                        for source in sources {
+                            if web_sources.len() >= WEB_SOURCES_CAP {
+                                break;
+                            }
+                            if !web_sources
+                                .iter()
+                                .any(|existing| existing.url == source.url)
+                            {
+                                web_sources.push(source.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         'requests: loop {
             self.pending_nudges
                 .extend(self.promoted_steers.drain_committed());
@@ -3217,8 +3482,11 @@ impl HarnessActor {
                     &run_id,
                     provider_request_ordinal,
                     pending_provider_view,
-                    provider_view_attempt_data,
-                    request_attempt_data,
+                    RequestAttemptMarkers {
+                        provider_view: provider_view_attempt_data,
+                        cache: request_attempt_data,
+                        response_epoch: replay.response_epoch,
+                    },
                     &mut thinking_pending,
                 )
                 .await
@@ -3236,11 +3504,6 @@ impl HarnessActor {
             cache_rewarm_pending = None;
             let mut request_usage: Option<Usage> = None;
             let mut pending_usage_commit: Option<PendingUsageCommit> = None;
-            // A terminal coalescing batch is valid only for a response that
-            // never crossed a tool boundary. Tool accumulators may already
-            // be empty again after dispatch, so their final shape alone is
-            // not enough to prove that no external await intervened.
-            let mut crossed_tool_boundary = false;
             let attempt_provider = Arc::clone(&provider);
             let mut opening = Box::pin(before_provider_request_deadline(
                 self.config.provider_deadline,
@@ -3261,9 +3524,9 @@ impl HarnessActor {
                             )
                             .await;
                     }
-                    () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                    () = tokio::time::sleep(ROUTE_STATE_POLL_INTERVAL) => {
                         let unavailable = trusts_default_route_absence
-                            && haider_platform::route_status()
+                            && attempt_provider.route_status()
                                 == haider_platform::RouteStatus::Unavailable;
                         if unavailable != opening_network_waiting {
                             let state = if unavailable {
@@ -3374,6 +3637,43 @@ impl HarnessActor {
                         }
                         cache_rewarm_pending = Some(CacheRewarmReasonV1::PlannedCompaction);
                         provider_attempt = 0;
+                        replay.reset_for_next_request();
+                        refusal_reason.clear();
+                        assistant_blocks.clear();
+                        tool_results.clear();
+                        continue 'requests;
+                    }
+                    Err(error)
+                        if provider_error_waits_for_route(&error, provider.route_status()) =>
+                    {
+                        replay.capture(&message, &reasoning, &refusal_reason);
+                        match self
+                            .wait_for_provider_route(&run_id, &cancel, &provider)
+                            .await
+                        {
+                            Ok(()) => thinking_pending = false,
+                            Err(DriveError::Cancelled) => {
+                                return self
+                                    .cancelled_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                    )
+                                    .await;
+                            }
+                            Err(error) => {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
+                            }
+                        }
                         continue 'requests;
                     }
                     Err(error) => {
@@ -3428,10 +3728,10 @@ impl HarnessActor {
                 return self.errored_state_outcome(&run_id, error).await;
             }
 
-            let mut assistant_blocks = Vec::new();
-            let mut tool_results = Vec::new();
-            let mut provider_content_seen = false;
-            let mut refusal_reason = String::new();
+            let mut provider_content_seen =
+                message.as_ref().is_some_and(|item| !item.text.is_empty())
+                    || reasoning.as_ref().is_some_and(|item| !item.text.is_empty())
+                    || replay.has_applied_content();
             loop {
                 // Coalesce only a Finish already buffered immediately after
                 // Usage. If polling would suspend, preserve the old durability
@@ -3612,6 +3912,68 @@ impl HarnessActor {
                         }
                         cache_rewarm_pending = Some(CacheRewarmReasonV1::PlannedCompaction);
                         provider_attempt = 0;
+                        replay.reset_for_next_request();
+                        refusal_reason.clear();
+                        assistant_blocks.clear();
+                        tool_results.clear();
+                        continue 'requests;
+                    }
+                    Err(error)
+                        if provider_error_waits_for_route(&error, provider.route_status()) =>
+                    {
+                        if let Err(error) = self
+                            .commit_pending_usage(&run_id, &mut pending_usage_commit)
+                            .await
+                        {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    DriveError::Store(error),
+                                )
+                                .await;
+                        }
+                        if let Err(error) = self.flush_pending_item_delta().await {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    DriveError::Store(error),
+                                )
+                                .await;
+                        }
+                        replay.capture(&message, &reasoning, &refusal_reason);
+                        match self
+                            .wait_for_provider_route(&run_id, &cancel, &provider)
+                            .await
+                        {
+                            Ok(()) => thinking_pending = false,
+                            Err(DriveError::Cancelled) => {
+                                return self
+                                    .cancelled_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                    )
+                                    .await;
+                            }
+                            Err(error) => {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
+                            }
+                        }
                         continue 'requests;
                     }
                     Err(error) if !provider_content_seen => {
@@ -3810,6 +4172,10 @@ impl HarnessActor {
                             }
                             provider_attempt = 0;
                             thinking_pending = true;
+                            replay.reset_for_next_request();
+                            refusal_reason.clear();
+                            assistant_blocks.clear();
+                            tool_results.clear();
                             continue 'requests;
                         }
                         return self
@@ -3875,38 +4241,59 @@ impl HarnessActor {
                         }
                     }
                 }
-                if matches!(
-                    &event,
-                    StreamEvent::ToolCallStart { .. }
-                        | StreamEvent::ToolCallArgsDelta { .. }
-                        | StreamEvent::ToolCallEnd { .. }
-                        | StreamEvent::ServerToolUse { .. }
-                        | StreamEvent::ServerToolResult { .. }
-                ) {
-                    crossed_tool_boundary = true;
-                }
+                let event = match replay.filter_structured(event) {
+                    Ok(Some(event)) => event,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        return self
+                            .provider_failure_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                                error,
+                            )
+                            .await;
+                    }
+                };
+                let mut route_replay_event =
+                    is_structured_replay_event(&event).then(|| event.clone());
 
                 let event_result: Result<Option<Message>, DriveError> = match event {
                     // Consumed by the state-transition gate immediately above.
                     StreamEvent::NetworkUnavailable | StreamEvent::NetworkRestored => Ok(None),
                     StreamEvent::TextDelta { text } => {
-                        assistant_blocks.push(Block::Text { text: text.clone() });
-                        self.apply_text_delta(&run_id, &mut message, text, false)
-                            .await
-                            .map(|()| None)
+                        let text = replay.filter_message(text);
+                        if text.is_empty() {
+                            Ok(None)
+                        } else {
+                            assistant_blocks.push(Block::Text { text: text.clone() });
+                            self.apply_text_delta(&run_id, &mut message, text, false)
+                                .await
+                                .map(|()| None)
+                        }
                     }
                     StreamEvent::ReasoningDelta { text } => {
                         // Normalized reasoning has no provider-valid signature
                         // and must never be replayed into a follow-up request.
-                        self.apply_text_delta(&run_id, &mut reasoning, text, true)
-                            .await
-                            .map(|()| None)
+                        let text = replay.filter_reasoning(text);
+                        if text.is_empty() {
+                            Ok(None)
+                        } else {
+                            self.apply_text_delta(&run_id, &mut reasoning, text, true)
+                                .await
+                                .map(|()| None)
+                        }
                     }
                     StreamEvent::RefusalDelta { text } => {
                         // Refusal content has its own provider channel. The
                         // terminal Refusal outcome survives, but this content
                         // must never become assistant text or prompt history.
+                        let text = replay.filter_refusal(text);
                         append_bounded_refusal(&mut refusal_reason, &text);
+                        if !text.is_empty() {
+                            route_replay_event = Some(StreamEvent::RefusalDelta { text });
+                        }
                         Ok(None)
                     }
                     StreamEvent::ProviderOpaque { provider, data } => {
@@ -3989,6 +4376,10 @@ impl HarnessActor {
                                     }
                                     provider_attempt = 0;
                                     thinking_pending = true;
+                                    replay.reset_for_next_request();
+                                    refusal_reason.clear();
+                                    assistant_blocks.clear();
+                                    tool_results.clear();
                                     continue 'requests;
                                 }
                                 self.complete_tool(
@@ -4251,7 +4642,6 @@ impl HarnessActor {
                             && pending_usage_commit.is_some()
                             && message.is_some()
                             && self.tree_head_initialized
-                            && !crossed_tool_boundary
                             && tools.is_empty()
                             && deferred.is_empty()
                             && server_calls.is_empty()
@@ -4427,6 +4817,9 @@ impl HarnessActor {
                             provider_attempt = 0;
                             messages.append(&mut tool_results);
                             thinking_pending = true;
+                            replay.reset_for_next_request();
+                            refusal_reason.clear();
+                            assistant_blocks.clear();
                             continue 'requests;
                         }
                         // W-B (LW2): `pause_turn` shares the MaxTokens
@@ -4504,6 +4897,10 @@ impl HarnessActor {
                             }
                             provider_attempt = 0;
                             thinking_pending = true;
+                            replay.reset_for_next_request();
+                            refusal_reason.clear();
+                            assistant_blocks.clear();
+                            tool_results.clear();
                             continue 'requests;
                         }
                         // No tool-call boundary appeared in this response.
@@ -4531,6 +4928,10 @@ impl HarnessActor {
                             );
                             provider_attempt = 0;
                             thinking_pending = true;
+                            replay.reset_for_next_request();
+                            refusal_reason.clear();
+                            assistant_blocks.clear();
+                            tool_results.clear();
                             continue 'requests;
                         }
                         if !self.pending_nudges.is_empty() {
@@ -4549,6 +4950,10 @@ impl HarnessActor {
                             }
                             provider_attempt = 0;
                             thinking_pending = true;
+                            replay.reset_for_next_request();
+                            refusal_reason.clear();
+                            assistant_blocks.clear();
+                            tool_results.clear();
                             continue 'requests;
                         }
                         // W-B (decision 6): the bounded sources list journals
@@ -4607,6 +5012,10 @@ impl HarnessActor {
                                         }
                                         provider_attempt = 0;
                                         thinking_pending = true;
+                                        replay.reset_for_next_request();
+                                        refusal_reason.clear();
+                                        assistant_blocks.clear();
+                                        tool_results.clear();
                                         continue 'requests;
                                     }
                                     FinalizationGuardDecision::ConfirmRequired(menu) => {
@@ -4635,6 +5044,10 @@ impl HarnessActor {
                                                 ));
                                                 provider_attempt = 0;
                                                 thinking_pending = true;
+                                                replay.reset_for_next_request();
+                                                refusal_reason.clear();
+                                                assistant_blocks.clear();
+                                                tool_results.clear();
                                                 continue 'requests;
                                             }
                                             Ok(GraphFinalizationAnswer::AbandonAndFinish) => {
@@ -4790,6 +5203,10 @@ impl HarnessActor {
                             messages.extend(promoted.into_iter().map(Message::user_text));
                             provider_attempt = 0;
                             thinking_pending = true;
+                            replay.reset_for_next_request();
+                            refusal_reason.clear();
+                            assistant_blocks.clear();
+                            tool_results.clear();
                             continue 'requests;
                         }
                         if post_stream_batch {
@@ -4882,6 +5299,25 @@ impl HarnessActor {
                             .await;
                     }
                 }
+                if let Some(event) = route_replay_event {
+                    let marker = serde_json::json!({
+                        "response_epoch": replay.response_epoch,
+                        "stream_event": event,
+                    });
+                    if let Err(error) = self
+                        .commit_hidden_extension_marker(
+                            &run_id,
+                            ROUTE_REPLAY_EVENT_EXTENSION_KIND,
+                            marker,
+                        )
+                        .await
+                    {
+                        return self.errored_state_outcome(&run_id, error).await;
+                    }
+                    if is_structured_replay_event(&event) {
+                        replay.record_structured(event);
+                    }
+                }
                 if cancel.is_cancelled() {
                     if let Err(error) = self
                         .commit_pending_usage(&run_id, &mut pending_usage_commit)
@@ -4905,6 +5341,80 @@ impl HarnessActor {
                             &mut tools,
                         )
                         .await;
+                }
+            }
+        }
+    }
+
+    /// Parks one broken network request until the platform route seam is no
+    /// longer authoritatively negative or the original run deadline expires.
+    async fn wait_for_provider_route(
+        &mut self,
+        run_id: &RunId,
+        cancel: &CancelToken,
+        provider: &Arc<dyn Provider>,
+    ) -> Result<(), DriveError> {
+        self.flush_pending_item_delta()
+            .await
+            .map_err(DriveError::Store)?;
+        self.commit_state(
+            run_id,
+            RunState::Waiting {
+                reason: WaitReason::NetworkUnavailable,
+            },
+        )
+        .await
+        .map_err(DriveError::Store)?;
+
+        let started = tokio::time::Instant::now();
+        let provider_deadline = self.config.provider_deadline;
+        let budget = provider_deadline
+            .map(|deadline| deadline.saturating_duration_since(started))
+            .unwrap_or(std::time::Duration::MAX);
+        let mut deadline = Box::pin(async move {
+            match provider_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        });
+        let mut poll = tokio::time::interval_at(
+            tokio::time::Instant::now() + ROUTE_STATE_POLL_INTERVAL,
+            ROUTE_STATE_POLL_INTERVAL,
+        );
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(DriveError::Cancelled),
+                () = &mut deadline => {
+                    return Err(DriveError::Provider(deadline_exhausted_error(
+                        budget,
+                        started.elapsed(),
+                    )));
+                }
+                _ = poll.tick() => {
+                    // Negative-only attribution: only a confirmed absence
+                    // keeps the route wait parked. Available or Unknown lets
+                    // the same absolute-deadline request resume.
+                    if provider.route_status() != haider_platform::RouteStatus::Unavailable {
+                        self.commit_state(run_id, RunState::Thinking)
+                            .await
+                            .map_err(DriveError::Store)?;
+                        return Ok(());
+                    }
+                }
+                command = self.commands.recv() => {
+                    let Some(command) = command else {
+                        return Err(DriveError::Provider(provider_protocol_error(
+                            "session actor command channel closed while waiting for network route",
+                        )));
+                    };
+                    if let ActorCommand::Stop { completed } = command {
+                        cancel.cancel();
+                        let _ = completed.send(());
+                        return Err(DriveError::Cancelled);
+                    }
+                    self.service_command_without_menu(command);
                 }
             }
         }
@@ -8341,13 +8851,17 @@ impl HarnessActor {
         run_id: &RunId,
         provider_request_ordinal: u64,
         provider_view: Option<(ProviderViewLedgerV1, Vec<ProviderViewBlobV1>)>,
-        provider_view_data: Option<serde_json::Value>,
-        cache_attempt_data: serde_json::Value,
+        markers: RequestAttemptMarkers,
         thinking_pending: &mut bool,
     ) -> Result<Option<ProviderViewLedgerV1>, HaiderError> {
+        let RequestAttemptMarkers {
+            provider_view: provider_view_data,
+            cache: cache_attempt_data,
+            response_epoch,
+        } = markers;
         self.flush_pending_item_delta().await?;
         let mut envelopes = Vec::with_capacity(
-            usize::from(provider_view_data.is_some()) * 2 + usize::from(*thinking_pending) + 2,
+            usize::from(provider_view_data.is_some()) * 2 + usize::from(*thinking_pending) + 4,
         );
         if let Some(data) = provider_view_data {
             envelopes.extend(self.uncommitted_extension_marker(
@@ -8374,6 +8888,14 @@ impl HarnessActor {
             cache_attempt_data,
             hidden_prompt_omit_render(),
         )?);
+        if response_epoch != 0 {
+            envelopes.extend(self.uncommitted_extension_marker(
+                run_id,
+                ROUTE_REPLAY_ATTEMPT_EXTENSION_KIND,
+                serde_json::json!({ "response_epoch": response_epoch }),
+                hidden_prompt_omit_render(),
+            )?);
+        }
         let (persisted_provider_view, committed) = match provider_view {
             Some((ledger, blobs)) => {
                 let outcome = self
@@ -9033,9 +9555,249 @@ struct TextAccumulator {
     text: String,
 }
 
+/// Suppresses only the exact already-journaled prefix replayed by a resumed
+/// provider stream. A divergence ends suppression immediately, preserving all
+/// novel suffix content without relying on provider chunk boundaries.
+#[derive(Debug, Default)]
+struct ReplayPrefix {
+    message: String,
+    reasoning: String,
+    refusal: String,
+    message_applied: String,
+    reasoning_applied: String,
+    refusal_applied: String,
+    structured_applied: Vec<StreamEvent>,
+    structured_expected: VecDeque<StreamEvent>,
+    response_epoch: u64,
+}
+
+impl ReplayPrefix {
+    fn capture(
+        &mut self,
+        message: &Option<TextAccumulator>,
+        reasoning: &Option<TextAccumulator>,
+        refusal: &str,
+    ) {
+        if self.message_applied.is_empty() {
+            self.message_applied = message
+                .as_ref()
+                .map_or_else(String::new, |item| item.text.clone());
+        }
+        if self.reasoning_applied.is_empty() {
+            self.reasoning_applied = reasoning
+                .as_ref()
+                .map_or_else(String::new, |item| item.text.clone());
+        }
+        if self.refusal_applied.is_empty() {
+            self.refusal_applied = refusal.to_owned();
+        }
+        self.message.clone_from(&self.message_applied);
+        self.reasoning.clone_from(&self.reasoning_applied);
+        self.refusal.clone_from(&self.refusal_applied);
+        self.structured_expected = normalized_structured_replay(&self.structured_applied);
+    }
+
+    fn filter_message(&mut self, text: String) -> String {
+        let text = strip_replayed_prefix(&mut self.message, text);
+        self.message_applied.push_str(&text);
+        text
+    }
+
+    fn filter_reasoning(&mut self, text: String) -> String {
+        let text = strip_replayed_prefix(&mut self.reasoning, text);
+        self.reasoning_applied.push_str(&text);
+        text
+    }
+
+    fn filter_refusal(&mut self, text: String) -> String {
+        let text = strip_replayed_prefix(&mut self.refusal, text);
+        self.refusal_applied.push_str(&text);
+        text
+    }
+
+    fn filter_structured(
+        &mut self,
+        event: StreamEvent,
+    ) -> Result<Option<StreamEvent>, ProviderError> {
+        if !is_structured_replay_event(&event) {
+            if matches!(&event, StreamEvent::Finish { .. }) && !self.structured_expected.is_empty()
+            {
+                return Err(provider_protocol_error(
+                    "provider structured replay ended before its durable prefix was restored",
+                ));
+            }
+            return Ok(Some(event));
+        }
+        let Some(expected) = self.structured_expected.front() else {
+            return Ok(Some(event));
+        };
+        if let (
+            StreamEvent::ToolCallArgsDelta {
+                call_id: expected_call,
+                args_fragment: expected_args,
+            },
+            StreamEvent::ToolCallArgsDelta {
+                call_id,
+                args_fragment,
+            },
+        ) = (expected, &event)
+        {
+            if expected_call != call_id {
+                return Err(provider_protocol_error(
+                    "provider structured replay changed tool-call identity",
+                ));
+            }
+            let (remaining, suffix) = strip_exact_replayed_prefix(expected_args, args_fragment)?;
+            if remaining.is_empty() {
+                self.structured_expected.pop_front();
+            } else if let Some(StreamEvent::ToolCallArgsDelta { args_fragment, .. }) =
+                self.structured_expected.front_mut()
+            {
+                *args_fragment = remaining;
+            }
+            return Ok(
+                (!suffix.is_empty()).then(|| StreamEvent::ToolCallArgsDelta {
+                    call_id: call_id.clone(),
+                    args_fragment: suffix,
+                }),
+            );
+        }
+        if expected != &event {
+            return Err(provider_protocol_error(
+                "provider structured replay diverged from its durable prefix",
+            ));
+        }
+        self.structured_expected.pop_front();
+        Ok(None)
+    }
+
+    fn record_structured(&mut self, event: StreamEvent) {
+        if let StreamEvent::ToolCallArgsDelta {
+            call_id,
+            args_fragment,
+        } = &event
+            && let Some(StreamEvent::ToolCallArgsDelta {
+                call_id: previous_call,
+                args_fragment: previous_args,
+            }) = self.structured_applied.last_mut()
+            && previous_call == call_id
+        {
+            previous_args.push_str(args_fragment);
+            return;
+        }
+        self.structured_applied.push(event);
+    }
+
+    fn has_applied_content(&self) -> bool {
+        !self.message_applied.is_empty()
+            || !self.reasoning_applied.is_empty()
+            || !self.refusal_applied.is_empty()
+            || !self.structured_applied.is_empty()
+    }
+
+    fn reset_for_next_request(&mut self) {
+        self.message.clear();
+        self.reasoning.clear();
+        self.refusal.clear();
+        self.message_applied.clear();
+        self.reasoning_applied.clear();
+        self.refusal_applied.clear();
+        self.structured_applied.clear();
+        self.structured_expected.clear();
+        self.response_epoch = self.response_epoch.saturating_add(1);
+    }
+}
+
+fn normalized_structured_replay(events: &[StreamEvent]) -> VecDeque<StreamEvent> {
+    let mut normalized = Vec::<StreamEvent>::new();
+    for event in events {
+        if let StreamEvent::ToolCallArgsDelta {
+            call_id,
+            args_fragment,
+        } = event
+            && let Some(StreamEvent::ToolCallArgsDelta {
+                call_id: previous_call,
+                args_fragment: previous_args,
+            }) = normalized.last_mut()
+            && previous_call == call_id
+        {
+            previous_args.push_str(args_fragment);
+        } else {
+            normalized.push(event.clone());
+        }
+    }
+    normalized.into()
+}
+
+fn strip_exact_replayed_prefix(
+    expected: &str,
+    incoming: &str,
+) -> Result<(String, String), ProviderError> {
+    let common = expected
+        .bytes()
+        .zip(incoming.bytes())
+        .take_while(|(expected, incoming)| expected == incoming)
+        .count();
+    if common < expected.len().min(incoming.len()) {
+        return Err(provider_protocol_error(
+            "provider replay changed a durable tool-argument prefix",
+        ));
+    }
+    if incoming.len() < expected.len() {
+        Ok((expected[incoming.len()..].to_owned(), String::new()))
+    } else {
+        Ok((String::new(), incoming[expected.len()..].to_owned()))
+    }
+}
+
+fn is_structured_replay_event(event: &StreamEvent) -> bool {
+    matches!(
+        event,
+        StreamEvent::ProviderOpaque { .. }
+            | StreamEvent::ToolCallStart { .. }
+            | StreamEvent::ToolCallArgsDelta { .. }
+            | StreamEvent::ToolCallEnd { .. }
+            | StreamEvent::ServerToolUse { .. }
+            | StreamEvent::ServerToolResult { .. }
+            | StreamEvent::WebSources { .. }
+    )
+}
+
+fn strip_replayed_prefix(expected: &mut String, text: String) -> String {
+    if expected.is_empty() || text.is_empty() {
+        return text;
+    }
+    let common_chars = expected
+        .chars()
+        .zip(text.chars())
+        .take_while(|(expected, actual)| expected == actual)
+        .count();
+    let expected_bytes = expected
+        .char_indices()
+        .nth(common_chars)
+        .map_or(expected.len(), |(index, _)| index);
+    let text_bytes = text
+        .char_indices()
+        .nth(common_chars)
+        .map_or(text.len(), |(index, _)| index);
+    if text_bytes == text.len() && expected_bytes < expected.len() {
+        expected.drain(..expected_bytes);
+        String::new()
+    } else {
+        expected.clear();
+        text[text_bytes..].to_owned()
+    }
+}
+
 struct PendingUsageCommit {
     footprint: Option<ContextFootprint>,
     usage: Usage,
+}
+
+struct RequestAttemptMarkers {
+    provider_view: Option<serde_json::Value>,
+    cache: serde_json::Value,
+    response_epoch: u64,
 }
 
 /// One as-yet-uncommitted provider-stream delta. It is intentionally limited
@@ -9688,6 +10450,17 @@ fn provider_error_is_transport_fault(error: &ProviderError) -> bool {
             | ProviderErrorKind::Transport
             | ProviderErrorKind::StreamInterrupted
     )
+}
+
+fn provider_error_waits_for_route(
+    error: &ProviderError,
+    route_status: haider_platform::RouteStatus,
+) -> bool {
+    (error.kind == ProviderErrorKind::NetworkUnavailable
+        || (error.kind == ProviderErrorKind::StreamInterrupted
+            && route_status == haider_platform::RouteStatus::Unavailable))
+        && error.timeout_reason.is_none()
+        && error.presentation.provider_http_status.is_none()
 }
 
 fn provider_error_allows_rotation(error: &ProviderError) -> bool {

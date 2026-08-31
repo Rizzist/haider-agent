@@ -943,6 +943,7 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
             RecoveredWork::Retry(_)
             | RecoveredWork::Checkpoint(_)
             | RecoveredWork::PartialStream(_)
+            | RecoveredWork::RouteWait(_)
             | RecoveredWork::ChildWait(_) => None,
         })
         .collect::<Vec<_>>();
@@ -1276,6 +1277,7 @@ async fn failed_recovery_start_terminalizes_on_the_accepted_branch() {
             RecoveredWork::Retry(_)
             | RecoveredWork::Checkpoint(_)
             | RecoveredWork::PartialStream(_)
+            | RecoveredWork::RouteWait(_)
             | RecoveredWork::ChildWait(_) => None,
         })
         .collect::<Vec<_>>();

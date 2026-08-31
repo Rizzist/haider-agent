@@ -20580,6 +20580,7 @@ fn durable_headless_run_facts(
                 budget_exhausted = true;
             }
             Some(HeadlessRunEventPayload::RunBudgetExhausted(_)) => {}
+            Some(HeadlessRunEventPayload::RunDeadlineExceeded(_)) => {}
             None => {}
         }
         if configured && budget_exhausted {
@@ -20681,10 +20682,16 @@ fn validate_worker_run_transitions(
                 decode_payload::<HeadlessRunEventPayload>(&envelope.payload),
                 Ok(HeadlessRunEventPayload::RunBudgetExhausted(_))
             );
+        let supplemental_run_deadline = kind == Some("run_deadline_exceeded")
+            && matches!(
+                decode_payload::<HeadlessRunEventPayload>(&envelope.payload),
+                Ok(HeadlessRunEventPayload::RunDeadlineExceeded(_))
+            );
         let Some(run_id) = envelope.run_id.as_ref() else {
             if supplemental_project_instructions
                 || supplemental_computer_permission
                 || supplemental_run_budget
+                || supplemental_run_deadline
             {
                 return Err(store_error(
                     ErrorCode::InvalidArgument,
@@ -20696,7 +20703,8 @@ fn validate_worker_run_transitions(
         };
         if (supplemental_project_instructions
             || supplemental_computer_permission
-            || supplemental_run_budget)
+            || supplemental_run_budget
+            || supplemental_run_deadline)
             && (!envelope.render.durable || envelope.render.prompt != PromptRender::Omit)
         {
             return Err(store_error(

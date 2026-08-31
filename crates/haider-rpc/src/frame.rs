@@ -34,6 +34,10 @@ fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -1958,6 +1962,7 @@ pub struct SessionReadResult {
 pub enum ObserveRunStateWire {
     Idle,
     Running,
+    WaitingForRoute,
     EffectUnknown,
     ParkedPermission,
     ParkedInput,
@@ -4179,6 +4184,10 @@ pub enum ResponseBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         active_account: Option<haider_protocol::credential::CredentialDescriptor>,
         session_count: u64,
+        /// Number of sessions whose selected active run is durably parked on
+        /// network reachability. Older daemons omit this additive scalar.
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        waiting_for_route_count: u64,
         /// Last completed metadata-only discovery. A cache miss schedules a
         /// bounded refresh after this response rather than delaying it.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

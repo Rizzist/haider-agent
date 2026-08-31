@@ -3570,6 +3570,10 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
                 )
                 .await
                 .expect("recover partial stream"),
+            RecoveredWork::RouteWait(recovered) => manager_handle
+                .recover_route_wait(recovered.accepted, recovered.checkpoint)
+                .await
+                .expect("recover route wait"),
         }
     }
     assert!(resumed_parent, "parent child wait must survive restart");

@@ -17,6 +17,11 @@
 //! - an autonomous `plan` interrupted after its non-blocking `MenuOpened` is
 //!   reconstructed from `Streaming` (or legacy `InputRequired`) so the actor
 //!   immediately journals acceptance and continues without a waiter;
+//! - a run durably waiting on network reachability is reconstructed with its
+//!   response-epoch text, reasoning, refusal, structured prefix, open tool
+//!   accumulators, completed tool results, and original accepted-run deadline;
+//!   exact provider replay is suppressed and completed effects are not
+//!   dispatched again;
 //! - an active delegated child is left nonterminal for its recovered parent's
 //!   durable child-wait coordinator. W6c re-arms the progress deadline from
 //!   committed envelope time, delivers at most one steer, and then uses the
@@ -36,8 +41,10 @@
 
 use haider_core::{
     AcceptedRunRetry, AcceptedTurn, ChildWaitCheckpoint, DeferredTicket, DeferredToolCheckpoint,
-    PartialStreamCheckpoint, RequestInputCheckpoint, SessionProjectionCheckpoint,
-    SqliteStoreHandle, StoreHandle, TurnAdmissionDisposition,
+    PartialStreamCheckpoint, ROUTE_REPLAY_ATTEMPT_EXTENSION_KIND,
+    ROUTE_REPLAY_EVENT_EXTENSION_KIND, RequestInputCheckpoint, RouteWaitCheckpoint,
+    RouteWaitCompletedToolCheckpoint, RouteWaitTextCheckpoint, RouteWaitToolCheckpoint,
+    SessionProjectionCheckpoint, SqliteStoreHandle, StoreHandle, TurnAdmissionDisposition,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::{
@@ -50,6 +57,7 @@ use haider_protocol::ids::{
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuCloseReason, MenuKind};
+use haider_protocol::provider::StreamEvent;
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::state::{RunState, SessionState, WaitReason};
 use serde::{Deserialize, Serialize};
@@ -79,14 +87,20 @@ pub(crate) const STARTUP_HYDRATION_PAYLOAD_KINDS: &[&str] = &[
 const CHECKPOINT_PROJECTION: &str = "startup_turn_recovery";
 const CHECKPOINT_TIMELINE: &str = "session";
 const CHECKPOINT_SHAPE_VERSION: u32 = 1;
-const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v2";
+const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v3";
 
 pub(crate) enum RecoveredWork {
     Queued(AcceptedTurn),
     Retry(AcceptedRunRetry),
     Checkpoint(Box<RecoveredCheckpoint>),
     PartialStream(Box<RecoveredPartialStream>),
+    RouteWait(Box<RecoveredRouteWait>),
     ChildWait(Box<RecoveredChildWait>),
+}
+
+pub(crate) struct RecoveredRouteWait {
+    pub(crate) accepted: AcceptedTurn,
+    pub(crate) checkpoint: RouteWaitCheckpoint,
 }
 
 pub(crate) struct RecoveredPartialStream {
@@ -120,6 +134,8 @@ struct RunReduction {
     menu: Option<OpenMenu>,
     menu_answers: HashMap<MenuId, RawEnvelope>,
     tool_results: HashSet<String>,
+    #[serde(default)]
+    tool_result_values: HashMap<String, haider_protocol::tool::BoundedResult>,
     tool_calls: HashMap<String, RecoveredToolCall>,
     agent_reports: HashSet<AgentId>,
     child_results: HashSet<AgentId>,
@@ -127,6 +143,10 @@ struct RunReduction {
     headless_configured: bool,
     #[serde(default)]
     budget_exhausted: Option<RunBudgetExhaustedV1>,
+    #[serde(default)]
+    route_replay_epoch: u64,
+    #[serde(default)]
+    route_replay_events: Vec<StreamEvent>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -431,6 +451,32 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
             if matches!(
                 state,
                 RunState::Waiting {
+                    reason: WaitReason::NetworkUnavailable
+                }
+            ) && let Some(checkpoint) = pending_route_wait_checkpoint(&reduction)
+            {
+                let accepted_seq = reduction.user_seq.ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!("route-wait run {run_id} has no user message"),
+                        false,
+                    )
+                })?;
+                recovered.push(RecoveredWork::RouteWait(Box::new(RecoveredRouteWait {
+                    accepted: recovered_acceptance(
+                        &session_id,
+                        &run_id,
+                        accepted_seq,
+                        store.worker_generation(),
+                        reduction.branch_id.clone(),
+                    ),
+                    checkpoint,
+                })));
+                continue;
+            }
+            if matches!(
+                state,
+                RunState::Waiting {
                     reason: WaitReason::LocalChild
                 }
             ) && let Some(checkpoint) =
@@ -684,6 +730,7 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
             Some(
                 HeadlessRunEventPayload::HeadlessRunConfigured(_)
                     | HeadlessRunEventPayload::RunBudgetExhausted(_)
+                    | HeadlessRunEventPayload::RunDeadlineExceeded(_)
             )
         )
         || matches!(
@@ -732,7 +779,8 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
         }
         Some(
             HeadlessRunEventPayload::HeadlessRunConfigured(_)
-            | HeadlessRunEventPayload::RunBudgetExhausted(_),
+            | HeadlessRunEventPayload::RunBudgetExhausted(_)
+            | HeadlessRunEventPayload::RunDeadlineExceeded(_),
         ) => return,
         None => {}
     }
@@ -783,8 +831,17 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
         EventPayload::Item(ItemEvent::Delta { item_id, delta }) => {
             if let Some(open) = reduction.open_items.get_mut(&item_id) {
                 match &delta {
-                    ItemDelta::Text { text } | ItemDelta::Reasoning { text } => {
+                    ItemDelta::Text { text } => {
                         open.text.push_str(text);
+                        reduction
+                            .route_replay_events
+                            .push(StreamEvent::TextDelta { text: text.clone() });
+                    }
+                    ItemDelta::Reasoning { text } => {
+                        open.text.push_str(text);
+                        reduction
+                            .route_replay_events
+                            .push(StreamEvent::ReasoningDelta { text: text.clone() });
                     }
                     ItemDelta::ToolArgs { fragment } => open.args.push_str(fragment),
                     ItemDelta::CommandOutput { .. } => {}
@@ -800,6 +857,27 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
             }
         }
         EventPayload::Item(ItemEvent::Completed { item_id, item }) => {
+            if let TurnItem::Extension { kind, data } = &item {
+                if kind == ROUTE_REPLAY_ATTEMPT_EXTENSION_KIND {
+                    if let Some(epoch) = data
+                        .get("response_epoch")
+                        .and_then(serde_json::Value::as_u64)
+                        && epoch != reduction.route_replay_epoch
+                    {
+                        reduction.route_replay_epoch = epoch;
+                        reduction.route_replay_events.clear();
+                    }
+                } else if kind == ROUTE_REPLAY_EVENT_EXTENSION_KIND
+                    && data
+                        .get("response_epoch")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(reduction.route_replay_epoch)
+                    && let Some(value) = data.get("stream_event")
+                    && let Ok(event) = serde_json::from_value::<StreamEvent>(value.clone())
+                {
+                    reduction.route_replay_events.push(event);
+                }
+            }
             let item = match item {
                 TurnItem::IncompleteAgentMessage { text, .. } => {
                     reduction.open_items.remove(&item_id);
@@ -853,8 +931,9 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
         {
             reduction.menu = None;
         }
-        EventPayload::ToolResult { call_id, .. } => {
-            reduction.tool_results.insert(call_id);
+        EventPayload::ToolResult { call_id, result } => {
+            reduction.tool_results.insert(call_id.clone());
+            reduction.tool_result_values.insert(call_id, result);
         }
         EventPayload::AgentReport(report) => {
             reduction.agent_reports.insert(report.agent);
@@ -914,6 +993,77 @@ fn pending_partial_stream_checkpoint(reduction: &RunReduction) -> Option<Partial
         item_id,
         text: text.clone(),
     })
+}
+
+fn pending_route_wait_checkpoint(reduction: &RunReduction) -> Option<RouteWaitCheckpoint> {
+    let mut checkpoint = RouteWaitCheckpoint {
+        structured_events: reduction.route_replay_events.clone(),
+        response_epoch: reduction.route_replay_epoch,
+        ..RouteWaitCheckpoint::default()
+    };
+    let mut tools = Vec::new();
+    for (item_id, open) in &reduction.open_items {
+        let text = RouteWaitTextCheckpoint {
+            item_id: item_id.clone(),
+            text: open.text.clone(),
+        };
+        match &open.item {
+            TurnItem::AgentMessage { .. } if checkpoint.message.is_none() => {
+                checkpoint.message = Some(text);
+            }
+            TurnItem::Reasoning { .. } if checkpoint.reasoning.is_none() => {
+                checkpoint.reasoning = Some(text);
+            }
+            TurnItem::ToolCall { call_id, name, .. } => {
+                tools.push((
+                    open.started_seq,
+                    RouteWaitToolCheckpoint {
+                        item_id: item_id.clone(),
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        args: open.args.clone(),
+                    },
+                ));
+            }
+            _ => return None,
+        }
+    }
+    tools.sort_by_key(|(started_seq, _)| *started_seq);
+    checkpoint.tools = tools
+        .into_iter()
+        .map(|(_, checkpoint)| checkpoint)
+        .collect();
+    let completed_call_ids = checkpoint
+        .structured_events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::ToolCallEnd { call_id } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut completed_tools = reduction
+        .tool_calls
+        .iter()
+        .filter(|(call_id, tool)| tool.completed && completed_call_ids.contains(call_id.as_str()))
+        .map(|(call_id, tool)| {
+            (
+                tool.started_seq,
+                RouteWaitCompletedToolCheckpoint {
+                    call_id: call_id.clone(),
+                    name: tool.name.clone(),
+                    args: serde_json::from_str(&tool.args)
+                        .unwrap_or_else(|_| serde_json::Value::String(tool.args.clone())),
+                    result: reduction.tool_result_values.get(call_id).cloned(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    completed_tools.sort_by_key(|(started_seq, _)| *started_seq);
+    checkpoint.completed_tools = completed_tools
+        .into_iter()
+        .map(|(_, checkpoint)| checkpoint)
+        .collect();
+    Some(checkpoint)
 }
 
 async fn pending_child_wait(

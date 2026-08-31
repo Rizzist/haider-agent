@@ -1,15 +1,19 @@
 #![allow(clippy::expect_used)]
 
 use super::{
-    BufferedWireFrames, EnsureOptions, HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES, HeadlessAttachment,
-    HeadlessEvent, HeadlessEventLedgerWriter, HeadlessEventMode, HeadlessEventOutput,
-    HeadlessFailureCode, HeadlessOutcome, HeadlessRunError, HeadlessRunEventStorage,
-    HeadlessRunFailure, HeadlessSessionConfig, HeadlessTerminalKind, headless_submit_body,
-    load_attachment, load_pdf_attachment, normalize_session_config_features, terminal_kind,
+    ApplyStatus, BufferedWireFrames, EnsureOptions, HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES,
+    HeadlessAttachment, HeadlessEvent, HeadlessEventLedgerWriter, HeadlessEventMode,
+    HeadlessEventOutput, HeadlessFailureCode, HeadlessOutcome, HeadlessReducer, HeadlessRunError,
+    HeadlessRunEventStorage, HeadlessRunFailure, HeadlessSessionConfig, HeadlessTerminalKind,
+    headless_submit_body, load_attachment, load_pdf_attachment, normalize_session_config_features,
+    terminal_kind,
 };
+use haider_rpc::haider_protocol::EventPayload;
 use haider_rpc::haider_protocol::envelope::RawEnvelope;
 use haider_rpc::haider_protocol::error::ErrorCode;
+use haider_rpc::haider_protocol::headless::{HeadlessRunEventPayload, RunDeadlineExceededV1};
 use haider_rpc::haider_protocol::ids::{RunId, SessionId};
+use haider_rpc::haider_protocol::state::RunState;
 use haider_rpc::{CommandId, RequestBody};
 
 #[cfg(unix)]
@@ -238,6 +242,68 @@ fn terminal_kind_vocabulary_is_distinct_and_provider_timeout_stays_provider_owne
             HeadlessTerminalKind::ProviderError
         );
     }
+}
+
+/// MUTATION CHECK: discard the durable deadline cause or choose the exit by
+/// provider phase. The adjacent ProviderTimeout would then project as a
+/// provider error instead of the one caller-timeout terminal.
+#[tokio::test]
+async fn durable_request_deadline_reason_wins_terminal_race_as_timeout() {
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    let output = HeadlessEventOutput::new(sender, HeadlessEventMode::Summary);
+    let mut reducer = HeadlessReducer::new(SessionId::new("spool-session"), output);
+    reducer.run_id = Some(RunId::new("spool-run"));
+
+    let deadline = HeadlessRunEventPayload::RunDeadlineExceeded(RunDeadlineExceededV1 {
+        deadline_unix_ms: 42,
+    });
+    assert_eq!(
+        reducer
+            .apply(spool_test_envelope(
+                1,
+                deadline
+                    .to_payload_value()
+                    .expect("deadline fact serializes"),
+            ))
+            .await,
+        ApplyStatus::Applied
+    );
+    assert_eq!(
+        reducer
+            .apply(spool_test_envelope(
+                2,
+                serde_json::to_value(EventPayload::RunFailed {
+                    code: ErrorCode::ProviderTimeout,
+                    message: "response deadline elapsed".into(),
+                    retryable: true,
+                    presentation: None,
+                })
+                .expect("run failure serializes"),
+            ))
+            .await,
+        ApplyStatus::Applied
+    );
+    assert_eq!(
+        reducer
+            .apply(spool_test_envelope(
+                3,
+                serde_json::to_value(EventPayload::RunState(RunState::Errored))
+                    .expect("terminal state serializes"),
+            ))
+            .await,
+        ApplyStatus::Applied
+    );
+
+    let terminal = reducer.terminal.expect("typed natural terminal");
+    assert_eq!(terminal.outcome, HeadlessOutcome::Timeout);
+    assert_eq!(terminal.seq, 3);
+    assert!(matches!(
+        terminal.failure,
+        Some(HeadlessRunFailure {
+            code: HeadlessFailureCode::Timeout,
+            ..
+        })
+    ));
 }
 
 /// MUTATION CHECK: ignore the run-scoped trust bit or change ordinary turn

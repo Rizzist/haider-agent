@@ -6,7 +6,7 @@ use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::headless::{
     HeadlessRunEventPayload, HeadlessRunSpecV1, HeadlessRunUsageV1, RunBudgetDimensionV1,
-    RunBudgetExhaustedV1, RunBudgetV1,
+    RunBudgetExhaustedV1, RunBudgetV1, RunDeadlineExceededV1,
 };
 use haider_protocol::ids::{DeviceId, EventId, RunId, SessionId};
 use haider_protocol::session::SessionPermissionOverridesV1;
@@ -147,6 +147,22 @@ fn budget_exhaustion_is_a_typed_fact_and_terminal_error_code() {
     assert_eq!(encoded["usage"]["cache_read_tokens"], 40);
     assert_eq!(encoded["usage"]["cache_write_tokens"], 5);
     assert_eq!(ErrorCode::BudgetExhausted.as_str(), "budget_exhausted");
+    assert_eq!(
+        HeadlessRunEventPayload::from_payload_value(&encoded),
+        Some(payload)
+    );
+}
+
+#[test]
+fn request_deadline_is_a_distinct_typed_durable_fact() {
+    let payload = HeadlessRunEventPayload::RunDeadlineExceeded(RunDeadlineExceededV1 {
+        deadline_unix_ms: 4_200,
+    });
+    let encoded = payload
+        .to_payload_value()
+        .expect("deadline payload encodes");
+    assert_eq!(encoded["type"], "run_deadline_exceeded");
+    assert_eq!(encoded["deadline_unix_ms"], 4_200);
     assert_eq!(
         HeadlessRunEventPayload::from_payload_value(&encoded),
         Some(payload)

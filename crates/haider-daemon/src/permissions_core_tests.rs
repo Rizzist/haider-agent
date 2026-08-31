@@ -1081,6 +1081,7 @@ async fn recovery_dual_reads_historical_and_canonical_permission_states() {
             RecoveredWork::Queued(_)
             | RecoveredWork::Retry(_)
             | RecoveredWork::PartialStream(_)
+            | RecoveredWork::RouteWait(_)
             | RecoveredWork::ChildWait(_) => None,
         })
         .collect::<Vec<_>>();

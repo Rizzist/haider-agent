@@ -104,6 +104,16 @@ pub struct RunBudgetExhaustedV1 {
     pub usage: HeadlessRunUsageV1,
 }
 
+/// Durable cause for an accepted run whose absolute caller deadline elapsed.
+///
+/// This is distinct from [`RunBudgetExhaustedV1`]: `--timeout` includes time
+/// spent before durable acceptance, while `budget.max_time_ms` starts at the
+/// acceptance fact and retains the budget-exhaustion exit contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunDeadlineExceededV1 {
+    pub deadline_unix_ms: u64,
+}
+
 /// Semantic comparison between a source run and its re-execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayDivergenceV1 {
@@ -124,6 +134,7 @@ pub struct ReplayDivergenceV1 {
 pub enum HeadlessRunEventPayload {
     HeadlessRunConfigured(HeadlessRunSpecV1),
     RunBudgetExhausted(RunBudgetExhaustedV1),
+    RunDeadlineExceeded(RunDeadlineExceededV1),
 }
 
 impl HeadlessRunEventPayload {

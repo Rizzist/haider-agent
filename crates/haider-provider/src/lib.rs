@@ -55,9 +55,10 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, sleep};
 
 /// Frequency at which a blame clock re-reads the cached OS route signal.
-/// The absolute run deadline is owned outside these clocks and is never
-/// sampled, moved, or suspended here.
-const ROUTE_STATE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// One cache TTL is 250 ms (four observations/second); a shorter period cannot
+/// reveal fresher state. The absolute run deadline is owned outside these
+/// clocks and is never sampled, moved, or suspended here.
+pub const ROUTE_STATE_POLL_INTERVAL: Duration = haider_platform::ROUTE_STATUS_CACHE_TTL;
 
 /// Which route-gated provider progress clock exhausted its active time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1799,9 +1800,11 @@ pub enum ProviderErrorKind {
     /// active model context window. Core may compact and retry this once.
     ContextExceeded,
     InvalidRequest,
-    /// The local OS positively reported that the host has no usable route.
-    /// This is local and retryable; it must never be presented as a provider
-    /// transport fault or used to rotate credentials/fallback providers.
+    /// A network-class transport failure: confirmed route loss, DNS/connect
+    /// failure, connection reset/refusal, or a transient TLS handshake break.
+    /// Completed HTTP responses and local timeout/stall decisions never use
+    /// this kind. It is retryable on the same provider/account and must not
+    /// rotate credentials or fallback providers.
     NetworkUnavailable,
     Transport,
     MalformedFrame,
@@ -2125,8 +2128,9 @@ async fn read_http_error_body_bounded(
 
 /// Classifies one reqwest connection failure without exposing a credential-
 /// bearing URL. Builder failures and certificate/proxy trust failures require
-/// configuration changes; DNS/connect/reset/timeout and transient TLS errors
-/// remain retryable transport failures.
+/// configuration changes; DNS/connect/reset and transient TLS errors become
+/// retryable network failures. Local timeout decisions remain transport
+/// failures so silence/stalls cannot masquerade as route loss.
 pub(crate) fn reqwest_transport_error(provider: &str, error: reqwest::Error) -> ProviderError {
     reqwest_transport_error_with_route_gating(provider, error, RouteGating::Disabled)
 }
@@ -2138,6 +2142,7 @@ pub(crate) fn reqwest_transport_error_with_route_gating(
 ) -> ProviderError {
     let mut diagnostic = error.to_string();
     let mut permanent_tls = false;
+    let mut network_io = false;
     let mut source = error.source();
     while let Some(cause) = source {
         permanent_tls |= cause.downcast_ref::<rustls::Error>().is_some_and(|error| {
@@ -2146,6 +2151,20 @@ pub(crate) fn reqwest_transport_error_with_route_gating(
                 rustls::Error::InvalidCertificate(_)
                     | rustls::Error::NoCertificatesPresented
                     | rustls::Error::UnsupportedNameType
+            )
+        });
+        network_io |= cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::AddrNotAvailable
+                    | std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::NetworkUnreachable
+                    | std::io::ErrorKind::NetworkDown
             )
         });
         diagnostic.push_str(": ");
@@ -2176,12 +2195,15 @@ pub(crate) fn reqwest_transport_error_with_route_gating(
                 "{provider} connection configuration failed; check the endpoint, proxy, and certificate trust settings"
             ),
         )
-    } else if route_gating.enabled()
-        && haider_platform::route_status() == haider_platform::RouteStatus::Unavailable
+    } else if !error.is_timeout()
+        && (error.is_connect()
+            || network_io
+            || (route_gating.enabled()
+                && haider_platform::route_status() == haider_platform::RouteStatus::Unavailable))
     {
         ProviderError::new(
             ProviderErrorKind::NetworkUnavailable,
-            format!("{provider} request stopped while this device had no network route"),
+            format!("{provider} request stopped after a network connection failure"),
         )
     } else {
         ProviderError::new(
@@ -2213,7 +2235,7 @@ pub(crate) fn provider_timeout_presentation() -> ErrorPresentation {
     )
 }
 
-fn deadline_exhausted_error(budget: Duration, elapsed: Duration) -> ProviderError {
+pub fn deadline_exhausted_error(budget: Duration, elapsed: Duration) -> ProviderError {
     let budget_ms = duration_ms(budget);
     let opened_within_ms = duration_ms(elapsed.min(budget));
     let mut error = ProviderError::new(
@@ -2318,6 +2340,13 @@ pub trait Provider: Send + Sync {
     /// caller deadline.
     fn trusts_default_route_absence(&self) -> bool {
         false
+    }
+
+    /// Reads the platform-owned route seam. Injected providers may override
+    /// this only to make route transitions deterministic in tests; production
+    /// adapters use the single conservative OS signal.
+    fn route_status(&self) -> haider_platform::RouteStatus {
+        haider_platform::route_status()
     }
 
     /// Describes how this adapter authenticates its outbound request.
@@ -2576,6 +2605,7 @@ pub struct FakeProvider {
     requests: Arc<Mutex<Vec<TurnRequest>>>,
     vision: FeatureResolve,
     pdf_documents: FeatureResolve,
+    route_status: Option<Arc<Mutex<haider_platform::RouteStatus>>>,
 }
 
 impl FakeProvider {
@@ -2586,6 +2616,7 @@ impl FakeProvider {
             requests: Arc::new(Mutex::new(Vec::new())),
             vision: FeatureResolve::Unsupported,
             pdf_documents: FeatureResolve::ExplicitlyEmulated,
+            route_status: None,
         }
     }
 
@@ -2600,6 +2631,16 @@ impl FakeProvider {
     #[must_use]
     pub fn with_pdf_documents_native(mut self) -> Self {
         self.pdf_documents = FeatureResolve::Native;
+        self
+    }
+
+    /// Installs a shared deterministic view of the platform route seam.
+    #[must_use]
+    pub fn with_route_status(
+        mut self,
+        route_status: Arc<Mutex<haider_platform::RouteStatus>>,
+    ) -> Self {
+        self.route_status = Some(route_status);
         self
     }
 
@@ -2626,6 +2667,16 @@ impl FakeProvider {
 
 #[async_trait]
 impl Provider for FakeProvider {
+    fn route_status(&self) -> haider_platform::RouteStatus {
+        self.route_status
+            .as_ref()
+            .map_or_else(haider_platform::route_status, |status| {
+                *status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+    }
+
     async fn capabilities(&self) -> CapabilityDoc {
         CapabilityDoc {
             provider: "fake".into(),
@@ -3046,6 +3097,24 @@ impl Utf8Assembler {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod e2_contract_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connection_refused_is_network_class_not_generic_transport() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve loopback port");
+        let address = listener.local_addr().expect("listener address");
+        drop(listener);
+        let error = reqwest::Client::new()
+            .get(format!("http://{address}/network-class"))
+            .send()
+            .await
+            .expect_err("closed port refuses connection");
+        let classified = reqwest_transport_error("fixture", error);
+        assert_eq!(classified.kind, ProviderErrorKind::NetworkUnavailable);
+        assert!(classified.retryable);
+        assert!(classified.timeout_reason.is_none());
+        assert!(classified.presentation.provider_http_status.is_none());
+    }
 
     #[test]
     fn heartbeat_bytes_cannot_keep_a_semantically_dead_stream_alive() {
