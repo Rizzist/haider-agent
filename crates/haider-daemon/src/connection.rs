@@ -44,6 +44,7 @@ use crate::session_hub::{
     SessionHub,
 };
 use crate::{DaemonError, ShutdownHandle};
+use haider_client::DAEMON_STOP_CLIENT_NAME;
 use haider_platform::IpcStream;
 use haider_rpc::{
     AttachmentId, Capability, CapabilitySet, ERROR_CODE_OVERLOADED, FEATURE_ACCOUNT_LOGIN_API_V1,
@@ -1853,11 +1854,9 @@ async fn handle_frame(
                 *encoding,
             )?;
             if granted {
-                // Exactly one request: a second call would select the forced
-                // lifecycle path, so fallback decisions remain client-side.
-                context
-                    .shutdown
-                    .request("authenticated daemon.shutdown RPC");
+                // Operator requests are graceful and idempotent. Repeated OS
+                // signals retain their separate force-on-second policy.
+                context.shutdown.request_graceful();
             }
             Ok(false)
         }
@@ -2015,15 +2014,23 @@ fn negotiate_hello(
             return Ok(None);
         }
     };
-    let frame_limit =
-        u32::try_from(context.frame_limit).map_err(|_| DaemonError::InvalidConfig {
-            message: "frame limit does not fit the Welcome frame".into(),
-        })?;
     let lifecycle_phase = if drain.borrow().is_some() {
         LifecyclePhase::Draining
     } else {
         LifecyclePhase::Ready
     };
+    if lifecycle_phase == LifecyclePhase::Draining
+        && hello.client_name == DAEMON_STOP_CLIENT_NAME
+        && negotiated
+            .capabilities_granted
+            .contains(&Capability::Control)
+    {
+        context.shutdown.observe_operator_stop();
+    }
+    let frame_limit =
+        u32::try_from(context.frame_limit).map_err(|_| DaemonError::InvalidConfig {
+            message: "frame limit does not fit the Welcome frame".into(),
+        })?;
     let encoded_welcome = if lifecycle_phase == LifecyclePhase::Ready
         && negotiated.capabilities_granted == server_range.capabilities
         && negotiated.encoding.is_none()

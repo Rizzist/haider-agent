@@ -112,8 +112,9 @@ published here for independent implementations, not as permission to diverge.
 3. Compute `profile_id` as lowercase BLAKE3 hex over the exact byte string
    `haider-profile-id-v1\n` followed by the canonical UTF-8 store path, with no
    separator added after the path.
-4. Select a runtime root: `HAIDER_RUNTIME_DIR` when set (for gates/CI), else a
-   verified owner-private `$XDG_RUNTIME_DIR/haider` on Linux, then the resolved
+4. Select a runtime root: `HAIDER_RUNTIME_DIR` when set (an operator override,
+   also useful for gates/CI), else a verified owner-private
+   `$XDG_RUNTIME_DIR/haider` on Unix, then the resolved
    user home joined with `.haider/runtime`. Only an invocation with an explicit
    profile store and no available user home proceeds to a verified
    `$TMPDIR/haider` or `$PREFIX/tmp/haider`, the per-UID
@@ -128,10 +129,22 @@ published here for independent implementations, not as permission to diverge.
    the UTF-8 `profile_id`, take the first 32 hex characters, and form
    `\\.\pipe\haider-<32hex>`; the profile-scoped filesystem runtime still
    holds its pid and temporary files.
-6. Validate the longest bind/staging address during profile resolution. A
-   selected HOME/XDG path that exceeds the platform IPC limit is a typed fatal
-   error naming the observed path/length/limit and recommending a shorter
-   owner-private `HAIDER_RUNTIME_DIR`; it MUST NOT silently escape to `/tmp`.
+6. Before publishing or using filesystem paths, make them absolute and resolve
+   symlinks in the deepest existing ancestor; append any not-yet-created suffix
+   lexically. This makes macOS `/tmp` and `/private/tmp` one identity without
+   creating daemon state during a `--no-spawn` lookup.
+7. Validate the longest bind/staging address during profile resolution. When a
+   preferred Unix address exceeds `sun_path`, fall back to the canonical short,
+   owner- and profile-scoped `/tmp/haider-<effective-uid>/<profile-scope>` path.
+   Other endpoint-validation failures remain typed and fatal. Windows retains
+   its selected filesystem runtime because its named-pipe address is independent
+   of that path.
+
+`haider status --json` applies one path rule: every filesystem path is a
+canonical absolute path. On Windows, `daemon.socket_path` is the sole exception
+because it is a named-pipe address rather than a filesystem path. The reported
+runtime, socket, and PID-file values are the paths the serving daemon actually
+uses after any Unix path-budget fallback.
 
 The endpoint name is the discovery mechanism. Do not scan the runtime
 directory and do not parse lock files. Connect first. Only a missing or
@@ -405,6 +418,26 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | Method | Success response | Kind |
 |---|---|---|
 | `daemon.shutdown` | `DaemonShutdown` | Control-gated graceful daemon lifecycle request |
+
+The operator surface is `haider daemon stop [--json] [--timeout <duration>]`.
+It never auto-spawns and never escalates to a signal or forced kill. Its
+`haider.daemon-stop.v1` result distinguishes `stopped_cleanly`, `not_running`,
+and `did_not_stop`; `elapsed_ms` measures the caller-observed lifecycle. A clean
+result requires an authenticated connection, a matching `ServerDraining`,
+disconnect, the matching generation-bound completion receipt, release of the
+profile lifetime lock, and kernel confirmation that the authenticated process
+identity exited. Only a `graceful` completion receipt produces
+`stopped_cleanly`; a `forced`/`failed` receipt or a process that remains alive
+produces `did_not_stop`. A Control-capable stop client registers its completion
+interest during the authenticated handshake, before `Welcome`, so a connection
+that receives `Welcome(Draining)` still gets the exact final receipt without
+making unrelated idle/signal exits leave receipt debris. The report records
+whether the success response itself arrived; joining an already-draining daemon
+reports that field as false.
+Response loss is tolerated only when the matching lifecycle and completion
+records independently confirm the drain. Repeated operator shutdown RPCs are
+graceful and idempotent; the separate second-signal policy remains the only
+force selector.
 | `artifact.put` | `ArtifactPut` | receipt-free content-addressed upload |
 | `session.create` | `SessionCreate` | durable receipt |
 | `branch.create` | `BranchCreate` | durable receipt |

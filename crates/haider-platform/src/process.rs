@@ -86,6 +86,149 @@ impl ProcessId {
     }
 }
 
+/// Retained kernel identity for one already-authenticated process.
+///
+/// Capture this while the IPC peer is still connected, then await it after
+/// shutdown. Linux pins the task with a pidfd, macOS arms EVFILT_PROC before
+/// the PID can be reused, and Windows retains a SYNCHRONIZE process handle.
+pub struct ProcessExitMonitor {
+    #[cfg(target_os = "linux")]
+    descriptor: rustix::fd::OwnedFd,
+    #[cfg(target_os = "macos")]
+    queue: nix::sys::event::Kqueue,
+    #[cfg(target_os = "macos")]
+    event: nix::sys::event::KEvent,
+    #[cfg(windows)]
+    handle: std::os::windows::io::OwnedHandle,
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    pid: ProcessId,
+}
+
+impl ProcessExitMonitor {
+    /// Pins the exact process currently named by `pid` against PID reuse.
+    pub fn capture(pid: ProcessId) -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::process::{Pid, PidfdFlags, pidfd_open};
+
+            let pid = Pid::from_raw(pid.as_raw_nonzero().get())
+                .ok_or_else(|| std::io::Error::other("process-exit monitor PID became zero"))?;
+            let descriptor = pidfd_open(pid, PidfdFlags::NONBLOCK).map_err(std::io::Error::from)?;
+            Ok(Self { descriptor })
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            use nix::libc::timespec;
+            use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+
+            let queue = Kqueue::new().map_err(std::io::Error::other)?;
+            let event = KEvent::new(
+                pid.id() as usize,
+                EventFilter::EVFILT_PROC,
+                EvFlags::EV_ADD | EvFlags::EV_ONESHOT,
+                FilterFlag::NOTE_EXIT,
+                0,
+                0,
+            );
+            queue
+                .kevent(
+                    &[event],
+                    &mut [],
+                    Some(timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    }),
+                )
+                .map_err(std::io::Error::other)?;
+            Ok(Self { queue, event })
+        }
+
+        #[cfg(windows)]
+        {
+            open_windows_process_monitor(pid).map(|handle| Self { handle })
+        }
+
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        {
+            match rustix::process::test_kill_process(unix_pid(pid.id())?) {
+                Ok(()) | Err(rustix::io::Errno::PERM) => Ok(Self { pid }),
+                Err(rustix::io::Errno::SRCH) => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "process exited before its monitor was armed",
+                )),
+                Err(error) => Err(error.into()),
+            }
+        }
+    }
+
+    /// Waits until the retained process identity exits without reaping it.
+    pub async fn wait(self) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let descriptor = tokio::io::unix::AsyncFd::new(self.descriptor)?;
+            let _ready = descriptor.readable().await?;
+            Ok(())
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            std::thread::Builder::new()
+                .name("haider-peer-exit".into())
+                .spawn(move || {
+                    let mut events = [self.event];
+                    let result = self
+                        .queue
+                        .kevent(&[], &mut events, None)
+                        .map_err(std::io::Error::other)
+                        .and_then(|count| {
+                            if count == 0 {
+                                Err(std::io::Error::other(
+                                    "process-exit monitor returned without an event",
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        });
+                    let _ = sender.send(result);
+                })
+                .map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("could not start process-exit monitor: {error}"),
+                    )
+                })?;
+            receiver.await.map_err(|error| {
+                std::io::Error::other(format!("process-exit monitor stopped: {error}"))
+            })?
+        }
+
+        #[cfg(windows)]
+        {
+            loop {
+                if windows_process_handle_exited(&self.handle)? {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        {
+            loop {
+                match rustix::process::test_kill_process(unix_pid(self.pid.id())?) {
+                    Ok(()) | Err(rustix::io::Errno::PERM) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    Err(rustix::io::Errno::SRCH) => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcessGroup(u32);
@@ -1213,12 +1356,11 @@ async fn observe_process_leader_exit_by_polling(pid: ProcessId) -> std::io::Resu
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-pub fn process_leader_exited(pid: ProcessId) -> std::io::Result<bool> {
-    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
-    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
-    };
+fn open_windows_process_monitor(
+    pid: ProcessId,
+) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::FromRawHandle as _;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     // SYNCHRONIZE is a frozen Win32 access-right bit; windows-sys moves its
     // module home between releases, so pin the ABI value directly.
@@ -1226,26 +1368,40 @@ pub fn process_leader_exited(pid: ProcessId) -> std::io::Result<bool> {
 
     // SAFETY: the access mask and PID are value arguments; a non-null result
     // is one newly owned process handle.
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid.0) };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        return if error.raw_os_error() == Some(87) {
-            Ok(true)
-        } else {
-            Err(error)
-        };
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid.0) };
+    if raw.is_null() {
+        return Err(std::io::Error::last_os_error());
     }
     // SAFETY: OpenProcess returned a non-null newly owned handle and this is
     // its unique transfer into the standard RAII owner.
-    let handle = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
+    Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw.cast()) })
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_process_handle_exited(
+    handle: &std::os::windows::io::OwnedHandle,
+) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
     // SAFETY: `handle` remains live and a zero timeout makes this a nonblocking
     // state query that does not transfer ownership.
     let wait = unsafe { WaitForSingleObject(handle.as_raw_handle().cast(), 0) };
-    drop(handle);
     match wait {
         WAIT_OBJECT_0 => Ok(true),
         WAIT_TIMEOUT => Ok(false),
         _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+#[cfg(windows)]
+pub fn process_leader_exited(pid: ProcessId) -> std::io::Result<bool> {
+    match open_windows_process_monitor(pid) {
+        Ok(handle) => windows_process_handle_exited(&handle),
+        Err(error) if error.raw_os_error() == Some(87) => Ok(true),
+        Err(error) => Err(error),
     }
 }
 

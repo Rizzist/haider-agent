@@ -583,6 +583,19 @@ fn killed_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
         },
     );
     wait_for_cleanup(&runtime, &profile, Some(&mut helper), Some(daemon_pid));
+    let completion_receipts = std::fs::read_dir(&profile.store_dir)
+        .expect("read automatic-lifetime profile store")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".daemon-stop-") && name.ends_with(".json")
+        })
+        .count();
+    assert_eq!(
+        completion_receipts, 0,
+        "an automatic lifecycle exit must not leave an operator-stop receipt"
+    );
 }
 
 /// S3(a): the fixture explicitly selects zero-TTL ephemeral lifetime. Once
@@ -951,15 +964,15 @@ fn two_private_home_instances_are_self_contained_and_never_adopt_each_other() {
 
     for (home, profile) in [(&first_home, &first), (&second_home, &second)] {
         let canonical_home = home.canonicalize().expect("canonical private HOME");
-        assert!(profile.store_dir.starts_with(canonical_home));
-        assert!(profile.runtime_dir.starts_with(home));
+        assert!(profile.store_dir.starts_with(&canonical_home));
+        assert!(profile.runtime_dir.starts_with(&canonical_home));
         assert_eq!(
             profile.endpoint_path,
             haider_client::endpoint_path_for(&profile.runtime_dir, &profile.profile_id),
             "private-home endpoint must retain the shared profile scope"
         );
         #[cfg(unix)]
-        assert!(profile.endpoint_path.starts_with(home));
+        assert!(profile.endpoint_path.starts_with(&canonical_home));
         #[cfg(windows)]
         assert!(
             profile

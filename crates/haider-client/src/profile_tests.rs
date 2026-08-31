@@ -93,11 +93,15 @@ fn default_home_store_dir_is_preserved() {
     };
     let profile = resolve_profile(&env).unwrap_or_else(|error| panic!("{error}"));
     assert!(profile.store_dir.ends_with(".haider/dev-profile"));
-    assert!(profile.runtime_dir.starts_with(root.path()));
+    let canonical_root = root
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("canonicalize HOME root: {error}"));
+    assert!(profile.runtime_dir.starts_with(&canonical_root));
     assert!(
         profile
             .runtime_dir
-            .starts_with(root.path().join(".haider/runtime"))
+            .starts_with(canonical_root.join(".haider/runtime"))
     );
     assert_profile_scoped_endpoint(&profile);
 }
@@ -123,36 +127,45 @@ fn private_home_contains_store_runtime_and_endpoint() {
     let canonical_home = private_home
         .canonicalize()
         .unwrap_or_else(|error| panic!("canonicalize private HOME: {error}"));
-    assert!(profile.store_dir.starts_with(canonical_home));
-    assert!(profile.runtime_dir.starts_with(&private_home));
+    assert!(profile.store_dir.starts_with(&canonical_home));
+    assert!(profile.runtime_dir.starts_with(&canonical_home));
     assert_profile_scoped_endpoint(&profile);
 }
 
-/// A deep private HOME keeps the canonical store under HOME but moves the
-/// endpoint to the short owner/profile scope required by `sun_path`.
+/// A deep private XDG runtime keeps the canonical store under HOME but moves
+/// the endpoint to the short owner/profile scope required by `sun_path`.
 #[test]
 #[cfg(unix)]
-fn overlong_private_home_falls_back_to_an_isolated_short_runtime() {
+fn overlong_private_xdg_falls_back_to_an_isolated_short_runtime() {
+    use std::os::unix::fs::PermissionsExt as _;
+
     let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
     let private_home = root.path().join("h".repeat(100));
+    std::fs::create_dir(&private_home)
+        .unwrap_or_else(|error| panic!("create deep private XDG runtime: {error}"));
+    std::fs::set_permissions(&private_home, std::fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|error| panic!("chmod deep private XDG runtime: {error}"));
     let env = ProfileEnv {
         profile_dir: None,
         home: Some(private_home.clone()),
         user_profile: None,
         model: None,
         runtime_dir: None,
-        xdg_runtime_dir: None,
+        xdg_runtime_dir: Some(private_home.clone()),
     };
 
     let profile = resolve_profile(&env).unwrap_or_else(|error| panic!("{error}"));
     let canonical_home = private_home
         .canonicalize()
         .unwrap_or_else(|error| panic!("canonicalize deep private HOME: {error}"));
-    let expected_owner_root = PathBuf::from("/tmp").join(format!("haider-{}", effective_uid()));
+    let expected_owner_root = PathBuf::from("/tmp")
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("canonicalize fallback root: {error}"))
+        .join(format!("haider-{}", effective_uid()));
     assert!(profile.store_dir.starts_with(&canonical_home));
     assert!(profile.runtime_dir.starts_with(&expected_owner_root));
     assert!(profile.endpoint_path.starts_with(&profile.runtime_dir));
-    assert!(!profile.runtime_dir.starts_with(&private_home));
+    assert!(!profile.runtime_dir.starts_with(&canonical_home));
     use std::os::unix::ffi::OsStrExt as _;
     assert!(
         profile.endpoint_path.as_os_str().as_bytes().len()
@@ -356,8 +369,12 @@ fn malformed_profile_config_is_loud() {
     let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
     std::fs::write(root.path().join(PROFILE_CONFIG_FILE), "{not json")
         .unwrap_or_else(|error| panic!("write config: {error}"));
-    let error = resolve_profile(&env_for(root.path()));
+    let env = env_for(root.path());
+    let error = resolve_profile(&env);
     assert!(matches!(error, Err(ProfileError::InvalidConfig { .. })));
+    let identity = resolve_profile_read_only(&env)
+        .unwrap_or_else(|error| panic!("read-only identity resolution failed: {error}"));
+    assert_eq!(identity.default_model, PACKAGED_DEFAULT_MODEL);
 }
 
 // MUTATION CHECK (R8/D1 short-private-directory rule): change endpoint
@@ -386,12 +403,13 @@ fn endpoint_stays_inside_the_resolved_runtime_directory() {
     }
 }
 
-/// MUTATION CHECK (TMPDIR portability): restore the unconditional
-/// `/tmp/haider-<uid>` return in `runtime_dir`. Expected failure: the left
-/// path starts with `/tmp`, not the private TMPDIR fixture.
+/// MUTATION CHECK (runtime-root precedence): restore Linux-only XDG handling,
+/// or choose HOME/TMPDIR ahead of XDG. Expected failure: the first path leaves
+/// the private XDG fixture. The second assertion retains the TMPDIR fallback
+/// law when XDG is absent.
 #[test]
 #[cfg(unix)]
-fn runtime_dir_honors_a_verified_private_tmpdir() {
+fn runtime_dir_honors_private_xdg_then_private_tmpdir() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
@@ -403,6 +421,19 @@ fn runtime_dir_honors_a_verified_private_tmpdir() {
         tmpdir: Some(tmpdir.clone()),
         prefix: None,
     };
+
+    let xdg = root.path().join("xdg-runtime");
+    std::fs::create_dir(&xdg).unwrap_or_else(|error| panic!("create XDG runtime: {error}"));
+    std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|error| panic!("chmod XDG runtime: {error}"));
+    let mut with_xdg = env_for(root.path());
+    with_xdg.home = Some(root.path().join("home"));
+    with_xdg.xdg_runtime_dir = Some(xdg.clone());
+
+    assert_eq!(
+        runtime_dir(&with_xdg, &runtime_env, "profile-123"),
+        xdg.join("haider").join("profile-123")
+    );
 
     assert_eq!(
         runtime_dir(&env_for(root.path()), &runtime_env, "profile-123"),
@@ -465,14 +496,18 @@ fn runtime_override_is_a_root_and_never_collapses_profiles() {
     let runtime_root = root.path().join("gate-runtime");
     let mut first_env = env_for(&root.path().join("first"));
     first_env.runtime_dir = Some(runtime_root.clone());
+    first_env.xdg_runtime_dir = Some(root.path().join("ignored-xdg"));
     let mut second_env = env_for(&root.path().join("second"));
     second_env.runtime_dir = Some(runtime_root.clone());
+    second_env.xdg_runtime_dir = Some(root.path().join("ignored-xdg"));
 
     let first = resolve_profile(&first_env).unwrap_or_else(|error| panic!("{error}"));
     let second = resolve_profile(&second_env).unwrap_or_else(|error| panic!("{error}"));
 
-    assert!(first.runtime_dir.starts_with(&runtime_root));
-    assert!(second.runtime_dir.starts_with(&runtime_root));
+    let canonical_runtime_root = canonicalize_path_allow_missing(runtime_root)
+        .unwrap_or_else(|error| panic!("canonicalize runtime override: {error}"));
+    assert!(first.runtime_dir.starts_with(&canonical_runtime_root));
+    assert!(second.runtime_dir.starts_with(&canonical_runtime_root));
     assert_ne!(first.runtime_dir, second.runtime_dir);
     assert_eq!(
         first

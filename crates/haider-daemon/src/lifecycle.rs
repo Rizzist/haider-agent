@@ -13,7 +13,7 @@ use std::time::Duration;
 #[path = "lifecycle_tests.rs"]
 mod lifecycle_tests;
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use tokio::sync::watch;
 
@@ -224,6 +224,8 @@ pub enum ShutdownOutcome {
 struct ShutdownInner {
     /// Count of shutdown requests so far; `> 0` means a drain has started.
     requests: AtomicU8,
+    /// Sticky proof that a stop caller needs this drain's completion receipt.
+    operator_stop: AtomicBool,
     /// Serializes shutdown requests against the Ready publication so that
     /// `Ready` can never be advertised at or after the first request.
     transition: Mutex<()>,
@@ -261,6 +263,7 @@ impl ShutdownHandle {
         let (sender, receiver) = watch::channel(ShutdownRequest::None);
         let inner = Arc::new(ShutdownInner {
             requests: AtomicU8::new(0),
+            operator_stop: AtomicBool::new(false),
             transition: Mutex::new(()),
             sender,
         });
@@ -289,6 +292,40 @@ impl ShutdownHandle {
                 .send_replace(ShutdownRequest::Forced { reason });
             ShutdownDisposition::Forced
         }
+    }
+
+    /// Starts or advances to an immediate graceful drain without ever forcing.
+    ///
+    /// Operator RPCs are idempotent: a daemon may already carry an idle or
+    /// linger request from its launcher, and independent stop callers may race.
+    /// Only repeated process signals use [`ShutdownHandle::request`] to select
+    /// the forced path.
+    pub fn request_graceful(&self) {
+        let reason = ShutdownReason::Message("authenticated daemon.shutdown RPC".into());
+        let _transition = lock_transition(&self.inner);
+        self.inner.operator_stop.store(true, Ordering::Release);
+        let current = self.inner.sender.borrow().clone();
+        match current {
+            ShutdownRequest::None => {
+                self.inner.requests.store(1, Ordering::Release);
+                self.inner
+                    .sender
+                    .send_replace(ShutdownRequest::Graceful { reason });
+            }
+            ShutdownRequest::GracefulWhenIdle { .. }
+            | ShutdownRequest::GracefulAfterIdle { .. } => {
+                self.inner
+                    .sender
+                    .send_replace(ShutdownRequest::Graceful { reason });
+            }
+            ShutdownRequest::Graceful { .. } | ShutdownRequest::Forced { .. } => {}
+        }
+    }
+
+    /// Registers a stop caller before its Welcome is published. The sticky bit
+    /// lets that caller observe a drain which another source already started.
+    pub(crate) fn observe_operator_stop(&self) {
+        self.inner.operator_stop.store(true, Ordering::Release);
     }
 
     /// Records an ephemeral launcher death without disconnecting unrelated
@@ -321,6 +358,11 @@ impl ShutdownHandle {
 }
 
 impl ShutdownObserver {
+    /// Returns whether a stop caller registered for this drain's completion.
+    pub(crate) fn operator_stop_requested(&self) -> bool {
+        self.inner.operator_stop.load(Ordering::Acquire)
+    }
+
     /// Publishes `Ready` unless a shutdown request already arrived.
     ///
     /// Holding the transition mutex across the check-and-publish closes the

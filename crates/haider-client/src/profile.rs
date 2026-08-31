@@ -10,9 +10,10 @@
 //!   canonicalized; `profile_id` is the lowercase BLAKE3 hex digest of a
 //!   version tag plus the canonical store-path bytes.
 //! - Every profile receives a distinct runtime directory. `HAIDER_RUNTIME_DIR`
-//!   selects the containing root for gates/CI; otherwise a verified
-//!   owner-private `XDG_RUNTIME_DIR` on Linux or the resolved user home
-//!   supplies the preferred base.
+//!   selects the containing root; otherwise a verified owner-private
+//!   `XDG_RUNTIME_DIR` on Unix or the resolved user home supplies the preferred
+//!   base. Resolved filesystem paths are absolute and canonical even when the
+//!   final runtime suffix does not exist yet.
 //! - The complete bind/staging path budget is checked during profile
 //!   resolution. Unix falls back to a short owner- and profile-scoped `/tmp`
 //!   path when the preferred socket path is too long. Windows uses a
@@ -64,7 +65,7 @@ pub struct ProfileEnv {
     /// `HAIDER_RUNTIME_DIR`, interpreted as a root; the resolver always adds
     /// a profile-derived child so two profiles cannot share runtime files.
     pub runtime_dir: Option<PathBuf>,
-    /// `XDG_RUNTIME_DIR` (consulted on Linux only).
+    /// `XDG_RUNTIME_DIR` (consulted on Unix).
     pub xdg_runtime_dir: Option<PathBuf>,
 }
 
@@ -199,6 +200,20 @@ struct ProfileConfig {
 
 /// Resolves the shared profile from an explicit environment snapshot.
 pub fn resolve_profile(env: &ProfileEnv) -> Result<ResolvedProfile, ProfileError> {
+    resolve_profile_with_store_mode(env, true)
+}
+
+/// Resolves the same identity without creating a missing profile store.
+/// Lifecycle probes use this so asking whether a daemon exists has no profile
+/// side effect; launch and mutation paths continue to use [`resolve_profile`].
+pub fn resolve_profile_read_only(env: &ProfileEnv) -> Result<ResolvedProfile, ProfileError> {
+    resolve_profile_with_store_mode(env, false)
+}
+
+fn resolve_profile_with_store_mode(
+    env: &ProfileEnv,
+    materialize_store: bool,
+) -> Result<ResolvedProfile, ProfileError> {
     let store_dir = match &env.profile_dir {
         Some(dir) => dir.clone(),
         None => profile_home(env)
@@ -206,18 +221,22 @@ pub fn resolve_profile(env: &ProfileEnv) -> Result<ResolvedProfile, ProfileError
             .ok_or(ProfileError::NoStoreDir)?,
     };
     let store_dir = absolute(store_dir)?;
-    std::fs::create_dir_all(&store_dir).map_err(|source| ProfileError::Io {
-        operation: "create profile store directory",
-        path: store_dir.clone(),
-        source,
-    })?;
-    let store_dir = store_dir
-        .canonicalize()
-        .map_err(|source| ProfileError::Io {
-            operation: "canonicalize profile store directory",
+    let store_dir = if materialize_store {
+        std::fs::create_dir_all(&store_dir).map_err(|source| ProfileError::Io {
+            operation: "create profile store directory",
             path: store_dir.clone(),
             source,
         })?;
+        store_dir
+            .canonicalize()
+            .map_err(|source| ProfileError::Io {
+                operation: "canonicalize profile store directory",
+                path: store_dir.clone(),
+                source,
+            })?
+    } else {
+        canonicalize_path_allow_missing(store_dir)?
+    };
     let store_text = store_dir
         .to_str()
         .ok_or_else(|| ProfileError::NonUtf8Path(store_dir.clone()))?;
@@ -229,7 +248,13 @@ pub fn resolve_profile(env: &ProfileEnv) -> Result<ResolvedProfile, ProfileError
 
     let (runtime_dir, endpoint) = runtime_endpoint(env, &RuntimeEnv::capture(), &profile_id)?;
     let endpoint_path = endpoint.into_address();
-    let default_model = resolve_default_model(&store_dir, env)?;
+    let default_model = if materialize_store {
+        resolve_default_model(&store_dir, env)?
+    } else {
+        // Read-only lifecycle probes need only the profile/rendezvous identity.
+        // A damaged model config must not make a live daemon unlocatable.
+        PACKAGED_DEFAULT_MODEL.to_owned()
+    };
 
     Ok(ResolvedProfile {
         profile_id,
@@ -287,7 +312,8 @@ fn runtime_endpoint(
     runtime_env: &RuntimeEnv,
     profile_id: &str,
 ) -> Result<(PathBuf, haider_platform::Endpoint), ProfileError> {
-    let preferred_runtime_dir = runtime_dir(env, runtime_env, profile_id);
+    let preferred_runtime_dir =
+        canonicalize_path_allow_missing(runtime_dir(env, runtime_env, profile_id))?;
     let preferred_endpoint = haider_platform::Endpoint::new(&preferred_runtime_dir, profile_id);
     match preferred_endpoint.validate_for_bind(&preferred_runtime_dir) {
         Ok(()) => return Ok((preferred_runtime_dir, preferred_endpoint)),
@@ -295,7 +321,7 @@ fn runtime_endpoint(
         Err(source) => return Err(ProfileError::RuntimeEndpoint { source }),
     }
 
-    let fallback_runtime_dir = short_runtime_dir(profile_id);
+    let fallback_runtime_dir = canonicalize_path_allow_missing(short_runtime_dir(profile_id))?;
     let fallback_endpoint = haider_platform::Endpoint::new(&fallback_runtime_dir, profile_id);
     fallback_endpoint
         .validate_for_bind(&fallback_runtime_dir)
@@ -339,7 +365,7 @@ fn runtime_root(env: &ProfileEnv, runtime_env: &RuntimeEnv) -> PathBuf {
     {
         return override_root.clone();
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if let Some(xdg) = &env.xdg_runtime_dir
         && verified_owner_private(xdg)
     {
@@ -442,6 +468,52 @@ fn absolute(path: PathBuf) -> Result<PathBuf, ProfileError> {
         source,
     })?;
     Ok(cwd.join(path))
+}
+
+/// Canonicalizes the deepest existing ancestor and appends a missing suffix.
+///
+/// Runtime resolution must not create daemon state, because `--no-spawn`
+/// callers use the same path. This still resolves aliases such as macOS
+/// `/tmp` -> `/private/tmp` before any path is published or handed to the
+/// daemon.
+pub fn canonicalize_path_allow_missing(path: PathBuf) -> Result<PathBuf, ProfileError> {
+    let path = absolute(path)?;
+    let mut ancestor = path.clone();
+    let mut missing = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut canonical) => {
+                for component in missing.into_iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(component) = ancestor.file_name().map(ToOwned::to_owned) else {
+                    return Err(ProfileError::Io {
+                        operation: "canonicalize profile runtime directory",
+                        path,
+                        source: error,
+                    });
+                };
+                missing.push(component);
+                if !ancestor.pop() {
+                    return Err(ProfileError::Io {
+                        operation: "canonicalize profile runtime directory",
+                        path,
+                        source: error,
+                    });
+                }
+            }
+            Err(source) => {
+                return Err(ProfileError::Io {
+                    operation: "canonicalize profile runtime directory",
+                    path: ancestor,
+                    source,
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -34,6 +34,7 @@ pub mod shell;
 pub mod shell_registry;
 pub mod spawn;
 pub mod ssh_profiles;
+pub mod stop_receipt;
 pub mod surface;
 pub mod transcription;
 pub mod workflow_graph;
@@ -86,8 +87,9 @@ pub use permission::{
 };
 pub use profile::{
     DEFAULT_MAX_TOKENS, DEFAULT_PROVIDER, MODEL_ENV, PACKAGED_DEFAULT_MODEL, PROFILE_CONFIG_FILE,
-    PROFILE_DIR_ENV, ProfileEnv, ProfileError, RUNTIME_DIR_ENV, ResolvedProfile, effective_uid,
-    endpoint_path_for, resolve_default_model_for, resolve_profile,
+    PROFILE_DIR_ENV, ProfileEnv, ProfileError, RUNTIME_DIR_ENV, ResolvedProfile,
+    canonicalize_path_allow_missing, effective_uid, endpoint_path_for, resolve_default_model_for,
+    resolve_profile, resolve_profile_read_only,
 };
 pub use session_fork::{
     FORKABLE_PROMPT_PAGE, ForkablePrompt, PromptFork, SessionForkClientError, fork_at_prompt,
@@ -108,6 +110,10 @@ pub use spawn::{
 };
 pub use ssh_profiles::{
     SshProfiles, SshProfilesClientError, ssh_list_response, ssh_profiles, ssh_profiles_available,
+};
+pub use stop_receipt::{
+    DAEMON_STOP_CLIENT_NAME, DAEMON_STOP_COMPLETION_SCHEMA, DaemonStopCompletion,
+    DaemonStopReceipt, daemon_stop_receipt_path,
 };
 pub use surface::{
     SurfaceClientError, SurfaceInjectAck, SurfaceInjectOp, SurfaceInputPublishWire,

@@ -188,6 +188,8 @@ async fn armed_kqueue_observes_a_short_command_without_coarse_backoff() {
         .spawn()
         .expect("spawn short kqueue fixture");
     let pid = super::process_id(child.id()).expect("short fixture pid");
+    let retained = super::ProcessExitMonitor::capture(pid)
+        .expect("arm retained process identity while child is live");
     tokio::time::timeout(
         std::time::Duration::from_millis(50),
         super::observe_process_leader_exit(pid),
@@ -195,5 +197,9 @@ async fn armed_kqueue_observes_a_short_command_without_coarse_backoff() {
     .await
     .expect("armed kqueue must beat a 50 ms replacement backoff")
     .expect("observe short fixture exit");
+    tokio::time::timeout(std::time::Duration::from_millis(50), retained.wait())
+        .await
+        .expect("retained kqueue must observe the same short exit")
+        .expect("wait for retained short fixture exit");
     child.wait().await.expect("reap short kqueue fixture");
 }

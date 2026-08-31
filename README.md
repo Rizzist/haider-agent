@@ -171,6 +171,28 @@ Evidence: [`/talk` state machine](crates/haider-tui/src/talk.rs), [STT engine](c
 
 The [client contract v1](docs/client-contract-v1.md) is the integration boundary: discovery, framing, feature negotiation, replay laws, absence semantics, and projection precedence are specified there.
 
+### Runtime discovery and cleanup
+
+Each profile gets an isolated runtime directory. `HAIDER_RUNTIME_DIR` selects
+its containing root explicitly. Otherwise Unix uses an owner-private
+`XDG_RUNTIME_DIR` when available, then the user home; Windows keeps filesystem
+runtime state below the user home and rendezvous through a profile-derived named
+pipe. If a Unix socket would exceed `sun_path`, Haider automatically selects its
+short owner/profile fallback. `haider status --json` reports the canonical paths
+actually in use; the Windows `daemon.socket_path` value is a named-pipe address,
+not a filesystem path.
+
+Stop a profile daemon gracefully and measure the observed lifecycle with:
+
+```console
+$ haider daemon stop --json --timeout 20s
+```
+
+The JSON outcome is one of `stopped_cleanly`, `not_running`, or `did_not_stop`.
+The command never starts a missing daemon and never escalates to a forced kill.
+`stopped_cleanly` is emitted only after the daemon reports a graceful final
+outcome and the authenticated process identity has exited.
+
 ## 🚀 Development
 
 ```bash
