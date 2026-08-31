@@ -177,6 +177,48 @@ const BOUNDED_OUTPUT_TIMEOUT_MS: u64 = 2_000;
 #[cfg(windows)]
 const BOUNDED_OUTPUT_TIMEOUT_MS: u64 = 5_000;
 
+const HOOK_OBSERVATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Test-only process-dispatch allowances. The repository's loaded process
+// tests establish five seconds for a Unix shell and 30 seconds for a cold
+// Windows PowerShell. Hook spawn is synchronous and happens before the
+// engine installs `definition.timeout`, so an outer observation must budget
+// for it separately. These constants do not change a production deadline.
+#[cfg(unix)]
+const HOOK_DISPATCH_AND_PROCESS_SPAWN_ALLOWANCE: Duration = Duration::from_secs(5);
+#[cfg(windows)]
+const HOOK_DISPATCH_AND_PROCESS_SPAWN_ALLOWANCE: Duration = Duration::from_secs(30);
+
+// A one-shot exec observation is dispatch/spawn + the configured hook wall +
+// three product-owned one-second settlement bounds (child reap, stdout, and
+// stderr) + one 10ms poll. Script execution is already inside the hook wall,
+// so it is not added twice. For the decision fixture on Unix this is exactly
+// 5s + 1s + (3 * 1s) + 10ms = 9.010s; on Windows it is 34.010s.
+fn exec_hook_observation_timeout(hook_timeout: Duration, hook_count: u32) -> Duration {
+    (HOOK_DISPATCH_AND_PROCESS_SPAWN_ALLOWANCE
+        + hook_timeout
+        + (super::HOOK_CHILD_REAP_TIMEOUT * 3))
+        * hook_count
+        + HOOK_OBSERVATION_POLL_INTERVAL
+}
+
+// Subscribers do not apply `definition.timeout` while waiting for their
+// child. Bound these immediate-exit fixtures by the exact number of process
+// starts, their literal restart backoff, and one poll instead.
+fn subscriber_start_observation_timeout(
+    process_starts: u32,
+    restart_backoff: Duration,
+) -> Duration {
+    HOOK_DISPATCH_AND_PROCESS_SPAWN_ALLOWANCE * process_starts
+        + restart_backoff
+        + HOOK_OBSERVATION_POLL_INTERVAL
+}
+
+// Snapshot-only waits do not spawn a process: one second is the product idle
+// delay and two seconds cover the test observer's SQLite/runtime scheduling.
+const SNAPSHOT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(3);
+
 #[cfg(unix)]
 fn subscriber_tree_command(ready: &Path, survived: &Path) -> String {
     format!(
@@ -292,18 +334,6 @@ const USER_MESSAGE_CAPTURE_TIMEOUT_MS: u64 = 1_000;
 
 #[cfg(windows)]
 const USER_MESSAGE_CAPTURE_TIMEOUT_MS: u64 = 5_000;
-
-#[cfg(unix)]
-const USER_MESSAGE_CAPTURE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[cfg(windows)]
-const USER_MESSAGE_CAPTURE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
-
-#[cfg(unix)]
-const BOUNDED_OUTPUT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[cfg(windows)]
-const BOUNDED_OUTPUT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn write_profile_policy(profile: &Path, policy: &str) {
     std::fs::write(
@@ -1016,8 +1046,8 @@ impl EngineFixture {
     }
 }
 
-async fn wait_for_hook_outbox_drain(store: &SqliteStoreHandle) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+async fn wait_for_hook_outbox_drain(store: &SqliteStoreHandle, timeout: Duration) {
+    tokio::time::timeout(timeout, async {
         loop {
             if store
                 .pending_hook_dispatches(64)
@@ -1027,7 +1057,7 @@ async fn wait_for_hook_outbox_drain(store: &SqliteStoreHandle) {
             {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
         }
     })
     .await
@@ -1049,7 +1079,7 @@ async fn snapshot_cadence_coalesces_batches_and_avoids_clean_shutdown_rewrite() 
         "run_finished",
     )
     .await;
-    wait_for_hook_outbox_drain(&fixture.store).await;
+    wait_for_hook_outbox_drain(&fixture.store, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT).await;
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     let baseline = fixture.service.snapshot_persist_count();
 
@@ -1081,14 +1111,14 @@ async fn snapshot_cadence_coalesces_batches_and_avoids_clean_shutdown_rewrite() 
         .append(&mut paged_batch)
         .await
         .expect("commit paged burst");
-    wait_for_hook_outbox_drain(&fixture.store).await;
+    wait_for_hook_outbox_drain(&fixture.store, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT).await;
     assert!(
         fixture.service.snapshot_persist_count() - baseline <= 1,
         "batches inside one second produce at most one snapshot persist"
     );
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(SNAPSHOT_OBSERVATION_TIMEOUT, async {
         while fixture.service.snapshot_persist_count() == baseline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
         }
     })
     .await
@@ -1112,11 +1142,14 @@ async fn snapshot_cadence_coalesces_batches_and_avoids_clean_shutdown_rewrite() 
         .append(&mut terminal)
         .await
         .expect("commit terminal run");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while fixture.service.snapshot_persist_count() == before_terminal {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        exec_hook_observation_timeout(Duration::from_millis(1_000), 1),
+        async {
+            while fixture.service.snapshot_persist_count() == before_terminal {
+                tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
+            }
+        },
+    )
     .await
     .expect("terminal snapshot deadline");
 
@@ -1126,9 +1159,9 @@ async fn snapshot_cadence_coalesces_batches_and_avoids_clean_shutdown_rewrite() 
         .delete_session(fixture.session_id.clone())
         .await
         .expect("durably delete terminal hook session");
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(SNAPSHOT_OBSERVATION_TIMEOUT, async {
         while fixture.service.snapshot_persist_count() == before_delete {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
         }
     })
     .await
@@ -1171,7 +1204,7 @@ async fn hook_start_and_clean_shutdown_do_not_persist_an_empty_snapshot() {
 async fn committed_batch_computes_discovery_stamp_once() {
     let command = emit_command("stamped");
     let fixture = EngineFixture::start(&command, 1_000, false, "exec").await;
-    wait_for_hook_outbox_drain(&fixture.store).await;
+    wait_for_hook_outbox_drain(&fixture.store, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT).await;
     let baseline = fixture.service.discovery_stamp_count();
     let mut batch = (0..3)
         .map(|index| {
@@ -1189,7 +1222,11 @@ async fn committed_batch_computes_discovery_stamp_once() {
         .append(&mut batch)
         .await
         .expect("commit classifiable batch");
-    wait_for_hook_outbox_drain(&fixture.store).await;
+    wait_for_hook_outbox_drain(
+        &fixture.store,
+        exec_hook_observation_timeout(Duration::from_millis(1_000), 3),
+    )
+    .await;
     assert_eq!(fixture.service.discovery_stamp_count() - baseline, 1);
     fixture.close().await;
 }
@@ -1211,7 +1248,7 @@ async fn untrusted_hook_never_executes_and_notices_honestly() {
         EventPayload::RunState(RunState::Thinking),
     )];
     fixture.hub.append(&mut event).await.expect("commit fact");
-    let events = wait_for(&fixture, |events| {
+    let events = wait_for_with_timeout(&fixture, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT, |events| {
         events.iter().any(|event| {
             matches!(
                 HookEventPayload::from_payload_value(event.payload.clone()),
@@ -1246,15 +1283,16 @@ async fn untrusted_notice_dedup_is_digest_sensitive() {
         EventPayload::RunState(RunState::Thinking),
     )];
     fixture.hub.append(&mut first).await.expect("first fact");
-    let first_events = wait_for(&fixture, |events| {
-        events.iter().any(|event| {
-            matches!(
-                HookEventPayload::from_payload_value(event.payload.clone()),
-                Ok(HookEventPayload::HookNotice(_))
-            )
+    let first_events =
+        wait_for_with_timeout(&fixture, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT, |events| {
+            events.iter().any(|event| {
+                matches!(
+                    HookEventPayload::from_payload_value(event.payload.clone()),
+                    Ok(HookEventPayload::HookNotice(_))
+                )
+            })
         })
-    })
-    .await;
+        .await;
     let first_digest = first_events
         .iter()
         .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
@@ -1280,7 +1318,7 @@ async fn untrusted_notice_dedup_is_digest_sensitive() {
         EventPayload::RunState(RunState::Thinking),
     )];
     fixture.hub.append(&mut second).await.expect("second fact");
-    let events = wait_for(&fixture, |events| {
+    let events = wait_for_with_timeout(&fixture, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT, |events| {
         events
             .iter()
             .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
@@ -1417,29 +1455,30 @@ async fn hook_trust_revision_and_journal_fact_are_receipted_once() {
     fixture.close().await;
 }
 
-async fn wait_for(
-    fixture: &EngineFixture,
-    predicate: impl Fn(&[RawEnvelope]) -> bool,
-) -> Vec<RawEnvelope> {
-    wait_for_with_timeout(fixture, Duration::from_secs(5), predicate).await
-}
-
 async fn wait_for_with_timeout(
     fixture: &EngineFixture,
     timeout: Duration,
     predicate: impl Fn(&[RawEnvelope]) -> bool,
 ) -> Vec<RawEnvelope> {
-    tokio::time::timeout(timeout, async {
+    let observed = tokio::time::timeout(timeout, async {
         loop {
             let events = fixture.events().await;
             if predicate(&events) {
                 break events;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
         }
     })
-    .await
-    .expect("hook result deadline")
+    .await;
+    match observed {
+        Ok(events) => events,
+        Err(_) => {
+            let events = fixture.events().await;
+            let state = serde_json::to_string(&events)
+                .unwrap_or_else(|error| format!("<event serialization failed: {error}>"));
+            panic!("hook result deadline after {timeout:?}; observed events: {state}");
+        }
+    }
 }
 
 /// MUTATION CHECK: hash parsed JSON or omit the command bytes. Expected
@@ -1629,7 +1668,7 @@ async fn committed_user_message_hook_projection_is_surface_neutral() {
         .await;
     let headless_events = wait_for_with_timeout(
         &headless,
-        USER_MESSAGE_CAPTURE_OBSERVATION_TIMEOUT,
+        exec_hook_observation_timeout(Duration::from_millis(USER_MESSAGE_CAPTURE_TIMEOUT_MS), 1),
         |events| {
             events.iter().any(|event| {
                 HookEventPayload::from_payload_value(event.payload.clone())
@@ -1658,14 +1697,17 @@ async fn committed_user_message_hook_projection_is_surface_neutral() {
         vec![],
     )
     .await;
-    let rpc_events =
-        wait_for_with_timeout(&rpc, USER_MESSAGE_CAPTURE_OBSERVATION_TIMEOUT, |events| {
+    let rpc_events = wait_for_with_timeout(
+        &rpc,
+        exec_hook_observation_timeout(Duration::from_millis(USER_MESSAGE_CAPTURE_TIMEOUT_MS), 1),
+        |events| {
             events.iter().any(|event| {
                 HookEventPayload::from_payload_value(event.payload.clone())
                     .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
             })
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         rpc_events
             .iter()
@@ -1952,14 +1994,18 @@ async fn decision_hook_allow_uses_existing_menu_cas_and_allow_once_only() {
     fixture
         .append_permission(broker_permission_menu(&fixture.workspace).await)
         .await;
-    let events = wait_for(&fixture, |events| {
-        events.iter().any(|event| {
-            matches!(
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
-                Ok(EventPayload::MenuAnswered(_))
-            )
-        })
-    })
+    let events = wait_for_with_timeout(
+        &fixture,
+        exec_hook_observation_timeout(Duration::from_millis(1_000), 1),
+        |events| {
+            events.iter().any(|event| {
+                matches!(
+                    serde_json::from_value::<EventPayload>(event.payload.clone()),
+                    Ok(EventPayload::MenuAnswered(_))
+                )
+            })
+        },
+    )
     .await;
     let answer = events
         .iter()
@@ -1982,16 +2028,35 @@ async fn decision_hook_allow_uses_existing_menu_cas_and_allow_once_only() {
 #[tokio::test]
 async fn decision_deny_is_reject_once_and_malformed_output_falls_through() {
     let deny = EngineFixture::start(&emit_command("deny"), 1_000, true, "exec").await;
-    deny.append_permission(broker_permission_menu(&deny.workspace).await)
-        .await;
-    let events = wait_for(&deny, |events| {
-        events.iter().any(|event| {
-            matches!(
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
-                Ok(EventPayload::MenuAnswered(_))
-            )
-        })
-    })
+    let menu = broker_permission_menu(&deny.workspace).await;
+    let menu_id = menu.id.clone();
+    deny.append_permission(menu).await;
+    let events = wait_for_with_timeout(
+        &deny,
+        exec_hook_observation_timeout(Duration::from_millis(1_000), 1),
+        |events| {
+            for event in events {
+                if matches!(
+                    serde_json::from_value::<EventPayload>(event.payload.clone()),
+                    Ok(EventPayload::MenuAnswered(ref answer)) if answer.menu == menu_id
+                ) {
+                    return true;
+                }
+                if matches!(
+                    HookEventPayload::from_payload_value(event.payload.clone()),
+                    Ok(HookEventPayload::HookFired(ref fired))
+                        if fired.kind == HookRuntimeKind::Decision
+                            && fired.menu_id.as_ref() == Some(&menu_id)
+                ) {
+                    panic!(
+                        "deny decision hook completed without MenuAnswered; terminal payload: {}",
+                        event.payload
+                    );
+                }
+            }
+            false
+        },
+    )
     .await;
     let answer = events
         .iter()
@@ -2011,14 +2076,18 @@ async fn decision_deny_is_reject_once_and_malformed_output_falls_through() {
     malformed
         .append_permission(broker_permission_menu(&malformed.workspace).await)
         .await;
-    let events = wait_for(&malformed, |events| {
-        events.iter().any(|event| {
-            matches!(
-                HookEventPayload::from_payload_value(event.payload.clone()),
-                Ok(HookEventPayload::HookFired(_))
-            )
-        })
-    })
+    let events = wait_for_with_timeout(
+        &malformed,
+        exec_hook_observation_timeout(Duration::from_millis(1_000), 1),
+        |events| {
+            events.iter().any(|event| {
+                matches!(
+                    HookEventPayload::from_payload_value(event.payload.clone()),
+                    Ok(HookEventPayload::HookFired(_))
+                )
+            })
+        },
+    )
     .await;
     assert!(!events.iter().any(|event| {
         matches!(
@@ -2043,12 +2112,16 @@ async fn decision_hook_cannot_exceed_committed_ask_scope() {
             decision: Some(DecisionKind::AllowAlways),
         }]))
         .await;
-    let events = wait_for(&fixture, |events| {
-        events.iter().any(|event| {
-            HookEventPayload::from_payload_value(event.payload.clone())
-                .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
-        })
-    })
+    let events = wait_for_with_timeout(
+        &fixture,
+        exec_hook_observation_timeout(Duration::from_millis(1_000), 1),
+        |events| {
+            events.iter().any(|event| {
+                HookEventPayload::from_payload_value(event.payload.clone())
+                    .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
+            })
+        },
+    )
     .await;
     assert!(!events.iter().any(|event| {
         matches!(
@@ -2127,13 +2200,17 @@ async fn decision_timeout_falls_through_to_byte_identical_ask() {
     fixture
         .append_permission(broker_permission_menu(&fixture.workspace).await)
         .await;
-    let events = wait_for(&fixture, |events| {
-        events.iter().any(|event| {
-            HookEventPayload::from_payload_value(event.payload.clone()).is_ok_and(|payload| {
-                matches!(payload, HookEventPayload::HookFired(ref fired) if fired.timed_out)
+    let events = wait_for_with_timeout(
+        &fixture,
+        exec_hook_observation_timeout(Duration::from_millis(20), 1),
+        |events| {
+            events.iter().any(|event| {
+                HookEventPayload::from_payload_value(event.payload.clone()).is_ok_and(|payload| {
+                    matches!(payload, HookEventPayload::HookFired(ref fired) if fired.timed_out)
+                })
             })
-        })
-    })
+        },
+    )
     .await;
     assert!(!events.iter().any(|event| {
         matches!(
@@ -2200,11 +2277,14 @@ async fn matcher_fires_only_after_commit() {
         .append(&mut committed)
         .await
         .expect("commit fact");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !marker.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        exec_hook_observation_timeout(Duration::from_millis(1_000), 1),
+        async {
+            while !marker.exists() {
+                tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
+            }
+        },
+    )
     .await
     .expect("hook marker");
     fixture.close().await;
@@ -2253,7 +2333,7 @@ async fn lockdown_run_binding_suppresses_hooks_until_the_next_run() {
             Vec::new(),
         )
         .await;
-    wait_for_hook_outbox_drain(&fixture.store).await;
+    wait_for_hook_outbox_drain(&fixture.store, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!marker.exists());
     assert!(fixture.events().await.iter().any(|event| {
@@ -2368,9 +2448,9 @@ async fn keyless_resolution_survives_management_mutation_before_hook_binding() {
             Vec::new(),
         )
         .await;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT, async {
         while fixture.service.discovery_stamp_count() <= discovery_before {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
         }
     })
     .await
@@ -2386,7 +2466,7 @@ async fn keyless_resolution_survives_management_mutation_before_hook_binding() {
         .bind_lockdown_turn(&fixture.session_id, &fixture.run_id, "fake", worker_policy)
         .expect("publish authoritative keyless binding");
     assert!(bound.is_auto_hermetic());
-    wait_for_hook_outbox_drain(&fixture.store).await;
+    wait_for_hook_outbox_drain(&fixture.store, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT).await;
     assert!(!marker.exists());
     assert!(fixture.events().await.iter().any(|event| {
         matches!(
@@ -2421,20 +2501,23 @@ async fn live_drain_cycle_acknowledges_handled_rows_in_one_batch() {
         )];
         fixture.hub.append(&mut batch).await.expect("commit fact");
     }
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while marker_lines(&marker) < 3 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        while !fixture
-            .store
-            .pending_hook_dispatches(16)
-            .await
-            .expect("pending")
-            .is_empty()
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        exec_hook_observation_timeout(Duration::from_millis(1_000), 3),
+        async {
+            while marker_lines(&marker) < 3 {
+                tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
+            }
+            while !fixture
+                .store
+                .pending_hook_dispatches(16)
+                .await
+                .expect("pending")
+                .is_empty()
+            {
+                tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
+            }
+        },
+    )
     .await
     .expect("live drain acknowledges every handled row");
     assert_eq!(marker_lines(&marker), 3, "each committed fact fired once");
@@ -2531,11 +2614,14 @@ async fn committed_fact_survives_crash_before_publish_and_fires_on_recovery() {
         .await
         .expect("recovery engine");
     hub.install_hooks(service).expect("reinstall");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !marker.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        exec_hook_observation_timeout(Duration::from_millis(1_000), 1),
+        async {
+            while !marker.exists() {
+                tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
+            }
+        },
+    )
     .await
     .expect("recovered hook marker");
     engine.shutdown().await;
@@ -2660,19 +2746,22 @@ async fn recovery_replays_exactly_the_unacknowledged_rows() {
         .await
         .expect("recovery engine");
     hub.install_hooks(service).expect("reinstall");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while marker_lines(&marker) < 2 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        while !store
-            .pending_hook_dispatches(16)
-            .await
-            .expect("pending")
-            .is_empty()
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        exec_hook_observation_timeout(Duration::from_millis(1_000), 2),
+        async {
+            while marker_lines(&marker) < 2 {
+                tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
+            }
+            while !store
+                .pending_hook_dispatches(16)
+                .await
+                .expect("pending")
+                .is_empty()
+            {
+                tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
+            }
+        },
+    )
     .await
     .expect("recovery drains the two unacknowledged rows");
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2786,11 +2875,14 @@ async fn run_scoped_hook_trust_is_reduced_before_recovery_dispatch() {
         .await
         .expect("engine");
     hub.install_hooks(service).expect("install");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !marker.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        exec_hook_observation_timeout(Duration::from_millis(1_000), 1),
+        async {
+            while !marker.exists() {
+                tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
+            }
+        },
+    )
     .await
     .expect("run trust recovery marker");
     engine.shutdown().await;
@@ -2823,7 +2915,7 @@ async fn digest_change_revokes_trust_before_fire() {
         EventPayload::RunState(RunState::Thinking),
     )];
     fixture.hub.append(&mut event).await.expect("commit fact");
-    let events = wait_for(&fixture, |events| {
+    let events = wait_for_with_timeout(&fixture, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT, |events| {
         events.iter().any(|event| {
             matches!(
                 HookEventPayload::from_payload_value(event.payload.clone()),
@@ -3091,15 +3183,19 @@ async fn exec_output_is_bounded_and_overflow_is_in_cas() {
         EventPayload::RunState(RunState::Thinking),
     )];
     fixture.hub.append(&mut event).await.expect("commit fact");
-    let events = wait_for_with_timeout(&fixture, BOUNDED_OUTPUT_OBSERVATION_TIMEOUT, |events| {
-        events.iter().any(|event| {
-            matches!(
-                HookEventPayload::from_payload_value(event.payload.clone()),
-                Ok(HookEventPayload::HookFired(ref fired))
-                    if fired.observed_seq == event.seq.saturating_sub(1)
-            )
-        })
-    })
+    let events = wait_for_with_timeout(
+        &fixture,
+        exec_hook_observation_timeout(Duration::from_millis(BOUNDED_OUTPUT_TIMEOUT_MS), 1),
+        |events| {
+            events.iter().any(|event| {
+                matches!(
+                    HookEventPayload::from_payload_value(event.payload.clone()),
+                    Ok(HookEventPayload::HookFired(ref fired))
+                        if fired.observed_seq == event.seq.saturating_sub(1)
+                )
+            })
+        },
+    )
     .await;
     let fired = events
         .iter()
@@ -3158,21 +3254,25 @@ async fn subscribe_restart_backoff_is_exponential_and_bounded() {
         EventPayload::RunState(RunState::Thinking),
     )];
     fixture.hub.append(&mut event).await.expect("commit fact");
-    let events = wait_for(&fixture, |events| {
-        events
-            .iter()
-            .filter_map(|event| {
-                let HookEventPayload::HookSubscription(subscription) =
-                    HookEventPayload::from_payload_value(event.payload.clone()).ok()?
-                else {
-                    return None;
-                };
-                (subscription.state == HookSubscriptionState::RestartScheduled)
-                    .then_some(subscription)
-            })
-            .count()
-            >= 2
-    })
+    let events = wait_for_with_timeout(
+        &fixture,
+        subscriber_start_observation_timeout(2, super::SUBSCRIBE_BACKOFF_MIN),
+        |events| {
+            events
+                .iter()
+                .filter_map(|event| {
+                    let HookEventPayload::HookSubscription(subscription) =
+                        HookEventPayload::from_payload_value(event.payload.clone()).ok()?
+                    else {
+                        return None;
+                    };
+                    (subscription.state == HookSubscriptionState::RestartScheduled)
+                        .then_some(subscription)
+                })
+                .count()
+                >= 2
+        },
+    )
     .await;
     let schedules = events
         .iter()
@@ -3227,11 +3327,14 @@ async fn subscribe_revoke_kills_the_entire_process_group() {
         EventPayload::RunState(RunState::Thinking),
     )];
     fixture.hub.append(&mut event).await.expect("commit fact");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !ready.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        subscriber_start_observation_timeout(if cfg!(windows) { 2 } else { 1 }, Duration::ZERO),
+        async {
+            while !ready.exists() {
+                tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
+            }
+        },
+    )
     .await
     .expect("subscriber readiness");
     let digest = fixture
@@ -3280,11 +3383,14 @@ async fn run_scoped_trust_authorizes_subscribe_only_for_that_run() {
         ),
     ];
     fixture.hub.append(&mut started).await.expect("start run");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !ready.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        subscriber_start_observation_timeout(if cfg!(windows) { 2 } else { 1 }, Duration::ZERO),
+        async {
+            while !ready.exists() {
+                tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
+            }
+        },
+    )
     .await
     .expect("run subscriber readiness");
     let mut done = [raw_event(
@@ -3532,11 +3638,18 @@ async fn successful_server_fire_count(fixture: &EngineFixture) -> usize {
         .count()
 }
 
-// Outer TEST observation budget only. The fixture exchange timeout above and
-// the product-owned idle timeout remain independently bounded; full-suite
-// scheduling and SQLite/process I/O may legitimately delay observation.
-const SERVER_MODE_OBSERVATION_TIMEOUT: Duration =
-    Duration::from_secs(if cfg!(windows) { 30 } else { 15 });
+// Outer TEST observation budget only: dispatch/spawn allowance + the fixture's
+// JSONL exchange wall + the product one-second child reap + the first 200ms
+// crash backoff + one poll. That is 5s + 2s + 1s + 200ms + 10ms = 8.210s on
+// Unix and 30s + 10s + 1s + 200ms + 10ms = 41.210s on Windows. Product
+// exchange, idle, reap, and backoff bounds remain unchanged.
+fn server_mode_observation_timeout() -> Duration {
+    HOOK_DISPATCH_AND_PROCESS_SPAWN_ALLOWANCE
+        + Duration::from_millis(if cfg!(windows) { 10_000 } else { 2_000 })
+        + super::HOOK_CHILD_REAP_TIMEOUT
+        + super::SUBSCRIBE_BACKOFF_MIN
+        + HOOK_OBSERVATION_POLL_INTERVAL
+}
 
 fn server_test_state(fixture: &EngineFixture) -> Arc<super::hooks_server::ServerTestState> {
     fixture
@@ -3548,7 +3661,7 @@ fn server_test_state(fixture: &EngineFixture) -> Arc<super::hooks_server::Server
 }
 
 async fn wait_for_server_fires(fixture: &EngineFixture, expected: usize) {
-    wait_for_with_timeout(fixture, SERVER_MODE_OBSERVATION_TIMEOUT, |events| {
+    wait_for_with_timeout(fixture, server_mode_observation_timeout(), |events| {
         events
             .iter()
             .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
@@ -3561,11 +3674,11 @@ async fn wait_for_server_fires(fixture: &EngineFixture, expected: usize) {
 
 async fn wait_for_server_leader_exit(raw_pid: u32) {
     let pid = process_id(Some(raw_pid)).expect("valid server pid");
-    tokio::time::timeout(SERVER_MODE_OBSERVATION_TIMEOUT, async {
+    tokio::time::timeout(server_mode_observation_timeout(), async {
         loop {
             match process_leader_exited(pid) {
                 Ok(true) => break,
-                Ok(false) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Ok(false) => tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await,
                 // Tokio may reap between observations. Not-found everywhere,
                 // and ECHILD on Unix, both establish the required premise.
                 Err(error) if process_observation_means_exited(&error) => break,
@@ -3589,9 +3702,9 @@ fn process_observation_means_exited(error: &std::io::Error) -> bool {
 }
 
 async fn wait_for_server_stopped(state: &super::hooks_server::ServerTestState) {
-    tokio::time::timeout(SERVER_MODE_OBSERVATION_TIMEOUT, async {
+    tokio::time::timeout(server_mode_observation_timeout(), async {
         while state.is_running() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
         }
     })
     .await
@@ -3629,7 +3742,7 @@ async fn fire_fresh_events_until_spawn_count(
     expected: usize,
 ) {
     let successful_target = successful_server_fire_count(fixture).await + 1;
-    let observed = tokio::time::timeout(SERVER_MODE_OBSERVATION_TIMEOUT, async {
+    let observed = tokio::time::timeout(server_mode_observation_timeout(), async {
         loop {
             let spawns = spawn_count(spawn_log);
             assert!(
@@ -3646,7 +3759,7 @@ async fn fire_fresh_events_until_spawn_count(
             fire_user_message(fixture, *next_index).await;
             *next_index += 1;
             while fired_count(fixture).await == fires_before {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
             }
         }
     })
@@ -3673,7 +3786,7 @@ async fn fire_one_event_and_expect_spawn_count(
     let fires_before = fired_count(fixture).await;
     let successful_before = successful_server_fire_count(fixture).await;
     fire_user_message(fixture, index).await;
-    let observed = tokio::time::timeout(SERVER_MODE_OBSERVATION_TIMEOUT, async {
+    let observed = tokio::time::timeout(server_mode_observation_timeout(), async {
         loop {
             let spawns = spawn_count(spawn_log);
             assert!(
@@ -3686,7 +3799,7 @@ async fn fire_one_event_and_expect_spawn_count(
             {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(HOOK_OBSERVATION_POLL_INTERVAL).await;
         }
     })
     .await;
@@ -3721,16 +3834,19 @@ async fn server_mode_spawns_once_serializes_and_dies_on_drain() {
         state.is_running(),
         "the resident server is live before drain"
     );
-    // Deterministically model a child stuck below the OS wait seam. Removing
-    // the product reap deadline makes this existing drain pin hit its outer
-    // observation deadline.
+    // Deterministically model a child stuck below the OS wait seam. The outer
+    // test bound is the product's one-second reap plus two seconds of actor
+    // scheduling; removing the product bound still hits this observation.
     state.wedge_reap();
     fixture.service.inner.shutdown.send_replace(true);
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while state.is_running() {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        super::HOOK_CHILD_REAP_TIMEOUT + Duration::from_secs(2),
+        async {
+            while state.is_running() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("hook server actor is bounded when child reap never resolves");
     assert!(
