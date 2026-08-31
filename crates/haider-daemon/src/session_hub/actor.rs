@@ -1420,6 +1420,11 @@ pub(super) async fn run_session_actor(
                         through_seq: head,
                     });
                     if !matches!(menu.kind, MenuKind::GraphHumanConfirm { .. })
+                        // A delegated menu is durable in the parent so its
+                        // user can answer it, but the answer belongs to the
+                        // child's parked harness. The delegation collector
+                        // replays this parent decision into that harness.
+                        && !matches!(&menu.scope, MenuScope::Subagent { .. })
                         && let Some(harness) =
                             worker.as_ref().and_then(|worker| worker.harness.as_ref())
                         && let Err(error) =

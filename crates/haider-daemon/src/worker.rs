@@ -1530,8 +1530,11 @@ pub struct WorkerToolContext {
     pub metadata: SessionMetadataV1,
     pub store: HubStoreHandle,
     pub run_id: RunId,
-    /// Absolute run deadline. Remote command timeouts are capped to this
-    /// budget so an SSH channel cannot outlive its owning run.
+    /// Absolute run deadline, derived once from the accepted parent run and
+    /// retained across autonomous workflow hops and recovery. Delegation and
+    /// remote-command waits only consume its remaining wall time; this clock
+    /// is independent of the actor's logical provider-request counter, so a
+    /// delegated wait is never counted as a provider request.
     pub run_deadline: Option<tokio::time::Instant>,
     pub branch_id: Option<BranchId>,
     pub device_id: DeviceId,
@@ -16301,7 +16304,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
         ticket: &DeferredTicket,
         cancel: &CancelToken,
     ) -> Result<DeferredToolResult, HaiderError> {
-        self.delegation.collect(ticket, cancel).await
+        self.delegation
+            .collect(ticket, cancel, self.run_deadline)
+            .await
     }
 
     async fn acknowledge_deferred(&self, ticket: &DeferredTicket) -> Result<(), HaiderError> {
@@ -16319,7 +16324,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
             .cloned()
             .collect::<Vec<_>>();
         for ticket in tickets {
-            self.delegation.cancel_ticket(&ticket).await?;
+            self.delegation
+                .cancel_ticket(&ticket, self.run_deadline)
+                .await?;
         }
         Ok(())
     }

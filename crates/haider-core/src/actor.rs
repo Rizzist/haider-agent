@@ -7443,6 +7443,13 @@ impl HarnessActor {
                 if let Some(result) = wake {
                     break match result {
                         Ok(completion) => completion,
+                        // Delegation owns a typed, run-deadline-derived wait
+                        // bound. Do not turn that terminal condition into an
+                        // ordinary red tool result and issue another provider
+                        // request; preserve it as RunFailed + Errored.
+                        Err(error) if delegated_child_wait_timed_out(&error) => {
+                            return Err(DriveError::Store(error));
+                        }
                         Err(error) => DeferredToolResult {
                             report: ChildReport {
                                 agent: pending.ticket.manifest.agent.clone(),
@@ -9328,6 +9335,16 @@ fn submit_busy_error(capacity: usize) -> HaiderError {
         "deferred_command_capacity": capacity,
     }));
     error
+}
+
+fn delegated_child_wait_timed_out(error: &HaiderError) -> bool {
+    error.code == ErrorCode::ProviderTimeout
+        && error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("delegated_child_wait_timeout")
 }
 
 fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {

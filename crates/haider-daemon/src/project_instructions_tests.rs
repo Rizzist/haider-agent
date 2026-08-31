@@ -1034,7 +1034,8 @@ async fn recovery_rereads_and_journals_a_fresh_same_run_fact_on_digest_change() 
         | RecoveredWork::Checkpoint(_)
         | RecoveredWork::PartialStream(_)
         | RecoveredWork::ChildWait(_)
-        | RecoveredWork::WorkflowContinuation(_) => {
+        | RecoveredWork::WorkflowContinuation(_)
+        | RecoveredWork::DelegationMirror(_) => {
             panic!("expected queued recovery")
         }
     };

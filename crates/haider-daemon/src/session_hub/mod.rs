@@ -137,7 +137,7 @@ use haider_protocol::ids::{
     BranchId, CredentialAlias, DeviceId, EventId, GraphId, ItemId, MenuId, RunId, SessionId,
 };
 use haider_protocol::menu::{
-    AnswerVia, EffectRecoveryAction, Menu, MenuAnswer as DurableMenuAnswer, MenuKind,
+    AnswerVia, EffectRecoveryAction, Menu, MenuAnswer as DurableMenuAnswer, MenuKind, MenuScope,
     effect_recovery_menu,
 };
 use haider_protocol::state::RunState;
@@ -3857,6 +3857,49 @@ impl SessionHub {
         {
             TurnCancelOutcome::Committed { cancelled, .. }
             | TurnCancelOutcome::IdempotentReplay { cancelled } => Ok(cancelled),
+        }
+    }
+
+    /// Enqueue a persist-before-wake cancellation without waiting for its
+    /// receipt. Delegation uses this only after the run's absolute wait budget
+    /// is already exhausted: the pending mirror fact is durable first, this
+    /// nonblocking wake prevents a live orphan, and startup recovery remains
+    /// the repair owner if the daemon dies before the actor consumes it.
+    pub(crate) fn try_cancel_internal_turn(
+        &self,
+        command: TurnCancelCommand,
+    ) -> Result<(), HaiderError> {
+        let actor = self
+            .existing_actor(&command.session_id)
+            .map_err(hub_error_as_store)?
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::RunNotActive,
+                    "live child session has no actor for cancellation wake",
+                    false,
+                )
+            })?;
+        let (completed, _response) = oneshot::channel();
+        match actor
+            .commands
+            .try_send(ActorCommand::CancelTurn { command, completed })
+        {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(command)) => {
+                // The parent may not wait beyond its exhausted deadline. Keep
+                // an in-process owner for the already-durable cancellation
+                // wake; a concurrent daemon crash is repaired from the
+                // journaled mirror-pending fact at startup.
+                tokio::spawn(async move {
+                    if actor.commands.send(command).await.is_err() {
+                        tracing::warn!(
+                            "child session actor closed before queued cancellation wake"
+                        );
+                    }
+                });
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(hub_closed_store_error()),
         }
     }
 

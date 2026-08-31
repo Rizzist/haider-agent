@@ -1082,7 +1082,8 @@ async fn recovery_dual_reads_historical_and_canonical_permission_states() {
             | RecoveredWork::Retry(_)
             | RecoveredWork::PartialStream(_)
             | RecoveredWork::ChildWait(_)
-            | RecoveredWork::WorkflowContinuation(_) => None,
+            | RecoveredWork::WorkflowContinuation(_)
+            | RecoveredWork::DelegationMirror(_) => None,
         })
         .collect::<Vec<_>>();
     recovered_menus.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));

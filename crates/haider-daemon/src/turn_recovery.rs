@@ -34,6 +34,8 @@
 //! writer besides effect reconciliation), and current-generation runs (live
 //! workers own those; the generation fence skips them).
 
+use crate::delegation::{DelegationMirrorHandoff, DelegationMirrorHandoffPhase};
+
 use haider_core::{
     AcceptedRunRetry, AcceptedTurn, ChildWaitCheckpoint, DeferredTicket, DeferredToolCheckpoint,
     PartialStreamCheckpoint, RequestInputCheckpoint, SessionProjectionCheckpoint,
@@ -82,7 +84,11 @@ pub(crate) const STARTUP_HYDRATION_PAYLOAD_KINDS: &[&str] = &[
 const CHECKPOINT_PROJECTION: &str = "startup_turn_recovery";
 const CHECKPOINT_TIMELINE: &str = "session";
 const CHECKPOINT_SHAPE_VERSION: u32 = 1;
-const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v3";
+// v4 is the first composite reducer: v3 could checkpoint workflow deferrals
+// after skipping delegation handoffs, while v2 could checkpoint delegation
+// handoffs after skipping workflow request coordinates. Rejecting both older
+// cursors forces one full pass before the joined shape is trusted.
+const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v4";
 
 pub(crate) enum RecoveredWork {
     Queued(AcceptedTurn),
@@ -91,12 +97,18 @@ pub(crate) enum RecoveredWork {
     PartialStream(Box<RecoveredPartialStream>),
     ChildWait(Box<RecoveredChildWait>),
     WorkflowContinuation(Box<RecoveredWorkflowContinuation>),
+    DelegationMirror(Box<RecoveredDelegationMirror>),
 }
 
 pub(crate) struct RecoveredWorkflowContinuation {
     pub(crate) accepted: AcceptedTurn,
     pub(crate) provider_requests_consumed: usize,
     pub(crate) provider_request_ordinal: u64,
+}
+
+pub(crate) struct RecoveredDelegationMirror {
+    pub(crate) record: haider_core::DelegationRecord,
+    pub(crate) handoff: DelegationMirrorHandoff,
 }
 
 pub(crate) struct RecoveredPartialStream {
@@ -141,6 +153,8 @@ struct RunReduction {
     workflow_deferral: Option<(GraphFinalizationDeferred, u64)>,
     #[serde(default)]
     latest_provider_request_attempt: Option<(u64, u64)>,
+    #[serde(default)]
+    delegation_mirror_handoffs: HashMap<String, DelegationMirrorHandoff>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -295,6 +309,7 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
             visitor.visit_page(&session_id, &page.envelopes).await?;
             reductions.retain(|_, reduction| {
                 reduction.branch_mismatch
+                    || !reduction.delegation_mirror_handoffs.is_empty()
                     || !reduction
                         .state
                         .as_ref()
@@ -337,7 +352,76 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
             let Some((state, _)) = reduction.state.clone() else {
                 continue;
             };
-            if state.is_terminal() || reduction.state_generation == store.worker_generation() {
+            // Composite recovery invariant (wfcont + deleg), in this order:
+            // 1. validate and enqueue every durable cancellation-mirror
+            //    obligation, including obligations on terminal/current runs;
+            // 2. terminalize a stale nonterminal child with a pending mirror
+            //    as Cancelled and stop considering that run;
+            // 3. only with no mirror may workflow continuation restore its
+            //    logical request count and physical attempt ordinal, followed
+            //    by checkpoint/child-wait/generic recovery.
+            // Cancellation ownership must dominate resumable provider work or
+            // a crash can resurrect a delegated workflow after its parent has
+            // durably requested cancellation.
+            let mut mirror_handoffs = reduction
+                .delegation_mirror_handoffs
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            mirror_handoffs.sort_by(|left, right| left.handoff_id.cmp(&right.handoff_id));
+            for handoff in &mirror_handoffs {
+                if handoff.child_session_id != session_id || handoff.child_run_id != run_id {
+                    return Err(HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!(
+                            "delegation mirror handoff {} crosses child run coordinates",
+                            handoff.handoff_id
+                        ),
+                        false,
+                    ));
+                }
+                let record = store
+                    .delegation(handoff.agent.clone())
+                    .await?
+                    .ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!(
+                                "delegation mirror handoff {} has no durable delegation",
+                                handoff.handoff_id
+                            ),
+                            false,
+                        )
+                    })?;
+                recovered.push(RecoveredWork::DelegationMirror(Box::new(
+                    RecoveredDelegationMirror {
+                        record,
+                        handoff: handoff.clone(),
+                    },
+                )));
+            }
+            if state.is_terminal() {
+                continue;
+            }
+            if reduction.state_generation == store.worker_generation() {
+                continue;
+            }
+            if !mirror_handoffs.is_empty() {
+                // The pending child-journal fact precedes the live cancellation
+                // wake. A daemon crash in that window therefore recovers as a
+                // cancellation, never as generic interruption; the queued
+                // mirror remains until its completion fact is journaled.
+                terminalize_interrupted(
+                    store,
+                    device_id,
+                    &session_id,
+                    &run_id,
+                    reduction.branch_id.clone(),
+                    reduction,
+                    true,
+                )
+                .await?;
+                touched = true;
                 continue;
             }
             // Acceptance now requires typed metadata, but legacy/CLI journals
@@ -616,13 +700,7 @@ async fn pending_workflow_continuation(
     state: &RunState,
     reduction: &RunReduction,
 ) -> Result<Option<RecoveredWorkflowContinuation>, HaiderError> {
-    if *state != RunState::Streaming
-        || !reduction.headless_configured
-        || reduction.budget_exhausted.is_some()
-        || !reduction.open_items.is_empty()
-        || !reduction.incomplete_items.is_empty()
-        || reduction.menu.is_some()
-    {
+    if !workflow_continuation_shape_is_eligible(state, reduction) {
         return Ok(None);
     }
     let Some((deferred, deferred_seq)) = reduction.workflow_deferral.as_ref() else {
@@ -680,6 +758,19 @@ async fn pending_workflow_continuation(
             .latest_provider_request_attempt
             .map_or(0, |(_, ordinal)| ordinal),
     }))
+}
+
+fn workflow_continuation_shape_is_eligible(state: &RunState, reduction: &RunReduction) -> bool {
+    *state == RunState::Streaming
+        && reduction.headless_configured
+        && reduction.budget_exhausted.is_none()
+        && reduction.open_items.is_empty()
+        && reduction.incomplete_items.is_empty()
+        && reduction.menu.is_none()
+        // Defense in depth for the recovery-order invariant: even if runnable
+        // classification is later rearranged, durable cancellation intent can
+        // never be projected as resumable provider work.
+        && reduction.delegation_mirror_handoffs.is_empty()
 }
 
 fn provider_request_precedes_deferral(
@@ -904,6 +995,22 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
         EventPayload::Item(ItemEvent::Completed { item_id, item }) => {
             if let Some(attempt) = CacheRequestAttemptV1::from_extension_item(&item) {
                 reduction.latest_provider_request_attempt = Some((envelope.seq, attempt.ordinal));
+            }
+            if let Some(handoff) = DelegationMirrorHandoff::from_item(&item) {
+                match handoff.phase {
+                    DelegationMirrorHandoffPhase::Pending => {
+                        reduction
+                            .delegation_mirror_handoffs
+                            .insert(handoff.handoff_id.clone(), handoff);
+                    }
+                    DelegationMirrorHandoffPhase::Completed => {
+                        reduction
+                            .delegation_mirror_handoffs
+                            .remove(&handoff.handoff_id);
+                    }
+                }
+                reduction.open_items.remove(&item_id);
+                return;
             }
             let item = match item {
                 TurnItem::IncompleteAgentMessage { text, .. } => {
@@ -1420,6 +1527,77 @@ fn recovery_envelopes(
 #[cfg(test)]
 #[path = "turn_recovery_streaming_checkpoint_tests.rs"]
 mod streaming_checkpoint_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod composite_recovery_tests {
+    use super::*;
+
+    /// CROSS-LANE MUTATION CHECK: remove the pending-mirror condition from
+    /// `workflow_continuation_shape_is_eligible`. The assertion flips true,
+    /// proving durable child cancellation owns recovery before wfcont can
+    /// restore logical-request and physical-attempt coordinates.
+    #[test]
+    fn pending_cancellation_handoff_suppresses_workflow_continuation_shape() {
+        let run_id = RunId::new("composite-recovery-run");
+        let mut reduction = RunReduction {
+            state: Some((RunState::Streaming, 12)),
+            state_generation: 4,
+            user_seq: Some(1),
+            headless_configured: true,
+            workflow_deferral: Some((
+                GraphFinalizationDeferred {
+                    graph_id: haider_protocol::ids::GraphId::new("composite-recovery-graph"),
+                    run_id: run_id.clone(),
+                    state_digest: "composite-state".into(),
+                    provider_requests_consumed: 3,
+                    unmet_nodes: vec![
+                        haider_protocol::graph::GraphNodeName::new("VERIFY").expect("valid node"),
+                    ],
+                },
+                11,
+            )),
+            latest_provider_request_attempt: Some((10, 7)),
+            ..RunReduction::default()
+        };
+        let handoff = DelegationMirrorHandoff {
+            handoff_id: "composite-handoff".into(),
+            agent: AgentId::new("composite-agent"),
+            child_session_id: SessionId::new("composite-child"),
+            child_run_id: run_id,
+            deadline_at_ms: 241_000,
+            cancel_cause: "parent".into(),
+            source: "composite-test".into(),
+            phase: DelegationMirrorHandoffPhase::Pending,
+        };
+        reduction
+            .delegation_mirror_handoffs
+            .insert(handoff.handoff_id.clone(), handoff.clone());
+
+        let encoded = rmp_serde::to_vec(&reduction).expect("encode composite checkpoint");
+        let recovered: RunReduction =
+            rmp_serde::from_slice(&encoded).expect("decode composite checkpoint");
+        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v4");
+        assert_eq!(
+            recovered
+                .workflow_deferral
+                .as_ref()
+                .map(|(deferred, _)| deferred.provider_requests_consumed),
+            Some(3)
+        );
+        assert_eq!(recovered.latest_provider_request_attempt, Some((10, 7)));
+        assert_eq!(
+            recovered
+                .delegation_mirror_handoffs
+                .get("composite-handoff"),
+            Some(&handoff)
+        );
+        assert!(!workflow_continuation_shape_is_eligible(
+            &RunState::Streaming,
+            &recovered
+        ));
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
