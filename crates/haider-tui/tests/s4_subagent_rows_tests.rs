@@ -546,6 +546,7 @@ fn chip_row_tokens_is_truth_ordered() {
         soft_threshold_tokens: None,
         estimated_turns_to_threshold: None,
         truth: ContextFootprintTruth::Exact,
+        accounting: None,
     };
     let item = footprint.extension_item().expect("extension item");
     let chip = model.chips.first_mut().expect("chip");

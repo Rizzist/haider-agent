@@ -54,7 +54,10 @@ use haider_protocol::cache::{
     CacheRequestAttemptV1, PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND, ProviderViewAttemptV1,
     ProviderViewBlobV1, ProviderViewLedgerV1,
 };
-use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
+use haider_protocol::context::{
+    ContextAccounting, ContextCompactionTier, ContextEconomy, ContextFootprint,
+    ContextFootprintTruth, ContextSavingsEvent,
+};
 use haider_protocol::credential::RotationEvent;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
@@ -171,6 +174,10 @@ mod actor_request_attempt_tests;
 #[path = "actor_tool_result_tests.rs"]
 mod actor_tool_result_tests;
 
+#[cfg(test)]
+#[path = "actor_context_economy_tests.rs"]
+mod actor_context_economy_tests;
+
 const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 32;
 
 /// Profile-scoped secret used only for diagnostic prefix fingerprints.
@@ -254,6 +261,17 @@ const MAX_PROVIDER_RETRY_AFTER_MS: u64 = 60_000;
 /// compaction must free. Below this bound, another compaction in the same turn
 /// is more likely to thrash than recover useful context capacity.
 pub const COMPACTION_MIN_FREED_PERCENT: u64 = 15;
+/// Fast-mode structural tier one. Starting above 50% avoids invalidating a
+/// still-useful provider cache for conversations that have ample headroom.
+pub const CONTEXT_STRUCTURAL_TIER_ONE_PERCENT: u64 = 60;
+/// Fast-mode structural tier two. Ten percentage points remain before the
+/// existing model-summary boundary, leaving the cheaper trim one full chance
+/// to recover headroom first.
+pub const CONTEXT_STRUCTURAL_TIER_TWO_PERCENT: u64 = 75;
+/// Existing provider-summary boundary retained for compatibility.
+pub const CONTEXT_SUMMARY_TIER_PERCENT: u64 = 85;
+pub const CONTEXT_STRUCTURAL_TIER_ONE_RETAINED_TOOL_PAIRS: usize = 24;
+pub const CONTEXT_STRUCTURAL_TIER_TWO_RETAINED_TOOL_PAIRS: usize = 12;
 
 /// Immutable identity and fencing parameters for one session actor.
 #[derive(Debug, Clone)]
@@ -284,6 +302,11 @@ pub struct HarnessConfig {
     /// Daemons set this when serving `context_compaction_v1`; standalone
     /// embeddings retain W7a hard-fit behavior unless they opt in.
     pub context_compaction_v1: bool,
+    /// Enables the two model-free whole-tool-pair tiers. Daemon sessions bind
+    /// this to durable fast mode; default mode remains summarize-only.
+    pub structural_context_trimming: bool,
+    /// Restart-stable estimated savings loaded from typed session metadata.
+    pub context_economy: ContextEconomy,
     /// Enables the post-compaction runaway guard and promotion path. This is
     /// independent from proactive compaction for additive feature rollout.
     pub compaction_guard_v1: bool,
@@ -449,6 +472,8 @@ impl HarnessConfig {
             reserved_output_tokens: 4096,
             cached_input_is_subset: true,
             context_compaction_v1: false,
+            structural_context_trimming: false,
+            context_economy: ContextEconomy::default(),
             compaction_guard_v1: false,
             system_prompt: None,
             volatile_user_tail: None,
@@ -1076,13 +1101,26 @@ pub fn retry_jittered_backoff_ms(run_id: &RunId, attempt: usize) -> u64 {
 
 /// Two-phase compaction port. `plan` is journaled before `compact` performs
 /// private summarization and commits the final immutable overlay node.
+#[derive(Debug)]
+pub struct ContextCompactionRequest<'a> {
+    pub run_id: &'a RunId,
+    pub intent: &'a CompactionIntent,
+    pub covered_messages: Vec<Message>,
+    pub retained_messages: Vec<Message>,
+    pub attachments: Vec<haider_provider::ResolvedAttachment>,
+    pub latest_compaction_summary_end: Option<usize>,
+    pub economy_before: &'a ContextEconomy,
+}
+
 #[async_trait]
 pub trait ContextCompactor: Send + Sync + std::fmt::Debug {
     async fn plan(
         &self,
         run_id: &RunId,
         resume_cause: CompactionResume,
-    ) -> Result<CompactionIntent, HaiderError>;
+        messages: &[Message],
+        current_turn_start: usize,
+    ) -> Result<PlannedContextCompaction, HaiderError>;
 
     /// `attachments` (round 5): the replay's resolved attachments — the
     /// SAME resolution the live lane applied, so an image-bearing history
@@ -1093,12 +1131,21 @@ pub trait ContextCompactor: Send + Sync + std::fmt::Debug {
     /// not a value frozen at construction.
     async fn compact(
         &self,
-        run_id: &RunId,
-        intent: &CompactionIntent,
-        covered_messages: Vec<Message>,
-        attachments: Vec<haider_provider::ResolvedAttachment>,
-        latest_compaction_summary_end: Option<usize>,
-    ) -> Result<Message, HaiderError>;
+        request: ContextCompactionRequest<'_>,
+    ) -> Result<ContextCompactionOutcome, HaiderError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedContextCompaction {
+    pub intent: CompactionIntent,
+    /// Exclusive provider-message boundary replaced by the summary.
+    pub covered_message_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextCompactionOutcome {
+    pub summary: Message,
+    pub economy: ContextEconomy,
 }
 
 #[async_trait]
@@ -2613,15 +2660,6 @@ impl HarnessActor {
                 }
             };
             if request_projection_compacted {
-                // Compaction replaces the covered prefix with exactly one
-                // immutable summary message; the current-turn suffix stays
-                // verbatim after it.
-                Self::reset_cache_boundaries_after_compaction(
-                    &messages,
-                    &mut stable_history_end,
-                    &mut current_turn_start,
-                    &mut latest_compaction_summary_end,
-                );
                 cache_rewarm_pending = Some(CacheRewarmReasonV1::PlannedCompaction);
             }
             if provider_attempt == 0 {
@@ -5148,14 +5186,16 @@ impl HarnessActor {
     }
 
     fn reset_cache_boundaries_after_compaction(
-        messages: &[Message],
+        covered_message_count: usize,
         stable_history_end: &mut usize,
         current_turn_start: &mut usize,
         latest_compaction_summary_end: &mut Option<usize>,
     ) {
-        let summary_end = usize::from(!messages.is_empty());
-        *stable_history_end = summary_end;
-        *current_turn_start = summary_end;
+        let summary_end = 1_usize;
+        *stable_history_end =
+            summary_end.saturating_add(stable_history_end.saturating_sub(covered_message_count));
+        *current_turn_start =
+            summary_end.saturating_add(current_turn_start.saturating_sub(covered_message_count));
         *latest_compaction_summary_end = Some(summary_end);
     }
 
@@ -5171,15 +5211,16 @@ impl HarnessActor {
         if *forced_compaction_used {
             return Err(repeated_context_overflow_after_compaction());
         }
-        self.perform_context_compaction(
-            run_id,
-            messages,
-            *current_turn_start,
-            *latest_compaction_summary_end,
-        )
-        .await?;
+        let covered_message_count = self
+            .perform_context_compaction(
+                run_id,
+                messages,
+                *current_turn_start,
+                *latest_compaction_summary_end,
+            )
+            .await?;
         Self::reset_cache_boundaries_after_compaction(
-            messages,
+            covered_message_count,
             stable_history_end,
             current_turn_start,
             latest_compaction_summary_end,
@@ -5194,7 +5235,7 @@ impl HarnessActor {
         messages: &mut Vec<Message>,
         current_turn_start: usize,
         latest_compaction_summary_end: Option<usize>,
-    ) -> Result<(), DriveError> {
+    ) -> Result<usize, DriveError> {
         if current_turn_start == 0 || current_turn_start > messages.len() {
             return Err(DriveError::Provider(ProviderError::new(
                 ProviderErrorKind::ContextExceeded,
@@ -5207,10 +5248,24 @@ impl HarnessActor {
                 "provider context overflow requires a configured context compactor",
             ))
         })?;
-        let intent = compactor
-            .plan(run_id, CompactionResume::AutoMidTurn)
+        let planned = compactor
+            .plan(
+                run_id,
+                CompactionResume::AutoMidTurn,
+                messages,
+                current_turn_start,
+            )
             .await
             .map_err(DriveError::Store)?;
+        if planned.covered_message_count == 0 || planned.covered_message_count > current_turn_start
+        {
+            return Err(DriveError::Store(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "context compactor returned an invalid clean message boundary",
+                false,
+            )));
+        }
+        let intent = planned.intent;
         self.commit_ui_extension_marker(
             run_id,
             COMPACTION_INTENT_EXTENSION_KIND,
@@ -5228,7 +5283,7 @@ impl HarnessActor {
             .await
             .map_err(DriveError::Store)?;
 
-        let suffix = messages.split_off(current_turn_start);
+        let suffix = messages.split_off(planned.covered_message_count);
         let mut covered = std::mem::take(messages);
         // Round 5: resolve tool-result images exactly as the live lane does
         // — the compactor's replay must be the bytes the provider actually
@@ -5237,17 +5292,20 @@ impl HarnessActor {
             .resolve_tool_result_images(&mut covered)
             .await
             .map_err(DriveError::Store)?;
-        let summary = compactor
-            .compact(
+        let compacted = compactor
+            .compact(ContextCompactionRequest {
                 run_id,
-                &intent,
-                covered,
+                intent: &intent,
+                covered_messages: covered,
+                retained_messages: suffix.clone(),
                 attachments,
                 latest_compaction_summary_end,
-            )
+                economy_before: &self.config.context_economy,
+            })
             .await
             .map_err(DriveError::Store)?;
-        messages.push(summary);
+        self.config.context_economy = compacted.economy;
+        messages.push(compacted.summary);
         messages.extend(suffix);
         // The daemon committed a new compaction node behind this actor's
         // cached parent. Reload before the next current-run node is appended
@@ -5257,7 +5315,7 @@ impl HarnessActor {
         // The compactor atomically commits its final overlay/item together
         // with this resumed state; mirror that durable fact into the watch.
         self.state.send_replace(Some(RunState::Thinking));
-        Ok(())
+        Ok(planned.covered_message_count)
     }
 
     /// Publishes request occupancy and enforces the daemon-pinned soft/hard
@@ -5283,8 +5341,77 @@ impl HarnessActor {
         // still consumes real provider input capacity. Measure a request-only
         // projection so the hard-fit policy remains honest without allowing
         // the tail into compaction or journal history.
-        let before =
+        let mut before =
             estimated_request_shaped_context_footprint(&self.config, messages, volatile_user_tail);
+        if self.config.context_compaction_v1
+            && self.config.structural_context_trimming
+            && let Some(window) = self.config.context_window
+        {
+            let tier_two = context_tier_threshold_tokens(
+                window,
+                self.config.reserved_output_tokens,
+                CONTEXT_STRUCTURAL_TIER_TWO_PERCENT,
+            );
+            let tier_one = context_tier_threshold_tokens(
+                window,
+                self.config.reserved_output_tokens,
+                CONTEXT_STRUCTURAL_TIER_ONE_PERCENT,
+            );
+            let structural_tier =
+                if tier_two.is_some_and(|threshold| before.used_tokens >= threshold) {
+                    Some((
+                        ContextCompactionTier::StructuralTrim12,
+                        CONTEXT_STRUCTURAL_TIER_TWO_RETAINED_TOOL_PAIRS,
+                    ))
+                } else if tier_one.is_some_and(|threshold| before.used_tokens >= threshold) {
+                    Some((
+                        ContextCompactionTier::StructuralTrim24,
+                        CONTEXT_STRUCTURAL_TIER_ONE_RETAINED_TOOL_PAIRS,
+                    ))
+                } else {
+                    None
+                };
+            if let Some((tier, retained_pairs)) = structural_tier {
+                let estimated_tokens_before = before.used_tokens;
+                let trimmed = trim_stale_tool_pairs(messages, *current_turn_start, retained_pairs);
+                if trimmed.removed_pairs > 0 {
+                    *current_turn_start = current_turn_start
+                        .saturating_sub(trimmed.removed_messages_before_protected_start);
+                    *stable_history_end = stable_history_end
+                        .saturating_sub(trimmed.removed_messages_before_protected_start);
+                    *latest_compaction_summary_end =
+                        latest_compaction_summary_end.map(|boundary| {
+                            boundary.saturating_sub(
+                                trimmed
+                                    .removed_messages_before_protected_start
+                                    .min(boundary),
+                            )
+                        });
+                    let after_trim = estimated_request_shaped_context_footprint(
+                        &self.config,
+                        messages,
+                        volatile_user_tail,
+                    );
+                    self.commit_pending_thinking(run_id, thinking_pending)
+                        .await
+                        .map_err(DriveError::Store)?;
+                    self.commit_context_savings(
+                        run_id,
+                        tier,
+                        estimated_tokens_before,
+                        after_trim.used_tokens,
+                        trimmed.removed_tool_call_ids,
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                    before = estimated_request_shaped_context_footprint(
+                        &self.config,
+                        messages,
+                        volatile_user_tail,
+                    );
+                }
+            }
+        }
         if self.config.context_compaction_v1 {
             self.commit_pending_thinking(run_id, thinking_pending)
                 .await
@@ -5335,13 +5462,20 @@ impl HarnessActor {
         self.commit_pending_thinking(run_id, thinking_pending)
             .await
             .map_err(DriveError::Store)?;
-        self.perform_context_compaction(
-            run_id,
-            messages,
-            *current_turn_start,
-            *latest_compaction_summary_end,
-        )
-        .await?;
+        let covered_message_count = self
+            .perform_context_compaction(
+                run_id,
+                messages,
+                *current_turn_start,
+                *latest_compaction_summary_end,
+            )
+            .await?;
+        Self::reset_cache_boundaries_after_compaction(
+            covered_message_count,
+            stable_history_end,
+            current_turn_start,
+            latest_compaction_summary_end,
+        );
         let after = estimated_context_footprint(&self.config, messages);
         if self.config.context_compaction_v1 {
             self.commit_context_footprint(run_id, &after)
@@ -8102,6 +8236,42 @@ impl HarnessActor {
         self.commit_ui_extension_marker(run_id, &kind, data).await
     }
 
+    async fn commit_context_savings(
+        &mut self,
+        run_id: &RunId,
+        tier: ContextCompactionTier,
+        estimated_tokens_before: u64,
+        estimated_tokens_after: u64,
+        removed_tool_call_ids: Vec<String>,
+    ) -> Result<ContextSavingsEvent, HaiderError> {
+        let (economy, event) = self.config.context_economy.record_with_removed_tool_calls(
+            tier,
+            estimated_tokens_before,
+            estimated_tokens_after,
+            removed_tool_call_ids,
+        );
+        let item = event.extension_item().map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("context savings could not serialize: {error}"),
+                false,
+            )
+        })?;
+        let TurnItem::Extension { kind, data } = item else {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "context savings did not use the extension carrier",
+                false,
+            ));
+        };
+        self.commit_ui_extension_marker(run_id, &kind, data).await?;
+        self.config.context_economy = economy;
+        self.store
+            .persist_context_economy(&self.config.session_id, &self.config.context_economy)
+            .await?;
+        Ok(event)
+    }
+
     /// Commits the exact context measurement immediately before the usage fact
     /// in one append. Consumers observe the same envelope order, while a store
     /// failure exposes all three facts or none of them.
@@ -9802,10 +9972,214 @@ fn finalize_request_usage(
 /// threshold and must not recalculate it locally.
 #[must_use]
 pub fn context_soft_threshold_tokens(window: u64, reserved_output_tokens: u64) -> Option<u64> {
+    context_tier_threshold_tokens(window, reserved_output_tokens, CONTEXT_SUMMARY_TIER_PERCENT)
+}
+
+#[must_use]
+pub fn context_tier_threshold_tokens(
+    window: u64,
+    reserved_output_tokens: u64,
+    percent: u64,
+) -> Option<u64> {
     let hard_fit = window.checked_sub(reserved_output_tokens)?;
-    let eighty_five_percent =
-        u64::try_from(u128::from(window).saturating_mul(85) / 100).unwrap_or(u64::MAX);
-    Some(eighty_five_percent.min(hard_fit))
+    let percentage = u64::try_from(u128::from(window).saturating_mul(u128::from(percent)) / 100)
+        .unwrap_or(u64::MAX);
+    Some(percentage.min(hard_fit))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StructuralTrimOutcome {
+    removed_messages_before_protected_start: usize,
+    removed_pairs: usize,
+    removed_tool_call_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MessageBlockCoordinate {
+    message: usize,
+    block: usize,
+}
+
+/// Drops complete, unambiguous stale tool-call/result pairs while retaining
+/// every other block byte-for-byte. Current-turn pairs and image-bearing
+/// results are protected regardless of the requested pair count.
+fn trim_stale_tool_pairs(
+    messages: &mut Vec<Message>,
+    protected_start: usize,
+    retained_pairs: usize,
+) -> StructuralTrimOutcome {
+    let mut calls = HashMap::<&str, Vec<MessageBlockCoordinate>>::new();
+    let mut results = HashMap::<&str, Vec<(MessageBlockCoordinate, bool)>>::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        for (block_index, block) in message.blocks.iter().enumerate() {
+            match block {
+                Block::ToolCall { call_id, .. } => {
+                    calls
+                        .entry(call_id)
+                        .or_default()
+                        .push(MessageBlockCoordinate {
+                            message: message_index,
+                            block: block_index,
+                        })
+                }
+                Block::ToolResult {
+                    call_id, images, ..
+                } => results.entry(call_id).or_default().push((
+                    MessageBlockCoordinate {
+                        message: message_index,
+                        block: block_index,
+                    },
+                    !images.is_empty(),
+                )),
+                _ => {}
+            }
+        }
+    }
+    let mut pairs = calls
+        .into_iter()
+        .filter_map(|(call_id, call_positions)| {
+            let result_positions = results.get(call_id)?;
+            let ([call], [(result, has_images)]) =
+                (call_positions.as_slice(), result_positions.as_slice())
+            else {
+                return None;
+            };
+            (call.message < result.message).then_some((
+                call_id.to_owned(),
+                *call,
+                *result,
+                *has_images,
+            ))
+        })
+        .collect::<Vec<_>>();
+    pairs.sort_unstable_by_key(|(_, call, _, _)| (call.message, call.block));
+    let keep_from = pairs.len().saturating_sub(retained_pairs);
+    let mut remove = HashSet::<MessageBlockCoordinate>::new();
+    let mut removed_pairs = 0_usize;
+    let mut removed_tool_call_ids = Vec::new();
+    for (ordinal, (call_id, call, result, has_images)) in pairs.into_iter().enumerate() {
+        if ordinal >= keep_from
+            || has_images
+            || call.message >= protected_start
+            || result.message >= protected_start
+        {
+            continue;
+        }
+        remove.insert(call);
+        remove.insert(result);
+        removed_tool_call_ids.push(call_id);
+        removed_pairs = removed_pairs.saturating_add(1);
+    }
+    if remove.is_empty() {
+        return StructuralTrimOutcome {
+            removed_messages_before_protected_start: 0,
+            removed_pairs: 0,
+            removed_tool_call_ids: Vec::new(),
+        };
+    }
+
+    let mut removed_messages_before_protected_start = 0_usize;
+    let mut message_index = 0_usize;
+    messages.retain_mut(|message| {
+        let original_message_index = message_index;
+        message_index = message_index.saturating_add(1);
+        let mut block_index = 0_usize;
+        message.blocks.retain(|_| {
+            let coordinate = MessageBlockCoordinate {
+                message: original_message_index,
+                block: block_index,
+            };
+            block_index = block_index.saturating_add(1);
+            !remove.contains(&coordinate)
+        });
+        let retain = !message.blocks.is_empty();
+        if !retain && original_message_index < protected_start {
+            removed_messages_before_protected_start =
+                removed_messages_before_protected_start.saturating_add(1);
+        }
+        retain
+    });
+    removed_tool_call_ids.sort_unstable();
+    removed_tool_call_ids.dedup();
+    StructuralTrimOutcome {
+        removed_messages_before_protected_start,
+        removed_pairs,
+        removed_tool_call_ids,
+    }
+}
+
+fn context_accounting(config: &HarnessConfig, used_tokens: u64, window: u64) -> ContextAccounting {
+    build_context_accounting(
+        &config.context_economy,
+        config.structural_context_trimming,
+        used_tokens,
+        window,
+        config.reserved_output_tokens,
+    )
+}
+
+/// Builds the additive machine-readable context meter used by live and idle
+/// compaction paths. Clients consume these daemon-owned coordinates instead
+/// of duplicating threshold policy.
+#[must_use]
+pub fn build_context_accounting(
+    economy: &ContextEconomy,
+    structural_context_trimming: bool,
+    used_tokens: u64,
+    window: u64,
+    reserved_output_tokens: u64,
+) -> ContextAccounting {
+    let usage_basis_points =
+        u32::try_from(u128::from(used_tokens).saturating_mul(10_000) / u128::from(window.max(1)))
+            .unwrap_or(u32::MAX);
+    let tier_specs = if structural_context_trimming {
+        [
+            Some((
+                ContextCompactionTier::StructuralTrim24,
+                CONTEXT_STRUCTURAL_TIER_ONE_PERCENT,
+            )),
+            Some((
+                ContextCompactionTier::StructuralTrim12,
+                CONTEXT_STRUCTURAL_TIER_TWO_PERCENT,
+            )),
+            Some((
+                ContextCompactionTier::Summarize,
+                CONTEXT_SUMMARY_TIER_PERCENT,
+            )),
+        ]
+    } else {
+        [
+            Some((
+                ContextCompactionTier::Summarize,
+                CONTEXT_SUMMARY_TIER_PERCENT,
+            )),
+            None,
+            None,
+        ]
+    };
+    let mut resolved = tier_specs
+        .into_iter()
+        .flatten()
+        .filter_map(|(tier, percent)| {
+            context_tier_threshold_tokens(window, reserved_output_tokens, percent)
+                .map(|threshold| (tier, threshold))
+        });
+    let next = resolved
+        .find(|(_, threshold)| used_tokens < *threshold)
+        .or_else(|| {
+            context_soft_threshold_tokens(window, reserved_output_tokens)
+                .map(|threshold| (ContextCompactionTier::Summarize, threshold))
+        });
+    ContextAccounting {
+        used_tokens,
+        model_limit_tokens: window,
+        remaining_tokens: window.saturating_sub(used_tokens),
+        usage_basis_points,
+        next_tier: next.map(|(tier, _)| tier),
+        next_tier_at_tokens: next.map(|(_, threshold)| threshold),
+        tokens_until_next_tier: next.map(|(_, threshold)| threshold.saturating_sub(used_tokens)),
+        economy: economy.clone(),
+    }
 }
 
 /// Returns whether one compaction failed the hard-fit or minimum-effectiveness
@@ -9910,6 +10284,9 @@ fn context_footprint(
         soft_threshold_tokens,
         estimated_turns_to_threshold,
         truth,
+        accounting: config
+            .context_window
+            .map(|window| context_accounting(config, used_tokens, window)),
     }
 }
 

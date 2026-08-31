@@ -1,6 +1,9 @@
 #![allow(clippy::expect_used)]
 
-use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
+use haider_protocol::context::{
+    ContextAccounting, ContextCompactionTier, ContextEconomy, ContextFootprint,
+    ContextFootprintTruth,
+};
 use haider_rpc::{SeqRange, SessionReadResult};
 
 fn exact_footprint() -> ContextFootprint {
@@ -14,6 +17,16 @@ fn exact_footprint() -> ContextFootprint {
         soft_threshold_tokens: Some(170),
         estimated_turns_to_threshold: Some(1),
         truth: ContextFootprintTruth::Exact,
+        accounting: Some(ContextAccounting {
+            used_tokens: 150,
+            model_limit_tokens: 200,
+            remaining_tokens: 50,
+            usage_basis_points: 7_500,
+            next_tier: Some(ContextCompactionTier::Summarize),
+            next_tier_at_tokens: Some(170),
+            tokens_until_next_tier: Some(20),
+            economy: ContextEconomy::default(),
+        }),
     }
 }
 
@@ -46,6 +59,14 @@ fn session_read_latest_context_footprint_is_additive_and_optional() {
     let wire = serde_json::to_value(&current).expect("current session.read payload serializes");
     assert_eq!(wire["latest_context_footprint"]["truth"], "exact");
     assert_eq!(wire["latest_context_footprint"]["used_tokens"], 150);
+    assert_eq!(
+        wire["latest_context_footprint"]["accounting"]["remaining_tokens"],
+        50
+    );
+    assert_eq!(
+        wire["latest_context_footprint"]["accounting"]["tokens_until_next_tier"],
+        20
+    );
     assert_eq!(
         serde_json::from_value::<SessionReadResult>(wire)
             .expect("current session.read payload decodes")

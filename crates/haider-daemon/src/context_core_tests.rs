@@ -517,7 +517,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
             diagnostics: None,
             provider_factory: Arc::new(FixedWindowProviderFactory {
                 provider: provider.clone(),
-                context_window: 12_000,
+                context_window: 96_000,
             }),
             tool_factory: Arc::new(BrokerToolFactory),
             delegation: None,
@@ -550,7 +550,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
     })
     .await
     .expect("create session");
-    let large_source = "AUTO_BRANCH_SOURCE ".repeat(4_000);
+    let large_source = "AUTO_BRANCH_SOURCE ".repeat(6_000);
     hub.accept_internal_turn(TurnAcceptCommand {
         command_id: "accept-auto-compaction-source".into(),
         request_digest: "accept-auto-compaction-source-digest".into(),
@@ -570,6 +570,100 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
     })
     .await
     .expect("accept source");
+    let source_user_node = store
+        .read(&session_id, 0, 64)
+        .await
+        .expect("read accepted source")
+        .into_iter()
+        .rev()
+        .find_map(|event| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value::<EventPayload>(event.payload).ok()?
+            else {
+                return None;
+            };
+            (event.run_id.as_ref() == Some(&source_run)).then_some(node.node)
+        })
+        .expect("accepted source user node");
+    let mut parent = source_user_node;
+    for ordinal in 1..=2 {
+        let user_node = NodeId::new(format!("auto-compaction-source-user-node-{ordinal}"));
+        let assistant_node =
+            NodeId::new(format!("auto-compaction-source-assistant-node-{ordinal}"));
+        let user_text = format!("AUTO_BRANCH_RECENT_{ordinal} ").repeat(6_000);
+        let item_id = ItemId::new(format!("auto-compaction-source-item-{ordinal}"));
+        let fixture =
+            |event_id: String, payload: EventPayload, prompt: PromptRender| EventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                event_id: EventId::new(event_id),
+                seq: 0,
+                session_id: session_id.clone(),
+                branch_id: None,
+                run_id: Some(source_run.clone()),
+                agent_id: None,
+                device_id: DeviceId::new("auto-compaction-device"),
+                authority_epoch: 0,
+                worker_generation: store.worker_generation(),
+                causation_id: None,
+                correlation_id: None,
+                committed_at_ms: 0,
+                render: RenderTargets {
+                    ui: false,
+                    durable: true,
+                    prompt,
+                },
+                payload: serde_json::to_value(payload).expect("fixture payload"),
+            };
+        let mut recent_turn = vec![
+            fixture(
+                format!("auto-compaction-source-user-{ordinal}"),
+                EventPayload::UserMessage {
+                    text: user_text.clone(),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Queue,
+                },
+                PromptRender::Verbatim,
+            ),
+            fixture(
+                format!("auto-compaction-source-user-commit-{ordinal}"),
+                EventPayload::NodeCommitted(TreeNode {
+                    node: user_node.clone(),
+                    parent: Some(parent),
+                    kind: NodeKind::UserTurn {
+                        text: user_text,
+                        attachments: Vec::new(),
+                    },
+                }),
+                PromptRender::Omit,
+            ),
+            fixture(
+                format!("auto-compaction-source-answer-{ordinal}"),
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id,
+                    item: TurnItem::AgentMessage {
+                        text: format!("recent answer {ordinal}"),
+                    },
+                }),
+                PromptRender::Verbatim,
+            ),
+            fixture(
+                format!("auto-compaction-source-answer-commit-{ordinal}"),
+                EventPayload::NodeCommitted(TreeNode {
+                    node: assistant_node.clone(),
+                    parent: Some(user_node),
+                    kind: NodeKind::AssistantCommit {
+                        text: format!("recent answer {ordinal}"),
+                        verdict: haider_protocol::verify::VerifyVerdict::NotApplicable,
+                    },
+                }),
+                PromptRender::Omit,
+            ),
+        ];
+        StoreHandle::append(&store, &mut recent_turn)
+            .await
+            .expect("append recent clean source turn");
+        parent = assistant_node;
+    }
     let mut source_done = [EventEnvelope {
         schema_version: SCHEMA_VERSION,
         event_id: EventId::new("auto-compaction-source-done"),
@@ -598,6 +692,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
     let source_events = store.read(&session_id, 0, 64).await.expect("source events");
     let (fork_node, fork_seq) = source_events
         .iter()
+        .rev()
         .find_map(|event| {
             let EventPayload::NodeCommitted(node) =
                 serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?

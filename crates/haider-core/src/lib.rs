@@ -25,9 +25,10 @@ mod sqlite_store;
 
 pub use actor::{
     COMPACTION_MIN_FREED_PERCENT, CacheDiagnosticKey, CancelToken, ChildWaitCheckpoint,
-    ContextCompactor, DeferredTicket, DeferredToolCheckpoint, DeferredToolResult, EventIdGenerator,
-    FinalizationGuard, FinalizationGuardDecision, HarnessActor, HarnessConfig, HarnessHandle,
-    PartialStreamCheckpoint, PreviousCacheRequest, PromotedSteerReservation,
+    ContextCompactionOutcome, ContextCompactionRequest, ContextCompactor, DeferredTicket,
+    DeferredToolCheckpoint, DeferredToolResult, EventIdGenerator, FinalizationGuard,
+    FinalizationGuardDecision, HarnessActor, HarnessConfig, HarnessHandle, PartialStreamCheckpoint,
+    PlannedContextCompaction, PreviousCacheRequest, PromotedSteerReservation,
     ProviderAttemptDecision, ProviderAttemptResolver, ProviderDeadlineGuard,
     ProviderDerivedRequestState, ProviderPairSwitch, ProviderPairSwitchCause,
     ProviderPairSwitchCommitter, ProviderPairSwitchTarget, RealRetrySleeper,
@@ -35,10 +36,11 @@ pub use actor::{
     SharedToolPacks, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
     SubmitPartialStreamTurn, SubmitTurn, ToolDispatchResult, ToolDispatcher, TurnHandle,
     TurnOutcome, VISION_IMAGE_ESTIMATE_TOKENS, append_peer_message_to_provider_tail,
-    build_cache_request_diagnostic, classify_cache_request, compaction_guard_tripped,
-    context_soft_threshold_tokens, estimate_provider_request_input_tokens,
-    peer_message_for_provider, presentation_for_haider_error, retry_backoff_ms,
-    retry_jittered_backoff_ms, sanitized_failure_message,
+    build_cache_request_diagnostic, build_context_accounting, classify_cache_request,
+    compaction_guard_tripped, context_soft_threshold_tokens, context_tier_threshold_tokens,
+    estimate_provider_request_input_tokens, peer_message_for_provider,
+    presentation_for_haider_error, retry_backoff_ms, retry_jittered_backoff_ms,
+    sanitized_failure_message,
 };
 pub use fake_store::MemoryStore;
 pub use haider_protocol::interaction::{
@@ -80,8 +82,8 @@ pub use haider_store::{
     TypedAgentInstallWatchPage, TypedAgentInstallWatchResult,
 };
 pub use prompt_history::{
-    ArtifactReader, CompiledPromptProjection, PromptHistoryCache, PromptHistoryCompiler,
-    USER_COMMAND_OUTPUT_PREVIEW_BYTES, task_event_notice,
+    ArtifactReader, CompiledPromptProjection, PromptCompactionPlanRequest, PromptHistoryCache,
+    PromptHistoryCompiler, USER_COMMAND_OUTPUT_PREVIEW_BYTES, task_event_notice,
 };
 pub use recovery::{RecoveryReport, effect_recovery_evidence, reconcile_dispatched_effects};
 pub use sqlite_store::{
@@ -165,6 +167,17 @@ pub trait StoreHandle: Send + Sync {
     ) -> Result<Arc<[RawEnvelope]>, HaiderError> {
         self.append(&mut envelopes).await?;
         Ok(envelopes.into())
+    }
+
+    /// Persists restart-stable context-economy metadata after its authoritative
+    /// append-only savings event has committed. Journal-only embedders retain
+    /// the event as their source of truth through this compatibility default.
+    async fn persist_context_economy(
+        &self,
+        _session_id: &SessionId,
+        _economy: &haider_protocol::context::ContextEconomy,
+    ) -> Result<(), HaiderError> {
+        Ok(())
     }
 
     async fn read(

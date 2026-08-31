@@ -31,6 +31,7 @@ use haider_protocol::cache::{
 use haider_protocol::checkpoint::{
     CHECKPOINT_LIST_MAX_PAGE, CheckpointCursor, CheckpointListPage, CheckpointRecorded,
 };
+use haider_protocol::context::ContextEconomy;
 use haider_protocol::credential::CredentialDescriptor;
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectOutcome, EffectPhase, WorkspaceMutation,
@@ -4358,6 +4359,52 @@ impl Store {
         }
     }
 
+    /// Monotonically persists conversation-level savings after the matching
+    /// append-only event committed. Equal updates are idempotent; an older
+    /// writer can never roll the cumulative counter backwards.
+    pub fn persist_context_economy(
+        &self,
+        session_id: &SessionId,
+        economy: &ContextEconomy,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let mut metadata = typed_session_metadata(&transaction, session_id)?;
+        if economy.operation_count < metadata.context_economy.operation_count {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(());
+        }
+        if economy.operation_count == metadata.context_economy.operation_count
+            && economy != &metadata.context_economy
+        {
+            return Err(corrupt(
+                "equal context-economy coordinates disagree with session metadata",
+            ));
+        }
+        metadata.context_economy = economy.clone();
+        let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize context-economy metadata: {error}"),
+                false,
+            )
+        })?;
+        let updated = transaction
+            .execute(
+                "UPDATE sessions SET meta_json = ?2 WHERE id = ?1",
+                params![session_id.as_str(), updated_metadata],
+            )
+            .map_err(map_sqlite_error)?;
+        if updated != 1 {
+            return Err(corrupt(
+                "session row disappeared during context-economy persistence",
+            ));
+        }
+        transaction.commit().map_err(map_sqlite_error)
+    }
+
     /// Pure read of the latest graph projection. Graph truth remains the
     /// append-only event stream; there is intentionally no mutable graph row.
     pub fn graph_status(&self, session_id: &SessionId) -> StoreResult<Option<GraphStatus>> {
@@ -7906,6 +7953,7 @@ impl Store {
             // W-flow: sessions are born plain; `session.select_agent_type`
             // binds a Loom identity later.
             agent_type: None,
+            context_economy: ContextEconomy::default(),
             created_at_ms,
         };
         let metadata_json = serde_json::to_string(&metadata).map_err(|error| {
@@ -8386,6 +8434,9 @@ impl Store {
             decode_session_metadata(command.source_session_id, &source_metadata_json)?
                 .ok_or_else(|| corrupt("typed source session lost its metadata"))?;
         metadata.created_at_ms = now;
+        // A fork inherits prompt history, not the source session's operational
+        // savings ledger. Its first model-view reduction starts a fresh total.
+        metadata.context_economy = ContextEconomy::default();
 
         let scopes = branch_lineage_scopes(
             &transaction,

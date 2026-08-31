@@ -98,6 +98,7 @@ fn digest(
             effort: None,
             fast: false,
             cache_policy: Default::default(),
+            context_economy: Default::default(),
             created_at_ms: 1_800_000_000_000,
             agent_type: None,
         }),
@@ -128,6 +129,7 @@ fn digest(
             soft_threshold_tokens: Some(100_000),
             estimated_turns_to_threshold: Some(9),
             truth: ContextFootprintTruth::Exact,
+            accounting: None,
         }),
         pending_menus: menu.into_iter().collect(),
         subagents: vec![

@@ -61,26 +61,27 @@ use base64::Engine;
 use haider_core::{
     AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, CancelToken, ChildWaitCheckpoint,
     CompiledPromptProjection, ComputerEvidenceCommand, ComputerEvidenceOutcome,
-    ContextCompactionClaim, ContextCompactionReceiptResponse, ContextCompactor, DeferredTicket,
-    DeferredToolResult, EventIdGenerator, FinalizationGuard, FinalizationGuardDecision,
-    GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
-    GraphSwitchCommand, GraphSwitchOutcome, HarnessActor, HarnessConfig, PartialStreamCheckpoint,
-    PreviousCacheRequest, ProcessSignalCommand, ProcessSignalOutcome, PromptHistoryCompiler,
+    ContextCompactionClaim, ContextCompactionReceiptResponse, ContextCompactionRequest,
+    ContextCompactor, DeferredTicket, DeferredToolResult, EventIdGenerator, FinalizationGuard,
+    FinalizationGuardDecision, GraphEvidenceCommand, GraphEvidenceOutcome,
+    GraphFinalizationCommand, GraphFinalizationOutcome, GraphSwitchCommand, GraphSwitchOutcome,
+    HarnessActor, HarnessConfig, PartialStreamCheckpoint, PreviousCacheRequest,
+    ProcessSignalCommand, ProcessSignalOutcome, PromptCompactionPlanRequest, PromptHistoryCompiler,
     ProviderDeadlineGuard, ProviderDerivedRequestState, ProviderPairSwitch,
     ProviderPairSwitchCommitter, ProviderViewAppendRequest, RequestInputCheckpoint,
     SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks, StoreHandle,
     SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
     ToolDispatchResult, ToolDispatcher, TurnHandle, build_cache_request_diagnostic,
-    classify_cache_request, context_soft_threshold_tokens, effect_recovery_evidence,
-    estimate_provider_request_input_tokens, presentation_for_haider_error,
-    sanitized_failure_message,
+    build_context_accounting, classify_cache_request, context_soft_threshold_tokens,
+    effect_recovery_evidence, estimate_provider_request_input_tokens,
+    presentation_for_haider_error, sanitized_failure_message,
 };
 use haider_protocol::agent::Grant;
 use haider_protocol::cache::{
     CacheEpochTransitionReason, CacheEpochTransitionV1, CacheRequestAttemptV1,
     ProviderViewAttemptV1, ProviderViewBlobV1, ProviderViewLedgerV1,
 };
-use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
+use haider_protocol::context::{ContextCompactionTier, ContextFootprint, ContextFootprintTruth};
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase, FileFreshness,
     WorkspaceMutation,
@@ -427,6 +428,7 @@ struct DaemonContextCompactor {
     provider_deadline_guard: Option<Arc<DaemonGraphFinalizationGuard>>,
     context_window: Option<u64>,
     reserved_output_tokens: u64,
+    structural_context_trimming: bool,
     post_compaction_system_prompt: Option<String>,
     post_compaction_volatile_tail: Option<String>,
     post_compaction_grant_scope: String,
@@ -840,27 +842,71 @@ impl ContextCompactor for DaemonContextCompactor {
         &self,
         run_id: &RunId,
         resume_cause: CompactionResume,
-    ) -> Result<CompactionIntent, HaiderError> {
+        _messages: &[Message],
+        _current_turn_start: usize,
+    ) -> Result<haider_core::PlannedContextCompaction, HaiderError> {
         PromptHistoryCompiler::plan_compaction(
             &self.store,
-            self.store.session_id(),
-            self.branch_id.as_ref(),
-            self.agent_id.as_ref(),
-            run_id,
-            format!("compact-{}", self.event_ids.next()),
-            resume_cause,
+            &self.store,
+            PromptCompactionPlanRequest {
+                session_id: self.store.session_id(),
+                branch_id: self.branch_id.as_ref(),
+                agent_id: self.agent_id.as_ref(),
+                current_run: run_id,
+                operation_id: format!("compact-{}", self.event_ids.next()),
+                resume_cause,
+            },
         )
         .await
     }
 
     async fn compact(
         &self,
-        run_id: &RunId,
-        intent: &CompactionIntent,
-        covered_messages: Vec<Message>,
-        attachments: Vec<haider_provider::ResolvedAttachment>,
-        latest_compaction_summary_end: Option<usize>,
-    ) -> Result<Message, HaiderError> {
+        request: ContextCompactionRequest<'_>,
+    ) -> Result<haider_core::ContextCompactionOutcome, HaiderError> {
+        let ContextCompactionRequest {
+            run_id,
+            intent,
+            covered_messages,
+            retained_messages,
+            attachments,
+            latest_compaction_summary_end,
+            economy_before,
+        } = request;
+        let replaced_projection_tokens = estimate_provider_request_input_tokens(
+            &covered_messages,
+            &self.post_compaction_system_prompt,
+            self.post_compaction_tools.as_ref(),
+            &attachments,
+        );
+        // The first summary must replay the actor's exact provider projection:
+        // it already contains provider-bound attachment resolution and any
+        // durable structural-trim selection. A replacement summary is the one
+        // exceptional case. Its actor projection begins with the prior brief,
+        // so rebuild the intent-named original journal fragments instead of
+        // ever feeding a summary back into a summary.
+        let (covered_messages, source_attachments) = if latest_compaction_summary_end.is_some() {
+            let mut original_messages = PromptHistoryCompiler::compile_compaction_source(
+                &self.store,
+                self.store.session_id(),
+                self.branch_id.as_ref(),
+                self.agent_id.as_ref(),
+                run_id,
+                intent,
+            )
+            .await?;
+            prepare_compaction_messages(&self.store, &mut original_messages).await?;
+            (original_messages, Vec::new())
+        } else {
+            (covered_messages, attachments)
+        };
+        let recovered_economy =
+            PromptHistoryCompiler::latest_context_economy(&self.store, self.store.session_id())
+                .await?;
+        let economy_before = recovered_economy
+            .as_ref()
+            .filter(|economy| economy.operation_count > economy_before.operation_count)
+            .unwrap_or(economy_before);
         let (previous_cache_request, previous_provider_view, _) = prior_cache_request_context(
             &self.store,
             &self.usage_scope,
@@ -919,7 +965,7 @@ impl ContextCompactor for DaemonContextCompactor {
             // Round 5: the ACTOR resolved these exactly as the live lane
             // does, so an image-bearing prefix replays instead of always
             // detouring through the uncached fallback.
-            attachments,
+            attachments: source_attachments.clone(),
             cache_metadata: Some(cache_metadata.clone()),
         };
         let mut prepared = self
@@ -1026,7 +1072,7 @@ impl ContextCompactor for DaemonContextCompactor {
         let replay_request_messages = request.messages.clone();
         let (
             mut stream,
-            request_messages,
+            _request_messages,
             request_ordinal,
             request_cache_epoch,
             request_cache_diagnostic,
@@ -1293,8 +1339,22 @@ impl ContextCompactor for DaemonContextCompactor {
             self.agent_id.as_ref(),
         )
         .await?;
-        let tokens_before = approximate_message_tokens(&request_messages);
-        let tokens_after = approximate_text_tokens(&summary);
+        // Savings describe the provider projection actually replaced. For a
+        // replacement summary this is the old brief plus newly covered turns,
+        // not the expanded original-journal source used to author the new
+        // brief; counting the latter would save the same tokens twice.
+        let tokens_before = replaced_projection_tokens;
+        let tokens_after = estimate_provider_request_input_tokens(
+            &[Message::user_text(summary.clone())],
+            &self.post_compaction_system_prompt,
+            self.post_compaction_tools.as_ref(),
+            &[],
+        );
+        let (economy, savings) = economy_before.record(
+            ContextCompactionTier::Summarize,
+            tokens_before,
+            tokens_after,
+        );
         let item_id = ItemId::new(format!("compaction-item-{}", intent.operation_id));
         let item = TurnItem::ContextCompaction {
             summary_artifact: artifact.clone(),
@@ -1321,11 +1381,30 @@ impl ContextCompactor for DaemonContextCompactor {
             EventPayload::Item(ItemEvent::Completed { item_id, item }),
             EventPayload::NodeCommitted(node),
         ];
+        let savings_item = savings.extension_item().map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("context savings could not serialize: {error}"),
+                false,
+            )
+        })?;
+        let savings_item_id = ItemId::new(format!("compaction-savings-{}", intent.operation_id));
+        payloads.extend([
+            EventPayload::Item(ItemEvent::Started {
+                item_id: savings_item_id.clone(),
+                item: savings_item.clone(),
+            }),
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: savings_item_id,
+                item: savings_item,
+            }),
+        ]);
         if let Some(usage) = reported_usage {
             payloads.push(EventPayload::Usage(usage));
         }
         if intent.resume_cause == CompactionResume::ManualIdle {
             let mut post_compaction_messages = vec![Message::user_text(summary.clone())];
+            post_compaction_messages.extend(retained_messages);
             if let Some(tail) = &self.post_compaction_volatile_tail {
                 post_compaction_messages.push(Message::user_text(tail.clone()));
             }
@@ -1347,6 +1426,15 @@ impl ContextCompactor for DaemonContextCompactor {
                 }),
                 estimated_turns_to_threshold: None,
                 truth: ContextFootprintTruth::Estimated,
+                accounting: self.context_window.map(|window| {
+                    build_context_accounting(
+                        &economy,
+                        self.structural_context_trimming,
+                        post_compaction_input,
+                        window,
+                        self.reserved_output_tokens,
+                    )
+                }),
             };
             let footprint_item = footprint.extension_item().map_err(|error| {
                 HaiderError::new(
@@ -1390,22 +1478,14 @@ impl ContextCompactor for DaemonContextCompactor {
         self.store
             .append_at_head(expected_head, &mut envelopes)
             .await?;
-        Ok(Message::user_text(summary))
+        self.store
+            .persist_context_economy(self.store.session_id(), &economy)
+            .await?;
+        Ok(haider_core::ContextCompactionOutcome {
+            summary: Message::user_text(summary),
+            economy,
+        })
     }
-}
-
-fn approximate_message_tokens(messages: &[Message]) -> u64 {
-    serde_json::to_vec(messages)
-        .map(|bytes| approximate_len_tokens(bytes.len()))
-        .unwrap_or(u64::MAX)
-}
-
-fn approximate_text_tokens(text: &str) -> u64 {
-    approximate_len_tokens(text.len())
-}
-
-fn approximate_len_tokens(bytes: usize) -> u64 {
-    u64::try_from(bytes).unwrap_or(u64::MAX).saturating_add(3) / 4
 }
 
 /// Inputs available to a turn-scoped tool dispatcher factory.
@@ -5251,11 +5331,33 @@ async fn perform_manual_compaction(
         )
         .await?;
     prepare_compaction_messages(lease, &mut messages).await?;
-    let (run_id, accepted_seq, intent) = if let Some(existing) = existing {
-        (existing.run_id, existing.accepted_seq, existing.intent)
+    let (run_id, accepted_seq, intent, covered_message_count) = if let Some(existing) = existing {
+        let planned = PromptHistoryCompiler::plan_idle_compaction(
+            lease,
+            lease,
+            lease.session_id(),
+            branch_id.as_ref(),
+            agent_id.as_ref(),
+            existing.intent.operation_id.clone(),
+        )
+        .await?;
+        if planned.intent != existing.intent {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "durable manual-compaction intent no longer matches its clean message boundary",
+                false,
+            ));
+        }
+        (
+            existing.run_id,
+            existing.accepted_seq,
+            existing.intent,
+            planned.covered_message_count,
+        )
     } else {
         let run_id = boundary_run_id;
-        let intent = PromptHistoryCompiler::plan_idle_compaction(
+        let planned = PromptHistoryCompiler::plan_idle_compaction(
+            lease,
             lease,
             lease.session_id(),
             branch_id.as_ref(),
@@ -5263,6 +5365,7 @@ async fn perform_manual_compaction(
             format!("manual-{command_id}"),
         )
         .await?;
+        let intent = planned.intent;
         let intent_item_id = ItemId::new(format!("compaction-intent-{}", intent.operation_id));
         let intent_item = TurnItem::Extension {
             kind: COMPACTION_INTENT_EXTENSION_KIND.into(),
@@ -5310,8 +5413,21 @@ async fn perform_manual_compaction(
             envelope.agent_id = agent_id.clone();
         }
         let range = StoreHandle::append(lease, &mut envelopes).await?;
-        (run_id, range.first_seq.saturating_add(1), intent)
+        (
+            run_id,
+            range.first_seq.saturating_add(1),
+            intent,
+            planned.covered_message_count,
+        )
     };
+    if covered_message_count == 0 || covered_message_count > messages.len() {
+        return Err(HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            "manual compaction produced an invalid clean message boundary",
+            false,
+        ));
+    }
+    let retained_messages = messages.split_off(covered_message_count);
     drop(workflow_selection);
     let cache_expected_later_reads = u32::from(!post_compaction_tools.is_empty()) * 2;
     let cache_cohort = reduce_turn_setup_journal(
@@ -5337,6 +5453,7 @@ async fn perform_manual_compaction(
         provider_deadline_guard: None,
         context_window: resolved.context_window,
         reserved_output_tokens: metadata.max_tokens,
+        structural_context_trimming: metadata.fast,
         post_compaction_system_prompt: Some(post_compaction_system_prompt),
         post_compaction_volatile_tail: Some(post_compaction_volatile_tail),
         post_compaction_grant_scope,
@@ -5354,13 +5471,15 @@ async fn perform_manual_compaction(
         usage_account,
     };
     if let Err(error) = compactor
-        .compact(
-            &run_id,
-            &intent,
-            messages,
-            Vec::new(),
+        .compact(ContextCompactionRequest {
+            run_id: &run_id,
+            intent: &intent,
+            covered_messages: messages,
+            retained_messages,
+            attachments: Vec::new(),
             latest_compaction_summary_end,
-        )
+            economy_before: &metadata.context_economy,
+        })
         .await
     {
         append_failure(
@@ -6022,6 +6141,15 @@ async fn start_turn(
     let headless = headless_run_context(lease, &accepted.run_id).await?;
     let provider_deadline = headless.as_ref().and_then(provider_request_deadline);
     let mut pinned_metadata = metadata.clone();
+    if let Some(journal_economy) =
+        PromptHistoryCompiler::latest_context_economy(lease, lease.session_id()).await?
+        && journal_economy.operation_count > pinned_metadata.context_economy.operation_count
+    {
+        lease
+            .persist_context_economy(lease.session_id(), &journal_economy)
+            .await?;
+        pinned_metadata.context_economy = journal_economy;
+    }
     if let Some(context) = headless.as_ref() {
         let spec = &context.spec;
         pinned_metadata.provider.clone_from(&spec.provider);
@@ -6524,6 +6652,8 @@ async fn start_turn(
     );
     config.cached_input_is_subset = cached_input_is_subset_for_provider(&resolved.provider_name);
     config.context_compaction_v1 = true;
+    config.structural_context_trimming = metadata.fast;
+    config.context_economy = metadata.context_economy.clone();
     config.compaction_guard_v1 = true;
     config.model = resolved.model;
     config.context_window = resolved.context_window;
@@ -6669,6 +6799,7 @@ async fn start_turn(
         provider_deadline_guard: Some(Arc::clone(&run_boundary_guard)),
         context_window: config.context_window,
         reserved_output_tokens: config.reserved_output_tokens,
+        structural_context_trimming: config.structural_context_trimming,
         post_compaction_system_prompt: config.system_prompt.clone(),
         // Graph/typed state refreshes at live provider boundaries. Compaction
         // retains only the immutable per-turn session suffix so it cannot

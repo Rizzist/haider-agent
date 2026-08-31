@@ -59,6 +59,7 @@ fn footprint(truth: ContextFootprintTruth) -> ContextFootprint {
         soft_threshold_tokens: Some(170_000),
         estimated_turns_to_threshold: Some(7),
         truth,
+        accounting: None,
     }
 }
 

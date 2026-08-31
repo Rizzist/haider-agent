@@ -456,6 +456,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         effort: None,
         fast: false,
         cache_policy: Default::default(),
+        context_economy: Default::default(),
         created_at_ms: 1,
         agent_type: None,
     };
@@ -962,6 +963,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
             effort: None,
             fast: false,
             cache_policy: Default::default(),
+            context_economy: Default::default(),
             created_at_ms: 1,
             agent_type: None,
         })
@@ -1032,6 +1034,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         effort: None,
         fast: false,
         cache_policy: Default::default(),
+        context_economy: Default::default(),
         created_at_ms: 1,
         agent_type: None,
     };
@@ -1176,6 +1179,7 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         effort: None,
         fast: false,
         cache_policy: Default::default(),
+        context_economy: Default::default(),
         created_at_ms: 1,
         agent_type: None,
     };
@@ -1346,6 +1350,7 @@ async fn lk1_keyless_fallback_stays_scoped_to_enabled_auth_none_profiles() {
                 effort: None,
                 fast: false,
                 cache_policy: Default::default(),
+                context_economy: Default::default(),
                 created_at_ms: 1,
                 agent_type: None,
             })
@@ -1828,6 +1833,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
             effort: None,
             fast: false,
             cache_policy: Default::default(),
+            context_economy: Default::default(),
             created_at_ms: 1,
             agent_type: None,
         },
@@ -1932,6 +1938,7 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
         effort: None,
         fast: false,
         cache_policy: Default::default(),
+        context_economy: Default::default(),
         created_at_ms: 1,
         agent_type: None,
     };
@@ -2159,6 +2166,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             effort: None,
             fast: false,
             cache_policy: Default::default(),
+            context_economy: Default::default(),
             created_at_ms: 1,
             agent_type: None,
         })
@@ -2370,6 +2378,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         effort: None,
         fast: false,
         cache_policy: Default::default(),
+        context_economy: Default::default(),
         created_at_ms: 1,
         agent_type: None,
     };
@@ -11044,6 +11053,7 @@ fn provider_tuning_derives_from_metadata_and_fast_gate_filters_stale_pairs() {
         effort: Some("xhigh".into()),
         fast: true,
         cache_policy: Default::default(),
+        context_economy: Default::default(),
         created_at_ms: 1,
         agent_type: None,
     };
@@ -11252,6 +11262,7 @@ fn enterprise_metadata(provider: &str, model: &str) -> haider_protocol::session:
         effort: None,
         fast: false,
         cache_policy: Default::default(),
+        context_economy: Default::default(),
         created_at_ms: 1,
         agent_type: None,
     }
@@ -11989,6 +12000,7 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
         effort: None,
         fast: false,
         cache_policy: Default::default(),
+        context_economy: Default::default(),
         created_at_ms: 1,
         agent_type: None,
     };
@@ -12182,6 +12194,7 @@ async fn each_turn_resolves_the_currently_active_account() {
         effort: None,
         fast: false,
         cache_policy: Default::default(),
+        context_economy: Default::default(),
         created_at_ms: 1,
         agent_type: None,
     };

@@ -2401,7 +2401,7 @@ async fn vision_unsupported_provider_refuses_locally_with_typed_error() {
 
 /// MUTATION CHECK: resolve image bytes into a summarization request, or let
 /// compaction erase the original attachment-bearing user fact. Expected
-/// RUNTIME failure: request two contains an image/base64 payload, or the
+/// RUNTIME failure: request three contains an image/base64 payload, or the
 /// durable post-compaction journal no longer carries the original CAS ref.
 #[tokio::test]
 async fn compaction_summary_request_carries_no_image_attachments() {
@@ -2415,6 +2415,12 @@ async fn compaction_summary_request_carries_no_image_attachments() {
     );
     let fake = Arc::new(
         FakeProvider::new(vec![
+            FakeStep::EmitText {
+                text: "older answer".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
             FakeStep::EmitText {
                 text: "image answer".into(),
             },
@@ -2454,6 +2460,24 @@ async fn compaction_summary_request_carries_no_image_attachments() {
     )
     .await;
     let (session_id, generation) = create_and_attach(&mut client, &config, &workspace).await;
+    send_request(
+        &mut client,
+        &config,
+        "submit-older-clean-turn",
+        RequestBody::TurnSubmit {
+            command_id: CommandId::new("submit-older-clean-turn-command"),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            text: "older clean fact".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+        },
+    )
+    .await;
+    let (run_id, _) = next_submit_response(&mut client).await;
+    let _ = events_until_terminal(&mut client, &run_id).await;
+    let _ = next_idle(&mut client).await;
+
     let image = AttachmentBlock::Image {
         artifact: artifact.clone(),
         mime: "image/png".into(),
@@ -2502,8 +2526,8 @@ async fn compaction_summary_request_carries_no_image_attachments() {
     }
 
     let requests = fake.requests();
-    assert_eq!(requests.len(), 2);
-    let summary_request = &requests[1];
+    assert_eq!(requests.len(), 3);
+    let summary_request = &requests[2];
     assert!(summary_request.attachments.is_empty());
     assert!(summary_request.messages.iter().all(|message| {
         message

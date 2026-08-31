@@ -138,6 +138,13 @@ pub struct SessionMetadataV1 {
     /// clearing never moves the conversation tree or the cache epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,
+    /// Conversation-level estimated token savings. This is additive metadata;
+    /// legacy rows omit it and decode to an empty counter.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::context::ContextEconomy::is_empty"
+    )]
+    pub context_economy: crate::context::ContextEconomy,
     /// Durable creation time in Unix milliseconds.
     pub created_at_ms: u64,
 }

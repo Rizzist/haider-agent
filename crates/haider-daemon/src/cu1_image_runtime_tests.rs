@@ -10,9 +10,9 @@ use crate::worker::{
 use async_trait::async_trait;
 use base64::Engine as _;
 use haider_core::{
-    ArtifactReader, CancelToken, ContextCompactor, EventIdGenerator, SessionCreateCommand,
-    SqliteStoreHandle, StoreHandle, ToolDispatchResult, ToolDispatcher, TurnAcceptCommand,
-    TurnAdmissionDisposition,
+    ArtifactReader, CancelToken, ContextCompactionRequest, ContextCompactor, EventIdGenerator,
+    SessionCreateCommand, SqliteStoreHandle, StoreHandle, ToolDispatchResult, ToolDispatcher,
+    TurnAcceptCommand, TurnAdmissionDisposition,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
@@ -52,7 +52,7 @@ fn daemon_compactor_fuses_provider_view_and_cache_attempt_publication() {
     let helper_body = &source[impl_start..compact_start];
     let compact_tail = &source[compact_start..];
     let compact_end = compact_tail
-        .find("\nfn approximate_message_tokens(")
+        .find("\n/// Inputs available to a turn-scoped tool dispatcher factory.")
         .expect("compactor implementation boundary");
     let compact_body = &compact_tail[..compact_end];
 
@@ -551,6 +551,7 @@ async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
         provider_deadline_guard: None,
         context_window: None,
         reserved_output_tokens: 4096,
+        structural_context_trimming: false,
         post_compaction_system_prompt: lane_system_prompt.clone(),
         post_compaction_volatile_tail: None,
         post_compaction_grant_scope: "cu1-image-grant".into(),
@@ -587,8 +588,17 @@ async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
     )
     .await;
 
+    let economy = haider_protocol::context::ContextEconomy::default();
     let _result = compactor
-        .compact(&run_id, &intent, covered_messages.clone(), Vec::new(), None)
+        .compact(ContextCompactionRequest {
+            run_id: &run_id,
+            intent: &intent,
+            covered_messages: covered_messages.clone(),
+            retained_messages: Vec::new(),
+            attachments: Vec::new(),
+            latest_compaction_summary_end: None,
+            economy_before: &economy,
+        })
         .await;
 
     let requests = provider.requests();
@@ -682,6 +692,7 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
         provider_deadline_guard: None,
         context_window: None,
         reserved_output_tokens: 4096,
+        structural_context_trimming: false,
         post_compaction_system_prompt: lane_system_prompt.clone(),
         post_compaction_volatile_tail: None,
         post_compaction_grant_scope: "cu1-fallback-grant".into(),
@@ -718,8 +729,17 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
     )
     .await;
 
+    let economy = haider_protocol::context::ContextEconomy::default();
     let post_summary_result = compactor
-        .compact(&run_id, &intent, covered_messages.clone(), Vec::new(), None)
+        .compact(ContextCompactionRequest {
+            run_id: &run_id,
+            intent: &intent,
+            covered_messages: covered_messages.clone(),
+            retained_messages: Vec::new(),
+            attachments: Vec::new(),
+            latest_compaction_summary_end: None,
+            economy_before: &economy,
+        })
         .await;
     assert!(
         post_summary_result.is_ok(),
