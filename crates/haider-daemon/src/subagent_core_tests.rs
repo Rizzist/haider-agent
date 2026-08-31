@@ -2,6 +2,8 @@
 
 #[cfg(unix)]
 use crate::connection::{ConnectionContext, DrainNotice, serve};
+#[cfg(unix)]
+use crate::delegation::StallDeadlineTestClock;
 use crate::delegation::{
     DelegationHandle, MessageCoordinates, SpawnCoordinates, callsign_from_identity,
 };
@@ -25,6 +27,8 @@ use haider_protocol::error::ErrorCode;
 #[cfg(unix)]
 use haider_protocol::ids::MenuId;
 use haider_protocol::ids::{AgentId, BranchId, DeviceId, EventId, RunId, SessionId};
+#[cfg(unix)]
+use haider_protocol::item::ItemDelta;
 use haider_protocol::item::{ItemEvent, TurnItem};
 #[cfg(unix)]
 use haider_protocol::menu::Menu;
@@ -48,6 +52,8 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
@@ -745,6 +751,66 @@ impl Provider for GatedSteerProvider {
             });
         }
         Ok(receiver.into())
+    }
+}
+
+#[cfg(unix)]
+struct GatedRecoveryProvider {
+    inner: FakeProvider,
+    request_count: AtomicUsize,
+    child_stream_opened: Arc<Notify>,
+    release_progress: Arc<Notify>,
+    release_completion: Arc<Notify>,
+}
+
+#[cfg(unix)]
+impl GatedRecoveryProvider {
+    fn new(script: Vec<FakeStep>) -> Self {
+        Self {
+            inner: FakeProvider::new(script),
+            request_count: AtomicUsize::new(0),
+            child_stream_opened: Arc::new(Notify::new()),
+            release_progress: Arc::new(Notify::new()),
+            release_completion: Arc::new(Notify::new()),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[async_trait]
+impl Provider for GatedRecoveryProvider {
+    async fn capabilities(&self) -> CapabilityDoc {
+        self.inner.capabilities().await
+    }
+
+    async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        let request_index = self.request_count.fetch_add(1, Ordering::SeqCst);
+        let mut inner = self.inner.stream_turn(request).await?;
+        if request_index != 1 {
+            return Ok(inner);
+        }
+
+        let (sender, receiver) = mpsc::channel(4);
+        let child_stream_opened = Arc::clone(&self.child_stream_opened);
+        let release_progress = Arc::clone(&self.release_progress);
+        let release_completion = Arc::clone(&self.release_completion);
+        let producer = tokio::spawn(async move {
+            child_stream_opened.notify_one();
+            release_progress.notified().await;
+            let Some(first) = inner.recv().await else {
+                return;
+            };
+            if sender.send(first).await.is_err() {
+                return;
+            }
+            release_completion.notified().await;
+            while let Some(item) = inner.recv().await {
+                if sender.send(item).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(ProviderStream::owned(receiver, producer))
     }
 }
 
@@ -1849,6 +1915,62 @@ async fn wait_for_state(
     .expect("expected run state");
 }
 
+#[cfg(unix)]
+async fn wait_for_journal_event(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    observation_timeout: Duration,
+    label: &str,
+    expected: impl Fn(&EventPayload) -> bool,
+) -> haider_protocol::envelope::RawEnvelope {
+    let observed = timeout(observation_timeout, async {
+        loop {
+            let events = store.read(session_id, 0, 1024).await.expect("read run");
+            for event in events {
+                if serde_json::from_value::<EventPayload>(event.payload.clone())
+                    .is_ok_and(|payload| expected(&payload))
+                {
+                    return event;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    match observed {
+        Ok(event) => event,
+        Err(_) => {
+            let last = store
+                .read(session_id, 0, 1024)
+                .await
+                .expect("read timed-out journal");
+            panic!("timed out waiting for {label}; last child journal: {last:?}");
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_wall_clock_after(
+    committed_at_ms: u64,
+    observation_timeout: Duration,
+    label: &str,
+) {
+    timeout(observation_timeout, async {
+        loop {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            if now_ms > u128::from(committed_at_ms) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
+}
+
 /// Autonomous interaction mode is durable child-session policy, not a root
 /// headless reducer trick: a child request_input without a default returns a
 /// typed tool rejection and both child and parent terminate.
@@ -2769,21 +2891,15 @@ async fn committed_child_progress_resets_the_stall_deadline() {
 #[tokio::test]
 #[cfg(unix)]
 async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
-    // Linux CI can defer both Tokio tasks past a 5ms nominal margin. Give the
-    // silent child two complete 25ms poll opportunities after its 35ms-style
-    // threshold, while retaining enough post-nudge room for the first
-    // recovered heartbeat. The 120ms heartbeat train still outlasts a mutant
-    // cancellation window measured from the nudge alone.
-    // ONE generous timing envelope for every platform: a fast host satisfies
-    // the same margins a deferred-scheduling CI runner needs, and a single
-    // choreography can't drift green-on-one-OS/red-on-the-other (the cfg-split
-    // round did exactly that).
     const STALL_DEADLINE: Duration = Duration::from_millis(100);
-    const INITIAL_SILENCE_MS: u64 = 175;
+    // Outer observation bound: twenty complete supervision cycles, each
+    // initial deadline + grace deadline + two 25ms collector polls:
+    // 20 * (100ms + 100ms + 25ms + 25ms) = 5_000ms.
+    const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
-    let mut script = vec![
+    let script = vec![
         FakeStep::EmitToolCall {
             call_id: "recover-spawn".into(),
             name: "spawn_subagent".into(),
@@ -2792,20 +2908,9 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
         },
-        // Silent past the deadline AND across a complete 25ms poll tick; a
-        // shorter silence can fall between samples and never draw the nudge.
-        // Recovery still begins inside the post-nudge cancellation window.
-        FakeStep::Delay {
-            ms: INITIAL_SILENCE_MS,
+        FakeStep::EmitReasoning {
+            text: "recovered-heartbeat-0".into(),
         },
-    ];
-    for index in 0..10 {
-        script.push(FakeStep::EmitReasoning {
-            text: format!("recovered-heartbeat-{index}"),
-        });
-        script.push(FakeStep::Delay { ms: 12 });
-    }
-    script.extend([
         FakeStep::EmitText {
             text: "recovered child report".into(),
         },
@@ -2830,10 +2935,15 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
         FakeStep::Finish {
             reason: FinishReason::EndTurn,
         },
-    ]);
-    let provider = Arc::new(FakeProvider::new(script));
+    ];
+    let provider = Arc::new(GatedRecoveryProvider::new(script));
+    let stall_clock = Arc::new(StallDeadlineTestClock::default());
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
-    let delegation = DelegationHandle::with_stall_deadline(hub.clone(), STALL_DEADLINE);
+    let delegation = DelegationHandle::with_stall_deadline_clock(
+        hub.clone(),
+        STALL_DEADLINE,
+        Arc::clone(&stall_clock),
+    );
     let manager = WorkerManager::start(
         hub.clone(),
         WorkerDependencies {
@@ -2857,14 +2967,132 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
         .submit(accepted)
         .await
         .expect("submit parent");
-    wait_for_state(&store, &parent_session, |state| *state == RunState::Done).await;
+
+    timeout(OBSERVATION_TIMEOUT, provider.child_stream_opened.notified())
+        .await
+        .expect("child provider stream opens");
 
     let child = hub
-        .delegations_for_parent_run(parent_session.clone(), parent_run)
+        .delegations_for_parent_run(parent_session.clone(), parent_run.clone())
         .await
         .expect("delegations")
         .pop()
         .expect("child");
+    wait_for_journal_event(
+        &store,
+        &child.child_session_id,
+        OBSERVATION_TIMEOUT,
+        "child Streaming state",
+        |payload| matches!(payload, EventPayload::RunState(RunState::Streaming)),
+    )
+    .await;
+    let latest_before_nudge = store
+        .read(&child.child_session_id, 0, 1024)
+        .await
+        .expect("child journal before nudge")
+        .into_iter()
+        .map(|event| event.committed_at_ms)
+        .max()
+        .expect("child has durable progress before nudge");
+    wait_for_wall_clock_after(
+        latest_before_nudge,
+        OBSERVATION_TIMEOUT,
+        "wall clock to pass pre-nudge progress",
+    )
+    .await;
+    let stall_deadline_ms = u64::try_from(STALL_DEADLINE.as_millis()).expect("deadline fits u64");
+    let initial_stall_boundary_ms = latest_before_nudge.saturating_add(stall_deadline_ms);
+    stall_clock.set_now_ms(initial_stall_boundary_ms);
+
+    let nudge = wait_for_journal_event(
+        &store,
+        &child.child_session_id,
+        OBSERVATION_TIMEOUT,
+        "durable stall nudge",
+        |payload| {
+            matches!(
+                payload,
+                EventPayload::UserMessage { text, .. }
+                    if text == "report your status or conclude"
+            )
+        },
+    )
+    .await;
+    wait_for_wall_clock_after(
+        nudge.committed_at_ms,
+        OBSERVATION_TIMEOUT,
+        "wall clock to pass the durable nudge",
+    )
+    .await;
+
+    provider.release_progress.notify_one();
+    let heartbeat = wait_for_journal_event(
+        &store,
+        &child.child_session_id,
+        OBSERVATION_TIMEOUT,
+        "durable recovered heartbeat",
+        |payload| {
+            matches!(
+                payload,
+                EventPayload::Item(ItemEvent::Delta {
+                    delta: ItemDelta::Reasoning { text },
+                    ..
+                }) if text == "recovered-heartbeat-0"
+            )
+        },
+    )
+    .await;
+    assert!(
+        heartbeat.committed_at_ms > nudge.committed_at_ms,
+        "recovery progress must be durably newer than the nudge"
+    );
+
+    // Flush any supervision check that took its progress snapshot before the
+    // heartbeat commit. At the nudge timestamp even that stale snapshot is
+    // safe; after this observed check, the collector's next loop must reread
+    // the journal before it can evaluate the grace boundary below.
+    let safe_flush_ms = if nudge.committed_at_ms == initial_stall_boundary_ms {
+        nudge.committed_at_ms.saturating_add(1)
+    } else {
+        nudge.committed_at_ms
+    };
+    stall_clock.set_now_ms(safe_flush_ms);
+    timeout(OBSERVATION_TIMEOUT, async {
+        while stall_clock.checks_at(safe_flush_ms) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("pre-heartbeat supervision snapshot is flushed safely");
+
+    // Arm the grace boundary only after the recovered heartbeat is durable.
+    // Two observed checks prove the correct path continued polling; the
+    // nudge-only mutation cancels on the first check and is observed instead.
+    let grace_boundary_ms = nudge.committed_at_ms.saturating_add(stall_deadline_ms);
+    stall_clock.set_now_ms(grace_boundary_ms);
+    timeout(OBSERVATION_TIMEOUT, async {
+        loop {
+            let events = store
+                .read(&child.child_session_id, 0, 1024)
+                .await
+                .expect("child journal during grace evaluation");
+            let cancelled = events.iter().any(|event| {
+                serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(|payload| {
+                    matches!(payload, EventPayload::RunState(RunState::Cancelled))
+                })
+            });
+            if cancelled || stall_clock.checks_at(grace_boundary_ms) >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("grace boundary is evaluated or cancellation becomes durable");
+    provider.release_completion.notify_one();
+
+    wait_for_state(&store, &parent_session, |state| *state == RunState::Done).await;
+
     let child_payloads = typed_payloads(
         &store
             .read(&child.child_session_id, 0, 1024)
