@@ -89,8 +89,9 @@ pub use permission::{
 pub use profile::{
     DEFAULT_MAX_TOKENS, DEFAULT_PROVIDER, MODEL_ENV, PACKAGED_DEFAULT_MODEL, PROFILE_CONFIG_FILE,
     PROFILE_DIR_ENV, ProfileEnv, ProfileError, RUNTIME_DIR_ENV, ResolvedProfile,
+    RuntimeDirRejection, RuntimeDirRejectionReason, RuntimeDirResolution, RuntimeDirSource,
     canonicalize_path_allow_missing, effective_uid, endpoint_path_for, resolve_default_model_for,
-    resolve_profile, resolve_profile_read_only,
+    resolve_profile, resolve_profile_read_only, resolve_profile_with_runtime_resolution,
 };
 pub use session_fork::{
     FORKABLE_PROMPT_PAGE, ForkablePrompt, PromptFork, SessionForkClientError, fork_at_prompt,

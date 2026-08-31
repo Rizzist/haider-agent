@@ -33,7 +33,8 @@ use cli_main::run::{
     EX_UNAVAILABLE, EX_USAGE,
 };
 use haider_client::{
-    ClientError, ConnectError, DisconnectReason, ObserveError, ProfileEnv, resolve_profile,
+    ClientError, ConnectError, DisconnectReason, ObserveError, ProfileEnv, RuntimeDirResolution,
+    RuntimeDirSource, resolve_profile,
 };
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -311,6 +312,10 @@ fn observe_json_schemas_are_goldened_and_secret_free() {
         session_count: 2,
         profile_path: "/tmp/haider-profile".into(),
         runtime_dir: "/tmp/haider-runtime/profile-a".into(),
+        runtime_dir_resolution: RuntimeDirResolution {
+            source: RuntimeDirSource::HaiderRuntimeDir,
+            rejections: Vec::new(),
+        },
         adoption_available: Vec::new(),
     };
     let permission = digest(

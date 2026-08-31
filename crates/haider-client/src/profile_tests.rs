@@ -154,7 +154,8 @@ fn overlong_private_xdg_falls_back_to_an_isolated_short_runtime() {
         xdg_runtime_dir: Some(private_home.clone()),
     };
 
-    let profile = resolve_profile(&env).unwrap_or_else(|error| panic!("{error}"));
+    let (profile, resolution) =
+        resolve_profile_with_runtime_resolution(&env).unwrap_or_else(|error| panic!("{error}"));
     let canonical_home = private_home
         .canonicalize()
         .unwrap_or_else(|error| panic!("canonicalize deep private HOME: {error}"));
@@ -166,6 +167,32 @@ fn overlong_private_xdg_falls_back_to_an_isolated_short_runtime() {
     assert!(profile.runtime_dir.starts_with(&expected_owner_root));
     assert!(profile.endpoint_path.starts_with(&profile.runtime_dir));
     assert!(!profile.runtime_dir.starts_with(&canonical_home));
+    assert_eq!(resolution.source, RuntimeDirSource::TmpFallback);
+    assert_eq!(resolution.rejections.len(), 1);
+    assert_eq!(
+        resolution.rejections[0].source,
+        RuntimeDirSource::XdgRuntimeDir
+    );
+    let (len, limit) = match &resolution.rejections[0].reason {
+        RuntimeDirRejectionReason::SocketPathTooLong { len, limit } => (*len, *limit),
+        other => panic!("unexpected overlong XDG rejection: {other:?}"),
+    };
+    assert!(len > limit);
+    assert_eq!(
+        serde_json::to_value(&resolution)
+            .unwrap_or_else(|error| panic!("serialize runtime resolution: {error}")),
+        serde_json::json!({
+            "source": "tmp_fallback",
+            "rejections": [{
+                "source": "xdg_runtime_dir",
+                "reason": {
+                    "kind": "socket_path_too_long",
+                    "len": len,
+                    "limit": limit,
+                }
+            }]
+        })
+    );
     use std::os::unix::ffi::OsStrExt as _;
     assert!(
         profile.endpoint_path.as_os_str().as_bytes().len()
@@ -431,12 +458,16 @@ fn runtime_dir_honors_private_xdg_then_private_tmpdir() {
     with_xdg.xdg_runtime_dir = Some(xdg.clone());
 
     assert_eq!(
-        runtime_dir(&with_xdg, &runtime_env, "profile-123"),
+        runtime_dir(&with_xdg, &runtime_env, "profile-123")
+            .unwrap_or_else(|error| panic!("resolve XDG runtime: {error}"))
+            .0,
         xdg.join("haider").join("profile-123")
     );
 
     assert_eq!(
-        runtime_dir(&env_for(root.path()), &runtime_env, "profile-123"),
+        runtime_dir(&env_for(root.path()), &runtime_env, "profile-123")
+            .unwrap_or_else(|error| panic!("resolve TMPDIR runtime: {error}"))
+            .0,
         tmpdir.join("haider").join("profile-123")
     );
 }
@@ -460,7 +491,9 @@ fn runtime_dir_refuses_a_non_private_tmpdir_and_falls_back() {
     };
 
     assert_eq!(
-        runtime_dir(&env_for(root.path()), &runtime_env, "profile-123"),
+        runtime_dir(&env_for(root.path()), &runtime_env, "profile-123")
+            .unwrap_or_else(|error| panic!("resolve shared TMPDIR runtime: {error}"))
+            .0,
         PathBuf::from("/tmp")
             .join(format!("haider-{}", effective_uid()))
             .join("profile-123")
@@ -485,7 +518,9 @@ fn runtime_dir_uses_a_verified_prefix_tmp_when_tmpdir_is_unavailable() {
     };
 
     assert_eq!(
-        runtime_dir(&env_for(root.path()), &runtime_env, "profile-123"),
+        runtime_dir(&env_for(root.path()), &runtime_env, "profile-123")
+            .unwrap_or_else(|error| panic!("resolve PREFIX runtime: {error}"))
+            .0,
         prefix_tmp.join("haider").join("profile-123")
     );
 }
@@ -501,7 +536,8 @@ fn runtime_override_is_a_root_and_never_collapses_profiles() {
     second_env.runtime_dir = Some(runtime_root.clone());
     second_env.xdg_runtime_dir = Some(root.path().join("ignored-xdg"));
 
-    let first = resolve_profile(&first_env).unwrap_or_else(|error| panic!("{error}"));
+    let (first, first_resolution) = resolve_profile_with_runtime_resolution(&first_env)
+        .unwrap_or_else(|error| panic!("{error}"));
     let second = resolve_profile(&second_env).unwrap_or_else(|error| panic!("{error}"));
 
     let canonical_runtime_root = canonicalize_path_allow_missing(runtime_root)
@@ -510,11 +546,119 @@ fn runtime_override_is_a_root_and_never_collapses_profiles() {
     assert!(second.runtime_dir.starts_with(&canonical_runtime_root));
     assert_ne!(first.runtime_dir, second.runtime_dir);
     assert_eq!(
+        first_resolution,
+        RuntimeDirResolution {
+            source: RuntimeDirSource::HaiderRuntimeDir,
+            rejections: Vec::new(),
+        }
+    );
+    assert_eq!(
         first
             .runtime_dir
             .file_name()
             .and_then(|name| name.to_str())
             .map(str::len),
         Some(RUNTIME_PROFILE_ID_CHARS)
+    );
+}
+
+/// MUTATION CHECK (explicit isolation law): restore the unconditional
+/// short-runtime fallback in `runtime_endpoint`. Expected failure: this test
+/// receives a profile outside the configured root instead of the typed path
+/// budget error.
+#[test]
+#[cfg(unix)]
+fn overlong_explicit_runtime_root_fails_with_typed_path_budget() {
+    let store = tempfile::Builder::new()
+        .prefix("hp-")
+        .tempdir_in("/tmp")
+        .unwrap_or_else(|error| panic!("short profile root: {error}"));
+    let runtime = tempfile::Builder::new()
+        .prefix(&"r".repeat(147))
+        .tempdir_in("/tmp")
+        .unwrap_or_else(|error| panic!("long explicit runtime root: {error}"));
+    let mut env = env_for(store.path());
+    env.runtime_dir = Some(runtime.path().to_path_buf());
+
+    let error = resolve_profile_with_runtime_resolution(&env)
+        .expect_err("an explicit overlong runtime root must fail");
+    match error {
+        ProfileError::RuntimeEndpoint {
+            source:
+                haider_platform::EndpointError::AddressTooLong {
+                    path,
+                    length,
+                    limit,
+                    unit,
+                },
+        } => {
+            assert!(
+                path.starts_with(
+                    runtime.path().canonicalize().unwrap_or_else(|error| panic!(
+                        "canonicalize explicit runtime root: {error}"
+                    ))
+                )
+            );
+            assert!(length > limit);
+            assert_eq!(unit, "bytes");
+        }
+        other => panic!("unexpected explicit runtime error: {other}"),
+    }
+}
+
+/// MUTATION CHECK (XDG visibility): collapse every rejected XDG directory into
+/// a boolean. Expected failure: operators lose both the rejected source and
+/// its exact mode in the status resolution record.
+#[test]
+#[cfg(unix)]
+fn non_private_and_missing_xdg_rejections_are_reported() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::Builder::new()
+        .prefix("hx-")
+        .tempdir_in("/tmp")
+        .unwrap_or_else(|error| panic!("short XDG test root: {error}"));
+    let home = root.path().join("home");
+    let xdg = root.path().join("xdg");
+    std::fs::create_dir(&home).unwrap_or_else(|error| panic!("create HOME: {error}"));
+    std::fs::create_dir(&xdg).unwrap_or_else(|error| panic!("create XDG runtime: {error}"));
+    std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|error| panic!("chmod XDG runtime: {error}"));
+    let mut env = env_for(&root.path().join("profile"));
+    env.home = Some(home.clone());
+    env.xdg_runtime_dir = Some(xdg);
+
+    let (profile, resolution) = resolve_profile_with_runtime_resolution(&env)
+        .unwrap_or_else(|error| panic!("resolve non-private XDG: {error}"));
+    let canonical_home = home
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("canonicalize HOME: {error}"));
+    assert!(
+        profile
+            .runtime_dir
+            .starts_with(canonical_home.join(".haider/runtime"))
+    );
+    assert_eq!(resolution.source, RuntimeDirSource::Home);
+    assert_eq!(resolution.rejections.len(), 1);
+    assert_eq!(
+        resolution.rejections[0],
+        RuntimeDirRejection {
+            source: RuntimeDirSource::XdgRuntimeDir,
+            reason: RuntimeDirRejectionReason::NotOwnerPrivate {
+                mode: "0755".into(),
+            },
+        }
+    );
+
+    env.xdg_runtime_dir = Some(root.path().join("missing-xdg"));
+    let (_, resolution) = resolve_profile_with_runtime_resolution(&env)
+        .unwrap_or_else(|error| panic!("resolve missing XDG: {error}"));
+    assert_eq!(resolution.source, RuntimeDirSource::Home);
+    assert_eq!(
+        resolution.rejections,
+        vec![RuntimeDirRejection {
+            source: RuntimeDirSource::XdgRuntimeDir,
+            reason: RuntimeDirRejectionReason::Missing,
+        }]
     );
 }

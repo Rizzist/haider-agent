@@ -177,10 +177,15 @@ Each profile gets an isolated runtime directory. `HAIDER_RUNTIME_DIR` selects
 its containing root explicitly. Otherwise Unix uses an owner-private
 `XDG_RUNTIME_DIR` when available, then the user home; Windows keeps filesystem
 runtime state below the user home and rendezvous through a profile-derived named
-pipe. If a Unix socket would exceed `sun_path`, Haider automatically selects its
-short owner/profile fallback. `haider status --json` reports the canonical paths
-actually in use; the Windows `daemon.socket_path` value is a named-pipe address,
-not a filesystem path.
+pipe. An explicit Unix `HAIDER_RUNTIME_DIR` that cannot fit under `sun_path`
+fails with the computed length, platform limit, and shorter-directory remedy;
+Haider never silently leaves that configured isolation root. An overlong
+derived root may use the short owner/profile fallback. `haider status --json`
+reports the canonical paths actually in use plus `runtime_dir_resolution`,
+including the winning source and any rejected source/reason, while a fallback
+also emits one stderr warning line. The Windows `daemon.socket_path` value is a
+named-pipe address, not a filesystem path, so Windows keeps a long explicit
+filesystem runtime root.
 
 Stop a profile daemon gracefully and measure the observed lifecycle with:
 
