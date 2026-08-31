@@ -5825,7 +5825,26 @@ impl CredentialBroker {
             })?;
         match begin_result.await {
             Ok(Ok(true)) => {}
-            Ok(Ok(false)) => return Err(stale_refresh()),
+            Ok(Ok(false)) => {
+                // Refresh preparation is an optimistic compare against the
+                // bundle read before this flight was published. A concurrent
+                // flight may have committed a newer generation between that
+                // read and the actor's comparison. Adopt only that narrowly
+                // proven successor; removal, replacement, uncertainty, and
+                // every other mismatch retain the generation fence below.
+                if let Some(access) = Self::adopt_newer_refresh_after_preparation_loss(
+                    inner,
+                    descriptor,
+                    bundle,
+                    expected_fence,
+                    &registration,
+                )
+                .await
+                {
+                    return Ok(access);
+                }
+                return Err(stale_refresh());
+            }
             Ok(Err(error)) => return Err(error),
             Err(_) => {
                 return Err(HaiderError::new(
@@ -5923,6 +5942,51 @@ impl CredentialBroker {
         // MUTATION CHECK: returning before the successful `vault.put` above
         // is killed by refresh_vault_failure_never_returns_rotated_access.
         Ok(refreshed.access_token_handle())
+    }
+
+    async fn adopt_newer_refresh_after_preparation_loss(
+        inner: &Arc<BrokerInner>,
+        descriptor: &CredentialDescriptor,
+        observed: &OAuthTokenBundleV1,
+        expected_fence: u64,
+        registration: &OAuthProviderRegistration,
+    ) -> Option<SecretHandle> {
+        let fence = Self::fence_for_inner(inner, &descriptor.alias);
+        if fence.load(Ordering::Acquire) != expected_fence
+            || Self::snapshot_oauth_state(inner, descriptor) != SnapshotOAuthState::Current
+        {
+            return None;
+        }
+
+        let stored = Self::resolve_vault_inner(inner, &descriptor.alias)
+            .await
+            .ok()?;
+        let current = OAuthTokenBundleV1::decode(stored.expose_secret()).ok()?;
+        let now = now_ms()?;
+        if current.generation <= observed.generation
+            || current.issuer != observed.issuer
+            || current.audience != observed.audience
+            || current.resource != observed.resource
+            || current.identity != observed.identity
+            || current.identity.display_identity != descriptor.identity
+            || current
+                .refresh_rejected_until_unix_ms
+                .is_some_and(|until| now < until)
+            || current.expires_at_unix_ms <= now
+            || validate_bundle_against(registration, descriptor, &current).is_err()
+        {
+            return None;
+        }
+
+        // Recheck both authorities after the blocking vault read. The caller
+        // also repeats these checks after the shared flight completes, closing
+        // a removal/replacement that races this return.
+        if fence.load(Ordering::Acquire) != expected_fence
+            || Self::snapshot_oauth_state(inner, descriptor) != SnapshotOAuthState::Current
+        {
+            return None;
+        }
+        Some(current.access_token_handle())
     }
 
     async fn refresh_serialized_rotating(
