@@ -2132,6 +2132,8 @@ pub(crate) struct WorkerManagerHandle {
 struct WorkerManagerStats {
     supervisors: AtomicUsize,
     joined_supervisors: AtomicUsize,
+    #[cfg(test)]
+    supervisor_exit_observed: Notify,
 }
 
 /// Owner of every supervisor task (R1): one lazy supervisor per session,
@@ -2512,7 +2514,18 @@ impl WorkerManagerHandle {
 
     #[cfg(test)]
     fn joined_supervisor_count(&self) -> usize {
-        self.stats.joined_supervisors.load(Ordering::Relaxed)
+        // Acquire pairs with the manager's release publication after slot
+        // removal, so this witness cannot expose a stale supervisor count.
+        self.stats.joined_supervisors.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    async fn wait_for_joined_supervisor_count(&self, expected: usize) {
+        while self.joined_supervisor_count() < expected {
+            // `notify_one` retains a permit if the manager publishes the
+            // JoinSet outcome between the counter check and this await.
+            self.stats.supervisor_exit_observed.notified().await;
+        }
     }
 
     pub(crate) async fn retry(&self, accepted: AcceptedRunRetry) -> Result<(), HaiderError> {
@@ -3464,7 +3477,6 @@ async fn handle_supervisor_exit(
     // Reaching this line is the explicit witness that the manager-owned
     // JoinSet yielded the task; slot removal and retirement acknowledgements
     // are deliberately downstream of it.
-    stats.joined_supervisors.fetch_add(1, Ordering::Relaxed);
     task_sessions.remove(&task_id);
     if supervisors
         .get(&session_id)
@@ -3473,6 +3485,11 @@ async fn handle_supervisor_exit(
         supervisors.remove(&session_id);
         stats.supervisors.fetch_sub(1, Ordering::Relaxed);
     }
+    // Publish the preceding slot removal to a test observer even when it sees
+    // the counter before it has to await the notification.
+    stats.joined_supervisors.fetch_add(1, Ordering::Release);
+    #[cfg(test)]
+    stats.supervisor_exit_observed.notify_one();
     let (terminalize_nonterminal, quiescent_retired) = match supervisor_outcome {
         SupervisorOutcome::Stopped {
             terminalize_nonterminal,
@@ -11391,13 +11408,17 @@ mod manager_law_tests {
             1,
             "activity earns a complete fresh idle TTL"
         );
+        let joined_before = handle.joined_supervisor_count();
+        let expected_retirement_at = tokio::time::Instant::now() + Duration::from_millis(1);
         tokio::time::advance(Duration::from_millis(1)).await;
-        for _ in 0..64 {
-            if handle.supervisor_count() == 0 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        handle
+            .wait_for_joined_supervisor_count(joined_before.saturating_add(1))
+            .await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            expected_retirement_at,
+            "observing the JoinSet outcome cannot auto-advance past the exact TTL"
+        );
         assert_eq!(
             handle.supervisor_count(),
             0,
