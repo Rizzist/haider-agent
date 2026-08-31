@@ -17,6 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 pub(crate) mod account;
+pub(crate) mod automation;
 pub(crate) mod export;
 pub(crate) mod graph;
 pub(crate) mod hooks;
@@ -65,6 +66,12 @@ impl RuntimeProfile {
     fn for_args(args: &[String]) -> Self {
         match args.first().map(String::as_str) {
             Some("run" | "status") => Self::EphemeralHeadless,
+            Some("sessions") if args.get(1).is_some_and(|argument| argument == "wait-ready") => {
+                Self::EphemeralHeadless
+            }
+            Some("resume") if args.iter().any(|argument| argument == "--json") => {
+                Self::EphemeralHeadless
+            }
             _ => Self::Full,
         }
     }
@@ -159,6 +166,18 @@ fn run_cli(args: Vec<String>) -> ExitCode {
                 runtime.shutdown_background();
                 code
             }
+            Some("sessions") if args.get(1).is_some_and(|argument| argument == "wait-ready") => {
+                let rest = args.get(2..).unwrap_or_default();
+                let code = runtime.block_on(automation::sessions_wait_ready_command(rest));
+                runtime.shutdown_background();
+                code
+            }
+            Some("resume") => {
+                let rest = args.get(1..).unwrap_or_default();
+                let code = runtime.block_on(automation::resume_command(rest));
+                runtime.shutdown_background();
+                code
+            }
             _ => ExitCode::from(EX_SOFTWARE),
         },
         RuntimeProfile::Full => runtime.block_on(dispatch(&args)),
@@ -186,7 +205,12 @@ mod runtime_tests {
 
     #[test]
     fn one_shot_commands_use_the_lean_current_thread_runtime() {
-        for arguments in [args(&["run", "hello"]), args(&["status", "--json"])] {
+        for arguments in [
+            args(&["run", "hello"]),
+            args(&["status", "--json"]),
+            args(&["sessions", "wait-ready", "--count", "1", "--json"]),
+            args(&["resume", "session-a", "--json"]),
+        ] {
             let profile = RuntimeProfile::for_args(&arguments);
             assert_eq!(profile, RuntimeProfile::EphemeralHeadless);
             assert_eq!(runtime_flavor(profile), RuntimeFlavor::CurrentThread);
@@ -281,6 +305,9 @@ async fn dispatch(args: &[String]) -> ExitCode {
         [command] if command == "--ready" => front_door(FrontDoor::Report).await,
         [command, rest @ ..] if command == "run" => run::run_command(rest).await,
         [command, rest @ ..] if command == "status" => observe::status_command(rest).await,
+        [command, subcommand, rest @ ..] if command == "sessions" && subcommand == "wait-ready" => {
+            automation::sessions_wait_ready_command(rest).await
+        }
         [command, rest @ ..] if command == "sessions" => observe::sessions_command(rest).await,
         [command, session_id, subcommand, rest @ ..]
             if command == "session" && subcommand == "config" =>
@@ -319,6 +346,11 @@ async fn dispatch(args: &[String]) -> ExitCode {
         [command, rest @ ..] if command == "tui" => tui_command(rest).await,
         // Owner 2026-08-21: `haider resume` opens the all-sessions picker;
         // `haider resume <id>` attaches that session directly.
+        [command, rest @ ..]
+            if command == "resume" && rest.iter().any(|argument| argument == "--json") =>
+        {
+            automation::resume_command(rest).await
+        }
         [command, rest @ ..] if command == "resume" => match rest {
             [] => {
                 front_door_with_options(
@@ -356,7 +388,8 @@ async fn dispatch(args: &[String]) -> ExitCode {
                  [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] \
                  [--allow-writes] [--allow-exec] [--trust-hooks] [--attach <path>]..., \
                  status [--json] [--no-spawn], sessions [--recovery] [--json] [--no-spawn], \
-                 resume [<session-id>], \
+                 sessions wait-ready --count <n> [--session <id>]... [--timeout <dur>] --json [--no-spawn], \
+                 resume [<session-id>], resume <session-id> --json [--timeout <dur>] [--no-spawn], \
                  session <id> [--json|--watch] [--no-spawn], \
                  session <id> config [--json] [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>], \
                  session <id> seen, session <id> recover [--json] [--probe|--mark-done|--retry|--abandon], \

@@ -2634,12 +2634,73 @@ commit success first. After effect cleanup, terminalization commits
 `RunFailed(BudgetExhausted)` and `RunState::Errored`; restart recovery finds
 the durable exhaustion fact before starting another provider request.
 
-Replay reads the source's typed input and pin, reuses durable attachment refs,
-and submits a new run with `replay_of`. Its typed `ReplayDivergenceV1` compares
-final text, canonical tool calls/results, usage, and terminal outcome. The
-provider layer has no portable seed parameter in this revision: the requested
-seed is recorded, never injected into prompt text, and provider
-nondeterminism remains visible in the divergence report.
+`haider run --replay <run-id>` is a read-only durable-journal operation. It
+resolves the terminal source through the durable run index, reads that run's
+committed envelopes only through its indexed `terminal_seq`, verifies their run identity, strict sequence increase,
+and single terminal coordinate, then emits `haider.run.replay.v1`. It creates
+no session or run, invokes no provider or tool, and appends no journal row.
+The result explicitly reports `mode: "durable_journal"` and
+`provider_requests: 0`. The operation is bounded by `--timeout`, defaulting to
+30 seconds when omitted. Its bytes depend only on the indexed source run: live
+daemon/worker generations and the session's later full-journal head are not
+part of the replay document.
+Same-run session facts that legitimately arrive later (for example a
+background task completion) remain journaled and observable, but are beyond
+the sealed replay boundary and cannot change a replay document.
+
+Replay equivalence is `durable_run_projection_v1`. Four ordered projections
+must be preserved without mutation:
+
+1. **Final text** — the last completed or incomplete assistant message.
+2. **Tool trace** — every tool call and result in journal order, including the
+   provider's stable `call_id`, tool name, arguments, status, and result.
+3. **Usage** — every typed usage fact in journal order, including tokens,
+   cache counters, cost/source truth, and its original durable coordinates.
+4. **Terminal** — the typed budget-exhaustion and failure facts, when present,
+   plus the one terminal `run_state` at the indexed `terminal_seq`.
+
+`equivalent` means all four booleans are true. Since this command returns the
+source envelopes themselves rather than a new execution, any failed integrity
+check is a typed protocol error; the command never reports partial faithfulness
+as success. Sequence values are strictly increasing but may have gaps because
+the session journal can contain envelopes for other runs. The old
+`ReplayDivergenceV1` type remains decodable for compatibility with stored data;
+the CLI no longer creates a billed re-execution under the word "replay".
+
+`haider resume <session-id> --json [--timeout <duration>] [--no-spawn]`
+reconnects through daemon `Ready`, subscribes to the durable session roster,
+and exits when the named session is no longer `running`. Idle, terminal,
+input-required, and effect-recovery-required are finite typed outcomes; a
+missing or still-running session exits `124` with one
+`haider.session.resume.v1` JSON document. The existing spellings without
+`--json` retain their interactive TUI behavior. The timeout is a total wall
+deadline: it starts before connect/autospawn, watch registration, and the
+baseline read, and it also bounds any loss-repair read.
+
+`haider session <id> recover --json <action>` immediately reads the resulting
+digest after `menu.answer` on the same connection. There is no timing sleep,
+and the answer alone is not treated as completion: the CLI verifies the
+action-specific durable postcondition. `--probe` requires a distinct
+replacement recovery menu whose id is causally bound as
+`<answered-menu-id>-probe-<resolution-seq>`, `--retry` requires a fresh run id, `--mark-done`
+requires idle without a replacement recovery menu, and `--abandon` requires
+errored without one. If a crash/lost-response window left only `MenuAnswered`
+committed, the command returns a typed retryable `recovery_incomplete` error
+instead of a false `completed: true`. A successful receipt includes the
+committed resolution and head sequences, resulting state/run id, and the
+replacement menu id produced by `--probe`. `--retry` completes when ambiguity
+is durably settled and the separately identified fresh run is accepted; it
+does not misrepresent that fresh provider run as already terminal.
+
+`haider sessions wait-ready --count N [--session <id>]... --json` installs
+`session.list_watch` before reading its baseline and exits when N current
+durable summaries are published. Named mode requires exactly N unique ids and
+is immune to old profile rows. A ready row has a committed head, typed session
+metadata, and a typed run state; it may intentionally be running. The result
+reports daemon generation, ready/total counts, ids, state counts, and the
+durable summaries. The only timer is the caller's finite deadline; roster
+changes are event-driven, with the daemon's existing reconciliation audit as
+the loss-repair backstop.
 
 Absence laws:
 
@@ -2652,8 +2713,8 @@ Absence laws:
 - Budget exhaustion is journal truth and survives reconnect; it is never
   projected as ordinary user cancellation. Once its durable typed cause is
   committed, a racing later stop cannot replace the budget terminal state.
-- Replay never reports equality by ignoring a provider/tool/usage/terminal
-  difference. Unknown future raw events remain in structured output.
+- Replay never re-executes a provider or tool. Unknown future raw events remain
+  in structured output and are part of the returned durable projection.
 - Exit codes retain the existing headless mapping: provider failure `65`,
   protocol/feature skew `76`, blocked or budget-exhausted `77`, and explicit
   user cancellation `130`.

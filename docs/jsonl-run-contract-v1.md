@@ -63,3 +63,17 @@ emitted as an untyped envelope, so the stream never repeats the terminal `seq`.
 Detached submission ends at the accepted/started boundary and is outside this
 attached-run terminal guarantee; its terminal is consumed later through the
 detached status/events APIs.
+
+## Additive persistence commands
+
+This contiguous JSONL contract is unchanged by the finite persistence
+commands. `haider run --replay <run-id>` deliberately emits one
+`haider.run.replay.v1` JSON document, not JSONL: it filters a shared session
+journal to one run, so its strictly increasing durable `seq` values may have
+gaps where other runs own intervening rows. The replay document preserves the
+same stable provider tool-call ids and verifies exactly one typed terminal.
+
+`haider resume <session-id> --json`, `haider session <id> recover --json ...`,
+and `haider sessions wait-ready ... --json` also emit one versioned document
+and one process exit. They do not add, reorder, or reinterpret records in an
+accepted `haider run --output jsonl` stream.
