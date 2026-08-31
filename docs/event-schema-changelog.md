@@ -120,3 +120,30 @@ JSONL terminal type introduced in this release.
   not a schema entry.
 - `EventPayload::Item` was not added in this release. It is part of the
   v0.0.964 baseline above; the tag diff contains no `EventPayload` change.
+
+### v0.0.968 — additive budget terminal and decision detail
+
+Diff audited: `8952219..ab9c3e8` over `crates/haider-protocol/src`, plus the
+public JSONL terminal enum changed by the same max-cost lane.
+
+- Additive new JSONL terminal kind: `terminal:budget`
+  (`crates/haider-client/src/headless.rs:474`). It identifies the typed
+  `budget_exhausted` run failure and remains distinct from caller timeout and
+  provider failures.
+- Additive optional/defaulted field: `RunBudgetExhaustedV1.decision`
+  (`crates/haider-protocol/src/headless.rs:132-140`). Older facts may omit the
+  field and still decode; a writer also omits it when no decision detail is
+  available.
+- Additive nested decision fields: `spent: u64`, defaulted
+  `projected: Option<u64>`, `cap: u64`, and typed `reason`
+  (`crates/haider-protocol/src/headless.rs:119-130`). An input may omit
+  `projected`; a writer represents an unavailable projection as JSON `null`.
+- Additive `reason.type` kinds: `actual_usage`, `time_elapsed`,
+  `projected_request`, `pricing_unavailable`, and `usage_unavailable`, with
+  `unknown` as the forward-reader fallback
+  (`crates/haider-protocol/src/headless.rs:99-117`). The two unavailable kinds
+  add required `provider` and `model` string fields
+  (`crates/haider-protocol/src/headless.rs:106-113`).
+- No envelope field, core `EventPayload`/`TurnItem` kind, or durable headless
+  payload kind changed. `RunBudgetDimensionV1`, `HeadlessRunUsageV1`, and
+  `HeadlessRunEventPayload::RunBudgetExhausted` all predate this release.
