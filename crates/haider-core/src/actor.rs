@@ -464,11 +464,13 @@ pub struct HarnessConfig {
     pub compaction_guard_v1: bool,
     /// Deterministic daemon-owned policy bound to every request in this actor.
     pub system_prompt: Option<String>,
-    /// Ephemeral daemon-authored user-role context snapshotted once per turn
+    /// Ephemeral daemon-authored user-role context snapshotted once per
+    /// logical provider request
     /// and inserted immediately before the accepted current-user message. It
     /// is never journaled or hashed into the durable stable prefix. The
-    /// snapshot is intentionally byte-stable through every same-turn tool
-    /// continuation; Convergence Graph M1 uses this for `GraphBrief`.
+    /// snapshot is intentionally byte-stable through physical transport
+    /// retries of that request; Convergence Graph M1 uses this for
+    /// `GraphBrief` and typed workflows rebind it after each completed stage.
     pub volatile_user_tail: Option<String>,
     /// General tools the paired dispatcher can execute.
     pub tools: Vec<ToolDefinition>,
@@ -570,6 +572,12 @@ pub struct HarnessConfig {
     pub broadcast_capacity: usize,
     /// Hard ceiling on provider requests made by one logical turn.
     pub max_provider_requests_per_turn: usize,
+    /// Logical requests already spent before a restart-safe continuation was
+    /// reconstructed. Ordinary accepted turns start at zero.
+    pub provider_requests_already_made: usize,
+    /// Physical request-attempt ordinal already consumed before recovery.
+    /// This keeps durable cache/provider-view coordinates monotonic.
+    pub provider_request_ordinal_already_made: u64,
     /// Independent guard against providers repeatedly exhausting output.
     pub max_continuations_per_turn: usize,
     /// Maximum number of submissions parked behind the active turn.
@@ -669,6 +677,8 @@ impl HarnessConfig {
             command_capacity: 8,
             broadcast_capacity: 128,
             max_provider_requests_per_turn: DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN,
+            provider_requests_already_made: 0,
+            provider_request_ordinal_already_made: 0,
             max_continuations_per_turn: DEFAULT_MAX_CONTINUATIONS_PER_TURN,
             deferred_command_capacity: DEFAULT_DEFERRED_COMMAND_CAPACITY,
             supervisor_commits_cancelled: false,
@@ -1050,6 +1060,17 @@ pub enum FinalizationGuardDecision {
 #[async_trait]
 pub trait FinalizationGuard: Send + Sync + std::fmt::Debug {
     async fn before_done(&self, run_id: &RunId) -> Result<FinalizationGuardDecision, HaiderError>;
+
+    /// Request-count-aware daemon hook. Standalone guards retain their old
+    /// implementation; daemon recovery persists this count at clean workflow
+    /// continuation checkpoints.
+    async fn before_done_after_requests(
+        &self,
+        run_id: &RunId,
+        _provider_requests_consumed: usize,
+    ) -> Result<FinalizationGuardDecision, HaiderError> {
+        self.before_done(run_id).await
+    }
 }
 
 /// Daemon-owned classifier for a provider-open wait that exhausted the
@@ -1343,12 +1364,12 @@ pub trait ToolDispatcher: Send + Sync {
         .await
     }
 
-    /// Returns the provider-only context snapshot for a new turn. `None`
+    /// Returns the provider-only context snapshot for a new logical request. `None`
     /// means this dispatcher does not manage volatile context; `Some("")`
     /// clears a previously supplied snapshot. The actor calls this exactly
-    /// once at turn start and freezes the result through all provider/tool
-    /// continuations. State changed during the turn is therefore visible no
-    /// later than the next turn boundary.
+    /// once before each logical request and freezes the result through that
+    /// request's physical transport retries. State changed by a tool round is
+    /// therefore visible at the next provider-request boundary.
     async fn refresh_volatile_context_tail(&self) -> Result<Option<String>, HaiderError> {
         Ok(None)
     }
@@ -2482,10 +2503,10 @@ impl HarnessActor {
             .cache_compaction_summary_end
             .filter(|boundary| *boundary <= stable_history_end);
         // Provider-only context remains separate from the reconstructed
-        // conversation. It is frozen once for this turn, then inserted before
-        // the accepted current-user message in every request projection. This
-        // makes same-turn tool continuations append-only at the provider while
-        // keeping the snapshot out of durable prompt history.
+        // conversation. It is refreshed at each logical request boundary and
+        // frozen across only that request's physical transport retries. This
+        // lets a workflow rebind after durable stage progress while keeping
+        // the snapshot out of durable prompt history.
         let mut volatile_user_tail = self.config.volatile_user_tail.take();
 
         let mut message: Option<TextAccumulator> = None;
@@ -2705,7 +2726,7 @@ impl HarnessActor {
             }
             rotation_budget_consumed = true;
         }
-        let mut provider_request_count = 0usize;
+        let mut provider_request_count = self.config.provider_requests_already_made;
         let mut continuation_count = 0usize;
         let mut forced_compaction_used = false;
         // Once an ineffective compaction promotes this turn, later request
@@ -2721,42 +2742,13 @@ impl HarnessActor {
         // replay and invalidate both the provider-view ledger and cache key.
         let mut logical_request_cacheable_history_end = stable_history_end;
         let mut completed_usage: Option<Usage> = None;
-        let mut provider_request_ordinal = 0_u64;
+        let mut provider_request_ordinal = self.config.provider_request_ordinal_already_made;
         let mut previous_cache_request = self.config.cache_previous_request.clone();
         let mut previous_provider_view = self.config.cache_previous_provider_view.clone();
         let mut pending_previous_cache_request: Option<PreviousCacheRequest> = None;
         let mut previous_cache_request_sent_at: Option<tokio::time::Instant> = None;
         let mut cache_rewarm_pending = self.config.cache_initial_rewarm;
-        if let Some(dispatcher) = self.dispatcher.as_ref() {
-            match dispatcher.refresh_volatile_context_tail().await {
-                Ok(Some(tail)) => volatile_user_tail = (!tail.is_empty()).then_some(tail),
-                Ok(None) => {}
-                Err(error) => {
-                    if let Err(state_error) = self
-                        .commit_pending_thinking(&run_id, &mut thinking_pending)
-                        .await
-                    {
-                        return self.errored_state_outcome(&run_id, state_error).await;
-                    }
-                    return self
-                        .errored_outcome_with_items(
-                            &run_id,
-                            &mut message,
-                            &mut reasoning,
-                            &mut tools,
-                            error,
-                        )
-                        .await;
-                }
-            }
-        }
-        // A snapshot is an immutable provider-prefix block for this turn, but
-        // it is refreshed at the next accepted-turn boundary. Include the run
-        // identity so even byte-identical refreshes declare a new exact-view
-        // epoch instead of pretending to continue the preceding turn.
-        let volatile_context_epoch = volatile_user_tail
-            .as_ref()
-            .map(|tail| digest_json(&(run_id.clone(), tail)));
+        let mut volatile_context_epoch = None;
         // W-B: provider-executed tool rows and cited web sources are
         // TURN-scoped — a pause_turn boundary can split a server call from
         // its result across requests, and the bounded sources list journals
@@ -2764,6 +2756,37 @@ impl HarnessActor {
         let mut server_calls: HashMap<String, (String, serde_json::Value)> = HashMap::new();
         let mut web_sources: Vec<WebSource> = Vec::new();
         'requests: loop {
+            if provider_attempt == 0 {
+                if let Some(dispatcher) = self.dispatcher.as_ref() {
+                    match dispatcher.refresh_volatile_context_tail().await {
+                        Ok(Some(tail)) => volatile_user_tail = (!tail.is_empty()).then_some(tail),
+                        Ok(None) => {}
+                        Err(error) => {
+                            if let Err(state_error) = self
+                                .commit_pending_thinking(&run_id, &mut thinking_pending)
+                                .await
+                            {
+                                return self.errored_state_outcome(&run_id, state_error).await;
+                            }
+                            return self
+                                .errored_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    error,
+                                )
+                                .await;
+                        }
+                    }
+                }
+                // The run identity separates accepted turns; the tail digest
+                // separates logical requests after durable workflow progress.
+                // Physical retries keep this exact epoch and request body.
+                volatile_context_epoch = volatile_user_tail
+                    .as_ref()
+                    .map(|tail| digest_json(&(run_id.clone(), tail)));
+            }
             self.pending_nudges
                 .extend(self.promoted_steers.drain_committed());
             let previous_cache_request_completed = pending_previous_cache_request.is_some();
@@ -2915,8 +2938,8 @@ impl HarnessActor {
             if let Some(tail) = &volatile_user_tail {
                 request_messages.insert(snapshot_insert_at, Message::user_text(tail.clone()));
                 let snapshot_end = snapshot_insert_at.saturating_add(1);
-                // The frozen snapshot is stable inside this turn. A later
-                // provider/tool-loop boundary is expressed in durable-message
+                // The request snapshot is stable across physical retries. A
+                // later provider/tool-loop boundary is expressed in durable-message
                 // coordinates, so shift it past the inserted request block.
                 request_stable_history_end = request_stable_history_end.max(snapshot_end);
                 request_cacheable_history_end =
@@ -4585,7 +4608,10 @@ impl HarnessActor {
                                     .await;
                             }
                             loop {
-                                let decision = match guard.before_done(&run_id).await {
+                                let decision = match guard
+                                    .before_done_after_requests(&run_id, provider_request_count)
+                                    .await
+                                {
                                     Ok(decision) => decision,
                                     Err(error) => {
                                         return self

@@ -10,15 +10,21 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_accounts::{MemoryVault, Vault as _};
+use haider_core::{CancelToken, ToolDispatchResult, ToolDispatcher};
 use haider_daemon::{
     DaemonConfig, DaemonDependencies, ProviderFactory, ProviderFactoryConfig, ResolvedTurnProvider,
+    TurnToolFactory, WorkerToolContext,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
+use haider_protocol::effect::{EffectClass, FileFreshness};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{CredentialAlias, RunId, SessionId};
+use haider_protocol::headless::{HeadlessRunSpecV1, RunBudgetV1};
+use haider_protocol::ids::{CredentialAlias, ItemId, MenuId, RunId, SessionId};
 use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, TurnItem};
+use haider_protocol::loom::LoomAgentType;
+use haider_protocol::menu::{Menu, MenuAnswer};
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason};
 use haider_protocol::session::{
     SessionInteractionModeV1, SessionMetadataV1, SessionPermissionOverridesV1,
@@ -34,12 +40,13 @@ use haider_rpc::{
     ResponseBody, SeqRange, SessionFleetSnapshot, SshAuthInputWire, SshProfileInputWire,
     SshScopeWire, WireFrame,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use haider_tools::SessionGrant;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use support::{UdsClient, ready_with_dependencies, test_root};
-#[cfg(windows)]
 use tokio::sync::Semaphore;
 
 // This binary has five tests that launch the production Windows PowerShell,
@@ -67,11 +74,160 @@ async fn windows_real_process_test_guard(
 struct RoutingFactory {
     providers: Arc<BTreeMap<String, Arc<dyn Provider>>>,
     fail_on_resolve: Arc<BTreeSet<String>>,
+    max_provider_requests_per_turn: Option<usize>,
 }
 
 struct CacheAwareFixtureProvider {
     renderer: AnthropicProvider,
     scripted: Arc<FakeProvider>,
+}
+
+struct RefreshBarrier {
+    needle: String,
+    occurrence: usize,
+    matches: AtomicUsize,
+    armed: AtomicBool,
+    entered: Semaphore,
+    release: tokio::sync::Notify,
+}
+
+impl RefreshBarrier {
+    fn new(needle: impl Into<String>, occurrence: usize) -> Self {
+        Self {
+            needle: needle.into(),
+            occurrence,
+            matches: AtomicUsize::new(0),
+            armed: AtomicBool::new(true),
+            entered: Semaphore::new(0),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("refresh barrier remains open")
+            .forget();
+    }
+
+    async fn pause_if_armed(&self, tail: &Option<String>) {
+        if tail
+            .as_deref()
+            .is_some_and(|tail| tail.contains(&self.needle))
+            && self.matches.fetch_add(1, Ordering::AcqRel) + 1 == self.occurrence
+            && self.armed.swap(false, Ordering::AcqRel)
+        {
+            self.entered.add_permits(1);
+            self.release.notified().await;
+        }
+    }
+}
+
+struct BarrierToolFactory {
+    inner: Arc<dyn TurnToolFactory>,
+    barrier: Arc<RefreshBarrier>,
+}
+
+struct BarrierDispatcher {
+    inner: Arc<dyn ToolDispatcher>,
+    barrier: Arc<RefreshBarrier>,
+}
+
+#[async_trait]
+impl ToolDispatcher for BarrierDispatcher {
+    async fn preflight_tool_call(&self, name: &str) -> Result<(), HaiderError> {
+        self.inner.preflight_tool_call(name).await
+    }
+
+    async fn execute(
+        &self,
+        run_id: &RunId,
+        item_id: &ItemId,
+        call_id: &str,
+        name: &str,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        self.inner
+            .execute(run_id, item_id, call_id, name, args, cancel)
+            .await
+    }
+
+    async fn refresh_volatile_context_tail(&self) -> Result<Option<String>, HaiderError> {
+        let tail = self.inner.refresh_volatile_context_tail().await?;
+        self.barrier.pause_if_armed(&tail).await;
+        Ok(tail)
+    }
+
+    async fn activate_approval(
+        &self,
+        run_id: &RunId,
+        checkpoint: &haider_core::RequestInputCheckpoint,
+    ) -> Result<(), HaiderError> {
+        self.inner.activate_approval(run_id, checkpoint).await
+    }
+
+    async fn resolve_approval(&self, menu: &Menu, answer: &MenuAnswer) -> Result<(), HaiderError> {
+        self.inner.resolve_approval(menu, answer).await
+    }
+
+    async fn cancel(&self) -> Result<(), HaiderError> {
+        self.inner.cancel().await
+    }
+
+    async fn close(&self) -> Result<(), HaiderError> {
+        self.inner.close().await
+    }
+}
+
+#[async_trait]
+impl TurnToolFactory for BarrierToolFactory {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        self.inner.definitions()
+    }
+
+    fn shared_definitions(&self) -> Arc<[ToolDefinition]> {
+        self.inner.shared_definitions()
+    }
+
+    async fn create(
+        &self,
+        context: WorkerToolContext,
+    ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        Ok(self.inner.create(context).await?.map(|inner| {
+            Arc::new(BarrierDispatcher {
+                inner,
+                barrier: Arc::clone(&self.barrier),
+            }) as Arc<dyn ToolDispatcher>
+        }))
+    }
+
+    async fn create_with_turn_snapshot(
+        &self,
+        context: WorkerToolContext,
+        durable_grants: Vec<SessionGrant>,
+        durable_bindings: HashMap<MenuId, (EffectClass, String)>,
+        durable_freshness: HashMap<String, FileFreshness>,
+        effect_dispatched: Arc<AtomicBool>,
+    ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        Ok(self
+            .inner
+            .create_with_turn_snapshot(
+                context,
+                durable_grants,
+                durable_bindings,
+                durable_freshness,
+                effect_dispatched,
+            )
+            .await?
+            .map(|inner| {
+                Arc::new(BarrierDispatcher {
+                    inner,
+                    barrier: Arc::clone(&self.barrier),
+                }) as Arc<dyn ToolDispatcher>
+            }))
+    }
 }
 
 #[async_trait]
@@ -130,6 +286,10 @@ impl ProviderFactory for RoutingFactory {
             compaction_promotion: None,
         })
     }
+
+    fn max_provider_requests_per_turn_override(&self) -> Option<usize> {
+        self.max_provider_requests_per_turn
+    }
 }
 
 fn dependencies(
@@ -152,11 +312,39 @@ fn dependencies(
             factory: Arc::new(RoutingFactory {
                 providers: Arc::new(providers),
                 fail_on_resolve: Arc::new(fail_on_resolve),
+                max_provider_requests_per_turn: None,
             }),
             providers: creatable,
         },
         ..DaemonDependencies::default()
     }
+}
+
+fn fake_dependencies_with_request_limit(
+    script: Vec<FakeStep>,
+    limit: usize,
+) -> (DaemonDependencies, Arc<FakeProvider>) {
+    let fake = Arc::new(FakeProvider::new(script));
+    let provider: Arc<dyn Provider> = fake.clone();
+    let mut dependencies = dependencies([("fake".into(), provider)], []);
+    let ProviderFactoryConfig::Injected { factory, providers } = dependencies.provider_factory
+    else {
+        unreachable!("fixture dependencies always use an injected provider factory")
+    };
+    let routing = RoutingFactory {
+        providers: Arc::new(BTreeMap::from([(
+            "fake".into(),
+            fake.clone() as Arc<dyn Provider>,
+        )])),
+        fail_on_resolve: Arc::new(BTreeSet::new()),
+        max_provider_requests_per_turn: Some(limit),
+    };
+    let _ = factory;
+    dependencies.provider_factory = ProviderFactoryConfig::Injected {
+        factory: Arc::new(routing),
+        providers,
+    };
+    (dependencies, fake)
 }
 
 fn fake_dependencies(script: Vec<FakeStep>) -> (DaemonDependencies, Arc<FakeProvider>) {
@@ -248,6 +436,30 @@ async fn create_and_attach(
     permission_overrides: Option<SessionPermissionOverridesV1>,
     ssh_scope: Option<SshScopeWire>,
 ) -> (SessionId, u64) {
+    create_and_attach_with_mode(
+        client,
+        config,
+        workspace,
+        provider,
+        model,
+        permission_overrides,
+        ssh_scope,
+        SessionInteractionModeV1::Interactive,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_and_attach_with_mode(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    workspace: &Path,
+    provider: &str,
+    model: &str,
+    permission_overrides: Option<SessionPermissionOverridesV1>,
+    ssh_scope: Option<SshScopeWire>,
+    interaction_mode: SessionInteractionModeV1,
+) -> (SessionId, u64) {
     send_request(
         client,
         config,
@@ -260,7 +472,7 @@ async fn create_and_attach(
             max_tokens: 4096,
             permission_overrides,
             cache_policy: None,
-            interaction_mode: SessionInteractionModeV1::Interactive,
+            interaction_mode,
             ssh_scope,
             account_alias: None,
             resolve_provider: false,
@@ -349,7 +561,227 @@ async fn submit_turn(
     }
 }
 
+async fn register_workflow_chain(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    workflow_id: &str,
+    node_names: &[&str],
+) {
+    for (index, node) in node_names.iter().enumerate() {
+        let agent_id = node.to_ascii_lowercase();
+        send_request(
+            client,
+            config,
+            &format!("register-agent-{agent_id}"),
+            RequestBody::LoomRegisterAgentType {
+                record: LoomAgentType {
+                    id: agent_id.clone(),
+                    name: format!("{node} fixture"),
+                    job: format!("produce artifact {}", index + 1),
+                    in_type: format!("Artifact{index}"),
+                    out_type: format!("Artifact{}", index + 1),
+                    clis: Vec::new(),
+                    apis: Vec::new(),
+                    denials: Vec::new(),
+                    skills: Vec::new(),
+                    scripts: Vec::new(),
+                    color: String::new(),
+                    glyph: String::new(),
+                    rev: 0,
+                },
+                expected_rev: Some(0),
+                expected_digest: None,
+            },
+        )
+        .await;
+        match next_response(client).await {
+            WireFrame::Response {
+                body: ResponseBody::LoomRegistered { .. },
+                ..
+            } => {}
+            other => panic!("registering agent type {agent_id} failed: {other:?}"),
+        }
+    }
+    let terminal_type = format!("Artifact{}", node_names.len());
+    let nodes = node_names
+        .iter()
+        .map(|node| {
+            format!(
+                "{} @{} \"produce {}\" :cmd",
+                node.to_ascii_lowercase(),
+                node.to_ascii_lowercase(),
+                node.to_ascii_lowercase()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    send_request(
+        client,
+        config,
+        "register-workflow",
+        RequestBody::LoomRegisterWorkflow {
+            source: format!("{workflow_id}: Artifact0 -> {terminal_type}\n{nodes}"),
+            expected_rev: Some(0),
+            expected_digest: None,
+        },
+    )
+    .await;
+    match next_response(client).await {
+        WireFrame::Response {
+            body: ResponseBody::LoomRegistered { .. },
+            ..
+        } => {}
+        other => panic!("registering workflow {workflow_id} failed: {other:?}"),
+    }
+}
+
+async fn pin_workflow(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    session_id: SessionId,
+    generation: u64,
+    workflow_id: &str,
+) {
+    send_request(
+        client,
+        config,
+        "pin-workflow",
+        RequestBody::GraphPin {
+            command_id: CommandId::new("pin-workflow-command"),
+            session_id,
+            worker_generation: generation,
+            template: workflow_id.into(),
+            expected_digest: None,
+        },
+    )
+    .await;
+    match next_response(client).await {
+        WireFrame::Response {
+            body: ResponseBody::GraphPin { .. },
+            ..
+        } => {}
+        other => panic!("pinning workflow {workflow_id} failed: {other:?}"),
+    }
+}
+
+async fn start_headless_run(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    workspace: &Path,
+    session_id: SessionId,
+    generation: u64,
+    command_id: &str,
+) -> RunId {
+    send_request(
+        client,
+        config,
+        command_id,
+        RequestBody::HeadlessRunStart {
+            command_id: CommandId::new(command_id),
+            session_id,
+            worker_generation: generation,
+            text: "execute the pinned workflow".into(),
+            attachments: Vec::new(),
+            spec: HeadlessRunSpecV1 {
+                cwd: workspace.to_string_lossy().into_owned(),
+                provider: "fake".into(),
+                model: "fake-v1".into(),
+                max_output_tokens: 4096,
+                effort: None,
+                fast: false,
+                seed: Some(968),
+                permission_overrides: SessionPermissionOverridesV1::default(),
+                trust_hooks: false,
+                budget: RunBudgetV1::default(),
+                request_deadline_unix_ms: None,
+                replay_of: None,
+            },
+            trust_hooks: false,
+        },
+    )
+    .await;
+    loop {
+        match client.next().await {
+            WireFrame::Response {
+                body: ResponseBody::HeadlessRunStart { run_id, .. },
+                ..
+            } => return run_id,
+            WireFrame::Response {
+                body: ResponseBody::Error { code, message, .. },
+                ..
+            } => panic!("headless start `{command_id}` failed ({code}): {message}"),
+            _ => {}
+        }
+    }
+}
+
+fn workflow_script(node_names: &[&str]) -> Vec<FakeStep> {
+    node_names
+        .iter()
+        .enumerate()
+        .flat_map(|(index, node)| {
+            tool_round(
+                &format!("evidence-{}", index + 1),
+                "graph_evidence",
+                serde_json::json!({
+                    "node": node,
+                    "verdict": "green",
+                    "detail": format!("artifact-marker-{}", index + 1),
+                }),
+                &format!("stage-{}-finished", index + 1),
+            )
+        })
+        .collect()
+}
+
+fn request_contains(request: &TurnRequest, needle: &str) -> bool {
+    request.messages.iter().any(|message| {
+        message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Text { text } if text.contains(needle)))
+    })
+}
+
+async fn workflow_graph_state(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    session_id: SessionId,
+) -> haider_protocol::graph::WorkflowGraphState {
+    send_request(
+        client,
+        config,
+        "workflow-state",
+        RequestBody::WorkflowGraphState {
+            session_id,
+            graph_id: None,
+        },
+    )
+    .await;
+    match next_response(client).await {
+        WireFrame::Response {
+            body: ResponseBody::WorkflowGraphState { state: Some(state) },
+            ..
+        } => state,
+        other => panic!("reading workflow graph state failed: {other:?}"),
+    }
+}
+
 async fn events_until_terminal(client: &mut UdsClient, run_id: &RunId) -> Vec<EventPayload> {
+    let (state, failure, events) = events_until_any_terminal(client, run_id).await;
+    match state {
+        RunState::Done => events,
+        state => panic!(
+            "run {run_id} reached unexpected terminal state {state:?}; failure={failure:?}; observed_events={}",
+            events.len()
+        ),
+    }
+}
+
+async fn events_until_any_terminal(
+    client: &mut UdsClient,
+    run_id: &RunId,
+) -> (RunState, Option<(ErrorCode, String)>, Vec<EventPayload>) {
     let mut events = Vec::new();
     let mut last_state = None;
     let mut failure = None;
@@ -383,14 +815,7 @@ async fn events_until_terminal(client: &mut UdsClient, run_id: &RunId) -> Vec<Ev
                 };
                 events.push(payload);
                 if terminal {
-                    match last_state.as_ref() {
-                        Some(RunState::Done) => return,
-                        Some(state) => panic!(
-                            "run {run_id} reached unexpected terminal state {state:?}; failure={failure:?}; observed_events={}",
-                            events.len()
-                        ),
-                        None => unreachable!("terminal payload records a run state"),
-                    }
+                    return;
                 }
             }
         }
@@ -405,7 +830,11 @@ async fn events_until_terminal(client: &mut UdsClient, run_id: &RunId) -> Vec<Ev
         client.report_connection_failure(&reason);
         panic!("{reason}");
     }
-    events
+    (
+        last_state.expect("terminal payload records a run state"),
+        failure,
+        events,
+    )
 }
 
 async fn wait_for_session_idle(client: &mut UdsClient, session_id: &SessionId) {
@@ -872,6 +1301,302 @@ fn create_large_sparse_file(path: &Path, length: u64) -> std::io::Result<()> {
     let file = fs::File::create(path)?;
     haider_platform::fs::mark_file_sparse(&file)?;
     file.set_len(length)
+}
+
+async fn assert_headless_workflow_chain_completes(test_id: &str, node_names: &[&str]) {
+    let root = test_root(&format!("{test_id}-"));
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let (dependencies, fake) = fake_dependencies(workflow_script(node_names));
+    let config = DaemonConfig::new(
+        test_id,
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        test_id,
+        "workflow-client",
+        ClientKind::Headless,
+    )
+    .await;
+    register_workflow_chain(&mut client, &config, test_id, node_names).await;
+    let (session_id, generation) = create_and_attach_with_mode(
+        &mut client,
+        &config,
+        &workspace,
+        "fake",
+        "fake-v1",
+        None,
+        None,
+        SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    pin_workflow(
+        &mut client,
+        &config,
+        session_id.clone(),
+        generation,
+        test_id,
+    )
+    .await;
+    let run_id = start_headless_run(
+        &mut client,
+        &config,
+        &workspace,
+        session_id.clone(),
+        generation,
+        "headless-workflow",
+    )
+    .await;
+    let _events = events_until_terminal(&mut client, &run_id).await;
+    let requests = fake.requests();
+    assert_eq!(
+        requests.len(),
+        node_names.len() * 2,
+        "the fake script supplies exactly two terminal request segments per stage"
+    );
+    for (index, node) in node_names.iter().enumerate().skip(1) {
+        let request = &requests[index * 2];
+        assert!(
+            request_contains(request, &format!("artifact-marker-{index}")),
+            "stage {node} did not receive its predecessor's exact CAS artifact"
+        );
+        assert!(
+            request_contains(
+                request,
+                &format!("daemon bound workflow {test_id} node {node}")
+            ),
+            "stage {node} did not receive its current typed executor binding"
+        );
+    }
+    let state = workflow_graph_state(&mut client, &config, session_id).await;
+    assert_eq!(
+        state.phase,
+        haider_protocol::graph::WorkflowGraphPhase::Completed
+    );
+    assert!(state.nodes.iter().all(|node| {
+        node.phase == haider_protocol::graph::WorkflowNodePhase::Completed
+            && !node.outputs.is_empty()
+    }));
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// P0 workflow-continuation gate. This is also the requested mutation check:
+/// moving volatile refresh back outside the logical request loop makes the
+/// IMPLEMENT call retain PLAN authority and the run ends workflow_unfinished.
+#[tokio::test]
+async fn headless_three_stage_workflow_completes_with_forwarded_artifacts() {
+    assert_headless_workflow_chain_completes(
+        "headless-three-stage-workflow",
+        &["PLAN", "IMPLEMENT", "VERIFY"],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn headless_five_stage_workflow_has_no_two_hop_ceiling() {
+    assert_headless_workflow_chain_completes(
+        "headless-five-stage-workflow",
+        &["PLAN", "IMPLEMENT", "VERIFY", "PACKAGE", "PUBLISH"],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn headless_workflow_provider_request_cap_returns_typed_loop_limit() {
+    let test_id = "headless-workflow-loop-limit";
+    let nodes = ["PLAN", "IMPLEMENT", "VERIFY"];
+    let root = test_root("headless-workflow-loop-limit-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let request_limit = 2;
+    assert!(request_limit < nodes.len());
+    let (dependencies, fake) =
+        fake_dependencies_with_request_limit(workflow_script(&nodes), request_limit);
+    let config = DaemonConfig::new(
+        test_id,
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        test_id,
+        "loop-limit-client",
+        ClientKind::Headless,
+    )
+    .await;
+    register_workflow_chain(&mut client, &config, test_id, &nodes).await;
+    let (session_id, generation) = create_and_attach_with_mode(
+        &mut client,
+        &config,
+        &workspace,
+        "fake",
+        "fake-v1",
+        None,
+        None,
+        SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    pin_workflow(
+        &mut client,
+        &config,
+        session_id.clone(),
+        generation,
+        test_id,
+    )
+    .await;
+    let run_id = start_headless_run(
+        &mut client,
+        &config,
+        &workspace,
+        session_id,
+        generation,
+        "headless-loop-limit",
+    )
+    .await;
+    let (state, failure, events) = events_until_any_terminal(&mut client, &run_id).await;
+    assert_eq!(state, RunState::Errored);
+    assert!(matches!(failure, Some((ErrorCode::LoopLimit, _))));
+    assert!(!events.iter().any(|payload| {
+        matches!(
+            payload,
+            EventPayload::RunFailed {
+                code: ErrorCode::WorkflowUnfinished,
+                ..
+            }
+        )
+    }));
+    assert_eq!(fake.requests().len(), request_limit);
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+#[tokio::test]
+async fn headless_workflow_resumes_after_daemon_crash_between_stages() {
+    let test_id = "headless-workflow-crash-recovery";
+    let nodes = ["PLAN", "IMPLEMENT", "VERIFY"];
+    let root = test_root("headless-workflow-crash-recovery-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let (mut dependencies, fake) = fake_dependencies(workflow_script(&nodes));
+    let barrier = Arc::new(RefreshBarrier::new(
+        "daemon bound workflow headless-workflow-crash-recovery node VERIFY",
+        2,
+    ));
+    dependencies.tool_factory = Arc::new(BarrierToolFactory {
+        inner: Arc::clone(&dependencies.tool_factory),
+        barrier: Arc::clone(&barrier),
+    });
+    let config = DaemonConfig::new(
+        test_id,
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let first_task = ready_with_dependencies(&config, dependencies.clone()).await;
+    let mut first_client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        test_id,
+        "crash-client",
+        ClientKind::Headless,
+    )
+    .await;
+    register_workflow_chain(&mut first_client, &config, test_id, &nodes).await;
+    let (session_id, generation) = create_and_attach_with_mode(
+        &mut first_client,
+        &config,
+        &workspace,
+        "fake",
+        "fake-v1",
+        None,
+        None,
+        SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    pin_workflow(
+        &mut first_client,
+        &config,
+        session_id.clone(),
+        generation,
+        test_id,
+    )
+    .await;
+    let run_id = start_headless_run(
+        &mut first_client,
+        &config,
+        &workspace,
+        session_id.clone(),
+        generation,
+        "headless-crash-run",
+    )
+    .await;
+    tokio::time::timeout(support::DEADLINE, barrier.wait_until_entered())
+        .await
+        .expect("VERIFY request-boundary barrier is reached");
+    assert_eq!(
+        fake.requests().len(),
+        4,
+        "the daemon crashed after IMPLEMENT finalization and before VERIFY request attempt"
+    );
+    drop(first_client);
+    first_task.crash().await;
+
+    let second_task = ready_with_dependencies(&config, dependencies).await;
+    let mut second_client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        test_id,
+        "restart-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let replay = attach_existing(
+        &mut second_client,
+        &config,
+        session_id.clone(),
+        "attach-after-crash",
+    )
+    .await;
+    let replay_terminal = replay.iter().filter_map(|envelope| {
+        (envelope.run_id.as_ref() == Some(&run_id))
+            .then(|| serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok())
+            .flatten()
+            .and_then(|payload| match payload {
+                EventPayload::RunState(state) if state.is_terminal() => Some(state),
+                _ => None,
+            })
+    });
+    if !replay_terminal
+        .into_iter()
+        .any(|state| state == RunState::Done)
+    {
+        let events = events_until_terminal(&mut second_client, &run_id).await;
+        assert!(
+            events
+                .iter()
+                .any(|payload| matches!(payload, EventPayload::RunState(RunState::Done)))
+        );
+    }
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 6);
+    assert!(request_contains(&requests[4], "artifact-marker-2"));
+    assert!(request_contains(
+        &requests[4],
+        "daemon bound workflow headless-workflow-crash-recovery node VERIFY"
+    ));
+    let state = workflow_graph_state(&mut second_client, &config, session_id).await;
+    assert_eq!(
+        state.phase,
+        haider_protocol::graph::WorkflowGraphPhase::Completed
+    );
+    second_task.shutdown_handle().request("test complete");
+    second_task.join().await.expect("daemon joins");
 }
 
 /// A1: one provider script forces every real tool result back through a

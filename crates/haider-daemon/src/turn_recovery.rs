@@ -40,10 +40,12 @@ use haider_core::{
     SqliteStoreHandle, StoreHandle, TurnAdmissionDisposition,
 };
 use haider_protocol::EventPayload;
+use haider_protocol::cache::CacheRequestAttemptV1;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
+use haider_protocol::graph::{GraphFinalizationDeferred, GraphPhase};
 use haider_protocol::headless::{HeadlessRunEventPayload, RunBudgetExhaustedV1};
 use haider_protocol::ids::{
     AgentId, BranchId, DeviceId, EventId, ItemId, MenuId, RunId, SessionId,
@@ -61,6 +63,7 @@ const RUN_STATE_PAYLOAD_KINDS: &[&str] = &["run_state"];
 pub(crate) const STARTUP_HYDRATION_PAYLOAD_KINDS: &[&str] = &[
     "agent_report",
     "effect",
+    "graph_finalization_deferred",
     "headless_run_configured",
     "hook_run_trust",
     "item",
@@ -79,7 +82,7 @@ pub(crate) const STARTUP_HYDRATION_PAYLOAD_KINDS: &[&str] = &[
 const CHECKPOINT_PROJECTION: &str = "startup_turn_recovery";
 const CHECKPOINT_TIMELINE: &str = "session";
 const CHECKPOINT_SHAPE_VERSION: u32 = 1;
-const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v2";
+const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v3";
 
 pub(crate) enum RecoveredWork {
     Queued(AcceptedTurn),
@@ -87,6 +90,13 @@ pub(crate) enum RecoveredWork {
     Checkpoint(Box<RecoveredCheckpoint>),
     PartialStream(Box<RecoveredPartialStream>),
     ChildWait(Box<RecoveredChildWait>),
+    WorkflowContinuation(Box<RecoveredWorkflowContinuation>),
+}
+
+pub(crate) struct RecoveredWorkflowContinuation {
+    pub(crate) accepted: AcceptedTurn,
+    pub(crate) provider_requests_consumed: usize,
+    pub(crate) provider_request_ordinal: u64,
 }
 
 pub(crate) struct RecoveredPartialStream {
@@ -127,6 +137,10 @@ struct RunReduction {
     headless_configured: bool,
     #[serde(default)]
     budget_exhausted: Option<RunBudgetExhaustedV1>,
+    #[serde(default)]
+    workflow_deferral: Option<(GraphFinalizationDeferred, u64)>,
+    #[serde(default)]
+    latest_provider_request_attempt: Option<(u64, u64)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -378,6 +392,13 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                 }
                 continue;
             }
+            if let Some(continuation) =
+                pending_workflow_continuation(store, &session_id, &run_id, &state, &reduction)
+                    .await?
+            {
+                recovered.push(RecoveredWork::WorkflowContinuation(Box::new(continuation)));
+                continue;
+            }
             if let Some(checkpoint) = pending_checkpoint(&reduction)
                 && checkpoint_state_matches(&state, &checkpoint)
             {
@@ -588,6 +609,86 @@ pub(crate) async fn recover_interrupted_turns(
     .work)
 }
 
+async fn pending_workflow_continuation(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    run_id: &RunId,
+    state: &RunState,
+    reduction: &RunReduction,
+) -> Result<Option<RecoveredWorkflowContinuation>, HaiderError> {
+    if *state != RunState::Streaming
+        || !reduction.headless_configured
+        || reduction.budget_exhausted.is_some()
+        || !reduction.open_items.is_empty()
+        || !reduction.incomplete_items.is_empty()
+        || reduction.menu.is_some()
+    {
+        return Ok(None);
+    }
+    let Some((deferred, deferred_seq)) = reduction.workflow_deferral.as_ref() else {
+        return Ok(None);
+    };
+    // A request-attempt marker is committed before provider open. Once one
+    // exists after the deferral, provider delivery is ambiguous and generic
+    // interrupted-stream recovery must remain fail-closed.
+    if !provider_request_precedes_deferral(
+        reduction
+            .latest_provider_request_attempt
+            .map(|(seq, _)| seq),
+        *deferred_seq,
+    ) || &deferred.run_id != run_id
+    {
+        return Ok(None);
+    }
+    let Some(status) = store.graph_status(session_id).await? else {
+        return Ok(None);
+    };
+    if status.phase != GraphPhase::Active
+        || status.graph_id != deferred.graph_id
+        || haider_store::graph_finalization_state_digest(&status)? != deferred.state_digest
+    {
+        return Ok(None);
+    }
+    let accepted_seq = reduction.user_seq.ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            format!("workflow continuation run {run_id} has no user message"),
+            false,
+        )
+    })?;
+    let provider_requests_consumed =
+        usize::try_from(deferred.provider_requests_consumed).map_err(|_| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!(
+                    "workflow continuation request count {} does not fit this platform",
+                    deferred.provider_requests_consumed
+                ),
+                false,
+            )
+        })?;
+    Ok(Some(RecoveredWorkflowContinuation {
+        accepted: recovered_acceptance(
+            session_id,
+            run_id,
+            accepted_seq,
+            store.worker_generation(),
+            reduction.branch_id.clone(),
+        ),
+        provider_requests_consumed,
+        provider_request_ordinal: reduction
+            .latest_provider_request_attempt
+            .map_or(0, |(_, ordinal)| ordinal),
+    }))
+}
+
+fn provider_request_precedes_deferral(
+    latest_provider_request_attempt_seq: Option<u64>,
+    deferred_seq: u64,
+) -> bool {
+    latest_provider_request_attempt_seq.is_some_and(|attempt_seq| attempt_seq < deferred_seq)
+}
+
 fn checkpoint_state_matches(state: &RunState, checkpoint: &RequestInputCheckpoint) -> bool {
     match state {
         // A present-and-proceed plan can crash after MenuOpened but before its
@@ -698,6 +799,7 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
                     | EventPayload::MenuClosed { .. }
                     | EventPayload::ToolResult { .. }
                     | EventPayload::AgentReport(_)
+                    | EventPayload::GraphFinalizationDeferred(_)
             )
         );
     if !recovery_relevant {
@@ -800,6 +902,9 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
             }
         }
         EventPayload::Item(ItemEvent::Completed { item_id, item }) => {
+            if let Some(attempt) = CacheRequestAttemptV1::from_extension_item(&item) {
+                reduction.latest_provider_request_attempt = Some((envelope.seq, attempt.ordinal));
+            }
             let item = match item {
                 TurnItem::IncompleteAgentMessage { text, .. } => {
                     reduction.open_items.remove(&item_id);
@@ -834,6 +939,9 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
                 reduction.child_results.insert(report.agent.clone());
             }
             reduction.open_items.remove(&item_id);
+        }
+        EventPayload::GraphFinalizationDeferred(deferred) => {
+            reduction.workflow_deferral = Some((deferred, envelope.seq));
         }
         EventPayload::MenuOpened(menu) => {
             reduction.menu = Some(OpenMenu {

@@ -103,5 +103,15 @@ only after both are green.
   header types must be identifiers (or `A + B` composites), never empty.
 - **Bounds**: hop cap and per-node attempt caps are runtime constants, not
   source-controlled (a graph author cannot un-bound a run).
+- **Autonomous continuation**: one external turn may spend as many workflow
+  continuations as the declared stages require and its run budget permits.
+  Each logical provider-request boundary rebinds the current typed node and
+  its exact CAS inputs. The run deadline, `max-cost`, and
+  `max_provider_requests_per_turn` remain the enclosing bounds; crossing the
+  request ceiling returns the typed loop-limit error. A repeated
+  `(run_id, workflow-state digest)` after a durable finalization deferral stays
+  fail-closed as `workflow_unfinished`, because crash/replay ambiguity or no
+  progress cannot safely authorize duplicate work. A changed digest is durable
+  proof of stage progress and may spend the next continuation.
 - Versioning: this document is `pipe/v1`. The version rides the registry
   record, not the source text.

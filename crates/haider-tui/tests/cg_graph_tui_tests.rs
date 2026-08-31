@@ -214,6 +214,7 @@ fn m2c_finalization_deferred_surfaces_a_bounded_note() {
             graph_id: GraphId::new("g1"),
             run_id: haider_protocol::ids::RunId::new("r1"),
             state_digest: "blake3:deadbeef".into(),
+            provider_requests_consumed: 0,
             unmet_nodes: vec![
                 build_node(),
                 verify_node(),

@@ -1605,13 +1605,21 @@ autonomous resolutions in
 | `InteractionGate::RequestInputWithoutDefault` | `InteractionResolution::ReturnNoHumanAvailable` |
 | `InteractionGate::PartialProviderStream` | `InteractionResolution::ContinuePartial` |
 | `InteractionGate::WorkflowUnfinishedFirst` | `InteractionResolution::ContinueWorkflow` |
-| `InteractionGate::WorkflowUnfinishedRecurrence` | `InteractionResolution::ReturnWorkflowUnfinished` |
+| `InteractionGate::WorkflowUnfinishedRecurrence` | `InteractionResolution::ReturnWorkflowUnfinished` for recurrence of the same durable `(run_id, workflow-state digest)` |
 | `InteractionGate::EffectBrokerAsk`, `InteractionGate::OsOrDesktopPermission`, `InteractionGate::CredentialOrLogin`, `InteractionGate::MobileOrDeviceGrant`, `InteractionGate::GraphHumanConfirm`, `InteractionGate::UnknownEffectAfterCrash`, `InteractionGate::DestructiveOrClobber`, or `InteractionGate::CacheEpochOrConfiguration` | `InteractionResolution::FailClosed` |
 
 `ReturnNoHumanAvailable` commits the typed tool code
-`"no_human_available"` (`crates/haider-core/src/actor.rs:5544-5577`), and
+`"no_human_available"` in `HarnessActor::run_turn`, and
 `ReturnWorkflowUnfinished` publishes the turn error code
-`"workflow_unfinished"` (`crates/haider-daemon/src/worker.rs:509-528`).
+`"workflow_unfinished"` through `workflow_unfinished_error` in
+`crates/haider-daemon/src/worker.rs`.
+
+A changed workflow-state digest is progress, not recurrence. An autonomous
+external turn may therefore continue through every declared stage while its
+run deadline, maximum cost, and provider-request ceiling permit it. The daemon
+rebinds the active typed node and exact CAS inputs at each logical provider
+request. Repeating the same digest remains fail-closed because the journal
+cannot distinguish no progress from an ambiguous crash/replay at that point.
 
 In particular, autonomous mode MUST NOT be rendered as auto-approval. Durable
 permission overrides remain a separate field and authority. Without
@@ -2617,7 +2625,7 @@ surface from these implementation facts:
 | Lane | Client-contract effect |
 |---|---|
 | cachemaxxing | Provider-view ledgers, breakpoint placement, cache lifecycle, header epochs, and economic cache accounting refine the existing published cache metrics. They add no RPC method; clients still read the authorities in §1.1 and §9.1. |
-| C1 | A provider-only graph/Loom/inventory snapshot is frozen once per turn and placed in that turn's immutable provider prefix. It is not journaled or exposed as a client field. |
+| C1 | A provider-only graph/Loom/inventory snapshot is refreshed at each logical provider request and frozen across that request's physical transport retries. It is not journaled or exposed as a client field. |
 | C2 | OpenAI-family prompt-cache routing hashes provider + model + account scope + finalized provider-view header epoch + cohort. Cohort defaults to the session identity, so unrelated same-account sessions are isolated. The opaque provider key is not a client surface. |
 | C3 | A byte-identical fork may inherit the parent provider-view segment and its fork-cohort root; only `context_epoch: inherited` with a present, still-active `inherited_cache_segment` shares that route. A `fresh` fork, or an inherited child after its provider view diverges from the recorded segment, uses its own session cohort. The segment records provider/model/account scope, cache route/epoch, exact prefix digest and stable boundary, and source provider-view coordinates; no new `session.fork` request or response field was added. |
 | C4 | Pure filesystem reads and validated web responses may be served from bounded, freshness-checked process-local memos. Tool results retain their existing wire and journal shapes. |

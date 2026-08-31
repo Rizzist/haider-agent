@@ -423,6 +423,7 @@ async fn graph_evidence_tool_dispatches_to_daemon_gate_authority() {
     assert_eq!(status.attempt, 1);
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
+    let expected_nodes = ["BUILD", "VERIFY", "VERIFY"];
     for (round, request) in requests.iter().enumerate() {
         let user_turn = request
             .messages
@@ -451,19 +452,20 @@ async fn graph_evidence_tool_dispatches_to_daemon_gate_authority() {
         assert_eq!(
             graph_briefs.len(),
             1,
-            "request round {} contains exactly one frozen graph snapshot",
+            "request round {} contains exactly one current graph snapshot",
             round + 1
         );
         assert!(
-            graph_briefs[0]
-                .1
-                .starts_with("GraphBrief: BUILD attempt 1/8;"),
-            "request round {} retains the turn-opening BUILD snapshot",
-            round + 1
+            graph_briefs[0].1.starts_with(&format!(
+                "GraphBrief: {} attempt 1/8;",
+                expected_nodes[round]
+            )),
+            "request round {} reflects the graph transition at its logical request boundary",
+            round + 1,
         );
         assert!(
             graph_briefs[0].0 < user_turn,
-            "request round {} places the frozen graph snapshot before the accepted user",
+            "request round {} places the current graph snapshot before the accepted user",
             round + 1
         );
     }

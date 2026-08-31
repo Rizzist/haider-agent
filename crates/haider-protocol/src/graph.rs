@@ -2169,13 +2169,18 @@ pub struct GraphAbandoned {
 }
 
 /// Durable claim that one provider run tried to finalize while the active
-/// graph still had obligations. The state digest distinguishes genuine graph
-/// progress while `(graph_id, run_id)` bounds the one automatic reminder.
+/// graph still had obligations. A repeated `(run_id, state_digest)` is the
+/// fail-closed crash/replay coordinate; a changed digest proves genuine graph
+/// progress. `(graph_id, run_id)` bounds the one automatic reminder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphFinalizationDeferred {
     pub graph_id: GraphId,
     pub run_id: RunId,
     pub state_digest: String,
+    /// Logical provider requests spent through this clean continuation
+    /// checkpoint. Recovery restores it so restart cannot reset the loop cap.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub provider_requests_consumed: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmet_nodes: Vec<GraphNodeName>,
 }
@@ -4906,6 +4911,10 @@ fn docs_sweep_template() -> GraphTemplateSpec {
 }
 
 const fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+const fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 

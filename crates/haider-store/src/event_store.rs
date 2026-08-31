@@ -493,6 +493,7 @@ pub struct GraphFinalizationCommand {
     pub run_id: RunId,
     pub worker_generation: u64,
     pub device_id: DeviceId,
+    pub provider_requests_consumed: u64,
 }
 
 /// Durable graph authority's decision at one provider finalization boundary.
@@ -511,8 +512,9 @@ pub enum GraphFinalizationOutcome {
         /// Empty when an already-open durable menu is replayed.
         envelopes: Vec<RawEnvelope>,
     },
-    /// Autonomous recurrence after the one durable continue-work deferral.
-    /// No abandon menu is opened and no graph authority is mutated.
+    /// Autonomous recurrence at the same durable workflow-state digest after
+    /// a continue-work deferral. No abandon menu is opened and no graph
+    /// authority is mutated.
     WorkflowUnfinished {
         graph_id: GraphId,
         state_digest: String,
@@ -4823,10 +4825,6 @@ impl Store {
         let same_state_deferred = reduction.finalization_deferrals.iter().any(|deferred| {
             deferred.run_id == command.run_id && deferred.state_digest == state_digest
         });
-        let run_already_deferred = reduction
-            .finalization_deferrals
-            .iter()
-            .any(|deferred| deferred.run_id == command.run_id);
         let metadata_json = transaction
             .query_row(
                 "SELECT meta_json FROM sessions WHERE id = ?1",
@@ -4845,7 +4843,7 @@ impl Store {
         let policy = haider_protocol::interaction::InteractionResolutionPolicy::new(
             metadata.interaction_mode,
         );
-        if run_already_deferred
+        if same_state_deferred
             && matches!(
                 (
                     policy.resolve(
@@ -4873,7 +4871,7 @@ impl Store {
             {
                 return Err(store_error(
                     ErrorCode::Internal,
-                    "unfinished-workflow policy refused its one safe continuation",
+                    "unfinished-workflow policy refused a progressed safe continuation",
                     false,
                 ));
             }
@@ -4885,6 +4883,7 @@ impl Store {
                 graph_id: status.graph_id.clone(),
                 run_id: command.run_id.clone(),
                 state_digest: state_digest.clone(),
+                provider_requests_consumed: command.provider_requests_consumed,
                 unmet_nodes: status
                     .nodes
                     .iter()
@@ -16044,7 +16043,7 @@ fn graph_confirm_menu_for(
     }
 }
 
-fn graph_finalization_state_digest(status: &GraphStatus) -> StoreResult<String> {
+pub fn graph_finalization_state_digest(status: &GraphStatus) -> StoreResult<String> {
     let mut obligation = status.clone();
     // Guardrail menus are presentation/wait state, not graph progress. If
     // included, opening the confirmation would make its own coordinates stale

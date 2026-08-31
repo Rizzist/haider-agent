@@ -1151,6 +1151,15 @@ async fn run_inner(
                     .recover_child_wait(recovered.accepted, recovered.checkpoint)
                     .await
             }
+            RecoveredWork::WorkflowContinuation(recovered) => {
+                worker_handle
+                    .recover_workflow_continuation(
+                        recovered.accepted,
+                        recovered.provider_requests_consumed,
+                        recovered.provider_request_ordinal,
+                    )
+                    .await
+            }
         };
         if let Err(error) = result {
             let _ = worker_manager.shutdown().await;

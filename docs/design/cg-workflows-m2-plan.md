@@ -65,10 +65,12 @@ evidence-item key, so three duplicate attestations satisfy VERIFY.
 
 ## M2c — Adoption guardrail + telemetry + inspection (click-to-see-stats)
 - At provider `EndTurn`, after items settle but before `RunState::Done`, consult
-  the graph (streamed text can't be honestly erased — actor.rs:2160/:2453).
-  First unmet finalization → `GraphFinalizationDeferred` + one managed
-  continuation reminder; the second opens a durable `GraphAbandonConfirm` — only
-  continue-work or explicit abandon-and-finish may proceed. Never silently drop.
+  the graph in `HarnessActor::run_turn` (streamed text can't be honestly
+  erased).
+  First unmet finalization state → `GraphFinalizationDeferred` + one managed
+  continuation reminder. A changed state digest proves graph progress and may
+  continue again; recurrence of the same `(run, digest)` fails closed (or opens
+  the interactive durable `GraphAbandonConfirm`). Never silently drop.
 - Journal facts stay authoritative; transactionally maintain rebuildable
   `graph_runs`, `graph_node_attempts`, `graph_template_rollups`. Derive
   completion/abandon rates, mis-gates/overrides, attempts/node, node duration
@@ -78,8 +80,9 @@ evidence-item key, so three duplicate attestations satisfy VERIFY.
   **clicking the strip opens a scrollable inspection screen** — this is the
   owner's "click the active workflow → stats."
 - **Laws:** never commit Done with unmet obligations absent explicit abandon;
-  exactly one reminder per graph/run across restart; metrics rebuild byte-for-
-  byte from events; parallel durations aren't summed.
+  exactly one reminder per graph/run across restart; changed workflow states
+  may continue within the run's request/deadline/cost budgets; metrics rebuild
+  byte-for-byte from events; parallel durations aren't summed.
 
 ## M2d — Per-todo workflow groups (K runs per turn)
 - **Each todo is a separate CHILD GRAPH, not a re-epoched replay** (epochs mean
