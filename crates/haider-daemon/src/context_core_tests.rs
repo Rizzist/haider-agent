@@ -86,12 +86,13 @@ const BRANCH_EXEC_COMMAND: &str = "printf branch";
 #[cfg(windows)]
 const BRANCH_EXEC_COMMAND: &str = "[Console]::Out.Write('branch')";
 
-// The production Windows interpreter is inbox PowerShell. Its cold process
-// startup is materially slower under the fully concurrent per-crate gate;
-// this bound covers that platform cost without changing Unix's five-second
-// regression budget or any production deadline.
+// The production Windows interpreter is inbox PowerShell. The outer test
+// bound must cover its existing 30-second cold-start allowance plus the
+// process supervisor's 60-second wall limit and two-second kill grace. This
+// changes no production deadline and keeps Unix's five-second regression
+// budget unchanged.
 #[cfg(windows)]
-const PROCESS_TURN_DEADLINE: Duration = Duration::from_secs(30);
+const PROCESS_TURN_DEADLINE: Duration = Duration::from_secs(92);
 #[cfg(not(windows))]
 const PROCESS_TURN_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -276,16 +277,31 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
     timeout(PROCESS_TURN_DEADLINE, async {
         loop {
             let events = store.read(&session_id, 0, 512).await.expect("read");
-            if events.iter().any(|event| {
-                event.run_id.as_ref() == Some(&branch_run)
-                    && matches!(
-                        serde_json::from_value::<EventPayload>(event.payload.clone()),
-                        Ok(EventPayload::RunState(RunState::Done))
-                    )
-            }) {
-                break;
+            let mut terminal = None;
+            let mut failure = None;
+            for event in events
+                .iter()
+                .filter(|event| event.run_id.as_ref() == Some(&branch_run))
+            {
+                match serde_json::from_value::<EventPayload>(event.payload.clone()) {
+                    Ok(EventPayload::RunFailed { code, message, .. }) => {
+                        failure = Some((code, message));
+                    }
+                    Ok(EventPayload::RunState(state)) if state.is_terminal() => {
+                        terminal = Some(state);
+                    }
+                    _ => {}
+                }
             }
-            tokio::task::yield_now().await;
+            match terminal {
+                Some(RunState::Done) => break,
+                Some(state) => {
+                    panic!(
+                        "branch reached unexpected terminal state {state:?}; failure={failure:?}"
+                    )
+                }
+                None => tokio::task::yield_now().await,
+            }
         }
     })
     .await

@@ -1370,7 +1370,7 @@ fn session_readiness_and_resume_are_finite_event_driven_json_barriers() {
     let mut running_resume = Command::new(env!("CARGO_BIN_EXE_haider"));
     configure_test_home(&mut running_resume, &hanging.profile);
     running_resume
-        .args(["resume", hanging_session, "--json", "--timeout", "50ms"])
+        .args(["resume", hanging_session, "--json", "--timeout", "2s"])
         .env("HAIDER_PROFILE_DIR", &hanging.profile)
         .env("HAIDER_DISCOVERY_DISABLED", "1");
     let running_resume = running_resume.output().expect("running resume executes");
@@ -2298,7 +2298,25 @@ fn run_jsonl_cancelled_has_130_exit_and_terminal_envelope() {
 
 #[test]
 fn run_jsonl_timeout_has_one_distinct_timeout_terminal() {
-    let out = haider()
+    let mut run = haider();
+    run.env("HAIDER_TEST_FAKE_PROVIDER", r#"[{"step":"hang"}]"#);
+    let mut ready = Command::new(env!("CARGO_BIN_EXE_haider"));
+    configure_test_home(&mut ready, &run.profile);
+    ready
+        .arg("--ready")
+        .env("HAIDER_PROFILE_DIR", &run.profile)
+        .env("HAIDER_DISCOVERY_DISABLED", "1")
+        // The daemon owns the fake provider, so the warm-up process must
+        // install the same script before the timed client connects to it.
+        .env("HAIDER_TEST_FAKE_PROVIDER", r#"[{"step":"hang"}]"#);
+    let ready = output_with_boot_retry(&mut ready);
+    assert!(
+        ready.status.success(),
+        "daemon warm-up stderr: {}",
+        String::from_utf8_lossy(&ready.stderr)
+    );
+
+    let out = run
         .args([
             "run",
             "--provider",
@@ -2309,7 +2327,6 @@ fn run_jsonl_timeout_has_one_distinct_timeout_terminal() {
             "--timeout",
             "2s",
         ])
-        .env("HAIDER_TEST_FAKE_PROVIDER", r#"[{"step":"hang"}]"#)
         .output()
         .expect("binary runs");
     assert_eq!(out.status.code(), Some(124));

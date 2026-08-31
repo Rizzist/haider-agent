@@ -569,13 +569,13 @@ async fn exhausted_aggregate_budget_marks_and_counts_the_farther_omission() {
         loaded
             .files()
             .iter()
-            .any(|file| file.path.ends_with("child/HAIDER.md"))
+            .any(|file| Path::new(&file.path).ends_with(Path::new("child").join("HAIDER.md")))
     );
     assert!(
         loaded
             .files()
             .iter()
-            .all(|file| !file.path.ends_with("parent/HAIDER.md"))
+            .all(|file| !Path::new(&file.path).ends_with(Path::new("parent").join("HAIDER.md")))
     );
     assert!(
         loaded
