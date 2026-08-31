@@ -243,7 +243,7 @@ An operation not listed here is part of the v1 base surface. “Field” means t
 client may use that field only when it is present; the named token permits an
 affordance before the response exists.
 
-The ordinary v0.0.967 `welcome_features()` set contains all 101 tokens below.
+The ordinary v0.0.968 `welcome_features()` set contains all 101 tokens below.
 The re-verification anchors are the `welcome_features()` function in
 `crates/haider-daemon/src/connection.rs` and the `FEATURE_*` constant block in
 `crates/haider-rpc/src/frame.rs`. The one peer-specific withholding exception
