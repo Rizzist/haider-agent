@@ -206,7 +206,7 @@ class LoaderContractTests(unittest.TestCase):
         self.assertEqual(
             {check.id: check.budget.milliseconds for check in checks}, expected
         )
-        self.assertEqual(sum(check.budget.milliseconds for check in checks), 20_550_000)
+        self.assertEqual(sum(check.budget.milliseconds for check in checks), 20_078_500)
         by_id = {check.id: check for check in checks}
         for check_id in (
             "t0.budget.max_cost_binds_before_request",
