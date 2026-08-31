@@ -55,6 +55,11 @@ use haider_tools::{MessageSubagent, SpawnSubagent};
 use rustix::fs::{Mode, OFlags};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+#[cfg(all(test, unix))]
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -83,6 +88,49 @@ pub(crate) struct DelegationHandle {
     stall_deadline: Duration,
     run_wait_timeout: Duration,
     settlement_tail_timeout: Duration,
+    #[cfg(all(test, unix))]
+    stall_deadline_clock: Option<Arc<StallDeadlineTestClock>>,
+}
+
+#[cfg(all(test, unix))]
+#[derive(Default)]
+pub(crate) struct StallDeadlineTestClock {
+    now_ms: AtomicU64,
+    checked: Mutex<(u64, u64)>,
+}
+
+#[cfg(all(test, unix))]
+impl StallDeadlineTestClock {
+    pub(crate) fn set_now_ms(&self, now_ms: u64) {
+        self.now_ms.store(now_ms, Ordering::SeqCst);
+    }
+
+    pub(crate) fn checks_at(&self, expected_ms: u64) -> u64 {
+        let checked = self
+            .checked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if checked.0 == expected_ms {
+            checked.1
+        } else {
+            0
+        }
+    }
+
+    fn deadline_elapsed(&self, committed_at_ms: u64, deadline: Duration) -> bool {
+        let now_ms = self.now_ms.load(Ordering::SeqCst);
+        let elapsed = deadline_elapsed_at(committed_at_ms, deadline, now_ms);
+        let mut checked = self
+            .checked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if checked.0 == now_ms {
+            checked.1 = checked.1.saturating_add(1);
+        } else {
+            *checked = (now_ms, 1);
+        }
+        elapsed
+    }
 }
 
 #[derive(Debug)]
@@ -205,6 +253,8 @@ impl DelegationHandle {
             stall_deadline: CHILD_STALL_DEADLINE,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
             settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
+            #[cfg(all(test, unix))]
+            stall_deadline_clock: None,
         }
     }
 
@@ -215,6 +265,22 @@ impl DelegationHandle {
             stall_deadline,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
             settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
+            stall_deadline_clock: None,
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_stall_deadline_clock(
+        hub: SessionHub,
+        stall_deadline: Duration,
+        stall_deadline_clock: Arc<StallDeadlineTestClock>,
+    ) -> Self {
+        Self {
+            hub,
+            stall_deadline,
+            run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
+            settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
+            stall_deadline_clock: Some(stall_deadline_clock),
         }
     }
 
@@ -228,6 +294,8 @@ impl DelegationHandle {
             stall_deadline: CHILD_STALL_DEADLINE,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
             settlement_tail_timeout,
+            #[cfg(all(test, unix))]
+            stall_deadline_clock: None,
         }
     }
 
@@ -243,7 +311,17 @@ impl DelegationHandle {
             stall_deadline,
             run_wait_timeout,
             settlement_tail_timeout,
+            #[cfg(all(test, unix))]
+            stall_deadline_clock: None,
         }
+    }
+
+    fn stall_deadline_elapsed(&self, committed_at_ms: u64) -> bool {
+        #[cfg(all(test, unix))]
+        if let Some(clock) = &self.stall_deadline_clock {
+            return clock.deadline_elapsed(committed_at_ms, self.stall_deadline);
+        }
+        deadline_elapsed(committed_at_ms, self.stall_deadline)
     }
 
     /// Resolves the child's metadata from the parent's CURRENT metadata plus
@@ -969,14 +1047,12 @@ impl DelegationHandle {
                 let progress = self.delegation_progress(&record).await?;
                 if !progress.human_required {
                     match progress.nudge {
-                        None if deadline_elapsed(progress.latest_at_ms, self.stall_deadline) => {
+                        None if self.stall_deadline_elapsed(progress.latest_at_ms) => {
                             self.nudge(&record).await?;
                         }
                         Some((_, nudge_at_ms))
-                            if deadline_elapsed(
-                                progress.latest_at_ms.max(nudge_at_ms),
-                                self.stall_deadline,
-                            ) =>
+                            if self
+                                .stall_deadline_elapsed(progress.latest_at_ms.max(nudge_at_ms)) =>
                         {
                             self.cancel_subtree(&record, CancelCause::Stall).await?;
                         }
@@ -2991,7 +3067,11 @@ fn instant_from_unix_deadline(deadline_at_ms: u64) -> tokio::time::Instant {
 }
 
 fn deadline_elapsed(committed_at_ms: u64, deadline: Duration) -> bool {
-    unix_time_ms().saturating_sub(committed_at_ms) >= duration_millis(deadline)
+    deadline_elapsed_at(committed_at_ms, deadline, unix_time_ms())
+}
+
+fn deadline_elapsed_at(committed_at_ms: u64, deadline: Duration, now_ms: u64) -> bool {
+    now_ms.saturating_sub(committed_at_ms) >= duration_millis(deadline)
 }
 
 pub(crate) fn graph_reduction_event(payload: &serde_json::Value) -> bool {
