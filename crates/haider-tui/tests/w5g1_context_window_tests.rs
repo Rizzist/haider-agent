@@ -50,6 +50,7 @@ fn windowed_summary(
             .iter()
             .map(|(slug, window)| haider_rpc::ModelDetailWire {
                 name: (*slug).to_owned(),
+                display_name: None,
                 context_window: *window,
                 supported_efforts: Vec::new(),
                 default_effort: None,

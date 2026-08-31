@@ -53,6 +53,7 @@ fn provider_summary(
             .iter()
             .map(|slug| haider_rpc::ModelDetailWire {
                 name: (*slug).to_owned(),
+                display_name: None,
                 context_window: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,

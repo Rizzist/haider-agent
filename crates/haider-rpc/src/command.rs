@@ -157,6 +157,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         "[scope all|none|name,…|shell name]",
     ),
     client_cmd("shells", "List local and SSH terminal sessions", ""),
+    session_client_cmd("monitors", "Existing session monitor details", ""),
     client_cmd(
         "accounts",
         "Accounts — provider credentials (OAuth / API), pick the active one",

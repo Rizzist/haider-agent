@@ -690,6 +690,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     models: vec!["frontier-a".into()],
                     model_details: vec![ModelDetailWire {
                         name: "frontier-a".into(),
+                        display_name: None,
                         context_window: None,
                         supported_efforts: Vec::new(),
                         default_effort: None,
@@ -763,6 +764,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     models: vec!["frontier-a".into()],
                     model_details: vec![ModelDetailWire {
                         name: "frontier-a".into(),
+                        display_name: None,
                         context_window: None,
                         supported_efforts: Vec::new(),
                         default_effort: None,
@@ -813,6 +815,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     models: vec!["local-frontier-a".into()],
                     model_details: vec![ModelDetailWire {
                         name: "local-frontier-a".into(),
+                        display_name: None,
                         context_window: None,
                         supported_efforts: Vec::new(),
                         default_effort: None,
@@ -880,6 +883,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     model_details: vec![
                         ModelDetailWire {
                             name: "frontier-a".into(),
+                            display_name: None,
                             context_window: None,
                             supported_efforts: Vec::new(),
                             default_effort: None,
@@ -888,6 +892,7 @@ pub fn transcript() -> Vec<WireFrame> {
                         },
                         ModelDetailWire {
                             name: "frontier-b".into(),
+                            display_name: None,
                             context_window: None,
                             supported_efforts: Vec::new(),
                             default_effort: None,
@@ -1320,6 +1325,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     models: vec!["gemini-2.5-flash".into()],
                     model_details: vec![ModelDetailWire {
                         name: "gemini-2.5-flash".into(),
+                        display_name: None,
                         context_window: Some(1_048_576),
                         supported_efforts: Vec::new(),
                         default_effort: None,

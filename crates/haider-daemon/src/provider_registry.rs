@@ -1094,6 +1094,7 @@ fn model_detail_wire(provider: &str, model: DiscoveredModel) -> ModelDetailWire 
     };
     ModelDetailWire {
         name: model.slug,
+        display_name: Some(model.display_name),
         context_window: model.context_window,
         supported_efforts,
         default_effort,

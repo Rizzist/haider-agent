@@ -6,7 +6,7 @@
 
 use crate::app::{AppModel, Hit, LauncherRow, LoomPane, Screen, update_version_label};
 use crate::boot::{boot_subline, check_rows, launcher_subline};
-use crate::commands::{HELP_TEXT, PALETTE_MAX_ROWS};
+use crate::commands::{HELP_INTRO_TEXT, PALETTE_MAX_ROWS, help_catalog_lines};
 use crate::format::{METER_CELLS_DEFAULT, fmt_elapsed, fmt_tok, meter_cells};
 use crate::plain::status_glyph;
 use crate::projection::{ItemBlock, SessionProjection, TranscriptEntry};
@@ -11243,14 +11243,17 @@ fn palette_row_hits(model: &AppModel, area: Rect, hits: &mut Vec<(Rect, Hit)>) {
     }
 }
 
-/// The /help overlay: sim HELP_TEXT panel over the body.
+/// The `/help` overlay: prose plus command rows from the shared catalog.
 fn render_help(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let mut lines = vec![Line::from(vec![
         Span::styled("help", theme.gold_style()),
         Span::styled("  esc closes", theme.faint_style()),
     ])];
-    for entry in HELP_TEXT {
+    for entry in HELP_INTRO_TEXT {
         lines.push(Line::styled(*entry, theme.dim_style()));
+    }
+    for entry in help_catalog_lines(&model.dynamic_slots()) {
+        lines.push(Line::styled(entry, theme.dim_style()));
     }
     // W-C M1: user-loaded custom commands are listed under their OWN heading,
     // visually distinct from the built-ins (the maroon `✎ /name` marker), so
@@ -11620,6 +11623,10 @@ fn render_monitors_overlay(
         Span::styled("monitors", theme.gold_style()),
         Span::styled("  existing monitor details · esc", theme.faint_style()),
     ])];
+    lines.push(Line::styled(
+        "  use /monitors to refresh daemon truth",
+        theme.faint_style(),
+    ));
     if model.monitors.is_empty() {
         lines.push(Line::styled("  no active monitors", theme.dim_style()));
     } else {

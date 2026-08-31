@@ -391,6 +391,7 @@ pub fn seed_provider_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
             .iter()
             .map(|&model| haider_rpc::ModelDetailWire {
                 name: model.to_owned(),
+                display_name: None,
                 context_window: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,

@@ -1195,6 +1195,10 @@ pub enum SnapshotAvailabilityWire {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelDetailWire {
     pub name: String,
+    /// Human label from the provider catalog. `None` is an older daemon or a
+    /// source that publishes only the request slug; clients then show `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     /// The pair's effort ladder, in the provider's own vocabulary and order.

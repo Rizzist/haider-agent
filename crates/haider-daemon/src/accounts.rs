@@ -595,7 +595,7 @@ struct StagedSecret {
 /// this connection and daemon instance.
 #[derive(Default)]
 pub(crate) struct StagedSecrets {
-    entries: Vec<StagedSecret>,
+    entries: Arc<StdMutex<Vec<StagedSecret>>>,
 }
 
 /// Typed staging failure mapped by the rpc layer.
@@ -618,7 +618,8 @@ impl StagedSecrets {
     ) -> Result<(String, u64), StageError> {
         self.sweep_expired();
         let digest = *blake3::hash(secret_bytes).as_bytes();
-        if let Some(existing) = self.entries.iter().find(|entry| entry.stage_id == stage_id) {
+        let mut entries = lock_staged_entries(&self.entries);
+        if let Some(existing) = entries.iter().find(|entry| entry.stage_id == stage_id) {
             if existing.digest == digest && existing.purpose == purpose {
                 return Ok((existing.reference.clone(), existing.expires_at_ms));
             }
@@ -633,15 +634,18 @@ impl StagedSecrets {
             let _ = write!(&mut reference, "{byte:02x}");
         }
         let expires_at_ms = unix_ms_after(SECRET_TTL);
-        self.entries.push(StagedSecret {
+        let staged_at = Instant::now();
+        entries.push(StagedSecret {
             stage_id: stage_id.to_owned(),
             digest,
             purpose,
             secret: Zeroizing::new(secret_bytes.to_vec()),
-            staged_at: Instant::now(),
+            staged_at,
             reference: reference.clone(),
             expires_at_ms,
         });
+        drop(entries);
+        self.schedule_expiry(staged_at);
         Ok((reference, expires_at_ms))
     }
 
@@ -649,11 +653,11 @@ impl StagedSecrets {
     /// caller. `None` covers unknown, already-claimed, and expired alike.
     pub(crate) fn claim(&mut self, reference: &str) -> Option<(StagePurpose, Zeroizing<Vec<u8>>)> {
         self.sweep_expired();
-        let index = self
-            .entries
+        let mut entries = lock_staged_entries(&self.entries);
+        let index = entries
             .iter()
             .position(|entry| entry.reference == reference)?;
-        let entry = self.entries.swap_remove(index);
+        let entry = entries.swap_remove(index);
         Some((entry.purpose, entry.secret))
     }
 
@@ -663,17 +667,44 @@ impl StagedSecrets {
     /// it before `account.login_api` consumes the same reference.
     pub(crate) fn probe(&mut self, reference: &str) -> Option<(StagePurpose, Zeroizing<Vec<u8>>)> {
         self.sweep_expired();
-        let entry = self
-            .entries
-            .iter()
-            .find(|entry| entry.reference == reference)?;
+        let entries = lock_staged_entries(&self.entries);
+        let entry = entries.iter().find(|entry| entry.reference == reference)?;
         Some((entry.purpose, Zeroizing::new(entry.secret.to_vec())))
     }
 
     fn sweep_expired(&mut self) {
-        self.entries
-            .retain(|entry| entry.staged_at.elapsed() < SECRET_TTL);
+        lock_staged_entries(&self.entries).retain(|entry| entry.staged_at.elapsed() < SECRET_TTL);
     }
+
+    /// Schedule the storage release itself. The weak reference makes
+    /// disconnect/close authoritative: the timer cannot keep connection-owned
+    /// secrets alive. Lazy sweeps remain a defense-in-depth clock check.
+    fn schedule_expiry(&self, staged_at: Instant) {
+        let entries = Arc::downgrade(&self.entries);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let _expiry_task = runtime.spawn(async move {
+            tokio::time::sleep_until(staged_at + SECRET_TTL).await;
+            let Some(entries) = entries.upgrade() else {
+                return;
+            };
+            lock_staged_entries(&entries).retain(|entry| entry.staged_at.elapsed() < SECRET_TTL);
+        });
+    }
+
+    #[cfg(test)]
+    fn resident_entry_count(&self) -> usize {
+        lock_staged_entries(&self.entries).len()
+    }
+}
+
+fn lock_staged_entries(
+    entries: &StdMutex<Vec<StagedSecret>>,
+) -> std::sync::MutexGuard<'_, Vec<StagedSecret>> {
+    entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn unix_ms_after(delta: Duration) -> u64 {

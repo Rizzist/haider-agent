@@ -239,6 +239,40 @@ fn selecting_a_login_provider_visibly_advances_to_its_method_slot() {
     }
 }
 
+/// MUTATION CHECK: replace an argument row with only its newest value in
+/// `activate_palette_item`, or do the same in Tab completion. Expected
+/// failure: the provider slot disappears and the API-key card cannot open.
+#[test]
+fn login_palette_activation_preserves_provider_then_method_slots() {
+    let mut enter_model = live_model(&[]);
+    for character in "/login".chars() {
+        enter_model.handle(key(KeyCode::Char(character)));
+    }
+    enter_model.handle(key(KeyCode::Enter));
+    assert_eq!(enter_model.composer.text(), "/login anthropic ");
+    enter_model.handle(key(KeyCode::Enter));
+    assert_eq!(
+        enter_model
+            .login
+            .as_ref()
+            .map(|card| card.provider.as_str()),
+        Some("anthropic"),
+        "the second activation must open the chosen provider's API-key card"
+    );
+
+    let mut tab_model = live_model(&[]);
+    for character in "/login".chars() {
+        tab_model.handle(key(KeyCode::Char(character)));
+    }
+    tab_model.handle(key(KeyCode::Enter));
+    tab_model.handle(key(KeyCode::Tab));
+    assert_eq!(
+        tab_model.composer.text(),
+        "/login anthropic api",
+        "Tab must complete only the active method slot"
+    );
+}
+
 /// Dismissing the palette and directly executing `/login <provider>` has the
 /// same visible slot transition as selecting the provider row.
 #[test]
