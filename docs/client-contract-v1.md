@@ -11,6 +11,11 @@ fixtures remain the byte-level authority. This document decides which door a
 client uses, what absence means, and which projection wins when the same fact
 is visible in more than one place.
 
+External orchestrators should begin with the concise
+[automation contract v1](automation-contract-v1.md). Release-by-release event
+additions are recorded in the
+[event schema changelog](event-schema-changelog.md).
+
 There is deliberately no aggregate `client.snapshot`. Sessions, accounts,
 providers, usage, commands, workflows, binding, surfaces, and the journal keep
 their existing authorities. A client must not create a second mega-document
