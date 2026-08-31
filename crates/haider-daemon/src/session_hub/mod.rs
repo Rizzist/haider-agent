@@ -96,6 +96,15 @@ pub(crate) mod rpc;
 #[cfg(test)]
 pub(crate) use rpc::pdf_delivery_for_provider;
 
+#[cfg(test)]
+pub(crate) async fn open_retention_test_hub(
+    path: &std::path::Path,
+) -> Result<(SqliteStoreHandle, SessionHub), SessionHubError> {
+    let store = SqliteStoreHandle::open(path).await?;
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default())?;
+    Ok((store, hub))
+}
+
 use crate::DaemonError;
 use crate::worker::{TurnSetupReductionCache, WorkerManagerHandle};
 use actor::run_session_actor;
@@ -874,6 +883,10 @@ struct HubInner {
     /// `actor_for` checks them at both sides of its await so deletion cannot
     /// race actor recreation or fresh admission.
     deleting_sessions: Mutex<HashSet<SessionId>>,
+    /// Per-session actor joins are kept separately so deletion can join and
+    /// release the completed task immediately instead of retaining one handle
+    /// for every session served until daemon shutdown.
+    session_actor_tasks: Mutex<HashMap<SessionId, JoinHandle<()>>>,
     actor_tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Wakes the daemon-wide shell fan-out actor before shutdown joins the
     /// hub-owned task set. The registry sender itself lives in `HubInner`, so
@@ -1861,6 +1874,10 @@ enum ActorCommand {
     },
     UnregisterHarness {
         lease_id: WorkerLeaseId,
+        completed: oneshot::Sender<()>,
+    },
+    FenceIfQuiescent {
+        completed: oneshot::Sender<Result<bool, HaiderError>>,
     },
     StopIfQuiescent {
         completed: oneshot::Sender<Result<bool, HaiderError>>,
@@ -2153,6 +2170,7 @@ impl SessionHub {
             surfaces: Mutex::new(HashMap::new()),
             surface_publications,
             deleting_sessions: Mutex::new(HashSet::new()),
+            session_actor_tasks: Mutex::new(HashMap::new()),
             actor_tasks: Mutex::new(Vec::new()),
             shell_registry_events_cancel,
             typed_install_serial: Arc::new(tokio::sync::Mutex::new(())),
@@ -5653,6 +5671,51 @@ impl SessionHub {
         hooks: Option<&crate::hooks::HookService>,
     ) -> Result<(), HaiderError> {
         let metadata = self.deletion_metadata_if_eligible(session_id).await?;
+        let actor = lock(&self.inner.actors)
+            .map_err(hub_error_as_store)?
+            .get(session_id)
+            .cloned();
+        if let Some(actor) = actor.as_ref() {
+            // First consume every command admitted before the permanent
+            // deletion tombstone and prove the durable session is quiescent.
+            // Keep the actor alive so the worker lease can be unregistered
+            // through the actor's FIFO before its supervisor joins.
+            let (completed, quiescent) = oneshot::channel();
+            actor
+                .commands
+                .send(ActorCommand::FenceIfQuiescent { completed })
+                .await
+                .map_err(|_| {
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        "session actor stopped before deletion fencing",
+                        true,
+                    )
+                })?;
+            if !quiescent.await.map_err(|_| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    "session actor did not acknowledge deletion fencing",
+                    true,
+                )
+            })?? {
+                return Err(HaiderError::new(
+                    ErrorCode::Busy,
+                    "session became nonterminal or attached during deletion",
+                    true,
+                ));
+            }
+        }
+        let worker_manager = lock(&self.inner.worker_manager)
+            .map_err(hub_error_as_store)?
+            .clone();
+        if let Some(worker_manager) = worker_manager {
+            // The FIFO deletion fence and permanent admission tombstone are
+            // both installed. Close the supervisor, await its acknowledged
+            // lease unregister, then wait for the manager-owned JoinSet to
+            // join and remove the slot before stopping the actor.
+            worker_manager.retire(session_id.clone()).await?;
+        }
         // Publish the target-unavailable terminal state before deleting the
         // private core record. The deletion tombstone already blocks a new
         // claim, so a crash after the store delete cannot leave a foreign
@@ -5675,10 +5738,6 @@ impl SessionHub {
                     )
                 })?;
         }
-        let actor = lock(&self.inner.actors)
-            .map_err(hub_error_as_store)?
-            .get(session_id)
-            .cloned();
         if let Some(actor) = actor {
             let (completed, quiescent) = oneshot::channel();
             actor
@@ -5705,12 +5764,31 @@ impl SessionHub {
                     true,
                 ));
             }
-            // The actor stopped only after its FIFO-local quiescence check.
-            // The deletion tombstone prevents any replacement from racing
-            // this removal.
+            // Remove both live registries while the deletion tombstone still
+            // fences recreation, then join without holding either mutex.
             lock(&self.inner.actors)
                 .map_err(hub_error_as_store)?
                 .remove(session_id);
+            let actor_task = lock(&self.inner.session_actor_tasks)
+                .map_err(hub_error_as_store)?
+                .remove(session_id)
+                .ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        "session actor task was missing during deletion fencing",
+                        true,
+                    )
+                })?;
+            actor_task.await.map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("session actor failed during deletion fencing: {error}"),
+                    true,
+                )
+            })?;
+            // The actor stopped only after its FIFO-local quiescence check.
+            // The deletion tombstone prevents any replacement from racing
+            // this removal.
         }
         // The pre-tombstone hook drain and this post-actor check form one
         // deletion fence. Any append admitted between them either precedes
@@ -5983,7 +6061,6 @@ impl SessionHub {
         let authority_epoch = last.as_ref().map_or(0, |envelope| envelope.authority_epoch);
         let (commands, receiver) = mpsc::channel(self.inner.config.actor_command_capacity);
         let actor = SessionActorHandle { commands };
-        let mut actor_tasks = lock(&self.inner.actor_tasks)?;
         let task = tokio::spawn(run_session_actor(
             session_id.clone(),
             head,
@@ -5999,7 +6076,7 @@ impl SessionHub {
             Arc::clone(&self.inner.force_stop),
             receiver,
         ));
-        actor_tasks.push(task);
+        lock(&self.inner.session_actor_tasks)?.insert(session_id.clone(), task);
         actors.insert(session_id.clone(), actor.clone());
         let _ = self.inner.roster_publications.send(session_id);
         Ok(actor)
@@ -6876,6 +6953,11 @@ impl SessionHub {
             let mut actors = lock(&self.inner.actors)?;
             actors.drain().map(|(_, actor)| actor).collect::<Vec<_>>()
         };
+        let session_actor_tasks = std::mem::take(&mut *lock(&self.inner.session_actor_tasks)?)
+            .into_values()
+            .collect::<Vec<_>>();
+        let mut session_actor_tasks =
+            OwnedTasks::new(session_actor_tasks, Arc::clone(&self.inner.force_stop));
         let actor_tasks = std::mem::take(&mut *lock(&self.inner.actor_tasks)?);
         let mut actor_tasks = OwnedTasks::new(actor_tasks, Arc::clone(&self.inner.force_stop));
         let append_commit_task = lock(&self.inner.append_commit_task)?.take();
@@ -6898,6 +6980,7 @@ impl SessionHub {
         for actor in actors {
             let _ = actor.commands.send(ActorCommand::Stop).await;
         }
+        let _ = session_actor_tasks.join_all().await;
         let _ = actor_tasks.join_all().await;
         self.inner.append_committer.shutdown().await;
         let append_outcomes = append_commit_task.join_all().await;
@@ -7439,13 +7522,16 @@ impl HubStoreHandle {
             .hub
             .existing_actor(&self.session_id)?
             .ok_or(SessionHubError::Closed)?;
+        let (completed, response) = oneshot::channel();
         actor
             .commands
             .send(ActorCommand::UnregisterHarness {
                 lease_id: self.lease_id.clone(),
+                completed,
             })
             .await
-            .map_err(|_| SessionHubError::Closed)
+            .map_err(|_| SessionHubError::Closed)?;
+        response.await.map_err(|_| SessionHubError::Closed)
     }
 
     /// Stores opaque artifact bytes through this worker lease's bounded CAS

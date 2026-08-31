@@ -19,7 +19,7 @@
     },
     "haider-daemon": {
       "production": 7,
-      "test": 0
+      "test": 1
     },
     "haider-daemond": {
       "production": 1,

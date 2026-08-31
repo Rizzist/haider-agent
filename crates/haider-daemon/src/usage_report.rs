@@ -665,7 +665,7 @@ impl TokenTotals {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(serde::Serialize, Deserialize)]
 struct UsagePayload {
     #[serde(default)]
     input: u64,
@@ -689,7 +689,7 @@ struct UsagePayload {
     request: Option<RequestUsage>,
 }
 
-#[derive(Deserialize)]
+#[derive(serde::Serialize, Deserialize)]
 struct UsageAccountPayload {
     account: CredentialAlias,
     #[serde(default)]
@@ -1249,6 +1249,84 @@ impl SessionFolder {
     /// `model_selected` fact.
     pub(crate) fn active_model(&self) -> Option<&str> {
         (!self.current_model.is_empty()).then_some(self.current_model.as_str())
+    }
+
+    /// Heap owned by the incremental observe/usage fold. Saturating charges
+    /// deliberately include collection slabs plus every retained coordinate;
+    /// these maps are precisely where long-lived sessions accumulate run,
+    /// agent, usage-chunk, and tool IDs.
+    pub(crate) fn deep_owned_bytes(&self) -> usize {
+        let mut total = std::mem::size_of::<Self>().saturating_add(self.current_model.capacity());
+        total = total.saturating_add(self.stats.tokens.capacity().saturating_mul(
+            std::mem::size_of::<(CredentialAlias, TokenTotals)>().saturating_add(1),
+        ));
+        for (alias, totals) in &self.stats.tokens {
+            total = total.saturating_add(alias.0.capacity()).saturating_add(
+                serde_json::to_vec(&totals.cache).map_or(usize::MAX, |bytes| bytes.len()),
+            );
+        }
+        for (key, (payload, model, _)) in &self.chunks {
+            let conservative_btree_node = 11_usize
+                .saturating_mul(
+                    std::mem::size_of::<UsageChunkKey>().saturating_add(std::mem::size_of::<(
+                        UsagePayload,
+                        String,
+                        u64,
+                    )>()),
+                )
+                .saturating_add(16_usize.saturating_mul(std::mem::size_of::<usize>()));
+            total = total
+                // One complete eleven-slot node plus generous edge/metadata
+                // space per occupied entry covers sparse-root and split-node
+                // slack without depending on std's private BTree layout.
+                .saturating_add(conservative_btree_node)
+                .saturating_add(key.run.capacity())
+                .saturating_add(key.agent.capacity())
+                .saturating_add(key.provider.capacity())
+                .saturating_add(key.model.capacity())
+                .saturating_add(key.cache_epoch.capacity())
+                .saturating_add(model.capacity())
+                .saturating_add(
+                    serde_json::to_vec(payload).map_or(usize::MAX, |bytes| bytes.len()),
+                );
+        }
+        total =
+            total.saturating_add(self.tool_attempts.capacity().saturating_mul(
+                std::mem::size_of::<(String, HashSet<String>)>().saturating_add(1),
+            ));
+        for (tool, attempts) in &self.tool_attempts {
+            total = total.saturating_add(tool.capacity()).saturating_add(
+                attempts
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>().saturating_add(1)),
+            );
+            for attempt in attempts {
+                total = total.saturating_add(attempt.capacity());
+            }
+        }
+        total = total.saturating_add(
+            self.timings
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, AgentTiming)>().saturating_add(1)),
+        );
+        for agent in self.timings.keys() {
+            total = total.saturating_add(agent.capacity());
+        }
+        total = total.saturating_add(
+            self.run_agents
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, Option<String>)>().saturating_add(1)),
+        );
+        for (run, agent) in &self.run_agents {
+            total = total.saturating_add(run.capacity());
+            if let Some(agent) = agent {
+                total = total.saturating_add(agent.capacity());
+            }
+        }
+        if let Some(agent) = &self.primary_agent {
+            total = total.saturating_add(agent.0.capacity());
+        }
+        total
     }
 
     pub(crate) fn push(&mut self, envelope: &RawEnvelope) {

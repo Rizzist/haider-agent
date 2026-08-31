@@ -623,9 +623,7 @@ fn terminal_turn_cleanup_race_defers_one_owned_shell_handoff() {
 fn active_supervisor_shell_arm_uses_owned_deferred_handoff() {
     let source = include_str!("worker.rs").replace("\r\n", "\n");
     let arm = source
-        .split_once(
-            "Some(SupervisorCommand::ShellExec(pending)) => {\n                            // Store admission",
-        )
+        .split_once("// Store admission can observe the turn's durable")
         .map(|(_, tail)| tail)
         .expect("active-turn shell arm remains identifiable");
     let arm = arm

@@ -1004,13 +1004,14 @@ fn direct_ssh_session(sessions: &[SessionId]) -> DirectSshSession<'_> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 struct ObservedRun {
     state: RunState,
     seq: u64,
     branch_id: Option<BranchId>,
 }
 
+#[derive(serde::Serialize)]
 struct ObserveProjection {
     event_limit: usize,
     event_kinds: VecDeque<String>,
@@ -1030,15 +1031,29 @@ struct ObserveProjection {
 /// journal oracle; once installed, the session actor extends the fold with
 /// every committed envelope before waking roster consumers.
 pub(super) struct ObserveDigestCache {
-    sessions: Mutex<HashMap<SessionId, Box<ObserveCacheEntry>>>,
+    state: Mutex<ObserveCacheState>,
     next_build: AtomicU64,
+    building_admission: Arc<Semaphore>,
+}
+
+const MAX_OBSERVE_READY_ENTRIES: usize = 256;
+const MAX_OBSERVE_READY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_OBSERVE_BUILDING_ENTRIES: usize = 8;
+
+#[derive(Default)]
+struct ObserveCacheState {
+    sessions: HashMap<SessionId, Box<ObserveCacheEntry>>,
+    ready_count: usize,
+    ready_bytes: usize,
+    touch_clock: u64,
 }
 
 impl Default for ObserveDigestCache {
     fn default() -> Self {
         Self {
-            sessions: Mutex::new(HashMap::new()),
+            state: Mutex::new(ObserveCacheState::default()),
             next_build: AtomicU64::new(1),
+            building_admission: Arc::new(Semaphore::new(MAX_OBSERVE_BUILDING_ENTRIES)),
         }
     }
 }
@@ -1047,8 +1062,14 @@ enum ObserveCacheEntry {
     Building {
         token: u64,
         pending: Vec<RawEnvelope>,
+        completion: watch::Sender<Option<Arc<ObserveFoldSnapshot>>>,
+        _permit: OwnedSemaphorePermit,
     },
-    Ready(ObserveFold),
+    Ready {
+        fold: ObserveFold,
+        deep_bytes: usize,
+        last_touched: u64,
+    },
 }
 
 struct ObserveFold {
@@ -1085,7 +1106,7 @@ struct ObserveFoldSnapshot {
 enum CacheStart {
     Ready(ObserveFoldSnapshot),
     BuildAndInstall(u64),
-    BuildOnly,
+    WaitExisting(watch::Receiver<Option<Arc<ObserveFoldSnapshot>>>),
 }
 
 struct ObserveBuildGuard {
@@ -1195,6 +1216,192 @@ impl ObserveFold {
                 .and_then(|reduction| reduction.status.clone()),
         }
     }
+
+    fn deep_owned_bytes(&self) -> usize {
+        // Serialized bytes conservatively charge every recursively owned
+        // string/value (including opaque graph internals) twice: once for its
+        // used bytes and once for decoded-buffer headroom. Every collection's
+        // actual allocation slab/node charge and every accessible spare String
+        // capacity is added separately below. This intentionally overcounts;
+        // the 32 MiB ceiling is a retained-heap ceiling, not a compact-wire
+        // estimate.
+        serialized_owned_charge(&self.projection)
+            .saturating_add(std::mem::size_of::<Self>())
+            .saturating_add(observe_projection_allocation_charge(&self.projection))
+            .saturating_add(self.metrics.deep_owned_bytes())
+    }
+}
+
+fn serialized_owned_charge<T: serde::Serialize>(value: &T) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |payload| payload.len().saturating_mul(2))
+}
+
+fn vec_slab<T>(values: &Vec<T>) -> usize {
+    values.capacity().saturating_mul(std::mem::size_of::<T>())
+}
+
+fn hash_slab<K, V>(values: &HashMap<K, V>) -> usize {
+    values.capacity().saturating_mul(
+        std::mem::size_of::<(K, V)>()
+            // Hashbrown-style control byte; one per bucket is a conservative
+            // portable charge without depending on its private layout.
+            .saturating_add(1),
+    )
+}
+
+fn btree_node_charge<K, V>(values: &BTreeMap<K, V>) -> usize {
+    // std's BTree nodes reserve eleven key/value slots even when a sparse
+    // root owns one entry. Charge one complete node (plus generous edge and
+    // metadata space) per occupied entry. A real tree has fewer nodes than
+    // entries, so this covers fixed-capacity slack without relying on std's
+    // private node layout.
+    let conservative_node = 11_usize
+        .saturating_mul(std::mem::size_of::<(K, V)>())
+        .saturating_add(16_usize.saturating_mul(std::mem::size_of::<usize>()));
+    values.len().saturating_mul(conservative_node)
+}
+
+fn string_spare(value: &String) -> usize {
+    value.capacity().saturating_sub(value.len())
+}
+
+fn menu_allocation_charge(menu: &haider_rpc::ObserveMenuWire) -> usize {
+    let mut total = string_spare(&menu.kind)
+        .saturating_add(string_spare(&menu.title))
+        .saturating_add(vec_slab(&menu.body))
+        .saturating_add(vec_slab(&menu.options));
+    for line in &menu.body {
+        total = total.saturating_add(string_spare(line));
+    }
+    for option in &menu.options {
+        total = total
+            .saturating_add(string_spare(&option.key))
+            .saturating_add(string_spare(&option.label))
+            .saturating_add(option.detail.as_ref().map_or(0, string_spare))
+            .saturating_add(option.decision.as_ref().map_or(0, string_spare));
+    }
+    if let Some(description) = &menu.permission_description {
+        total = total.saturating_add(string_spare(description));
+    }
+    if let Some(presentation) = &menu.presentation {
+        total = total
+            .saturating_add(string_spare(&presentation.title))
+            .saturating_add(string_spare(&presentation.detail))
+            .saturating_add(
+                presentation
+                    .provider_request_id
+                    .as_ref()
+                    .map_or(0, string_spare),
+            )
+            .saturating_add(vec_slab(&presentation.allowed_actions));
+    }
+    total
+}
+
+fn subagent_allocation_charge(subagent: &haider_rpc::ObserveSubagentWire) -> usize {
+    let mut total = subagent
+        .agent_id
+        .0
+        .capacity()
+        .saturating_sub(subagent.agent_id.0.len())
+        .saturating_add(subagent.callsign.as_ref().map_or(0, string_spare))
+        .saturating_add(string_spare(&subagent.task))
+        .saturating_add(string_spare(&subagent.state))
+        .saturating_add(subagent.provider.as_ref().map_or(0, string_spare));
+    if let Some(lockdown) = &subagent.lockdown {
+        total = total
+            .saturating_add(lockdown.provider.as_ref().map_or(0, string_spare))
+            .saturating_add(lockdown.reason.as_ref().map_or(0, string_spare))
+            .saturating_add(vec_slab(&lockdown.tools_allowed));
+        for tool in &lockdown.tools_allowed {
+            total = total.saturating_add(string_spare(tool));
+        }
+    }
+    total
+}
+
+fn graph_allocation_charge(graphs: &haider_protocol::graph::GraphReductions) -> usize {
+    let mut total = hash_slab(&graphs.by_graph).saturating_add(hash_slab(&graphs.run_sets));
+    for reduction in graphs.by_graph.values() {
+        total = total
+            .saturating_add(vec_slab(&reduction.evidence))
+            .saturating_add(vec_slab(&reduction.finalization_deferrals))
+            .saturating_add(vec_slab(&reduction.finalization_menus))
+            .saturating_add(vec_slab(&reduction.template_nodes));
+        if let Some(status) = &reduction.status {
+            total = total
+                .saturating_add(vec_slab(&status.ready_nodes))
+                .saturating_add(vec_slab(&status.nodes))
+                .saturating_add(vec_slab(&status.pending_menus));
+            for node in &status.nodes {
+                total = total.saturating_add(vec_slab(&node.evidence_slots));
+            }
+            if let Some(run_set) = &status.run_set {
+                total = total.saturating_add(vec_slab(&run_set.children));
+            }
+        }
+        for deferred in &reduction.finalization_deferrals {
+            total = total.saturating_add(vec_slab(&deferred.unmet_nodes));
+        }
+        for node in &reduction.template_nodes {
+            total = total
+                .saturating_add(vec_slab(&node.depends_on))
+                .saturating_add(vec_slab(&node.verify_slots));
+        }
+    }
+    for run_set in graphs.run_sets.values() {
+        total = total.saturating_add(vec_slab(&run_set.children));
+    }
+    total
+}
+
+fn observe_projection_allocation_charge(projection: &ObserveProjection) -> usize {
+    let mut total = std::mem::size_of::<ObserveProjection>()
+        .saturating_add(
+            projection
+                .event_kinds
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>()),
+        )
+        .saturating_add(hash_slab(&projection.runs))
+        .saturating_add(btree_node_charge(&projection.menus))
+        .saturating_add(btree_node_charge(&projection.subagents))
+        .saturating_add(hash_slab(&projection.branches))
+        .saturating_add(projection.title.as_ref().map_or(0, string_spare))
+        .saturating_add(graph_allocation_charge(&projection.graphs));
+    for kind in &projection.event_kinds {
+        total = total.saturating_add(string_spare(kind));
+    }
+    for (run_id, run) in &projection.runs {
+        total = total
+            .saturating_add(run_id.0.capacity().saturating_sub(run_id.0.len()))
+            .saturating_add(run.branch_id.as_ref().map_or(0, |branch| {
+                branch.0.capacity().saturating_sub(branch.0.len())
+            }));
+    }
+    for (key, menu) in &projection.menus {
+        total = total
+            .saturating_add(string_spare(key))
+            .saturating_add(menu_allocation_charge(menu));
+    }
+    for (key, subagent) in &projection.subagents {
+        total = total
+            .saturating_add(string_spare(key))
+            .saturating_add(subagent_allocation_charge(subagent));
+    }
+    for (branch_id, branch) in &projection.branches {
+        total = total
+            .saturating_add(branch_id.0.capacity().saturating_sub(branch_id.0.len()))
+            .saturating_add(string_spare(&branch.name));
+    }
+    total
+}
+
+fn ready_entry_deep_bytes(session_id: &SessionId, fold: &ObserveFold) -> usize {
+    std::mem::size_of::<SessionId>()
+        .saturating_add(session_id.as_str().len())
+        .saturating_add(std::mem::size_of::<ObserveCacheEntry>())
+        .saturating_add(fold.deep_owned_bytes())
 }
 
 /// Attention is derived only from committed facts a human would reasonably
@@ -1267,24 +1474,52 @@ impl ObserveFoldSnapshot {
 }
 
 impl ObserveDigestCache {
-    fn start(&self, session_id: &SessionId) -> CacheStart {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match sessions.get(session_id).map(Box::as_ref) {
-            Some(ObserveCacheEntry::Ready(fold)) => CacheStart::Ready(fold.snapshot(session_id)),
-            Some(ObserveCacheEntry::Building { .. }) => CacheStart::BuildOnly,
-            None => {
-                let token = self.next_build.fetch_add(1, Ordering::Relaxed);
-                sessions.insert(
-                    session_id.clone(),
-                    Box::new(ObserveCacheEntry::Building {
-                        token,
-                        pending: Vec::new(),
-                    }),
-                );
-                CacheStart::BuildAndInstall(token)
+    async fn start(&self, session_id: &SessionId, sealed_head: u64) -> CacheStart {
+        let mut permit = None;
+        loop {
+            let needs_admission = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.touch_clock = state.touch_clock.saturating_add(1);
+                let touched = state.touch_clock;
+                match state.sessions.get_mut(session_id).map(Box::as_mut) {
+                    Some(ObserveCacheEntry::Ready {
+                        fold, last_touched, ..
+                    }) if fold.head_seq == sealed_head => {
+                        *last_touched = touched;
+                        return CacheStart::Ready(fold.snapshot(session_id));
+                    }
+                    Some(ObserveCacheEntry::Building { completion, .. }) => {
+                        return CacheStart::WaitExisting(completion.subscribe());
+                    }
+                    Some(ObserveCacheEntry::Ready { .. }) | None if permit.is_some() => {
+                        let Some(building_permit) = permit.take() else {
+                            continue;
+                        };
+                        state.remove_ready(session_id);
+                        let token = self.next_build.fetch_add(1, Ordering::Relaxed);
+                        let (completion, _) = watch::channel(None);
+                        state.sessions.insert(
+                            session_id.clone(),
+                            Box::new(ObserveCacheEntry::Building {
+                                token,
+                                pending: Vec::new(),
+                                completion,
+                                _permit: building_permit,
+                            }),
+                        );
+                        return CacheStart::BuildAndInstall(token);
+                    }
+                    Some(ObserveCacheEntry::Ready { .. }) | None => true,
+                }
+            };
+            if needs_admission {
+                permit = Arc::clone(&self.building_admission)
+                    .acquire_owned()
+                    .await
+                    .ok();
             }
         }
     }
@@ -1293,59 +1528,63 @@ impl ObserveDigestCache {
         &self,
         session_id: SessionId,
         mut fold: ObserveFold,
-        build_token: Option<u64>,
+        build_token: u64,
     ) -> ObserveFoldSnapshot {
-        let mut sessions = self
-            .sessions
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pending = match sessions.remove(&session_id).map(|entry| *entry) {
-            Some(ObserveCacheEntry::Building { token, pending }) if build_token == Some(token) => {
-                pending
-            }
-            Some(entry @ ObserveCacheEntry::Building { .. }) => {
-                sessions.insert(session_id.clone(), Box::new(entry));
-                return fold.snapshot(&session_id);
-            }
-            Some(ObserveCacheEntry::Ready(current)) => {
-                if current.head_seq >= fold.head_seq {
-                    let snapshot = current.snapshot(&session_id);
-                    sessions.insert(session_id, Box::new(ObserveCacheEntry::Ready(current)));
-                    return snapshot;
-                }
-                Vec::new()
-            }
-            None => Vec::new(),
+        if !matches!(
+            state.sessions.get(&session_id).map(Box::as_ref),
+            Some(ObserveCacheEntry::Building { token, .. }) if *token == build_token
+        ) {
+            return fold.snapshot(&session_id);
+        }
+        let Some(entry) = state.sessions.remove(&session_id) else {
+            return fold.snapshot(&session_id);
         };
+        let ObserveCacheEntry::Building {
+            pending,
+            completion,
+            ..
+        } = *entry
+        else {
+            unreachable!("exact build token selected a non-building entry")
+        };
+        let mut contiguous = true;
         for envelope in pending {
             if envelope.seq > fold.head_seq {
                 if envelope.seq != fold.head_seq.saturating_add(1) {
                     // A gap means a writer bypassed the live commit seam.
                     // Leave the cache absent so the next read replays the
                     // deterministic journal oracle instead of guessing.
-                    return fold.snapshot(&session_id);
+                    contiguous = false;
+                    break;
                 }
                 fold.apply(envelope);
             }
         }
-        let snapshot = fold.snapshot(&session_id);
-        sessions.insert(session_id, Box::new(ObserveCacheEntry::Ready(fold)));
-        snapshot
+        let snapshot = Arc::new(fold.snapshot(&session_id));
+        completion.send_replace(Some(Arc::clone(&snapshot)));
+        if contiguous {
+            state.insert_ready(session_id, fold);
+        }
+        (*snapshot).clone()
     }
 
     fn abandon(&self, session_id: &SessionId, token: u64) {
-        let mut sessions = self
-            .sessions
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if matches!(
-            sessions.get(session_id).map(Box::as_ref),
+            state.sessions.get(session_id).map(Box::as_ref),
             Some(ObserveCacheEntry::Building {
                 token: current,
                 ..
             }) if *current == token
         ) {
-            sessions.remove(session_id);
+            state.sessions.remove(session_id);
         }
     }
 
@@ -1354,17 +1593,25 @@ impl ObserveDigestCache {
             return;
         };
         let session_id = &first.session_id;
-        let mut sessions = self
-            .sessions
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(entry) = sessions.get_mut(session_id) else {
+        state.touch_clock = state.touch_clock.saturating_add(1);
+        let touched = state.touch_clock;
+        let Some(entry) = state.sessions.get_mut(session_id) else {
             return;
         };
         let mut invalidate = false;
+        let mut ready_bytes = None;
         match entry.as_mut() {
             ObserveCacheEntry::Building { pending, .. } => pending.extend_from_slice(envelopes),
-            ObserveCacheEntry::Ready(fold) => {
+            ObserveCacheEntry::Ready {
+                fold,
+                deep_bytes,
+                last_touched,
+            } => {
+                let old_bytes = *deep_bytes;
                 for envelope in envelopes {
                     if envelope.seq <= fold.head_seq {
                         continue;
@@ -1375,18 +1622,595 @@ impl ObserveDigestCache {
                     }
                     fold.apply(envelope.clone());
                 }
+                if !invalidate {
+                    *deep_bytes = ready_entry_deep_bytes(session_id, fold);
+                    *last_touched = touched;
+                    ready_bytes = Some((old_bytes, *deep_bytes));
+                }
             }
         }
         if invalidate {
-            sessions.remove(session_id);
+            state.remove_ready(session_id);
+        } else if let Some((old_bytes, new_bytes)) = ready_bytes {
+            state.ready_bytes = state
+                .ready_bytes
+                .saturating_sub(old_bytes)
+                .saturating_add(new_bytes);
+            state.enforce_ready_limits();
         }
     }
 
     pub(super) fn remove(&self, session_id: &SessionId) {
-        self.sessions
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session_id);
+            .remove_ready(session_id);
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> (usize, usize, usize) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let building = state
+            .sessions
+            .values()
+            .filter(|entry| matches!(entry.as_ref(), ObserveCacheEntry::Building { .. }))
+            .count();
+        (state.ready_count, building, state.ready_bytes)
+    }
+
+    #[cfg(test)]
+    fn contains(&self, session_id: &SessionId) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
+            .contains_key(session_id)
+    }
+}
+
+impl ObserveCacheState {
+    fn remove_ready(&mut self, session_id: &SessionId) {
+        if let Some(entry) = self.sessions.remove(session_id)
+            && let ObserveCacheEntry::Ready { deep_bytes, .. } = *entry
+        {
+            self.ready_count = self.ready_count.saturating_sub(1);
+            self.ready_bytes = self.ready_bytes.saturating_sub(deep_bytes);
+        }
+    }
+
+    fn insert_ready(&mut self, session_id: SessionId, fold: ObserveFold) {
+        self.remove_ready(&session_id);
+        self.touch_clock = self.touch_clock.saturating_add(1);
+        let deep_bytes = ready_entry_deep_bytes(&session_id, &fold);
+        self.ready_count = self.ready_count.saturating_add(1);
+        self.ready_bytes = self.ready_bytes.saturating_add(deep_bytes);
+        self.sessions.insert(
+            session_id,
+            Box::new(ObserveCacheEntry::Ready {
+                fold,
+                deep_bytes,
+                last_touched: self.touch_clock,
+            }),
+        );
+        self.enforce_ready_limits();
+    }
+
+    fn enforce_ready_limits(&mut self) {
+        self.enforce_ready_limits_with(MAX_OBSERVE_READY_ENTRIES, MAX_OBSERVE_READY_BYTES);
+    }
+
+    fn enforce_ready_limits_with(&mut self, max_entries: usize, max_bytes: usize) {
+        while self.ready_count > max_entries || self.ready_bytes > max_bytes {
+            let victim = self
+                .sessions
+                .iter()
+                .filter_map(|(session_id, entry)| match entry.as_ref() {
+                    ObserveCacheEntry::Ready { last_touched, .. } => {
+                        Some((session_id.clone(), *last_touched))
+                    }
+                    ObserveCacheEntry::Building { .. } => None,
+                })
+                .min_by_key(|(_, touched)| *touched)
+                .map(|(session_id, _)| session_id);
+            let Some(victim) = victim else {
+                break;
+            };
+            self.remove_ready(&victim);
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod observe_cache_retention_tests {
+    use super::*;
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::ids::{DeviceId, EventId};
+
+    fn fold(session_id: &SessionId, seq: u64, title_bytes: usize) -> ObserveFold {
+        let mut fold = ObserveFold::new("fake-model");
+        fold.projection.title = Some("t".repeat(title_bytes));
+        fold.apply(EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(format!("observe-retain-{session_id}-{seq}")),
+            seq,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: DeviceId::new("observe-retain-test"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: seq,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::json!({"type":"observe_retention_probe"}),
+        });
+        fold
+    }
+
+    #[tokio::test]
+    async fn observe_cache_ready_count_evicts_lru_at_256() {
+        let cache = ObserveDigestCache::default();
+        for index in 0..MAX_OBSERVE_READY_ENTRIES {
+            let session_id = SessionId::new(format!("observe-ready-{index}"));
+            cache
+                .state
+                .lock()
+                .expect("cache state")
+                .insert_ready(session_id.clone(), fold(&session_id, 1, 8));
+        }
+        let oldest = SessionId::new("observe-ready-0");
+        assert!(matches!(
+            cache.start(&oldest, 1).await,
+            CacheStart::Ready(_)
+        ));
+        let newcomer = SessionId::new("observe-ready-new");
+        cache
+            .state
+            .lock()
+            .expect("cache state")
+            .insert_ready(newcomer.clone(), fold(&newcomer, 1, 8));
+
+        assert_eq!(cache.stats().0, MAX_OBSERVE_READY_ENTRIES);
+        assert!(cache.contains(&oldest), "a touched Ready remains resident");
+        assert!(cache.contains(&newcomer));
+        assert!(!cache.contains(&SessionId::new("observe-ready-1")));
+    }
+
+    #[tokio::test]
+    async fn observe_cache_ready_byte_cap_evicts_only_ready() {
+        let cache = ObserveDigestCache::default();
+        let building = SessionId::new("observe-building-survivor");
+        let CacheStart::BuildAndInstall(_token) = cache.start(&building, 1).await else {
+            panic!("first miss owns the build");
+        };
+        let ready = SessionId::new("observe-byte-victim");
+        let mut state = cache.state.lock().expect("cache state");
+        state.insert_ready(ready.clone(), fold(&ready, 1, 128));
+        state.enforce_ready_limits_with(usize::MAX, 0);
+        drop(state);
+
+        assert_eq!(cache.stats(), (0, 1, 0));
+        assert!(
+            cache.contains(&building),
+            "Building is never a capacity victim"
+        );
+        assert!(!cache.contains(&ready));
+    }
+
+    #[test]
+    fn observe_cache_shipped_32_mib_path_evicts_an_oversize_ready() {
+        assert_eq!(MAX_OBSERVE_READY_BYTES, 32 * 1024 * 1024);
+        let session_id = SessionId::new("observe-shipped-byte-cap");
+        let mut state = ObserveCacheState::default();
+        // Serialized owned strings are conservatively charged at 2x, so this
+        // one Ready entry crosses the real shipped 32 MiB threshold.
+        state.insert_ready(
+            session_id.clone(),
+            fold(&session_id, 1, MAX_OBSERVE_READY_BYTES / 2 + 1),
+        );
+        assert_eq!(state.ready_count, 0);
+        assert_eq!(state.ready_bytes, 0);
+        assert!(!state.sessions.contains_key(&session_id));
+    }
+
+    #[test]
+    fn deep_owned_bytes_charges_sparse_btree_root_capacity() {
+        let mut sparse = BTreeMap::new();
+        sparse.insert(String::from("key"), String::from("value"));
+        assert!(
+            btree_node_charge(&sparse) >= 11 * std::mem::size_of::<(String, String)>(),
+            "one sparse root is charged for all fixed-capacity key/value slots"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_cache_building_admission_waits_without_busy() {
+        let cache = Arc::new(ObserveDigestCache::default());
+        let mut owners = Vec::new();
+        for index in 0..MAX_OBSERVE_BUILDING_ENTRIES {
+            let session_id = SessionId::new(format!("observe-builder-{index}"));
+            let CacheStart::BuildAndInstall(token) = cache.start(&session_id, 1).await else {
+                panic!("bounded builder is admitted");
+            };
+            owners.push((session_id, token));
+        }
+        let waiting_session = SessionId::new("observe-builder-waiting");
+        let waiting_cache = Arc::clone(&cache);
+        let waiter = tokio::spawn(async move { waiting_cache.start(&waiting_session, 1).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "the ninth builder waits for admission"
+        );
+
+        cache.abandon(&owners[0].0, owners[0].1);
+        assert!(matches!(
+            waiter.await.expect("admission waiter joins"),
+            CacheStart::BuildAndInstall(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_observers_of_evicted_session_share_one_rebuild() {
+        let cache = Arc::new(ObserveDigestCache::default());
+        let session_id = SessionId::new("observe-single-flight");
+        let CacheStart::BuildAndInstall(token) = cache.start(&session_id, 1).await else {
+            panic!("first observer owns rebuild");
+        };
+        let CacheStart::WaitExisting(mut completion) = cache.start(&session_id, 1).await else {
+            panic!("second observer joins existing rebuild");
+        };
+        let owner = cache.install(session_id.clone(), fold(&session_id, 1, 32), token);
+        completion.changed().await.expect("single-flight publishes");
+        let waiter = completion
+            .borrow_and_update()
+            .as_ref()
+            .map(|snapshot| snapshot.as_ref().clone())
+            .expect("waiter receives built snapshot");
+        assert_eq!(
+            serde_json::to_vec(&owner.digest(session_id.clone(), 1, None, 100, true))
+                .expect("owner digest"),
+            serde_json::to_vec(&waiter.digest(session_id, 1, None, 100, true))
+                .expect("waiter digest")
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_cache_remove_blocks_inflight_build_reinstallation() {
+        let cache = ObserveDigestCache::default();
+        let session_id = SessionId::new("observe-delete-build-race");
+        let CacheStart::BuildAndInstall(token) = cache.start(&session_id, 1).await else {
+            panic!("build starts");
+        };
+        cache.remove(&session_id);
+        let _ = cache.install(session_id.clone(), fold(&session_id, 1, 8), token);
+        assert!(!cache.contains(&session_id));
+        assert_eq!(cache.stats(), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn ready_eviction_rebuilds_byte_identical_digest_from_journal() {
+        let root = tempfile::tempdir().expect("temp store");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let session_id = SessionId::new("observe-byte-identical-rebuild");
+        hub.create_internal_session(SessionCreateCommand {
+            command_id: "observe-byte-identical-create".into(),
+            request_digest: "observe-byte-identical-digest".into(),
+            request_json: "{}".into(),
+            session_id: session_id.clone(),
+            cwd: std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+                .expect("canonical cwd")
+                .to_string_lossy()
+                .into_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new("observe-byte-identical-created"),
+            device_id: DeviceId::new("observe-byte-identical-device"),
+        })
+        .await
+        .expect("session");
+        let metadata = hub.session_metadata(&session_id).await.expect("metadata");
+        let first = cached_observe_snapshot(&hub, &session_id, "fake-model")
+            .await
+            .expect("warm digest")
+            .digest(
+                session_id.clone(),
+                store.worker_generation(),
+                metadata.clone(),
+                100,
+                true,
+            );
+        hub.inner.observe_digests.remove(&session_id);
+        let rebuilt = cached_observe_snapshot(&hub, &session_id, "fake-model")
+            .await
+            .expect("rebuilt digest")
+            .digest(
+                session_id.clone(),
+                store.worker_generation(),
+                metadata,
+                100,
+                true,
+            );
+
+        assert_eq!(
+            serde_json::to_vec(&first).expect("first bytes"),
+            serde_json::to_vec(&rebuilt).expect("rebuilt bytes")
+        );
+        hub.delete_session(session_id.clone())
+            .await
+            .expect("delete session");
+        assert_eq!(hub.inner.observe_digests.stats(), (0, 0, 0));
+        assert!(
+            !hub.inner
+                .session_actor_tasks
+                .lock()
+                .expect("actor tasks")
+                .contains_key(&session_id),
+            "completed deleted actor handles are released immediately"
+        );
+        hub.shutdown().await.expect("hub shutdown");
+        store.close().await.expect("store close");
+    }
+
+    fn fitted_slope(samples: &[(u64, u64)]) -> f64 {
+        let count = samples.len() as f64;
+        let mean_x = samples.iter().map(|(x, _)| *x as f64).sum::<f64>() / count;
+        let mean_y = samples.iter().map(|(_, y)| *y as f64).sum::<f64>() / count;
+        let numerator = samples
+            .iter()
+            .map(|(x, y)| (*x as f64 - mean_x) * (*y as f64 - mean_y))
+            .sum::<f64>();
+        let denominator = samples
+            .iter()
+            .map(|(x, _)| (*x as f64 - mean_x).powi(2))
+            .sum::<f64>();
+        numerator / denominator
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    fn resident_bytes() -> Option<u64> {
+        // SAFETY: `usage` is writable storage for the requested V0 layout;
+        // `assume_init` is reached only after the kernel reports success.
+        let usage = unsafe {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v0>::zeroed();
+            (libc::proc_pid_rusage(
+                std::process::id() as libc::c_int,
+                libc::RUSAGE_INFO_V0,
+                usage.as_mut_ptr().cast(),
+            ) == 0)
+                .then(|| usage.assume_init())
+        }?;
+        Some(usage.ri_resident_size)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resident_bytes() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let rss_kib = status.lines().find_map(|line| {
+            line.strip_prefix("VmRSS:")?
+                .split_ascii_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })?;
+        Some(rss_kib.saturating_mul(1024))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn resident_bytes() -> Option<u64> {
+        None
+    }
+
+    fn uptime_load() -> String {
+        std::process::Command::new("uptime")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map_or_else(|| "unavailable".into(), |output| output.trim().to_owned())
+    }
+
+    #[tokio::test]
+    async fn create_two_turn_observe_delete_soak_has_flat_retention_slopes() {
+        const CHILD_ENV: &str = "HAIDER_RETAIN_SOAK_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // RSS is process-global. Run the measurement alone so unrelated
+            // parallel daemon tests cannot be mistaken for retained session
+            // heap, then preserve the child's complete diagnostic stream.
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current daemon test binary"),
+            )
+            .env(CHILD_ENV, "1")
+            .args([
+                "--exact",
+                "session_hub::rpc::observe_cache_retention_tests::create_two_turn_observe_delete_soak_has_flat_retention_slopes",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .expect("isolated retention soak child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprint!("{stdout}{stderr}");
+            assert!(
+                output.status.success(),
+                "isolated retention soak failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            );
+            return;
+        }
+
+        // Old measured retention was (478.74 + 189.57) MiB / 10,000 =
+        // 70,077.38 B/session, or 4.277 MiB over N=64. A 16 KiB/session RSS
+        // ceiling is therefore well below the old signal while 64 immediate
+        // fake-provider cycles remain fast enough for the crate suite. Eight
+        // unmeasured cycles pay one-time allocator/runtime initialization.
+        const WARMUP_CYCLES: u64 = 8;
+        const CYCLES: u64 = 64;
+        const SAMPLE_AT: [u64; 7] = [1, 2, 4, 8, 16, 32, 64];
+        const MAX_FLAT_RSS_SLOPE: f64 = 16.0 * 1024.0;
+
+        let root = tempfile::tempdir().expect("temp store");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let manager = crate::worker::WorkerManager::start(
+            hub.clone(),
+            crate::worker::WorkerDependencies::unconfigured_for_tests(),
+            false,
+        );
+        let workers = manager.handle();
+        hub.install_worker_manager(workers.clone())
+            .expect("manager");
+        let mut started = std::time::Instant::now();
+        let mut baseline_rss = None;
+        let mut supervisor_samples = Vec::new();
+        let mut observe_samples = Vec::new();
+        let mut targeted_heap_samples = Vec::new();
+        let mut rss_samples = Vec::new();
+
+        for ordinal in 1..=WARMUP_CYCLES + CYCLES {
+            let session_id = SessionId::new(format!("retain-soak-{ordinal}"));
+            hub.create_internal_session(SessionCreateCommand {
+                command_id: format!("retain-soak-create-{ordinal}"),
+                request_digest: format!("retain-soak-create-digest-{ordinal}"),
+                request_json: "{}".into(),
+                session_id: session_id.clone(),
+                cwd: std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+                    .expect("canonical cwd")
+                    .to_string_lossy()
+                    .into_owned(),
+                provider: "fake".into(),
+                model: "fake-model".into(),
+                max_tokens: 4096,
+                permission_overrides: None,
+                effort: None,
+                fast: false,
+                cache_policy: Default::default(),
+                system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+                event_id: EventId::new(format!("retain-soak-created-{ordinal}")),
+                device_id: DeviceId::new("retain-soak-device"),
+            })
+            .await
+            .expect("session");
+
+            for turn in 0..2_u64 {
+                let run_id = RunId::new(format!("retain-soak-run-{ordinal}-{turn}"));
+                let accepted = hub
+                    .accept_turn(TurnAcceptCommand {
+                        command_id: format!("retain-soak-turn-{ordinal}-{turn}"),
+                        request_digest: format!("retain-soak-turn-digest-{ordinal}-{turn}"),
+                        request_json: "{}".into(),
+                        session_id: session_id.clone(),
+                        worker_generation: store.worker_generation(),
+                        branch_id: None,
+                        run_id,
+                        agent_id: None,
+                        text: "soak".into(),
+                        attachments: Vec::new(),
+                        mode: DeliveryMode::Queue,
+                        queued_event_id: EventId::new(format!(
+                            "retain-soak-queued-{ordinal}-{turn}"
+                        )),
+                        user_event_id: EventId::new(format!("retain-soak-user-{ordinal}-{turn}")),
+                        active_event_id: EventId::new(format!(
+                            "retain-soak-active-{ordinal}-{turn}"
+                        )),
+                        device_id: DeviceId::new("retain-soak-device"),
+                    })
+                    .await
+                    .expect("turn accepted");
+                let accepted = match accepted {
+                    TurnAcceptOutcome::Committed { accepted, .. }
+                    | TurnAcceptOutcome::IdempotentReplay { accepted } => accepted,
+                };
+                workers.submit(accepted).await.expect("turn handed off");
+                let mut settled = false;
+                for _ in 0..1_000 {
+                    if !hub
+                        .session_has_nonterminal_runs(&session_id)
+                        .await
+                        .expect("run scan")
+                    {
+                        settled = true;
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert!(settled, "fake-provider turn reaches durable quiescence");
+            }
+
+            let _ = cached_observe_snapshot(&hub, &session_id, "fake-model")
+                .await
+                .expect("observe");
+            hub.delete_session(session_id).await.expect("delete");
+
+            if ordinal == WARMUP_CYCLES {
+                baseline_rss = resident_bytes();
+                started = std::time::Instant::now();
+                continue;
+            }
+            if ordinal < WARMUP_CYCLES {
+                continue;
+            }
+            let cycle = ordinal - WARMUP_CYCLES;
+
+            if SAMPLE_AT.contains(&cycle) {
+                let (ready, building, bytes) = hub.inner.observe_digests.stats();
+                let supervisors = workers.supervisor_count() as u64;
+                let observe_entries = ready.saturating_add(building) as u64;
+                let targeted_heap = bytes as u64;
+                supervisor_samples.push((cycle, supervisors));
+                observe_samples.push((cycle, observe_entries));
+                targeted_heap_samples.push((cycle, targeted_heap));
+                if let (Some(base), Some(current)) = (baseline_rss, resident_bytes()) {
+                    rss_samples.push((cycle, current.saturating_sub(base)));
+                }
+                eprintln!(
+                    "retain_soak n={cycle} uptime_ms={} load={:?} supervisors={supervisors} observe_ready={ready} observe_building={building} observe_bytes={bytes} rss_delta={:?}",
+                    started.elapsed().as_millis(),
+                    uptime_load(),
+                    rss_samples.last().map(|(_, bytes)| bytes),
+                );
+            }
+        }
+
+        let supervisor_slope = fitted_slope(&supervisor_samples);
+        let observe_slope = fitted_slope(&observe_samples);
+        let targeted_heap_slope = fitted_slope(&targeted_heap_samples);
+        let rss_slope = (rss_samples.len() == SAMPLE_AT.len()).then(|| fitted_slope(&rss_samples));
+        eprintln!(
+            "retain_soak slopes supervisors_per_session={supervisor_slope:.6} observe_entries_per_session={observe_slope:.6} targeted_heap_bytes_per_session={targeted_heap_slope:.3} rss_bytes_per_session={rss_slope:?}"
+        );
+        assert_eq!(supervisor_slope, 0.0);
+        assert_eq!(observe_slope, 0.0);
+        assert_eq!(targeted_heap_slope, 0.0);
+        if let Some(rss_slope) = rss_slope {
+            assert!(
+                rss_slope <= MAX_FLAT_RSS_SLOPE,
+                "live RSS slope {rss_slope:.1} B/session exceeds the flat ceiling"
+            );
+        }
+
+        manager.shutdown().await.expect("manager shutdown");
+        hub.shutdown().await.expect("hub shutdown");
+        store.close().await.expect("store close");
     }
 }
 
@@ -1438,52 +2262,55 @@ async fn cached_observe_snapshot(
     initial_model: &str,
 ) -> Result<ObserveFoldSnapshot, SessionHubError> {
     loop {
-        match hub.inner.observe_digests.start(session_id) {
-            CacheStart::Ready(snapshot) => {
-                let head_seq = hub.inner.store.latest_seq(session_id).await?;
-                if snapshot.head_seq == head_seq {
-                    return Ok(snapshot);
-                }
-                let fold =
-                    rebuild_observe_fold(&hub.inner.store, session_id, head_seq, initial_model)
-                        .await?;
-                let snapshot = hub
-                    .inner
-                    .observe_digests
-                    .install(session_id.clone(), fold, None);
-                if snapshot.head_seq == hub.inner.store.latest_seq(session_id).await? {
-                    return Ok(snapshot);
-                }
-            }
+        let sealed_head = hub.inner.store.latest_seq(session_id).await?;
+        if sealed_head == 0 {
+            // Deleted/missing sessions never enter the cache. An in-flight
+            // pre-delete builder also cannot reinstall without its exact
+            // Building token, so deletion cannot resurrect an entry.
+            return Ok(ObserveFold::new(initial_model).snapshot(session_id));
+        }
+        match hub
+            .inner
+            .observe_digests
+            .start(session_id, sealed_head)
+            .await
+        {
+            CacheStart::Ready(snapshot) => return Ok(snapshot),
             CacheStart::BuildAndInstall(token) => {
                 let mut guard = ObserveBuildGuard::new(
                     Arc::clone(&hub.inner.observe_digests),
                     session_id.clone(),
                     token,
                 );
-                let head_seq = hub.inner.store.latest_seq(session_id).await?;
                 let fold =
-                    rebuild_observe_fold(&hub.inner.store, session_id, head_seq, initial_model)
+                    rebuild_observe_fold(&hub.inner.store, session_id, sealed_head, initial_model)
                         .await?;
-                let snapshot =
-                    hub.inner
-                        .observe_digests
-                        .install(session_id.clone(), fold, Some(token));
+                let snapshot = hub
+                    .inner
+                    .observe_digests
+                    .install(session_id.clone(), fold, token);
                 guard.disarm();
                 if snapshot.head_seq == hub.inner.store.latest_seq(session_id).await? {
                     return Ok(snapshot);
                 }
             }
-            CacheStart::BuildOnly => {
-                let head_seq = hub.inner.store.latest_seq(session_id).await?;
-                let fold =
-                    rebuild_observe_fold(&hub.inner.store, session_id, head_seq, initial_model)
-                        .await?;
-                let snapshot = fold.snapshot(session_id);
-                if snapshot.head_seq == hub.inner.store.latest_seq(session_id).await? {
-                    return Ok(snapshot);
+            CacheStart::WaitExisting(mut completion) => loop {
+                let snapshot = {
+                    let current = completion.borrow_and_update();
+                    let snapshot = current.as_ref().map(Arc::clone);
+                    drop(current);
+                    snapshot
+                };
+                if let Some(snapshot) = snapshot {
+                    if snapshot.head_seq == hub.inner.store.latest_seq(session_id).await? {
+                        return Ok((*snapshot).clone());
+                    }
+                    break;
                 }
-            }
+                if completion.changed().await.is_err() {
+                    break;
+                }
+            },
         }
     }
 }
