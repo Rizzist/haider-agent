@@ -1081,6 +1081,7 @@ async fn recovery_dual_reads_historical_and_canonical_permission_states() {
             | RecoveredWork::PartialStream(_)
             | RecoveredWork::RouteWait(_)
             | RecoveredWork::ChildWait(_)
+            | RecoveredWork::AdmissionRetry(_)
             | RecoveredWork::WorkflowContinuation(_)
             | RecoveredWork::DelegationMirror(_) => None,
         })

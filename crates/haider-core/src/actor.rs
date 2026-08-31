@@ -585,6 +585,10 @@ pub struct HarnessConfig {
     /// Physical request-attempt ordinal already consumed before recovery.
     /// This keeps durable cache/provider-view coordinates monotonic.
     pub provider_request_ordinal_already_made: u64,
+    /// A restart-reconstructed admission retry has no trustworthy in-memory
+    /// cumulative baseline. Keep each durable response snapshot request-local
+    /// while retaining cumulative accounting inside the actor.
+    pub recovery_request_local_usage: bool,
     /// Independent guard against providers repeatedly exhausting output.
     pub max_continuations_per_turn: usize,
     /// Maximum number of submissions parked behind the active turn.
@@ -687,6 +691,7 @@ impl HarnessConfig {
             max_provider_requests_per_turn: DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN,
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
+            recovery_request_local_usage: false,
             max_continuations_per_turn: DEFAULT_MAX_CONTINUATIONS_PER_TURN,
             deferred_command_capacity: DEFAULT_DEFERRED_COMMAND_CAPACITY,
             supervisor_commits_cancelled: false,
@@ -1156,6 +1161,21 @@ impl ProviderBudgetPermit {
     }
 }
 
+/// Typed control result from the daemon-owned provider budget boundary.
+/// A descendant cancelled by its root budget is lifecycle control, not a
+/// provider/run failure; every other budget/store error retains its cause.
+#[derive(Debug)]
+pub enum ProviderBudgetGuardError {
+    Cancelled,
+    Failure(HaiderError),
+}
+
+impl From<HaiderError> for ProviderBudgetGuardError {
+    fn from(error: HaiderError) -> Self {
+        Self::Failure(error)
+    }
+}
+
 /// Daemon-owned hard-budget authority at every physical provider request.
 /// The preflight receives the fully shaped request and current provider
 /// coordinate; usage callbacks run only after the cumulative snapshot is
@@ -1168,15 +1188,18 @@ pub trait ProviderBudgetGuard: Send + Sync + std::fmt::Debug {
         provider: &str,
         request: &TurnRequest,
         projected_input_tokens: u64,
-    ) -> Result<ProviderBudgetPermit, HaiderError>;
+    ) -> Result<ProviderBudgetPermit, ProviderBudgetGuardError>;
 
-    async fn after_usage(&self, run_id: &RunId) -> Result<(), HaiderError>;
+    async fn after_usage(&self, run_id: &RunId) -> Result<(), ProviderBudgetGuardError>;
 
     /// Releases one admitted physical request into a confirmed route wait.
     /// The daemon retains its projection as the replaceable admission for the
     /// exact reconnect retry; it must not charge or reject the wait as missing
     /// provider usage.
-    async fn after_route_interruption(&self, run_id: &RunId) -> Result<(), HaiderError>;
+    async fn after_route_interruption(
+        &self,
+        run_id: &RunId,
+    ) -> Result<(), ProviderBudgetGuardError>;
 
     async fn after_request(
         &self,
@@ -1184,14 +1207,14 @@ pub trait ProviderBudgetGuard: Send + Sync + std::fmt::Debug {
         provider: &str,
         model: &str,
         usage_reported: bool,
-    ) -> Result<(), HaiderError>;
+    ) -> Result<(), ProviderBudgetGuardError>;
 }
 
 async fn release_provider_budget_for_route(
     guard: Option<&Arc<dyn ProviderBudgetGuard>>,
     run_id: &RunId,
     permit: &mut Option<ProviderBudgetPermit>,
-) -> Result<(), HaiderError> {
+) -> Result<(), ProviderBudgetGuardError> {
     let result = if let Some(guard) = guard {
         guard.after_route_interruption(run_id).await
     } else {
@@ -1208,7 +1231,7 @@ async fn release_provider_budget_request(
     model: &str,
     usage_reported: bool,
     permit: &mut Option<ProviderBudgetPermit>,
-) -> Result<(), HaiderError> {
+) -> Result<(), ProviderBudgetGuardError> {
     let result = if let Some(guard) = guard {
         guard
             .after_request(run_id, provider, model, usage_reported)
@@ -1439,7 +1462,31 @@ pub trait ContextCompactor: Send + Sync + std::fmt::Debug {
     async fn compact(
         &self,
         request: ContextCompactionRequest<'_>,
-    ) -> Result<ContextCompactionOutcome, HaiderError>;
+    ) -> Result<ContextCompactionOutcome, ContextCompactionError>;
+}
+
+/// Context compaction can encounter the same root-budget cancellation as the
+/// main provider lane. Preserve that lifecycle signal across the compactor
+/// port instead of flattening it into a run error.
+#[derive(Debug)]
+pub enum ContextCompactionError {
+    Cancelled,
+    Failure(HaiderError),
+}
+
+impl From<HaiderError> for ContextCompactionError {
+    fn from(error: HaiderError) -> Self {
+        Self::Failure(error)
+    }
+}
+
+impl From<ProviderBudgetGuardError> for ContextCompactionError {
+    fn from(error: ProviderBudgetGuardError) -> Self {
+        match error {
+            ProviderBudgetGuardError::Cancelled => Self::Cancelled,
+            ProviderBudgetGuardError::Failure(error) => Self::Failure(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3623,12 +3670,12 @@ impl HarnessActor {
                         Ok(permit) => Some(permit),
                         Err(error) => {
                             return self
-                                .errored_outcome_with_items(
+                                .drive_error_outcome_with_items(
                                     &run_id,
                                     &mut message,
                                     &mut reasoning,
                                     &mut tools,
-                                    error,
+                                    DriveError::from(error),
                                 )
                                 .await;
                         }
@@ -3690,7 +3737,7 @@ impl HarnessActor {
                                     &mut message,
                                     &mut reasoning,
                                     &mut tools,
-                                    DriveError::Store(error),
+                                    DriveError::from(error),
                                 )
                                 .await;
                         }
@@ -3750,7 +3797,7 @@ impl HarnessActor {
                                         &mut message,
                                         &mut reasoning,
                                         &mut tools,
-                                        DriveError::Store(error),
+                                        DriveError::from(error),
                                     )
                                     .await;
                             }
@@ -3794,7 +3841,7 @@ impl HarnessActor {
                                         &mut message,
                                         &mut reasoning,
                                         &mut tools,
-                                        DriveError::Store(error),
+                                        DriveError::from(error),
                                     )
                                     .await
                                 }
@@ -3823,7 +3870,7 @@ impl HarnessActor {
                                 &mut message,
                                 &mut reasoning,
                                 &mut tools,
-                                DriveError::Store(error),
+                                DriveError::from(error),
                             )
                             .await;
                     }
@@ -3874,7 +3921,7 @@ impl HarnessActor {
                             &mut message,
                             &mut reasoning,
                             &mut tools,
-                            DriveError::Store(error),
+                            DriveError::from(error),
                         )
                         .await;
                 }
@@ -3933,7 +3980,7 @@ impl HarnessActor {
                                     &mut message,
                                     &mut reasoning,
                                     &mut tools,
-                                    DriveError::Store(error),
+                                    DriveError::from(error),
                                 )
                                 .await;
                         }
@@ -4053,7 +4100,7 @@ impl HarnessActor {
                             &mut message,
                             &mut reasoning,
                             &mut tools,
-                            DriveError::Store(error),
+                            DriveError::from(error),
                         )
                         .await;
                 }
@@ -4083,7 +4130,7 @@ impl HarnessActor {
                                     &mut message,
                                     &mut reasoning,
                                     &mut tools,
-                                    DriveError::Store(error),
+                                    DriveError::from(error),
                                 )
                                 .await;
                         }
@@ -4104,7 +4151,7 @@ impl HarnessActor {
                                     &mut message,
                                     &mut reasoning,
                                     &mut tools,
-                                    DriveError::Store(error),
+                                    DriveError::from(error),
                                 )
                                 .await;
                         }
@@ -4129,7 +4176,7 @@ impl HarnessActor {
                                         &mut message,
                                         &mut reasoning,
                                         &mut tools,
-                                        DriveError::Store(error),
+                                        DriveError::from(error),
                                     )
                                     .await;
                             }
@@ -4173,7 +4220,7 @@ impl HarnessActor {
                                         &mut message,
                                         &mut reasoning,
                                         &mut tools,
-                                        DriveError::Store(error),
+                                        DriveError::from(error),
                                     )
                                     .await
                                 }
@@ -4199,7 +4246,7 @@ impl HarnessActor {
                             &mut message,
                             &mut reasoning,
                             &mut tools,
-                            DriveError::Store(error),
+                            DriveError::from(error),
                         )
                         .await;
                 }
@@ -4215,7 +4262,7 @@ impl HarnessActor {
                                 &mut message,
                                 &mut reasoning,
                                 &mut tools,
-                                DriveError::Store(error),
+                                DriveError::from(error),
                             )
                             .await;
                     }
@@ -4235,7 +4282,7 @@ impl HarnessActor {
                                 &mut message,
                                 &mut reasoning,
                                 &mut tools,
-                                DriveError::Store(error),
+                                DriveError::from(error),
                             )
                             .await;
                     }
@@ -4285,7 +4332,7 @@ impl HarnessActor {
                                     &mut message,
                                     &mut reasoning,
                                     &mut tools,
-                                    DriveError::Store(error),
+                                    DriveError::from(error),
                                 )
                                 .await;
                         }
@@ -4335,7 +4382,7 @@ impl HarnessActor {
                                     &mut message,
                                     &mut reasoning,
                                     &mut tools,
-                                    DriveError::Store(error),
+                                    DriveError::from(error),
                                 )
                                 .await;
                         }
@@ -4346,7 +4393,7 @@ impl HarnessActor {
                                     &mut message,
                                     &mut reasoning,
                                     &mut tools,
-                                    DriveError::Store(error),
+                                    DriveError::from(error),
                                 )
                                 .await;
                         }
@@ -4363,7 +4410,7 @@ impl HarnessActor {
                                     &mut message,
                                     &mut reasoning,
                                     &mut tools,
-                                    DriveError::Store(error),
+                                    DriveError::from(error),
                                 )
                                 .await;
                         }
@@ -4414,7 +4461,7 @@ impl HarnessActor {
                                     &mut message,
                                     &mut reasoning,
                                     &mut tools,
-                                    DriveError::Store(error),
+                                    DriveError::from(error),
                                 )
                                 .await;
                         }
@@ -4480,7 +4527,7 @@ impl HarnessActor {
                                     &mut message,
                                     &mut reasoning,
                                     &mut tools,
-                                    DriveError::Store(budget_error),
+                                    DriveError::from(budget_error),
                                 )
                                 .await;
                         }
@@ -4716,7 +4763,7 @@ impl HarnessActor {
                                             &mut message,
                                             &mut reasoning,
                                             &mut tools,
-                                            DriveError::Store(error),
+                                            DriveError::from(error),
                                         )
                                         .await
                                     }
@@ -4865,7 +4912,7 @@ impl HarnessActor {
                                                 &mut message,
                                                 &mut reasoning,
                                                 &mut tools,
-                                                DriveError::Store(error),
+                                                DriveError::from(error),
                                             )
                                             .await;
                                     }
@@ -4948,7 +4995,7 @@ impl HarnessActor {
                                     &mut message,
                                     &mut reasoning,
                                     &mut tools,
-                                    DriveError::Store(error),
+                                    DriveError::from(error),
                                 )
                                 .await;
                         }
@@ -5067,7 +5114,12 @@ impl HarnessActor {
                         let footprint =
                             context_footprint_from_usage(&self.config, &usage, &messages);
                         request_usage = Some(usage.clone());
-                        match cumulative_usage(completed_usage.as_ref(), &usage) {
+                        let durable_usage = if self.config.recovery_request_local_usage {
+                            Ok(usage.clone())
+                        } else {
+                            cumulative_usage(completed_usage.as_ref(), &usage)
+                        };
+                        match durable_usage {
                             Ok(usage) => {
                                 if let Err(error) = self.flush_pending_item_delta().await {
                                     return self
@@ -5076,7 +5128,7 @@ impl HarnessActor {
                                             &mut message,
                                             &mut reasoning,
                                             &mut tools,
-                                            DriveError::Store(error),
+                                            DriveError::from(error),
                                         )
                                         .await;
                                 }
@@ -5098,7 +5150,7 @@ impl HarnessActor {
                                                 &mut message,
                                                 &mut reasoning,
                                                 &mut tools,
-                                                DriveError::Store(error),
+                                                DriveError::from(error),
                                             )
                                             .await;
                                     }
@@ -5109,7 +5161,7 @@ impl HarnessActor {
                                                 &mut message,
                                                 &mut reasoning,
                                                 &mut tools,
-                                                DriveError::Store(error),
+                                                DriveError::from(error),
                                             )
                                             .await;
                                     }
@@ -5136,7 +5188,7 @@ impl HarnessActor {
                                     &mut message,
                                     &mut reasoning,
                                     &mut tools,
-                                    DriveError::Store(error),
+                                    DriveError::from(error),
                                 )
                                 .await;
                         }
@@ -5152,7 +5204,7 @@ impl HarnessActor {
                                         &mut message,
                                         &mut reasoning,
                                         &mut tools,
-                                        DriveError::Store(error),
+                                        DriveError::from(error),
                                     )
                                     .await;
                             }
@@ -5176,7 +5228,7 @@ impl HarnessActor {
                                         &mut message,
                                         &mut reasoning,
                                         &mut tools,
-                                        DriveError::Store(error),
+                                        DriveError::from(error),
                                     )
                                     .await;
                             }
@@ -5218,7 +5270,7 @@ impl HarnessActor {
                                         &mut message,
                                         &mut reasoning,
                                         &mut tools,
-                                        DriveError::Store(error),
+                                        DriveError::from(error),
                                     )
                                     .await;
                             }
@@ -5280,7 +5332,7 @@ impl HarnessActor {
                                         &mut message,
                                         &mut reasoning,
                                         &mut tools,
-                                        DriveError::Store(error),
+                                        DriveError::from(error),
                                     )
                                     .await;
                             }
@@ -5663,7 +5715,7 @@ impl HarnessActor {
                                                 &mut message,
                                                 &mut reasoning,
                                                 &mut tools,
-                                                DriveError::Store(error),
+                                                DriveError::from(error),
                                             )
                                             .await;
                                     }
@@ -5730,7 +5782,7 @@ impl HarnessActor {
                                             &mut message,
                                             &mut reasoning,
                                             &mut tools,
-                                            DriveError::Store(error),
+                                            DriveError::from(error),
                                         )
                                         .await;
                                 }
@@ -5785,7 +5837,7 @@ impl HarnessActor {
                                             &mut message,
                                             &mut reasoning,
                                             &mut tools,
-                                            DriveError::Store(error),
+                                            DriveError::from(error),
                                         )
                                         .await;
                                 }
@@ -5825,7 +5877,7 @@ impl HarnessActor {
                                         &mut message,
                                         &mut reasoning,
                                         &mut tools,
-                                        DriveError::Store(error),
+                                        DriveError::from(error),
                                     )
                                     .await
                                 }
@@ -5890,7 +5942,7 @@ impl HarnessActor {
                                 &mut message,
                                 &mut reasoning,
                                 &mut tools,
-                                DriveError::Store(error),
+                                DriveError::from(error),
                             )
                             .await;
                     }
@@ -6532,7 +6584,7 @@ impl HarnessActor {
                 economy_before: &self.config.context_economy,
             })
             .await
-            .map_err(DriveError::Store)?;
+            .map_err(DriveError::from)?;
         self.config.context_economy = compacted.economy;
         messages.push(compacted.summary);
         messages.extend(suffix);
@@ -9098,6 +9150,10 @@ impl HarnessActor {
                 self.provider_failure_outcome_with_items(run_id, message, reasoning, tools, error)
                     .await
             }
+            DriveError::Cancelled => {
+                self.cancelled_outcome_with_items(run_id, message, reasoning, tools)
+                    .await
+            }
             other => {
                 self.errored_outcome_with_items(
                     run_id,
@@ -10113,6 +10169,30 @@ enum DriveError {
     Account(HaiderError),
     Store(HaiderError),
     Cancelled,
+}
+
+impl From<HaiderError> for DriveError {
+    fn from(error: HaiderError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<ProviderBudgetGuardError> for DriveError {
+    fn from(error: ProviderBudgetGuardError) -> Self {
+        match error {
+            ProviderBudgetGuardError::Cancelled => Self::Cancelled,
+            ProviderBudgetGuardError::Failure(error) => Self::Store(error),
+        }
+    }
+}
+
+impl From<ContextCompactionError> for DriveError {
+    fn from(error: ContextCompactionError) -> Self {
+        match error {
+            ContextCompactionError::Cancelled => Self::Cancelled,
+            ContextCompactionError::Failure(error) => Self::Store(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

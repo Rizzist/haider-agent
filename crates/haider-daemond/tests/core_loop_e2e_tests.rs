@@ -17,15 +17,19 @@ use haider_daemon::{
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
+use haider_protocol::cache::CacheRequestAttemptV1;
 use haider_protocol::effect::{EffectClass, FileFreshness};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::headless::{HeadlessRunSpecV1, RunBudgetV1};
+use haider_protocol::headless::{
+    HeadlessRunEventPayload, HeadlessRunSpecV1, RunBudgetDecisionReasonV1, RunBudgetDimensionV1,
+    RunBudgetExhaustedV1, RunBudgetV1,
+};
 use haider_protocol::ids::{CredentialAlias, ItemId, MenuId, RunId, SessionId};
 use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, TurnItem};
 use haider_protocol::loom::LoomAgentType;
 use haider_protocol::menu::{Menu, MenuAnswer};
-use haider_protocol::provider::{Block, CapabilityDoc, FinishReason};
+use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::session::{
     SessionInteractionModeV1, SessionMetadataV1, SessionPermissionOverridesV1,
 };
@@ -36,16 +40,16 @@ use haider_provider::{
     ProviderStream, ToolDefinition, TurnRequest,
 };
 use haider_rpc::{
-    AttachMode, CancelStatus, ClientKind, CommandId, FleetAgentStateWire, RequestBody, RequestId,
-    ResponseBody, SeqRange, SessionFleetSnapshot, SshAuthInputWire, SshProfileInputWire,
+    AttachMode, CancelStatus, ClientKind, CommandId, FleetAgentStateWire, MenuInput, RequestBody,
+    RequestId, ResponseBody, SeqRange, SessionFleetSnapshot, SshAuthInputWire, SshProfileInputWire,
     SshScopeWire, WireFrame,
 };
 use haider_tools::SessionGrant;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use support::{UdsClient, ready_with_dependencies, test_root};
 use tokio::sync::Semaphore;
 
@@ -80,6 +84,44 @@ struct RoutingFactory {
 struct CacheAwareFixtureProvider {
     renderer: AnthropicProvider,
     scripted: Arc<FakeProvider>,
+}
+
+/// Holds exactly one physical provider open after the daemon has admitted and
+/// journaled it. The next open crosses the same scripted boundary normally,
+/// so restart recovery, not a synthetic provider failure, decides the run.
+struct CrashAfterAdmissionProvider {
+    scripted: Arc<FakeProvider>,
+    blocked_ordinal: usize,
+    attempts: AtomicUsize,
+    requests: StdMutex<Vec<TurnRequest>>,
+    entered: Semaphore,
+}
+
+impl CrashAfterAdmissionProvider {
+    fn new(script: Vec<FakeStep>, blocked_ordinal: usize) -> Self {
+        Self {
+            scripted: Arc::new(FakeProvider::new(script)),
+            blocked_ordinal,
+            attempts: AtomicUsize::new(0),
+            requests: StdMutex::new(Vec::new()),
+            entered: Semaphore::new(0),
+        }
+    }
+
+    async fn wait_until_blocked(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("crash-admission barrier remains open")
+            .forget();
+    }
+
+    fn requests(&self) -> Vec<TurnRequest> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 struct RefreshBarrier {
@@ -249,6 +291,26 @@ impl Provider for CacheAwareFixtureProvider {
     }
 
     async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        self.scripted.stream_turn(request).await
+    }
+}
+
+#[async_trait]
+impl Provider for CrashAfterAdmissionProvider {
+    async fn capabilities(&self) -> CapabilityDoc {
+        self.scripted.capabilities().await
+    }
+
+    async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request.clone());
+        let ordinal = self.attempts.fetch_add(1, Ordering::AcqRel) + 1;
+        if ordinal == self.blocked_ordinal {
+            self.entered.add_permits(1);
+            return std::future::pending().await;
+        }
         self.scripted.stream_turn(request).await
     }
 }
@@ -672,6 +734,32 @@ async fn start_headless_run(
     generation: u64,
     command_id: &str,
 ) -> RunId {
+    start_headless_run_with_budget(
+        client,
+        config,
+        workspace,
+        session_id,
+        generation,
+        command_id,
+        "fake",
+        "fake-v1",
+        RunBudgetV1::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_headless_run_with_budget(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    workspace: &Path,
+    session_id: SessionId,
+    generation: u64,
+    command_id: &str,
+    provider: &str,
+    model: &str,
+    budget: RunBudgetV1,
+) -> RunId {
     send_request(
         client,
         config,
@@ -684,15 +772,15 @@ async fn start_headless_run(
             attachments: Vec::new(),
             spec: HeadlessRunSpecV1 {
                 cwd: workspace.to_string_lossy().into_owned(),
-                provider: "fake".into(),
-                model: "fake-v1".into(),
+                provider: provider.into(),
+                model: model.into(),
                 max_output_tokens: 4096,
                 effort: None,
                 fast: false,
                 seed: Some(968),
                 permission_overrides: SessionPermissionOverridesV1::default(),
                 trust_hooks: false,
-                budget: RunBudgetV1::default(),
+                budget,
                 request_deadline_unix_ms: None,
                 replay_of: None,
             },
@@ -732,6 +820,164 @@ fn workflow_script(node_names: &[&str]) -> Vec<FakeStep> {
             )
         })
         .collect()
+}
+
+fn reported_usage(input: u64) -> Usage {
+    Usage {
+        input,
+        output: 0,
+        reasoning: 0,
+        cached: 0,
+        source: UsageSource::ProviderReported,
+        account: None,
+        accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
+        request: None,
+    }
+}
+
+fn budget_facts(envelopes: &[RawEnvelope], run_id: &RunId) -> Vec<RunBudgetExhaustedV1> {
+    envelopes
+        .iter()
+        .filter(|envelope| envelope.run_id.as_ref() == Some(run_id))
+        .filter_map(|envelope| {
+            HeadlessRunEventPayload::from_payload_value(&envelope.payload).and_then(|payload| {
+                match payload {
+                    HeadlessRunEventPayload::RunBudgetExhausted(exhausted) => Some(exhausted),
+                    HeadlessRunEventPayload::HeadlessRunConfigured(_)
+                    | HeadlessRunEventPayload::RunDeadlineExceeded(_) => None,
+                }
+            })
+        })
+        .collect()
+}
+
+fn provider_request_attempts(
+    envelopes: &[RawEnvelope],
+    run_id: &RunId,
+) -> Vec<CacheRequestAttemptV1> {
+    envelopes
+        .iter()
+        .filter(|envelope| envelope.run_id.as_ref() == Some(run_id))
+        .filter_map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                .ok()
+                .and_then(|payload| match payload {
+                    EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                        CacheRequestAttemptV1::from_extension_item(&item)
+                    }
+                    _ => None,
+                })
+        })
+        .collect()
+}
+
+async fn wait_for_delegated_question(client: &mut UdsClient, run_id: &RunId) -> (Menu, u64, u64) {
+    // Registry #94: the seam's headless run has a 30s absolute budget. The
+    // observer owns that complete production wait plus 1s for publication.
+    tokio::time::timeout(std::time::Duration::from_secs(31), async {
+        loop {
+            let Some(frame) = client.try_next().await else {
+                panic!("connection closed while waiting for delegated question")
+            };
+            let WireFrame::Event { envelope, .. } = frame else {
+                continue;
+            };
+            if envelope.run_id.as_ref() != Some(run_id) {
+                continue;
+            }
+            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+                continue;
+            };
+            match payload {
+                EventPayload::MenuOpened(menu) if menu.origin == "delegated-child" => {
+                    return (menu, envelope.seq, envelope.worker_generation);
+                }
+                EventPayload::RunFailed { code, message, .. } => {
+                    panic!("parent failed before surfacing child question: {code:?}: {message}")
+                }
+                EventPayload::RunState(state) if state.is_terminal() => {
+                    panic!("parent terminalized before surfacing child question: {state:?}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("delegated question is surfaced inside the run budget")
+}
+
+async fn wait_for_cancelled_child_reap(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    parent_session: SessionId,
+    request_prefix: &str,
+) -> (SessionId, Vec<RawEnvelope>) {
+    // Registry #94: delegated cancellation reserves a 1s settlement tail;
+    // the outer 5s bound is 1s production cleanup + 4s scheduling/store I/O.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut attempt = 0_u32;
+        loop {
+            let snapshot = fleet(
+                client,
+                config,
+                parent_session.clone(),
+                &format!("{request_prefix}-fleet-{attempt}"),
+            )
+            .await;
+            let Some(node) = snapshot.roots.first() else {
+                attempt = attempt.saturating_add(1);
+                tokio::task::yield_now().await;
+                continue;
+            };
+            assert!(
+                matches!(
+                    node.state,
+                    FleetAgentStateWire::Live | FleetAgentStateWire::Cancelled
+                ),
+                "budget cleanup produced the wrong child terminal: {:?}",
+                node.state
+            );
+            let child_session = node.session_id.clone();
+            let journal = read_session(
+                client,
+                config,
+                child_session.clone(),
+                &format!("{request_prefix}-child-read-{attempt}"),
+            )
+            .await;
+            let cancelled = journal.iter().position(|envelope| {
+                serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                    |payload| matches!(payload, EventPayload::RunState(RunState::Cancelled)),
+                )
+            });
+            let idle = journal.iter().position(|envelope| {
+                serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                    |payload| {
+                        matches!(
+                            payload,
+                            EventPayload::SessionState(
+                                haider_protocol::state::SessionState::Idle { .. }
+                            )
+                        )
+                    },
+                )
+            });
+            if node.state == FleetAgentStateWire::Cancelled
+                && cancelled
+                    .zip(idle)
+                    .is_some_and(|(cancelled, idle)| idle > cancelled)
+            {
+                return (child_session, journal);
+            }
+            attempt = attempt.saturating_add(1);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("budget-cancelled child reaches its durable Idle reap fence")
 }
 
 fn request_contains(request: &TurnRequest, needle: &str) -> bool {
@@ -1477,6 +1723,137 @@ async fn headless_workflow_provider_request_cap_returns_typed_loop_limit() {
     task.join().await.expect("daemon joins");
 }
 
+/// Seam: budget admission owns the terminal between autonomous workflow
+/// requests. A mutation that checks only at run finalization reports
+/// workflow_unfinished/loop_limit or opens the second provider request.
+#[tokio::test]
+async fn workflow_hop_cost_cap_terminalizes_budget_before_request_two() {
+    let test_id = "workflow-hop-budget-seam";
+    let root = test_root("workflow-hop-budget-seam-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let script = vec![
+        FakeStep::EmitUsage {
+            usage: reported_usage(180_000),
+        },
+        FakeStep::EmitToolCall {
+            call_id: "budget-hop-evidence".into(),
+            name: "graph_evidence".into(),
+            args: serde_json::json!({
+                "node": "PLAN",
+                "verdict": "green",
+                "detail": "budget-hop-one-complete",
+            }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "budget-hop-evidence".into(),
+        },
+        FakeStep::EmitText {
+            text: "request two must remain unopened".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ];
+    let fake = Arc::new(FakeProvider::new(script));
+    let provider: Arc<dyn Provider> = fake.clone();
+    let config = DaemonConfig::new(
+        test_id,
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let task =
+        ready_with_dependencies(&config, dependencies([("openai".into(), provider)], [])).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        test_id,
+        "workflow-budget-client",
+        ClientKind::Headless,
+    )
+    .await;
+    register_workflow_chain(&mut client, &config, test_id, &["PLAN"]).await;
+    let (session_id, generation) = create_and_attach_with_mode(
+        &mut client,
+        &config,
+        &workspace,
+        "openai",
+        "gpt-5.6-sol",
+        None,
+        None,
+        SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    pin_workflow(
+        &mut client,
+        &config,
+        session_id.clone(),
+        generation,
+        test_id,
+    )
+    .await;
+    let run_id = start_headless_run_with_budget(
+        &mut client,
+        &config,
+        &workspace,
+        session_id.clone(),
+        generation,
+        "workflow-budget-run",
+        "openai",
+        "gpt-5.6-sol",
+        RunBudgetV1 {
+            max_cost_microusd: Some(1_000_000),
+            // Registry #94: the non-Windows support deadline is 60s = this
+            // 30s run budget + 1s terminal tail + 29s scheduling. Windows'
+            // 92s platform wrapper is independently derived in support.
+            max_time_ms: Some(30_000),
+            ..RunBudgetV1::default()
+        },
+    )
+    .await;
+    let (state, failure, events) = events_until_any_terminal(&mut client, &run_id).await;
+    assert_eq!(state, RunState::Errored);
+    assert!(matches!(failure, Some((ErrorCode::BudgetExhausted, _))));
+    assert!(!events.iter().any(|payload| matches!(
+        payload,
+        EventPayload::RunFailed {
+            code: ErrorCode::WorkflowUnfinished | ErrorCode::LoopLimit,
+            ..
+        }
+    )));
+    assert_eq!(
+        fake.requests().len(),
+        1,
+        "the cap must bind before workflow request two reaches transport"
+    );
+    let journal = read_session(&mut client, &config, session_id, "workflow-budget-journal").await;
+    assert_eq!(
+        provider_request_attempts(&journal, &run_id).len(),
+        1,
+        "the durable journal records exactly one provider request attempt"
+    );
+    let facts = budget_facts(&journal, &run_id);
+    assert_eq!(facts.len(), 1, "one typed budget terminal cause");
+    assert_eq!(facts[0].dimension, RunBudgetDimensionV1::Cost);
+    let decision = facts[0]
+        .decision
+        .as_ref()
+        .expect("projected request-two decision");
+    assert_eq!(decision.reason, RunBudgetDecisionReasonV1::ProjectedRequest);
+    assert!(decision.spent < decision.cap);
+    assert!(
+        decision
+            .projected
+            .is_some_and(|projected| decision.spent.saturating_add(projected) > decision.cap)
+    );
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
 #[tokio::test]
 async fn headless_workflow_resumes_after_daemon_crash_between_stages() {
     let test_id = "headless-workflow-crash-recovery";
@@ -1595,6 +1972,252 @@ async fn headless_workflow_resumes_after_daemon_crash_between_stages() {
         state.phase,
         haider_protocol::graph::WorkflowGraphPhase::Completed
     );
+    second_task.shutdown_handle().request("test complete");
+    second_task.join().await.expect("daemon joins");
+}
+
+/// Seam: a provider attempt admitted and durably marked immediately before a
+/// crash is neither spend nor a reason to forget prior spend. Recovery must
+/// retry the interrupted workflow request once, retain its logical ordinal,
+/// and finish under a cap that covers every completed exchange.
+#[tokio::test]
+async fn workflow_recovery_after_budget_admission_preserves_spend_and_ordinal() {
+    let test_id = "workflow-budget-admission-recovery";
+    let nodes = ["PLAN"];
+    let root = test_root("workflow-budget-admission-recovery-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let provider = Arc::new(CrashAfterAdmissionProvider::new(
+        vec![
+            FakeStep::EmitUsage {
+                usage: reported_usage(1_000),
+            },
+            FakeStep::EmitToolCall {
+                call_id: "recovery-evidence-1".into(),
+                name: "graph_evidence".into(),
+                args: serde_json::json!({
+                    "node": "PLAN",
+                    "verdict": "green",
+                    "detail": "recovery-artifact-1",
+                }),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::ExpectToolResult {
+                call_id: "recovery-evidence-1".into(),
+            },
+            FakeStep::EmitUsage {
+                usage: reported_usage(1_000),
+            },
+            FakeStep::EmitText {
+                text: "recovery stage one finished".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ],
+        1,
+    ));
+    let routed: Arc<dyn Provider> = provider.clone();
+    let dependencies = dependencies([("openai".into(), routed)], []);
+    let config = DaemonConfig::new(
+        test_id,
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let first_task = ready_with_dependencies(&config, dependencies.clone()).await;
+    let mut first_client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        test_id,
+        "admission-crash-client",
+        ClientKind::Headless,
+    )
+    .await;
+    register_workflow_chain(&mut first_client, &config, test_id, &nodes).await;
+    let (session_id, generation) = create_and_attach_with_mode(
+        &mut first_client,
+        &config,
+        &workspace,
+        "openai",
+        "gpt-5.6-sol",
+        None,
+        None,
+        SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    pin_workflow(
+        &mut first_client,
+        &config,
+        session_id.clone(),
+        generation,
+        test_id,
+    )
+    .await;
+    let run_id = start_headless_run_with_budget(
+        &mut first_client,
+        &config,
+        &workspace,
+        session_id.clone(),
+        generation,
+        "admission-crash-run",
+        "openai",
+        "gpt-5.6-sol",
+        RunBudgetV1 {
+            max_cost_microusd: Some(10_000_000),
+            // Registry #94: the 31s admission observer below is this 30s
+            // absolute run budget plus 1s for publication.
+            max_time_ms: Some(30_000),
+            ..RunBudgetV1::default()
+        },
+    )
+    .await;
+    // Registry #94/#95: the provider-open observer services Ping/Pong while
+    // containing the run's 30s absolute budget plus 1s publication margin.
+    tokio::time::timeout(std::time::Duration::from_secs(31), async {
+        loop {
+            tokio::select! {
+                () = provider.wait_until_blocked() => break,
+                frame = first_client.try_next() => {
+                    let Some(frame) = frame else {
+                        panic!("connection closed before the admitted provider barrier")
+                    };
+                    let WireFrame::Event { envelope, .. } = frame else {
+                        continue;
+                    };
+                    if envelope.run_id.as_ref() != Some(&run_id) {
+                        continue;
+                    }
+                    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+                        continue;
+                    };
+                    match payload {
+                        EventPayload::RunFailed { code, message, .. } => panic!(
+                            "run failed before reaching the admitted provider barrier: {code:?}: {message}"
+                        ),
+                        EventPayload::RunState(state) if state.is_terminal() => panic!(
+                            "run terminalized before reaching the admitted provider barrier: {state:?}"
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("first admitted provider attempt reaches the crash barrier");
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(provider.scripted.requests().len(), 0);
+    drop(first_client);
+    first_task.crash().await;
+
+    let second_task = ready_with_dependencies(&config, dependencies).await;
+    let mut second_client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        test_id,
+        "admission-restart-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let replay = attach_existing(
+        &mut second_client,
+        &config,
+        session_id.clone(),
+        "admission-restart-attach",
+    )
+    .await;
+    let replay_payloads = replay
+        .iter()
+        .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
+        .filter_map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()
+        })
+        .collect::<Vec<_>>();
+    let replay_failure = replay_payloads.iter().find_map(|payload| match payload {
+        EventPayload::RunFailed { code, message, .. } => Some((*code, message.clone())),
+        _ => None,
+    });
+    let replay_terminal = replay_payloads.iter().find_map(|payload| match payload {
+        EventPayload::RunState(state) if state.is_terminal() => Some(state.clone()),
+        _ => None,
+    });
+    if let Some(state) = replay_terminal {
+        assert_eq!(
+            state,
+            RunState::Done,
+            "recovery misclassified the admitted pre-response attempt; failure={replay_failure:?}"
+        );
+        assert!(replay_failure.is_none());
+    } else {
+        let (state, failure, _) = events_until_any_terminal(&mut second_client, &run_id).await;
+        assert_eq!(
+            state,
+            RunState::Done,
+            "recovery misclassified the admitted pre-response attempt; failure={failure:?}"
+        );
+        assert!(failure.is_none());
+    }
+    assert_eq!(
+        provider.requests().len(),
+        3,
+        "two completed workflow requests plus one abandoned pre-response attempt"
+    );
+    assert_eq!(provider.scripted.requests().len(), 2);
+    let journal = read_session(
+        &mut second_client,
+        &config,
+        session_id.clone(),
+        "admission-recovery-journal",
+    )
+    .await;
+    assert!(
+        budget_facts(&journal, &run_id).is_empty(),
+        "a sufficient cap must not become a missing-usage budget terminal"
+    );
+    let attempts = provider_request_attempts(&journal, &run_id);
+    assert_eq!(attempts.len(), 3, "one durable marker per physical attempt");
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|attempt| attempt.ordinal)
+            .collect::<Vec<_>>(),
+        vec![1, 1, 2],
+        "the retried first hop retains its logical ordinal before hop two"
+    );
+    let usage = journal
+        .iter()
+        .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
+        .filter_map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                .ok()
+                .and_then(|payload| match payload {
+                    EventPayload::Usage(usage) => Some(usage),
+                    _ => None,
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(usage.len(), 2, "only completed exchanges contribute spend");
+    assert_eq!(usage.iter().map(|usage| usage.input).sum::<u64>(), 2_000);
+    let ordinals = usage
+        .iter()
+        .map(|usage| {
+            usage
+                .request
+                .as_ref()
+                .expect("budgeted usage carries request ordinal")
+                .ordinal
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(ordinals.len(), 2, "recovery reused a logical ordinal");
+    assert_eq!(
+        workflow_graph_state(&mut second_client, &config, session_id)
+            .await
+            .phase,
+        haider_protocol::graph::WorkflowGraphPhase::Completed
+    );
+
     second_task.shutdown_handle().request("test complete");
     second_task.join().await.expect("daemon joins");
 }
@@ -2266,6 +2889,321 @@ async fn cross_provider_subagent_returns_to_parent_and_fleet_is_truthful() {
             .is_some_and(|name| !name.is_empty())
     );
     assert_eq!(node.state, FleetAgentStateWire::Done);
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// Seam: a delegated request debits the root coordinator. Crossing the root
+/// cap mid-stream must budget-terminalize the parent, cancel/reap the child,
+/// and retain exactly one copy of the child's committed usage.
+#[tokio::test]
+async fn child_spend_crossing_parent_cap_is_counted_once_and_child_is_reaped() {
+    let test_id = "child-spend-parent-budget-seam";
+    let root = test_root("child-spend-parent-budget-seam-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let parent = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitUsage {
+            usage: reported_usage(100),
+        },
+        FakeStep::EmitToolCall {
+            call_id: "budget-child-spawn".into(),
+            name: "spawn_subagent".into(),
+            args: serde_json::json!({
+                "task": "cross the root cap",
+                "prompt": "report after a costly exchange",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-5",
+                "budget_tokens": 4096,
+            }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::EmitText {
+            text: "parent continuation must remain unopened".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let child = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitUsage {
+            usage: reported_usage(400_000),
+        },
+        FakeStep::Hang,
+    ]));
+    let parent_provider: Arc<dyn Provider> = parent.clone();
+    let child_provider: Arc<dyn Provider> = child.clone();
+    let config = DaemonConfig::new(
+        test_id,
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let task = ready_with_dependencies(
+        &config,
+        dependencies(
+            [
+                ("openai".into(), parent_provider),
+                ("anthropic".into(), child_provider),
+            ],
+            [],
+        ),
+    )
+    .await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        test_id,
+        "child-budget-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach_with_mode(
+        &mut client,
+        &config,
+        &workspace,
+        "openai",
+        "gpt-5.6-sol",
+        None,
+        None,
+        SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    let run_id = start_headless_run_with_budget(
+        &mut client,
+        &config,
+        &workspace,
+        session_id.clone(),
+        generation,
+        "child-budget-run",
+        "openai",
+        "gpt-5.6-sol",
+        RunBudgetV1 {
+            max_cost_microusd: Some(1_000_000),
+            // Registry #94: events_until_any_terminal's non-Windows 60s is
+            // this 30s run budget + 1s terminal tail + 29s scheduling;
+            // support derives Windows' stronger platform wrapper separately.
+            max_time_ms: Some(30_000),
+            ..RunBudgetV1::default()
+        },
+    )
+    .await;
+    let (state, failure, _) = events_until_any_terminal(&mut client, &run_id).await;
+    assert_eq!(state, RunState::Errored);
+    assert!(matches!(failure, Some((ErrorCode::BudgetExhausted, _))));
+    assert_eq!(parent.requests().len(), 1);
+    assert_eq!(child.requests().len(), 1);
+
+    let journal = read_session(
+        &mut client,
+        &config,
+        session_id.clone(),
+        "child-budget-parent-journal",
+    )
+    .await;
+    let facts = budget_facts(&journal, &run_id);
+    assert_eq!(facts.len(), 1, "child crossing emits one root budget fact");
+    let fact = &facts[0];
+    assert_eq!(fact.dimension, RunBudgetDimensionV1::Cost);
+    assert_eq!(fact.usage.logical_input_tokens, 400_100);
+    assert_eq!(fact.usage.total_tokens, 400_100);
+    assert_eq!(fact.usage.estimated_cost_microusd, Some(1_200_500));
+    let decision = fact.decision.as_ref().expect("actual child spend decision");
+    assert_eq!(decision.reason, RunBudgetDecisionReasonV1::ActualUsage);
+    assert_eq!(decision.spent, 1_200_500);
+    assert_eq!(decision.projected, None);
+
+    let (_child_session, _child_journal) =
+        wait_for_cancelled_child_reap(&mut client, &config, session_id, "child-budget-reap").await;
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// Seam: InputRequired wins while spend remains below the cap. Answering the
+/// parent-projected question resumes the child; only its next UsageUpdate may
+/// cross the root cap. The delegated wait itself opens no provider request.
+#[tokio::test]
+async fn delegated_question_surfaces_before_later_child_spend_exhausts_budget() {
+    let test_id = "delegated-question-budget-seam";
+    let root = test_root("delegated-question-budget-seam-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let parent = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitUsage {
+            usage: reported_usage(100),
+        },
+        FakeStep::EmitToolCall {
+            call_id: "question-child-spawn".into(),
+            name: "spawn_subagent".into(),
+            args: serde_json::json!({
+                "task": "ask before spending",
+                "prompt": "ask one question, then finish",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-5",
+                "budget_tokens": 4096,
+            }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::EmitText {
+            text: "parent continuation must remain unopened".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let child = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitUsage {
+            usage: reported_usage(100),
+        },
+        FakeStep::EmitRequestInput {
+            call_id: "budget-child-question".into(),
+            kind: haider_provider::FakeInputKind::Question,
+            title: "which value?".into(),
+            body: vec!["The answer should resume this delegated run.".into()],
+            options: Vec::new(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "budget-child-question".into(),
+        },
+        FakeStep::EmitUsage {
+            usage: reported_usage(400_000),
+        },
+        FakeStep::Hang,
+    ]));
+    let parent_provider: Arc<dyn Provider> = parent.clone();
+    let child_provider: Arc<dyn Provider> = child.clone();
+    let config = DaemonConfig::new(
+        test_id,
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let task = ready_with_dependencies(
+        &config,
+        dependencies(
+            [
+                ("openai".into(), parent_provider),
+                ("anthropic".into(), child_provider),
+            ],
+            [],
+        ),
+    )
+    .await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        test_id,
+        "question-budget-client",
+        ClientKind::Headless,
+    )
+    .await;
+    // Headless admission requires Autonomous session policy. The merged
+    // delegation contract must therefore keep a child's projected question
+    // answerable even though ordinary autonomous input fails closed.
+    let (session_id, generation) = create_and_attach_with_mode(
+        &mut client,
+        &config,
+        &workspace,
+        "openai",
+        "gpt-5.6-sol",
+        None,
+        None,
+        SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    let run_id = start_headless_run_with_budget(
+        &mut client,
+        &config,
+        &workspace,
+        session_id.clone(),
+        generation,
+        "question-budget-run",
+        "openai",
+        "gpt-5.6-sol",
+        RunBudgetV1 {
+            max_cost_microusd: Some(1_000_000),
+            // Registry #94: both the 31s menu observer and the later 60s
+            // terminal observer contain this 30s run budget; their margins
+            // are respectively 1s publication and 1s tail + 29s scheduling.
+            max_time_ms: Some(30_000),
+            ..RunBudgetV1::default()
+        },
+    )
+    .await;
+    let (menu, request_seq, worker_generation) =
+        wait_for_delegated_question(&mut client, &run_id).await;
+    assert_eq!(parent.requests().len(), 1);
+    assert_eq!(child.requests().len(), 1);
+    let parked = read_session(
+        &mut client,
+        &config,
+        session_id.clone(),
+        "question-budget-parked-journal",
+    )
+    .await;
+    assert!(
+        budget_facts(&parked, &run_id).is_empty(),
+        "delegated wait consumed budget admission"
+    );
+
+    client
+        .send(
+            &WireFrame::MenuAnswer {
+                request_id: Some(RequestId::new("question-budget-answer")),
+                command_id: CommandId::new("question-budget-answer-command"),
+                session_id: session_id.clone(),
+                menu_id: menu.id,
+                request_seq,
+                worker_generation,
+                option_key: String::new(),
+                option_index: 0,
+                input: Some(MenuInput::Text {
+                    text: "resume after this answer".into(),
+                }),
+            },
+            config.frame_limit,
+        )
+        .await;
+    match next_response(&mut client).await {
+        WireFrame::Response {
+            body: ResponseBody::MenuAnswer { .. },
+            ..
+        } => {}
+        other => panic!("delegated answer failed: {other:?}"),
+    }
+    let (state, failure, _) = events_until_any_terminal(&mut client, &run_id).await;
+    assert_eq!(state, RunState::Errored);
+    assert!(matches!(failure, Some((ErrorCode::BudgetExhausted, _))));
+    assert!(!matches!(failure, Some((ErrorCode::ProviderTimeout, _))));
+    assert_eq!(parent.requests().len(), 1);
+    assert_eq!(
+        child.requests().len(),
+        2,
+        "the answer, not the delegated wait, admits child request two"
+    );
+    let journal = read_session(
+        &mut client,
+        &config,
+        session_id,
+        "question-budget-terminal-journal",
+    )
+    .await;
+    let facts = budget_facts(&journal, &run_id);
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].dimension, RunBudgetDimensionV1::Cost);
+    assert_eq!(facts[0].usage.logical_input_tokens, 400_200);
+    assert_eq!(facts[0].usage.total_tokens, 400_200);
+    assert_eq!(
+        facts[0].decision.as_ref().map(|decision| &decision.reason),
+        Some(&RunBudgetDecisionReasonV1::ActualUsage)
+    );
 
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");

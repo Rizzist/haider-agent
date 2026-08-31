@@ -1670,6 +1670,365 @@ async fn child_usage_is_charged_to_the_parent_before_its_next_request() {
     );
 }
 
+/// Seam: the shared root coordinator is deliberately weak and disappears
+/// when both quiescent supervisors retire. Recreating the delegated child
+/// must rebuild the root's durable spend before admitting another request.
+///
+/// MUTATION CHECK: seed the recreated coordinator with zero usage and the
+/// fourth provider request opens instead of failing at projected admission.
+#[tokio::test(start_paused = true)]
+async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
+    let label = "budget-retirement-shared-root";
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitUsage {
+            usage: Usage {
+                input: 100,
+                output: 0,
+                reasoning: 0,
+                cached: 0,
+                source: UsageSource::ProviderReported,
+                account: None,
+                accounts: Vec::new(),
+                normalized: None,
+                scope: None,
+                cache_cost: None,
+                request: None,
+            },
+        },
+        FakeStep::EmitToolCall {
+            call_id: "retirement-budget-spawn".into(),
+            name: "spawn_subagent".into(),
+            args: serde_json::json!({
+                "task": "seed durable child spend",
+                "prompt": "return one report",
+                "budget_tokens": 4096,
+            }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::EmitUsage {
+            usage: Usage {
+                input: 100,
+                output: 0,
+                reasoning: 0,
+                cached: 0,
+                source: UsageSource::ProviderReported,
+                account: None,
+                accounts: Vec::new(),
+                normalized: None,
+                scope: None,
+                cache_cost: None,
+                request: None,
+            },
+        },
+        FakeStep::EmitText {
+            text: "durable child report".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "retirement-budget-spawn".into(),
+        },
+        FakeStep::EmitUsage {
+            usage: Usage {
+                input: 180_000,
+                output: 0,
+                reasoning: 0,
+                cached: 0,
+                source: UsageSource::ProviderReported,
+                account: None,
+                accounts: Vec::new(),
+                normalized: None,
+                scope: None,
+                cache_cost: None,
+                request: None,
+            },
+        },
+        FakeStep::EmitText {
+            text: "root completed below its cap".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitText {
+            text: "recreated supervisor must not open this request".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FakeBudgetProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: Arc::new(BrokerToolFactory),
+            delegation: Some(crate::delegation::DelegationHandle::new(hub.clone())),
+            web_search: None,
+        },
+        false,
+    );
+    let handle = manager.handle();
+    hub.install_worker_manager(handle.clone())
+        .expect("install worker manager");
+
+    let parent_session = SessionId::new(format!("{label}-parent-session"));
+    let parent_run = RunId::new(format!("{label}-parent-run"));
+    let device_id = DeviceId::new(format!("{label}-device"));
+    let cwd = std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+        .expect("canonical cwd")
+        .to_string_lossy()
+        .into_owned();
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: format!("{label}-create"),
+        request_digest: format!("{label}-create-digest"),
+        request_json: format!(r#"{{"session":"{label}"}}"#),
+        session_id: parent_session.clone(),
+        cwd: cwd.clone(),
+        provider: "openai".into(),
+        model: "gpt-5.6-sol".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new(format!("{label}-created")),
+        device_id: device_id.clone(),
+    })
+    .await
+    .expect("create parent session");
+    let spec = HeadlessRunSpecV1 {
+        cwd,
+        provider: "openai".into(),
+        model: "gpt-5.6-sol".into(),
+        max_output_tokens: 4096,
+        effort: None,
+        fast: false,
+        seed: Some(968),
+        permission_overrides: SessionPermissionOverridesV1::default(),
+        trust_hooks: false,
+        budget: RunBudgetV1 {
+            max_cost_microusd: Some(1_000_000),
+            ..RunBudgetV1::default()
+        },
+        request_deadline_unix_ms: None,
+        replay_of: None,
+    };
+    let request_json = serde_json::json!({
+        "session_id": &parent_session,
+        "text": "delegate once, then finish",
+        "headless": spec,
+    })
+    .to_string();
+    let accepted = hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: format!("{label}-turn"),
+            request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+            request_json,
+            session_id: parent_session.clone(),
+            worker_generation: store.worker_generation(),
+            run_id: parent_run.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "delegate once, then finish".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new(format!("{label}-queued")),
+            user_event_id: EventId::new(format!("{label}-user")),
+            active_event_id: EventId::new(format!("{label}-active")),
+            device_id: device_id.clone(),
+        })
+        .await
+        .expect("accept capped parent turn");
+    handle.submit(accepted).await.expect("submit capped parent");
+    // Registry #94: 4,010ms = the delegation path's 1s settlement tail +
+    // 3s local scheduling/store allowance + one 10ms journal-poll interval.
+    timeout(BUDGET_CASE_DEADLINE, async {
+        loop {
+            let done = store
+                .read(&parent_session, 0, 1024)
+                .await
+                .expect("read parent")
+                .iter()
+                .any(|event| {
+                    event.run_id.as_ref() == Some(&parent_run)
+                        && serde_json::from_value::<EventPayload>(event.payload.clone())
+                            .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Done))
+                });
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("initial delegation settles inside the 1s tail plus 3.01s scheduling budget");
+    let initial_parent_events = store
+        .read(&parent_session, 0, 1024)
+        .await
+        .expect("read completed parent");
+    assert!(
+        initial_parent_events.iter().any(|event| {
+            event.run_id.as_ref() == Some(&parent_run)
+                && serde_json::from_value::<EventPayload>(event.payload.clone())
+                    .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Done))
+        }),
+        "initial capped delegation reaches Done; requests={}; payloads={:?}",
+        provider.requests().len(),
+        initial_parent_events
+            .iter()
+            .filter(|event| event.run_id.as_ref() == Some(&parent_run))
+            .map(|event| &event.payload)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(provider.requests().len(), 3);
+    let child = hub
+        .delegations_for_parent_run(parent_session.clone(), parent_run.clone())
+        .await
+        .expect("delegation lookup")
+        .pop()
+        .expect("durable child record");
+    assert_eq!(handle.supervisor_count(), 2);
+
+    // The production TTL is five minutes. Paused time makes it short in wall
+    // time while preserving the exact 300s production budget it wraps.
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(5 * 60)).await;
+    for _ in 0..128 {
+        if handle.supervisor_count() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        handle.supervisor_count(),
+        0,
+        "both durably quiescent supervisors retire"
+    );
+
+    let resumed_run = RunId::new(format!("{label}-recreated-child-run"));
+    let resumed_json = serde_json::json!({
+        "session_id": &child.child_session_id,
+        "text": "recreate and debit the old root",
+        "headless": &spec,
+    })
+    .to_string();
+    let resumed = hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: format!("{label}-recreated-child"),
+            request_digest: blake3::hash(resumed_json.as_bytes()).to_hex().to_string(),
+            request_json: resumed_json,
+            session_id: child.child_session_id.clone(),
+            worker_generation: store.worker_generation(),
+            run_id: resumed_run.clone(),
+            agent_id: Some(child.agent_id.clone()),
+            branch_id: None,
+            text: "recreate and debit the old root".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new(format!("{label}-recreated-queued")),
+            user_event_id: EventId::new(format!("{label}-recreated-user")),
+            active_event_id: EventId::new(format!("{label}-recreated-active")),
+            device_id,
+        })
+        .await
+        .expect("accept recreated child turn");
+    handle
+        .submit(resumed)
+        .await
+        .expect("recreate child supervisor transparently");
+    // Registry #94: the same 4,010ms local bound contains synchronous budget
+    // admission, 4s scheduling/store allowance, and one 10ms poll interval.
+    timeout(BUDGET_CASE_DEADLINE, async {
+        loop {
+            let terminal = store
+                .read(&child.child_session_id, 0, 1024)
+                .await
+                .expect("read recreated child")
+                .iter()
+                .any(|event| {
+                    event.run_id.as_ref() == Some(&resumed_run)
+                        && serde_json::from_value::<EventPayload>(event.payload.clone())
+                            .is_ok_and(|payload| {
+                                matches!(payload, EventPayload::RunState(state) if state.is_terminal())
+                            })
+                });
+            if terminal {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recreated admission terminalizes inside the 4.01s local budget");
+    let resumed_events = store
+        .read(&child.child_session_id, 0, 1024)
+        .await
+        .expect("read terminal recreated child");
+    assert!(
+        resumed_events.iter().any(|event| {
+            event.run_id.as_ref() == Some(&resumed_run)
+                && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                    |payload| {
+                        matches!(
+                            payload,
+                            EventPayload::RunFailed {
+                                code: ErrorCode::BudgetExhausted,
+                                ..
+                            }
+                        )
+                    },
+                )
+        }),
+        "recreated run must debit its durable root spend; requests={}; payloads={:?}",
+        provider.requests().len(),
+        resumed_events
+            .iter()
+            .filter(|event| event.run_id.as_ref() == Some(&resumed_run))
+            .map(|event| &event.payload)
+            .collect::<Vec<_>>()
+    );
+    assert!(resumed_events.iter().any(|event| {
+        event.run_id.as_ref() == Some(&resumed_run)
+            && serde_json::from_value::<EventPayload>(event.payload.clone())
+                .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Errored))
+    }));
+    assert_eq!(
+        provider.requests().len(),
+        3,
+        "recreated admission binds before provider request four"
+    );
+    assert_eq!(handle.supervisor_count(), 1);
+    let root_events = store
+        .read(&parent_session, 0, 1024)
+        .await
+        .expect("read durable root budget");
+    let exhausted = budget_fact(&root_events);
+    let decision = exhausted.decision.expect("recreated projected decision");
+    assert_eq!(decision.reason, RunBudgetDecisionReasonV1::ProjectedRequest);
+    assert_eq!(decision.spent, 901_000);
+    assert_eq!(exhausted.usage.logical_input_tokens, 180_200);
+    assert!(
+        decision
+            .projected
+            .is_some_and(|projected| decision.spent.saturating_add(projected) > decision.cap)
+    );
+
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 #[async_trait::async_trait]
 impl ProviderFactory for DeadlineProviderFactory {
     async fn resolve_for_turn(

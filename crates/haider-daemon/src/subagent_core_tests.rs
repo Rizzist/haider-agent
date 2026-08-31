@@ -2079,12 +2079,13 @@ async fn wait_for_wall_clock_after(
     .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
 }
 
-/// Autonomous interaction mode is durable child-session policy, not a root
-/// headless reducer trick: a child request_input without a default returns a
-/// typed tool rejection and both child and parent terminate.
+/// A headless/autonomous parent and its delegated child use one admission
+/// contract: the root remains Autonomous, while the child is Interactive so
+/// a projected request_input stays pending until the parent-side answer is
+/// durably forwarded.
 #[cfg(unix)]
 #[tokio::test]
-async fn autonomous_child_request_input_cannot_hold_parent_forever() {
+async fn autonomous_parent_keeps_delegated_request_input_answerable() {
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let provider = Arc::new(FakeProvider::new(vec![
@@ -2159,17 +2160,21 @@ async fn autonomous_child_request_input_cannot_hold_parent_forever() {
         .submit(accepted)
         .await
         .expect("submit parent");
-    wait_for_state(&store, &parent_session, |state| {
-        matches!(state, RunState::Done)
+    let child = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(child) = hub
+                .delegations_for_parent_run(parent_session.clone(), parent_run.clone())
+                .await
+                .expect("delegation")
+                .pop()
+            {
+                return child;
+            }
+            tokio::task::yield_now().await;
+        }
     })
-    .await;
-
-    let child = hub
-        .delegations_for_parent_run(parent_session.clone(), parent_run)
-        .await
-        .expect("delegation")
-        .pop()
-        .expect("child");
+    .await
+    .expect("delegated child is admitted");
     let child_metadata = store
         .session_metadata(&child.child_session_id)
         .await
@@ -2177,8 +2182,32 @@ async fn autonomous_child_request_input_cannot_hold_parent_forever() {
         .expect("metadata");
     assert_eq!(
         child_metadata.interaction_mode,
-        haider_protocol::session::SessionInteractionModeV1::Autonomous
+        haider_protocol::session::SessionInteractionModeV1::Interactive
     );
+    let (parent_menu, request_seq, worker_generation) =
+        wait_for_parent_delegated_menu(&store, &parent_session, &child.agent_id).await;
+    wait_for_state(&store, &child.child_session_id, |state| {
+        matches!(state, RunState::InputRequired { .. })
+    })
+    .await;
+    let mut control = UdsControlClient::connect(hub.clone()).await;
+    let _ = control.attach_control(parent_session.clone()).await;
+    control
+        .answer_question(
+            parent_session.clone(),
+            parent_menu.id,
+            request_seq,
+            worker_generation,
+        )
+        .await;
+    wait_for_state(&store, &child.child_session_id, |state| {
+        matches!(state, RunState::Done)
+    })
+    .await;
+    wait_for_state(&store, &parent_session, |state| {
+        matches!(state, RunState::Done)
+    })
+    .await;
     let payloads = typed_payloads(
         &store
             .read(&child.child_session_id, 0, 1024)
@@ -2187,15 +2216,16 @@ async fn autonomous_child_request_input_cannot_hold_parent_forever() {
     );
     assert!(!payloads.iter().any(|payload| matches!(
         payload,
-        EventPayload::RunState(RunState::InputRequired { .. })
-    )));
-    assert!(payloads.iter().any(|payload| matches!(
-        payload,
         EventPayload::ToolResult { result, .. }
             if serde_json::from_str::<serde_json::Value>(&result.preview)
                 .is_ok_and(|value| value["code"] == "no_human_available")
     )));
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::MenuAnswered(answer) if answer.via == AnswerVia::Hook
+    )));
 
+    control.close().await;
     manager.shutdown().await.expect("manager shutdown");
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
@@ -3035,6 +3065,14 @@ async fn durable_parent_answer_replays_into_child_after_coordinator_restart() {
                 )
                 .await
                 .expect("recover route wait"),
+            RecoveredWork::AdmissionRetry(recovered) => manager_handle
+                .recover_admission_retry(
+                    recovered.accepted,
+                    recovered.provider_requests_consumed,
+                    recovered.provider_request_ordinal,
+                )
+                .await
+                .expect("recover admission retry"),
             RecoveredWork::WorkflowContinuation(recovered) => manager_handle
                 .recover_workflow_continuation(
                     recovered.accepted,
@@ -4568,6 +4606,14 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
                 )
                 .await
                 .expect("recover partial stream"),
+            RecoveredWork::AdmissionRetry(recovered) => manager_handle
+                .recover_admission_retry(
+                    recovered.accepted,
+                    recovered.provider_requests_consumed,
+                    recovered.provider_request_ordinal,
+                )
+                .await
+                .expect("recover admission retry"),
             RecoveredWork::WorkflowContinuation(recovered) => manager_handle
                 .recover_workflow_continuation(
                     recovered.accepted,

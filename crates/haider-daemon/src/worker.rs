@@ -61,18 +61,18 @@ use base64::Engine;
 use haider_core::{
     AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, CancelToken, ChildWaitCheckpoint,
     CompiledPromptProjection, ComputerEvidenceCommand, ComputerEvidenceOutcome,
-    ContextCompactionClaim, ContextCompactionReceiptResponse, ContextCompactionRequest,
-    ContextCompactor, DeferredTicket, DeferredToolResult, EventIdGenerator, FinalizationGuard,
-    FinalizationGuardDecision, GraphEvidenceCommand, GraphEvidenceOutcome,
-    GraphFinalizationCommand, GraphFinalizationOutcome, GraphSwitchCommand, GraphSwitchOutcome,
-    HarnessActor, HarnessConfig, PartialStreamCheckpoint, PreviousCacheRequest,
+    ContextCompactionClaim, ContextCompactionError, ContextCompactionReceiptResponse,
+    ContextCompactionRequest, ContextCompactor, DeferredTicket, DeferredToolResult,
+    EventIdGenerator, FinalizationGuard, FinalizationGuardDecision, GraphEvidenceCommand,
+    GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome, GraphSwitchCommand,
+    GraphSwitchOutcome, HarnessActor, HarnessConfig, PartialStreamCheckpoint, PreviousCacheRequest,
     ProcessSignalCommand, ProcessSignalOutcome, PromptCompactionPlanRequest, PromptHistoryCompiler,
-    ProviderBudgetGuard, ProviderBudgetPermit, ProviderDeadlineGuard, ProviderDerivedRequestState,
-    ProviderPairSwitch, ProviderPairSwitchCommitter, ProviderViewAppendRequest,
-    RequestInputCheckpoint, RouteWaitCheckpoint, SessionSelectModelCommand,
-    SessionSelectModelOutcome, SharedToolPacks, StoreHandle, SubmitCheckpointTurn,
-    SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn, SubmitRouteWaitTurn,
-    ToolDispatchResult, ToolDispatcher, TurnHandle, UserCommandOutput,
+    ProviderBudgetGuard, ProviderBudgetGuardError, ProviderBudgetPermit, ProviderDeadlineGuard,
+    ProviderDerivedRequestState, ProviderPairSwitch, ProviderPairSwitchCommitter,
+    ProviderViewAppendRequest, RequestInputCheckpoint, RouteWaitCheckpoint,
+    SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks, StoreHandle,
+    SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
+    SubmitRouteWaitTurn, ToolDispatchResult, ToolDispatcher, TurnHandle, UserCommandOutput,
     build_cache_request_diagnostic, build_context_accounting, classify_cache_request,
     context_soft_threshold_tokens, effect_recovery_evidence,
     estimate_provider_request_bytes_div_four, estimate_provider_request_input_tokens,
@@ -514,7 +514,7 @@ impl DaemonContextCompactor {
         run_id: &RunId,
         request: &TurnRequest,
         projected_input_tokens: u64,
-    ) -> Result<Option<ProviderBudgetPermit>, HaiderError> {
+    ) -> Result<Option<ProviderBudgetPermit>, ContextCompactionError> {
         let Some(guard) = self.provider_budget_guard.as_ref() else {
             return Ok(None);
         };
@@ -527,6 +527,7 @@ impl DaemonContextCompactor {
             )
             .await
             .map(Some)
+            .map_err(ContextCompactionError::from)
     }
 
     async fn release_budget_request(
@@ -534,7 +535,7 @@ impl DaemonContextCompactor {
         run_id: &RunId,
         usage_reported: bool,
         permit: &mut Option<ProviderBudgetPermit>,
-    ) -> Result<(), HaiderError> {
+    ) -> Result<(), ContextCompactionError> {
         let result = if let Some(guard) = self.provider_budget_guard.as_ref() {
             guard
                 .after_request(
@@ -548,7 +549,7 @@ impl DaemonContextCompactor {
             Ok(())
         };
         drop(permit.take());
-        result
+        result.map_err(ContextCompactionError::from)
     }
 
     fn provider_view_attempt_envelopes(
@@ -918,7 +919,7 @@ impl ProviderBudgetGuard for DaemonGraphFinalizationGuard {
         provider: &str,
         request: &TurnRequest,
         projected_input_tokens: u64,
-    ) -> Result<ProviderBudgetPermit, HaiderError> {
+    ) -> Result<ProviderBudgetPermit, ProviderBudgetGuardError> {
         let Some(check) = self.budget_check.as_ref() else {
             return Ok(ProviderBudgetPermit::new(()));
         };
@@ -935,7 +936,7 @@ impl ProviderBudgetGuard for DaemonGraphFinalizationGuard {
                 &exhausted,
             )
             .await?;
-            return Err(budget_exhausted_error(&exhausted));
+            return Err(budget_guard_terminal_error(check, run_id, &exhausted));
         }
         let snapshot = run_budget_usage_for_context(check).await?;
         let route_retry = check
@@ -996,7 +997,7 @@ impl ProviderBudgetGuard for DaemonGraphFinalizationGuard {
                 &exhausted,
             )
             .await?;
-            return Err(budget_exhausted_error(&exhausted));
+            return Err(budget_guard_terminal_error(check, run_id, &exhausted));
         }
         let usage = snapshot.usage;
         if let Some(exhausted) = exhausted_budget(
@@ -1015,7 +1016,7 @@ impl ProviderBudgetGuard for DaemonGraphFinalizationGuard {
                 &exhausted,
             )
             .await?;
-            return Err(budget_exhausted_error(&exhausted));
+            return Err(budget_guard_terminal_error(check, run_id, &exhausted));
         }
         let projection = ProviderRequestProjection {
             provider: provider.to_owned(),
@@ -1039,7 +1040,8 @@ impl ProviderBudgetGuard for DaemonGraphFinalizationGuard {
                 ErrorCode::Internal,
                 "route retry changed the admitted provider-request projection",
                 false,
-            ));
+            )
+            .into());
         }
         if let Some(exhausted) = projected_budget_exhaustion(&check.spec.budget, usage, &projection)
         {
@@ -1053,7 +1055,7 @@ impl ProviderBudgetGuard for DaemonGraphFinalizationGuard {
                 &exhausted,
             )
             .await?;
-            return Err(budget_exhausted_error(&exhausted));
+            return Err(budget_guard_terminal_error(check, run_id, &exhausted));
         }
         check
             .coordinator
@@ -1066,7 +1068,7 @@ impl ProviderBudgetGuard for DaemonGraphFinalizationGuard {
         }))
     }
 
-    async fn after_usage(&self, run_id: &RunId) -> Result<(), HaiderError> {
+    async fn after_usage(&self, run_id: &RunId) -> Result<(), ProviderBudgetGuardError> {
         let Some(check) = self.budget_check.as_ref() else {
             return Ok(());
         };
@@ -1081,12 +1083,19 @@ impl ProviderBudgetGuard for DaemonGraphFinalizationGuard {
                 &exhausted,
             )
             .await?;
-            return Err(budget_exhausted_error(&exhausted));
+            // The shared root coordinator is the sole owner of the typed
+            // BudgetExhausted terminal. A delegated participant carries an
+            // explicit cancellation through the actor immediately, while the
+            // root carries the terminal failure.
+            return Err(budget_guard_terminal_error(check, run_id, &exhausted));
         }
         Ok(())
     }
 
-    async fn after_route_interruption(&self, _run_id: &RunId) -> Result<(), HaiderError> {
+    async fn after_route_interruption(
+        &self,
+        _run_id: &RunId,
+    ) -> Result<(), ProviderBudgetGuardError> {
         let Some(check) = self.budget_check.as_ref() else {
             return Ok(());
         };
@@ -1106,7 +1115,7 @@ impl ProviderBudgetGuard for DaemonGraphFinalizationGuard {
         provider: &str,
         model: &str,
         usage_reported: bool,
-    ) -> Result<(), HaiderError> {
+    ) -> Result<(), ProviderBudgetGuardError> {
         let Some(check) = self.budget_check.as_ref() else {
             return Ok(());
         };
@@ -1133,7 +1142,7 @@ impl ProviderBudgetGuard for DaemonGraphFinalizationGuard {
                 &exhausted,
             )
             .await?;
-            return Err(budget_exhausted_error(&exhausted));
+            return Err(budget_guard_terminal_error(check, run_id, &exhausted));
         }
         Ok(())
     }
@@ -1189,7 +1198,7 @@ impl ContextCompactor for DaemonContextCompactor {
     async fn compact(
         &self,
         request: ContextCompactionRequest<'_>,
-    ) -> Result<haider_core::ContextCompactionOutcome, HaiderError> {
+    ) -> Result<haider_core::ContextCompactionOutcome, ContextCompactionError> {
         let ContextCompactionRequest {
             run_id,
             intent,
@@ -1434,12 +1443,13 @@ impl ContextCompactor for DaemonContextCompactor {
                     ErrorCode::ProviderError,
                     format!("context summarization could not start: {error}"),
                     true,
-                ));
+                )
+                .into());
             }
             Err(error) if error.presentation.subcode.as_str() == "provider-timeout" => {
                 self.release_budget_request(run_id, false, &mut budget_permit)
                     .await?;
-                return Err(self.provider_open_error(run_id, error).await);
+                return Err(self.provider_open_error(run_id, error).await.into());
             }
             Err(_) => {
                 self.release_budget_request(run_id, false, &mut budget_permit)
@@ -1543,7 +1553,7 @@ impl ContextCompactor for DaemonContextCompactor {
                     Err(error) => {
                         self.release_budget_request(run_id, false, &mut budget_permit)
                             .await?;
-                        return Err(self.provider_open_error(run_id, error).await);
+                        return Err(self.provider_open_error(run_id, error).await.into());
                     }
                 };
                 (
@@ -1573,7 +1583,7 @@ impl ContextCompactor for DaemonContextCompactor {
                         &mut budget_permit,
                     )
                     .await?;
-                    return Err(self.provider_stream_error(run_id, error).await);
+                    return Err(self.provider_stream_error(run_id, error).await.into());
                 }
                 Ok(None) => break,
             };
@@ -1671,7 +1681,8 @@ impl ContextCompactor for DaemonContextCompactor {
                         ErrorCode::ProviderError,
                         format!("context summarization ended with {reason:?}"),
                         false,
-                    ));
+                    )
+                    .into());
                 }
                 // Provider bookkeeping, not structure: the codex
                 // responses-lite stream emits opaque reasoning fragments on
@@ -1694,7 +1705,8 @@ impl ContextCompactor for DaemonContextCompactor {
                         ErrorCode::ProviderError,
                         "context summarization was refused by the provider",
                         false,
-                    ));
+                    )
+                    .into());
                 }
                 StreamEvent::ToolCallStart { .. }
                 | StreamEvent::ToolCallArgsDelta { .. }
@@ -1709,7 +1721,8 @@ impl ContextCompactor for DaemonContextCompactor {
                         ErrorCode::ProviderError,
                         "context summarization returned tool calls",
                         false,
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -1720,7 +1733,8 @@ impl ContextCompactor for DaemonContextCompactor {
                 ErrorCode::ProviderError,
                 "context summarization returned no completed summary",
                 false,
-            ));
+            )
+            .into());
         }
 
         let artifact = self.store.put_artifact(summary.as_bytes().to_vec()).await?;
@@ -2360,6 +2374,7 @@ struct PendingTurn {
     provider_requests_already_made: usize,
     provider_request_ordinal_already_made: u64,
     workflow_continuation: bool,
+    admission_retry: bool,
     recovery_ready: Option<oneshot::Sender<Result<(), HaiderError>>>,
     /// Recovery semantics outlive the pre-Ready acknowledgement. In
     /// particular, a queued recovery may be acknowledged behind a parked
@@ -2433,6 +2448,7 @@ impl PendingTurn {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
+            admission_retry: false,
             recovery_ready: None,
             recovering: false,
         }
@@ -2459,6 +2475,7 @@ impl PendingTurn {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
+            admission_retry: false,
             recovery_ready: None,
             recovering: false,
         }
@@ -2784,6 +2801,7 @@ impl WorkerManagerHandle {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
+            admission_retry: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2808,6 +2826,7 @@ impl WorkerManagerHandle {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
+            admission_retry: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2827,6 +2846,7 @@ impl WorkerManagerHandle {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
+            admission_retry: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2852,6 +2872,32 @@ impl WorkerManagerHandle {
             provider_requests_already_made,
             provider_request_ordinal_already_made,
             workflow_continuation: false,
+            admission_retry: false,
+            recovery_ready: Some(completed),
+            recovering: true,
+        })?;
+        response.await.map_err(|_| manager_stopped())?
+    }
+
+    pub(crate) async fn recover_admission_retry(
+        &self,
+        accepted: AcceptedTurn,
+        provider_requests_already_made: usize,
+        provider_request_ordinal_already_made: u64,
+    ) -> Result<(), HaiderError> {
+        let (completed, response) = oneshot::channel();
+        self.send_recovery(PendingTurn {
+            accepted,
+            prompt_run_id: None,
+            checkpoint: None,
+            partial_stream: None,
+            route_wait: None,
+            child_wait: None,
+            committed_answer: None,
+            provider_requests_already_made,
+            provider_request_ordinal_already_made,
+            workflow_continuation: false,
+            admission_retry: true,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2876,6 +2922,7 @@ impl WorkerManagerHandle {
             provider_requests_already_made,
             provider_request_ordinal_already_made,
             workflow_continuation: true,
+            admission_retry: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2911,6 +2958,7 @@ impl WorkerManagerHandle {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
+            admission_retry: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -4318,6 +4366,9 @@ async fn run_supervisor(
             tokio::select! {
                 biased;
                 exhausted = wait_for_budget(&mut turn.budget) => {
+                    let owns_budget_terminal = turn.budget_check.as_ref().is_some_and(|check| {
+                        budget_context_owns_terminal(check, &active_run)
+                    });
                     let persisted = match turn.budget_check.as_ref() {
                         Some(check) => persist_headless_budget_fact(
                             check,
@@ -4335,8 +4386,10 @@ async fn run_supervisor(
                     };
                     match persisted {
                         Ok(()) => {
-                            turn.budget_exhausted = Some(exhausted);
-                            turn.budget_fact_persisted = true;
+                            if owns_budget_terminal {
+                                turn.budget_exhausted = Some(exhausted);
+                                turn.budget_fact_persisted = true;
+                            }
                             active_cancel.cancel();
                         }
                         Err(error) => {
@@ -4345,7 +4398,9 @@ async fn run_supervisor(
                                 ?error,
                                 "budget exhaustion could not be made durable"
                             );
-                            turn.budget_exhausted = Some(exhausted);
+                            if owns_budget_terminal {
+                                turn.budget_exhausted = Some(exhausted);
+                            }
                             active_cancel.cancel();
                         }
                     }
@@ -5020,6 +5075,7 @@ async fn admit_pending(
         || pending.route_wait.is_some()
         || pending.child_wait.is_some()
         || pending.workflow_continuation
+        || pending.admission_retry
     {
         let queue_changed = queue.len() < SUPERVISOR_CAPACITY;
         if queue.len() < SUPERVISOR_CAPACITY {
@@ -6418,6 +6474,14 @@ async fn perform_manual_compaction(
         })
         .await
     {
+        let error = match error {
+            ContextCompactionError::Failure(error) => error,
+            ContextCompactionError::Cancelled => HaiderError::new(
+                ErrorCode::Internal,
+                "manual context compaction was cancelled without a budget guard",
+                false,
+            ),
+        };
         append_failure(
             lease,
             device_id,
@@ -7149,6 +7213,7 @@ async fn start_turn(
         provider_requests_already_made,
         provider_request_ordinal_already_made,
         workflow_continuation: _,
+        admission_retry,
         recovery_ready: _,
         recovering: _,
     } = pending;
@@ -7208,6 +7273,7 @@ async fn start_turn(
             accepted_at_ms: context.accepted_at_ms,
             fact_persisted: Arc::clone(&coordinator.fact_persisted),
             coordinator,
+            owns_terminal: true,
         });
     }
     let metadata = &pinned_metadata;
@@ -7265,17 +7331,22 @@ async fn start_turn(
                 accepted_at_ms: coordinator.accepted_at_ms,
                 fact_persisted: Arc::new(Mutex::new(false)),
                 coordinator,
+                // A directly submitted headless run still owns its own
+                // terminal even when its delegated-session ancestry makes it
+                // debit an older root coordinator. Ordinary child turns have
+                // no local headless configuration and cancel instead.
+                owns_terminal: headless.is_some(),
             });
         }
     }
-    if route_wait.is_some()
+    if (route_wait.is_some() || admission_retry)
         && let Some(check) = budget_check.as_ref()
     {
         // Recovery reconstructs coordinators from durable facts, so there is
         // no in-memory permit/projection to release. Mark the already admitted
-        // physical attempt as the one the exact route retry will supersede
-        // before the budget monitor starts; the run's absolute time/cost
-        // limits remain armed throughout the wait.
+        // physical attempt as the one the exact route/admission retry will
+        // supersede before the budget monitor starts; the run's absolute
+        // time/cost limits remain armed throughout the wait.
         check
             .coordinator
             .route_retry_pending
@@ -7742,6 +7813,7 @@ async fn start_turn(
         haider_core::InteractionResolutionPolicy::new(metadata.interaction_mode);
     config.provider_requests_already_made = provider_requests_already_made;
     config.provider_request_ordinal_already_made = provider_request_ordinal_already_made;
+    config.recovery_request_local_usage = admission_retry;
     if let Some(limit) = dependencies
         .provider_factory
         .max_provider_requests_per_turn_override()
@@ -9439,6 +9511,23 @@ struct BudgetCheckContext {
     accepted_at_ms: u64,
     fact_persisted: Arc<Mutex<bool>>,
     coordinator: Arc<RunBudgetCoordinator>,
+    owns_terminal: bool,
+}
+
+fn budget_context_owns_terminal(check: &BudgetCheckContext, _run_id: &RunId) -> bool {
+    check.owns_terminal
+}
+
+fn budget_guard_terminal_error(
+    check: &BudgetCheckContext,
+    run_id: &RunId,
+    exhausted: &RunBudgetExhaustedV1,
+) -> ProviderBudgetGuardError {
+    if budget_context_owns_terminal(check, run_id) {
+        ProviderBudgetGuardError::Failure(budget_exhausted_error(exhausted))
+    } else {
+        ProviderBudgetGuardError::Cancelled
+    }
 }
 
 async fn root_budget_owner(
@@ -10576,10 +10665,10 @@ async fn append_headless_deadline_fact(
 
 async fn persist_headless_budget_fact(
     check: &BudgetCheckContext,
-    device_id: &DeviceId,
+    _device_id: &DeviceId,
     run_id: &RunId,
-    branch_id: Option<&BranchId>,
-    event_ids: &EventIdGenerator,
+    _branch_id: Option<&BranchId>,
+    _event_ids: &EventIdGenerator,
     exhausted: &RunBudgetExhaustedV1,
 ) -> Result<(), HaiderError> {
     let coordinator = &check.coordinator;
@@ -10592,23 +10681,13 @@ async fn persist_headless_budget_fact(
             *persisted = true;
         }
     }
-    if is_root {
-        return Ok(());
+    // Delegated participants share the root coordinator but are not
+    // themselves configured headless runs. The store correctly rejects a
+    // local run_budget_exhausted fact for them; the single root fact above is
+    // the durable terminal cause for the whole delegation tree.
+    if !is_root {
+        *check.fact_persisted.lock().await = true;
     }
-    let mut persisted = check.fact_persisted.lock().await;
-    if *persisted {
-        return Ok(());
-    }
-    append_headless_budget_fact(
-        &check.store,
-        device_id,
-        run_id,
-        branch_id,
-        event_ids,
-        exhausted,
-    )
-    .await?;
-    *persisted = true;
     Ok(())
 }
 
