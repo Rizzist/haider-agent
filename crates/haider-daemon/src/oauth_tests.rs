@@ -1,11 +1,12 @@
 #![allow(clippy::expect_used)]
 
+use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use futures_util::StreamExt as _;
 use haider_accounts::{AccountsResult, MemoryVault};
 use haider_protocol::credential::CredentialStatus;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 use super::*;
 use crate::session_hub::{FrameSendError, FrameSink};
@@ -3344,6 +3345,66 @@ impl Vault for ControlledVault {
     }
 }
 
+struct StaleReadVault {
+    inner: ControlledVault,
+    capture_next_resolve: AtomicBool,
+    stale_read_captured: Notify,
+    stale_read_release: (Mutex<bool>, Condvar),
+}
+
+impl StaleReadVault {
+    fn new(durable: Arc<FakeState>) -> Self {
+        Self {
+            inner: ControlledVault::new(durable),
+            capture_next_resolve: AtomicBool::new(false),
+            stale_read_captured: Notify::new(),
+            stale_read_release: (Mutex::new(false), Condvar::new()),
+        }
+    }
+
+    fn arm(&self) {
+        self.inner.arm(false);
+        self.capture_next_resolve.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_until_stale_read_is_captured(&self) {
+        self.stale_read_captured.notified().await;
+    }
+
+    fn release_stale_read(&self) {
+        let (released, changed) = &self.stale_read_release;
+        *released.lock().expect("stale-read release lock") = true;
+        changed.notify_all();
+    }
+}
+
+impl Vault for StaleReadVault {
+    fn put(&self, alias: &CredentialAlias, secret: &[u8]) -> AccountsResult<()> {
+        self.inner.put(alias, secret)
+    }
+
+    fn resolve(&self, alias: &CredentialAlias) -> AccountsResult<SecretHandle> {
+        let stored = self.inner.resolve(alias)?;
+        if self.capture_next_resolve.swap(false, Ordering::SeqCst) {
+            self.stale_read_captured.notify_one();
+            let (released, changed) = &self.stale_read_release;
+            let mut released = released.lock().expect("stale-read release lock");
+            while !*released {
+                released = changed.wait(released).expect("stale-read release wait");
+            }
+        }
+        Ok(stored)
+    }
+
+    fn delete(&self, alias: &CredentialAlias) -> AccountsResult<()> {
+        self.inner.delete(alias)
+    }
+
+    fn list(&self) -> AccountsResult<Vec<CredentialAlias>> {
+        self.inner.list()
+    }
+}
+
 struct ResolveCountingVault {
     inner: MemoryVault,
     resolves: AtomicUsize,
@@ -4936,6 +4997,81 @@ async fn cancelled_resolver_does_not_abandon_or_duplicate_refresh_flight() {
     server.release_refresh();
     let access = waiter.await.expect("waiter join").expect("waiter resolve");
     assert_eq!(access.expose_secret(), b"ACCESS_ROTATED_SENTINEL_3a19");
+    let stored = vault.resolve(&descriptor.alias).expect("stored");
+    assert_eq!(
+        OAuthTokenBundleV1::decode(stored.expose_secret())
+            .expect("decode")
+            .generation,
+        2
+    );
+}
+
+// MUTATION CHECK: map a lost BeginOAuthRefresh comparison directly to
+// stale_refresh. Expected runtime failure: the waiter resumes with generation
+// one after generation two is durable and receives the removal/replacement
+// fence instead of adopting the completed refresh.
+#[tokio::test]
+async fn resolver_with_stale_vault_read_adopts_completed_refresh_generation() {
+    let server = FakeOAuthServer::start(FakeMode::Success, true).await;
+    let vault = Arc::new(StaleReadVault::new(Arc::clone(&server.state)));
+    let descriptor = oauth_descriptor_for_test();
+    vault
+        .put(
+            &descriptor.alias,
+            &oauth_bundle_for_test(&server, now_ms().expect("clock").saturating_sub(1))
+                .encode()
+                .expect("encode"),
+        )
+        .expect("seed");
+    let (broker, _, descriptor) = broker_for(&server, vault.clone(), descriptor);
+    let first = {
+        let broker = broker.clone();
+        let descriptor = descriptor.clone();
+        tokio::spawn(async move { broker.resolve(&descriptor).await })
+    };
+    wait_for_refresh_calls(&server, 1).await;
+    first.abort();
+    assert!(
+        first
+            .await
+            .expect_err("first resolver is cancelled")
+            .is_cancelled(),
+        "the caller, not the daemon-owned refresh worker, is cancelled"
+    );
+
+    vault.arm();
+    let waiter = {
+        let broker = broker.clone();
+        let descriptor = descriptor.clone();
+        tokio::spawn(async move { broker.resolve(&descriptor).await })
+    };
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        vault.wait_until_stale_read_is_captured(),
+    )
+    .await
+    .expect("waiter captures generation one");
+    assert_eq!(
+        server.state.refresh_calls.load(Ordering::SeqCst),
+        1,
+        "the successor must not duplicate the in-flight refresh"
+    );
+
+    server.release_refresh();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !server.state.durable.load(Ordering::SeqCst)
+            || !broker.inner.flights.lock().expect("flights").is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("generation two is durable and its flight is retired");
+    vault.release_stale_read();
+
+    let access = waiter.await.expect("waiter join").expect("waiter resolve");
+    assert_eq!(access.expose_secret(), b"ACCESS_ROTATED_SENTINEL_3a19");
+    assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 1);
     let stored = vault.resolve(&descriptor.alias).expect("stored");
     assert_eq!(
         OAuthTokenBundleV1::decode(stored.expose_secret())
