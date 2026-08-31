@@ -3,6 +3,7 @@
 from .contract import (
     DAEMON_STARTUP,
     DAEMON_STOP,
+    DAEMON_DRAIN,
     PASS,
     FAIL,
     SKIP,
@@ -21,6 +22,7 @@ from .contract import (
 __all__ = [
     "DAEMON_STARTUP",
     "DAEMON_STOP",
+    "DAEMON_DRAIN",
     "PASS",
     "FAIL",
     "SKIP",

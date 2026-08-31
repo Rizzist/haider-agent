@@ -85,6 +85,11 @@ DAEMON_STOP = BudgetPart(
     20.0,
     "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT",
 )
+DAEMON_DRAIN = BudgetPart(
+    "daemon graceful drain deadline",
+    5.0,
+    "crates/haider-daemon/src/config.rs:108 DaemonConfig::new drain_timeout",
+)
 PROCESS_EXIT_GRACE = BudgetPart(
     "post-stop process-exit observation grace",
     2.0,

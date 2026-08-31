@@ -9,6 +9,7 @@ import platform
 import signal
 import socket
 import struct
+import sys
 import tempfile
 import textwrap
 import threading
@@ -25,7 +26,7 @@ from gate.context import (
 )
 from gate.contract import PASS, BudgetPart, ContractError, Evidence, validate_evidence_list
 from gate.headless import provider_request_ordinals
-from gate.loader import load_check
+from gate.loader import load_check, missing_needs
 from gate.report import diff_reports, load_report, validate_report, write_report
 from gate.tui_probe import (
     DurableSnapshot,
@@ -193,11 +194,19 @@ class LoaderContractTests(unittest.TestCase):
             "t0.tui.model_picker_cardinality": 3_149_500,
             "t0.tui.palette_activation_closure": 5_937_500,
             "t0.tui.three_door_parity": 5_332_500,
+            "t1.daemon.kill9_midturn": 751_000,
+            "t1.daemon.lifecycle_triad": 298_000,
+            "t1.install.paths": 408_000,
+            "t1.store.previous_release_upgrade": 901_000,
         }
-        checks = runner.discover_checks(runner.CHECK_ROOT, "t0")
+        checks = [
+            *runner.discover_checks(runner.CHECK_ROOT, "t0"),
+            *runner.discover_checks(runner.CHECK_ROOT, "t1"),
+        ]
         self.assertEqual(
             {check.id: check.budget.milliseconds for check in checks}, expected
         )
+        self.assertEqual(sum(check.budget.milliseconds for check in checks), 20_550_000)
         by_id = {check.id: check for check in checks}
         for check_id in (
             "t0.budget.max_cost_binds_before_request",
@@ -205,6 +214,32 @@ class LoaderContractTests(unittest.TestCase):
         ):
             self.assertEqual(by_id[check_id].segments, 1)
             self.assertEqual(by_id[check_id].turns_expected, 1)
+            self.assertEqual(by_id[check_id].expected_fail_until, "0.0.968")
+        self.assertEqual(by_id["t1.daemon.lifecycle_triad"].turns_expected, 0)
+        self.assertEqual(
+            by_id["t1.daemon.lifecycle_triad"].expected_fail_until, "0.0.968"
+        )
+        self.assertEqual(
+            by_id["t1.daemon.kill9_midturn"].expected_fail_until, "0.0.968"
+        )
+        for check in runner.discover_checks(runner.CHECK_ROOT, "t1"):
+            source = check.path.read_text(encoding="utf-8")
+            self.assertNotIn("time.sleep", source, check.id)
+
+    def test_github_need_can_be_explicitly_environment_blocked(self):
+        with tempfile.TemporaryDirectory() as directory_text:
+            directory = Path(directory_text)
+            source = VALID_MODULE.replace(
+                'needs = ("network:none",)', 'needs = ("network:github",)'
+            )
+            check = load_check(self.write_module(directory, source), "t0")
+            with mock.patch.dict(os.environ, {"HAIDER_QA_GATE_OFFLINE": "1"}):
+                reasons = missing_needs(
+                    check, bin_dir=directory, fixture_root=runner.FIXTURE_ROOT
+                )
+            self.assertEqual(
+                reasons, ["GitHub network disabled by HAIDER_QA_GATE_OFFLINE=1"]
+            )
 
     def test_provider_request_counter_uses_completed_attempt_once(self):
         document = {
@@ -624,6 +659,182 @@ class ReportAndPathTests(unittest.TestCase):
         self.assertFalse(
             CheckContext._may_spawn(("sessions", "wait-ready", "--no-spawn"))
         )
+
+    def test_generic_command_overrides_env_and_published_artefact_survives_dispose(self):
+        with tempfile.TemporaryDirectory() as directory_text:
+            report_root = Path(directory_text) / "published"
+            context = CheckContext(
+                check_id="t1.test.publish",
+                bin_dir=Path(directory_text),
+                script=[],
+                report_artefact_root=report_root,
+            )
+            context.set_fake_provider_script([{"step": "hang"}])
+            try:
+                result = context.run_command(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import os; print(os.environ['QA_GATE_SENTINEL'])",
+                    ],
+                    timeout=runner.DAEMON_STARTUP,
+                    env_overrides={"QA_GATE_SENTINEL": "present"},
+                )
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout.strip(), "present")
+                self.assertEqual(context.fake_script, [{"step": "hang"}])
+                source = context.root / "fixture.txt"
+                source.write_text("captured\n", encoding="utf-8")
+                published = Path(context.publish_artefact("fixture.txt", source))
+            finally:
+                context.dispose(keep=False)
+            self.assertEqual(published.read_text(encoding="utf-8"), "captured\n")
+
+    def test_status_identity_allows_retired_generation_but_rejects_concurrent_one(self):
+        with tempfile.TemporaryDirectory() as directory_text:
+            context = CheckContext(
+                check_id="t1.test.generations",
+                bin_dir=Path(directory_text),
+                script=[],
+            )
+
+            def status(pid, profile=None, runtime_root=None):
+                profile = profile or context.profile_dir
+                runtime_root = runtime_root or context.runtime_root
+                runtime = Path(runtime_root) / "profile-runtime"
+                runtime.mkdir(exist_ok=True)
+                return {
+                    "schema": "haider.observe.v1",
+                    "profile_path": str(profile),
+                    "runtime_dir": str(runtime),
+                    "daemon": {
+                        "pid": pid,
+                        "version": "0.0.968",
+                        "socket_path": str(runtime / "h.sock"),
+                        "pid_file_path": str(runtime / "haiderd.pid"),
+                    },
+                }
+
+            try:
+                self.assertEqual(context.observe_status(status(101)), [])
+                with mock.patch("gate.context.process_is_alive", return_value=False):
+                    self.assertEqual(context.observe_status(status(102)), [])
+                fresh_profile = context.root / "fresh-profile"
+                fresh_runtime = context.root / "fresh-runtime"
+                fresh_profile.mkdir()
+                fresh_runtime.mkdir()
+                with mock.patch("gate.context.process_is_alive", return_value=False):
+                    self.assertEqual(
+                        context.observe_status(
+                            status(103, fresh_profile, fresh_runtime),
+                            profile_dir=fresh_profile,
+                            runtime_root=fresh_runtime,
+                        ),
+                        [],
+                    )
+                with mock.patch("gate.context.process_is_alive", return_value=True):
+                    problems = context.observe_status(status(104))
+                self.assertIn("actual_live=[101, 102, 103]", problems[0])
+                self.assertEqual(context.daemon_pids, {101, 102, 103, 104})
+            finally:
+                context.dispose(keep=False)
+
+    def test_empty_alternate_root_status_refuses_ownership(self):
+        with tempfile.TemporaryDirectory() as directory_text:
+            context = CheckContext(
+                check_id="t1.test.empty-alternate-status",
+                bin_dir=Path(directory_text),
+                script=[],
+            )
+            alternate_profile = context.root / "alternate-profile"
+            alternate_runtime = context.root / "alternate-runtime"
+            alternate_profile.mkdir()
+            alternate_runtime.mkdir()
+            try:
+                problems = context.observe_status(
+                    {},
+                    profile_dir=alternate_profile,
+                    runtime_root=alternate_runtime,
+                )
+                self.assertTrue(problems)
+                self.assertTrue(context.ownership_refused)
+                self.assertEqual(context.daemon_pids, set())
+            finally:
+                context.dispose(keep=False)
+
+    def test_legacy_status_owns_only_pidfile_with_exact_executable(self):
+        with tempfile.TemporaryDirectory() as directory_text:
+            context = CheckContext(
+                check_id="t1.test.legacy-pid",
+                bin_dir=Path(directory_text),
+                script=[],
+            )
+            runtime = context.runtime_root / "legacy-runtime"
+            runtime.mkdir()
+            (runtime / "haiderd.pid").write_text("4242\n", encoding="ascii")
+            old_daemon = context.root / "old" / "haiderd"
+            old_daemon.parent.mkdir()
+            old_daemon.write_bytes(b"binary")
+            status = {
+                "schema": "haider.observe.v1",
+                "profile_path": str(context.profile_dir),
+                "runtime_dir": str(runtime),
+                "daemon": {"version": "0.0.966", "generation": 1},
+            }
+            try:
+                with mock.patch(
+                    "gate.context._lsof_identity",
+                    return_value=(str(old_daemon), str(context.workspace_dir)),
+                ), mock.patch("gate.context.process_is_alive", return_value=True):
+                    pid, problems = context.observe_legacy_status(
+                        status,
+                        daemon_binary=old_daemon,
+                        expected_version="0.0.966",
+                        identity_timeout=runner.DAEMON_STARTUP,
+                    )
+                self.assertEqual(pid, 4242)
+                self.assertEqual(problems, [])
+                self.assertEqual(context.daemon_pids, {4242})
+            finally:
+                context.dispose(keep=False)
+
+    def test_legacy_status_refuses_mismatched_executable_without_signal_authority(self):
+        with tempfile.TemporaryDirectory() as directory_text:
+            context = CheckContext(
+                check_id="t1.test.legacy-refusal",
+                bin_dir=Path(directory_text),
+                script=[],
+            )
+            runtime = context.runtime_root / "legacy-runtime"
+            runtime.mkdir()
+            (runtime / "haiderd.pid").write_text("4242\n", encoding="ascii")
+            expected_daemon = context.root / "expected" / "haiderd"
+            expected_daemon.parent.mkdir()
+            expected_daemon.write_bytes(b"expected")
+            status = {
+                "schema": "haider.observe.v1",
+                "profile_path": str(context.profile_dir),
+                "runtime_dir": str(runtime),
+                "daemon": {"version": "0.0.966", "generation": 1},
+            }
+            try:
+                with mock.patch(
+                    "gate.context._lsof_identity",
+                    return_value=(str(context.root / "foreign" / "haiderd"), None),
+                ), mock.patch("gate.context.process_is_alive", return_value=True):
+                    pid, problems = context.observe_legacy_status(
+                        status,
+                        daemon_binary=expected_daemon,
+                        expected_version="0.0.966",
+                        identity_timeout=runner.DAEMON_STARTUP,
+                    )
+                self.assertIsNone(pid)
+                self.assertIn("legacy daemon executable expected=", problems[0])
+                self.assertTrue(context.ownership_refused)
+                self.assertEqual(context.untrusted_status_pids, {4242})
+                self.assertEqual(context.daemon_pids, set())
+            finally:
+                context.dispose(keep=False)
 
     def test_sigint_helper_arms_on_stdout_and_signals_only_the_client(self):
         context = CheckContext(
