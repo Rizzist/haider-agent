@@ -558,11 +558,11 @@ impl DelegationHandle {
                 .map(|record| record.clis.clone()),
         };
         manifest.placement.ensure_local()?;
-        // OWNER DIRECTIVE (W6d): delegation is AUTOMATIC — a child must
-        // never park on a human. Children are created with writes+exec
+        // Delegated request_input is answered through the projected parent
+        // menu, so the child must retain the ordinary Interactive wait until
+        // that durable answer is forwarded. Writes and exec remain
         // pre-allowed through the W9b override seam (journaled as ordinary
-        // policy `Allow`); spawning a child is itself the standing
-        // permission. The parent's own surface keeps its Ask defaults.
+        // policy `Allow`); spawning a child is itself the standing permission.
         let child_overrides = Some(haider_protocol::session::SessionPermissionOverridesV1 {
             allow_writes: crate::worker::effect_within_grant(&grant, &EffectClass::FsWrite),
             allow_exec: crate::worker::effect_within_grant(&grant, &EffectClass::ProcessExec),
@@ -573,6 +573,8 @@ impl DelegationHandle {
             // in on the parent's auto-allow mode.
             auto_allow: false,
         });
+        let child_interaction_mode =
+            haider_protocol::session::SessionInteractionModeV1::Interactive;
         let create_json = serde_json::to_string(&serde_json::json!({
             "cwd": coordinates.metadata.cwd,
             "provider": coordinates.metadata.provider,
@@ -586,7 +588,7 @@ impl DelegationHandle {
             "effort": coordinates.metadata.effort,
             "fast": coordinates.metadata.fast,
             "cache_policy": coordinates.metadata.cache_policy,
-            "interaction_mode": coordinates.metadata.interaction_mode,
+            "interaction_mode": child_interaction_mode,
         }))
         .map_err(internal_serialization)?;
         let create_digest = digest_bytes(create_json.as_bytes());
@@ -609,7 +611,7 @@ impl DelegationHandle {
                     event_id: EventId::new(format!("delegation-created-{identity}")),
                     device_id: self.hub.device_id(),
                 },
-                coordinates.metadata.interaction_mode,
+                child_interaction_mode,
             )
             .await?;
 

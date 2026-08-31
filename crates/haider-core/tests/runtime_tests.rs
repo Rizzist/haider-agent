@@ -2,13 +2,15 @@
 
 use async_trait::async_trait;
 use haider_core::{
-    ArtifactReader, CommittedRange, ContextCompactionRequest, ContextCompactor, FinalizationGuard,
-    FinalizationGuardDecision, HarnessActor, HarnessConfig, HarnessHandle, MemoryStore,
-    PromptHistoryCompiler, ProviderAttemptDecision, ProviderAttemptResolver, ProviderPairSwitch,
-    ProviderPairSwitchCause, ProviderPairSwitchCommitter, ProviderPairSwitchTarget,
-    ResolvedProviderAttempt, RouteWaitCheckpoint, RouteWaitTextCheckpoint, RouteWaitToolCheckpoint,
-    StoreHandle, SubmitCommittedTurn, SubmitRouteWaitTurn, SubmitTurn, ToolDispatchResult,
-    ToolDispatcher, VISION_IMAGE_ESTIMATE_TOKENS, estimate_provider_request_input_tokens,
+    ArtifactReader, CommittedRange, ContextCompactionError, ContextCompactionRequest,
+    ContextCompactor, FinalizationGuard, FinalizationGuardDecision, HarnessActor, HarnessConfig,
+    HarnessHandle, MemoryStore, PromptHistoryCompiler, ProviderAttemptDecision,
+    ProviderAttemptResolver, ProviderBudgetGuard, ProviderBudgetGuardError, ProviderBudgetPermit,
+    ProviderPairSwitch, ProviderPairSwitchCause, ProviderPairSwitchCommitter,
+    ProviderPairSwitchTarget, ResolvedProviderAttempt, RouteWaitCheckpoint,
+    RouteWaitTextCheckpoint, RouteWaitToolCheckpoint, StoreHandle, SubmitCommittedTurn,
+    SubmitRouteWaitTurn, SubmitTurn, ToolDispatchResult, ToolDispatcher,
+    VISION_IMAGE_ESTIMATE_TOKENS, estimate_provider_request_input_tokens,
 };
 use haider_platform::RouteStatus;
 use haider_protocol::EventPayload;
@@ -181,6 +183,74 @@ impl FinalizationGuard for ScriptedFinalizationGuard {
 #[derive(Debug)]
 struct FailingFinalizationGuard {
     error: HaiderError,
+}
+
+#[derive(Debug)]
+struct CancellingBeforeRequestBudgetGuard;
+
+#[async_trait]
+impl ProviderBudgetGuard for CancellingBeforeRequestBudgetGuard {
+    async fn before_request(
+        &self,
+        _run_id: &RunId,
+        _provider: &str,
+        _request: &TurnRequest,
+        _projected_input_tokens: u64,
+    ) -> Result<ProviderBudgetPermit, ProviderBudgetGuardError> {
+        Err(ProviderBudgetGuardError::Cancelled)
+    }
+
+    async fn after_usage(&self, _run_id: &RunId) -> Result<(), ProviderBudgetGuardError> {
+        Ok(())
+    }
+
+    async fn after_route_interruption(
+        &self,
+        _run_id: &RunId,
+    ) -> Result<(), ProviderBudgetGuardError> {
+        Ok(())
+    }
+
+    async fn after_request(
+        &self,
+        _run_id: &RunId,
+        _provider: &str,
+        _model: &str,
+        _usage_reported: bool,
+    ) -> Result<(), ProviderBudgetGuardError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn budget_guard_pre_request_cancellation_never_opens_provider_or_errors() {
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let store = Arc::new(MemoryStore::new());
+    let mut runtime_config = config();
+    runtime_config.provider_budget_guard = Some(Arc::new(CancellingBeforeRequestBudgetGuard));
+    let handle = HarnessActor::spawn(runtime_config, provider.clone(), store.clone());
+
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("cancel before provider admission"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+
+    assert_eq!(outcome.state, RunState::Cancelled);
+    assert!(outcome.error.is_none());
+    assert!(provider.requests().is_empty());
+    assert!(matches!(
+        store
+            .events(&SessionId::new(SESSION))
+            .await
+            .last()
+            .map(typed),
+        Some(EventPayload::RunState(RunState::Cancelled))
+    ));
 }
 
 #[async_trait]
@@ -835,7 +905,7 @@ impl ContextCompactor for FakeContextCompactor {
     async fn compact(
         &self,
         request: ContextCompactionRequest<'_>,
-    ) -> Result<haider_core::ContextCompactionOutcome, HaiderError> {
+    ) -> Result<haider_core::ContextCompactionOutcome, ContextCompactionError> {
         let ContextCompactionRequest {
             covered_messages,
             economy_before,
@@ -889,7 +959,7 @@ impl ContextCompactor for ShrinkingContextCompactor {
     async fn compact(
         &self,
         request: ContextCompactionRequest<'_>,
-    ) -> Result<haider_core::ContextCompactionOutcome, HaiderError> {
+    ) -> Result<haider_core::ContextCompactionOutcome, ContextCompactionError> {
         let ContextCompactionRequest {
             covered_messages,
             economy_before,
@@ -953,7 +1023,7 @@ impl ContextCompactor for IneffectiveContextCompactor {
     async fn compact(
         &self,
         request: ContextCompactionRequest<'_>,
-    ) -> Result<haider_core::ContextCompactionOutcome, HaiderError> {
+    ) -> Result<haider_core::ContextCompactionOutcome, ContextCompactionError> {
         let ContextCompactionRequest {
             covered_messages,
             economy_before,

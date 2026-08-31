@@ -985,6 +985,134 @@ fn detached_run_lifecycle_is_addressable_by_run_id() {
     }
 }
 
+/// A process death after durable provider admission but before the first
+/// response is a retry boundary, not an Internal/Errored terminal. The
+/// recovery CLI has no effect-ambiguity card to probe in this case, so its
+/// `no_recovery` diagnostic must observe the replacement run as `running`.
+#[cfg(unix)]
+#[test]
+fn kill9_after_provider_admission_retries_instead_of_reporting_errored() {
+    let blocked_script = r#"[{"step":"delay","ms":30000},{"step":"emit_text","text":"too late"},{"step":"finish","reason":"end_turn"}]"#;
+    let recovered_script = r#"[{"step":"delay","ms":5000},{"step":"emit_text","text":"recovered"},{"step":"finish","reason":"end_turn"}]"#;
+    let mut starter = haider();
+    starter
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "--start",
+            "--json",
+            "-p",
+            "kill9 admission recovery",
+        ])
+        .env("HAIDER_TEST_FAKE_PROVIDER", blocked_script);
+    let started = output_with_boot_retry(&mut starter);
+    assert!(
+        started.status.success(),
+        "start stderr: {}; daemon logs: {}",
+        String::from_utf8_lossy(&started.stderr),
+        daemon_logs(&starter.profile)
+    );
+    let started: serde_json::Value = serde_json::from_slice(&started.stdout).expect("start JSON");
+    assert_eq!(started["outcome"], "started");
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("start session id")
+        .to_owned();
+    let run_id = started["run_id"].as_str().expect("start run id").to_owned();
+
+    let invoke = |arguments: &[&str], script: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
+        configure_test_home(&mut command, &starter.profile);
+        command
+            .args(arguments)
+            .env("HAIDER_PROFILE_DIR", &starter.profile)
+            .env("HAIDER_DISCOVERY_DISABLED", "1")
+            .env("HAIDER_TEST_FAKE_PROVIDER", script);
+        bounded_output(&mut command, None)
+    };
+
+    let admission_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = invoke(&["run", "--status", &run_id, "--json"], blocked_script);
+        assert!(
+            status.status.success(),
+            "admission status stderr: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let status: serde_json::Value =
+            serde_json::from_slice(&status.stdout).expect("admission status JSON");
+        if status["result"]["state"]["state"] == "streaming" {
+            break;
+        }
+        assert!(
+            Instant::now() < admission_deadline,
+            "run never reached the post-admission pre-response streaming state: {status}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let killed_pid = wait_for_daemon_pid(&starter.profile);
+    let killed = Command::new("kill")
+        .args(["-9", &killed_pid.to_string()])
+        .status()
+        .expect("invoke real kill -9");
+    assert!(killed.success(), "kill -9 failed for daemon {killed_pid}");
+    let death_deadline = Instant::now() + Duration::from_secs(5);
+    while process_is_alive(killed_pid) {
+        assert!(
+            Instant::now() < death_deadline,
+            "killed daemon {killed_pid} remained alive"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let probe = invoke(
+        &["session", &session_id, "recover", "--probe", "--json"],
+        recovered_script,
+    );
+    assert_eq!(
+        probe.status.code(),
+        Some(i32::from(EX_BLOCKED)),
+        "probe stdout: {}; stderr: {}; daemon logs: {}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr),
+        daemon_logs(&starter.profile)
+    );
+    let probe: serde_json::Value =
+        serde_json::from_slice(&probe.stdout).expect("recovery probe JSON");
+    assert_eq!(probe["error"]["code"], "no_recovery");
+    let message = probe["error"]["message"]
+        .as_str()
+        .expect("probe diagnostic message");
+    assert!(
+        message.contains("run_state is running"),
+        "startup recovery did not re-enter the admitted request: {probe}"
+    );
+    assert!(!message.contains("errored"));
+
+    let completion_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = invoke(&["run", "--status", &run_id, "--json"], recovered_script);
+        assert!(
+            status.status.success(),
+            "completion status stderr: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let status: serde_json::Value =
+            serde_json::from_slice(&status.stdout).expect("completion status JSON");
+        if status["result"]["state"]["state"] == "done" {
+            assert!(status["result"]["terminal_seq"].as_u64().is_some());
+            break;
+        }
+        assert!(
+            Instant::now() < completion_deadline,
+            "recovered run did not finish: {status}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn unknown_lifecycle_run_is_a_machine_readable_error() {
     let out = haider_with_boot_retry(&["run", "--status", "missing-run", "--json"], &[]);

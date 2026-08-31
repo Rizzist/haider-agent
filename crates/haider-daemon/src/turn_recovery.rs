@@ -61,7 +61,7 @@ use haider_protocol::ids::{
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuCloseReason, MenuKind};
-use haider_protocol::provider::StreamEvent;
+use haider_protocol::provider::{PROVIDER_OPAQUE_EXTENSION_KIND, StreamEvent};
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::state::{RunState, SessionState, WaitReason};
 use serde::{Deserialize, Serialize};
@@ -87,15 +87,17 @@ pub(crate) const STARTUP_HYDRATION_PAYLOAD_KINDS: &[&str] = &[
     "run_retried",
     "run_state",
     "tool_result",
+    "usage",
     "user_message",
 ];
 const CHECKPOINT_PROJECTION: &str = "startup_turn_recovery";
 const CHECKPOINT_TIMELINE: &str = "session";
 const CHECKPOINT_SHAPE_VERSION: u32 = 1;
-// v5 is the first fully composite reducer. Earlier cursors could omit one of
-// delegation mirrors, workflow logical coordinates, or route replay epochs.
-// Reject them so recovery performs one complete ordered journal reduction.
-const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v5";
+// v6 adds the provider-response coordinate used to distinguish an admitted
+// request with no response from an interrupted response stream. Earlier
+// cursors cannot prove that retry boundary, so reject them and perform one
+// complete ordered journal reduction.
+const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v6";
 
 pub(crate) enum RecoveredWork {
     Queued(AcceptedTurn),
@@ -104,8 +106,15 @@ pub(crate) enum RecoveredWork {
     PartialStream(Box<RecoveredPartialStream>),
     RouteWait(Box<RecoveredRouteWait>),
     ChildWait(Box<RecoveredChildWait>),
+    AdmissionRetry(Box<RecoveredAdmissionRetry>),
     WorkflowContinuation(Box<RecoveredWorkflowContinuation>),
     DelegationMirror(Box<RecoveredDelegationMirror>),
+}
+
+pub(crate) struct RecoveredAdmissionRetry {
+    pub(crate) accepted: AcceptedTurn,
+    pub(crate) provider_requests_consumed: usize,
+    pub(crate) provider_request_ordinal: u64,
 }
 
 pub(crate) struct RecoveredWorkflowContinuation {
@@ -170,6 +179,8 @@ struct RunReduction {
     workflow_deferral: Option<(GraphFinalizationDeferred, u64)>,
     #[serde(default)]
     latest_provider_request_attempt: Option<(u64, u64)>,
+    #[serde(default)]
+    latest_provider_response_seq: Option<u64>,
     #[serde(default)]
     delegation_mirror_handoffs: HashMap<String, DelegationMirrorHandoff>,
     route_replay_epoch: u64,
@@ -500,6 +511,12 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                 }
                 continue;
             }
+            if let Some(retry) =
+                pending_admission_retry(store, &session_id, &run_id, &state, &reduction)?
+            {
+                recovered.push(RecoveredWork::AdmissionRetry(Box::new(retry)));
+                continue;
+            }
             if let Some(continuation) =
                 pending_workflow_continuation(store, &session_id, &run_id, &state, &reduction)
                     .await?
@@ -766,6 +783,70 @@ pub(crate) async fn recover_interrupted_turns(
     .work)
 }
 
+fn pending_admission_retry(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    run_id: &RunId,
+    state: &RunState,
+    reduction: &RunReduction,
+) -> Result<Option<RecoveredAdmissionRetry>, HaiderError> {
+    if !admitted_first_request_has_no_response(state, reduction) {
+        return Ok(None);
+    }
+    let accepted_seq = reduction.user_seq.ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            format!("admission-retry run {run_id} has no user message"),
+            false,
+        )
+    })?;
+    let provider_request_ordinal = reduction
+        .latest_provider_request_attempt
+        .map_or(0, |(_, ordinal)| ordinal.saturating_sub(1));
+    Ok(Some(RecoveredAdmissionRetry {
+        accepted: recovered_acceptance(
+            session_id,
+            run_id,
+            accepted_seq,
+            store.worker_generation(),
+            reduction.branch_id.clone(),
+        ),
+        // This exact shape is the first logical request. Its durable marker
+        // proves admission, not completion, so recovery re-enters request one
+        // with the ordinal seed rewound from 1 to 0.
+        provider_requests_consumed: 0,
+        provider_request_ordinal,
+    }))
+}
+
+fn admitted_first_request_has_no_response(state: &RunState, reduction: &RunReduction) -> bool {
+    let Some((attempt_seq, ordinal)) = reduction.latest_provider_request_attempt else {
+        return false;
+    };
+    let state_matches_attempt = match reduction.state.as_ref() {
+        Some((RunState::Thinking, state_seq)) if *state == RunState::Thinking => {
+            *state_seq < attempt_seq
+        }
+        Some((RunState::Streaming, state_seq)) if *state == RunState::Streaming => {
+            attempt_seq < *state_seq
+        }
+        _ => false,
+    };
+    ordinal == 1
+        && reduction.workflow_deferral.is_none()
+        && state_matches_attempt
+        && reduction.headless_configured
+        && reduction.budget_exhausted.is_none()
+        && reduction.open_items.is_empty()
+        && reduction.incomplete_items.is_empty()
+        && reduction.menu.is_none()
+        && reduction.delegation_mirror_handoffs.is_empty()
+        && reduction.route_replay_events.is_empty()
+        && reduction
+            .latest_provider_response_seq
+            .is_none_or(|response_seq| response_seq < attempt_seq)
+}
+
 async fn pending_workflow_continuation(
     store: &SqliteStoreHandle,
     session_id: &SessionId,
@@ -963,6 +1044,7 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
                     | EventPayload::MenuAnswered(_)
                     | EventPayload::MenuClosed { .. }
                     | EventPayload::ToolResult { .. }
+                    | EventPayload::Usage(_)
                     | EventPayload::AgentReport(_)
                     | EventPayload::GraphFinalizationDeferred(_)
             )
@@ -1016,6 +1098,9 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
             reduction.user_seq = Some(envelope.seq);
         }
         EventPayload::Item(ItemEvent::Started { item_id, item }) => {
+            if provider_response_item(&item) {
+                reduction.latest_provider_response_seq = Some(envelope.seq);
+            }
             if let TurnItem::ToolCall {
                 call_id,
                 name,
@@ -1049,6 +1134,13 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
             );
         }
         EventPayload::Item(ItemEvent::Delta { item_id, delta }) => {
+            if reduction
+                .open_items
+                .get(&item_id)
+                .is_some_and(|open| provider_response_item(&open.item))
+            {
+                reduction.latest_provider_response_seq = Some(envelope.seq);
+            }
             if let Some(open) = reduction.open_items.get_mut(&item_id) {
                 match &delta {
                     ItemDelta::Text { text } => {
@@ -1077,6 +1169,9 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
             }
         }
         EventPayload::Item(ItemEvent::Completed { item_id, item }) => {
+            if provider_response_item(&item) {
+                reduction.latest_provider_response_seq = Some(envelope.seq);
+            }
             if let Some(attempt) = CacheRequestAttemptV1::from_extension_item(&item) {
                 reduction.latest_provider_request_attempt = Some((envelope.seq, attempt.ordinal));
             }
@@ -1177,11 +1272,30 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
             reduction.tool_results.insert(call_id.clone());
             reduction.tool_result_values.insert(call_id, result);
         }
+        EventPayload::Usage(_) => {
+            reduction.latest_provider_response_seq = Some(envelope.seq);
+        }
         EventPayload::AgentReport(report) => {
             reduction.agent_reports.insert(report.agent);
         }
         _ => {}
     }
+}
+
+fn provider_response_item(item: &TurnItem) -> bool {
+    matches!(
+        item,
+        TurnItem::AgentMessage { .. }
+            | TurnItem::IncompleteAgentMessage { .. }
+            | TurnItem::Reasoning { .. }
+            | TurnItem::ToolCall { .. }
+            | TurnItem::Refusal { .. }
+    ) || matches!(
+        item,
+        TurnItem::Extension { kind, .. }
+            if kind == PROVIDER_OPAQUE_EXTENSION_KIND
+                || kind == ROUTE_REPLAY_EVENT_EXTENSION_KIND
+    )
 }
 
 fn pending_checkpoint(reduction: &RunReduction) -> Option<RequestInputCheckpoint> {
@@ -1704,6 +1818,36 @@ mod streaming_checkpoint_tests;
 mod composite_recovery_tests {
     use super::*;
 
+    /// MUTATION CHECK: omit the response coordinate or accept a later
+    /// response fact and the final assertion flips true, allowing a daemon
+    /// restart to replay provider work after response delivery began.
+    #[test]
+    fn admitted_first_request_retries_only_before_any_response_fact() {
+        let mut reduction = RunReduction {
+            state: Some((RunState::Thinking, 5)),
+            user_seq: Some(1),
+            headless_configured: true,
+            latest_provider_request_attempt: Some((6, 1)),
+            ..RunReduction::default()
+        };
+        assert!(admitted_first_request_has_no_response(
+            &RunState::Thinking,
+            &reduction
+        ));
+
+        reduction.state = Some((RunState::Streaming, 7));
+        assert!(admitted_first_request_has_no_response(
+            &RunState::Streaming,
+            &reduction
+        ));
+
+        reduction.latest_provider_response_seq = Some(8);
+        assert!(!admitted_first_request_has_no_response(
+            &RunState::Streaming,
+            &reduction
+        ));
+    }
+
     /// CROSS-LANE MUTATION CHECK: remove the pending-mirror condition from
     /// `workflow_continuation_shape_is_eligible`. The assertion flips true,
     /// proving durable child cancellation owns recovery before wfcont can
@@ -1729,6 +1873,7 @@ mod composite_recovery_tests {
                 11,
             )),
             latest_provider_request_attempt: Some((10, 7)),
+            latest_provider_response_seq: Some(9),
             ..RunReduction::default()
         };
         let handoff = DelegationMirrorHandoff {
@@ -1748,7 +1893,7 @@ mod composite_recovery_tests {
         let encoded = rmp_serde::to_vec(&reduction).expect("encode composite checkpoint");
         let recovered: RunReduction =
             rmp_serde::from_slice(&encoded).expect("decode composite checkpoint");
-        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v5");
+        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v6");
         assert_eq!(
             recovered
                 .workflow_deferral
@@ -1757,6 +1902,7 @@ mod composite_recovery_tests {
             Some(3)
         );
         assert_eq!(recovered.latest_provider_request_attempt, Some((10, 7)));
+        assert_eq!(recovered.latest_provider_response_seq, Some(9));
         assert_eq!(
             recovered
                 .delegation_mirror_handoffs
