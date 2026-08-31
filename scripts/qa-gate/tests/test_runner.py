@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import copy
+import io
 import os
 from pathlib import Path
 import platform
+import signal
 import tempfile
 import textwrap
 import unittest
@@ -17,7 +19,8 @@ from gate.context import (
     path_is_within,
     status_socket_path_valid,
 )
-from gate.contract import ContractError, Evidence, validate_evidence_list
+from gate.contract import PASS, ContractError, Evidence, validate_evidence_list
+from gate.headless import provider_request_ordinals
 from gate.loader import load_check
 from gate.report import diff_reports, load_report, validate_report, write_report
 import runner
@@ -83,6 +86,32 @@ class LoaderContractTests(unittest.TestCase):
             self.assertFalse(check.module.CALLED)
             self.assertEqual(versions, set())
 
+    def test_expected_fail_until_is_validated_and_reported_without_rewriting_status(self):
+        with tempfile.TemporaryDirectory() as directory_text:
+            directory = Path(directory_text)
+            source = VALID_MODULE.replace(
+                'needs = ("network:none",)',
+                'needs = ("fixture:definitely-missing",)\nexpected_fail_until = "0.0.968"',
+            )
+            check = load_check(self.write_module(directory, source), "t0")
+            row, _versions = runner.execute_check(
+                check,
+                bin_dir=directory,
+                measurement_accepted=True,
+            )
+            self.assertEqual(check.expected_fail_until, "0.0.968")
+            self.assertEqual(row["expected_fail_until"], "0.0.968")
+            self.assertEqual(row["status"], "ENV_BLOCKED")
+
+    def test_malformed_expected_fail_until_is_rejected_at_load(self):
+        with tempfile.TemporaryDirectory() as directory_text:
+            directory = Path(directory_text)
+            source = VALID_MODULE.replace(
+                "timed = False", 'expected_fail_until = "968"\ntimed = False'
+            )
+            with self.assertRaisesRegex(ContractError, "semantic version"):
+                load_check(self.write_module(directory, source), "t0")
+
     def test_cleanup_exception_becomes_fail_row_and_does_not_escape(self):
         with tempfile.TemporaryDirectory() as directory_text:
             directory = Path(directory_text)
@@ -119,14 +148,51 @@ class LoaderContractTests(unittest.TestCase):
             validate_evidence_list([Evidence("empty", "PASS", "")])
 
     def test_shipped_check_budget_sums_cover_every_nested_bound(self):
-        jsonl = load_check(
-            runner.CHECK_ROOT / "t0" / "t0.run.jsonl_contract.py", "t0"
+        expected = {
+            "t0.account.alias_selects": 306_000,
+            "t0.budget.max_cost_binds_before_request": 252_000,
+            "t0.budget.max_tokens_binds": 252_000,
+            "t0.daemon.status_stop": 310_000,
+            "t0.headless.input_required_is_typed": 118_000,
+            "t0.run.exit_codes": 336_000,
+            "t0.run.jsonl_contract": 146_000,
+            "t0.run.replay_resume_recover": 445_000,
+            "t0.sessions.wait_ready_n": 506_000,
+        }
+        checks = runner.discover_checks(runner.CHECK_ROOT, "t0")
+        self.assertEqual(
+            {check.id: check.budget.milliseconds for check in checks}, expected
         )
-        status_stop = load_check(
-            runner.CHECK_ROOT / "t0" / "t0.daemon.status_stop.py", "t0"
-        )
-        self.assertEqual(jsonl.budget.milliseconds, 146_000)
-        self.assertEqual(status_stop.budget.milliseconds, 310_000)
+        by_id = {check.id: check for check in checks}
+        for check_id in (
+            "t0.budget.max_cost_binds_before_request",
+            "t0.budget.max_tokens_binds",
+        ):
+            self.assertEqual(by_id[check_id].segments, 1)
+            self.assertEqual(by_id[check_id].turns_expected, 1)
+
+    def test_provider_request_counter_uses_completed_attempt_once(self):
+        document = {
+            "events": [
+                {
+                    "payload": {
+                        "type": "item",
+                        "event": event,
+                        "item": {
+                            "item": "extension",
+                            "kind": "cache_request_attempt_v1",
+                            "data": {"ordinal": 1},
+                        },
+                    }
+                }
+                for event in ("started", "completed", "completed")
+            ]
+        }
+        self.assertEqual(provider_request_ordinals(document), {1})
+
+    def test_account_stub_stays_small_stdlib_fixture(self):
+        source = (runner.HERE / "gate" / "openai_stub.py").read_text(encoding="utf-8")
+        self.assertLessEqual(len(source.splitlines()), 150)
 
     def test_status_check_never_stops_without_trusted_status_pid(self):
         check = load_check(
@@ -282,6 +348,17 @@ class ReportAndPathTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "canonical absolute path"):
             validate_report(report)
 
+    def test_report_validator_rejects_nonstring_expected_fail_until(self):
+        report = copy.deepcopy(sample_report(current=False))
+        report["checks"][0]["expected_fail_until"] = 968
+        with self.assertRaisesRegex(ContractError, "expected_fail_until"):
+            validate_report(report)
+
+        report = copy.deepcopy(sample_report(current=False))
+        report["checks"][0]["expected_fail_until"] = "968"
+        with self.assertRaisesRegex(ContractError, "expected_fail_until"):
+            validate_report(report)
+
     def test_canonical_path_compare_accepts_symlink_alias_and_descendant(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -338,6 +415,94 @@ class ReportAndPathTests(unittest.TestCase):
                 os.environ.pop("NO_COLOR", None)
             else:
                 os.environ["NO_COLOR"] = previous
+
+    def test_spawn_tracking_covers_new_headless_command_families(self):
+        self.assertTrue(CheckContext._may_spawn(("account", "add")))
+        self.assertTrue(CheckContext._may_spawn(("resume", "session-id")))
+        self.assertTrue(CheckContext._may_spawn(("session", "session-id", "--json")))
+        self.assertTrue(CheckContext._may_spawn(("sessions", "wait-ready")))
+        self.assertFalse(
+            CheckContext._may_spawn(("sessions", "wait-ready", "--no-spawn"))
+        )
+
+    def test_sigint_helper_arms_on_stdout_and_signals_only_the_client(self):
+        context = CheckContext(
+            check_id="t0.test.sigint",
+            bin_dir=Path(tempfile.gettempdir()),
+            script=[{"step": "hang"}],
+        )
+
+        class FakeProcess:
+            pid = 12345
+
+            def __init__(self):
+                self.stdout = io.StringIO('{"state":"streaming"}\n')
+                self.stderr = io.StringIO("")
+                self.returncode = None
+                self.signals = []
+
+            def poll(self):
+                return self.returncode
+
+            def send_signal(self, value):
+                self.signals.append(value)
+                self.returncode = 130
+
+            def wait(self, timeout=None):
+                del timeout
+                return self.returncode
+
+        process = FakeProcess()
+        try:
+            with mock.patch("gate.context.subprocess.Popen", return_value=process):
+                result = context.interrupt_haider_after_stdout(
+                    ["run", "--output", "jsonl"],
+                    marker='"state":"streaming"',
+                    arm_timeout=runner.DAEMON_STARTUP,
+                    terminal_timeout=runner.DAEMON_STARTUP,
+                )
+            self.assertEqual(result.returncode, 130)
+            self.assertFalse(result.timed_out)
+            self.assertEqual(process.signals, [signal.SIGINT])
+        finally:
+            context.dispose(keep=False)
+
+    def test_isolated_subcase_uses_fresh_context_and_returns_cleanup_evidence(self):
+        context = CheckContext(
+            check_id="t0.test.isolated",
+            bin_dir=Path(tempfile.gettempdir()),
+            script=[{"step": "finish", "reason": "end_turn"}],
+        )
+        observed = {}
+
+        def fake_run(child, args, *, timeout):
+            observed["root"] = child.root
+            observed["args"] = tuple(args)
+            observed["timeout"] = timeout
+            observed["script"] = child.fake_script
+            return CommandResult(tuple(args), 0, "{}\n", "", False, 1)
+
+        try:
+            with mock.patch.object(CheckContext, "run_haider", fake_run), mock.patch.object(
+                CheckContext,
+                "cleanup",
+                lambda _child: Evidence(
+                    "no_orphan_daemons", PASS, "no_orphan_daemons pids=1 alive_after=false"
+                ),
+            ):
+                result, cleanup = context.run_isolated_haider(
+                    "control",
+                    ["run", "-p", "control"],
+                    timeout=runner.DAEMON_STARTUP,
+                )
+            self.assertEqual(result.returncode, 0)
+            self.assertNotEqual(observed["root"], context.root)
+            self.assertEqual(observed["script"], context.fake_script)
+            self.assertEqual(cleanup.status, PASS)
+            self.assertEqual(cleanup.label, "control_no_orphan_daemons")
+            self.assertIn("isolated_subcase=control", cleanup.evidence_line)
+        finally:
+            context.dispose(keep=False)
 
     def test_spawn_capable_cleanup_without_status_pid_fails(self):
         context = CheckContext(

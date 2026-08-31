@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -201,6 +202,7 @@ class CheckContext:
             }
         )
         self.env = env
+        self.fake_script = json.loads(json.dumps(script))
         self.spawn_possible = False
         self.daemon_pids: set[int] = set()
         self.untrusted_status_pids: set[int] = set()
@@ -208,6 +210,7 @@ class CheckContext:
         self.status_violations: list[str] = []
         self.ownership_refused = False
         self.commands: list[CommandResult] = []
+        self._isolated_active = False
         self._disposed = False
 
     def run_haider(
@@ -258,12 +261,166 @@ class CheckContext:
         self.commands.append(result)
         return result
 
+    def interrupt_haider_after_stdout(
+        self,
+        args: Sequence[str],
+        *,
+        marker: str,
+        arm_timeout: BudgetPart | BudgetSum,
+        terminal_timeout: BudgetPart | BudgetSum,
+    ) -> CommandResult:
+        """Send the client SIGINT only after a machine-output marker is visible.
+
+        The client remains alive and services its negotiated connection while
+        this harness observes stdout, satisfying registry #95. Both phases use
+        named budgets so the outer wait is the sum of the arm observation and
+        the client's terminal grace (registry #94).
+        """
+
+        if not marker:
+            raise ContractError("interrupt stdout marker must be non-empty")
+        argv = (str(self.haider_bin), *map(str, args))
+        if self._may_spawn(args):
+            self.spawn_possible = True
+        started = time.monotonic()
+        popen_kwargs: dict[str, Any] = {
+            "cwd": self.workspace_dir,
+            "env": self.env,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
+        if os.name == "posix":
+            popen_kwargs["start_new_session"] = True
+        elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        process = subprocess.Popen(argv, **popen_kwargs)
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+
+        def drain(pipe: Any, parts: list[str]) -> None:
+            if pipe is None:
+                return
+            for line in iter(pipe.readline, ""):
+                parts.append(line)
+
+        readers = [
+            threading.Thread(target=drain, args=(process.stdout, stdout_parts), daemon=True),
+            threading.Thread(target=drain, args=(process.stderr, stderr_parts), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+
+        timed_out = False
+        arm_deadline = time.monotonic() + budget_seconds(arm_timeout)
+        while marker not in "".join(stdout_parts) and process.poll() is None:
+            if time.monotonic() >= arm_deadline:
+                timed_out = True
+                break
+            time.sleep(0.01)
+
+        if not timed_out and process.poll() is None:
+            interrupt = (
+                signal.SIGINT
+                if os.name == "posix"
+                else getattr(signal, "CTRL_C_EVENT", signal.SIGINT)
+            )
+            try:
+                process.send_signal(interrupt)
+            except (OSError, ValueError):
+                process.terminate()
+            try:
+                process.wait(timeout=budget_seconds(terminal_timeout))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+
+        if timed_out and process.poll() is None:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
+        if process.poll() is None:
+            process.wait()
+        for reader in readers:
+            reader.join()
+        result = CommandResult(
+            argv=argv,
+            returncode=process.returncode,
+            stdout="".join(stdout_parts),
+            stderr="".join(stderr_parts),
+            timed_out=timed_out,
+            wall_ms=round((time.monotonic() - started) * 1_000),
+        )
+        self.commands.append(result)
+        return result
+
+    def run_isolated_haider(
+        self,
+        label: str,
+        args: Sequence[str],
+        *,
+        timeout: BudgetPart | BudgetSum,
+    ) -> tuple[CommandResult, Evidence]:
+        """Run one sequential subcase with a fresh profile, script, and daemon.
+
+        Budget controls need independent consumptive fake scripts. This is not
+        a second runner: the child uses the same context/cleanup laws, cannot
+        overlap another child, and returns its no-orphan evidence to the one
+        owning check.
+        """
+
+        if not label or any(character in label for character in "\r\n"):
+            raise ContractError("isolated subcase label must be non-empty and single-line")
+        if self._isolated_active:
+            raise ContractError("isolated subcases must be sequential")
+        self._isolated_active = True
+        child: CheckContext | None = None
+        result: CommandResult | None = None
+        cleanup: Evidence | None = None
+        try:
+            child = CheckContext(
+                check_id=f"{self.check_id}.{label}",
+                bin_dir=self.bin_dir,
+                script=self.fake_script,
+            )
+            result = child.run_haider(args, timeout=timeout)
+        finally:
+            if child is not None:
+                try:
+                    cleanup = child.cleanup()
+                except Exception as error:
+                    emergency = child.emergency_cleanup()
+                    cleanup = Evidence(
+                        "no_orphan_daemons",
+                        FAIL,
+                        f"isolated cleanup_runner_error type={type(error).__name__} "
+                        f"actual={str(error)!r} emergency_cleanup={emergency}",
+                    )
+                self.daemon_versions.update(child.daemon_versions)
+                child.dispose(keep=cleanup.status == FAIL)
+            self._isolated_active = False
+        if result is None or cleanup is None:
+            raise ContractError("isolated subcase ended without a result and cleanup evidence")
+        return result, Evidence(
+            f"{label}_no_orphan_daemons",
+            cleanup.status,
+            f"isolated_subcase={label} {cleanup.evidence_line}",
+            cleanup.artefacts,
+        )
+
     @staticmethod
     def _may_spawn(args: Sequence[str]) -> bool:
         if not args:
             return True
-        if args[0] == "run" or args[0] == "--ready":
+        if args[0] in ("run", "--ready", "account", "resume"):
             return True
+        if args[0] in ("session", "sessions"):
+            return "--no-spawn" not in args
         return args[0] == "status" and "--no-spawn" not in args
 
     def observe_status(self, document: dict[str, Any]) -> list[str]:

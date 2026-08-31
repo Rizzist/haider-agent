@@ -46,6 +46,7 @@ Each `checks/<tier>/*.py` module exports:
 | `turns_expected` | Explicit non-negative integer required by the segment law. This field supplements the base check contract because the runner cannot enforce that law without it. |
 | `budget` | A `BudgetSum` of at least two positive named `BudgetPart` values, each with a source. An `int`, `float`, lone part, or other literal-only deadline is rejected while loading all checks, before any spawn. |
 | `timed` | Boolean. Correctness always stands; an overloaded host rejects only the published timing. |
+| `expected_fail_until` | Optional semantic version documenting a known-open product defect. It is report metadata only: a real `FAIL` remains `FAIL` and can flip to `PASS` without editing the check. |
 | `run(ctx)` | Returns a non-empty `list[Evidence]`. Exceptions become a diagnostic runner `FAIL`, followed by mandatory daemon cleanup. |
 
 `Evidence(label, status, evidence_line, artefacts)` accepts only `PASS`, `FAIL`,
@@ -57,8 +58,12 @@ Fake-provider segments end at exactly these shipped step names:
 `finish`, `error`, `error_presented`, `hang`, `premature_eof`,
 `error_with_retryability`, and `malformed_frame`. All checks are loaded first;
 the runner refuses `turns_expected > segment_count` before creating a context.
-One daemon and one consumptive script belong to one check—never to a tier or a
-neighbouring check.
+One daemon and one consumptive script normally belong to one check—never to a
+tier or a neighbouring check. The narrow budget-control exception uses
+`ctx.run_isolated_haider`: one sequential child context gets its own short
+profile and copy of the same one-segment script, returns mandatory no-orphan
+evidence, and is fully disposed before the primary below-bound context starts.
+Isolated subcases cannot overlap or nest.
 
 Every subprocess timeout receives a named budget or sum. The first JSONL check
 adds `--timeout 30s` to the requested command because an attached run otherwise
@@ -119,6 +124,31 @@ trusted PID. The harness never uses `pgrep` or `pgrep -f`. The second stop's shi
   `stopped_cleanly`, the same PID with `process_exited=true`, PID disappearance,
   a second `not_running`/69 stop, and a no-spawn status probe that remains
   unavailable.
+- `t0.run.exit_codes` records one evidence row for provider error, product
+  timeout, max-time budget, a real client SIGINT, and missing credentials.
+- `t0.budget.max_cost_binds_before_request` and
+  `t0.budget.max_tokens_binds` count completed durable request-attempt facts,
+  require a typed budget terminal before any below-bound exchange, and reserve
+  one sole scripted segment in each of two sequential hermetic subcases: an
+  above-bound one-request control and a below-bound zero-request probe. Each
+  subcase proves its own no-orphan cleanup. The cost check carries
+  `expected_fail_until=0.0.968`; this metadata never turns a failure into a
+  pass.
+- `t0.sessions.wait_ready_n` starts three sessions and proves both the exact
+  positive barrier document and the finite typed timeout when only two of
+  three scripted sessions can complete.
+- `t0.account.alias_selects` removes the daemon fake seam and owns two
+  loopback-only stdlib OpenAI-compatible listeners, each with a distinct
+  response. The listener implementation is kept below 150 lines.
+- `t0.run.replay_resume_recover` compares durable replay against a read-only
+  SQLite source projection, verifies replay consumes no provider request, then
+  exercises finite typed resume and recovery commands.
+- `t0.headless.input_required_is_typed` pins the installed 0.0.967 behavior:
+  `request_input` is rejected as `no_human_available`, fed back to the fake
+  provider, and the run completes instead of hanging.
+
+All seven Step 2 rows set `timed=False`; they report correctness under load and
+publish no timing verdict.
 
 ## Normative report schema
 
@@ -135,7 +165,7 @@ authority for this table; additive keys are allowed.
 | `binary`, `daemon_binary` | Canonical path plus nullable lowercase SHA-256, exact `version_output`, and parsed bare `version`. Both pair members are hashed. |
 | `daemon_version` | Nullable string collected from `status --json .daemon.version`; a normal passing run records the installed daemon's bare version. |
 | `warmup` | Boolean `accepted`, integer `wall_ms`, non-empty `evidence_line`. Version executions and one isolated ready/start/stop happen before timed rows. |
-| `checks[]` | Required `id`, `area`, aggregate `status`, non-empty `evidence[]`, non-negative integer `wall_ms`, string-list `artefacts`, boolean `timed`, and boolean-or-null `measurement_accepted`. The writer also records named budget parts, segment count, and expected turns. |
+| `checks[]` | Required `id`, `area`, aggregate `status`, non-empty `evidence[]`, non-negative integer `wall_ms`, string-list `artefacts`, boolean `timed`, and boolean-or-null `measurement_accepted`. The writer also records named budget parts, segment count, expected turns, and nullable `expected_fail_until`. |
 | `checks[].evidence[]` | `label`, allowed `status`, non-empty single-line `evidence_line`, and string-list `artefacts`. The aggregate status precedence is `FAIL > ENV_BLOCKED > SKIP > PASS`. |
 | `summary` | Exact integers `total`, `pass`, `fail`, `skip`, `env_blocked`, recomputed from the check array. |
 

@@ -89,6 +89,7 @@ def execute_check(
                 },
                 "segments": check.segments,
                 "turns_expected": check.turns_expected,
+                "expected_fail_until": check.expected_fail_until,
             },
             set(),
         )
@@ -167,6 +168,7 @@ def execute_check(
         },
         "segments": check.segments,
         "turns_expected": check.turns_expected,
+        "expected_fail_until": check.expected_fail_until,
     }
     return row, daemon_versions
 
