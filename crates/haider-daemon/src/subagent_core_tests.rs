@@ -14,10 +14,12 @@ use crate::worker::{
     WorkerManager, WorkerToolContext,
 };
 use async_trait::async_trait;
+#[cfg(unix)]
+use haider_core::DeferredTicket;
 use haider_core::{
-    BranchCreateCommand, CancelToken, DeferredTicket, EventIdGenerator, SessionCreateCommand,
-    SqliteStoreHandle, StoreHandle, ToolDispatchResult, TurnAcceptCommand,
-    TurnAdmissionDisposition, TurnCancelCommand,
+    BranchCreateCommand, CancelToken, EventIdGenerator, SessionCreateCommand, SqliteStoreHandle,
+    StoreHandle, ToolDispatchResult, TurnAcceptCommand, TurnAdmissionDisposition,
+    TurnCancelCommand,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
@@ -94,6 +96,25 @@ fn workflow_hops_do_not_refresh_the_delegation_wait_deadline() {
 
     assert_eq!(first_hop_deadline, first_now + fallback);
     assert_eq!(second_hop_deadline, first_hop_deadline);
+}
+
+/// MUTATION CHECK: collapse every child wait to Thinking and the route-outage
+/// chip loses its typed parked state. A parent's own delegated wait remains a
+/// local-child coordination state; mirroring the child never cancels it.
+#[test]
+fn child_route_outage_is_waiting_while_parent_local_child_wait_stays_thinking() {
+    assert_eq!(
+        crate::delegation::chip_for_run_state(&RunState::Waiting {
+            reason: WaitReason::NetworkUnavailable,
+        }),
+        Some(ChipState::Waiting)
+    );
+    assert_eq!(
+        crate::delegation::chip_for_run_state(&RunState::Waiting {
+            reason: WaitReason::LocalChild,
+        }),
+        Some(ChipState::Thinking)
+    );
 }
 
 /// LAW E1d: a child resolves to the intersection of its requested grant and
@@ -3005,6 +3026,15 @@ async fn durable_parent_answer_replays_into_child_after_coordinator_restart() {
                 )
                 .await
                 .expect("recover partial stream"),
+            RecoveredWork::RouteWait(recovered) => manager_handle
+                .recover_route_wait(
+                    recovered.accepted,
+                    recovered.checkpoint,
+                    recovered.provider_requests_consumed,
+                    recovered.provider_request_ordinal,
+                )
+                .await
+                .expect("recover route wait"),
             RecoveredWork::WorkflowContinuation(recovered) => manager_handle
                 .recover_workflow_continuation(
                     recovered.accepted,
@@ -4550,6 +4580,15 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
                 .recover_terminal_mirror_handoff(recovered.record, recovered.handoff)
                 .await
                 .expect("recover delegation mirror"),
+            RecoveredWork::RouteWait(recovered) => manager_handle
+                .recover_route_wait(
+                    recovered.accepted,
+                    recovered.checkpoint,
+                    recovered.provider_requests_consumed,
+                    recovered.provider_request_ordinal,
+                )
+                .await
+                .expect("recover route wait"),
         }
     }
     assert!(resumed_parent, "parent child wait must survive restart");

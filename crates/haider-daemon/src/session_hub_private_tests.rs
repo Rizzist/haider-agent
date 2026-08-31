@@ -1414,6 +1414,7 @@ async fn status_snapshot_counts_sessions_without_listing_summaries() {
                     ResponseBody::StatusSnapshot {
                         active_account,
                         session_count,
+                        waiting_for_route_count,
                         adoption_available,
                         daemon_pid,
                         socket_path,
@@ -1423,6 +1424,7 @@ async fn status_snapshot_counts_sessions_without_listing_summaries() {
             } if request_id.as_str() == "status-scalars" => Some((
                 active_account.clone(),
                 *session_count,
+                *waiting_for_route_count,
                 adoption_available.clone(),
                 *daemon_pid,
                 socket_path.clone(),
@@ -1437,6 +1439,7 @@ async fn status_snapshot_counts_sessions_without_listing_summaries() {
         (
             None,
             3,
+            0,
             Vec::new(),
             Some(std::process::id()),
             None,
@@ -6548,5 +6551,11 @@ fn effect_outcome_unknown_maps_to_typed_state_and_outranks() {
     assert!(matches!(
         observe_run_state(&RunState::Thinking),
         ObserveRunStateWire::Running
+    ));
+    assert!(matches!(
+        observe_run_state(&RunState::Waiting {
+            reason: haider_protocol::state::WaitReason::NetworkUnavailable,
+        }),
+        ObserveRunStateWire::WaitingForRoute
     ));
 }

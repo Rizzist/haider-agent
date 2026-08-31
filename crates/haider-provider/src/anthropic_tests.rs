@@ -2000,3 +2000,46 @@ async fn anthropic_error_body_read_is_bounded_to_64kib() {
         "exactly the ceiling, never a byte beyond"
     );
 }
+
+/// MUTATION CHECK: propagate the diagnostic-body reset with `?` before
+/// attaching the already-received status. Core would then mistake this
+/// completed 503 response for route loss and enter WaitingForRoute.
+#[tokio::test]
+async fn completed_anthropic_5xx_with_reset_body_keeps_http_status_not_network_class() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let address = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut request_head = [0u8; 4096];
+        let _ = socket.read(&mut request_head).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: 64\r\nx-request-id: req-503\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .expect("write completed 503 headers");
+        socket.shutdown().await.expect("truncate response body");
+    });
+
+    let provider = AnthropicProvider::new_custom(
+        secret_credential("anthropic-503", b"fixture-secret"),
+        "claude-local",
+        &format!("http://{address}"),
+    )
+    .expect("loopback compatible provider");
+    let error = provider
+        .stream_turn(one_line_turn("claude-local"))
+        .await
+        .expect_err("completed HTTP 503 remains an error");
+
+    assert_ne!(error.kind, ProviderErrorKind::NetworkUnavailable);
+    assert_eq!(error.presentation.provider_http_status, Some(503));
+    assert_eq!(
+        error.presentation.provider_request_id.as_deref(),
+        Some("req-503")
+    );
+}

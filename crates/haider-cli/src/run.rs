@@ -1922,8 +1922,11 @@ mod tests {
             .expect("raw envelope fixture")
         }
 
-        let (sender, receiver) = mpsc::channel(4);
+        let (sender, receiver) = mpsc::channel(5);
         for (index, payload) in [
+            EventPayload::RunState(RunState::Waiting {
+                reason: WaitReason::NetworkUnavailable,
+            }),
             EventPayload::RunState(RunState::Waiting {
                 reason: WaitReason::RateLimit,
             }),
@@ -1969,7 +1972,7 @@ mod tests {
             serde_json::json!({
                 "type": "run_state",
                 "state": "waiting",
-                "reason": {"reason": "rate_limit"}
+                "reason": {"reason": "network_unavailable"}
             })
         );
         assert_eq!(
@@ -1977,11 +1980,19 @@ mod tests {
             serde_json::json!({
                 "type": "run_state",
                 "state": "waiting",
-                "reason": {"reason": "provider_backoff"}
+                "reason": {"reason": "rate_limit"}
             })
         );
         assert_eq!(
             payloads[2],
+            serde_json::json!({
+                "type": "run_state",
+                "state": "waiting",
+                "reason": {"reason": "provider_backoff"}
+            })
+        );
+        assert_eq!(
+            payloads[3],
             serde_json::json!({
                 "type": "run_failed",
                 "code": "provider_error",
@@ -1990,7 +2001,7 @@ mod tests {
             })
         );
         assert_eq!(
-            payloads[3],
+            payloads[4],
             serde_json::json!({
                 "type": "run_failed",
                 "code": "provider_timeout",

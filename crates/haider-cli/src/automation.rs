@@ -330,6 +330,7 @@ fn run_state_name(state: ObserveRunStateWire) -> &'static str {
     match state {
         ObserveRunStateWire::Idle => "idle",
         ObserveRunStateWire::Running => "running",
+        ObserveRunStateWire::WaitingForRoute => "waiting_for_route",
         ObserveRunStateWire::EffectUnknown => "effect_unknown",
         ObserveRunStateWire::ParkedPermission => "parked_permission",
         ObserveRunStateWire::ParkedInput => "parked_input",
@@ -349,7 +350,12 @@ fn resume_outcome(state: Option<ObserveRunStateWire>) -> &'static str {
         }
         Some(ObserveRunStateWire::Errored) => "errored",
         Some(ObserveRunStateWire::Cancelled) => "cancelled",
-        Some(ObserveRunStateWire::Running | ObserveRunStateWire::Unknown) | None => "unknown",
+        Some(
+            ObserveRunStateWire::Running
+            | ObserveRunStateWire::WaitingForRoute
+            | ObserveRunStateWire::Unknown,
+        )
+        | None => "unknown",
         _ => "unknown",
     }
 }

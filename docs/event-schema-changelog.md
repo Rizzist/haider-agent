@@ -121,11 +121,17 @@ JSONL terminal type introduced in this release.
 - `EventPayload::Item` was not added in this release. It is part of the
   v0.0.964 baseline above; the tag diff contains no `EventPayload` change.
 
-### v0.0.968 — additive budget terminal and decision detail
+### v0.0.968 — additive budget, deadline, and route-wait detail
 
-Diff audited: `8952219..ab9c3e8` over `crates/haider-protocol/src`, plus the
-public JSONL terminal enum changed by the same max-cost lane.
+Diff audited: `8952219..lane-968-resume` over `crates/haider-protocol` and
+`crates/haider-core`, plus the integrated max-cost and public observation
+surfaces.
 
+- Current durable headless-kind inventory:
+  `headless:headless_run_configured`, `headless:run_budget_exhausted`, and the
+  additive `headless:run_deadline_exceeded`. The new deadline fact carries the
+  required absolute `RunDeadlineExceededV1.deadline_unix_ms: u64`; it records
+  one run-deadline terminal independently of provider timeout presentation.
 - Additive new JSONL terminal kind: `terminal:budget`
   (`crates/haider-client/src/headless.rs:474`). It identifies the typed
   `budget_exhausted` run failure and remains distinct from caller timeout and
@@ -144,6 +150,14 @@ public JSONL terminal enum changed by the same max-cost lane.
   (`crates/haider-protocol/src/headless.rs:99-117`). The two unavailable kinds
   add required `provider` and `model` string fields
   (`crates/haider-protocol/src/headless.rs:106-113`).
-- No envelope field, core `EventPayload`/`TurnItem` kind, or durable headless
-  payload kind changed. `RunBudgetDimensionV1`, `HeadlessRunUsageV1`, and
+- Additive public observation state `waiting_for_route` identifies a run
+  durably parked only on confirmed network unavailability. Status snapshots
+  add defaulted `waiting_for_route_count: u64`, omitted by writers when zero;
+  older snapshots therefore decode as zero.
+- Two durable `item:extension` subkinds support exact reconnect replay:
+  `haider.route_replay_attempt.v1` carries `response_epoch`, while
+  `haider.route_replay_event.v1` carries `response_epoch` and `stream_event`.
+  They are prompt-omitted recovery metadata, not new core `TurnItem` variants.
+- No envelope field or core `EventPayload`/`TurnItem` kind changed.
+  `RunBudgetDimensionV1`, `HeadlessRunUsageV1`, and
   `HeadlessRunEventPayload::RunBudgetExhausted` all predate this release.

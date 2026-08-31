@@ -51,6 +51,10 @@ jobs:
       - name: repo guards
         run: cargo run -p xtask -- check
       - name: self-test
+        env:
+          # The CLI-only self-test embeds the same deep actor future that
+          # production haiderd runs on explicit 8 MiB Tokio workers.
+          RUST_MIN_STACK: 8388608
         run: |
           cargo build -p haider-cli --locked
           ./target/debug/haider self-test | grep '"ok":true'

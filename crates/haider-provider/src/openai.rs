@@ -2132,13 +2132,15 @@ fn classify_http_body_read_error(
     retry_after: Option<&str>,
     mut error: ProviderError,
 ) -> ProviderError {
-    if error.kind == ProviderErrorKind::MalformedFrame {
-        let classified = replay_openai_http_error(status, retry_after, &[]);
-        error.kind = classified.kind;
-        error.retryable = classified.retryable;
-        error.retry_after_ms = classified.retry_after_ms;
-        error.presentation = classified.presentation;
-    }
+    // The response status was already received, so it owns recovery policy
+    // even if the bounded diagnostic body later truncates or resets. Keeping
+    // a body-read NetworkUnavailable kind here could misattribute a completed
+    // provider 4xx/5xx as local route loss.
+    let classified = replay_openai_http_error(status, retry_after, &[]);
+    error.kind = classified.kind;
+    error.retryable = classified.retryable;
+    error.retry_after_ms = classified.retry_after_ms;
+    error.presentation = classified.presentation;
     error
 }
 

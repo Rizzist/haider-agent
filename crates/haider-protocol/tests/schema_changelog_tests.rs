@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used)]
 
 use haider_protocol::EventPayload;
+use haider_protocol::headless::HeadlessRunEventPayload;
 use haider_protocol::item::TurnItem;
 use std::fs;
 use std::path::Path;
@@ -96,6 +97,25 @@ item_kinds! {
         TurnItem::Refusal { .. } => "refusal",
 }
 
+macro_rules! headless_kinds {
+    ($($pattern:pat => $kind:literal),+ $(,)?) => {
+        const HEADLESS_KINDS: &[&str] = &[$($kind),+];
+
+        #[allow(dead_code)]
+        fn headless_kind(payload: &HeadlessRunEventPayload) -> &'static str {
+            match payload {
+                $($pattern => $kind),+
+            }
+        }
+    };
+}
+
+headless_kinds! {
+    HeadlessRunEventPayload::HeadlessRunConfigured(_) => "headless_run_configured",
+    HeadlessRunEventPayload::RunBudgetExhausted(_) => "run_budget_exhausted",
+    HeadlessRunEventPayload::RunDeadlineExceeded(_) => "run_deadline_exceeded",
+}
+
 fn terminal_kinds() -> Vec<String> {
     let source = include_str!("../../haider-client/src/headless.rs");
     let enum_body = source
@@ -151,5 +171,6 @@ fn every_current_automation_kind_is_pinned_in_the_schema_changelog() {
 
     assert_documented(&changelog, "payload", PAYLOAD_KINDS);
     assert_documented(&changelog, "item", ITEM_KINDS);
+    assert_documented(&changelog, "headless", HEADLESS_KINDS);
     assert_documented(&changelog, "terminal", terminal_kinds());
 }

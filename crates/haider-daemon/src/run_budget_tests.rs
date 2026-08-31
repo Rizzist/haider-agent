@@ -7,7 +7,7 @@ use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::headless::{
     HeadlessRunEventPayload, HeadlessRunSpecV1, HeadlessRunUsageV1, RunBudgetDecisionReasonV1,
-    RunBudgetDimensionV1, RunBudgetExhaustedV1, RunBudgetV1,
+    RunBudgetDimensionV1, RunBudgetExhaustedV1, RunBudgetV1, RunDeadlineExceededV1,
 };
 use haider_protocol::ids::{DeviceId, EventId, ItemId, RunId, SessionId};
 use haider_protocol::item::ItemEvent;
@@ -36,7 +36,8 @@ use crate::worker::{
     BrokerToolFactory, ProviderFactory, QueuedBudgetArm, QueuedBudgetWake, ResolvedTurnProvider,
     WorkerDependencies, WorkerManager, budget_request_is_unresolved_for_test,
     budget_usage_from_envelopes_for_test, exhausted_budget,
-    projected_time_budget_exhaustion_for_test, signal_queued_budget_change,
+    projected_time_budget_exhaustion_for_test,
+    route_retry_unresolved_attempt_is_chargeable_for_test, signal_queued_budget_change,
     wait_for_queued_budget_deadline_or_change,
 };
 use haider_core::{SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand};
@@ -100,6 +101,17 @@ async fn queued_budget_arm_survives_select_reentry_and_rearms_after_queue_change
     assert_eq!(scans.load(Ordering::SeqCst), 2);
 }
 
+/// MUTATION CHECK: charge the unmatched route attempt as missing usage and a
+/// recovered retry terminalizes before transport; suppress all future missing
+/// attempts and a genuinely lost usage projection escapes the hard budget.
+#[test]
+fn route_retry_supersedes_only_the_admitted_unreported_physical_attempts() {
+    assert!(!route_retry_unresolved_attempt_is_chargeable_for_test(1, 1));
+    assert!(!route_retry_unresolved_attempt_is_chargeable_for_test(2, 2));
+    assert!(route_retry_unresolved_attempt_is_chargeable_for_test(2, 1));
+    assert!(route_retry_unresolved_attempt_is_chargeable_for_test(3, 2));
+}
+
 fn envelope(seq: u64, run_id: &RunId, payload: serde_json::Value) -> RawEnvelope {
     serde_json::from_value(serde_json::json!({
         "schema_version": 1,
@@ -160,6 +172,22 @@ fn budget_exhaustion_is_a_typed_fact_and_terminal_error_code() {
     assert_eq!(encoded["usage"]["cache_read_tokens"], 40);
     assert_eq!(encoded["usage"]["cache_write_tokens"], 5);
     assert_eq!(ErrorCode::BudgetExhausted.as_str(), "budget_exhausted");
+    assert_eq!(
+        HeadlessRunEventPayload::from_payload_value(&encoded),
+        Some(payload)
+    );
+}
+
+#[test]
+fn request_deadline_is_a_distinct_typed_durable_fact() {
+    let payload = HeadlessRunEventPayload::RunDeadlineExceeded(RunDeadlineExceededV1 {
+        deadline_unix_ms: 4_200,
+    });
+    let encoded = payload
+        .to_payload_value()
+        .expect("deadline payload encodes");
+    assert_eq!(encoded["type"], "run_deadline_exceeded");
+    assert_eq!(encoded["deadline_unix_ms"], 4_200);
     assert_eq!(
         HeadlessRunEventPayload::from_payload_value(&encoded),
         Some(payload)
@@ -710,6 +738,14 @@ impl Drop for InFlightRequest {
 
 #[async_trait::async_trait]
 impl Provider for NeverOpensProvider {
+    fn trusts_default_route_absence(&self) -> bool {
+        true
+    }
+
+    fn route_status(&self) -> haider_platform::RouteStatus {
+        haider_platform::RouteStatus::Available
+    }
+
     async fn capabilities(&self) -> haider_protocol::provider::CapabilityDoc {
         self.fallback.capabilities().await
     }
@@ -1023,7 +1059,8 @@ fn budget_fact(events: &[RawEnvelope]) -> RunBudgetExhaustedV1 {
             HeadlessRunEventPayload::from_payload_value(&event.payload).and_then(|payload| {
                 match payload {
                     HeadlessRunEventPayload::RunBudgetExhausted(exhausted) => Some(exhausted),
-                    HeadlessRunEventPayload::HeadlessRunConfigured(_) => None,
+                    HeadlessRunEventPayload::HeadlessRunConfigured(_)
+                    | HeadlessRunEventPayload::RunDeadlineExceeded(_) => None,
                 }
             })
         })
@@ -1825,6 +1862,27 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
             .subcode
             .as_str(),
         "provider-timeout"
+    );
+    assert!(
+        !store
+            .read(&session_id, 0, 512)
+            .await
+            .expect("read terminalized run")
+            .iter()
+            .any(|event| {
+                event.run_id.as_ref() == Some(&run_id)
+                    && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                        |payload| {
+                            matches!(
+                                payload,
+                                EventPayload::RunState(RunState::Waiting {
+                                    reason: haider_protocol::state::WaitReason::NetworkUnavailable
+                                })
+                            )
+                        },
+                    )
+            }),
+        "a never-opening provider on a live route must not enter WaitingForRoute"
     );
     timeout(Duration::from_millis(250), async {
         while in_flight.load(Ordering::SeqCst) != 0 {

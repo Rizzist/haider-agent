@@ -151,6 +151,17 @@ async fn hostile_probe_and_http_error_body_sources_are_bounded() {
     assert_eq!(classified.kind, ProviderErrorKind::Overloaded);
     assert!(classified.retryable);
     assert!(classified.message.contains("65536-byte limit"));
+
+    let reset_after_status = classify_http_body_read_error(
+        503,
+        None,
+        ProviderError::new(
+            ProviderErrorKind::NetworkUnavailable,
+            "diagnostic body reset after response status",
+        ),
+    );
+    assert_eq!(reset_after_status.kind, ProviderErrorKind::Overloaded);
+    assert!(reset_after_status.retryable);
 }
 
 /// MUTATION CHECK: discard the extracted provider message, or restrict HTTP

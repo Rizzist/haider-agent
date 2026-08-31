@@ -91,6 +91,12 @@ fn badge_walks_the_run_state_machine_with_sim_labels() {
         ),
         (
             RunState::Waiting {
+                reason: WaitReason::NetworkUnavailable,
+            },
+            "◔ WAITING · network unavailable",
+        ),
+        (
+            RunState::Waiting {
                 reason: WaitReason::Other {
                     tag: "custom".to_owned(),
                 },

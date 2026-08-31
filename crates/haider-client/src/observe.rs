@@ -109,6 +109,7 @@ pub struct ObserveClient {
 pub struct ObserveStatusSnapshot {
     pub active_account: Option<CredentialDescriptor>,
     pub session_count: u64,
+    pub waiting_for_route_count: u64,
     pub adoption_available: Vec<haider_rpc::AccountAdoptionAvailable>,
     pub daemon_pid: Option<u32>,
     pub socket_path: Option<String>,
@@ -260,6 +261,7 @@ impl ObserveClient {
             ResponseBody::StatusSnapshot {
                 active_account,
                 session_count,
+                waiting_for_route_count,
                 adoption_available,
                 daemon_pid,
                 socket_path,
@@ -268,6 +270,7 @@ impl ObserveClient {
             } => Ok(ObserveStatusSnapshot {
                 active_account,
                 session_count,
+                waiting_for_route_count,
                 adoption_available,
                 daemon_pid,
                 socket_path,
@@ -1186,9 +1189,17 @@ fn session_summary_is_ready(summary: &SessionSummary) -> bool {
 }
 
 fn session_summary_is_settled(summary: &SessionSummary) -> bool {
+    session_run_state_is_settled(summary.run_state)
+}
+
+fn session_run_state_is_settled(run_state: Option<ObserveRunStateWire>) -> bool {
     !matches!(
-        summary.run_state,
-        None | Some(ObserveRunStateWire::Running | ObserveRunStateWire::Unknown)
+        run_state,
+        None | Some(
+            ObserveRunStateWire::Running
+                | ObserveRunStateWire::WaitingForRoute
+                | ObserveRunStateWire::Unknown,
+        )
     )
 }
 
@@ -1413,4 +1424,22 @@ fn health_requires_reconnect(outcome: &ClientHealthWait, baseline_lost: u64) -> 
     outcome.channel_closed()
         || health.lost_events != baseline_lost
         || matches!(health.state, ConnectionState::Disconnected(_))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_run_state_is_settled;
+    use haider_rpc::ObserveRunStateWire;
+
+    /// MUTATION CHECK: classify a route wait as settled. A readiness caller
+    /// would return while the same run is still alive and waiting to resume.
+    #[test]
+    fn waiting_for_route_is_not_a_settled_observe_state() {
+        assert!(!session_run_state_is_settled(Some(
+            ObserveRunStateWire::WaitingForRoute
+        )));
+        assert!(session_run_state_is_settled(Some(
+            ObserveRunStateWire::Idle
+        )));
+    }
 }

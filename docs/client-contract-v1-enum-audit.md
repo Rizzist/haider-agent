@@ -268,7 +268,7 @@ appendix list every spelling in context.
 
 ### `crates/haider-protocol/src/headless.rs`
 
-- `HeadlessRunEventPayload` (`type` tag): `"headless_run_configured"` | `"run_budget_exhausted"`. Unknown headless event kinds remain preserved in `RawEnvelope.payload`; this focused typed decoder returns no value for them.
+- `HeadlessRunEventPayload` (`type` tag): `"headless_run_configured"` | `"run_budget_exhausted"` | `"run_deadline_exceeded"`. Unknown headless event kinds remain preserved in `RawEnvelope.payload`; this focused typed decoder returns no value for them.
 - `RunBudgetDimensionV1`: `"tokens"` | `"cost"` | `"time"` | `"unknown"`; any other string → Rust `Unknown`.
 
 ### `crates/haider-protocol/src/graph.rs`

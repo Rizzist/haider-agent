@@ -42,6 +42,14 @@ impl Drop for InFlightRequest {
 
 #[async_trait]
 impl Provider for NeverOpensProvider {
+    fn trusts_default_route_absence(&self) -> bool {
+        true
+    }
+
+    fn route_status(&self) -> haider_platform::RouteStatus {
+        haider_platform::RouteStatus::Available
+    }
+
     async fn capabilities(&self) -> CapabilityDoc {
         self.capabilities.capabilities().await
     }

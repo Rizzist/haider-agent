@@ -72,6 +72,7 @@ pub(crate) struct StatusDocument {
     pub features: Vec<String>,
     pub account: Option<AccountView>,
     pub session_count: u64,
+    pub waiting_for_route_count: u64,
     pub profile_path: String,
     pub runtime_dir: String,
     pub runtime_dir_resolution: RuntimeDirResolution,
@@ -112,6 +113,7 @@ struct StatusDocumentWire<'a> {
     runtime_dir_resolution: &'a RuntimeDirResolution,
     schema: &'static str,
     session_count: u64,
+    waiting_for_route_count: u64,
     update: StatusUpdateWire<'a>,
 }
 
@@ -266,6 +268,7 @@ impl ObserveJson for StatusDocument {
                 "alias": account.alias,
             })),
             "session_count": self.session_count,
+            "waiting_for_route_count": self.waiting_for_route_count,
             "profile_path": self.profile_path,
             "runtime_dir": self.runtime_dir,
             "runtime_dir_resolution": self.runtime_dir_resolution,
@@ -602,6 +605,7 @@ JSON filesystem paths are canonical absolute paths; daemon.socket_path is a Wind
         features: welcome.features.into_iter().collect(),
         account,
         session_count: snapshot.session_count,
+        waiting_for_route_count: snapshot.waiting_for_route_count,
         profile_path: profile.store_dir.display().to_string(),
         runtime_dir: profile.runtime_dir.display().to_string(),
         runtime_dir_resolution,
@@ -1158,6 +1162,7 @@ fn run_state_name(state: ObserveRunStateWire) -> &'static str {
     match state {
         ObserveRunStateWire::Idle => "idle",
         ObserveRunStateWire::Running => "running",
+        ObserveRunStateWire::WaitingForRoute => "waiting_for_route",
         ObserveRunStateWire::EffectUnknown => "effect_unknown",
         ObserveRunStateWire::ParkedPermission => "parked_permission",
         ObserveRunStateWire::ParkedInput => "parked_input",
@@ -1200,6 +1205,7 @@ fn write_status_document(document: &StatusDocument) -> ExitCode {
             alias: &account.alias,
         }),
         session_count: document.session_count,
+        waiting_for_route_count: document.waiting_for_route_count,
         profile_path: &document.profile_path,
         runtime_dir: &document.runtime_dir,
         runtime_dir_resolution: &document.runtime_dir_resolution,
@@ -1247,7 +1253,7 @@ fn write_status_human(document: &StatusDocument) -> ExitCode {
         |version| format!("available ({version})"),
     );
     let mut text = format!(
-        "daemon {} (generation {}, pid {}, ready {})\nsocket: {}\npid file: {}\nupdate: {update}\naccount: {account}\nsessions: {}\nprofile: {}\nruntime: {}\nfeatures: {}\n",
+        "daemon {} (generation {}, pid {}, ready {})\nsocket: {}\npid file: {}\nupdate: {update}\naccount: {account}\nsessions: {}\nwaiting for route: {}\nprofile: {}\nruntime: {}\nfeatures: {}\n",
         document.daemon.version,
         document.daemon.generation,
         document
@@ -1262,6 +1268,7 @@ fn write_status_human(document: &StatusDocument) -> ExitCode {
             .as_deref()
             .unwrap_or("unknown"),
         document.session_count,
+        document.waiting_for_route_count,
         document.profile_path,
         document.runtime_dir,
         document.features.join(", ")

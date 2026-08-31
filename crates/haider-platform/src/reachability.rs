@@ -20,7 +20,12 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-const ROUTE_STATUS_CACHE_TTL: Duration = Duration::from_millis(250);
+/// Maximum age of one cached route observation.
+///
+/// Route waiters use this as their backstop period: one observation every
+/// cache TTL (250 ms = four observations/second). Polling more frequently
+/// cannot reveal fresher platform state and only rereads the same cache entry.
+pub const ROUTE_STATUS_CACHE_TTL: Duration = Duration::from_millis(250);
 
 /// Conservative result of one local OS link/route inspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
