@@ -8,7 +8,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_protocol::EventPayload;
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
-use haider_protocol::context::{CONTEXT_SAVINGS_EXTENSION_KIND, ContextSavingsEvent};
+use haider_protocol::context::{
+    CONTEXT_SAVINGS_EXTENSION_KIND, ContextSavingsEvent, OutputSavings,
+};
 use haider_protocol::envelope::{PromptRender, RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorAction, ErrorCode, HaiderError};
 use haider_protocol::history::{CompactionIntent, CompactionResume, NodeKind, TreeNode};
@@ -24,7 +26,7 @@ use haider_protocol::task::{TASK_TAIL_BYTES, TaskEventPayload, TaskTerminalState
 use haider_protocol::tool::{AttachmentBlock, BoundedResult};
 use haider_provider::{Message, MessageRole, UserCommandRecord};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
@@ -240,6 +242,8 @@ impl PromptHistoryCompiler {
     ) -> Result<Option<haider_protocol::context::ContextEconomy>, HaiderError> {
         let envelopes = read_all(store, session_id).await?;
         let mut latest: Option<haider_protocol::context::ContextSavingsEvent> = None;
+        let mut last_conversation = None;
+        let mut last_output = None;
         for envelope in envelopes {
             let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
                 serde_json::from_value::<EventPayload>(envelope.payload)
@@ -261,13 +265,22 @@ impl PromptHistoryCompiler {
                     return Err(corrupt("equal context-savings coordinates disagree"));
                 }
             }
+            match event.layer {
+                haider_protocol::context::ContextSavingsLayer::Conversation => {
+                    last_conversation = Some(event.clone());
+                }
+                haider_protocol::context::ContextSavingsLayer::ToolOutput => {
+                    last_output = Some(event.clone());
+                }
+            }
             latest = Some(event);
         }
         Ok(
             latest.map(|event| haider_protocol::context::ContextEconomy {
                 cumulative_estimated_tokens_saved: event.session_cumulative_estimated_tokens_saved,
                 operation_count: event.session_operation_count,
-                last_event: Some(event),
+                last_event: last_conversation,
+                last_output_event: last_output,
             }),
         )
     }
@@ -3166,11 +3179,20 @@ struct RenderedJournal {
     current_user_start: Option<usize>,
 }
 
+/// Bounded, deterministic accumulator shared by live direct-shell completion
+/// and journal replay. It retains only the provider-visible head/tail while
+/// counting the complete observed UTF-8-lossy projection incrementally.
 #[derive(Default)]
-struct UserCommandOutput {
-    chunks: Vec<UserCommandOutputChunk>,
-    retained_bytes: usize,
+pub struct UserCommandOutput {
+    head: Vec<UserCommandOutputChunk>,
+    head_bytes: usize,
+    tail: VecDeque<UserCommandOutputChunk>,
+    tail_bytes: usize,
     total_bytes: u64,
+    full_labels_bytes: u64,
+    full_label_projection_content_bytes: u64,
+    full_last_stream: Option<OutputStream>,
+    full_text: Utf8LossyLengthCounter,
 }
 
 struct UserCommandOutputChunk {
@@ -3178,66 +3200,242 @@ struct UserCommandOutputChunk {
     bytes: Vec<u8>,
 }
 
+pub struct UserCommandOutputProjection {
+    pub output_preview: String,
+    pub output_truncated: bool,
+    pub output_lossy_utf8: bool,
+    pub output_bytes: u64,
+    pub savings: Option<OutputSavings>,
+}
+
+#[derive(Default)]
+struct Utf8LossyLengthCounter {
+    pending: Vec<u8>,
+    utf8_bytes: u64,
+    projection_content_bytes: u64,
+    lossy: bool,
+}
+
+fn provider_text_content_bytes(text: &str) -> u64 {
+    u64::try_from(haider_tools::provider_request_text_projection_bytes(text).saturating_sub(2))
+        .unwrap_or(u64::MAX)
+}
+
+impl Utf8LossyLengthCounter {
+    fn push(&mut self, bytes: &[u8]) {
+        let mut combined = Vec::with_capacity(self.pending.len().saturating_add(bytes.len()));
+        combined.append(&mut self.pending);
+        combined.extend_from_slice(bytes);
+        let mut unread = combined.as_slice();
+        while !unread.is_empty() {
+            match std::str::from_utf8(unread) {
+                Ok(text) => {
+                    self.utf8_bytes = self
+                        .utf8_bytes
+                        .saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+                    self.projection_content_bytes = self
+                        .projection_content_bytes
+                        .saturating_add(provider_text_content_bytes(text));
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    self.utf8_bytes = self
+                        .utf8_bytes
+                        .saturating_add(u64::try_from(valid).unwrap_or(u64::MAX));
+                    self.projection_content_bytes =
+                        self.projection_content_bytes
+                            .saturating_add(provider_text_content_bytes(&String::from_utf8_lossy(
+                                &unread[..valid],
+                            )));
+                    unread = &unread[valid..];
+                    if let Some(invalid) = error.error_len() {
+                        // U+FFFD occupies three UTF-8 bytes, matching
+                        // `String::from_utf8_lossy` used for the real preview.
+                        self.utf8_bytes = self.utf8_bytes.saturating_add(3);
+                        self.projection_content_bytes = self
+                            .projection_content_bytes
+                            .saturating_add(provider_text_content_bytes("�"));
+                        self.lossy = true;
+                        unread = &unread[invalid..];
+                    } else {
+                        self.pending.extend_from_slice(unread);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish_segment(&mut self) {
+        if !self.pending.is_empty() {
+            self.pending.clear();
+            self.utf8_bytes = self.utf8_bytes.saturating_add(3);
+            self.projection_content_bytes = self
+                .projection_content_bytes
+                .saturating_add(provider_text_content_bytes("�"));
+            self.lossy = true;
+        }
+    }
+}
+
 impl UserCommandOutput {
-    fn push(&mut self, stream: OutputStream, bytes: &[u8]) {
+    const HEAD_BYTES: usize = USER_COMMAND_OUTPUT_PREVIEW_BYTES / 4;
+    const TAIL_BYTES: usize = USER_COMMAND_OUTPUT_PREVIEW_BYTES - Self::HEAD_BYTES;
+
+    pub fn push(&mut self, stream: OutputStream, bytes: &[u8]) {
+        if self.full_last_stream != Some(stream) {
+            self.full_text.finish_segment();
+            let label = match (self.full_last_stream.is_none(), stream) {
+                (true, OutputStream::Stdout) => "[stdout]\n",
+                (true, OutputStream::Stderr) => "[stderr]\n",
+                (false, OutputStream::Stdout) => "\n[stdout]\n",
+                (false, OutputStream::Stderr) => "\n[stderr]\n",
+            };
+            self.full_labels_bytes = self
+                .full_labels_bytes
+                .saturating_add(u64::try_from(label.len()).unwrap_or(u64::MAX));
+            self.full_label_projection_content_bytes = self
+                .full_label_projection_content_bytes
+                .saturating_add(provider_text_content_bytes(label));
+            self.full_last_stream = Some(stream);
+        }
+        self.full_text.push(bytes);
         self.total_bytes = self
             .total_bytes
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        let remaining = USER_COMMAND_OUTPUT_PREVIEW_BYTES.saturating_sub(self.retained_bytes);
-        let retained = bytes.len().min(remaining);
-        if retained == 0 {
+        let head_remaining = Self::HEAD_BYTES.saturating_sub(self.head_bytes);
+        let head_len = bytes.len().min(head_remaining);
+        if head_len > 0 {
+            Self::push_chunk(&mut self.head, stream, &bytes[..head_len]);
+            self.head_bytes = self.head_bytes.saturating_add(head_len);
+        }
+        let tail = &bytes[head_len..];
+        if tail.is_empty() {
             return;
         }
-        if let Some(last) = self.chunks.last_mut()
-            && last.stream == stream
-        {
-            last.bytes.extend_from_slice(&bytes[..retained]);
+        let tail = if tail.len() > Self::TAIL_BYTES {
+            &tail[tail.len() - Self::TAIL_BYTES..]
         } else {
-            self.chunks.push(UserCommandOutputChunk {
-                stream,
-                bytes: bytes[..retained].to_vec(),
-            });
+            tail
+        };
+        self.tail.push_back(UserCommandOutputChunk {
+            stream,
+            bytes: tail.to_vec(),
+        });
+        self.tail_bytes = self.tail_bytes.saturating_add(tail.len());
+        while self.tail_bytes > Self::TAIL_BYTES {
+            let excess = self.tail_bytes.saturating_sub(Self::TAIL_BYTES);
+            let Some(front) = self.tail.front_mut() else {
+                self.tail_bytes = 0;
+                break;
+            };
+            if front.bytes.len() <= excess {
+                self.tail_bytes = self.tail_bytes.saturating_sub(front.bytes.len());
+                self.tail.pop_front();
+            } else {
+                front.bytes.drain(..excess);
+                self.tail_bytes = self.tail_bytes.saturating_sub(excess);
+            }
         }
-        self.retained_bytes = self.retained_bytes.saturating_add(retained);
     }
 
-    fn finish(self, failed: bool) -> (String, bool, bool, u64) {
+    fn push_chunk(chunks: &mut Vec<UserCommandOutputChunk>, stream: OutputStream, bytes: &[u8]) {
+        if let Some(last) = chunks.last_mut()
+            && last.stream == stream
+        {
+            last.bytes.extend_from_slice(bytes);
+        } else {
+            chunks.push(UserCommandOutputChunk {
+                stream,
+                bytes: bytes.to_vec(),
+            });
+        }
+    }
+
+    pub fn finish(
+        mut self,
+        failed: bool,
+        source_omitted_bytes_at_least: u64,
+        source_complete: bool,
+    ) -> UserCommandOutputProjection {
+        self.full_text.finish_segment();
+        let full_preview_bytes = self
+            .full_labels_bytes
+            .saturating_add(self.full_text.utf8_bytes);
+        let full_output_lossy_utf8 = self.full_text.lossy;
         let mut preview = String::new();
-        let mut truncated = self.total_bytes > self.retained_bytes as u64;
+        let retained_bytes = self.head_bytes.saturating_add(self.tail_bytes);
+        let mut truncated = self.total_bytes > retained_bytes as u64;
         let mut lossy_utf8 = false;
-        for (index, chunk) in self.chunks.into_iter().enumerate() {
+        for (index, chunk) in self.head.into_iter().chain(self.tail).enumerate() {
             let label = match (index, chunk.stream) {
                 (0, OutputStream::Stdout) => "[stdout]\n",
                 (0, OutputStream::Stderr) => "[stderr]\n",
                 (_, OutputStream::Stdout) => "\n[stdout]\n",
                 (_, OutputStream::Stderr) => "\n[stderr]\n",
             };
-            truncated |= !append_bounded_utf8(&mut preview, label);
+            preview.push_str(label);
             let decoded = String::from_utf8_lossy(&chunk.bytes);
             lossy_utf8 |= matches!(decoded, std::borrow::Cow::Owned(_));
-            truncated |= !append_bounded_utf8(&mut preview, &decoded);
+            preview.push_str(&decoded);
         }
         // E4 content law: the journal remains the raw command transcript.
         // Deterministic output adapters apply only while constructing the
         // provider-facing record from those raw bytes.
         let reduced = haider_tools::reduce_tool_output("shell_exec", &preview, failed);
         truncated |= reduced.text != preview;
-        (reduced.text, truncated, lossy_utf8, self.total_bytes)
+        lossy_utf8 |= full_output_lossy_utf8;
+        let retained_elided_bytes = self
+            .total_bytes
+            .saturating_sub(u64::try_from(retained_bytes).unwrap_or(u64::MAX));
+        let model_preview = if retained_elided_bytes > 0 || source_omitted_bytes_at_least > 0 {
+            let omitted_bytes = retained_elided_bytes.saturating_add(source_omitted_bytes_at_least);
+            truncated = true;
+            haider_tools::mark_text_elision(
+                &reduced.text,
+                USER_COMMAND_OUTPUT_PREVIEW_BYTES,
+                "user_command_output_model_boundary",
+                usize::try_from(omitted_bytes).unwrap_or(usize::MAX),
+                source_complete && reduced.text == preview,
+            )
+            .text
+        } else {
+            reduced.text
+        };
+        let changed = truncated
+            || u64::try_from(model_preview.len()).unwrap_or(u64::MAX) != full_preview_bytes;
+        let savings = changed.then(|| {
+            let input_bytes = 2_u64
+                .saturating_add(self.full_label_projection_content_bytes)
+                .saturating_add(self.full_text.projection_content_bytes)
+                .saturating_add(source_omitted_bytes_at_least);
+            let mut savings = OutputSavings::from_provider_request_bytes(
+                "user_command_output_model_boundary",
+                usize::try_from(input_bytes).unwrap_or(usize::MAX),
+                haider_tools::provider_request_text_projection_bytes(&model_preview),
+                usize::try_from(
+                    full_preview_bytes
+                        .saturating_add(source_omitted_bytes_at_least)
+                        .saturating_sub(u64::try_from(model_preview.len()).unwrap_or(u64::MAX)),
+                )
+                .unwrap_or(usize::MAX),
+                source_complete,
+            );
+            savings.retained_head_bytes = Some(u64::try_from(self.head_bytes).unwrap_or(u64::MAX));
+            savings.retained_tail_bytes = Some(u64::try_from(self.tail_bytes).unwrap_or(u64::MAX));
+            savings.source_omitted_bytes_at_least =
+                (source_omitted_bytes_at_least > 0).then_some(source_omitted_bytes_at_least);
+            savings
+        });
+        UserCommandOutputProjection {
+            output_preview: model_preview,
+            output_truncated: truncated,
+            output_lossy_utf8: lossy_utf8,
+            output_bytes: self.total_bytes,
+            savings,
+        }
     }
-}
-
-fn append_bounded_utf8(target: &mut String, value: &str) -> bool {
-    let remaining = USER_COMMAND_OUTPUT_PREVIEW_BYTES.saturating_sub(target.len());
-    if value.len() <= remaining {
-        target.push_str(value);
-        return true;
-    }
-    let mut end = remaining.min(value.len());
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    target.push_str(&value[..end]);
-    false
 }
 
 async fn compile_ancestry(
@@ -3409,11 +3607,12 @@ fn apply_structural_trim_events(
             };
             if let Some(event) = ContextSavingsEvent::try_from_extension_item(&item)
                 .map_err(|error| corrupt(format!("context-savings event is malformed: {error}")))?
+                && let Some((_, removed_tool_call_ids)) = event.conversation()
             {
                 selections.extend(
-                    event
-                        .removed_tool_call_ids
-                        .into_iter()
+                    removed_tool_call_ids
+                        .iter()
+                        .cloned()
                         .map(|call_id| (envelope.seq, call_id)),
                 );
             }
@@ -3437,11 +3636,12 @@ fn apply_structural_trim_events(
             };
             if let Some(event) = ContextSavingsEvent::try_from_extension_item(&item)
                 .map_err(|error| corrupt(format!("context-savings event is malformed: {error}")))?
+                && let Some((_, removed_tool_call_ids)) = event.conversation()
             {
                 selections.extend(
-                    event
-                        .removed_tool_call_ids
-                        .into_iter()
+                    removed_tool_call_ids
+                        .iter()
+                        .cloned()
                         .map(|call_id| (envelope.seq, call_id)),
                 );
             }
@@ -3573,6 +3773,7 @@ struct JournalFacts {
     partial_menus: HashMap<MenuId, (haider_protocol::ids::ItemId, String, u32)>,
     continued_partial_items: HashSet<haider_protocol::ids::ItemId>,
     user_command_origins: HashMap<haider_protocol::ids::ItemId, UserCommandOriginV1>,
+    user_command_savings: HashMap<haider_protocol::ids::ItemId, OutputSavings>,
 }
 
 impl JournalFactsIndex {
@@ -3688,6 +3889,23 @@ impl JournalFacts {
                 }
             }
             EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                if let Some(event) =
+                    ContextSavingsEvent::try_from_extension_item(item).map_err(|error| {
+                        corrupt(format!("context-savings event is malformed: {error}"))
+                    })?
+                    && let Some(savings) = event.tool_output()
+                    && savings.scope == "user_command_output_model_boundary"
+                    && let Some(source_item_id) = savings.source_item_id.as_deref()
+                {
+                    let source_item_id = ItemId::new(source_item_id);
+                    if self
+                        .user_command_savings
+                        .insert(source_item_id, savings.clone())
+                        .is_some()
+                    {
+                        return Err(corrupt("duplicate user-command context-savings event"));
+                    }
+                }
                 let origin =
                     UserCommandOriginV1::try_from_extension_item(item).map_err(|error| {
                         corrupt(format!("malformed user-command origin marker: {error}"))
@@ -3860,17 +4078,23 @@ fn render_journal_with_facts(
                 {
                     let output = user_command_outputs.remove(&item_id).unwrap_or_default();
                     let failed = status != haider_protocol::item::ToolStatus::Completed;
-                    let (output_preview, output_truncated, output_lossy_utf8, output_bytes) =
-                        output.finish(failed);
+                    let recorded_savings = facts.user_command_savings.get(&item_id);
+                    let source_omitted_bytes_at_least = recorded_savings
+                        .and_then(|savings| savings.source_omitted_bytes_at_least)
+                        .unwrap_or(0);
+                    let source_complete =
+                        recorded_savings.is_none_or(|savings| savings.omitted_bytes_exact);
+                    let output =
+                        output.finish(failed, source_omitted_bytes_at_least, source_complete);
                     messages.push(Message::user_command(UserCommandRecord {
                         call_id,
                         command,
                         status,
                         exit_code,
-                        output_preview,
-                        output_bytes,
-                        output_truncated,
-                        output_lossy_utf8,
+                        output_preview: output.output_preview,
+                        output_bytes: output.output_bytes,
+                        output_truncated: output.output_truncated,
+                        output_lossy_utf8: output.output_lossy_utf8,
                     }));
                 }
                 TurnItem::ToolCall {
@@ -4006,20 +4230,34 @@ pub fn task_event_notice(event: &TaskEventPayload) -> String {
                 TaskTerminalState::Failed { reason } => format!("failed: {reason}"),
                 TaskTerminalState::Killed => "was killed".into(),
             };
-            let truncation = if completed.full_output_unavailable {
+            let availability = if completed.full_output_unavailable {
                 " (full output unavailable; bounded tail retained below)"
             } else if completed.truncated {
                 " (truncated; full retained output in the task artifact)"
             } else {
                 ""
             };
-            let mut tail = completed.tail.as_str();
-            if tail.len() > TASK_TAIL_BYTES {
-                let mut end = TASK_TAIL_BYTES;
-                while !tail.is_char_boundary(end) {
-                    end -= 1;
-                }
-                tail = &tail[..end];
+            let mut tail = haider_tools::elide_text_head_tail(
+                &completed.tail,
+                TASK_TAIL_BYTES,
+                "background_task_tail_byte_cap",
+            )
+            .map_or_else(|| completed.tail.clone(), |elided| elided.text);
+            let omitted_bytes_at_least = completed
+                .output_bytes
+                .saturating_sub(u64::try_from(completed.tail.len()).unwrap_or(u64::MAX));
+            if omitted_bytes_at_least > 0
+                || completed.truncated
+                || completed.full_output_unavailable
+            {
+                tail = haider_tools::mark_text_elision(
+                    &tail,
+                    TASK_TAIL_BYTES,
+                    "background_task_notice",
+                    usize::try_from(omitted_bytes_at_least).unwrap_or(usize::MAX),
+                    false,
+                )
+                .text;
             }
             let tail_section = if tail.trim().is_empty() {
                 String::new()
@@ -4033,7 +4271,7 @@ pub fn task_event_notice(event: &TaskEventPayload) -> String {
                 disposition,
                 completed.elapsed_ms / 1000,
                 completed.output_bytes,
-                truncation,
+                availability,
                 tail_section,
             )
         }

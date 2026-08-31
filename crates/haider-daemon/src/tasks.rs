@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Bounded command summary carried by the started fact (display only).
-const TASK_COMMAND_SUMMARY_CHARS: usize = 200;
+const TASK_COMMAND_SUMMARY_BYTES: usize = 512;
 /// Bounded failure-reason detail carried by a failed completion.
 const TASK_FAILURE_REASON_CHARS: usize = 400;
 /// One `task_output` cursor read returns at most this many bytes.
@@ -487,7 +487,7 @@ impl TaskFacade {
         let started = TaskStarted {
             task: task.clone(),
             name: name.clone(),
-            command: bounded_chars(&command, TASK_COMMAND_SUMMARY_CHARS),
+            command: bounded_task_command(&command),
             pid,
             started_at_ms,
         };
@@ -1269,6 +1269,15 @@ fn unknown_task_result(task_id: &str) -> BoundedResult {
 
 fn bounded_chars(text: &str, cap: usize) -> String {
     text.chars().take(cap).collect()
+}
+
+fn bounded_task_command(command: &str) -> String {
+    haider_tools::elide_text_head_tail(
+        command,
+        TASK_COMMAND_SUMMARY_BYTES,
+        "background_task_command",
+    )
+    .map_or_else(|| command.to_owned(), |elided| elided.text)
 }
 
 fn missing_task_output_backing(task: &TaskId) -> ToolError {

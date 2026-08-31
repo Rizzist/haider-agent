@@ -449,6 +449,7 @@ fn compaction_row_is_gold_and_honest() {
                 summary_artifact: ArtifactRef::new("blake3:abc"),
                 tokens_before: None,
                 tokens_after: None,
+                tokens_estimated: false,
             },
         },
     ))));

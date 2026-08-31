@@ -1,8 +1,8 @@
 #![allow(clippy::expect_used)]
 
 use crate::project_instructions::{
-    MAX_PROJECT_INSTRUCTION_FILE_BYTES, MAX_PROJECT_INSTRUCTION_TOTAL_BYTES, TRUNCATION_MARKER,
-    load,
+    MAX_PROJECT_INSTRUCTION_ANCESTORS, MAX_PROJECT_INSTRUCTION_FILE_BYTES,
+    MAX_PROJECT_INSTRUCTION_TOTAL_BYTES, load,
 };
 use crate::session_hub::{SessionHub, SessionHubConfig};
 use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
@@ -452,8 +452,7 @@ async fn nearest_instructions_compose_last_and_haider_wins_within_directory() {
 #[tokio::test]
 async fn per_file_cap_truncates_at_utf8_boundary_with_marker() {
     let root = tempfile::tempdir().expect("workspace");
-    let prefix_budget = MAX_PROJECT_INSTRUCTION_FILE_BYTES - TRUNCATION_MARKER.len();
-    let mut source = "a".repeat(prefix_budget.saturating_sub(1));
+    let mut source = "a".repeat(MAX_PROJECT_INSTRUCTION_FILE_BYTES.saturating_sub(1));
     source.push('€');
     source.push_str(&"z".repeat(128));
     std::fs::write(root.path().join("HAIDER.md"), source).expect("oversized instructions");
@@ -466,7 +465,11 @@ async fn per_file_cap_truncates_at_utf8_boundary_with_marker() {
         .find(|file| file.path.ends_with("HAIDER.md"))
         .expect("loaded HAIDER");
     assert!(file.truncated);
-    assert!(file.text.ends_with(TRUNCATION_MARKER));
+    assert!(file.text.contains("\"haider_elision_v1\""));
+    assert!(
+        file.text
+            .contains("\"scope\":\"project_instruction_file_cap\"")
+    );
     assert!(file.text.len() <= MAX_PROJECT_INSTRUCTION_FILE_BYTES);
     assert_eq!(
         file.digest,
@@ -525,6 +528,142 @@ async fn total_cap_preserves_nearest_files_and_composes_them_last() {
             .sum::<usize>()
             <= MAX_PROJECT_INSTRUCTION_TOTAL_BYTES
     );
+}
+
+#[tokio::test]
+async fn exhausted_aggregate_budget_marks_and_counts_the_farther_omission() {
+    let root = tempfile::tempdir().expect("workspace");
+    let parent = root.path().join("parent");
+    let child = parent.join("child");
+    std::fs::create_dir_all(&child).expect("nested workspace");
+    std::fs::write(root.path().join("HAIDER.md"), vec![b'r'; 200]).expect("farther instructions");
+    std::fs::write(parent.join("HAIDER.md"), vec![b'p'; 48 * 1024]).expect("parent instructions");
+    std::fs::write(child.join("HAIDER.md"), vec![b'c'; 48 * 1024]).expect("child instructions");
+
+    let loaded = load(&canonical_utf8(&child))
+        .await
+        .expect("loaded instructions");
+    let marker = loaded
+        .files()
+        .iter()
+        .find(|file| file.path == "[project instruction aggregate elision]")
+        .expect("aggregate elision marker");
+    assert!(marker.truncated);
+    assert!(
+        marker
+            .text
+            .contains("\"scope\":\"project_instruction_aggregate_cap\"")
+    );
+    assert!(marker.text.contains("\"omitted_bytes_exact\":false"));
+    let marker_json = marker
+        .text
+        .lines()
+        .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .expect("machine marker JSON");
+    assert!(
+        marker_json["haider_elision_v1"]["omitted_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 48 * 1024)
+    );
+    assert!(
+        loaded
+            .files()
+            .iter()
+            .any(|file| file.path.ends_with("child/HAIDER.md"))
+    );
+    assert!(
+        loaded
+            .files()
+            .iter()
+            .all(|file| !file.path.ends_with("parent/HAIDER.md"))
+    );
+    assert!(
+        loaded
+            .files()
+            .iter()
+            .map(|file| file.text.len())
+            .sum::<usize>()
+            <= MAX_PROJECT_INSTRUCTION_TOTAL_BYTES
+    );
+}
+
+#[tokio::test]
+async fn partial_aggregate_remainder_that_cannot_fit_a_file_marker_is_not_silent() {
+    let root = tempfile::tempdir().expect("workspace");
+    let grand = root.path().join("grand");
+    let parent = grand.join("parent");
+    let child = parent.join("child");
+    std::fs::create_dir_all(&child).expect("nested workspace");
+    std::fs::write(root.path().join("HAIDER.md"), "farther instruction")
+        .expect("farther instructions");
+    std::fs::write(grand.join("HAIDER.md"), vec![b'g'; 2_300]).expect("grand instructions");
+    std::fs::write(parent.join("HAIDER.md"), vec![b'p'; 48_000]).expect("parent instructions");
+    std::fs::write(child.join("HAIDER.md"), vec![b'c'; 48_000]).expect("child instructions");
+
+    let loaded = load(&canonical_utf8(&child))
+        .await
+        .expect("loaded instructions");
+    let marker = loaded
+        .files()
+        .iter()
+        .find(|file| file.path == "[project instruction aggregate elision]")
+        .expect("aggregate elision marker");
+    assert!(
+        marker
+            .text
+            .contains("\"scope\":\"project_instruction_aggregate_cap\"")
+    );
+    assert!(marker.text.contains("\"omitted_bytes_exact\":false"));
+    assert!(
+        loaded
+            .files()
+            .iter()
+            .map(|file| file.text.len())
+            .sum::<usize>()
+            <= MAX_PROJECT_INSTRUCTION_TOTAL_BYTES
+    );
+}
+
+#[tokio::test]
+async fn ancestor_depth_cap_reaches_the_prompt_with_a_counted_machine_marker() {
+    let root = tempfile::tempdir().expect("workspace");
+    let mut deepest = root.path().to_path_buf();
+    for _ in 0..=MAX_PROJECT_INSTRUCTION_ANCESTORS {
+        deepest.push("d");
+        std::fs::create_dir(&deepest).expect("nested directory");
+    }
+    let canonical = canonical_utf8(&deepest);
+
+    let first = load(&canonical).await.expect("depth marker");
+    let second = load(&canonical).await.expect("deterministic depth marker");
+    assert!(first == second);
+    let marker = first
+        .files()
+        .iter()
+        .find(|file| file.path == "[project instruction ancestor-depth elision]")
+        .expect("ancestor-depth elision marker");
+    assert!(
+        marker
+            .text
+            .contains("\"scope\":\"project_instruction_ancestor_depth_cap\"")
+    );
+    assert!(marker.text.contains("\"omitted_items_at_least\":1"));
+    assert!(
+        marker
+            .text
+            .contains("\"omitted_item_unit\":\"ancestor_directory\"")
+    );
+    assert!(marker.text.contains("\"omitted_bytes_exact\":false"));
+    assert!(
+        first
+            .files()
+            .iter()
+            .map(|file| file.text.len())
+            .sum::<usize>()
+            <= MAX_PROJECT_INSTRUCTION_TOTAL_BYTES
+    );
+    let prompt = SystemPromptBuilder::build(&metadata(canonical), &first.prompt_entries());
+    assert!(prompt.contains("\"scope\":\"project_instruction_ancestor_depth_cap\""));
 }
 
 /// MUTATION CHECK: canonicalize through a symlinked parent and continue the

@@ -38,9 +38,9 @@ pub use actor::{
     TurnOutcome, VISION_IMAGE_ESTIMATE_TOKENS, append_peer_message_to_provider_tail,
     build_cache_request_diagnostic, build_context_accounting, classify_cache_request,
     compaction_guard_tripped, context_soft_threshold_tokens, context_tier_threshold_tokens,
-    estimate_provider_request_input_tokens, peer_message_for_provider,
-    presentation_for_haider_error, retry_backoff_ms, retry_jittered_backoff_ms,
-    sanitized_failure_message,
+    estimate_provider_request_bytes_div_four, estimate_provider_request_input_tokens,
+    peer_message_for_provider, presentation_for_haider_error, retry_backoff_ms,
+    retry_jittered_backoff_ms, sanitized_failure_message,
 };
 pub use fake_store::MemoryStore;
 pub use haider_protocol::interaction::{
@@ -83,7 +83,8 @@ pub use haider_store::{
 };
 pub use prompt_history::{
     ArtifactReader, CompiledPromptProjection, PromptCompactionPlanRequest, PromptHistoryCache,
-    PromptHistoryCompiler, USER_COMMAND_OUTPUT_PREVIEW_BYTES, task_event_notice,
+    PromptHistoryCompiler, USER_COMMAND_OUTPUT_PREVIEW_BYTES, UserCommandOutput,
+    UserCommandOutputProjection, task_event_notice,
 };
 pub use recovery::{RecoveryReport, effect_recovery_evidence, reconcile_dispatched_effects};
 pub use sqlite_store::{

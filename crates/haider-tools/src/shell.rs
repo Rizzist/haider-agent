@@ -7,6 +7,10 @@
 
 use crate::process::ProcessExec;
 use crate::{ToolError, ToolResult};
+use haider_protocol::context::{
+    ContextSavingsMeasurement, OutputSavings, elide_text_head_tail,
+    provider_request_text_projection_bytes,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
@@ -37,6 +41,12 @@ pub struct ReducedToolOutput {
     pub adapter: OutputAdapter,
     pub before_tokens: usize,
     pub after_tokens: usize,
+    /// Provider-neutral estimate, never a model-tokenizer count.
+    pub saved_tokens_estimate: usize,
+    pub measurement: ContextSavingsMeasurement,
+    /// Exact byte accounting paired with the estimate whenever bytes were
+    /// removed or transformed for the model boundary.
+    pub savings: Option<OutputSavings>,
 }
 
 /// Approximate provider token charge used by the fixture report. This is a
@@ -46,13 +56,108 @@ pub const fn estimated_tokens(bytes: usize) -> usize {
     bytes.saturating_add(3) / 4
 }
 
+/// The shared savings estimate for one provider-bound text projection.
+#[must_use]
+pub fn estimated_text_tokens(text: &str) -> usize {
+    estimated_tokens(provider_request_text_projection_bytes(text))
+}
+
+/// Adds a machine-readable marker for a semantic reduction. `input` is the
+/// original model candidate and `selected` is the adapter-selected content.
+/// The omitted byte delta is exact only when `selected` is a verbatim subset.
+fn account_elision(
+    input: &str,
+    selected: &str,
+    max_bytes: usize,
+    scope: &str,
+    omitted_bytes_exact: bool,
+    split_selected: bool,
+) -> haider_protocol::context::ElidedText {
+    let input_projection_bytes = provider_request_text_projection_bytes(input);
+    let mut savings = OutputSavings::from_provider_request_bytes(
+        scope,
+        input_projection_bytes,
+        provider_request_text_projection_bytes(selected),
+        input.len().saturating_sub(selected.len()),
+        omitted_bytes_exact,
+    );
+    let mut result = String::new();
+    for _ in 0..32 {
+        let marker = elision_marker(&savings);
+        let content_budget = max_bytes.saturating_sub(marker.len());
+        let selected_budget = content_budget.min(selected.len());
+        let head_budget = if split_selected || selected.len() > content_budget {
+            selected_budget / 4
+        } else {
+            selected_budget
+        };
+        let head = utf8_prefix(selected, head_budget);
+        let tail_budget = selected_budget.saturating_sub(head.len());
+        let tail_start = utf8_suffix_start(selected, tail_budget);
+        let tail_start = tail_start.max(head.len());
+        let tail = &selected[tail_start..];
+        let retained = head.len().saturating_add(tail.len());
+        result.clear();
+        result.push_str(head);
+        result.push_str(&marker);
+        result.push_str(tail);
+        let mut next = OutputSavings::from_provider_request_bytes(
+            scope,
+            input_projection_bytes,
+            provider_request_text_projection_bytes(&result),
+            input.len().saturating_sub(retained),
+            omitted_bytes_exact,
+        );
+        next.retained_head_bytes = Some(u64::try_from(head.len()).unwrap_or(u64::MAX));
+        next.retained_tail_bytes = Some(u64::try_from(tail.len()).unwrap_or(u64::MAX));
+        let stable = next == savings;
+        savings = next;
+        if stable {
+            break;
+        }
+    }
+    let marker = elision_marker(&savings);
+    let content_budget = max_bytes.saturating_sub(marker.len());
+    let selected_budget = content_budget.min(selected.len());
+    let head_budget = if split_selected || selected.len() > content_budget {
+        selected_budget / 4
+    } else {
+        selected_budget
+    };
+    let head = utf8_prefix(selected, head_budget);
+    let tail_start =
+        utf8_suffix_start(selected, selected_budget.saturating_sub(head.len())).max(head.len());
+    let tail = &selected[tail_start..];
+    result.clear();
+    result.push_str(head);
+    result.push_str(&marker);
+    result.push_str(tail);
+    haider_protocol::context::ElidedText {
+        text: result,
+        savings,
+    }
+}
+
+fn elision_marker(savings: &OutputSavings) -> String {
+    let payload = serde_json::json!({
+        "haider_elision_v1": {
+            "scope": savings.scope,
+            "omitted_bytes": savings.omitted_bytes,
+            "omitted_bytes_exact": savings.omitted_bytes_exact,
+            "retained_head_bytes": savings.retained_head_bytes,
+            "retained_tail_bytes": savings.retained_tail_bytes,
+        }
+    });
+    format!("\n{}\n", payload)
+}
+
 /// Detects and reduces bounded process output without a model round trip.
 /// Reapplying it to the same bytes always produces byte-identical output.
 #[must_use]
 pub fn reduce_tool_output(tool: &str, output: &str, failed: bool) -> ReducedToolOutput {
     let stripped = strip_ansi(output);
     let adapter = detect_output_adapter(tool, &stripped);
-    let reduced = match adapter {
+    let selected = match adapter {
         OutputAdapter::RustCompiler => reduce_rust_compiler(&stripped),
         OutputAdapter::Test => reduce_test_output(&stripped, failed),
         OutputAdapter::GithubJson => reduce_github_json(&stripped),
@@ -62,12 +167,70 @@ pub fn reduce_tool_output(tool: &str, output: &str, failed: bool) -> ReducedTool
         OutputAdapter::Directory => reduce_directory_output(&stripped),
         OutputAdapter::Generic => reduce_generic_output(&stripped, failed),
     };
-    let reduced = bound_reduced_output(&reduced, failed);
+    let semantic_elision = (selected != stripped).then(|| {
+        let scope = format!("process_output_adapter:{}", output_adapter_name(adapter));
+        account_elision(
+            output,
+            &selected,
+            REDUCED_TOOL_OUTPUT_MAX_BYTES,
+            &scope,
+            false,
+            false,
+        )
+    });
+    // A semantic adapter is optional: if its required marker would make the
+    // model view no smaller, retain the stripped source instead. ANSI removal
+    // is still marked because those bytes really were elided.
+    let semantic_elision =
+        semantic_elision.filter(|elided| output != stripped || elided.text.len() < stripped.len());
+    let selected = if semantic_elision.is_some() {
+        selected
+    } else {
+        stripped.clone()
+    };
+    let ansi_elision = (semantic_elision.is_none() && output != stripped).then(|| {
+        account_elision(
+            output,
+            &stripped,
+            REDUCED_TOOL_OUTPUT_MAX_BYTES,
+            "process_output_ansi_strip",
+            true,
+            false,
+        )
+    });
+    let elided = semantic_elision.or(ansi_elision).or_else(|| {
+        elide_text_head_tail(
+            &selected,
+            REDUCED_TOOL_OUTPUT_MAX_BYTES,
+            "process_output_byte_cap",
+        )
+    });
+    let reduced = elided
+        .as_ref()
+        .map_or_else(|| selected.clone(), |elided| elided.text.clone());
+    let before_tokens = estimated_text_tokens(output);
+    let after_tokens = estimated_text_tokens(&reduced);
     ReducedToolOutput {
         text: reduced.clone(),
         adapter,
-        before_tokens: estimated_tokens(output.len()),
-        after_tokens: estimated_tokens(reduced.len()),
+        before_tokens,
+        after_tokens,
+        saved_tokens_estimate: before_tokens.saturating_sub(after_tokens),
+        measurement: ContextSavingsMeasurement::ProviderRequestBytesDivFourV1,
+        savings: elided.map(|elided| elided.savings),
+    }
+}
+
+const fn output_adapter_name(adapter: OutputAdapter) -> &'static str {
+    match adapter {
+        OutputAdapter::RustCompiler => "rust_compiler",
+        OutputAdapter::Test => "test",
+        OutputAdapter::GithubJson => "github_json",
+        OutputAdapter::Git => "git",
+        OutputAdapter::PackageManager => "package_manager",
+        OutputAdapter::StackTrace => "stack_trace",
+        OutputAdapter::Directory => "directory",
+        OutputAdapter::Generic => "generic",
     }
 }
 
@@ -235,9 +398,7 @@ fn reduce_test_output(input: &str, failed: bool) -> String {
                     .collect(),
             );
             let marker = "-- failures + final 20 lines (verbatim) --\n";
-            if estimated_tokens(marker.len().saturating_add(body.len()))
-                < estimated_tokens(input.len())
-            {
+            if estimated_text_tokens(&format!("{marker}{body}")) < estimated_text_tokens(input) {
                 return format!("{marker}{body}");
             }
             return body;
@@ -328,29 +489,52 @@ fn reduce_git_output(input: &str) -> String {
     }
     let lines = input.lines().collect::<Vec<_>>();
     let mut keep = vec![false; lines.len()];
-    let mut changed_per_file = 0usize;
     let mut capped_files = 0usize;
-    for (index, line) in lines.iter().enumerate() {
-        if line.starts_with("diff --git ") || line.starts_with("commit ") {
-            changed_per_file = 0;
-            keep[index] = true;
-            continue;
-        }
-        if line.starts_with("@@") || line.starts_with("--- ") || line.starts_with("+++ ") {
-            keep[index] = true;
-        }
-        if (line.starts_with('+') && !line.starts_with("+++"))
-            || (line.starts_with('-') && !line.starts_with("---"))
-        {
-            if changed_per_file < 200 {
-                let start = index.saturating_sub(3);
-                let end = index.saturating_add(3).min(lines.len().saturating_sub(1));
-                keep[start..=end].fill(true);
+    let mut starts = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| line.starts_with("diff --git ").then_some(index))
+        .collect::<Vec<_>>();
+    if starts.first().copied() != Some(0) {
+        starts.insert(0, 0);
+    }
+    starts.push(lines.len());
+    for bounds in starts.windows(2) {
+        let file_start = bounds[0];
+        let file_end = bounds[1];
+        for index in file_start..file_end {
+            let line = lines[index];
+            if line.starts_with("diff --git ")
+                || line.starts_with("commit ")
+                || line.starts_with("@@")
+                || line.starts_with("--- ")
+                || line.starts_with("+++ ")
+            {
+                keep[index] = true;
             }
-            changed_per_file = changed_per_file.saturating_add(1);
-            if changed_per_file == 201 {
-                capped_files = capped_files.saturating_add(1);
-            }
+        }
+        let changed = (file_start..file_end)
+            .filter(|index| {
+                let line = lines[*index];
+                (line.starts_with('+') && !line.starts_with("+++"))
+                    || (line.starts_with('-') && !line.starts_with("---"))
+            })
+            .collect::<Vec<_>>();
+        let selected = if changed.len() > 200 {
+            capped_files = capped_files.saturating_add(1);
+            changed
+                .iter()
+                .take(50)
+                .chain(changed.iter().rev().take(150))
+                .copied()
+                .collect::<Vec<_>>()
+        } else {
+            changed
+        };
+        for index in selected {
+            let context_start = index.saturating_sub(3).max(file_start);
+            let context_end = index.saturating_add(3).min(file_end.saturating_sub(1));
+            keep[context_start..=context_end].fill(true);
         }
     }
     let mut output = lines
@@ -395,24 +579,33 @@ fn reduce_package_output(input: &str) -> String {
 }
 
 fn reduce_stack_trace(input: &str) -> String {
-    let mut frames = 0usize;
-    let kept = input
-        .lines()
-        .filter(|line| {
-            let lower = line.to_ascii_lowercase();
-            if lower.contains("caused by:")
-                || lower.contains("exception")
-                || lower.contains("error")
-            {
-                return true;
-            }
-            if is_stack_frame(line) && frames < 12 {
-                frames = frames.saturating_add(1);
-                return true;
-            }
-            false
-        })
-        .map(ToOwned::to_owned)
+    let lines = input.lines().collect::<Vec<_>>();
+    let frames = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| is_stack_frame(line).then_some(index))
+        .collect::<Vec<_>>();
+    let mut keep = vec![false; lines.len()];
+    for (index, line) in lines.iter().enumerate() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("caused by:") || lower.contains("exception") || lower.contains("error") {
+            keep[index] = true;
+        }
+    }
+    if frames.len() <= 12 {
+        for index in frames {
+            keep[index] = true;
+        }
+    } else {
+        for index in frames.iter().take(4).chain(frames.iter().rev().take(8)) {
+            keep[*index] = true;
+        }
+    }
+    let kept = lines
+        .into_iter()
+        .zip(keep)
+        .filter(|(_, keep)| *keep)
+        .map(|(line, _)| line.to_owned())
         .collect();
     join_output_lines(kept)
 }
@@ -482,28 +675,6 @@ fn reduce_directory_output(input: &str) -> String {
             .map(|(name, count)| format!("{name}/: {count} paths collapsed")),
     );
     join_output_lines(first)
-}
-
-fn bound_reduced_output(input: &str, failed: bool) -> String {
-    if input.len() <= REDUCED_TOOL_OUTPUT_MAX_BYTES {
-        return input.to_owned();
-    }
-    let marker = "\n[… output adapter byte cap reached; raw transcript in artifact …]\n";
-    if failed {
-        let tail_budget = REDUCED_TOOL_OUTPUT_MAX_BYTES / 2;
-        let tail_start = utf8_suffix_start(input, tail_budget);
-        let prefix_budget = REDUCED_TOOL_OUTPUT_MAX_BYTES
-            .saturating_sub(input.len().saturating_sub(tail_start))
-            .saturating_sub(marker.len());
-        let mut output = utf8_prefix(input, prefix_budget).to_owned();
-        output.push_str(marker);
-        output.push_str(&input[tail_start..]);
-        return output;
-    }
-    let prefix_budget = REDUCED_TOOL_OUTPUT_MAX_BYTES.saturating_sub(marker.len());
-    let mut output = utf8_prefix(input, prefix_budget).to_owned();
-    output.push_str(marker);
-    output
 }
 
 fn utf8_prefix(input: &str, max_bytes: usize) -> &str {

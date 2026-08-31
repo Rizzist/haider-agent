@@ -24,6 +24,7 @@ use crate::{ProviderError, ProviderErrorKind};
 pub const WEB_FETCH_MAX_REDIRECTS: usize = 5;
 /// Hard cap on the text handed back to the tool result.
 pub const WEB_FETCH_OUTPUT_CAP_BYTES: usize = 96 * 1024;
+const WEB_FETCH_MIN_OUTPUT_CAP_BYTES: usize = 512;
 /// Hard cap on raw bytes read off the wire before reduction.
 const WEB_FETCH_SOURCE_CAP_BYTES: usize = 4 * 1024 * 1024;
 /// Max nested DROP_CONTENT elements tracked at once (H2). A closing tag scans
@@ -414,10 +415,15 @@ async fn fetch_public_url_inner(
         .map_err(|error| refused(format!("web_fetch URL does not parse: {error}")))?;
     let output_cap = max_bytes
         .and_then(|bytes| usize::try_from(bytes).ok())
-        .filter(|bytes| *bytes > 0)
+        .filter(|bytes| *bytes >= WEB_FETCH_MIN_OUTPUT_CAP_BYTES)
         .map_or(WEB_FETCH_OUTPUT_CAP_BYTES, |bytes| {
             bytes.min(WEB_FETCH_OUTPUT_CAP_BYTES)
         });
+    if max_bytes.is_some_and(|bytes| bytes < WEB_FETCH_MIN_OUTPUT_CAP_BYTES as u64) {
+        return Err(refused(format!(
+            "web_fetch max_bytes must be at least {WEB_FETCH_MIN_OUTPUT_CAP_BYTES} so a truncation marker fits"
+        )));
+    }
     // H1 downgrade fence: once the chain's FIRST hop is a public host, no
     // later hop may be redirected onto loopback/private/link-local. `None`
     // until the origin is classified on hop 0.
@@ -527,13 +533,7 @@ async fn fetch_public_url_inner(
         } else {
             String::from_utf8_lossy(&bytes).into_owned()
         };
-        let (text, output_truncated) = cap_output(text, output_cap);
-        let truncated = source_truncated || output_truncated;
-        let text = if truncated {
-            format!("{text}\n[web_fetch: output truncated at {output_cap} bytes]")
-        } else {
-            text
-        };
+        let (text, truncated) = cap_output(text, output_cap, source_truncated);
         let outcome = WebFetchOutcome {
             final_url: current.to_string(),
             content_type,
@@ -851,18 +851,94 @@ async fn within_fetch_deadline<F: std::future::Future>(
         })
 }
 
-/// Cuts `text` at the byte cap on a character boundary.
-fn cap_output(text: String, cap: usize) -> (String, bool) {
-    if text.len() <= cap {
+/// Keeps a 25% head / 75% tail within `cap`, with an inline JSON marker. A
+/// source-cap marker uses a lower bound because bytes not read from the wire
+/// cannot be tokenized or reduced honestly.
+fn cap_output(text: String, cap: usize, source_truncated: bool) -> (String, bool) {
+    if text.len() <= cap && !source_truncated {
         return (text, false);
     }
-    let mut cut = cap;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
+    let source_omitted_at_least = usize::from(source_truncated);
+    let input_bytes = text.len();
+    let mut retained_head = 0usize;
+    let mut retained_tail = 0usize;
+    let mut output_bytes = 0usize;
+    for _ in 0..32 {
+        let omitted_bytes = input_bytes
+            .saturating_sub(retained_head.saturating_add(retained_tail))
+            .saturating_add(source_omitted_at_least);
+        let marker = web_fetch_elision_marker(WebFetchElisionMarker {
+            omitted_bytes,
+            omitted_bytes_exact: !source_truncated,
+            retained_head_bytes: retained_head,
+            retained_tail_bytes: retained_tail,
+        });
+        let content_budget = cap.saturating_sub(marker.len());
+        let head = utf8_prefix_len(&text, content_budget / 4);
+        let tail = utf8_suffix_len(&text, content_budget.saturating_sub(head));
+        let tail = tail.min(text.len().saturating_sub(head));
+        let next_output_bytes = head.saturating_add(marker.len()).saturating_add(tail);
+        if (head, tail, next_output_bytes) == (retained_head, retained_tail, output_bytes) {
+            break;
+        }
+        retained_head = head;
+        retained_tail = tail;
+        output_bytes = next_output_bytes;
     }
-    let mut text = text;
-    text.truncate(cut);
-    (text, true)
+    let omitted_bytes = input_bytes
+        .saturating_sub(retained_head.saturating_add(retained_tail))
+        .saturating_add(source_omitted_at_least);
+    let marker = web_fetch_elision_marker(WebFetchElisionMarker {
+        omitted_bytes,
+        omitted_bytes_exact: !source_truncated,
+        retained_head_bytes: retained_head,
+        retained_tail_bytes: retained_tail,
+    });
+    let tail_start = text.len().saturating_sub(retained_tail).max(retained_head);
+    let mut output = String::with_capacity(cap);
+    output.push_str(&text[..retained_head]);
+    output.push_str(&marker);
+    output.push_str(&text[tail_start..]);
+    (output, true)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WebFetchElisionMarker {
+    omitted_bytes: usize,
+    omitted_bytes_exact: bool,
+    retained_head_bytes: usize,
+    retained_tail_bytes: usize,
+}
+
+fn web_fetch_elision_marker(marker: WebFetchElisionMarker) -> String {
+    format!(
+        "\n{}\n",
+        serde_json::json!({
+            "haider_elision_v1": {
+                "scope": "web_fetch_output_cap",
+                "omitted_bytes": marker.omitted_bytes,
+                "omitted_bytes_exact": marker.omitted_bytes_exact,
+                "retained_head_bytes": marker.retained_head_bytes,
+                "retained_tail_bytes": marker.retained_tail_bytes,
+            }
+        })
+    )
+}
+
+fn utf8_prefix_len(text: &str, max_bytes: usize) -> usize {
+    let mut end = text.len().min(max_bytes);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+fn utf8_suffix_len(text: &str, max_bytes: usize) -> usize {
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text.len().saturating_sub(start)
 }
 
 /// Reduces an HTML document to readable text (decision 5): script/style/nav

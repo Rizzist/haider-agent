@@ -47,7 +47,9 @@ fn count_budget_drops_the_oldest_prefix_and_keeps_durable_source_unchanged() {
     assert_eq!(tool_image(&durable[0]).1.len(), 1);
     let (oldest_preview, oldest_images) = tool_image(&projected[0]);
     assert!(oldest_images.is_empty());
-    assert!(oldest_preview.contains("oldest first"));
+    assert!(oldest_preview.contains("\"haider_elision_v1\""));
+    assert!(oldest_preview.contains("\"scope\":\"tool_result_image_budget\""));
+    assert!(oldest_preview.contains("\"omitted_images\":1"));
     assert!(oldest_preview.contains("blake3:image-0"));
     let retained = projected
         .iter()
@@ -133,6 +135,8 @@ fn same_result_cutoff_and_placeholder_labels_are_hard_bounded() {
     let (preview, images) = tool_image(&unsupported[0]);
     assert!(images.is_empty());
     assert!(preview.len() < 512);
+    assert!(preview.contains("\"haider_elision_v1\""));
+    assert!(preview.contains("\"scope\":\"tool_result_image_capability_degradation\""));
     assert!(!preview.contains(control_artifact));
     assert!(!preview.contains("\n[forged-context]"));
 }

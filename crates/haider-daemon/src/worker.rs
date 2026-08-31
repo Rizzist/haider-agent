@@ -71,9 +71,10 @@ use haider_core::{
     ProviderPairSwitchCommitter, ProviderViewAppendRequest, RequestInputCheckpoint,
     SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks, StoreHandle,
     SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
-    ToolDispatchResult, ToolDispatcher, TurnHandle, build_cache_request_diagnostic,
-    build_context_accounting, classify_cache_request, context_soft_threshold_tokens,
-    effect_recovery_evidence, estimate_provider_request_input_tokens,
+    ToolDispatchResult, ToolDispatcher, TurnHandle, UserCommandOutput,
+    build_cache_request_diagnostic, build_context_accounting, classify_cache_request,
+    context_soft_threshold_tokens, effect_recovery_evidence,
+    estimate_provider_request_bytes_div_four, estimate_provider_request_input_tokens,
     presentation_for_haider_error, sanitized_failure_message,
 };
 use haider_protocol::agent::Grant;
@@ -81,7 +82,9 @@ use haider_protocol::cache::{
     CacheEpochTransitionReason, CacheEpochTransitionV1, CacheRequestAttemptV1,
     ProviderViewAttemptV1, ProviderViewBlobV1, ProviderViewLedgerV1,
 };
-use haider_protocol::context::{ContextCompactionTier, ContextFootprint, ContextFootprintTruth};
+use haider_protocol::context::{
+    ContextCompactionTier, ContextFootprint, ContextFootprintTruth, OutputSavings,
+};
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase, FileFreshness,
     WorkspaceMutation,
@@ -873,11 +876,10 @@ impl ContextCompactor for DaemonContextCompactor {
             latest_compaction_summary_end,
             economy_before,
         } = request;
-        let replaced_projection_tokens = estimate_provider_request_input_tokens(
+        let replaced_projection_tokens = estimate_provider_request_bytes_div_four(
             &covered_messages,
             &self.post_compaction_system_prompt,
             self.post_compaction_tools.as_ref(),
-            &attachments,
         );
         // The first summary must replay the actor's exact provider projection:
         // it already contains provider-bound attachment resolution and any
@@ -1344,11 +1346,10 @@ impl ContextCompactor for DaemonContextCompactor {
         // not the expanded original-journal source used to author the new
         // brief; counting the latter would save the same tokens twice.
         let tokens_before = replaced_projection_tokens;
-        let tokens_after = estimate_provider_request_input_tokens(
+        let tokens_after = estimate_provider_request_bytes_div_four(
             &[Message::user_text(summary.clone())],
             &self.post_compaction_system_prompt,
             self.post_compaction_tools.as_ref(),
-            &[],
         );
         let (economy, savings) = economy_before.record(
             ContextCompactionTier::Summarize,
@@ -1360,6 +1361,7 @@ impl ContextCompactor for DaemonContextCompactor {
             summary_artifact: artifact.clone(),
             tokens_before: Some(tokens_before),
             tokens_after: Some(tokens_after),
+            tokens_estimated: true,
         };
         let node = TreeNode {
             node: NodeId::new(format!("compaction-node-{}", intent.operation_id)),
@@ -5646,6 +5648,7 @@ async fn perform_shell_exec(
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
     };
+    let user_command_output = Arc::new(StdMutex::new(UserCommandOutput::default()));
     let output = output_context.sink(
         run_id.clone(),
         pending.accepted.item_id.clone(),
@@ -5654,6 +5657,7 @@ async fn perform_shell_exec(
         // later model prompt; tool-loop process calls expose only the bounded
         // deterministic result adapter.
         PromptRender::Omit,
+        Some(Arc::clone(&user_command_output)),
     );
     let shell = match lease.hub().shell_registry().open(
         haider_rpc::ShellKindWire::Local,
@@ -5891,17 +5895,38 @@ async fn perform_shell_exec(
     shell
         .exited(result.exit_code)
         .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+    let failed = result.status != haider_protocol::item::ToolStatus::Completed;
+    let source_complete =
+        result.limit_reached.is_none() && result.source_output_elided_bytes_at_least == 0;
+    let user_command_projection = std::mem::take(
+        &mut *user_command_output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .finish(
+        failed,
+        u64::try_from(result.source_output_elided_bytes_at_least).unwrap_or(u64::MAX),
+        source_complete,
+    );
+    let mut output_savings = user_command_projection.savings;
+    if let Some(savings) = &mut output_savings {
+        savings.source_item_id = Some(pending.accepted.item_id.to_string());
+    }
     let completed = append_shell_completion(
         lease,
         device_id,
-        &run_id,
         &event_ids,
-        pending.branch_id.as_ref(),
-        pending.agent_id.as_ref(),
-        EventPayload::Item(ItemEvent::Completed {
-            item_id: pending.accepted.item_id,
-            item: result.completed_item(pending.command),
-        }),
+        ShellCompletionRequest {
+            run_id: &run_id,
+            branch_id: pending.branch_id.as_ref(),
+            agent_id: pending.agent_id.as_ref(),
+            completed: EventPayload::Item(ItemEvent::Completed {
+                item_id: pending.accepted.item_id,
+                item: result.completed_item(pending.command),
+            }),
+            economy_before: &metadata.context_economy,
+            output_savings,
+        },
     )
     .await;
     if let Err(error) = completed {
@@ -6104,6 +6129,57 @@ async fn fresh_turn_metadata(lease: &HubStoreHandle) -> Result<SessionMetadataV1
     })
 }
 
+fn reconcile_context_economy(
+    metadata: &haider_protocol::context::ContextEconomy,
+    journal: Option<haider_protocol::context::ContextEconomy>,
+) -> Result<(haider_protocol::context::ContextEconomy, bool), HaiderError> {
+    let Some(journal) = journal else {
+        if metadata.operation_count == 0 {
+            return Ok((metadata.clone(), false));
+        }
+        return Err(HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            "session context economy has metadata operations but no journal record",
+            false,
+        ));
+    };
+    if journal.operation_count < metadata.operation_count {
+        return Err(HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            "session context economy journal moved behind metadata",
+            false,
+        ));
+    }
+    if journal.operation_count == metadata.operation_count {
+        if &journal != metadata {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "equal session context economy coordinates disagree",
+                false,
+            ));
+        }
+        return Ok((metadata.clone(), false));
+    }
+    Ok((journal, true))
+}
+
+/// Reduces the append-only savings stream before assigning the next operation
+/// coordinate. This heals the event-to-metadata crash gap and prevents a
+/// long-lived supervisor from reusing its startup snapshot for direct shells.
+async fn refresh_context_economy(
+    lease: &HubStoreHandle,
+    metadata: &haider_protocol::context::ContextEconomy,
+) -> Result<haider_protocol::context::ContextEconomy, HaiderError> {
+    let journal = PromptHistoryCompiler::latest_context_economy(lease, lease.session_id()).await?;
+    let (economy, heal_metadata) = reconcile_context_economy(metadata, journal)?;
+    if heal_metadata {
+        lease
+            .persist_context_economy(lease.session_id(), &economy)
+            .await?;
+    }
+    Ok(economy)
+}
+
 /// Assembles and starts one accepted turn: provider resolution (R6 pinning —
 /// this is the once-per-logical-turn call), committed-history compilation
 /// (R4), tool dispatcher creation, harness registration under the lease, and
@@ -6141,15 +6217,8 @@ async fn start_turn(
     let headless = headless_run_context(lease, &accepted.run_id).await?;
     let provider_deadline = headless.as_ref().and_then(provider_request_deadline);
     let mut pinned_metadata = metadata.clone();
-    if let Some(journal_economy) =
-        PromptHistoryCompiler::latest_context_economy(lease, lease.session_id()).await?
-        && journal_economy.operation_count > pinned_metadata.context_economy.operation_count
-    {
-        lease
-            .persist_context_economy(lease.session_id(), &journal_economy)
-            .await?;
-        pinned_metadata.context_economy = journal_economy;
-    }
+    pinned_metadata.context_economy =
+        refresh_context_economy(lease, &pinned_metadata.context_economy).await?;
     if let Some(context) = headless.as_ref() {
         let spec = &context.spec;
         pinned_metadata.provider.clone_from(&spec.provider);
@@ -8908,25 +8977,62 @@ fn budget_exhausted_error(exhausted: &RunBudgetExhaustedV1) -> HaiderError {
 /// before the ordinary omitted `Done` state. Output deltas use the same
 /// visibility, so the prompt compiler can reconstruct exactly one bounded
 /// user-command record without making model-initiated process output visible.
+struct ShellCompletionRequest<'a> {
+    run_id: &'a RunId,
+    branch_id: Option<&'a BranchId>,
+    agent_id: Option<&'a AgentId>,
+    completed: EventPayload,
+    economy_before: &'a haider_protocol::context::ContextEconomy,
+    output_savings: Option<OutputSavings>,
+}
+
 async fn append_shell_completion(
     store: &HubStoreHandle,
     device_id: &DeviceId,
-    run_id: &RunId,
     event_ids: &EventIdGenerator,
-    branch_id: Option<&BranchId>,
-    agent_id: Option<&AgentId>,
-    completed: EventPayload,
+    request: ShellCompletionRequest<'_>,
 ) -> Result<(), HaiderError> {
-    append_shell_payloads(
-        store,
-        device_id,
+    let ShellCompletionRequest {
         run_id,
         branch_id,
         agent_id,
-        event_ids,
-        vec![completed, EventPayload::RunState(RunState::Done)],
+        completed,
+        economy_before,
+        output_savings,
+    } = request;
+    let mut payloads = vec![completed];
+    let economy_before = refresh_context_economy(store, economy_before).await?;
+    let economy_update = output_savings.map(|output| economy_before.record_tool_output(output));
+    if let Some((_, event)) = &economy_update {
+        let source = event
+            .tool_output()
+            .and_then(|output| output.source_item_id.as_deref())
+            .unwrap_or("unattributed");
+        let item_id = ItemId::new(format!("context-savings-{source}"));
+        let item = event.extension_item().map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("direct command context savings could not serialize: {error}"),
+                false,
+            )
+        })?;
+        payloads.push(EventPayload::Item(ItemEvent::Started {
+            item_id: item_id.clone(),
+            item: item.clone(),
+        }));
+        payloads.push(EventPayload::Item(ItemEvent::Completed { item_id, item }));
+    }
+    payloads.push(EventPayload::RunState(RunState::Done));
+    append_shell_payloads(
+        store, device_id, run_id, branch_id, agent_id, event_ids, payloads,
     )
-    .await
+    .await?;
+    if let Some((economy, _)) = economy_update {
+        store
+            .persist_context_economy(store.session_id(), &economy)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Shell terminalization is the only recovery closure that exposes its
@@ -9526,6 +9632,64 @@ fn peer_error(error: crate::peer::PeerError) -> HaiderError {
 #[allow(clippy::expect_used, clippy::items_after_test_module)]
 mod manager_law_tests {
     use super::*;
+
+    fn output_savings(scope: &str, before: usize, after: usize) -> OutputSavings {
+        OutputSavings::from_provider_request_bytes(
+            scope,
+            before,
+            after,
+            before.saturating_sub(after),
+            true,
+        )
+    }
+
+    /// MUTATION CHECK: assign both direct-shell events from the supervisor's
+    /// immutable startup metadata. The second operation then reuses count 1.
+    #[test]
+    fn consecutive_direct_shells_advance_the_recovered_shared_ledger() {
+        let startup = haider_protocol::context::ContextEconomy::default();
+        let (after_first, first) = startup.record_tool_output(output_savings("first", 400, 200));
+        let (recovered, heal) =
+            reconcile_context_economy(&startup, Some(after_first)).expect("journal is newer");
+        assert!(heal);
+        let (after_second, second) =
+            recovered.record_tool_output(output_savings("second", 800, 400));
+
+        assert_eq!(first.session_operation_count, 1);
+        assert_eq!(second.session_operation_count, 2);
+        assert_eq!(after_second.operation_count, 2);
+        assert_eq!(
+            after_second.cumulative_estimated_tokens_saved,
+            first
+                .estimated_tokens_saved
+                .saturating_add(second.estimated_tokens_saved)
+        );
+    }
+
+    /// MUTATION CHECK: trust metadata after an event append succeeded but its
+    /// projection update did not. The next direct shell must heal from the
+    /// journal before allocating its coordinate.
+    #[test]
+    fn direct_shell_heals_the_event_to_metadata_crash_gap_before_recording() {
+        let (metadata, _) = haider_protocol::context::ContextEconomy::default().record(
+            ContextCompactionTier::StructuralTrim24,
+            1_000,
+            800,
+        );
+        let (journal, gap_event) =
+            metadata.record_tool_output(output_savings("committed-before-crash", 800, 600));
+        let (recovered, heal) =
+            reconcile_context_economy(&metadata, Some(journal)).expect("journal heals gap");
+        assert!(heal);
+        let (_, next) = recovered.record_tool_output(output_savings("after-restart", 600, 400));
+
+        assert_eq!(gap_event.session_operation_count, 2);
+        assert_eq!(next.session_operation_count, 3);
+        assert!(
+            next.session_cumulative_estimated_tokens_saved
+                > gap_event.session_cumulative_estimated_tokens_saved
+        );
+    }
 
     #[test]
     fn full_manager_queue_maps_to_typed_busy_without_waiting() {
@@ -10874,17 +11038,14 @@ pub(crate) fn registered_tool_route(name: &str) -> Option<RegisteredToolRoute> {
 /// 32 KiB on a char boundary with an honest truncation marker.
 fn bounded_search_preview(text: String) -> (String, bool) {
     const WEB_SEARCH_RESULT_CAP_BYTES: usize = 32 * 1024;
-    if text.len() <= WEB_SEARCH_RESULT_CAP_BYTES {
-        return (text, false);
+    match haider_tools::elide_text_head_tail(
+        &text,
+        WEB_SEARCH_RESULT_CAP_BYTES,
+        "web_search_output_cap",
+    ) {
+        Some(elided) => (elided.text, true),
+        None => (text, false),
     }
-    let mut cut = WEB_SEARCH_RESULT_CAP_BYTES;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let mut text = text;
-    text.truncate(cut);
-    text.push_str("\n[web_search: output truncated]");
-    (text, true)
 }
 
 /// Instruct-pipe stub of a tool's JSON Schema (LW-IP). Native tool-calling
@@ -11044,16 +11205,8 @@ pub(crate) fn loom_run_tail(workflow: &haider_protocol::loom::LoomWorkflow) -> S
     // Verify-fix C4: aggregate cap — the tail rides EVERY turn's volatile
     // context; per-node bounds do not bound the whole.
     const LOOM_TAIL_MAX_BYTES: usize = 1_200;
-    if tail.len() > LOOM_TAIL_MAX_BYTES {
-        // The ellipsis lives INSIDE the cap — 1200 means 1200.
-        let mut end = LOOM_TAIL_MAX_BYTES - '…'.len_utf8();
-        while !tail.is_char_boundary(end) {
-            end -= 1;
-        }
-        tail.truncate(end);
-        tail.push('…');
-    }
-    tail
+    haider_tools::elide_text_head_tail(&tail, LOOM_TAIL_MAX_BYTES, "loom_workflow_tail")
+        .map_or(tail, |elided| elided.text)
 }
 
 pub(crate) fn tool_manual(tools: &[ToolDefinition]) -> String {
@@ -13383,6 +13536,7 @@ impl BrokerToolDispatcher {
                         item_id.clone(),
                         call_id.to_owned(),
                         PromptRender::Omit,
+                        None,
                     )),
                 }),
             })
@@ -14947,6 +15101,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         // deterministic bounded result as the model's sole
                         // view. No model-visible prefix is rewritten.
                         PromptRender::Omit,
+                        None,
                     );
                     let started = SystemTime::now();
                     match broker
@@ -16853,21 +17008,44 @@ fn lockdown_quota_result(
 
 fn lockdown_read_result(text: &str, offset: Option<usize>, limit: Option<usize>) -> BoundedResult {
     let start = offset.unwrap_or(1).saturating_sub(1);
-    let selected = text
-        .lines()
+    let lines = text.lines().collect::<Vec<_>>();
+    let end = start
+        .saturating_add(limit.unwrap_or(usize::MAX))
+        .min(lines.len());
+    let selected = lines
+        .iter()
         .skip(start)
         .take(limit.unwrap_or(usize::MAX))
         .enumerate()
         .map(|(index, line)| format!("{}\t{line}", start.saturating_add(index).saturating_add(1)))
         .collect::<Vec<_>>()
         .join("\n");
+    let truncated = start > 0 || end < lines.len();
+    let selected = if truncated {
+        let omitted_bytes_at_least = text.len().saturating_sub(
+            lines[start.min(lines.len())..end]
+                .iter()
+                .map(|line| line.len())
+                .fold(0usize, usize::saturating_add),
+        );
+        haider_tools::mark_text_elision(
+            &selected,
+            selected.len().saturating_add(512),
+            "lockdown_read_range",
+            omitted_bytes_at_least,
+            false,
+        )
+        .text
+    } else {
+        selected
+    };
     BoundedResult {
         preview: selected,
-        truncated: false,
+        truncated,
         data: None,
         artifact: None,
         images: Vec::new(),
-        cursor: None,
+        cursor: truncated.then(|| end.saturating_add(1).to_string()),
         status: ToolResultStatus::Completed,
         reason: Some("lockdown secret redaction forced on".to_owned()),
         presentation: None,
@@ -17011,14 +17189,17 @@ pub(crate) fn plan_gate_admits(accepted_plan_bodies: &[String], needles: &[&str]
 /// The bound agent type's identity line (W-flow): the session IS this
 /// specialist for now. Bounded like the inventory; volatile-tail only.
 pub(crate) fn agent_type_identity_line(record: &haider_protocol::loom::LoomAgentType) -> String {
-    let mut job = record.job.chars().take(700).collect::<String>();
-    if job.len() < record.job.len() {
-        job.push('…');
-    }
-    format!(
+    const AGENT_TYPE_IDENTITY_MAX_BYTES: usize = 800;
+    let line = format!(
         "session agent type: @{} ({} -> {}) — {}",
-        record.id, record.in_type, record.out_type, job
+        record.id, record.in_type, record.out_type, record.job
+    );
+    haider_tools::elide_text_head_tail(
+        &line,
+        AGENT_TYPE_IDENTITY_MAX_BYTES,
+        "loom_agent_type_identity",
     )
+    .map_or(line, |elided| elided.text)
 }
 
 pub(crate) fn loom_inventory_line(
@@ -17055,15 +17236,14 @@ pub(crate) fn loom_inventory_line(
     }
     line.push_str(" new ones: present the registration in a `plan`, then loom_register.");
     const LOOM_INVENTORY_MAX_BYTES: usize = 700;
-    if line.len() > LOOM_INVENTORY_MAX_BYTES {
-        let mut end = LOOM_INVENTORY_MAX_BYTES - '…'.len_utf8();
-        while !line.is_char_boundary(end) {
-            end -= 1;
-        }
-        line.truncate(end);
-        line.push('…');
-    }
-    Some(line)
+    Some(
+        haider_tools::elide_text_head_tail(
+            &line,
+            LOOM_INVENTORY_MAX_BYTES,
+            "loom_registry_inventory",
+        )
+        .map_or(line, |elided| elided.text),
+    )
 }
 
 /// D4: the generic plan tool. The full markdown proposal is journaled in a
@@ -17416,7 +17596,7 @@ fn parse_fs_file_glob(value: Option<&serde_json::Value>) -> Result<FsFileGlob, H
     ))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn process_result(result: ProcessResult) -> BoundedResult {
     process_result_with_signal(result, None)
 }
@@ -17481,36 +17661,114 @@ fn process_result_with_signal(
     result: ProcessResult,
     signal: Option<&ProcessSignalRecorded>,
 ) -> BoundedResult {
+    const PROCESS_RESULT_MODEL_PREVIEW_MAX_BYTES: usize = 8 * 1024;
     let artifact = result.artifact.clone();
     let raw_output = process_combined_output(&result);
     let failed = result.status != haider_protocol::item::ToolStatus::Completed;
     let reduced = haider_tools::reduce_tool_output("process_exec", &raw_output, failed);
     let mut truncated = result.limit_reached.is_some() || reduced.text != raw_output;
     let reason = process_failure_reason(&result);
-    let mut presented_output = reduced.text.clone();
-    let mut preview = process_result_preview_json(&result, signal, &reduced, &presented_output);
-    for max_output_bytes in [4_096usize, 2_048, 1_024, 0] {
-        if preview.len() <= 8 * 1024 {
+    let hard_limit_elision =
+        (result.limit_reached.is_some() || result.output_elided_bytes_at_least > 0).then(|| {
+            haider_tools::mark_text_elision(
+                &reduced.text,
+                haider_tools::REDUCED_TOOL_OUTPUT_MAX_BYTES,
+                "process_output_execution_limit",
+                result.output_elided_bytes_at_least,
+                false,
+            )
+        });
+    let model_output = hard_limit_elision
+        .as_ref()
+        .map_or_else(|| reduced.text.clone(), |elided| elided.text.clone());
+    let baseline_preview =
+        process_result_preview_json(&result, signal, reduced.adapter, &raw_output, None);
+    let baseline_source_bytes = baseline_preview
+        .len()
+        .saturating_add(result.output_elided_bytes_at_least);
+    let baseline_input_bytes =
+        haider_tools::provider_request_text_projection_bytes(&baseline_preview)
+            .saturating_add(result.output_elided_bytes_at_least);
+    let omitted_bytes_exact = result.output_elided_bytes_at_least == 0
+        && result.limit_reached.is_none()
+        && reduced
+            .savings
+            .as_ref()
+            .is_none_or(|savings| savings.omitted_bytes_exact);
+    let mut presented_output = model_output.clone();
+    let mut preview = if truncated {
+        process_result_preview_with_savings(
+            &result,
+            signal,
+            reduced.adapter,
+            &presented_output,
+            baseline_input_bytes,
+            baseline_source_bytes,
+            omitted_bytes_exact,
+        )
+        .0
+    } else {
+        baseline_preview
+    };
+    for max_output_bytes in [4_096usize, 2_048, 1_024, 512] {
+        if preview.len() <= PROCESS_RESULT_MODEL_PREVIEW_MAX_BYTES {
             break;
         }
-        presented_output = utf8_bounded_prefix(&reduced.text, max_output_bytes).to_owned();
-        preview = process_result_preview_json(&result, signal, &reduced, &presented_output);
+        presented_output = haider_tools::mark_text_elision(
+            &model_output,
+            max_output_bytes,
+            "process_result_json_byte_cap",
+            0,
+            true,
+        )
+        .text;
+        (preview, _) = process_result_preview_with_savings(
+            &result,
+            signal,
+            reduced.adapter,
+            &presented_output,
+            baseline_input_bytes,
+            baseline_source_bytes,
+            omitted_bytes_exact,
+        );
     }
     truncated |= presented_output != reduced.text;
-    if preview.len() > 8 * 1024 {
+    if preview.len() > PROCESS_RESULT_MODEL_PREVIEW_MAX_BYTES {
         truncated = true;
-        preview = serde_json::json!({
-            "status": result.status,
-            "effect_id": result.effect,
-            "exit_code": result.exit_code,
-            "output_bytes": result.output_bytes,
-            "command_arg_digest": result.command_arg_digest,
-            "transcript_digest": result.transcript_digest,
-            "artifact": result.artifact,
-            "output_adapter": reduced.adapter,
-            "output_omitted": "preview metadata exceeded byte cap; use artifact",
-        })
-        .to_string();
+        let bounded_output = haider_tools::mark_text_elision(
+            &model_output,
+            512,
+            "process_result_json_byte_cap",
+            0,
+            true,
+        )
+        .text;
+        let mut savings = OutputSavings::from_provider_request_bytes(
+            "process_result_model_boundary",
+            baseline_input_bytes,
+            haider_tools::provider_request_text_projection_bytes(""),
+            baseline_source_bytes,
+            omitted_bytes_exact,
+        );
+        for _ in 0..32 {
+            preview = process_result_minimal_preview_json(
+                &result,
+                reduced.adapter,
+                &bounded_output,
+                &savings,
+            );
+            let next = OutputSavings::from_provider_request_bytes(
+                "process_result_model_boundary",
+                baseline_input_bytes,
+                haider_tools::provider_request_text_projection_bytes(&preview),
+                baseline_source_bytes.saturating_sub(preview.len()),
+                omitted_bytes_exact,
+            );
+            if next == savings {
+                break;
+            }
+            savings = next;
+        }
     }
     BoundedResult {
         preview,
@@ -17534,13 +17792,35 @@ fn process_result_with_signal(
     }
 }
 
+fn process_result_minimal_preview_json(
+    result: &ProcessResult,
+    output_adapter: haider_tools::OutputAdapter,
+    output: &str,
+    context_savings_detail: &OutputSavings,
+) -> String {
+    serde_json::json!({
+        "status": result.status,
+        "effect_id": result.effect,
+        "exit_code": result.exit_code,
+        "output_bytes": result.output_bytes,
+        "command_arg_digest": result.command_arg_digest,
+        "transcript_digest": result.transcript_digest,
+        "artifact": result.artifact,
+        "output_adapter": output_adapter,
+        "output": output,
+        "context_savings_detail": context_savings_detail,
+    })
+    .to_string()
+}
+
 fn process_result_preview_json(
     result: &ProcessResult,
     signal: Option<&ProcessSignalRecorded>,
-    reduced: &haider_tools::ReducedToolOutput,
+    output_adapter: haider_tools::OutputAdapter,
     output: &str,
+    context_savings_detail: Option<&OutputSavings>,
 ) -> String {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "status": result.status,
         "effect_id": result.effect,
         "exit_code": result.exit_code,
@@ -17556,11 +17836,7 @@ fn process_result_preview_json(
             effect_id: signal.effect_id.clone(),
         }),
         "output": output,
-        "output_adapter": reduced.adapter,
-        "token_estimate": {
-            "before": reduced.before_tokens,
-            "after": haider_tools::estimated_tokens(output.len()),
-        },
+        "output_adapter": output_adapter,
         "artifact": result.artifact,
         "limit_reached": result.limit_reached,
         "limits": {
@@ -17568,16 +17844,52 @@ fn process_result_preview_json(
             "max_output_bytes": result.max_output_bytes,
         },
         "escalation_note": result.escalation_note,
-    })
-    .to_string()
+    });
+    if let Some(context_savings_detail) = context_savings_detail {
+        value["context_savings_detail"] = serde_json::json!(context_savings_detail);
+    }
+    value.to_string()
 }
 
-fn utf8_bounded_prefix(text: &str, max_bytes: usize) -> &str {
-    let mut end = text.len().min(max_bytes);
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
+/// Builds the process-result child savings detail. The baseline
+/// is the same serialized process-result projection with the complete captured
+/// output and without the detail. The actor later nests this detail in the one
+/// authoritative `context_savings_v1` event. The result length includes JSON
+/// escaping, the inline elision marker, and this detail's own overhead.
+fn process_result_preview_with_savings(
+    result: &ProcessResult,
+    signal: Option<&ProcessSignalRecorded>,
+    output_adapter: haider_tools::OutputAdapter,
+    output: &str,
+    baseline_input_bytes: usize,
+    baseline_source_bytes: usize,
+    omitted_bytes_exact: bool,
+) -> (String, OutputSavings) {
+    let mut savings = OutputSavings::from_provider_request_bytes(
+        "process_result_model_boundary",
+        baseline_input_bytes,
+        haider_tools::provider_request_text_projection_bytes(""),
+        baseline_source_bytes,
+        omitted_bytes_exact,
+    );
+    let mut preview =
+        process_result_preview_json(result, signal, output_adapter, output, Some(&savings));
+    for _ in 0..32 {
+        let next = OutputSavings::from_provider_request_bytes(
+            "process_result_model_boundary",
+            baseline_input_bytes,
+            haider_tools::provider_request_text_projection_bytes(&preview),
+            baseline_source_bytes.saturating_sub(preview.len()),
+            omitted_bytes_exact,
+        );
+        if next == savings {
+            return (preview, savings);
+        }
+        savings = next;
+        preview =
+            process_result_preview_json(result, signal, output_adapter, output, Some(&savings));
     }
-    &text[..end]
+    (preview, savings)
 }
 
 fn process_failure_reason(result: &ProcessResult) -> Option<String> {
@@ -17685,6 +17997,7 @@ impl HubCommandOutputContext {
         item_id: ItemId,
         call_id: String,
         prompt: PromptRender,
+        user_command_output: Option<Arc<StdMutex<UserCommandOutput>>>,
     ) -> HubCommandOutputSink {
         HubCommandOutputSink {
             store: self.store.clone(),
@@ -17696,6 +18009,7 @@ impl HubCommandOutputContext {
             prompt,
             device_id: self.device_id.clone(),
             event_ids: Arc::clone(&self.event_ids),
+            user_command_output,
         }
     }
 
@@ -17855,6 +18169,7 @@ struct HubCommandOutputSink {
     prompt: PromptRender,
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
+    user_command_output: Option<Arc<StdMutex<UserCommandOutput>>>,
 }
 
 #[async_trait]
@@ -17868,6 +18183,19 @@ impl CommandOutputSink for HubCommandOutputSink {
                 ),
             });
         }
+        let captured = match (&self.user_command_output, &delta) {
+            (Some(_), ItemDelta::CommandOutput { stream, chunk_b64 }) => Some((
+                *stream,
+                base64::engine::general_purpose::STANDARD
+                    .decode(chunk_b64)
+                    .map_err(|error| ToolError::Runtime {
+                        message: format!(
+                            "cannot decode direct command output for accounting: {error}"
+                        ),
+                    })?,
+            )),
+            _ => None,
+        };
         let mut envelopes = [EventEnvelope {
             schema_version: SCHEMA_VERSION,
             event_id: self.event_ids.next(),
@@ -17900,6 +18228,12 @@ impl CommandOutputSink for HubCommandOutputSink {
             .map_err(|error| haider_tools::ToolError::Runtime {
                 message: error.message,
             })?;
+        if let (Some(output), Some((stream, bytes))) = (&self.user_command_output, captured) {
+            output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(stream, &bytes);
+        }
         #[cfg(windows)]
         trace_windows_process_publish("CommandOutputDelta", &self.run_id);
         Ok(())

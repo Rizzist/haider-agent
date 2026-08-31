@@ -64,31 +64,49 @@ through a summary-of-summary chain.
 
 ## Accounting and units
 
-Every successful conversation-level reduction records:
+Every successful reduction records estimated input before and after, the
+nonnegative estimated saving for that operation, the session-cumulative
+estimated saving, a monotonic operation count, and the sole measurement
+identifier `provider_request_bytes_div_four_v1`. Conversation events also name
+their tier; output events carry an `output` child with the exact or lower-bound
+omission facts.
 
-- tier;
-- estimated input before and after;
-- estimated saved input for that operation;
-- session-cumulative estimated saved input;
-- monotonic operation count; and
-- the measurement identifier `provider_request_bytes_div_four_v1`.
-
-The estimator is `ceil(serialized provider-request bytes / 4)` plus Haider's
-fixed per-image vision estimate. The same system prompt and tool schemas are
-included on both sides, so unchanged request components cancel in the saved
-difference. This is repeatable and provider-neutral, but model tokenizers vary:
+The savings estimator is `ceil(serialized provider-bound projection bytes / 4)`
+before minus after. Conversation operations serialize the whole neutral
+request projection; output operations serialize the changed provider-bound
+text projection, including JSON-string escaping. It deliberately adds no image-token heuristic. The separate
+request-occupancy estimate may still use Haider's fixed per-image heuristic to
+make threshold decisions, but that value never enters the savings ledger. The
+savings unit is repeatable and provider-neutral, while model tokenizers vary:
 the API and UI must label these values estimated and must never present them as
-exact billed tokens. Output-level reductions should reuse this measurement
-identifier if they contribute to the same session total; they must not create
-a second, incomparable `tokens_saved` counter.
+exact provider or billed tokens.
 
-Each `context_savings_v1` completed extension item is the append-only recovery
-authority. `SessionMetadataV1.context_economy` is a monotonic restart-fast
-projection. Turn startup reduces the journal and heals metadata if a crash
-occurred between the event append and projection update. A malformed event of
-this known authoritative kind fails closed as store corruption. Forks start a
-new economy ledger, while the parent's transcript and counters remain
-unchanged.
+Output and conversation records are parent-child layers in one stream, not
+competing counters. Conversation operations retain the backward-compatible
+parent kind `context_savings_v1`; output operations use the additive child kind
+`context_savings_output_v1`. Both share the same monotonic session operation
+coordinate and cumulative ledger. Output elision measures the original output
+projection (P0) to the bounded model-visible projection (P1). Later
+conversation compaction measures that already-bounded transcript (P1) to the
+compacted projection (P2). A consumer merges completed records from both kinds
+by `session_operation_count` and sums each operation once; inline
+`haider_elision_v1` markers are disclosure-only and carry no independently
+additive token value. This P0→P1 plus P1→P2 composition prevents a source byte
+removed at the output boundary from being counted again by compaction.
+
+Each completed parent `context_savings_v1` or child
+`context_savings_output_v1` extension item is an append-only recovery record.
+`SessionMetadataV1.context_economy` is a monotonic restart-fast projection.
+Turn startup reduces both kinds and heals metadata if a crash occurred between
+the event append and projection update. A malformed event of either known
+authoritative kind fails closed as store corruption. Forks start a new economy
+ledger, while the parent's transcript and counters remain unchanged.
+
+For ctx-v1 typed-reader compatibility, metadata's original `last_event` slot
+continues to hold only its tier-bearing conversation event. The newest output
+child is stored in additive `last_output_event`; older readers ignore that
+field and therefore never deserialize a tier-less child as the old required
+conversation shape.
 
 The deterministic stale-output-heavy reference fixture measured 991,104
 estimated input tokens before trimming, 198,240 after the 24-pair tier, and

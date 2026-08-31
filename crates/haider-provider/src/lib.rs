@@ -1114,6 +1114,7 @@ pub fn apply_tool_result_image_budget(messages: &mut [Message]) {
                 continue;
             }
             let mut omitted_count = 0_usize;
+            let mut omitted_bytes = 0_u64;
             let mut first_omitted = None;
             *images = std::mem::take(images)
                 .into_iter()
@@ -1127,6 +1128,7 @@ pub fn apply_tool_result_image_budget(messages: &mut [Message]) {
                             first_omitted = Some(image.artifact.clone());
                         }
                         omitted_count = omitted_count.saturating_add(1);
+                        omitted_bytes = omitted_bytes.saturating_add(image.byte_len);
                         None
                     } else {
                         Some(image)
@@ -1139,10 +1141,12 @@ pub fn apply_tool_result_image_budget(messages: &mut [Message]) {
             let Some(first_omitted) = first_omitted else {
                 continue;
             };
-            let additional = omitted_count.saturating_sub(1);
             let first_omitted = bounded_context_field(first_omitted.as_str(), 96);
-            preview.push_str(&format!(
-                "\n[tool images omitted from model context by the per-turn image budget (oldest first): {first_omitted}; {additional} additional; limit {TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN} images / {TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN} bytes]"
+            preview.push_str(&tool_image_elision_marker(
+                "tool_result_image_budget",
+                omitted_count,
+                omitted_bytes,
+                Some(&first_omitted),
             ));
         }
     }
@@ -1160,12 +1164,55 @@ pub fn degrade_tool_result_images_to_placeholders(messages: &mut [Message]) {
             else {
                 continue;
             };
-            for image in std::mem::take(images) {
-                preview.push('\n');
-                preview.push_str(&tool_image_placeholder(&image));
+            let removed = std::mem::take(images);
+            let omitted_count = removed.len();
+            let omitted_bytes = removed
+                .iter()
+                .map(|image| image.byte_len)
+                .fold(0_u64, u64::saturating_add);
+            let first_omitted = removed
+                .first()
+                .map(|image| bounded_context_field(image.artifact.as_str(), 96));
+            if omitted_count > 0 {
+                preview.push_str(&tool_image_elision_marker(
+                    "tool_result_image_capability_degradation",
+                    omitted_count,
+                    omitted_bytes,
+                    first_omitted.as_deref(),
+                ));
+                for image in removed {
+                    preview.push('\n');
+                    preview.push_str(&tool_image_placeholder(&image));
+                }
             }
         }
     }
+}
+
+fn tool_image_elision_marker(
+    scope: &str,
+    omitted_count: usize,
+    omitted_bytes: u64,
+    first_omitted: Option<&str>,
+) -> String {
+    let reason = if scope == "tool_result_image_budget" {
+        "oldest first"
+    } else {
+        "unsupported image capability"
+    };
+    format!(
+        "\n{}\n",
+        serde_json::json!({
+            "haider_elision_v1": {
+                "scope": scope,
+                "reason": reason,
+                "omitted_bytes": omitted_bytes,
+                "omitted_bytes_exact": true,
+                "omitted_images": omitted_count,
+                "first_omitted_artifact": first_omitted,
+            }
+        })
+    )
 }
 
 fn tool_image_placeholder(image: &ImageBlockRef) -> String {

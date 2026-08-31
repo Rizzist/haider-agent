@@ -541,11 +541,14 @@ fn render_item(out: &mut String, block: &ItemBlock) {
         TurnItem::ContextCompaction {
             tokens_before,
             tokens_after,
+            tokens_estimated,
             ..
         } => match (tokens_before, tokens_after) {
             (Some(before), Some(after)) => out.push_str(&format!(
-                "⊟ compacted {} → {}\n",
+                "⊟ compacted {}{} → {}{}\n",
+                if *tokens_estimated { "~" } else { "" },
                 fmt_tok(*before),
+                if *tokens_estimated { "~" } else { "" },
                 fmt_tok(*after)
             )),
             _ => out.push_str("⊟ context compacted\n"),

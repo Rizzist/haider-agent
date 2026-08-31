@@ -56,7 +56,7 @@ use haider_protocol::cache::{
 };
 use haider_protocol::context::{
     ContextAccounting, ContextCompactionTier, ContextEconomy, ContextFootprint,
-    ContextFootprintTruth, ContextSavingsEvent,
+    ContextFootprintTruth, ContextSavingsEvent, OutputSavings,
 };
 use haider_protocol::credential::RotationEvent;
 use haider_protocol::envelope::{
@@ -124,16 +124,32 @@ pub fn append_peer_message_to_provider_tail(messages: &mut Vec<Message>, message
 /// Peer/SSH inventories and remote command results can be large, so their
 /// first-send and replay views use the same deterministic byte cap while the
 /// journal retains the raw JSON.
-pub(crate) fn model_tool_result_preview(tool_name: &str, result: &BoundedResult) -> (String, bool) {
+struct ModelToolResultProjection {
+    preview: String,
+    truncated: bool,
+    savings: Option<OutputSavings>,
+}
+
+fn model_tool_result_projection(
+    tool_name: &str,
+    result: &BoundedResult,
+) -> ModelToolResultProjection {
     const INVENTORY_MODEL_PREVIEW_MAX_BYTES: usize = 8 * 1024;
-    let marker = match tool_name {
-        "peer_list" => "\n[… peer list compacted for model; raw result retained in journal …]",
-        "ssh_list" => {
-            "\n[… SSH profile list compacted for model; raw result retained in journal …]"
-        }
-        "ssh_shell" => {
-            "\n[… remote shell output compacted for model; raw result retained in journal …]"
-        }
+    let disclosed_omission = inline_text_elision_disclosure(&result.preview);
+    if tool_name == "process_exec"
+        && result.truncated
+        && let Some(savings) = trusted_process_output_savings(&result.preview)
+    {
+        return ModelToolResultProjection {
+            preview: result.preview.clone(),
+            truncated: true,
+            savings: Some(savings),
+        };
+    }
+    let scope = match tool_name {
+        "peer_list" => "peer_list_model_boundary",
+        "ssh_list" => "ssh_inventory_model_boundary",
+        "ssh_shell" => "remote_shell_model_boundary",
         // Keep the existing local process adapter byte-for-byte unchanged.
         // Only the SSH-profile form opts into this additional model-only cap.
         "process_exec"
@@ -144,21 +160,157 @@ pub(crate) fn model_tool_result_preview(tool_name: &str, result: &BoundedResult)
                 Some(true)
             ) =>
         {
-            "\n[… remote process output compacted for model; raw result retained in journal …]"
+            "remote_process_model_boundary"
         }
-        _ => return (result.preview.clone(), result.truncated),
+        _ => {
+            if result.truncated {
+                let (omitted_bytes_at_least, omitted_bytes_exact) =
+                    disclosed_omission.unwrap_or((1, false));
+                let elided = haider_tools::mark_text_elision(
+                    &result.preview,
+                    INVENTORY_MODEL_PREVIEW_MAX_BYTES,
+                    "bounded_tool_result",
+                    omitted_bytes_at_least,
+                    omitted_bytes_exact,
+                );
+                return ModelToolResultProjection {
+                    preview: elided.text,
+                    truncated: true,
+                    savings: Some(elided.savings),
+                };
+            }
+            return ModelToolResultProjection {
+                preview: result.preview.clone(),
+                truncated: result.truncated,
+                savings: None,
+            };
+        }
     };
     if result.preview.len() <= INVENTORY_MODEL_PREVIEW_MAX_BYTES {
-        return (result.preview.clone(), result.truncated);
+        if result.truncated {
+            let (omitted_bytes_at_least, omitted_bytes_exact) =
+                disclosed_omission.unwrap_or((1, false));
+            let elided = haider_tools::mark_text_elision(
+                &result.preview,
+                INVENTORY_MODEL_PREVIEW_MAX_BYTES,
+                scope,
+                omitted_bytes_at_least,
+                omitted_bytes_exact,
+            );
+            return ModelToolResultProjection {
+                preview: elided.text,
+                truncated: true,
+                savings: Some(elided.savings),
+            };
+        }
+        return ModelToolResultProjection {
+            preview: result.preview.clone(),
+            truncated: result.truncated,
+            savings: None,
+        };
     }
-    let budget = INVENTORY_MODEL_PREVIEW_MAX_BYTES.saturating_sub(marker.len());
-    let mut end = result.preview.len().min(budget);
-    while end > 0 && !result.preview.is_char_boundary(end) {
-        end -= 1;
+    let elided = disclosed_omission.map_or_else(
+        || {
+            haider_tools::elide_text_head_tail(
+                &result.preview,
+                INVENTORY_MODEL_PREVIEW_MAX_BYTES,
+                scope,
+            )
+            .unwrap_or_else(|| haider_tools::mark_text_elision(&result.preview, 0, scope, 1, false))
+        },
+        |(omitted_bytes_at_least, omitted_bytes_exact)| {
+            haider_tools::mark_text_elision(
+                &result.preview,
+                INVENTORY_MODEL_PREVIEW_MAX_BYTES,
+                scope,
+                omitted_bytes_at_least,
+                omitted_bytes_exact,
+            )
+        },
+    );
+    ModelToolResultProjection {
+        preview: elided.text,
+        truncated: true,
+        savings: Some(elided.savings),
     }
-    let mut preview = result.preview[..end].to_owned();
-    preview.push_str(marker);
-    (preview, true)
+}
+
+/// Reads disclosure-only inline markers so the actor can attach their source
+/// omission to the one authoritative output event. The maximum is used rather
+/// than a sum because nested markers can restate an upstream omission. Image
+/// byte sizes are not text-token estimates and are deliberately excluded.
+fn inline_text_elision_disclosure(preview: &str) -> Option<(usize, bool)> {
+    let mut omitted_bytes_at_least = None::<u64>;
+    let mut omitted_bytes_exact = true;
+    for line in preview.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(marker) = value.get("haider_elision_v1") else {
+            continue;
+        };
+        if marker.get("omitted_images").is_some() {
+            continue;
+        }
+        let Some(omitted) = marker
+            .get("omitted_bytes")
+            .and_then(serde_json::Value::as_u64)
+        else {
+            continue;
+        };
+        omitted_bytes_at_least =
+            Some(omitted_bytes_at_least.map_or(omitted, |seen| seen.max(omitted)));
+        omitted_bytes_exact &= marker
+            .get("omitted_bytes_exact")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    }
+    omitted_bytes_at_least.map(|omitted| {
+        (
+            usize::try_from(omitted.max(1)).unwrap_or(usize::MAX),
+            omitted_bytes_exact,
+        )
+    })
+}
+
+/// Accepts only the daemon's typed process-result envelope. Shell text that
+/// merely contains an economy key cannot suppress the generic boundary marker.
+fn trusted_process_output_savings(preview: &str) -> Option<OutputSavings> {
+    let value = serde_json::from_str::<serde_json::Value>(preview).ok()?;
+    for required in [
+        "status",
+        "effect_id",
+        "command_arg_digest",
+        "transcript_digest",
+        "output_adapter",
+    ] {
+        value.get(required)?;
+    }
+    let output = value.get("output")?.as_str()?;
+    let has_machine_marker = output.lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|value| value.get("haider_elision_v1").cloned())
+            .is_some()
+    });
+    if !has_machine_marker {
+        return None;
+    }
+    let savings =
+        serde_json::from_value::<OutputSavings>(value.get("context_savings_detail")?.clone())
+            .ok()?;
+    (savings.scope == "process_result_model_boundary"
+        && savings.output_bytes
+            == u64::try_from(haider_tools::provider_request_text_projection_bytes(
+                preview,
+            ))
+            .unwrap_or(u64::MAX))
+    .then_some(savings)
+}
+
+pub(crate) fn model_tool_result_preview(tool_name: &str, result: &BoundedResult) -> (String, bool) {
+    let projection = model_tool_result_projection(tool_name, result);
+    (projection.preview, projection.truncated)
 }
 use haider_tools::{Plan, RequestInput, TodoWrite};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -5372,7 +5524,8 @@ impl HarnessActor {
                     None
                 };
             if let Some((tier, retained_pairs)) = structural_tier {
-                let estimated_tokens_before = before.used_tokens;
+                let estimated_tokens_before =
+                    estimated_request_savings_tokens(&self.config, messages, volatile_user_tail);
                 let trimmed = trim_stale_tool_pairs(messages, *current_turn_start, retained_pairs);
                 if trimmed.removed_pairs > 0 {
                     *current_turn_start = current_turn_start
@@ -5387,7 +5540,7 @@ impl HarnessActor {
                                     .min(boundary),
                             )
                         });
-                    let after_trim = estimated_request_shaped_context_footprint(
+                    let estimated_tokens_after = estimated_request_savings_tokens(
                         &self.config,
                         messages,
                         volatile_user_tail,
@@ -5399,7 +5552,7 @@ impl HarnessActor {
                         run_id,
                         tier,
                         estimated_tokens_before,
-                        after_trim.used_tokens,
+                        estimated_tokens_after,
                         trimmed.removed_tool_call_ids,
                     )
                     .await
@@ -5981,12 +6134,12 @@ impl HarnessActor {
             let call_id = tools[index].call_id.clone();
             self.commit_tool_settlement_and_streaming(run_id, &tools[index], &result)
                 .await?;
-            let (preview, truncated) = model_tool_result_preview(&tools[index].name, &result);
+            let projection = model_tool_result_projection(&tools[index].name, &result);
             tools.remove(index);
             return Ok(Some(Message::tool_result_with_images(
                 call_id,
-                preview,
-                truncated,
+                projection.preview,
+                projection.truncated,
                 result.images,
             )));
         }
@@ -6790,12 +6943,12 @@ impl HarnessActor {
         let call_id = tools[index].call_id.clone();
         self.commit_tool_settlement_and_streaming(run_id, &tools[index], &result)
             .await?;
-        let (preview, truncated) = model_tool_result_preview(&tools[index].name, &result);
+        let projection = model_tool_result_projection(&tools[index].name, &result);
         tools.remove(index);
         Ok(Message::tool_result_with_images(
             call_id,
-            preview,
-            truncated,
+            projection.preview,
+            projection.truncated,
             result.images,
         ))
     }
@@ -7359,10 +7512,16 @@ impl HarnessActor {
                     ))
                 })?;
             if !pending.item_completed {
-                self.commit_tool_completed(run_id, &tools[tool_index], result.status.item_status())
-                    .await?;
+                self.commit_tool_completion_with_output_savings(
+                    run_id,
+                    &tools[tool_index],
+                    &result,
+                    result.status.item_status(),
+                )
+                .await?;
                 pending.item_completed = true;
             }
+            let projection = model_tool_result_projection(&tools[tool_index].name, &result);
             tools.remove(tool_index);
             dispatcher
                 .acknowledge_deferred(&pending.ticket)
@@ -7370,8 +7529,8 @@ impl HarnessActor {
                 .map_err(DriveError::Store)?;
             results.push(Message::tool_result(
                 pending.call_id,
-                result.preview,
-                result.truncated,
+                projection.preview,
+                projection.truncated,
             ));
             deferred.remove(0);
         }
@@ -7553,6 +7712,7 @@ impl HarnessActor {
             run_id,
             tool,
             Some(result),
+            Some(result),
             result.status.item_status(),
             false,
         )
@@ -7572,6 +7732,7 @@ impl HarnessActor {
             run_id,
             tool,
             Some(result),
+            Some(result),
             result.status.item_status(),
             true,
         )
@@ -7584,7 +7745,20 @@ impl HarnessActor {
         tool: &ToolAccumulator,
         status: ToolStatus,
     ) -> Result<(), DriveError> {
-        self.commit_tool_settlement(run_id, tool, None, status, true)
+        self.commit_tool_settlement(run_id, tool, None, None, status, true)
+            .await
+    }
+
+    /// Completes a deferred tool whose result was already journaled, while
+    /// atomically attaching the one authoritative output-savings event.
+    async fn commit_tool_completion_with_output_savings(
+        &mut self,
+        run_id: &RunId,
+        tool: &ToolAccumulator,
+        result: &BoundedResult,
+        status: ToolStatus,
+    ) -> Result<(), DriveError> {
+        self.commit_tool_settlement(run_id, tool, None, Some(result), status, false)
             .await
     }
 
@@ -7593,6 +7767,7 @@ impl HarnessActor {
         run_id: &RunId,
         tool: &ToolAccumulator,
         result: Option<&BoundedResult>,
+        savings_source: Option<&BoundedResult>,
         status: ToolStatus,
         resume_streaming: bool,
     ) -> Result<(), DriveError> {
@@ -7627,8 +7802,38 @@ impl HarnessActor {
                 artifact: None,
             },
         };
-        let mut envelopes =
-            Vec::with_capacity(2 + usize::from(result.is_some()) + usize::from(resume_streaming));
+        let economy_update = savings_source
+            .and_then(|result| model_tool_result_projection(&tool.name, result).savings)
+            .map(|mut output| {
+                output.source_item_id = Some(tool.item_id.to_string());
+                self.config.context_economy.record_tool_output(output)
+            });
+        let savings_envelopes = economy_update
+            .as_ref()
+            .map(|(_, event)| {
+                let item = event.extension_item().map_err(|error| {
+                    DriveError::Store(HaiderError::new(
+                        ErrorCode::Internal,
+                        format!("output context savings could not serialize: {error}"),
+                        false,
+                    ))
+                })?;
+                let TurnItem::Extension { kind, data } = item else {
+                    return Err(DriveError::Store(HaiderError::new(
+                        ErrorCode::Internal,
+                        "output context savings did not use the extension carrier",
+                        false,
+                    )));
+                };
+                self.uncommitted_extension_marker(run_id, &kind, data, prompt_omit_render())
+                    .map_err(DriveError::Store)
+            })
+            .transpose()?;
+        let mut envelopes = Vec::with_capacity(
+            2 + usize::from(result.is_some())
+                + usize::from(resume_streaming)
+                + usize::from(savings_envelopes.is_some()) * 2,
+        );
         if let Some(result) = result_envelope {
             envelopes.push(result);
         }
@@ -7648,6 +7853,9 @@ impl HarnessActor {
             )
             .map_err(DriveError::Store)?,
         );
+        if let Some(savings_envelopes) = savings_envelopes {
+            envelopes.extend(savings_envelopes);
+        }
         envelopes.push(
             self.uncommitted_envelope(
                 run_id,
@@ -7669,6 +7877,13 @@ impl HarnessActor {
         self.append_and_publish_owned(envelopes)
             .await
             .map_err(DriveError::Store)?;
+        if let Some((economy, _)) = economy_update {
+            self.config.context_economy = economy;
+            self.store
+                .persist_context_economy(&self.config.session_id, &self.config.context_economy)
+                .await
+                .map_err(DriveError::Store)?;
+        }
         self.tree_head = Some(node.node);
         if resume_streaming {
             self.state.send_replace(Some(RunState::Streaming));
@@ -10053,17 +10268,24 @@ fn trim_stale_tool_pairs(
         })
         .collect::<Vec<_>>();
     pairs.sort_unstable_by_key(|(_, call, _, _)| (call.message, call.block));
-    let keep_from = pairs.len().saturating_sub(retained_pairs);
+    // Current-turn and image-bearing pairs are independently protected. They
+    // do not consume the stale-pair retention quota.
+    let eligible_pairs = pairs
+        .iter()
+        .filter(|(_, call, result, has_images)| {
+            !has_images && call.message < protected_start && result.message < protected_start
+        })
+        .count();
+    let remove_count = eligible_pairs.saturating_sub(retained_pairs);
     let mut remove = HashSet::<MessageBlockCoordinate>::new();
     let mut removed_pairs = 0_usize;
     let mut removed_tool_call_ids = Vec::new();
-    for (ordinal, (call_id, call, result, has_images)) in pairs.into_iter().enumerate() {
-        if ordinal >= keep_from
-            || has_images
-            || call.message >= protected_start
-            || result.message >= protected_start
-        {
+    for (call_id, call, result, has_images) in pairs {
+        if has_images || call.message >= protected_start || result.message >= protected_start {
             continue;
+        }
+        if removed_pairs >= remove_count {
+            break;
         }
         remove.insert(call);
         remove.insert(result);
@@ -10218,6 +10440,26 @@ fn estimated_request_shaped_context_footprint(
     estimated_context_footprint(config, &measured)
 }
 
+fn estimated_request_savings_tokens(
+    config: &HarnessConfig,
+    messages: &[Message],
+    volatile_user_tail: Option<&str>,
+) -> u64 {
+    let mut projection = messages.to_vec();
+    if let Some(tail) = volatile_user_tail {
+        projection.push(Message::user_text(tail));
+    }
+    apply_tool_result_image_budget(&mut projection);
+    if !config.tool_result_images_supported {
+        degrade_tool_result_images_to_placeholders(&mut projection);
+    }
+    estimate_provider_request_bytes_div_four_raw(
+        &projection,
+        &config.system_prompt,
+        config.tool_definitions(),
+    )
+}
+
 fn context_footprint_from_usage(
     config: &HarnessConfig,
     usage: &Usage,
@@ -10294,12 +10536,25 @@ fn context_footprint(
 /// provider-reported request-local usage is available. It remains separate
 /// from cumulative billing usage.
 fn estimated_request_input_tokens(config: &HarnessConfig, messages: &[Message]) -> u64 {
+    estimated_request_input_measure(config, messages).tokens
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestInputMeasure {
+    bytes: u64,
+    tokens: u64,
+}
+
+fn estimated_request_input_measure(
+    config: &HarnessConfig,
+    messages: &[Message],
+) -> RequestInputMeasure {
     let mut projection = messages.to_vec();
     apply_tool_result_image_budget(&mut projection);
     if !config.tool_result_images_supported {
         degrade_tool_result_images_to_placeholders(&mut projection);
     }
-    estimate_provider_request_input_tokens_raw(
+    estimate_provider_request_input_measure_raw(
         &projection,
         &config.system_prompt,
         config.tool_definitions(),
@@ -10307,10 +10562,11 @@ fn estimated_request_input_tokens(config: &HarnessConfig, messages: &[Message]) 
     )
 }
 
-/// Deterministic accounting for the complete provider-bound request context.
-/// Daemon-owned idle operations use the same estimator as live actor rounds.
-/// Image bytes are intentionally excluded: providers tokenize vision inputs
-/// independently of their base64 transport encoding.
+/// Deterministic provider-neutral accounting for the textual request
+/// projection plus a per-image heuristic. Daemon-owned idle operations use
+/// the same estimator as live actor rounds. Resolved attachment transport
+/// bytes are intentionally excluded: this is neither a provider wire-byte
+/// count nor a model-tokenizer result.
 pub const VISION_IMAGE_ESTIMATE_TOKENS: u64 = 1_600;
 
 #[must_use]
@@ -10325,12 +10581,49 @@ pub fn estimate_provider_request_input_tokens(
     estimate_provider_request_input_tokens_raw(&projection, system_prompt, tools, attachments)
 }
 
+/// The sole savings unit: `ceil(serialized provider-neutral request bytes/4)`.
+/// Unlike context occupancy, this deliberately adds no image-token heuristic.
+#[must_use]
+pub fn estimate_provider_request_bytes_div_four(
+    messages: &[Message],
+    system_prompt: &Option<String>,
+    tools: &[ToolDefinition],
+) -> u64 {
+    let mut projection = messages.to_vec();
+    apply_tool_result_image_budget(&mut projection);
+    estimate_provider_request_bytes_div_four_raw(&projection, system_prompt, tools)
+}
+
+fn estimate_provider_request_bytes_div_four_raw(
+    messages: &[Message],
+    system_prompt: &Option<String>,
+    tools: &[ToolDefinition],
+) -> u64 {
+    serde_json::to_vec(&(messages, system_prompt, tools))
+        .map(|encoded| {
+            u64::try_from(encoded.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(3)
+                / 4
+        })
+        .unwrap_or(u64::MAX)
+}
+
 fn estimate_provider_request_input_tokens_raw(
     messages: &[Message],
     system_prompt: &Option<String>,
     tools: &[ToolDefinition],
     _attachments: &[ResolvedAttachment],
 ) -> u64 {
+    estimate_provider_request_input_measure_raw(messages, system_prompt, tools, _attachments).tokens
+}
+
+fn estimate_provider_request_input_measure_raw(
+    messages: &[Message],
+    system_prompt: &Option<String>,
+    tools: &[ToolDefinition],
+    _attachments: &[ResolvedAttachment],
+) -> RequestInputMeasure {
     let bytes = serde_json::to_vec(&(messages, system_prompt, tools))
         .map(|encoded| u64::try_from(encoded.len()).unwrap_or(u64::MAX))
         .unwrap_or(u64::MAX);
@@ -10348,7 +10641,10 @@ fn estimate_provider_request_input_tokens_raw(
     let image_tokens = u64::try_from(image_count)
         .unwrap_or(u64::MAX)
         .saturating_mul(VISION_IMAGE_ESTIMATE_TOKENS);
-    (bytes.saturating_add(3) / 4).saturating_add(image_tokens)
+    RequestInputMeasure {
+        bytes,
+        tokens: (bytes.saturating_add(3) / 4).saturating_add(image_tokens),
+    }
 }
 
 #[cfg(test)]

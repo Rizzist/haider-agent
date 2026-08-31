@@ -292,6 +292,7 @@ fn main() {
                 summary_artifact: haider_protocol::ids::ArtifactRef::new("blake3:demo"),
                 tokens_before: Some(170_000),
                 tokens_after: Some(12_000),
+                tokens_estimated: false,
             },
         }),
     )));

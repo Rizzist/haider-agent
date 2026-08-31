@@ -697,11 +697,16 @@ async fn live_web_search_executes_on_lite_with_the_turn_identity_and_bounds_its_
         .expect("search result");
     assert!(result.truncated, "40 KiB of answer exceeds the 32 KiB cap");
     assert!(
-        result.preview.ends_with("[web_search: output truncated]"),
+        result.preview.contains("\"haider_elision_v1\""),
         "the cap is honest: {}",
         &result.preview[result.preview.len().saturating_sub(80)..]
     );
-    assert!(result.preview.len() <= 32 * 1024 + 64);
+    assert!(
+        result
+            .preview
+            .contains("\"scope\":\"web_search_output_cap\"")
+    );
+    assert!(result.preview.len() <= 32 * 1024);
 }
 
 /// LAW (LW4 client half, degrade): a 404/410 from the unofficial

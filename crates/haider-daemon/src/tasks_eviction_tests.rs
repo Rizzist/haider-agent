@@ -4,6 +4,22 @@ use super::*;
 use crate::session_hub::SessionHubConfig;
 use haider_core::SqliteStoreHandle;
 
+#[test]
+fn started_command_summary_keeps_identity_tail_and_machine_marker() {
+    let command = format!(
+        "cargo test --locked {} -- final-diagnostic",
+        "very-long-argument ".repeat(200)
+    );
+    let first = bounded_task_command(&command);
+    let second = bounded_task_command(&command);
+    assert_eq!(first, second);
+    assert!(first.len() <= TASK_COMMAND_SUMMARY_BYTES);
+    assert!(first.starts_with("cargo test --locked"));
+    assert!(first.ends_with(" -- final-diagnostic"));
+    assert!(first.contains("\"haider_elision_v1\""));
+    assert!(first.contains("\"scope\":\"background_task_command\""));
+}
+
 fn running_entry(task: &TaskId, output: SharedTaskOutput) -> TaskEntry {
     TaskEntry {
         task: task.clone(),

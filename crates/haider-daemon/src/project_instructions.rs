@@ -28,8 +28,7 @@ type DirectoryOpenError = std::io::Error;
 
 pub(crate) const MAX_PROJECT_INSTRUCTION_FILE_BYTES: usize = 48 * 1024;
 pub(crate) const MAX_PROJECT_INSTRUCTION_TOTAL_BYTES: usize = 96 * 1024;
-const MAX_PROJECT_INSTRUCTION_ANCESTORS: usize = 256;
-pub(crate) const TRUNCATION_MARKER: &str = "\n[truncated]";
+pub(crate) const MAX_PROJECT_INSTRUCTION_ANCESTORS: usize = 256;
 const CANDIDATE_NAMES: [&str; 2] = ["HAIDER.md", "AGENTS.md"];
 
 #[derive(Clone, PartialEq, Eq)]
@@ -104,9 +103,23 @@ fn load_blocking(canonical_cwd: &Path) -> Option<LoadedProjectInstructions> {
     let mut remaining = MAX_PROJECT_INSTRUCTION_TOTAL_BYTES;
 
     for depth in 0..MAX_PROJECT_INSTRUCTION_ANCESTORS {
-        if let Some(file) = load_directory_winner(&directory, &display_directory, remaining) {
-            remaining = remaining.saturating_sub(file.text.len());
-            nearest_first.push(file);
+        match load_directory_winner(&directory, &display_directory, remaining) {
+            CandidateRead::Loaded(file) => {
+                remaining = remaining.saturating_sub(file.text.len());
+                nearest_first.push(file);
+            }
+            CandidateRead::BudgetExceeded => {
+                push_budgeted_elision_marker(
+                    &mut nearest_first,
+                    &mut remaining,
+                    "[project instruction aggregate elision]",
+                    "project_instruction_aggregate_cap",
+                    1,
+                    None,
+                );
+                break;
+            }
+            CandidateRead::Missing | CandidateRead::Skipped => {}
         }
 
         let parent = match open_directory_at(&directory, Path::new("..")) {
@@ -143,6 +156,14 @@ fn load_blocking(canonical_cwd: &Path) -> Option<LoadedProjectInstructions> {
         directory = parent;
 
         if depth + 1 == MAX_PROJECT_INSTRUCTION_ANCESTORS {
+            push_budgeted_elision_marker(
+                &mut nearest_first,
+                &mut remaining,
+                "[project instruction ancestor-depth elision]",
+                "project_instruction_ancestor_depth_cap",
+                0,
+                Some((1, "ancestor_directory")),
+            );
             instruction_notice(canonical_cwd, "bounded ancestor depth reached");
         }
     }
@@ -156,24 +177,70 @@ fn load_blocking(canonical_cwd: &Path) -> Option<LoadedProjectInstructions> {
     })
 }
 
+fn push_budgeted_elision_marker(
+    nearest_first: &mut Vec<LoadedProjectInstruction>,
+    remaining: &mut usize,
+    path: &str,
+    scope: &str,
+    mut omitted_bytes_at_least: usize,
+    omitted_items: Option<(u64, &str)>,
+) {
+    let marker = loop {
+        let marker = omitted_items
+            .map_or_else(
+                || haider_tools::mark_text_elision("", 512, scope, omitted_bytes_at_least, false),
+                |(count, unit)| {
+                    haider_tools::mark_text_elision_with_items(
+                        "",
+                        512,
+                        scope,
+                        omitted_bytes_at_least,
+                        false,
+                        count,
+                        unit,
+                    )
+                },
+            )
+            .text;
+        if marker.len() <= *remaining {
+            break marker;
+        }
+        let Some(removed) = nearest_first.pop() else {
+            break marker;
+        };
+        *remaining = remaining.saturating_add(removed.text.len());
+        omitted_bytes_at_least = omitted_bytes_at_least.saturating_add(removed.text.len());
+    };
+    *remaining = remaining.saturating_sub(marker.len());
+    let digest = blake3::hash(marker.as_bytes()).to_hex().to_string();
+    nearest_first.push(LoadedProjectInstruction {
+        path: path.into(),
+        text: marker,
+        digest,
+        truncated: true,
+    });
+}
+
 fn load_directory_winner(
     directory: &DirectoryHandle,
     display_directory: &Path,
     remaining: usize,
-) -> Option<LoadedProjectInstruction> {
+) -> CandidateRead {
     for name in CANDIDATE_NAMES {
         let display_path = display_directory.join(name);
         match read_candidate(directory, name, &display_path, remaining) {
-            CandidateRead::Loaded(file) => return Some(file),
+            CandidateRead::Loaded(file) => return CandidateRead::Loaded(file),
+            CandidateRead::BudgetExceeded => return CandidateRead::BudgetExceeded,
             CandidateRead::Missing | CandidateRead::Skipped => {}
         }
     }
-    None
+    CandidateRead::Missing
 }
 
 enum CandidateRead {
     Missing,
     Skipped,
+    BudgetExceeded,
     Loaded(LoadedProjectInstruction),
 }
 
@@ -237,13 +304,17 @@ fn read_candidate_platform(
         );
         return CandidateRead::Skipped;
     }
+    if cap == 0 && !bytes.is_empty() {
+        return CandidateRead::BudgetExceeded;
+    }
 
-    let Some((text, truncated)) = bounded_utf8(bytes, cap) else {
-        instruction_notice(
-            display_path,
-            "instruction file was not valid bounded UTF-8 or no truncation marker fit",
-        );
-        return CandidateRead::Skipped;
+    let (text, truncated) = match bounded_utf8(bytes, cap) {
+        BoundedUtf8::Loaded(text, truncated) => (text, truncated),
+        BoundedUtf8::MarkerDoesNotFit => return CandidateRead::BudgetExceeded,
+        BoundedUtf8::InvalidUtf8 => {
+            instruction_notice(display_path, "instruction file was not valid bounded UTF-8");
+            return CandidateRead::Skipped;
+        }
     };
     let Some(path) = display_path.to_str() else {
         instruction_notice(display_path, "instruction path is not UTF-8");
@@ -310,12 +381,16 @@ fn read_candidate_platform(
 
 #[cfg(windows)]
 fn loaded_candidate(display_path: &Path, bytes: Vec<u8>, cap: usize) -> CandidateRead {
-    let Some((text, truncated)) = bounded_utf8(bytes, cap) else {
-        instruction_notice(
-            display_path,
-            "instruction file was not valid bounded UTF-8 or no truncation marker fit",
-        );
-        return CandidateRead::Skipped;
+    if cap == 0 && !bytes.is_empty() {
+        return CandidateRead::BudgetExceeded;
+    }
+    let (text, truncated) = match bounded_utf8(bytes, cap) {
+        BoundedUtf8::Loaded(text, truncated) => (text, truncated),
+        BoundedUtf8::MarkerDoesNotFit => return CandidateRead::BudgetExceeded,
+        BoundedUtf8::InvalidUtf8 => {
+            instruction_notice(display_path, "instruction file was not valid bounded UTF-8");
+            return CandidateRead::Skipped;
+        }
     };
     let Some(path) = display_path.to_str() else {
         instruction_notice(display_path, "instruction path is not UTF-8");
@@ -330,25 +405,40 @@ fn loaded_candidate(display_path: &Path, bytes: Vec<u8>, cap: usize) -> Candidat
     })
 }
 
-fn bounded_utf8(bytes: Vec<u8>, cap: usize) -> Option<(String, bool)> {
+enum BoundedUtf8 {
+    Loaded(String, bool),
+    MarkerDoesNotFit,
+    InvalidUtf8,
+}
+
+fn bounded_utf8(bytes: Vec<u8>, cap: usize) -> BoundedUtf8 {
     if bytes.len() <= cap {
-        return String::from_utf8(bytes).ok().map(|text| (text, false));
+        return String::from_utf8(bytes)
+            .map(|text| BoundedUtf8::Loaded(text, false))
+            .unwrap_or(BoundedUtf8::InvalidUtf8);
     }
-    if cap < TRUNCATION_MARKER.len() {
-        return None;
-    }
-    let prefix_budget = cap - TRUNCATION_MARKER.len();
-    let candidate = &bytes[..prefix_budget];
+    let candidate = &bytes[..cap];
     let prefix_end = match std::str::from_utf8(candidate) {
         Ok(_) => candidate.len(),
         Err(error) if error.error_len().is_none() => error.valid_up_to(),
-        Err(_) => return None,
+        Err(_) => return BoundedUtf8::InvalidUtf8,
     };
-    let prefix = std::str::from_utf8(&candidate[..prefix_end]).ok()?;
-    let mut text = String::with_capacity(prefix.len() + TRUNCATION_MARKER.len());
-    text.push_str(prefix);
-    text.push_str(TRUNCATION_MARKER);
-    Some((text, true))
+    let Ok(prefix) = std::str::from_utf8(&candidate[..prefix_end]) else {
+        return BoundedUtf8::InvalidUtf8;
+    };
+    let omitted_bytes_at_least = bytes.len().saturating_sub(prefix.len());
+    let elided = haider_tools::mark_text_elision(
+        prefix,
+        cap,
+        "project_instruction_file_cap",
+        omitted_bytes_at_least,
+        false,
+    );
+    if elided.text.len() <= cap {
+        BoundedUtf8::Loaded(elided.text, true)
+    } else {
+        BoundedUtf8::MarkerDoesNotFit
+    }
 }
 
 #[cfg(unix)]

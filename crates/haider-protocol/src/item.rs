@@ -12,6 +12,10 @@ use crate::history::TodoItem;
 use crate::ids::{AgentId, ArtifactRef, ItemId};
 use serde::{Deserialize, Serialize};
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Durable extension kind linking a command item to direct composer origin.
 ///
 /// This deliberately uses the existing [`TurnItem::Extension`] escape hatch
@@ -122,6 +126,10 @@ pub enum TurnItem {
         /// Context footprint after compaction, in tokens (see above).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tokens_after: Option<u64>,
+        /// True when the counts use a documented local estimate rather than a
+        /// model tokenizer or provider-reported request-local usage.
+        #[serde(default, skip_serializing_if = "is_false")]
+        tokens_estimated: bool,
     },
     Extension {
         kind: String,

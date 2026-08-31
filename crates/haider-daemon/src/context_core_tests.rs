@@ -11,7 +11,9 @@ use haider_core::{
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
-use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
+use haider_protocol::context::{
+    ContextFootprint, ContextFootprintTruth, ContextSavingsEvent, ContextSavingsMeasurement,
+};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
@@ -1077,6 +1079,35 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
         })
         .next_back()
         .expect("manual compaction reset footprint");
+    let (savings_seq, savings) = payloads
+        .iter()
+        .filter_map(|(seq, payload)| match payload {
+            EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                ContextSavingsEvent::from_extension_item(item).map(|savings| (*seq, savings))
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("manual compaction savings record");
+    assert!(savings_seq > compaction_seq);
+    let (tier, removed_tool_call_ids) = savings
+        .conversation()
+        .expect("manual compaction is conversation-level");
+    assert_eq!(
+        tier,
+        haider_protocol::context::ContextCompactionTier::Summarize
+    );
+    assert!(removed_tool_call_ids.is_empty());
+    assert_eq!(
+        savings.estimated_tokens_saved,
+        savings
+            .estimated_tokens_before
+            .saturating_sub(savings.estimated_tokens_after)
+    );
+    assert_eq!(
+        savings.measurement,
+        ContextSavingsMeasurement::ProviderRequestBytesDivFourV1
+    );
     assert!(reset_seq > compaction_seq);
     assert_eq!(reset.truth, ContextFootprintTruth::Estimated);
     assert_eq!(reset.context_window, Some(32_000));

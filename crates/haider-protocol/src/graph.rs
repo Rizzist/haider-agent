@@ -2317,12 +2317,11 @@ impl GraphStatus {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
-            let mut line = format!(
+            let line = format!(
                 "GraphBrief: todo run-set {} {}/{} terminal; children [{}]. Record evidence against the child graph_id and its open stage.",
                 run_set.run_set_id, run_set.terminal_children, run_set.required_children, children,
             );
-            truncate_utf8(&mut line, GRAPH_BRIEF_MAX_BYTES);
-            return Some(line);
+            return Some(bound_graph_brief(line));
         }
         let node = self.current_node.as_ref()?;
         let node_status = self.nodes.iter().find(|status| &status.node == node)?;
@@ -2355,7 +2354,7 @@ impl GraphStatus {
                 .collect::<Vec<_>>()
                 .join(",")
         };
-        let mut line = format!(
+        let line = format!(
             "GraphBrief: {} attempt {}/{}; graph_id={}; ready={}; gate {}; evidence {} green/{} red ({} effective); next: {}.",
             node.label(),
             node_status.current_attempt.unwrap_or(self.attempt),
@@ -2368,8 +2367,7 @@ impl GraphStatus {
             node_status.evidence.effective_green,
             expectation,
         );
-        truncate_utf8(&mut line, GRAPH_BRIEF_MAX_BYTES);
-        Some(line)
+        Some(bound_graph_brief(line))
     }
 
     #[must_use]
@@ -2384,6 +2382,11 @@ impl GraphStatus {
     fn node_mut(&mut self, node: &GraphNodeName) -> Option<&mut GraphNodeStatus> {
         self.nodes.iter_mut().find(|status| &status.node == node)
     }
+}
+
+fn bound_graph_brief(line: String) -> String {
+    crate::context::elide_text_head_tail(&line, GRAPH_BRIEF_MAX_BYTES, "graph_brief")
+        .map_or(line, |elided| elided.text)
 }
 
 /// Read-facing projection of one todo-bound child graph.
@@ -5179,6 +5182,22 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(evidence_fingerprint(&a), evidence_fingerprint(&b));
         assert!(normalize_evidence_detail(&"🦀".repeat(1_000)).len() <= 1_024);
+    }
+
+    #[test]
+    fn oversized_graph_brief_keeps_both_ends_with_a_machine_marker() {
+        let source = format!(
+            "GraphBrief: BUILD {} next: verify the final diagnostic.",
+            "middle ".repeat(200)
+        );
+        let first = bound_graph_brief(source.clone());
+        let second = bound_graph_brief(source);
+        assert_eq!(first, second);
+        assert!(first.len() <= GRAPH_BRIEF_MAX_BYTES);
+        assert!(first.starts_with("GraphBrief: BUILD"));
+        assert!(first.ends_with("next: verify the final diagnostic."));
+        assert!(first.contains("\"haider_elision_v1\""));
+        assert!(first.contains("\"scope\":\"graph_brief\""));
     }
 
     #[test]

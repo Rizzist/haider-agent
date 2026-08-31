@@ -876,11 +876,13 @@ async fn hard_output_cap_terminates_the_process_group_and_reports_the_ledgered_l
     let (mut broker, journal) = broker(workspace.path());
     let output = RecordingOutput::default();
     let output_observer = output.observer();
+    let cas = RecordingCas::default();
+    let cas_observer = cas.observer();
     let result = broker
         .process_exec(
             &ProcessExec::new("output-cap", "/usr/bin/head -c 1048576 /dev/zero"),
             &process_policy(),
-            RecordingCas::default(),
+            cas,
             output,
             ProcessBounds {
                 max_inline_bytes: 2048,
@@ -899,17 +901,35 @@ async fn hard_output_cap_terminates_the_process_group_and_reports_the_ledgered_l
         result.limit_reached,
         Some(haider_tools::ProcessLimit::OutputCap)
     );
-    assert_eq!(result.output_bytes, 4096);
+    assert!(result.output_bytes > 4096);
+    assert!(result.output_bytes <= 4096 + PROCESS_OUTPUT_CHUNK_BYTES);
     assert_eq!(
         result.transcript_digest,
-        format!("blake3:{}", blake3::hash(&vec![0_u8; 4096]).to_hex())
+        format!(
+            "blake3:{}",
+            blake3::hash(&vec![0_u8; result.output_bytes]).to_hex()
+        )
     );
     assert_eq!(result.max_output_bytes, 4096);
     assert_eq!(
         output_bytes(&output_observer.lock().expect("output observer")).len(),
-        4096,
-        "streaming must stop exactly at the hard cap"
+        result.output_bytes,
+        "every byte accepted before termination must stay in the durable stream"
     );
+    {
+        let artifacts = cas_observer.lock().expect("CAS observer");
+        assert_eq!(artifacts.len(), 1);
+        let transcript: Vec<ProcessOutputChunk> =
+            serde_json::from_slice(&artifacts[0]).expect("raw CAS transcript");
+        assert_eq!(
+            transcript
+                .iter()
+                .map(|chunk| BASE64.decode(&chunk.chunk_b64).expect("base64").len())
+                .sum::<usize>(),
+            result.output_bytes,
+            "CAS spill must retain the same raw bytes as the journal deltas"
+        );
+    }
     assert!(phases(&journal).iter().any(|phase| matches!(
         phase,
         EffectPhase::Intent(intent)

@@ -4,10 +4,10 @@ use async_trait::async_trait;
 use haider_core::{
     ArtifactReader, CommittedRange, ContextCompactionRequest, ContextCompactor, FinalizationGuard,
     FinalizationGuardDecision, HarnessActor, HarnessConfig, HarnessHandle, MemoryStore,
-    ProviderAttemptDecision, ProviderAttemptResolver, ProviderPairSwitch, ProviderPairSwitchCause,
-    ProviderPairSwitchCommitter, ProviderPairSwitchTarget, ResolvedProviderAttempt, StoreHandle,
-    SubmitCommittedTurn, SubmitTurn, ToolDispatchResult, ToolDispatcher,
-    VISION_IMAGE_ESTIMATE_TOKENS, estimate_provider_request_input_tokens,
+    PromptHistoryCompiler, ProviderAttemptDecision, ProviderAttemptResolver, ProviderPairSwitch,
+    ProviderPairSwitchCause, ProviderPairSwitchCommitter, ProviderPairSwitchTarget,
+    ResolvedProviderAttempt, StoreHandle, SubmitCommittedTurn, SubmitTurn, ToolDispatchResult,
+    ToolDispatcher, VISION_IMAGE_ESTIMATE_TOKENS, estimate_provider_request_input_tokens,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
@@ -1428,8 +1428,11 @@ async fn fast_mode_structurally_trims_whole_stale_pairs_while_default_mode_does_
             _ => None,
         })
         .expect("durable structural savings event");
-    assert_eq!(savings.tier, ContextCompactionTier::StructuralTrim24);
-    assert_eq!(savings.removed_tool_call_ids.len(), 6);
+    let (tier, removed_tool_call_ids) = savings
+        .conversation()
+        .expect("structural saving is conversation-level");
+    assert_eq!(tier, ContextCompactionTier::StructuralTrim24);
+    assert_eq!(removed_tool_call_ids.len(), 6);
     assert!(savings.estimated_tokens_saved > 0);
 
     let default_provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
@@ -4181,6 +4184,33 @@ struct DurableRunningToolDispatcher {
     observed: AtomicBool,
 }
 
+struct TruncatedToolDispatcher;
+
+#[async_trait]
+impl ToolDispatcher for TruncatedToolDispatcher {
+    async fn execute(
+        &self,
+        _run_id: &RunId,
+        _item_id: &ItemId,
+        _call_id: &str,
+        _name: &str,
+        _args: serde_json::Value,
+        _cancel: &haider_core::CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        Ok(ToolDispatchResult::Completed(BoundedResult {
+            preview: format!("HEAD:{}:TAIL_FAILURE", "x".repeat(10_000)),
+            truncated: true,
+            data: None,
+            artifact: None,
+            images: Vec::new(),
+            cursor: None,
+            status: haider_protocol::tool::ToolResultStatus::Completed,
+            reason: None,
+            presentation: None,
+        }))
+    }
+}
+
 #[async_trait]
 impl ToolDispatcher for DurableRunningToolDispatcher {
     async fn execute(
@@ -4404,6 +4434,114 @@ async fn completed_tool_settlement_is_atomic_after_durable_running_tool() {
             EventPayload::RunState(RunState::Streaming)
         ] if result == "atomic-tool" && completed == "atomic-tool"
     ));
+
+    handle.stop().await.expect("actor stops");
+    actor_task.await.expect("actor joins");
+}
+
+#[tokio::test]
+async fn output_savings_is_one_atomic_child_event_and_replay_uses_only_the_bounded_projection() {
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "accounted-tool".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"path":"src/lib.rs"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "accounted-tool".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(BatchRecordingStore::new());
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        config(),
+        provider.clone(),
+        store.clone(),
+        Some(Arc::new(TruncatedToolDispatcher)),
+    );
+    let actor_task = tokio::spawn(actor.run());
+
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("account one bounded output"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+
+    let settlement = store
+        .batches()
+        .into_iter()
+        .find(|batch| {
+            batch.iter().any(|payload| {
+                matches!(payload, EventPayload::ToolResult { call_id, .. } if call_id == "accounted-tool")
+            })
+        })
+        .expect("tool settlement batch");
+    let [
+        EventPayload::ToolResult { result, .. },
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: tool_item_id,
+            item: TurnItem::ToolCall { .. },
+        }),
+        EventPayload::Item(ItemEvent::Started {
+            item_id: savings_started_id,
+            item: savings_started,
+        }),
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: savings_completed_id,
+            item: savings_completed,
+        }),
+        EventPayload::NodeCommitted(_),
+        EventPayload::RunState(RunState::Streaming),
+    ] = settlement.as_slice()
+    else {
+        panic!("truncated tool settlement must atomically carry one savings extension")
+    };
+    assert!(result.preview.ends_with("TAIL_FAILURE"));
+    assert!(!result.preview.contains("haider_elision_v1"));
+    assert_eq!(savings_started_id, savings_completed_id);
+    assert_eq!(savings_started, savings_completed);
+    let savings = ContextSavingsEvent::from_extension_item(savings_completed)
+        .expect("typed output savings extension");
+    let output = savings.tool_output().expect("output-level child");
+    assert_eq!(
+        output.source_item_id.as_deref(),
+        Some(tool_item_id.as_str())
+    );
+    assert!(savings.estimated_tokens_saved > 0);
+    assert_eq!(savings.session_operation_count, 1);
+    assert_eq!(
+        savings.session_cumulative_estimated_tokens_saved,
+        savings.estimated_tokens_saved
+    );
+
+    let requests = provider.requests();
+    let projected_result = requests[1]
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .find_map(|block| match block {
+            Block::ToolResult { preview, .. } => Some(preview),
+            _ => None,
+        })
+        .expect("second request carries the tool result");
+    assert!(projected_result.contains("haider_elision_v1"));
+    assert!(projected_result.ends_with("TAIL_FAILURE"));
+    assert!(!projected_result.contains(&"x".repeat(9_000)));
+
+    let recovered =
+        PromptHistoryCompiler::latest_context_economy(store.as_ref(), &SessionId::new(SESSION))
+            .await
+            .expect("savings journal reduces")
+            .expect("savings coordinate exists");
+    assert_eq!(recovered.last_output_event.as_ref(), Some(&savings));
 
     handle.stop().await.expect("actor stops");
     actor_task.await.expect("actor joins");

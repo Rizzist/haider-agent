@@ -1236,13 +1236,13 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // computer manifest description. Linux documents X11/Wayland (+49 bytes
     // over macOS), while Windows is one byte shorter than macOS.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_997;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_999;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_948;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_950;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_947;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_949;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_942;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_944;
     const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 11_246;
 
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
@@ -1313,7 +1313,7 @@ fn loom_run_tail_teaches_typed_nodes() {
     assert!(tail.contains("daemon-scoped typed nodes"), "{tail}");
 }
 
-/// Review round 2 MUTATION CHECK: put the ellipsis OUTSIDE the cap again.
+/// Review round 2 MUTATION CHECK: put the marker outside the cap again.
 /// Expected RUNTIME failure: a long workflow's tail exceeds 1200 bytes.
 #[test]
 fn loom_run_tail_cap_includes_the_ellipsis() {
@@ -1332,7 +1332,8 @@ fn loom_run_tail_cap_includes_the_ellipsis() {
         "cap must be honest: {} bytes",
         tail.len()
     );
-    assert!(tail.ends_with('…'), "long tail must mark truncation");
+    assert!(tail.contains("\"haider_elision_v1\""), "{tail}");
+    assert!(tail.contains("\"scope\":\"loom_workflow_tail\""), "{tail}");
 }
 
 /// Review round 2 MUTATION CHECK: drop the chaining check or the first-token
@@ -1525,7 +1526,11 @@ fn loom_inventory_rides_the_tail_bounded() {
         .collect();
     let capped = loom_inventory_line(&many, &[workflow]).expect("still teaches");
     assert!(capped.len() <= 700, "cap must hold: {} bytes", capped.len());
-    assert!(capped.ends_with('…'), "truncation must be marked");
+    assert!(capped.contains("\"haider_elision_v1\""), "{capped}");
+    assert!(
+        capped.contains("\"scope\":\"loom_registry_inventory\""),
+        "{capped}"
+    );
 }
 
 /// E2 MUTATION CHECK: let loom_register through without a presented,
@@ -1598,9 +1603,13 @@ fn agent_type_identity_line_is_bounded_and_names_the_signature() {
     );
     record.job = "j".repeat(2_000);
     let line = crate::worker::agent_type_identity_line(&record);
-    assert!(line.ends_with('…'), "truncation is marked");
+    assert!(line.contains("\"haider_elision_v1\""), "{line}");
     assert!(
-        line.len() < 800,
+        line.contains("\"scope\":\"loom_agent_type_identity\""),
+        "{line}"
+    );
+    assert!(
+        line.len() <= 800,
         "the tail line stays bounded: {}",
         line.len()
     );
