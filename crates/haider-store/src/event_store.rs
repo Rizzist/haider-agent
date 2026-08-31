@@ -218,6 +218,16 @@ pub struct CommittedSeqRange {
     pub last_seq: u64,
 }
 
+/// Allocation-light coordinates for one durable hook-dispatch outbox row.
+/// The authoritative envelope remains in `events` until a caller explicitly
+/// asks to decode this coordinate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingHookDispatchMetadata {
+    pub session_id: SessionId,
+    pub seq: u64,
+    pub payload_kind: Option<String>,
+}
+
 /// One payload-kind-filtered reducer page plus the committed journal head
 /// observed under the same connection lock. The head carries only indexed
 /// coordinates, so a reducer can advance across an irrelevant suffix without
@@ -11708,6 +11718,133 @@ impl Store {
         Ok(envelopes)
     }
 
+    /// Reads one metadata-only page of a session's durable hook outbox after
+    /// its last sequence cursor. No authoritative envelope bytes are fetched
+    /// or decoded by this query.
+    ///
+    /// The first row is always returned when `limit > 0`, even when its
+    /// encoded envelope exceeds `byte_budget`. The encoded length is used
+    /// only to retain the same forward-progress and page-bound contract as
+    /// [`Self::pending_hook_dispatches_bounded`].
+    pub fn pending_hook_dispatch_metadata_bounded(
+        &self,
+        session_id: &SessionId,
+        after_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+    ) -> StoreResult<Vec<PendingHookDispatchMetadata>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let after_seq = i64::try_from(after_seq).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT e.session_id, e.seq, e.payload_kind,
+                        length(e.envelope_json)
+                 FROM hook_dispatch_outbox AS o
+                 JOIN events AS e
+                   ON e.session_id = o.session_id AND e.seq = o.seq
+                 WHERE o.session_id = ?1 AND o.seq > ?2
+                 ORDER BY o.seq ASC
+                 LIMIT ?3",
+            )
+            .map_err(map_sqlite_error)?;
+        let mut rows = statement
+            .query(rusqlite::params![session_id.as_str(), after_seq, limit])
+            .map_err(map_sqlite_error)?;
+        let mut metadata = Vec::new();
+        let mut encoded_bytes = 0_usize;
+        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+            let session_id = row.get::<_, String>(0).map_err(map_sqlite_error)?;
+            let seq = row.get::<_, i64>(1).map_err(map_sqlite_error)?;
+            let payload_kind = row.get::<_, Option<String>>(2).map_err(map_sqlite_error)?;
+            let encoded_len = row.get::<_, i64>(3).map_err(map_sqlite_error)?;
+            let seq = u64::try_from(seq)
+                .map_err(|_| corrupt("hook outbox contains a negative event sequence"))?;
+            let encoded_len = usize::try_from(encoded_len)
+                .map_err(|_| corrupt("hook outbox contains an invalid envelope length"))?;
+            if !metadata.is_empty() && encoded_bytes.saturating_add(encoded_len) > byte_budget {
+                break;
+            }
+            encoded_bytes = encoded_bytes.saturating_add(encoded_len);
+            metadata.push(PendingHookDispatchMetadata {
+                session_id: SessionId::new(session_id),
+                seq,
+                payload_kind,
+            });
+            if encoded_bytes >= byte_budget {
+                break;
+            }
+        }
+        Ok(metadata)
+    }
+
+    /// Lists sessions that currently own at least one durable hook outbox
+    /// row without loading event-envelope bytes.
+    pub fn pending_hook_dispatch_session_ids(&self) -> StoreResult<Vec<SessionId>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT DISTINCT session_id
+                 FROM hook_dispatch_outbox
+                 ORDER BY session_id ASC",
+            )
+            .map_err(map_sqlite_error)?;
+        let mut rows = statement.query([]).map_err(map_sqlite_error)?;
+        let mut session_ids = Vec::new();
+        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+            let session_id = row.get::<_, String>(0).map_err(map_sqlite_error)?;
+            session_ids.push(SessionId::new(session_id));
+        }
+        Ok(session_ids)
+    }
+
+    /// Decodes one still-pending authoritative hook envelope. Returning
+    /// `None` is an idempotent acknowledgement race, not missing journal
+    /// truth: the join requires the durable outbox row to remain present.
+    pub fn pending_hook_dispatch_envelope(
+        &self,
+        session_id: &SessionId,
+        seq: u64,
+    ) -> StoreResult<Option<RawEnvelope>> {
+        let connection = self.connection()?;
+        let stored_seq = i64::try_from(seq).map_err(|_| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                "hook dispatch sequence does not fit SQLite INTEGER",
+                false,
+            )
+        })?;
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT e.envelope_json
+                 FROM hook_dispatch_outbox AS o
+                 JOIN events AS e
+                   ON e.session_id = o.session_id AND e.seq = o.seq
+                 WHERE o.session_id = ?1 AND o.seq = ?2",
+            )
+            .map_err(map_sqlite_error)?;
+        let mut rows = statement
+            .query(rusqlite::params![session_id.as_str(), stored_seq])
+            .map_err(map_sqlite_error)?;
+        let Some(row) = rows.next().map_err(map_sqlite_error)? else {
+            return Ok(None);
+        };
+        let envelope = decode_envelope_column(row, 0).map_err(|error| {
+            corrupt(format!(
+                "invalid hook-outbox envelope for session {session_id}, seq {seq}: {error}"
+            ))
+        })?;
+        if envelope.session_id != *session_id || envelope.seq != seq {
+            return Err(corrupt(
+                "hook outbox coordinates disagree with the authoritative envelope",
+            ));
+        }
+        Ok(Some(envelope))
+    }
+
     /// Reports whether any committed hook input for one session still awaits
     /// dispatch. Session deletion uses this after its actor FIFO fence so a
     /// coalesced wake can never be erased together with the authoritative
@@ -11722,6 +11859,19 @@ impl Store {
                      LIMIT 1
                  )",
                 [session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)
+    }
+
+    /// Reports whether any durable hook-dispatch row remains, without
+    /// reading or decoding an event envelope.
+    pub fn has_any_pending_hook_dispatches(&self) -> StoreResult<bool> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM hook_dispatch_outbox LIMIT 1)",
+                [],
                 |row| row.get(0),
             )
             .map_err(map_sqlite_error)

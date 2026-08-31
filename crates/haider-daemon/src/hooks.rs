@@ -15,6 +15,9 @@
 #[path = "hooks_server.rs"]
 mod hooks_server;
 #[cfg(test)]
+#[path = "hook_dispatch_peak_rss_tests.rs"]
+mod peak_rss_tests;
+#[cfg(test)]
 #[path = "hooks_tests.rs"]
 mod tests;
 
@@ -52,7 +55,7 @@ use std::io::{Read, Write};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -266,7 +269,7 @@ enum HookSource {
     Profile,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct HookDefinition {
     name: String,
     matcher: HookMatcher,
@@ -297,6 +300,7 @@ struct Discovery {
     hooks: BTreeMap<String, HookDefinition>,
     notices: Vec<HookNotice>,
     policy: HookTrustPolicy,
+    config_changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,11 +341,17 @@ struct HookServiceInner {
     /// Canonical workspace → mtime-keyed discovery result. Decision hooks
     /// deliberately bypass this cache again immediately before execution.
     discovery_cache: Mutex<HashMap<PathBuf, CachedDiscovery>>,
+    /// A newly discovered non-empty or invalid hook document can make rows
+    /// behind the metadata cursor relevant. The next drain restarts at the
+    /// durable beginning exactly once for that discovery change.
+    dispatch_rescan_required: AtomicBool,
     next_event: AtomicU64,
     #[cfg(test)]
     snapshot_persist_count: AtomicU64,
     #[cfg(test)]
     discovery_stamp_count: AtomicU64,
+    #[cfg(test)]
+    dispatch_metadata_scan_count: AtomicU64,
 }
 
 impl HookService {
@@ -353,6 +363,18 @@ impl HookService {
     #[cfg(test)]
     fn discovery_stamp_count(&self) -> u64 {
         self.inner.discovery_stamp_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn dispatch_decode_count(&self) -> u64 {
+        self.inner.store.hook_dispatch_decode_count()
+    }
+
+    #[cfg(test)]
+    fn dispatch_metadata_scan_count(&self) -> u64 {
+        self.inner
+            .dispatch_metadata_scan_count
+            .load(Ordering::Relaxed)
     }
 
     pub(crate) fn downgrade(&self) -> WeakHookService {
@@ -505,6 +527,13 @@ impl HookService {
                 decision: definition.decision,
                 timeout_ms: duration_ms(definition.timeout),
             });
+        }
+        if hooks.iter().any(|hook| hook.trusted) {
+            // A hook file may appear while no events are committing. The
+            // durable rows intentionally retained by the no-hook fast path
+            // must become eligible as soon as an explicit list observes the
+            // newly installed definitions.
+            self.inner.committed_wake.send_modify(|_| {});
         }
         Ok((discovery.policy, revision, hooks))
     }
@@ -892,11 +921,14 @@ impl HookEngine {
                 workspace_baselines: Mutex::new(workspace_baselines),
                 observed_trusted: Mutex::new(observed_trusted),
                 discovery_cache: Mutex::new(HashMap::new()),
+                dispatch_rescan_required: AtomicBool::new(false),
                 next_event: AtomicU64::new(0),
                 #[cfg(test)]
                 snapshot_persist_count: AtomicU64::new(0),
                 #[cfg(test)]
                 discovery_stamp_count: AtomicU64::new(0),
+                #[cfg(test)]
+                dispatch_metadata_scan_count: AtomicU64::new(0),
             }),
         };
         let manager_service = service.clone();
@@ -1628,7 +1660,16 @@ async fn run_engine(
 ) {
     let mut jobs = JoinSet::new();
     let inflight_dispatches = Arc::new(Mutex::new(HookDispatchFlights::default()));
-    if !replay_pending_dispatches(&service, &mut state, &mut jobs, &inflight_dispatches).await {
+    let mut dispatch_scan_after_seq = HashMap::new();
+    if !replay_pending_dispatches(
+        &service,
+        &mut state,
+        &mut jobs,
+        &inflight_dispatches,
+        &mut dispatch_scan_after_seq,
+    )
+    .await
+    {
         state.subscribers.clear();
         jobs.abort_all();
         while jobs.join_next().await.is_some() {}
@@ -1657,14 +1698,17 @@ async fn run_engine(
                     "draining durable hook outbox wake"
                 );
                 if matches!(
-                    drain_hook_dispatch_page(
-                        &service,
-                        &mut state,
-                        &mut jobs,
-                        &mut snapshot_schedule,
-                        &mut blocked_run_acks,
-                        &inflight_dispatches,
-                    ).await,
+                    drain_hook_dispatch_page(HookDrainContext {
+                        service: &service,
+                        state: &mut state,
+                        jobs: &mut jobs,
+                        snapshot_schedule: &mut snapshot_schedule,
+                        blocked_run_acks: &mut blocked_run_acks,
+                        inflight_dispatches: &inflight_dispatches,
+                        allow_deferred_servers: true,
+                        scan_after_seq: &mut dispatch_scan_after_seq,
+                        force_ack_no_hooks_for: None,
+                    }).await,
                     HookDrainPage::Progress
                 ) && controls.is_empty()
                 {
@@ -1692,12 +1736,17 @@ async fn run_engine(
                         completed,
                     } => {
                         let result = drain_hook_dispatches_through_session(
-                            &service,
-                            &mut state,
-                            &mut jobs,
-                            &mut snapshot_schedule,
-                            &mut blocked_run_acks,
-                            &inflight_dispatches,
+                            HookDrainContext {
+                                service: &service,
+                                state: &mut state,
+                                jobs: &mut jobs,
+                                snapshot_schedule: &mut snapshot_schedule,
+                                blocked_run_acks: &mut blocked_run_acks,
+                                inflight_dispatches: &inflight_dispatches,
+                                allow_deferred_servers: true,
+                                scan_after_seq: &mut dispatch_scan_after_seq,
+                                force_ack_no_hooks_for: Some(&session_id),
+                            },
                             &session_id,
                         ).await;
                         let _ = completed.send(result);
@@ -1708,9 +1757,11 @@ async fn run_engine(
                             service.inner.servers.kill_digest(&change.digest);
                             state.subscribers.retain(|_, handle| handle.digest != change.digest);
                         }
+                        dispatch_scan_after_seq.clear();
                         service.inner.committed_wake.send_modify(|_| {});
                     }
                     EngineMessage::SessionDeleted(session_id) => {
+                        dispatch_scan_after_seq.remove(&session_id);
                         state.sessions.remove(&session_id);
                         state.through_seq.remove(&session_id);
                         state.through_digest.remove(&session_id);
@@ -1740,14 +1791,17 @@ async fn run_engine(
                     }
                     EngineMessage::Shutdown(done) => {
                         while matches!(
-                            drain_hook_dispatch_page(
-                                &service,
-                                &mut state,
-                                &mut jobs,
-                                &mut snapshot_schedule,
-                                &mut blocked_run_acks,
-                                &inflight_dispatches,
-                            ).await,
+                            drain_hook_dispatch_page(HookDrainContext {
+                                service: &service,
+                                state: &mut state,
+                                jobs: &mut jobs,
+                                snapshot_schedule: &mut snapshot_schedule,
+                                blocked_run_acks: &mut blocked_run_acks,
+                                inflight_dispatches: &inflight_dispatches,
+                                allow_deferred_servers: true,
+                                scan_after_seq: &mut dispatch_scan_after_seq,
+                                force_ack_no_hooks_for: None,
+                            }).await,
                             HookDrainPage::Progress
                         ) {}
                         state.subscribers.clear();
@@ -1787,14 +1841,139 @@ enum HookDrainPage {
     Blocked,
 }
 
-async fn drain_hook_dispatch_page(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetadataDispatchDisposition {
+    Acknowledge,
+    Retain,
+    Decode,
+}
+
+struct HookDrainContext<'a> {
+    service: &'a HookService,
+    state: &'a mut EngineState,
+    jobs: &'a mut JoinSet<()>,
+    snapshot_schedule: &'a mut SnapshotSchedule,
+    blocked_run_acks: &'a mut HashSet<(SessionId, RunId)>,
+    inflight_dispatches: &'a InflightHookDispatches,
+    allow_deferred_servers: bool,
+    scan_after_seq: &'a mut HashMap<SessionId, u64>,
+    force_ack_no_hooks_for: Option<&'a SessionId>,
+}
+
+async fn batch_discovery_context(
     service: &HookService,
-    state: &mut EngineState,
-    jobs: &mut JoinSet<()>,
-    snapshot_schedule: &mut SnapshotSchedule,
-    blocked_run_acks: &mut HashSet<(SessionId, RunId)>,
-    inflight_dispatches: &InflightHookDispatches,
-) -> HookDrainPage {
+    session_id: &SessionId,
+    batch_discoveries: &mut BatchDiscoveryCache,
+) -> Option<(SessionMetadataV1, Result<Discovery, String>)> {
+    if let Some(context) = batch_discoveries.get(session_id) {
+        return context.clone();
+    }
+    let context = match service.inner.store.session_metadata(session_id).await {
+        Ok(Some(metadata)) => {
+            #[cfg(test)]
+            service
+                .inner
+                .discovery_stamp_count
+                .fetch_add(1, Ordering::Relaxed);
+            let discovery = discover_cached_async(service, PathBuf::from(&metadata.cwd)).await;
+            Some((metadata, discovery))
+        }
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(target: "haider.hooks", ?error, "hook metadata hydration failed");
+            return None;
+        }
+    };
+    batch_discoveries.insert(session_id.clone(), context.clone());
+    context
+}
+
+fn metadata_dispatch_disposition(
+    payload_kind: Option<&str>,
+    context: &Option<(SessionMetadataV1, Result<Discovery, String>)>,
+    force_ack_clean_no_hooks: bool,
+) -> MetadataDispatchDisposition {
+    let Some(kind) = payload_kind.filter(|kind| !kind.is_empty()) else {
+        return MetadataDispatchDisposition::Decode;
+    };
+    let Some((_, Ok(discovery))) = context else {
+        return MetadataDispatchDisposition::Decode;
+    };
+    if discovery.config_changed {
+        // A nonempty-to-empty transition must pass through the authoritative
+        // handler once so live subscriber/server processes are reconciled.
+        return MetadataDispatchDisposition::Decode;
+    }
+    let clean_no_hooks = discovery.hooks.is_empty() && discovery.notices.is_empty();
+    if clean_no_hooks {
+        if force_ack_clean_no_hooks || matches!(kind, "node_committed" | "item_tool_call") {
+            return MetadataDispatchDisposition::Acknowledge;
+        }
+        // Potential hook inputs remain transaction-coupled in the outbox.
+        // A later config discovery replays them instead of creating a policy
+        // bypass at the interval between commit and hook installation.
+        return MetadataDispatchDisposition::Retain;
+    }
+    if matches!(kind, "node_committed" | "item_tool_call") {
+        return MetadataDispatchDisposition::Acknowledge;
+    }
+    if matches!(
+        kind,
+        "run_state"
+            | "effect"
+            | "menu_opened"
+            | "menu_answered"
+            | "menu_closed"
+            | "hook_run_trust"
+            | "headless_run_configured"
+    ) {
+        return MetadataDispatchDisposition::Decode;
+    }
+    let possible_event = match kind {
+        "session_state" => Some(MatchEvent::SessionCreated),
+        "user_message" => Some(MatchEvent::UserMessage),
+        "agent_spawned" => Some(MatchEvent::SubagentSpawned),
+        "agent_report" => Some(MatchEvent::SubagentReported),
+        "item" => Some(MatchEvent::CompactionCompleted),
+        "update_available" => Some(MatchEvent::UpdateAvailable),
+        "account_expired" => Some(MatchEvent::AccountExpired),
+        _ => None,
+    };
+    let Some(possible_event) = possible_event else {
+        // Additive, legacy, malformed, and newly introduced payload kinds are
+        // deliberately fail-open to the authoritative decode path.
+        return MetadataDispatchDisposition::Decode;
+    };
+    if discovery
+        .hooks
+        .values()
+        .any(|definition| definition.matcher.event == possible_event)
+    {
+        MetadataDispatchDisposition::Decode
+    } else {
+        MetadataDispatchDisposition::Acknowledge
+    }
+}
+
+async fn drain_hook_dispatch_page(context: HookDrainContext<'_>) -> HookDrainPage {
+    let HookDrainContext {
+        service,
+        state,
+        jobs,
+        snapshot_schedule,
+        blocked_run_acks,
+        inflight_dispatches,
+        allow_deferred_servers,
+        scan_after_seq,
+        force_ack_no_hooks_for,
+    } = context;
+    if service
+        .inner
+        .dispatch_rescan_required
+        .swap(false, Ordering::AcqRel)
+    {
+        scan_after_seq.clear();
+    }
     // A completed coordinate from an earlier page is safe to forget before a
     // fresh database read: its ACK committed before it entered this set. Any
     // job completing after this point remains visible through the whole page
@@ -1804,22 +1983,69 @@ async fn drain_hook_dispatch_page(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .completed
         .clear();
-    let pending = match service
+    let session_ids = match service
         .inner
         .store
-        .pending_hook_dispatches_bounded(HOOK_DRAIN_PAGE_MAX_REQUESTS, HOOK_DRAIN_PAGE_MAX_BYTES)
+        .pending_hook_dispatch_session_ids()
         .await
     {
-        Ok(pending) => pending,
+        Ok(session_ids) => session_ids,
         Err(error) => {
-            tracing::warn!(target: "haider.hooks", ?error, "hook recovery outbox read failed");
+            tracing::warn!(target: "haider.hooks", ?error, "hook recovery outbox session scan failed");
             return HookDrainPage::Blocked;
         }
     };
+    let active_sessions: HashSet<_> = session_ids.iter().cloned().collect();
+    scan_after_seq.retain(|session_id, _| active_sessions.contains(session_id));
+    let mut pending = Vec::new();
+    for session_id in session_ids {
+        let remaining = HOOK_DRAIN_PAGE_MAX_REQUESTS.saturating_sub(pending.len());
+        if remaining == 0 {
+            break;
+        }
+        let after_seq = scan_after_seq.get(&session_id).copied().unwrap_or(0);
+        let mut session_pending = match service
+            .inner
+            .store
+            .pending_hook_dispatch_metadata_bounded(
+                &session_id,
+                after_seq,
+                remaining,
+                HOOK_DRAIN_PAGE_MAX_BYTES,
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(target: "haider.hooks", ?error, %session_id, "hook recovery outbox metadata read failed");
+                return HookDrainPage::Blocked;
+            }
+        };
+        pending.append(&mut session_pending);
+    }
+    #[cfg(test)]
+    service
+        .inner
+        .dispatch_metadata_scan_count
+        .fetch_add(1, Ordering::Relaxed);
     if pending.is_empty() {
+        match service.inner.store.has_any_pending_hook_dispatches().await {
+            Ok(false) => scan_after_seq.clear(),
+            // Intentionally retained rows sit behind per-session sequence
+            // cursors. A hook/config discovery flips
+            // `dispatch_rescan_required` above.
+            Ok(true) => {}
+            Err(error) => {
+                tracing::warn!(target: "haider.hooks", ?error, "hook recovery outbox presence read failed");
+                return HookDrainPage::Blocked;
+            }
+        }
         return HookDrainPage::Empty;
     }
-    snapshot_schedule.note_commit(Instant::now());
+    let page_tails: HashMap<_, _> = pending
+        .iter()
+        .map(|entry| (entry.session_id.clone(), entry.seq))
+        .collect();
     let mut acks = Vec::with_capacity(pending.len());
     let mut ordered_ack_scopes = HashSet::new();
     let mut terminal_trust_acks = HashSet::new();
@@ -1829,8 +2055,8 @@ async fn drain_hook_dispatch_page(
     let mut waiting_on_inflight = false;
     let mut blocked_inflight = false;
     let mut batch_discoveries = BatchDiscoveryCache::new();
-    for envelope in pending {
-        let coordinate = (envelope.session_id.clone(), envelope.seq);
+    for metadata in pending {
+        let coordinate = (metadata.session_id.clone(), metadata.seq);
         let (blocked, completed, active) = {
             let flight = inflight_dispatches
                 .lock()
@@ -1852,6 +2078,36 @@ async fn drain_hook_dispatch_page(
             waiting_on_inflight = true;
             continue;
         }
+        let discovery =
+            batch_discovery_context(service, &metadata.session_id, &mut batch_discoveries).await;
+        match metadata_dispatch_disposition(
+            metadata.payload_kind.as_deref(),
+            &discovery,
+            force_ack_no_hooks_for == Some(&metadata.session_id),
+        ) {
+            MetadataDispatchDisposition::Retain => continue,
+            MetadataDispatchDisposition::Acknowledge => {
+                acks.push((metadata.session_id, metadata.seq));
+                started_dispatch = true;
+                continue;
+            }
+            MetadataDispatchDisposition::Decode => {}
+        }
+        let envelope = match service
+            .inner
+            .store
+            .pending_hook_dispatch_envelope(&metadata.session_id, metadata.seq)
+            .await
+        {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(target: "haider.hooks", ?error, "hook recovery envelope decode failed");
+                aborted = true;
+                break;
+            }
+        };
+        snapshot_schedule.note_commit(Instant::now());
         started_dispatch = true;
         let ordered_run_scope = envelope.run_id.as_ref().and_then(|run_id| {
             let scope = (envelope.session_id.clone(), run_id.clone());
@@ -1868,7 +2124,7 @@ async fn drain_hook_dispatch_page(
                 inflight_dispatches,
             },
             envelope,
-            ordered_run_scope.is_none(),
+            allow_deferred_servers && ordered_run_scope.is_none(),
         )
         .await;
         terminal_snapshot |= outcome.terminal_scope.is_some();
@@ -1909,6 +2165,17 @@ async fn drain_hook_dispatch_page(
     {
         tracing::warn!(target: "haider.hooks", %error, "hook-engine scheduled snapshot persistence failed; journal rebuild remains authoritative");
     }
+    if !aborted && acknowledgements_flushed && !blocked_inflight {
+        // Sequence is monotonic within a live session, unlike SQLite ROWID,
+        // which may be reused after ACK deletes. Session deletion explicitly
+        // removes its cursor before that identifier can be created again.
+        for (session_id, seq) in page_tails {
+            scan_after_seq
+                .entry(session_id)
+                .and_modify(|cursor| *cursor = (*cursor).max(seq))
+                .or_insert(seq);
+        }
+    }
     if aborted || !acknowledgements_flushed || (!started_dispatch && blocked_inflight) {
         HookDrainPage::Blocked
     } else if !started_dispatch && waiting_on_inflight {
@@ -1919,45 +2186,53 @@ async fn drain_hook_dispatch_page(
 }
 
 async fn drain_hook_dispatches_through_session(
-    service: &HookService,
-    state: &mut EngineState,
-    jobs: &mut JoinSet<()>,
-    snapshot_schedule: &mut SnapshotSchedule,
-    blocked_run_acks: &mut HashSet<(SessionId, RunId)>,
-    inflight_dispatches: &InflightHookDispatches,
+    context: HookDrainContext<'_>,
     session_id: &SessionId,
 ) -> Result<(), HaiderError> {
+    // Session deletion must see retained coordinates that may sit behind the
+    // ordinary live cursor. The forced no-hook disposition below makes those
+    // rows acknowledgeable without decoding.
+    context.scan_after_seq.remove(session_id);
     loop {
-        let progress = service.inner.dispatch_progress.notified();
-        match service
+        let progress = context.service.inner.dispatch_progress.notified();
+        match context
+            .service
             .inner
             .store
             .has_pending_hook_dispatches(session_id)
             .await
         {
-            Ok(false) => return Ok(()),
+            Ok(false) => {
+                context.scan_after_seq.remove(session_id);
+                return Ok(());
+            }
             Err(error) => return Err(error),
             Ok(true) => {}
         }
-        match drain_hook_dispatch_page(
-            service,
-            state,
-            jobs,
-            snapshot_schedule,
-            blocked_run_acks,
-            inflight_dispatches,
-        )
+        match drain_hook_dispatch_page(HookDrainContext {
+            service: context.service,
+            state: &mut *context.state,
+            jobs: &mut *context.jobs,
+            snapshot_schedule: &mut *context.snapshot_schedule,
+            blocked_run_acks: &mut *context.blocked_run_acks,
+            inflight_dispatches: context.inflight_dispatches,
+            allow_deferred_servers: true,
+            scan_after_seq: &mut *context.scan_after_seq,
+            force_ack_no_hooks_for: Some(session_id),
+        })
         .await
         {
             HookDrainPage::Progress => {}
             HookDrainPage::Waiting => progress.await,
             HookDrainPage::Empty | HookDrainPage::Blocked => {
-                if !service
+                if !context
+                    .service
                     .inner
                     .store
                     .has_pending_hook_dispatches(session_id)
                     .await?
                 {
+                    context.scan_after_seq.remove(session_id);
                     return Ok(());
                 }
                 return Err(HaiderError::new(
@@ -2003,55 +2278,27 @@ async fn replay_pending_dispatches(
     state: &mut EngineState,
     jobs: &mut JoinSet<()>,
     inflight_dispatches: &InflightHookDispatches,
+    scan_after_seq: &mut HashMap<SessionId, u64>,
 ) -> bool {
+    let mut snapshot_schedule = SnapshotSchedule::new(Instant::now(), false);
+    let mut blocked_run_acks = HashSet::new();
     loop {
-        let pending = match service
-            .inner
-            .store
-            .pending_hook_dispatches_bounded(
-                HOOK_DRAIN_PAGE_MAX_REQUESTS,
-                HOOK_DRAIN_PAGE_MAX_BYTES,
-            )
-            .await
+        match drain_hook_dispatch_page(HookDrainContext {
+            service,
+            state: &mut *state,
+            jobs: &mut *jobs,
+            snapshot_schedule: &mut snapshot_schedule,
+            blocked_run_acks: &mut blocked_run_acks,
+            inflight_dispatches,
+            allow_deferred_servers: false,
+            scan_after_seq: &mut *scan_after_seq,
+            force_ack_no_hooks_for: None,
+        })
+        .await
         {
-            Ok(pending) => pending,
-            Err(error) => {
-                tracing::warn!(target: "haider.hooks", ?error, "hook recovery outbox read failed");
-                return false;
-            }
-        };
-        if pending.is_empty() {
-            return true;
-        }
-        // Per-page ack batch: one durable transaction per replay page. The
-        // flush must land before the next `pending_hook_dispatches` read or
-        // the same rows would be returned forever.
-        let mut acks = Vec::with_capacity(pending.len());
-        let mut batch_discoveries = BatchDiscoveryCache::new();
-        for envelope in pending {
-            if !handle_and_complete(
-                HookHandleContext {
-                    service,
-                    state,
-                    jobs,
-                    acks: &mut acks,
-                    batch_discoveries: &mut batch_discoveries,
-                    inflight_dispatches,
-                },
-                envelope,
-                false,
-            )
-            .await
-            .completed
-            {
-                // Rows handled before the failure are still acknowledged so
-                // a restart replays exactly the unhandled remainder.
-                let _ = flush_hook_dispatch_acks(service, acks).await;
-                return false;
-            }
-        }
-        if !flush_hook_dispatch_acks(service, acks).await {
-            return false;
+            HookDrainPage::Empty => return true,
+            HookDrainPage::Progress => {}
+            HookDrainPage::Waiting | HookDrainPage::Blocked => return false,
         }
     }
 }
@@ -2248,35 +2495,7 @@ async fn handle_committed(
     let Some(facts) = classify_payload(&payload) else {
         return true;
     };
-    let context = if let Some(context) = batch_discoveries.get(&envelope.session_id).cloned() {
-        context
-    } else {
-        let metadata = match service
-            .inner
-            .store
-            .session_metadata(&envelope.session_id)
-            .await
-        {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                tracing::warn!(target: "haider.hooks", ?error, "hook metadata hydration failed");
-                return false;
-            }
-        };
-        let context = if let Some(metadata) = metadata {
-            #[cfg(test)]
-            service
-                .inner
-                .discovery_stamp_count
-                .fetch_add(1, Ordering::Relaxed);
-            let discovery = discover_cached_async(service, PathBuf::from(&metadata.cwd)).await;
-            Some((metadata, discovery))
-        } else {
-            None
-        };
-        batch_discoveries.insert(envelope.session_id.clone(), context.clone());
-        context
-    };
+    let context = batch_discovery_context(service, &envelope.session_id, batch_discoveries).await;
     let Some((metadata, discovery)) = context else {
         return true;
     };
@@ -3910,13 +4129,31 @@ async fn discover_cached_async(service: &HookService, cwd: PathBuf) -> Result<Di
     let before = tokio::task::spawn_blocking(move || discovery_stamp(&stamp_cwd, &stamp_profile))
         .await
         .map_err(|error| format!("hook discovery stamp task stopped: {error}"))??;
-    if let Ok(cache) = service.inner.discovery_cache.lock()
-        && let Some(cached) = cache.get(&cwd)
+    let previous = service
+        .inner
+        .discovery_cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cwd).cloned());
+    if let Some(cached) = &previous
         && cached.stamp == before
     {
-        return Ok(cached.discovery.clone());
+        let mut discovery = cached.discovery.clone();
+        discovery.config_changed = false;
+        return Ok(discovery);
     }
-    let discovery = discover_async(cwd.clone(), profile_root.clone()).await?;
+    let mut discovery = discover_async(cwd.clone(), profile_root.clone()).await?;
+    discovery.config_changed = previous.as_ref().is_some_and(|cached| {
+        cached.discovery.hooks != discovery.hooks
+            || cached.discovery.notices != discovery.notices
+            || cached.discovery.policy != discovery.policy
+    });
+    if discovery.config_changed || !discovery.hooks.is_empty() || !discovery.notices.is_empty() {
+        service
+            .inner
+            .dispatch_rescan_required
+            .store(true, Ordering::Release);
+    }
     let after_cwd = cwd.clone();
     let after = tokio::task::spawn_blocking(move || discovery_stamp(&after_cwd, &profile_root))
         .await
@@ -4054,6 +4291,7 @@ fn discover(cwd: &Path, profile_root: &Path) -> Result<Discovery, String> {
         hooks,
         notices,
         policy,
+        config_changed: false,
     })
 }
 

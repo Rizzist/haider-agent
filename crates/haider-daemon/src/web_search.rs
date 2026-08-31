@@ -106,19 +106,14 @@ pub(crate) trait WebSearchHttp: Send + Sync {
 
 /// Production transport: proxy-free, redirect-free, timeout-bounded.
 pub(crate) struct ReqwestWebSearchHttp {
-    client: Option<reqwest::Client>,
+    transport: crate::http_transport::SharedHttpTransport,
 }
 
 impl ReqwestWebSearchHttp {
     pub(crate) fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(45))
-            .build()
-            .ok();
-        Self { client }
+        Self {
+            transport: crate::http_transport::SharedHttpTransport,
+        }
     }
 }
 
@@ -130,7 +125,7 @@ impl WebSearchHttp for ReqwestWebSearchHttp {
         bearer: &SecretHandle,
         body: &serde_json::Value,
     ) -> Result<(u16, Vec<u8>), String> {
-        let Some(client) = &self.client else {
+        let Some(client) = self.transport.client() else {
             return Err("search transport is unavailable".into());
         };
         let token = std::str::from_utf8(bearer.expose_secret())
@@ -140,6 +135,7 @@ impl WebSearchHttp for ReqwestWebSearchHttp {
         authorization.set_sensitive(true);
         let response = client
             .post(url)
+            .timeout(Duration::from_secs(45))
             .header(reqwest::header::AUTHORIZATION, authorization)
             .json(body)
             .send()

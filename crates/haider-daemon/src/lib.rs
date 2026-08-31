@@ -75,6 +75,7 @@ mod haider_code_plan;
 #[cfg(test)]
 mod haider_code_plan_tests;
 mod hooks;
+mod http_transport;
 mod image_events;
 mod lifecycle;
 mod lockdown;

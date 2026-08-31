@@ -2680,13 +2680,13 @@ impl OAuthCoordinator {
         if config.max_flows == 0 || config.max_invalid_callbacks == 0 {
             return Err(OAuthPublicError::new("invalid_oauth_limits", false));
         }
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(TOKEN_TIMEOUT)
-            .build()
-            .map_err(|_| OAuthPublicError::new("oauth_transport_unavailable", true))?;
+        // This shallow clone keeps the shared client's pool and exact OAuth
+        // transport policy; it does not construct another transport or alter
+        // the coordinator's request path.
+        let client = crate::http_transport::SharedHttpTransport
+            .client()
+            .cloned()
+            .ok_or_else(|| OAuthPublicError::new("oauth_transport_unavailable", true))?;
         let tasks = Arc::new(OwnedTaskSet::new());
         let inner = Arc::new(CoordinatorInner {
             instance_id,
@@ -5196,13 +5196,13 @@ impl CredentialBroker {
         status_commands: mpsc::Sender<crate::accounts::AccountCommand>,
         fences: RefreshFenceRegistry,
     ) -> Result<Self, HaiderError> {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(TOKEN_TIMEOUT)
-            .build()
-            .map_err(|_| {
+        // This shallow clone keeps the shared client's pool and exact OAuth
+        // transport policy; it does not construct another transport or alter
+        // refresh, fence, generation, or vault semantics.
+        let client = crate::http_transport::SharedHttpTransport
+            .client()
+            .cloned()
+            .ok_or_else(|| {
                 HaiderError::new(
                     ErrorCode::ProviderError,
                     "OAuth refresh transport is unavailable",

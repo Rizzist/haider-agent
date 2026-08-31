@@ -42,6 +42,7 @@ use haider_store::{
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -63,6 +64,7 @@ struct StoreOwner {
     profile_installation_id: String,
     store: Mutex<Option<Store>>,
     fault: tokio::sync::watch::Sender<Option<ProfileStoreFault>>,
+    hook_dispatch_decode_count: AtomicU64,
     #[cfg(test)]
     injected_append_error: Mutex<Option<HaiderError>>,
     #[cfg(test)]
@@ -150,6 +152,7 @@ impl SqliteStoreHandle {
                 profile_installation_id,
                 store: Mutex::new(Some(store)),
                 fault,
+                hook_dispatch_decode_count: AtomicU64::new(0),
                 #[cfg(test)]
                 injected_append_error: Mutex::new(None),
                 #[cfg(test)]
@@ -2144,7 +2147,14 @@ impl SqliteStoreHandle {
         limit: usize,
     ) -> Result<Vec<RawEnvelope>, HaiderError> {
         let owner = Arc::clone(&self.owner);
-        run_blocking(move || owner.with_store(|store| store.pending_hook_dispatches(limit))).await
+        run_blocking(move || {
+            let envelopes = owner.with_store(|store| store.pending_hook_dispatches(limit))?;
+            owner
+                .hook_dispatch_decode_count
+                .fetch_add(envelopes.len() as u64, Ordering::Relaxed);
+            Ok(envelopes)
+        })
+        .await
     }
 
     /// Loads one count- and true-weight-bounded page of durable hook work.
@@ -2155,9 +2165,75 @@ impl SqliteStoreHandle {
     ) -> Result<Vec<RawEnvelope>, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || {
-            owner.with_store(|store| store.pending_hook_dispatches_bounded(limit, byte_budget))
+            let envelopes = owner
+                .with_store(|store| store.pending_hook_dispatches_bounded(limit, byte_budget))?;
+            owner
+                .hook_dispatch_decode_count
+                .fetch_add(envelopes.len() as u64, Ordering::Relaxed);
+            Ok(envelopes)
         })
         .await
+    }
+
+    /// Loads a session's metadata-only hook-outbox page after one sequence.
+    pub async fn pending_hook_dispatch_metadata_bounded(
+        &self,
+        session_id: &SessionId,
+        after_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+    ) -> Result<Vec<haider_store::PendingHookDispatchMetadata>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.pending_hook_dispatch_metadata_bounded(
+                    &session_id,
+                    after_seq,
+                    limit,
+                    byte_budget,
+                )
+            })
+        })
+        .await
+    }
+
+    /// Lists sessions with durable hook-dispatch work without reading event
+    /// envelope bytes.
+    pub async fn pending_hook_dispatch_session_ids(&self) -> Result<Vec<SessionId>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.pending_hook_dispatch_session_ids()))
+            .await
+    }
+
+    /// Decodes one exact envelope only while its hook-outbox row is pending.
+    pub async fn pending_hook_dispatch_envelope(
+        &self,
+        session_id: &SessionId,
+        seq: u64,
+    ) -> Result<Option<RawEnvelope>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || {
+            let envelope =
+                owner.with_store(|store| store.pending_hook_dispatch_envelope(&session_id, seq))?;
+            if envelope.is_some() {
+                owner
+                    .hook_dispatch_decode_count
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(envelope)
+        })
+        .await
+    }
+
+    /// Number of hook-outbox envelopes decoded through this store handle.
+    /// This is intentionally an observation seam for regression and peak-RSS
+    /// verification; it does not affect dispatch behavior.
+    pub fn hook_dispatch_decode_count(&self) -> u64 {
+        self.owner
+            .hook_dispatch_decode_count
+            .load(Ordering::Relaxed)
     }
 
     /// Reports whether one session still has committed hook work in its
@@ -2172,6 +2248,14 @@ impl SqliteStoreHandle {
             owner.with_store(|store| store.has_pending_hook_dispatches(&session_id))
         })
         .await
+    }
+
+    /// Reports whether any committed hook work remains in the durable
+    /// outbox, without loading an envelope body.
+    pub async fn has_any_pending_hook_dispatches(&self) -> Result<bool, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.has_any_pending_hook_dispatches()))
+            .await
     }
 
     /// Idempotently acknowledges one committed hook-dispatch outbox row.
