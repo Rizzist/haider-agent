@@ -5,8 +5,12 @@ import copy
 import os
 from pathlib import Path
 import platform
+import socket
+import struct
 import tempfile
 import textwrap
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -17,9 +21,18 @@ from gate.context import (
     path_is_within,
     status_socket_path_valid,
 )
-from gate.contract import ContractError, Evidence, validate_evidence_list
+from gate.contract import BudgetPart, ContractError, Evidence, validate_evidence_list
 from gate.loader import load_check
 from gate.report import diff_reports, load_report, validate_report, write_report
+from gate.tui_probe import (
+    DurableSnapshot,
+    Frame,
+    RpcClient,
+    TuiProcess,
+    action_rows,
+    changed_body,
+    snapshot_delta,
+)
 import runner
 
 
@@ -61,6 +74,23 @@ class LoaderContractTests(unittest.TestCase):
                 ContractError, "turns_expected=2 exceeds segments=1"
             ):
                 load_check(self.write_module(directory, source), "t0")
+
+    def test_expected_fail_metadata_is_recorded_but_does_not_weaken_status(self):
+        with tempfile.TemporaryDirectory() as directory_text:
+            directory = Path(directory_text)
+            source = VALID_MODULE.replace(
+                'timed = False', 'timed = False\nexpected_fail_until = "0.0.968"'
+            ).replace(
+                'return [Evidence("valid", PASS, "valid evidence")]',
+                'return [Evidence("valid", "FAIL", "actual defect remains")]',
+            )
+            check = load_check(self.write_module(directory, source), "t0")
+            row, _versions = runner.execute_check(
+                check, bin_dir=directory, measurement_accepted=True
+            )
+            self.assertEqual(check.expected_fail_until, "0.0.968")
+            self.assertEqual(row["expected_fail_until"], "0.0.968")
+            self.assertEqual(row["status"], "FAIL")
 
     def test_missing_need_is_env_blocked_and_never_fail(self):
         with tempfile.TemporaryDirectory() as directory_text:
@@ -127,6 +157,171 @@ class LoaderContractTests(unittest.TestCase):
         )
         self.assertEqual(jsonl.budget.milliseconds, 146_000)
         self.assertEqual(status_stop.budget.milliseconds, 310_000)
+
+    def test_palette_activation_pack_loads_as_five_distinct_untimed_checks(self):
+        names = (
+            "t0.tui.palette_activation_closure.py",
+            "t0.tui.login_paths.py",
+            "t0.tui.model_picker_cardinality.py",
+            "t0.tui.three_door_parity.py",
+            "t0.tui.catalog_help_command_list_pin.py",
+        )
+        checks = [load_check(runner.CHECK_ROOT / "t0" / name, "t0") for name in names]
+        self.assertEqual(len({check.id for check in checks}), 5)
+        self.assertTrue(all(check.timed is False for check in checks))
+        self.assertTrue(all("pty" in check.needs for check in checks))
+        self.assertEqual(checks[-1].expected_fail_until, "0.0.968")
+
+    def test_tui_body_diff_excludes_only_footer_and_snapshot_names_actual_deltas(self):
+        before = Frame(80, 4, b"", {1: "card", 2: "composer", 4: "old flash"})
+        footer_only = Frame(80, 4, b"", {1: "card", 2: "composer", 4: "new flash"})
+        card_change = Frame(80, 4, b"", {1: "other", 2: "composer", 4: "new flash"})
+        self.assertEqual(changed_body(before, footer_only), ())
+        self.assertEqual(changed_body(before, card_change), (1,))
+        first = DurableSnapshot(3, 4, 5, (("z", 1, "old"),), (("c1", "old", "committed"),))
+        second = DurableSnapshot(
+            5,
+            7,
+            6,
+            (("a", 1, "new"), ("z", 1, "old")),
+            (("c1", "old", "committed"), ("c2", "session.rename", "committed")),
+        )
+        self.assertEqual(
+            snapshot_delta(first, second),
+            "journal_delta(events=2,receipts=3,sessions=1)",
+        )
+        self.assertEqual(action_rows(first, second), (("new",), ("session.rename:committed",)))
+
+    def test_tui_constructor_failure_reaps_the_forked_child(self):
+        class FakeProbe:
+            def __init__(self):
+                self.reaped = []
+
+            def require_throwaway_profile(self, _path):
+                return None
+
+            def set_size(self, _fd, _cols, _rows):
+                return None
+
+            def make_pump(self, _fd, _sink):
+                return lambda _seconds: None
+
+            def plain(self, raw):
+                return raw
+
+            def drain_quiet(self, _fd, _sink, **_kwargs):
+                return None
+
+            def reap(self, pid, timeout):
+                self.reaped.append((pid, timeout))
+                return True
+
+        fake = FakeProbe()
+        context = type(
+            "Context",
+            (),
+            {
+                "profile_dir": Path(tempfile.gettempdir()) / "throwaway-profile",
+                "workspace_dir": Path(tempfile.gettempdir()),
+                "haider_bin": Path(tempfile.gettempdir()) / "haider",
+                "env": {},
+                "spawn_possible": False,
+            },
+        )()
+        with (
+            mock.patch("gate.tui_probe._probelib", return_value=fake),
+            mock.patch("pty.fork", return_value=(4321, 17)),
+            mock.patch("gate.tui_probe.os.kill"),
+            mock.patch("gate.tui_probe.os.write", return_value=1),
+            mock.patch("gate.tui_probe.os.close"),
+            mock.patch("gate.tui_probe.budget_seconds", return_value=0.0),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "alternate_screen"):
+                TuiProcess(context)
+        self.assertEqual(fake.reaped, [(4321, 0.0)])
+
+    def test_rpc_client_sends_idle_ping_and_keeps_one_request_deadline(self):
+        def read_frame(connection):
+            size = struct.unpack(">I", connection.recv(4))[0]
+            body = b""
+            while len(body) < size:
+                body += connection.recv(size - len(body))
+            return json.loads(body)
+
+        def send_frame(connection, value):
+            body = json.dumps(value, separators=(",", ":")).encode()
+            connection.sendall(struct.pack(">I", len(body)) + body)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "rpc.sock")
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(path)
+            listener.listen(1)
+            observations = []
+            ping_seen = threading.Event()
+            coordination = BudgetPart(
+                "unit RPC coordination", 1.0, "test fixture event handoff"
+            )
+            server_window = BudgetPart(
+                "unit RPC server window", 0.4, "test fixture exceeds request deadline"
+            )
+            server_poll = BudgetPart(
+                "unit RPC server poll", 0.1, "test fixture frame observation"
+            )
+
+            def server():
+                connection, _address = listener.accept()
+                try:
+                    observations.append(read_frame(connection)["kind"])
+                    send_frame(connection, {"kind": "welcome"})
+                    ping = read_frame(connection)
+                    observations.append(ping)
+                    send_frame(connection, {"kind": "pong", "nonce": ping["nonce"]})
+                    ping_seen.set()
+                    request = read_frame(connection)
+                    while request.get("kind") == "ping":
+                        send_frame(
+                            connection,
+                            {"kind": "pong", "nonce": request["nonce"]},
+                        )
+                        request = read_frame(connection)
+                    observations.append(request["body"]["method"])
+                    deadline = time.monotonic() + server_window.seconds
+                    connection.settimeout(server_poll.seconds)
+                    while time.monotonic() < deadline:
+                        try:
+                            frame = read_frame(connection)
+                            if frame.get("kind") == "ping":
+                                send_frame(
+                                    connection,
+                                    {"kind": "pong", "nonce": frame["nonce"]},
+                                )
+                        except socket.timeout:
+                            continue
+                        except (OSError, struct.error):
+                            break
+                finally:
+                    connection.close()
+
+            worker = threading.Thread(target=server)
+            worker.start()
+            client = RpcClient(
+                path,
+                BudgetPart("unit RPC deadline", 0.15, "test fixture"),
+                BudgetPart("unit keepalive cadence", 0.02, "test fixture"),
+            )
+            try:
+                self.assertTrue(ping_seen.wait(timeout=coordination.seconds))
+                with self.assertRaisesRegex(RuntimeError, "deadline=0.15s exhausted"):
+                    client.request({"method": "never.responds"})
+            finally:
+                client.close()
+                listener.close()
+                worker.join(timeout=coordination.seconds)
+            self.assertEqual(observations[0], "hello")
+            self.assertEqual(observations[1]["kind"], "ping")
+            self.assertGreater(observations[1]["nonce"], 0)
+            self.assertEqual(observations[2], "never.responds")
 
     def test_status_check_never_stops_without_trusted_status_pid(self):
         check = load_check(

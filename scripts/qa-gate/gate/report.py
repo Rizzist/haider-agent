@@ -209,6 +209,13 @@ def validate_report(report: object) -> dict[str, Any]:
             raise ContractError(f"report check {check['id']} wall_ms must be non-negative integer")
         if not isinstance(check.get("timed"), bool):
             raise ContractError(f"report check {check['id']} timed must be bool")
+        expected_fail_until = check.get("expected_fail_until")
+        if expected_fail_until is not None and (
+            not isinstance(expected_fail_until, str) or not expected_fail_until.strip()
+        ):
+            raise ContractError(
+                f"report check {check['id']} expected_fail_until must be null or non-empty string"
+            )
         timing_accepted = check.get("measurement_accepted")
         if check["timed"]:
             if not isinstance(timing_accepted, bool):

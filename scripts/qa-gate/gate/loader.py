@@ -38,6 +38,7 @@ class CheckDefinition:
     timed: bool
     turns_expected: int
     segments: int
+    expected_fail_until: str | None
     run: Callable[[Any], list[Evidence]]
     module: ModuleType
 
@@ -116,6 +117,14 @@ def load_check(path: Path, expected_tier: str | None = None) -> CheckDefinition:
     if not callable(run):
         raise ContractError(f"check {check_id} must export callable run(ctx)")
 
+    expected_fail_until = getattr(module, "expected_fail_until", None)
+    if expected_fail_until is not None and (
+        not isinstance(expected_fail_until, str) or not expected_fail_until.strip()
+    ):
+        raise ContractError(
+            f"check {check_id} expected_fail_until must be absent or a non-empty version string"
+        )
+
     return CheckDefinition(
         path=path,
         id=check_id,
@@ -127,6 +136,7 @@ def load_check(path: Path, expected_tier: str | None = None) -> CheckDefinition:
         timed=timed,
         turns_expected=turns_expected,
         segments=segments,
+        expected_fail_until=expected_fail_until,
         run=run,
         module=module,
     )

@@ -46,6 +46,7 @@ Each `checks/<tier>/*.py` module exports:
 | `turns_expected` | Explicit non-negative integer required by the segment law. This field supplements the base check contract because the runner cannot enforce that law without it. |
 | `budget` | A `BudgetSum` of at least two positive named `BudgetPart` values, each with a source. An `int`, `float`, lone part, or other literal-only deadline is rejected while loading all checks, before any spawn. |
 | `timed` | Boolean. Correctness always stands; an overloaded host rejects only the published timing. |
+| `expected_fail_until` | Optional non-empty version string recorded in the report. It documents a known-open release defect but never converts FAIL to PASS. |
 | `run(ctx)` | Returns a non-empty `list[Evidence]`. Exceptions become a diagnostic runner `FAIL`, followed by mandatory daemon cleanup. |
 
 `Evidence(label, status, evidence_line, artefacts)` accepts only `PASS`, `FAIL`,
@@ -135,7 +136,7 @@ authority for this table; additive keys are allowed.
 | `binary`, `daemon_binary` | Canonical path plus nullable lowercase SHA-256, exact `version_output`, and parsed bare `version`. Both pair members are hashed. |
 | `daemon_version` | Nullable string collected from `status --json .daemon.version`; a normal passing run records the installed daemon's bare version. |
 | `warmup` | Boolean `accepted`, integer `wall_ms`, non-empty `evidence_line`. Version executions and one isolated ready/start/stop happen before timed rows. |
-| `checks[]` | Required `id`, `area`, aggregate `status`, non-empty `evidence[]`, non-negative integer `wall_ms`, string-list `artefacts`, boolean `timed`, and boolean-or-null `measurement_accepted`. The writer also records named budget parts, segment count, and expected turns. |
+| `checks[]` | Required `id`, `area`, aggregate `status`, non-empty `evidence[]`, non-negative integer `wall_ms`, string-list `artefacts`, boolean `timed`, and boolean-or-null `measurement_accepted`. The writer also records named budget parts, segment count, expected turns, and nullable `expected_fail_until`. |
 | `checks[].evidence[]` | `label`, allowed `status`, non-empty single-line `evidence_line`, and string-list `artefacts`. The aggregate status precedence is `FAIL > ENV_BLOCKED > SKIP > PASS`. |
 | `summary` | Exact integers `total`, `pass`, `fail`, `skip`, `env_blocked`, recomputed from the check array. |
 
