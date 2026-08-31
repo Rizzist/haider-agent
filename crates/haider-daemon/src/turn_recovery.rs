@@ -1033,10 +1033,7 @@ fn interrupted_restart_cause(
         Some(exhausted) => (
             false,
             ErrorCode::BudgetExhausted,
-            format!(
-                "headless {:?} budget exhausted at limit {}",
-                exhausted.dimension, exhausted.limit
-            ),
+            exhausted.summary(),
             false,
         ),
         None => (
@@ -1137,10 +1134,7 @@ async fn resumption_terminal_payloads(
     if let Some(exhausted) = reduction.budget_exhausted.as_ref() {
         cancelling = false;
         failure_code = ErrorCode::BudgetExhausted;
-        failure_message = format!(
-            "headless {:?} budget exhausted at limit {}",
-            exhausted.dimension, exhausted.limit
-        );
+        failure_message = exhausted.summary();
         retryable = false;
     }
     Ok(interrupted_terminal_payloads(

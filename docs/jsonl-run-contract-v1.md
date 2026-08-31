@@ -84,7 +84,8 @@ JSONL surface with `payload.terminal_kind`:
 | `terminal_kind` | Meaning |
 | --- | --- |
 | `success` | Durable run state `done`. |
-| `failure` | A non-provider run failure, including a daemon budget failure. |
+| `failure` | A non-provider run failure other than budget exhaustion. |
+| `budget` | The adjacent `run_failed` code is `budget_exhausted`. |
 | `cancellation` | Durable cancellation not caused by the caller's timeout. |
 | `timeout` | The caller's wall-clock deadline fired and cancellation was durably confirmed. |
 | `provider_error` | The adjacent `run_failed` code is `provider_error` or `provider_timeout`. |
@@ -93,7 +94,21 @@ Failed terminals also carry `payload.error_code`. Provider timeout reasons
 remain in the durable provider failure presentation and use the provider's
 typed reason vocabulary (including `response_open` when supported). JSONL does
 not create a parallel timeout-reason taxonomy: `provider_timeout` is a
-`provider_error` terminal, while `timeout` means the caller's run deadline.
+`provider_error` terminal, `budget_exhausted` is a `budget` terminal, and
+`timeout` means the caller's run deadline.
+
+The durable `run_budget_exhausted` fact precedes a budget terminal. New writers
+include additive `decision` detail: `spent`, `projected`, `cap`, and a typed
+`reason`. `projected` is the candidate request's incremental usage; admission
+is refused when `spent + projected > cap`. It is `null` when a projection is
+unavailable or does not apply to the decision; unavailable pricing or usage
+reasons name the provider and model. A capped run never represents an unknown
+estimate as zero. Native PDF projection includes the resolved base64 request
+bytes for every document-block occurrence; images retain their documented
+fixed visual-token estimate. A sent request abandoned before final usage,
+including across restart, is `usage_unavailable` and prevents any later
+provider request. Older stored facts without `decision` remain valid and decode
+as legacy budget outcomes.
 
 The terminal envelope consumes its normal cursor exactly once. It is not also
 emitted as an untyped envelope, so the stream never repeats the terminal `seq`.

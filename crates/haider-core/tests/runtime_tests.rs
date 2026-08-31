@@ -32,7 +32,8 @@ use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, M
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
 use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::{
-    AttachmentBlock, BoundedResult, ImageBlockRef, TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN,
+    AttachmentBlock, BoundedResult, ImageBlockRef, PdfDeliveryMode,
+    TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN,
 };
 use haider_provider::{
     FakeProvider, FakeStep, Message, Provider, ProviderError, ProviderErrorKind, ProviderStream,
@@ -918,6 +919,48 @@ fn image_footprint_uses_fixed_vision_estimate_not_base64_length() {
     assert_eq!(VISION_IMAGE_ESTIMATE_TOKENS, 1_600);
     assert!(tiny_estimate >= baseline + 1_600);
     assert!(tiny_estimate < baseline + 1_600 + 128);
+}
+
+/// MUTATION CHECK: ignore resolved attachments in request accounting and the
+/// native-document delta falls from 2,048 projected tokens to zero.
+#[test]
+fn native_pdf_footprint_counts_resolved_document_request_bytes() {
+    let artifact = ArtifactRef::new("blake3:native-pdf");
+    let message = |delivery| Message {
+        role: haider_provider::MessageRole::User,
+        blocks: vec![Block::Attachment(AttachmentBlock::Pdf {
+            artifact: artifact.clone(),
+            name: "report.pdf".into(),
+            pages: 1,
+            delivery,
+        })],
+    };
+    let resolved = vec![ResolvedAttachment {
+        artifact: artifact.clone(),
+        data_base64: "A".repeat(8_192),
+    }];
+    let native = vec![message(PdfDeliveryMode::NativeDocument)];
+    let native_without_bytes = estimate_provider_request_input_tokens(&native, &None, &[], &[]);
+    let native_with_bytes = estimate_provider_request_input_tokens(&native, &None, &[], &resolved);
+    assert_eq!(native_with_bytes - native_without_bytes, 2_048);
+
+    let duplicate_native = vec![
+        message(PdfDeliveryMode::NativeDocument),
+        message(PdfDeliveryMode::NativeDocument),
+    ];
+    assert_eq!(
+        estimate_provider_request_input_tokens(&duplicate_native, &None, &[], &resolved)
+            - estimate_provider_request_input_tokens(&duplicate_native, &None, &[], &[]),
+        4_096,
+        "providers inline the resolved bytes for every PDF block occurrence"
+    );
+
+    let extracted = vec![message(PdfDeliveryMode::ExtractedText)];
+    assert_eq!(
+        estimate_provider_request_input_tokens(&extracted, &None, &[], &resolved),
+        estimate_provider_request_input_tokens(&extracted, &None, &[], &[]),
+        "extracted text is already present in the message projection"
+    );
 }
 
 #[test]

@@ -891,6 +891,11 @@ struct HubInner {
     /// blocking daemon-internal workflow_author transitions inside an already
     /// fenced tool call.
     workflow_selection_serials: tokio::sync::Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
+    /// Weak root-run budget authorities shared by delegated child workers.
+    /// The owning parent turn controls their lifetime; stale entries cannot
+    /// keep a completed run or worker lease alive.
+    run_budget_coordinators:
+        Mutex<HashMap<(SessionId, RunId), Weak<crate::worker::RunBudgetCoordinator>>>,
     /// Serializes receipt lookup through workspace publication for checkpoint
     /// commands. This makes same-command retries idempotent even when two
     /// control connections race before either response is visible.
@@ -2157,6 +2162,7 @@ impl SessionHub {
             shell_registry_events_cancel,
             typed_install_serial: Arc::new(tokio::sync::Mutex::new(())),
             workflow_selection_serials: tokio::sync::Mutex::new(HashMap::new()),
+            run_budget_coordinators: Mutex::new(HashMap::new()),
             checkpoint_serials: tokio::sync::Mutex::new(HashMap::new()),
             replay_tasks: Mutex::new(Vec::new()),
             attachments: Mutex::new(HashMap::new()),
@@ -2463,6 +2469,35 @@ impl SessionHub {
             .get(session_id)
             .copied()
             .unwrap_or_default()
+    }
+
+    pub(crate) fn register_run_budget_coordinator(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        coordinator: Arc<crate::worker::RunBudgetCoordinator>,
+    ) -> Result<Arc<crate::worker::RunBudgetCoordinator>, SessionHubError> {
+        let mut coordinators = lock(&self.inner.run_budget_coordinators)?;
+        let key = (session_id, run_id);
+        if let Some(existing) = coordinators.get(&key).and_then(Weak::upgrade) {
+            return Ok(existing);
+        }
+        coordinators.insert(key, Arc::downgrade(&coordinator));
+        Ok(coordinator)
+    }
+
+    pub(crate) fn run_budget_coordinator(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+    ) -> Result<Option<Arc<crate::worker::RunBudgetCoordinator>>, SessionHubError> {
+        let mut coordinators = lock(&self.inner.run_budget_coordinators)?;
+        let key = (session_id.clone(), run_id.clone());
+        let coordinator = coordinators.get(&key).and_then(Weak::upgrade);
+        if coordinator.is_none() {
+            coordinators.remove(&key);
+        }
+        Ok(coordinator)
     }
 
     /// Returns the live provider policy used only when opening a new run

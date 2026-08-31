@@ -2345,6 +2345,67 @@ fn run_jsonl_timeout_has_one_distinct_timeout_terminal() {
     assert_eq!(terminals[0].payload["error_code"], "timeout");
 }
 
+/// MUTATION CHECK: classify budget exhaustion as a generic failure, or emit
+/// more than one terminal while rejecting an unpriceable provider request.
+#[test]
+fn run_jsonl_unknown_pricing_has_one_distinct_budget_terminal_and_exits_77() {
+    let out = haider_with_boot_retry(
+        &[
+            "run",
+            "--provider",
+            "fake",
+            "hello",
+            "--output",
+            "jsonl",
+            "--max-cost",
+            "0.000001",
+        ],
+        &[("HAIDER_TEST_FAKE_PROVIDER", DEFAULT_FAKE_SCRIPT)],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(i32::from(EX_BLOCKED)),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelopes = parse_jsonl(&out.stdout);
+    assert!(
+        envelopes
+            .windows(2)
+            .all(|pair| pair[1].seq == pair[0].seq + 1)
+    );
+    let terminals = envelopes
+        .iter()
+        .filter(|envelope| envelope.payload.get("terminal_kind").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].payload["terminal_kind"], "budget");
+    assert_eq!(terminals[0].payload["error_code"], "budget_exhausted");
+    let budget_facts = envelopes
+        .iter()
+        .filter(|envelope| envelope.payload["type"] == "run_budget_exhausted")
+        .collect::<Vec<_>>();
+    assert_eq!(budget_facts.len(), 1);
+    assert_eq!(
+        budget_facts[0].payload["decision"]["reason"]["type"],
+        "pricing_unavailable"
+    );
+    assert_eq!(
+        budget_facts[0].payload["decision"]["reason"]["provider"],
+        "fake"
+    );
+    assert_eq!(
+        budget_facts[0].payload["decision"]["reason"]["model"],
+        "fake-model"
+    );
+    assert_eq!(budget_facts[0].payload["decision"]["spent"], 0);
+    assert_eq!(
+        budget_facts[0].payload["decision"]["projected"],
+        serde_json::Value::Null
+    );
+    assert_eq!(budget_facts[0].payload["decision"]["cap"], 1);
+}
+
 /// MUTATION CHECK: let the later Cancelled terminal overwrite a wall-clock
 /// timeout or emit a success object. Expected RUNTIME failure: exit is not
 /// 124 or the v1 outcome/error stop reporting timeout.
@@ -2413,13 +2474,13 @@ fn fast_final_usage_is_budget_checked_before_done() {
             "fake",
             "--json",
             "--max-tokens",
-            "2",
+            "1000000",
             "-p",
             "budget",
         ],
         &[(
             "HAIDER_TEST_FAKE_PROVIDER",
-            r#"[{"step":"emit_usage","usage":{"input":2,"output":0,"reasoning":0,"cached":0,"source":"locally_exact"}},{"step":"finish","reason":"end_turn"}]"#,
+            r#"[{"step":"emit_usage","usage":{"input":2000000,"output":0,"reasoning":0,"cached":0,"source":"locally_exact"}},{"step":"finish","reason":"end_turn"}]"#,
         )],
     );
     assert_eq!(
@@ -2948,8 +3009,8 @@ fn result(outcome: HeadlessOutcome, failure: Option<HeadlessRunFailure>) -> Head
 
 /// MUTATION CHECK: alter any stable exit mapping. Expected RUNTIME failure:
 /// the corresponding table row differs, including denied-then-Done,
-/// RunFailed provider codes, blocked input, timeout, cancel, transport, and
-/// pre-acceptance RPC/daemon failures.
+/// RunFailed provider codes, budget exhaustion, blocked input, timeout,
+/// cancel, transport, and pre-acceptance RPC/daemon failures.
 #[test]
 fn run_exit_codes_are_table_driven() {
     let mut denied_done = result(HeadlessOutcome::Done, None);
@@ -2988,6 +3049,18 @@ fn run_exit_codes_are_table_driven() {
         ),
         (result(HeadlessOutcome::Cancelled, None), EX_CANCELLED),
         (result(HeadlessOutcome::Timeout, None), EX_TIMEOUT),
+        (
+            result(
+                HeadlessOutcome::Errored,
+                Some(HeadlessRunFailure {
+                    code: HeadlessFailureCode::Run(ErrorCode::BudgetExhausted),
+                    message: "budget exhausted".into(),
+                    retryable: false,
+                    presentation: None,
+                }),
+            ),
+            EX_BLOCKED,
+        ),
         (
             result(
                 HeadlessOutcome::InputRequired,

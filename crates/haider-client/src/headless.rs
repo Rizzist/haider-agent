@@ -471,6 +471,7 @@ pub enum HeadlessEvent {
 pub enum HeadlessTerminalKind {
     Success,
     Failure,
+    Budget,
     Cancellation,
     Timeout,
     ProviderError,
@@ -4544,15 +4545,14 @@ fn terminal_kind(
         HeadlessOutcome::Cancelled => HeadlessTerminalKind::Cancellation,
         HeadlessOutcome::Timeout => HeadlessTerminalKind::Timeout,
         HeadlessOutcome::Errored | HeadlessOutcome::InputRequired | HeadlessOutcome::Started => {
-            if matches!(
-                failure.map(|failure| &failure.code),
+            match failure.map(|failure| &failure.code) {
+                Some(HeadlessFailureCode::Run(ErrorCode::BudgetExhausted)) => {
+                    HeadlessTerminalKind::Budget
+                }
                 Some(HeadlessFailureCode::Run(
-                    ErrorCode::ProviderError | ErrorCode::ProviderTimeout
-                ))
-            ) {
-                HeadlessTerminalKind::ProviderError
-            } else {
-                HeadlessTerminalKind::Failure
+                    ErrorCode::ProviderError | ErrorCode::ProviderTimeout,
+                )) => HeadlessTerminalKind::ProviderError,
+                _ => HeadlessTerminalKind::Failure,
             }
         }
     }

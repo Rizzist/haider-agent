@@ -564,6 +564,9 @@ pub struct HarnessConfig {
     /// that typed budget terminal. A distinct client request deadline remains
     /// a provider timeout, and standalone actors leave this unset.
     pub provider_deadline_guard: Option<Arc<dyn ProviderDeadlineGuard>>,
+    /// Daemon-owned hard-budget authority at the physical provider-request
+    /// boundary. Standalone actors leave this unset.
+    pub provider_budget_guard: Option<Arc<dyn ProviderBudgetGuard>>,
     /// Typed human-availability policy derived from durable session metadata.
     pub interaction_policy: InteractionResolutionPolicy,
     pub command_capacity: usize,
@@ -665,6 +668,7 @@ impl HarnessConfig {
             context_compactor: None,
             finalization_guard: None,
             provider_deadline_guard: None,
+            provider_budget_guard: None,
             interaction_policy: InteractionResolutionPolicy::default(),
             command_capacity: 8,
             broadcast_capacity: 128,
@@ -1063,6 +1067,65 @@ pub trait ProviderDeadlineGuard: Send + Sync + std::fmt::Debug {
         &self,
         run_id: &RunId,
     ) -> Result<Option<HaiderError>, HaiderError>;
+}
+
+/// Keeps a daemon-owned request admission lock alive until one physical
+/// provider exchange reaches a terminal stream boundary.
+pub struct ProviderBudgetPermit {
+    _hold: Box<dyn Send>,
+}
+
+impl ProviderBudgetPermit {
+    #[must_use]
+    pub fn new(hold: impl Send + 'static) -> Self {
+        Self {
+            _hold: Box::new(hold),
+        }
+    }
+}
+
+/// Daemon-owned hard-budget authority at every physical provider request.
+/// The preflight receives the fully shaped request and current provider
+/// coordinate; usage callbacks run only after the cumulative snapshot is
+/// durable, so a refusal can stop the stream at that chunk boundary.
+#[async_trait]
+pub trait ProviderBudgetGuard: Send + Sync + std::fmt::Debug {
+    async fn before_request(
+        &self,
+        run_id: &RunId,
+        provider: &str,
+        request: &TurnRequest,
+        projected_input_tokens: u64,
+    ) -> Result<ProviderBudgetPermit, HaiderError>;
+
+    async fn after_usage(&self, run_id: &RunId) -> Result<(), HaiderError>;
+
+    async fn after_request(
+        &self,
+        run_id: &RunId,
+        provider: &str,
+        model: &str,
+        usage_reported: bool,
+    ) -> Result<(), HaiderError>;
+}
+
+async fn release_provider_budget_request(
+    guard: Option<&Arc<dyn ProviderBudgetGuard>>,
+    run_id: &RunId,
+    provider: &str,
+    model: &str,
+    usage_reported: bool,
+    permit: &mut Option<ProviderBudgetPermit>,
+) -> Result<(), HaiderError> {
+    let result = if let Some(guard) = guard {
+        guard
+            .after_request(run_id, provider, model, usage_reported)
+            .await
+    } else {
+        Ok(())
+    };
+    drop(permit.take());
+    result
 }
 
 /// A provider/account replacement for the current logical turn.
@@ -2998,6 +3061,14 @@ impl HarnessActor {
                 attachments: request_attachments,
                 cache_metadata: Some(cache_metadata.clone()),
             };
+            let projected_input_tokens = estimate_provider_request_input_tokens(
+                &provider_request.messages,
+                &provider_request.system_prompt,
+                shared_request_tools
+                    .as_deref()
+                    .map_or(provider_request.tools.as_slice(), |tools| tools),
+                &provider_request.attachments,
+            );
             let mut prepared = if let Some(tools) = shared_request_tools.as_ref() {
                 provider.prepare_turn_with_tools_owned(&mut provider_request, tools)
             } else {
@@ -3212,6 +3283,38 @@ impl HarnessActor {
                         .await;
                 }
             };
+            // P0 hard-budget boundary: the daemon sees the fully shaped
+            // physical request before either its durable attempt marker or
+            // provider transport can observe it. The returned permit keeps
+            // capped parent/child requests serialized until this exchange
+            // reaches a stream terminal.
+            let mut provider_budget_permit =
+                if let Some(guard) = self.config.provider_budget_guard.as_ref() {
+                    match guard
+                        .before_request(
+                            &run_id,
+                            &self.config.usage_scope.provider,
+                            &provider_request,
+                            projected_input_tokens,
+                        )
+                        .await
+                    {
+                        Ok(permit) => Some(permit),
+                        Err(error) => {
+                            return self
+                                .errored_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    error,
+                                )
+                                .await;
+                        }
+                    }
+                } else {
+                    None
+                };
             let persisted_provider_view = match self
                 .commit_request_attempt(
                     &run_id,
@@ -3252,6 +3355,26 @@ impl HarnessActor {
                 let opened = tokio::select! {
                     biased;
                     () = cancel.cancelled() => {
+                        if let Err(error) = release_provider_budget_request(
+                            self.config.provider_budget_guard.as_ref(),
+                            &run_id,
+                            &self.config.usage_scope.provider,
+                            &self.config.model,
+                            false,
+                            &mut provider_budget_permit,
+                        )
+                        .await
+                        {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    DriveError::Store(error),
+                                )
+                                .await;
+                        }
                         return self
                             .cancelled_outcome_with_items(
                                 &run_id,
@@ -3274,6 +3397,15 @@ impl HarnessActor {
                                 RunState::Thinking
                             };
                             if let Err(error) = self.commit_state(&run_id, state).await {
+                                let _ = release_provider_budget_request(
+                                    self.config.provider_budget_guard.as_ref(),
+                                    &run_id,
+                                    &self.config.usage_scope.provider,
+                                    &self.config.model,
+                                    false,
+                                    &mut provider_budget_permit,
+                                )
+                                .await;
                                 return self.errored_state_outcome(&run_id, error).await;
                             }
                             opening_network_waiting = unavailable;
@@ -3283,6 +3415,26 @@ impl HarnessActor {
                     opened = &mut opening => opened,
                     command = self.commands.recv() => {
                         let Some(command) = command else {
+                            if let Err(error) = release_provider_budget_request(
+                                self.config.provider_budget_guard.as_ref(),
+                                &run_id,
+                                &self.config.usage_scope.provider,
+                                &self.config.model,
+                                false,
+                                &mut provider_budget_permit,
+                            )
+                            .await
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        DriveError::Store(error),
+                                    )
+                                    .await;
+                            }
                             let error = provider_protocol_error(
                                 "session actor command channel closed while opening provider stream",
                             );
@@ -3298,14 +3450,36 @@ impl HarnessActor {
                         };
                         if let ActorCommand::Stop { completed } = command {
                             cancel.cancel();
-                            let outcome = self
-                                .cancelled_outcome_with_items(
-                                    &run_id,
-                                    &mut message,
-                                    &mut reasoning,
-                                    &mut tools,
-                                )
-                                .await;
+                            let outcome = match release_provider_budget_request(
+                                self.config.provider_budget_guard.as_ref(),
+                                &run_id,
+                                &self.config.usage_scope.provider,
+                                &self.config.model,
+                                false,
+                                &mut provider_budget_permit,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    self.cancelled_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                    )
+                                    .await
+                                }
+                                Err(error) => {
+                                    self.drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        DriveError::Store(error),
+                                    )
+                                    .await
+                                }
+                            };
                             let _ = completed.send(());
                             return outcome;
                         }
@@ -3314,6 +3488,26 @@ impl HarnessActor {
                     }
                 };
                 if cancel.is_cancelled() {
+                    if let Err(error) = release_provider_budget_request(
+                        self.config.provider_budget_guard.as_ref(),
+                        &run_id,
+                        &self.config.usage_scope.provider,
+                        &self.config.model,
+                        false,
+                        &mut provider_budget_permit,
+                    )
+                    .await
+                    {
+                        return self
+                            .drive_error_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                                DriveError::Store(error),
+                            )
+                            .await;
+                    }
                     return self
                         .cancelled_outcome_with_items(
                             &run_id,
@@ -3344,6 +3538,30 @@ impl HarnessActor {
                     }
                 }
                 messages = restored_messages;
+                if opened.is_err()
+                    && let Some(guard) = self.config.provider_budget_guard.clone()
+                    && let Err(error) = guard
+                        .after_request(
+                            &run_id,
+                            &self.config.usage_scope.provider,
+                            &self.config.model,
+                            false,
+                        )
+                        .await
+                {
+                    return self
+                        .drive_error_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                            DriveError::Store(error),
+                        )
+                        .await;
+                }
+                if opened.is_err() {
+                    drop(provider_budget_permit.take());
+                }
                 match opened {
                     Ok(stream) => break stream,
                     Err(error) if error.kind == ProviderErrorKind::ContextExceeded => {
@@ -3425,6 +3643,15 @@ impl HarnessActor {
                 }
             };
             if let Err(error) = self.commit_state(&run_id, RunState::Streaming).await {
+                let _ = release_provider_budget_request(
+                    self.config.provider_budget_guard.as_ref(),
+                    &run_id,
+                    &self.config.usage_scope.provider,
+                    &self.config.model,
+                    false,
+                    &mut provider_budget_permit,
+                )
+                .await;
                 return self.errored_state_outcome(&run_id, error).await;
             }
 
@@ -3436,9 +3663,11 @@ impl HarnessActor {
                 // Coalesce only a Finish already buffered immediately after
                 // Usage. If polling would suspend, preserve the old durability
                 // boundary by committing Usage before awaiting anything else.
-                let immediate_next = (pending_usage_commit.is_some() && !cancel.is_cancelled())
-                    .then(|| poll_provider_stream_now(&mut stream))
-                    .flatten();
+                let immediate_next = (self.config.provider_budget_guard.is_none()
+                    && pending_usage_commit.is_some()
+                    && !cancel.is_cancelled())
+                .then(|| poll_provider_stream_now(&mut stream))
+                .flatten();
                 if pending_usage_commit.is_some()
                     && immediate_next.is_none()
                     && let Err(error) = self
@@ -3465,6 +3694,26 @@ impl HarnessActor {
                     // command arrival rate cannot starve the active stream.
                     biased;
                     () = cancel.cancelled() => {
+                        if let Err(error) = release_provider_budget_request(
+                            self.config.provider_budget_guard.as_ref(),
+                            &run_id,
+                            &self.config.usage_scope.provider,
+                            &self.config.model,
+                            request_usage.is_some(),
+                            &mut provider_budget_permit,
+                        )
+                        .await
+                        {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    DriveError::Store(error),
+                                )
+                                .await;
+                        }
                         return self
                             .cancelled_outcome_with_items(
                                 &run_id,
@@ -3491,6 +3740,26 @@ impl HarnessActor {
                     item = stream.recv() => item,
                     command = self.commands.recv() => {
                         let Some(command) = command else {
+                            if let Err(error) = release_provider_budget_request(
+                                self.config.provider_budget_guard.as_ref(),
+                                &run_id,
+                                &self.config.usage_scope.provider,
+                                &self.config.model,
+                                request_usage.is_some(),
+                                &mut provider_budget_permit,
+                            )
+                            .await
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        DriveError::Store(error),
+                                    )
+                                    .await;
+                            }
                             let error = provider_protocol_error(
                                 "session actor command channel closed during provider stream",
                             );
@@ -3506,14 +3775,36 @@ impl HarnessActor {
                         };
                         if let ActorCommand::Stop { completed } = command {
                             cancel.cancel();
-                            let outcome = self
-                                .cancelled_outcome_with_items(
-                                    &run_id,
-                                    &mut message,
-                                    &mut reasoning,
-                                    &mut tools,
-                                )
-                                .await;
+                            let outcome = match release_provider_budget_request(
+                                self.config.provider_budget_guard.as_ref(),
+                                &run_id,
+                                &self.config.usage_scope.provider,
+                                &self.config.model,
+                                request_usage.is_some(),
+                                &mut provider_budget_permit,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    self.cancelled_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                    )
+                                    .await
+                                }
+                                Err(error) => {
+                                    self.drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        DriveError::Store(error),
+                                    )
+                                    .await
+                                }
+                            };
                             let _ = completed.send(());
                             return outcome;
                         }
@@ -3555,6 +3846,26 @@ impl HarnessActor {
                             )
                             .await;
                     }
+                    if let Err(error) = release_provider_budget_request(
+                        self.config.provider_budget_guard.as_ref(),
+                        &run_id,
+                        &self.config.usage_scope.provider,
+                        &self.config.model,
+                        request_usage.is_some(),
+                        &mut provider_budget_permit,
+                    )
+                    .await
+                    {
+                        return self
+                            .drive_error_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                                DriveError::Store(error),
+                            )
+                            .await;
+                    }
                     return self
                         .cancelled_outcome_with_items(
                             &run_id,
@@ -3585,6 +3896,26 @@ impl HarnessActor {
                         if error.kind == ProviderErrorKind::ContextExceeded
                             && !provider_content_seen =>
                     {
+                        if let Err(error) = release_provider_budget_request(
+                            self.config.provider_budget_guard.as_ref(),
+                            &run_id,
+                            &self.config.usage_scope.provider,
+                            &self.config.model,
+                            request_usage.is_some(),
+                            &mut provider_budget_permit,
+                        )
+                        .await
+                        {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    DriveError::Store(error),
+                                )
+                                .await;
+                        }
                         let compacted = if request_projection_compacted || compaction_guard_consumed
                         {
                             Err(repeated_context_overflow_after_compaction())
@@ -3615,6 +3946,26 @@ impl HarnessActor {
                         continue 'requests;
                     }
                     Err(error) if !provider_content_seen => {
+                        if let Err(error) = release_provider_budget_request(
+                            self.config.provider_budget_guard.as_ref(),
+                            &run_id,
+                            &self.config.usage_scope.provider,
+                            &self.config.model,
+                            request_usage.is_some(),
+                            &mut provider_budget_permit,
+                        )
+                        .await
+                        {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    DriveError::Store(error),
+                                )
+                                .await;
+                        }
                         if let Err(error) = self
                             .prepare_pre_first_event_retry(
                                 ProviderRetryContext {
@@ -3661,6 +4012,26 @@ impl HarnessActor {
                         continue 'requests;
                     }
                     Err(error) => {
+                        if let Err(budget_error) = release_provider_budget_request(
+                            self.config.provider_budget_guard.as_ref(),
+                            &run_id,
+                            &self.config.usage_scope.provider,
+                            &self.config.model,
+                            request_usage.is_some(),
+                            &mut provider_budget_permit,
+                        )
+                        .await
+                        {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    DriveError::Store(budget_error),
+                                )
+                                .await;
+                        }
                         // A network disconnect or idle timeout is not a user
                         // decision. Once provider content is visible we cannot
                         // safely replay the request, so terminate through the
@@ -3858,14 +4229,36 @@ impl HarnessActor {
                         match self.commands.try_recv() {
                             Ok(ActorCommand::Stop { completed }) => {
                                 cancel.cancel();
-                                let outcome = self
-                                    .cancelled_outcome_with_items(
-                                        &run_id,
-                                        &mut message,
-                                        &mut reasoning,
-                                        &mut tools,
-                                    )
-                                    .await;
+                                let outcome = match release_provider_budget_request(
+                                    self.config.provider_budget_guard.as_ref(),
+                                    &run_id,
+                                    &self.config.usage_scope.provider,
+                                    &self.config.model,
+                                    request_usage.is_some(),
+                                    &mut provider_budget_permit,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        self.cancelled_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                        )
+                                        .await
+                                    }
+                                    Err(error) => {
+                                        self.drive_error_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            DriveError::Store(error),
+                                        )
+                                        .await
+                                    }
+                                };
                                 let _ = completed.send(());
                                 return outcome;
                             }
@@ -3973,6 +4366,26 @@ impl HarnessActor {
                                             .into_iter()
                                             .map(Message::user_text),
                                     );
+                                    if let Err(error) = release_provider_budget_request(
+                                        self.config.provider_budget_guard.as_ref(),
+                                        &run_id,
+                                        &self.config.usage_scope.provider,
+                                        &self.config.model,
+                                        request_usage.is_some(),
+                                        &mut provider_budget_permit,
+                                    )
+                                    .await
+                                    {
+                                        return self
+                                            .drive_error_outcome_with_items(
+                                                &run_id,
+                                                &mut message,
+                                                &mut reasoning,
+                                                &mut tools,
+                                                DriveError::Store(error),
+                                            )
+                                            .await;
+                                    }
                                     if let Err(error) = finalize_request_usage(
                                         &mut completed_usage,
                                         &mut request_usage,
@@ -4187,12 +4600,60 @@ impl HarnessActor {
                                         .then_some(footprint),
                                     usage,
                                 });
+                                if let Some(guard) = self.config.provider_budget_guard.clone() {
+                                    if let Err(error) = self
+                                        .commit_pending_usage(&run_id, &mut pending_usage_commit)
+                                        .await
+                                    {
+                                        return self
+                                            .drive_error_outcome_with_items(
+                                                &run_id,
+                                                &mut message,
+                                                &mut reasoning,
+                                                &mut tools,
+                                                DriveError::Store(error),
+                                            )
+                                            .await;
+                                    }
+                                    if let Err(error) = guard.after_usage(&run_id).await {
+                                        return self
+                                            .drive_error_outcome_with_items(
+                                                &run_id,
+                                                &mut message,
+                                                &mut reasoning,
+                                                &mut tools,
+                                                DriveError::Store(error),
+                                            )
+                                            .await;
+                                    }
+                                }
                                 Ok(None)
                             }
                             Err(error) => Err(error),
                         }
                     }
                     StreamEvent::Finish { reason } => {
+                        if let Some(guard) = self.config.provider_budget_guard.clone()
+                            && let Err(error) = guard
+                                .after_request(
+                                    &run_id,
+                                    &self.config.usage_scope.provider,
+                                    &self.config.model,
+                                    request_usage.is_some(),
+                                )
+                                .await
+                        {
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    DriveError::Store(error),
+                                )
+                                .await;
+                        }
+                        drop(provider_budget_permit.take());
                         if reason == FinishReason::Cancelled {
                             if let Err(error) = self
                                 .commit_pending_usage(&run_id, &mut pending_usage_commit)
@@ -10563,10 +11024,11 @@ fn estimated_request_input_measure(
 }
 
 /// Deterministic provider-neutral accounting for the textual request
-/// projection plus a per-image heuristic. Daemon-owned idle operations use
-/// the same estimator as live actor rounds. Resolved attachment transport
-/// bytes are intentionally excluded: this is neither a provider wire-byte
-/// count nor a model-tokenizer result.
+/// projection, native-document payload bytes, and a per-image heuristic.
+/// Daemon-owned idle operations use the same estimator as live actor rounds.
+/// Image transport bytes remain excluded because their fixed visual-token
+/// approximation is provider-neutral; native PDFs have no such alternate
+/// measurement, so their resolved base64 request bytes bind the projection.
 pub const VISION_IMAGE_ESTIMATE_TOKENS: u64 = 1_600;
 
 #[must_use]
@@ -10613,20 +11075,41 @@ fn estimate_provider_request_input_tokens_raw(
     messages: &[Message],
     system_prompt: &Option<String>,
     tools: &[ToolDefinition],
-    _attachments: &[ResolvedAttachment],
+    attachments: &[ResolvedAttachment],
 ) -> u64 {
-    estimate_provider_request_input_measure_raw(messages, system_prompt, tools, _attachments).tokens
+    estimate_provider_request_input_measure_raw(messages, system_prompt, tools, attachments).tokens
 }
 
 fn estimate_provider_request_input_measure_raw(
     messages: &[Message],
     system_prompt: &Option<String>,
     tools: &[ToolDefinition],
-    _attachments: &[ResolvedAttachment],
+    attachments: &[ResolvedAttachment],
 ) -> RequestInputMeasure {
-    let bytes = serde_json::to_vec(&(messages, system_prompt, tools))
+    let textual_bytes = serde_json::to_vec(&(messages, system_prompt, tools))
         .map(|encoded| u64::try_from(encoded.len()).unwrap_or(u64::MAX))
         .unwrap_or(u64::MAX);
+    let native_pdf_bytes = messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| {
+            let haider_protocol::provider::Block::Attachment(
+                haider_protocol::tool::AttachmentBlock::Pdf {
+                    artifact,
+                    delivery: haider_protocol::tool::PdfDeliveryMode::NativeDocument,
+                    ..
+                },
+            ) = block
+            else {
+                return None;
+            };
+            attachments
+                .iter()
+                .find(|attachment| &attachment.artifact == artifact)
+        })
+        .map(|attachment| u64::try_from(attachment.data_base64.len()).unwrap_or(u64::MAX))
+        .fold(0_u64, u64::saturating_add);
+    let bytes = textual_bytes.saturating_add(native_pdf_bytes);
     let image_count = messages
         .iter()
         .flat_map(|message| &message.blocks)

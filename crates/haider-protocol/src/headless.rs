@@ -96,12 +96,68 @@ pub struct HeadlessRunUsageV1 {
     pub elapsed_ms: u64,
 }
 
+/// Why a run-budget decision refused or stopped provider work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RunBudgetDecisionReasonV1 {
+    ActualUsage,
+    TimeElapsed,
+    ProjectedRequest,
+    PricingUnavailable {
+        provider: String,
+        model: String,
+    },
+    UsageUnavailable {
+        provider: String,
+        model: String,
+    },
+    /// Forward-compatible value for reasons introduced by a newer peer.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The values used to make one observable run-budget decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunBudgetDecisionV1 {
+    /// Run usage already committed in the selected dimension.
+    pub spent: u64,
+    /// Projected incremental usage for the candidate request, or absent when
+    /// the projection is unavailable or does not apply to this decision.
+    #[serde(default)]
+    pub projected: Option<u64>,
+    pub cap: u64,
+    pub reason: RunBudgetDecisionReasonV1,
+}
+
 /// Structured terminal cause committed before `RunFailed`/`Errored`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunBudgetExhaustedV1 {
     pub dimension: RunBudgetDimensionV1,
     pub limit: u64,
     pub usage: HeadlessRunUsageV1,
+    /// Additive decision detail. Absent on events written by older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<RunBudgetDecisionV1>,
+}
+
+impl RunBudgetExhaustedV1 {
+    /// Stable human summary accompanying the typed budget fact.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let Some(decision) = self.decision.as_ref() else {
+            return format!(
+                "headless {:?} budget exhausted at limit {}",
+                self.dimension, self.limit
+            );
+        };
+        let projected = decision
+            .projected
+            .map_or_else(|| "unavailable".to_owned(), |value| value.to_string());
+        format!(
+            "headless {:?} budget exhausted: spent {}, projected {}, cap {}, reason {:?}",
+            self.dimension, decision.spent, projected, decision.cap, decision.reason
+        )
+    }
 }
 
 /// Semantic comparison between a source run and its re-execution.
@@ -136,3 +192,7 @@ impl HeadlessRunEventPayload {
         serde_json::from_value(value.clone()).ok()
     }
 }
+
+#[cfg(test)]
+#[path = "headless_tests.rs"]
+mod tests;

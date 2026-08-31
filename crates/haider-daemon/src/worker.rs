@@ -67,11 +67,11 @@ use haider_core::{
     GraphFinalizationCommand, GraphFinalizationOutcome, GraphSwitchCommand, GraphSwitchOutcome,
     HarnessActor, HarnessConfig, PartialStreamCheckpoint, PreviousCacheRequest,
     ProcessSignalCommand, ProcessSignalOutcome, PromptCompactionPlanRequest, PromptHistoryCompiler,
-    ProviderDeadlineGuard, ProviderDerivedRequestState, ProviderPairSwitch,
-    ProviderPairSwitchCommitter, ProviderViewAppendRequest, RequestInputCheckpoint,
-    SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks, StoreHandle,
-    SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
-    ToolDispatchResult, ToolDispatcher, TurnHandle, UserCommandOutput,
+    ProviderBudgetGuard, ProviderBudgetPermit, ProviderDeadlineGuard, ProviderDerivedRequestState,
+    ProviderPairSwitch, ProviderPairSwitchCommitter, ProviderViewAppendRequest,
+    RequestInputCheckpoint, SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks,
+    StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
+    SubmitPartialStreamTurn, ToolDispatchResult, ToolDispatcher, TurnHandle, UserCommandOutput,
     build_cache_request_diagnostic, build_context_accounting, classify_cache_request,
     context_soft_threshold_tokens, effect_recovery_evidence,
     estimate_provider_request_bytes_div_four, estimate_provider_request_input_tokens,
@@ -98,8 +98,8 @@ use haider_protocol::graph::{
     ProcessSignalRef, WorkspaceMutationRef, process_signal_subject_digest,
 };
 use haider_protocol::headless::{
-    HeadlessRunEventPayload, HeadlessRunSpecV1, HeadlessRunUsageV1, RunBudgetDimensionV1,
-    RunBudgetExhaustedV1, RunBudgetV1,
+    HeadlessRunEventPayload, HeadlessRunSpecV1, HeadlessRunUsageV1, RunBudgetDecisionReasonV1,
+    RunBudgetDecisionV1, RunBudgetDimensionV1, RunBudgetExhaustedV1, RunBudgetV1,
 };
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
@@ -429,6 +429,7 @@ struct DaemonContextCompactor {
     max_tokens: u64,
     provider_deadline: Option<tokio::time::Instant>,
     provider_deadline_guard: Option<Arc<DaemonGraphFinalizationGuard>>,
+    provider_budget_guard: Option<Arc<DaemonGraphFinalizationGuard>>,
     context_window: Option<u64>,
     reserved_output_tokens: u64,
     structural_context_trimming: bool,
@@ -492,6 +493,48 @@ impl DaemonContextCompactor {
     async fn provider_stream_error(&self, run_id: &RunId, error: ProviderError) -> HaiderError {
         self.provider_phase_error(run_id, error, "context summarization failed")
             .await
+    }
+
+    async fn admit_budget_request(
+        &self,
+        run_id: &RunId,
+        request: &TurnRequest,
+        projected_input_tokens: u64,
+    ) -> Result<Option<ProviderBudgetPermit>, HaiderError> {
+        let Some(guard) = self.provider_budget_guard.as_ref() else {
+            return Ok(None);
+        };
+        guard
+            .before_request(
+                run_id,
+                &self.usage_scope.provider,
+                request,
+                projected_input_tokens,
+            )
+            .await
+            .map(Some)
+    }
+
+    async fn release_budget_request(
+        &self,
+        run_id: &RunId,
+        usage_reported: bool,
+        permit: &mut Option<ProviderBudgetPermit>,
+    ) -> Result<(), HaiderError> {
+        let result = if let Some(guard) = self.provider_budget_guard.as_ref() {
+            guard
+                .after_request(
+                    run_id,
+                    &self.usage_scope.provider,
+                    &self.model,
+                    usage_reported,
+                )
+                .await
+        } else {
+            Ok(())
+        };
+        drop(permit.take());
+        result
     }
 
     fn provider_view_attempt_envelopes(
@@ -706,8 +749,7 @@ impl std::fmt::Debug for DaemonGraphFinalizationGuard {
 impl DaemonGraphFinalizationGuard {
     async fn reject_exhausted_budget(&self, run_id: &RunId) -> Result<(), HaiderError> {
         if let Some(check) = self.budget_check.as_ref()
-            && let Some(exhausted) =
-                check_run_budget(&check.store, run_id, &check.spec, check.accepted_at_ms).await?
+            && let Some(exhausted) = check_budget_context(check).await?
         {
             persist_headless_budget_fact(
                 check,
@@ -813,6 +855,185 @@ impl ProviderDeadlineGuard for DaemonGraphFinalizationGuard {
         run_id: &RunId,
     ) -> Result<Option<HaiderError>, HaiderError> {
         self.map_budget_owned_provider_deadline(run_id).await
+    }
+}
+
+#[async_trait]
+impl ProviderBudgetGuard for DaemonGraphFinalizationGuard {
+    async fn before_request(
+        &self,
+        run_id: &RunId,
+        provider: &str,
+        request: &TurnRequest,
+        projected_input_tokens: u64,
+    ) -> Result<ProviderBudgetPermit, HaiderError> {
+        let Some(check) = self.budget_check.as_ref() else {
+            return Ok(ProviderBudgetPermit::new(()));
+        };
+        let permit = Arc::clone(&check.coordinator.request_serial)
+            .lock_owned()
+            .await;
+        if let Some(exhausted) = forced_budget(&check.coordinator) {
+            persist_headless_budget_fact(
+                check,
+                &self.device_id,
+                run_id,
+                self.branch_id.as_ref(),
+                &self.event_ids,
+                &exhausted,
+            )
+            .await?;
+            return Err(budget_exhausted_error(&exhausted));
+        }
+        let snapshot = run_budget_usage_for_context(check).await?;
+        let unresolved = take_active_projection(&check.coordinator)
+            .map(|projection| {
+                let provider = projection.provider.clone();
+                let model = projection.model.clone();
+                (Some(projection), provider, model)
+            })
+            .or_else(|| {
+                snapshot
+                    .unresolved
+                    .as_ref()
+                    .map(|(provider, model)| (None, provider.clone(), model.clone()))
+            });
+        if let Some((projection, provider, model)) = unresolved
+            && let Some(exhausted) = missing_usage_budget_exhaustion(
+                &check.spec.budget,
+                snapshot.usage.clone(),
+                projection.as_ref(),
+                &provider,
+                &model,
+            )
+        {
+            force_budget(&check.coordinator, &exhausted);
+            persist_headless_budget_fact(
+                check,
+                &self.device_id,
+                run_id,
+                self.branch_id.as_ref(),
+                &self.event_ids,
+                &exhausted,
+            )
+            .await?;
+            return Err(budget_exhausted_error(&exhausted));
+        }
+        let usage = snapshot.usage;
+        if let Some(exhausted) = exhausted_budget(
+            &check.spec.budget,
+            usage.clone(),
+            &check.spec.provider,
+            &check.spec.model,
+        ) {
+            force_budget(&check.coordinator, &exhausted);
+            persist_headless_budget_fact(
+                check,
+                &self.device_id,
+                run_id,
+                self.branch_id.as_ref(),
+                &self.event_ids,
+                &exhausted,
+            )
+            .await?;
+            return Err(budget_exhausted_error(&exhausted));
+        }
+        let projection = ProviderRequestProjection {
+            provider: provider.to_owned(),
+            model: request.model.clone(),
+            input_tokens: projected_input_tokens,
+            max_output_tokens: request.max_tokens,
+            estimated_cost_microusd: haider_provider::estimate_chunk_cost_usd_for(
+                provider,
+                &request.model,
+                projected_input_tokens,
+                request.max_tokens,
+                0,
+                0,
+            )
+            .map(usd_to_microusd_ceil),
+        };
+        if let Some(exhausted) = projected_budget_exhaustion(&check.spec.budget, usage, &projection)
+        {
+            force_budget(&check.coordinator, &exhausted);
+            persist_headless_budget_fact(
+                check,
+                &self.device_id,
+                run_id,
+                self.branch_id.as_ref(),
+                &self.event_ids,
+                &exhausted,
+            )
+            .await?;
+            return Err(budget_exhausted_error(&exhausted));
+        }
+        check
+            .coordinator
+            .request_active
+            .store(true, Ordering::Release);
+        replace_active_projection(&check.coordinator, Some(projection));
+        Ok(ProviderBudgetPermit::new(RunBudgetRequestPermit {
+            _serial: permit,
+            active: Arc::clone(&check.coordinator.request_active),
+        }))
+    }
+
+    async fn after_usage(&self, run_id: &RunId) -> Result<(), HaiderError> {
+        let Some(check) = self.budget_check.as_ref() else {
+            return Ok(());
+        };
+        if let Some(exhausted) = check_budget_context(check).await? {
+            force_budget(&check.coordinator, &exhausted);
+            persist_headless_budget_fact(
+                check,
+                &self.device_id,
+                run_id,
+                self.branch_id.as_ref(),
+                &self.event_ids,
+                &exhausted,
+            )
+            .await?;
+            return Err(budget_exhausted_error(&exhausted));
+        }
+        Ok(())
+    }
+
+    async fn after_request(
+        &self,
+        run_id: &RunId,
+        provider: &str,
+        model: &str,
+        usage_reported: bool,
+    ) -> Result<(), HaiderError> {
+        let Some(check) = self.budget_check.as_ref() else {
+            return Ok(());
+        };
+        let projection = take_active_projection(&check.coordinator);
+        if usage_reported {
+            return Ok(());
+        }
+        let usage = run_budget_usage_for_context(check).await?.usage;
+        let exhausted = missing_usage_budget_exhaustion(
+            &check.spec.budget,
+            usage,
+            projection.as_ref(),
+            provider,
+            model,
+        );
+        if let Some(exhausted) = exhausted {
+            force_budget(&check.coordinator, &exhausted);
+            persist_headless_budget_fact(
+                check,
+                &self.device_id,
+                run_id,
+                self.branch_id.as_ref(),
+                &self.event_ids,
+                &exhausted,
+            )
+            .await?;
+            return Err(budget_exhausted_error(&exhausted));
+        }
+        Ok(())
     }
 }
 
@@ -970,6 +1191,12 @@ impl ContextCompactor for DaemonContextCompactor {
             attachments: source_attachments.clone(),
             cache_metadata: Some(cache_metadata.clone()),
         };
+        let projected_input_tokens = estimate_provider_request_input_tokens(
+            &request.messages,
+            &request.system_prompt,
+            self.post_compaction_tools.as_ref(),
+            &request.attachments,
+        );
         let mut prepared = self
             .provider
             .prepare_turn_with_tools_owned(&mut request, &self.post_compaction_tools);
@@ -1069,6 +1296,9 @@ impl ContextCompactor for DaemonContextCompactor {
             cache_control,
             None,
         );
+        let mut budget_permit = self
+            .admit_budget_request(run_id, &request, projected_input_tokens)
+            .await?;
         self.record_request_attempt(run_id, 1, pending_provider_view, &replay_cache_diagnostic)
             .await?;
         let replay_request_messages = request.messages.clone();
@@ -1096,6 +1326,8 @@ impl ContextCompactor for DaemonContextCompactor {
             // burning it as an uncached full-price fallback both lies about
             // the failure class and pays for the lie.
             Err(error) if error.retryable => {
+                self.release_budget_request(run_id, false, &mut budget_permit)
+                    .await?;
                 return Err(HaiderError::new(
                     ErrorCode::ProviderError,
                     format!("context summarization could not start: {error}"),
@@ -1103,9 +1335,13 @@ impl ContextCompactor for DaemonContextCompactor {
                 ));
             }
             Err(error) if error.presentation.subcode.as_str() == "provider-timeout" => {
+                self.release_budget_request(run_id, false, &mut budget_permit)
+                    .await?;
                 return Err(self.provider_open_error(run_id, error).await);
             }
             Err(_) => {
+                self.release_budget_request(run_id, false, &mut budget_permit)
+                    .await?;
                 // Some provider families cannot replay durable multimodal
                 // blocks. Preserve the old text-only request as a single
                 // degraded fallback, but never mutate the cache-riding
@@ -1144,6 +1380,12 @@ impl ContextCompactor for DaemonContextCompactor {
                     attachments: Vec::new(),
                     cache_metadata: None,
                 };
+                let fallback_projected_input_tokens = estimate_provider_request_input_tokens(
+                    &fallback.messages,
+                    &fallback.system_prompt,
+                    &fallback.tools,
+                    &fallback.attachments,
+                );
                 let fallback_prefix_digests = PrefixDigests {
                     system: digest_json(&fallback_system_prompt),
                     tools: empty_tool_definitions_digest().to_owned(),
@@ -1184,6 +1426,9 @@ impl ContextCompactor for DaemonContextCompactor {
                     CacheControlObservationV1::Unavailable,
                     None,
                 );
+                budget_permit = self
+                    .admit_budget_request(run_id, &fallback, fallback_projected_input_tokens)
+                    .await?;
                 self.record_request_attempt(run_id, 2, None, &fallback_cache_diagnostic)
                     .await?;
                 let stream = match haider_provider::before_provider_request_deadline(
@@ -1193,7 +1438,11 @@ impl ContextCompactor for DaemonContextCompactor {
                 .await
                 {
                     Ok(stream) => stream,
-                    Err(error) => return Err(self.provider_open_error(run_id, error).await),
+                    Err(error) => {
+                        self.release_budget_request(run_id, false, &mut budget_permit)
+                            .await?;
+                        return Err(self.provider_open_error(run_id, error).await);
+                    }
                 };
                 (
                     stream,
@@ -1216,6 +1465,12 @@ impl ContextCompactor for DaemonContextCompactor {
             {
                 Ok(Some(Ok(item))) => item,
                 Ok(Some(Err(error))) | Err(error) => {
+                    self.release_budget_request(
+                        run_id,
+                        reported_usage.is_some(),
+                        &mut budget_permit,
+                    )
+                    .await?;
                     return Err(self.provider_stream_error(run_id, error).await);
                 }
                 Ok(None) => break,
@@ -1277,15 +1532,39 @@ impl ContextCompactor for DaemonContextCompactor {
                     });
                     // Provider streaming usage is cumulative within this
                     // request; the latest snapshot replaces earlier ones.
+                    if let Some(guard) = self.provider_budget_guard.as_ref() {
+                        append_payloads(
+                            &self.store,
+                            &self.device_id,
+                            run_id,
+                            self.branch_id.as_ref(),
+                            &self.event_ids,
+                            vec![EventPayload::Usage(usage.clone())],
+                        )
+                        .await?;
+                        guard.after_usage(run_id).await?;
+                    }
                     reported_usage = Some(usage);
                 }
                 StreamEvent::Finish {
                     reason: FinishReason::EndTurn,
                 } => {
+                    self.release_budget_request(
+                        run_id,
+                        reported_usage.is_some(),
+                        &mut budget_permit,
+                    )
+                    .await?;
                     finished = true;
                     break;
                 }
                 StreamEvent::Finish { reason } => {
+                    self.release_budget_request(
+                        run_id,
+                        reported_usage.is_some(),
+                        &mut budget_permit,
+                    )
+                    .await?;
                     return Err(HaiderError::new(
                         ErrorCode::ProviderError,
                         format!("context summarization ended with {reason:?}"),
@@ -1303,6 +1582,12 @@ impl ContextCompactor for DaemonContextCompactor {
                 | StreamEvent::ServerToolResult { .. }
                 | StreamEvent::WebSources { .. } => {}
                 StreamEvent::RefusalDelta { .. } => {
+                    self.release_budget_request(
+                        run_id,
+                        reported_usage.is_some(),
+                        &mut budget_permit,
+                    )
+                    .await?;
                     return Err(HaiderError::new(
                         ErrorCode::ProviderError,
                         "context summarization was refused by the provider",
@@ -1312,6 +1597,12 @@ impl ContextCompactor for DaemonContextCompactor {
                 StreamEvent::ToolCallStart { .. }
                 | StreamEvent::ToolCallArgsDelta { .. }
                 | StreamEvent::ToolCallEnd { .. } => {
+                    self.release_budget_request(
+                        run_id,
+                        reported_usage.is_some(),
+                        &mut budget_permit,
+                    )
+                    .await?;
                     return Err(HaiderError::new(
                         ErrorCode::ProviderError,
                         "context summarization returned tool calls",
@@ -1321,6 +1612,8 @@ impl ContextCompactor for DaemonContextCompactor {
             }
         }
         if !finished || summary.trim().is_empty() {
+            self.release_budget_request(run_id, reported_usage.is_some(), &mut budget_permit)
+                .await?;
             return Err(HaiderError::new(
                 ErrorCode::ProviderError,
                 "context summarization returned no completed summary",
@@ -1401,7 +1694,9 @@ impl ContextCompactor for DaemonContextCompactor {
                 item: savings_item,
             }),
         ]);
-        if let Some(usage) = reported_usage {
+        if self.provider_budget_guard.is_none()
+            && let Some(usage) = reported_usage
+        {
             payloads.push(EventPayload::Usage(usage));
         }
         if intent.resume_cause == CompactionResume::ManualIdle {
@@ -3829,10 +4124,7 @@ async fn run_supervisor(
                                     return false;
                                 }
                             }
-                            let message = format!(
-                                "headless {:?} budget exhausted at limit {}",
-                                exhausted.dimension, exhausted.limit
-                            );
+                            let message = exhausted.summary();
                             let error = HaiderError::new(
                                 ErrorCode::BudgetExhausted,
                                 message.clone(),
@@ -5453,6 +5745,7 @@ async fn perform_manual_compaction(
         max_tokens: metadata.max_tokens,
         provider_deadline: None,
         provider_deadline_guard: None,
+        provider_budget_guard: None,
         context_window: resolved.context_window,
         reserved_output_tokens: metadata.max_tokens,
         structural_context_trimming: metadata.fast,
@@ -6215,7 +6508,7 @@ async fn start_turn(
         recovering: _,
     } = pending;
     let headless = headless_run_context(lease, &accepted.run_id).await?;
-    let provider_deadline = headless.as_ref().and_then(provider_request_deadline);
+    let mut provider_deadline = headless.as_ref().and_then(provider_request_deadline);
     let mut pinned_metadata = metadata.clone();
     pinned_metadata.context_economy =
         refresh_context_economy(lease, &pinned_metadata.context_economy).await?;
@@ -6242,24 +6535,36 @@ async fn start_turn(
                 )
                 .await?;
             }
-            return Err(HaiderError::new(
-                ErrorCode::BudgetExhausted,
-                format!(
-                    "headless {:?} budget exhausted at limit {}",
-                    exhausted.dimension, exhausted.limit
-                ),
-                false,
-            ));
+            return Err(budget_exhausted_error(&exhausted));
         }
     }
-    let budget_check = headless.as_ref().and_then(|context| {
-        (!context.spec.budget.is_empty()).then(|| BudgetCheckContext {
+    let mut budget_check = None;
+    if let Some(context) = headless
+        .as_ref()
+        .filter(|context| !context.spec.budget.is_empty())
+    {
+        let coordinator = lease
+            .hub()
+            .register_run_budget_coordinator(
+                lease.session_id().clone(),
+                accepted.run_id.clone(),
+                new_run_budget_coordinator(
+                    lease.hub().clone(),
+                    (lease.session_id().clone(), accepted.run_id.clone()),
+                    context,
+                    device_id.clone(),
+                    Arc::clone(&event_ids),
+                ),
+            )
+            .map_err(hub_error)?;
+        budget_check = Some(BudgetCheckContext {
             store: lease.clone(),
             spec: context.spec.clone(),
             accepted_at_ms: context.accepted_at_ms,
-            fact_persisted: Arc::new(Mutex::new(false)),
-        })
-    });
+            fact_persisted: Arc::clone(&coordinator.fact_persisted),
+            coordinator,
+        });
+    }
     let metadata = &pinned_metadata;
     // W-B (decision 8): the session's web-capability degrades ride into
     // pair resolution (native declarations) AND the tool pack below — ONE
@@ -6273,6 +6578,51 @@ async fn start_turn(
         )
     })?;
     let delegation_record = delegation.record_for_session(lease.session_id()).await?;
+    if let Some(record) = delegation_record.as_ref() {
+        let (root_session_id, root_run_id) = root_budget_owner(&delegation, record.clone()).await?;
+        let coordinator = match lease
+            .hub()
+            .run_budget_coordinator(&root_session_id, &root_run_id)
+            .map_err(hub_error)?
+        {
+            Some(coordinator) => Some(coordinator),
+            None => {
+                let context =
+                    headless_run_context_for_session(lease.hub(), &root_session_id, &root_run_id)
+                        .await?;
+                match context.filter(|context| !context.spec.budget.is_empty()) {
+                    Some(context) => Some(
+                        lease
+                            .hub()
+                            .register_run_budget_coordinator(
+                                root_session_id.clone(),
+                                root_run_id.clone(),
+                                new_run_budget_coordinator(
+                                    lease.hub().clone(),
+                                    (root_session_id.clone(), root_run_id.clone()),
+                                    &context,
+                                    device_id.clone(),
+                                    Arc::clone(&event_ids),
+                                ),
+                            )
+                            .map_err(hub_error)?,
+                    ),
+                    None => None,
+                }
+            }
+        };
+        if let Some(coordinator) = coordinator {
+            provider_deadline =
+                provider_request_deadline_for(&coordinator.spec, coordinator.accepted_at_ms);
+            budget_check = Some(BudgetCheckContext {
+                store: lease.clone(),
+                spec: coordinator.spec.clone(),
+                accepted_at_ms: coordinator.accepted_at_ms,
+                fact_persisted: Arc::new(Mutex::new(false)),
+                coordinator,
+            });
+        }
+    }
     let agent_id = delegation_record
         .as_ref()
         .map(|record| record.agent_id.clone());
@@ -6866,6 +7216,9 @@ async fn start_turn(
         max_tokens: config.max_tokens,
         provider_deadline,
         provider_deadline_guard: Some(Arc::clone(&run_boundary_guard)),
+        provider_budget_guard: budget_check
+            .as_ref()
+            .map(|_| Arc::clone(&run_boundary_guard)),
         context_window: config.context_window,
         reserved_output_tokens: config.reserved_output_tokens,
         structural_context_trimming: config.structural_context_trimming,
@@ -6889,7 +7242,10 @@ async fn start_turn(
         usage_account: config.usage_account.clone(),
     }));
     config.finalization_guard = Some(run_boundary_guard.clone());
-    config.provider_deadline_guard = Some(run_boundary_guard);
+    config.provider_deadline_guard = Some(run_boundary_guard.clone());
+    if budget_check.is_some() {
+        config.provider_budget_guard = Some(run_boundary_guard);
+    }
     config.rotation_budget_consumed = resolved.rotation_budget_consumed;
     config.initial_rotation = resolved.initial_rotation;
     config.provider_attempt_resolver = resolved.attempt_resolver;
@@ -6902,13 +7258,7 @@ async fn start_turn(
     }));
     config.supervisor_commits_cancelled = true;
     if let Some(check) = budget_check.as_ref()
-        && let Some(exhausted) = check_run_budget(
-            &check.store,
-            &accepted.run_id,
-            &check.spec,
-            check.accepted_at_ms,
-        )
-        .await?
+        && let Some(exhausted) = check_budget_context(check).await?
     {
         persist_headless_budget_fact(
             check,
@@ -8283,12 +8633,143 @@ fn active_turn(init: ActiveTurnInit) -> ActiveTurn {
     }
 }
 
+pub(crate) struct RunBudgetCoordinator {
+    hub: SessionHub,
+    root_session_id: SessionId,
+    root_run_id: RunId,
+    root_branch_id: Option<BranchId>,
+    device_id: DeviceId,
+    event_ids: Arc<EventIdGenerator>,
+    spec: HeadlessRunSpecV1,
+    accepted_at_ms: u64,
+    fact_persisted: Arc<Mutex<bool>>,
+    request_serial: Arc<tokio::sync::Mutex<()>>,
+    request_active: Arc<AtomicBool>,
+    active_projection: StdMutex<Option<ProviderRequestProjection>>,
+    forced: StdMutex<Option<RunBudgetExhaustedV1>>,
+}
+
+fn new_run_budget_coordinator(
+    hub: SessionHub,
+    root: (SessionId, RunId),
+    context: &DurableHeadlessRunContext,
+    device_id: DeviceId,
+    event_ids: Arc<EventIdGenerator>,
+) -> Arc<RunBudgetCoordinator> {
+    Arc::new(RunBudgetCoordinator {
+        hub,
+        root_session_id: root.0,
+        root_run_id: root.1,
+        root_branch_id: context.branch_id.clone(),
+        device_id,
+        event_ids,
+        spec: context.spec.clone(),
+        accepted_at_ms: context.accepted_at_ms,
+        fact_persisted: Arc::new(Mutex::new(context.exhausted.is_some())),
+        request_serial: Arc::new(tokio::sync::Mutex::new(())),
+        request_active: Arc::new(AtomicBool::new(false)),
+        active_projection: StdMutex::new(None),
+        forced: StdMutex::new(context.exhausted.clone()),
+    })
+}
+
+#[derive(Clone)]
+struct ProviderRequestProjection {
+    provider: String,
+    model: String,
+    input_tokens: u64,
+    max_output_tokens: u64,
+    estimated_cost_microusd: Option<u64>,
+}
+
+struct RunBudgetRequestPermit {
+    _serial: tokio::sync::OwnedMutexGuard<()>,
+    active: Arc<AtomicBool>,
+}
+
+impl Drop for RunBudgetRequestPermit {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+fn forced_budget(coordinator: &RunBudgetCoordinator) -> Option<RunBudgetExhaustedV1> {
+    match coordinator.forced.lock() {
+        Ok(forced) => forced.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+fn force_budget(coordinator: &RunBudgetCoordinator, exhausted: &RunBudgetExhaustedV1) {
+    match coordinator.forced.lock() {
+        Ok(mut forced) => *forced = Some(exhausted.clone()),
+        Err(poisoned) => *poisoned.into_inner() = Some(exhausted.clone()),
+    }
+}
+
+fn replace_active_projection(
+    coordinator: &RunBudgetCoordinator,
+    projection: Option<ProviderRequestProjection>,
+) {
+    match coordinator.active_projection.lock() {
+        Ok(mut active) => *active = projection,
+        Err(poisoned) => *poisoned.into_inner() = projection,
+    }
+}
+
+fn take_active_projection(coordinator: &RunBudgetCoordinator) -> Option<ProviderRequestProjection> {
+    match coordinator.active_projection.lock() {
+        Ok(mut active) => active.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    }
+}
+
+fn active_projection(coordinator: &RunBudgetCoordinator) -> Option<ProviderRequestProjection> {
+    match coordinator.active_projection.lock() {
+        Ok(active) => active.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+fn usd_to_microusd_ceil(cost_usd: f64) -> u64 {
+    if cost_usd <= 0.0 {
+        0
+    } else if !cost_usd.is_finite() {
+        u64::MAX
+    } else {
+        ((cost_usd * 1_000_000.0).ceil() as u64).max(1)
+    }
+}
+
 #[derive(Clone)]
 struct BudgetCheckContext {
     store: HubStoreHandle,
     spec: HeadlessRunSpecV1,
     accepted_at_ms: u64,
     fact_persisted: Arc<Mutex<bool>>,
+    coordinator: Arc<RunBudgetCoordinator>,
+}
+
+async fn root_budget_owner(
+    delegation: &DelegationHandle,
+    mut record: haider_core::DelegationRecord,
+) -> Result<(SessionId, RunId), HaiderError> {
+    while record.parent_session_id != record.root_session_id {
+        let parent_session_id = record.parent_session_id.clone();
+        record = delegation
+            .record_for_session(&parent_session_id)
+            .await?
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!(
+                        "delegated session {parent_session_id} has no durable parent budget owner"
+                    ),
+                    false,
+                )
+            })?;
+    }
+    Ok((record.parent_session_id, record.parent_run_id))
 }
 
 async fn headless_run_context(
@@ -8297,6 +8778,7 @@ async fn headless_run_context(
 ) -> Result<Option<DurableHeadlessRunContext>, HaiderError> {
     let mut cursor = 0_u64;
     let mut accepted_at_ms = None;
+    let mut branch_id = None;
     let mut spec = None;
     let mut exhausted = None;
     loop {
@@ -8310,7 +8792,10 @@ async fn headless_run_context(
             if envelope.run_id.as_ref() != Some(run_id) {
                 continue;
             }
-            accepted_at_ms.get_or_insert(envelope.committed_at_ms);
+            if accepted_at_ms.is_none() {
+                accepted_at_ms = Some(envelope.committed_at_ms);
+                branch_id = envelope.branch_id.clone();
+            }
             match HeadlessRunEventPayload::from_payload_value(&envelope.payload) {
                 Some(HeadlessRunEventPayload::HeadlessRunConfigured(configured)) => {
                     spec = Some(configured);
@@ -8328,6 +8813,54 @@ async fn headless_run_context(
     Ok(spec.map(|spec| DurableHeadlessRunContext {
         spec,
         accepted_at_ms: accepted_at_ms.unwrap_or(0),
+        branch_id,
+        exhausted,
+    }))
+}
+
+async fn headless_run_context_for_session(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    run_id: &RunId,
+) -> Result<Option<DurableHeadlessRunContext>, HaiderError> {
+    let mut cursor = 0_u64;
+    let mut accepted_at_ms = None;
+    let mut branch_id = None;
+    let mut spec = None;
+    let mut exhausted = None;
+    loop {
+        let page = hub.read_internal_session(session_id, cursor, 256).await?;
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len();
+        for envelope in page {
+            cursor = envelope.seq;
+            if envelope.run_id.as_ref() != Some(run_id) {
+                continue;
+            }
+            if accepted_at_ms.is_none() {
+                accepted_at_ms = Some(envelope.committed_at_ms);
+                branch_id = envelope.branch_id.clone();
+            }
+            match HeadlessRunEventPayload::from_payload_value(&envelope.payload) {
+                Some(HeadlessRunEventPayload::HeadlessRunConfigured(configured)) => {
+                    spec = Some(configured);
+                }
+                Some(HeadlessRunEventPayload::RunBudgetExhausted(fact)) => {
+                    exhausted = Some(fact);
+                }
+                None => {}
+            }
+        }
+        if page_len < 256 {
+            break;
+        }
+    }
+    Ok(spec.map(|spec| DurableHeadlessRunContext {
+        spec,
+        accepted_at_ms: accepted_at_ms.unwrap_or(0),
+        branch_id,
         exhausted,
     }))
 }
@@ -8335,16 +8868,23 @@ async fn headless_run_context(
 struct DurableHeadlessRunContext {
     spec: HeadlessRunSpecV1,
     accepted_at_ms: u64,
+    branch_id: Option<BranchId>,
     exhausted: Option<RunBudgetExhaustedV1>,
 }
 
 fn provider_request_deadline(context: &DurableHeadlessRunContext) -> Option<tokio::time::Instant> {
-    let budget_deadline = context
-        .spec
+    provider_request_deadline_for(&context.spec, context.accepted_at_ms)
+}
+
+fn provider_request_deadline_for(
+    spec: &HeadlessRunSpecV1,
+    accepted_at_ms: u64,
+) -> Option<tokio::time::Instant> {
+    let budget_deadline = spec
         .budget
         .max_time_ms
-        .map(|limit| context.accepted_at_ms.saturating_add(limit));
-    let deadline_ms = match (budget_deadline, context.spec.request_deadline_unix_ms) {
+        .map(|limit| accepted_at_ms.saturating_add(limit));
+    let deadline_ms = match (budget_deadline, spec.request_deadline_unix_ms) {
         (Some(budget), Some(request)) => Some(budget.min(request)),
         (Some(budget), None) => Some(budget),
         (None, Some(request)) => Some(request),
@@ -8531,6 +9071,11 @@ struct BudgetUsageComponent {
 
 type BudgetUsageChunks = BTreeMap<String, BudgetUsageComponent>;
 
+struct RunBudgetUsageSnapshot {
+    usage: HeadlessRunUsageV1,
+    unresolved: Option<(String, String)>,
+}
+
 async fn run_budget_usage(
     store: &HubStoreHandle,
     run_id: &RunId,
@@ -8546,7 +9091,7 @@ async fn run_budget_usage(
         }
         let page_len = page.len();
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
-        collect_budget_usage(
+        let _ = collect_budget_usage(
             &mut chunks,
             store.session_id(),
             run_id,
@@ -8560,19 +9105,90 @@ async fn run_budget_usage(
     Ok(finish_budget_usage(chunks, elapsed_ms))
 }
 
+async fn run_budget_usage_for_context(
+    check: &BudgetCheckContext,
+) -> Result<RunBudgetUsageSnapshot, HaiderError> {
+    let coordinator = &check.coordinator;
+    let elapsed_ms = unix_time_ms().saturating_sub(coordinator.accepted_at_ms);
+    let mut chunks = BudgetUsageChunks::new();
+    let mut pending = VecDeque::from([(
+        coordinator.root_session_id.clone(),
+        coordinator.root_run_id.clone(),
+        coordinator.spec.model.clone(),
+    )]);
+    let mut seen = HashSet::new();
+    let mut unresolved = None;
+    while let Some((session_id, run_id, fallback_model)) = pending.pop_front() {
+        if !seen.insert((session_id.clone(), run_id.clone())) {
+            continue;
+        }
+        let usage_before = chunks.len();
+        let mut attempts = 0_usize;
+        let mut cursor = 0_u64;
+        loop {
+            let page = coordinator
+                .hub
+                .read_internal_session(&session_id, cursor, 256)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+            attempts = attempts.saturating_add(collect_budget_usage(
+                &mut chunks,
+                &session_id,
+                &run_id,
+                &fallback_model,
+                page,
+            ));
+            if page_len < 256 {
+                break;
+            }
+        }
+        if attempts > chunks.len().saturating_sub(usage_before) && unresolved.is_none() {
+            unresolved = Some((coordinator.spec.provider.clone(), fallback_model.clone()));
+        }
+        for child in coordinator
+            .hub
+            .delegations_for_parent_run(session_id, run_id)
+            .await?
+        {
+            pending.push_back((
+                child.child_session_id,
+                child.child_run_id,
+                child.manifest.model_profile,
+            ));
+        }
+    }
+    Ok(RunBudgetUsageSnapshot {
+        usage: finish_budget_usage(chunks, elapsed_ms),
+        unresolved,
+    })
+}
+
 fn collect_budget_usage(
     chunks: &mut BudgetUsageChunks,
     session_id: &SessionId,
     run_id: &RunId,
     fallback_model: &str,
     envelopes: impl IntoIterator<Item = haider_protocol::envelope::RawEnvelope>,
-) {
+) -> usize {
+    let mut attempts = 0_usize;
     for envelope in envelopes {
         let envelope_run = envelope.run_id.clone();
         let envelope_agent = envelope.agent_id.clone();
-        let Ok(EventPayload::Usage(usage)) =
-            serde_json::from_value::<EventPayload>(envelope.payload)
-        else {
+        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+            continue;
+        };
+        if let EventPayload::Item(ItemEvent::Completed { item, .. }) = &payload
+            && envelope_run.as_ref() == Some(run_id)
+            && CacheRequestAttemptV1::from_extension_item(item).is_some()
+        {
+            attempts = attempts.saturating_add(1);
+            continue;
+        }
+        let EventPayload::Usage(usage) = payload else {
             continue;
         };
         let scoped_run = usage.scope.as_ref().and_then(|scope| scope.run.as_ref());
@@ -8651,6 +9267,7 @@ fn collect_budget_usage(
             },
         );
     }
+    attempts
 }
 
 fn finish_budget_usage(chunks: BudgetUsageChunks, elapsed_ms: u64) -> HeadlessRunUsageV1 {
@@ -8701,8 +9318,38 @@ pub(crate) fn budget_usage_from_envelopes_for_test(
     envelopes: Vec<haider_protocol::envelope::RawEnvelope>,
 ) -> HeadlessRunUsageV1 {
     let mut chunks = BudgetUsageChunks::new();
-    collect_budget_usage(&mut chunks, session_id, run_id, fallback_model, envelopes);
+    let _ = collect_budget_usage(&mut chunks, session_id, run_id, fallback_model, envelopes);
     finish_budget_usage(chunks, 0)
+}
+
+#[cfg(test)]
+pub(crate) fn budget_request_is_unresolved_for_test(
+    session_id: &SessionId,
+    run_id: &RunId,
+    fallback_model: &str,
+    envelopes: Vec<haider_protocol::envelope::RawEnvelope>,
+) -> bool {
+    let mut chunks = BudgetUsageChunks::new();
+    let attempts = collect_budget_usage(&mut chunks, session_id, run_id, fallback_model, envelopes);
+    attempts > chunks.len()
+}
+
+#[cfg(test)]
+pub(crate) fn projected_time_budget_exhaustion_for_test(
+    budget: &RunBudgetV1,
+    usage: HeadlessRunUsageV1,
+) -> Option<RunBudgetExhaustedV1> {
+    projected_budget_exhaustion(
+        budget,
+        usage,
+        &ProviderRequestProjection {
+            provider: "test-provider".into(),
+            model: "test-model".into(),
+            input_tokens: 0,
+            max_output_tokens: 0,
+            estimated_cost_microusd: Some(0),
+        },
+    )
 }
 
 fn unix_time_ms() -> u64 {
@@ -8713,11 +9360,9 @@ fn unix_time_ms() -> u64 {
         })
 }
 
-async fn monitor_run_budget(check: BudgetCheckContext, run_id: RunId) -> RunBudgetExhaustedV1 {
+async fn monitor_run_budget(check: BudgetCheckContext, _run_id: RunId) -> RunBudgetExhaustedV1 {
     loop {
-        if let Ok(Some(exhausted)) =
-            check_run_budget(&check.store, &run_id, &check.spec, check.accepted_at_ms).await
-        {
+        if let Ok(Some(exhausted)) = check_budget_context(&check).await {
             return exhausted;
         }
         let elapsed_ms = unix_time_ms().saturating_sub(check.accepted_at_ms);
@@ -8730,6 +9375,46 @@ async fn monitor_run_budget(check: BudgetCheckContext, run_id: RunId) -> RunBudg
     }
 }
 
+async fn check_budget_context(
+    check: &BudgetCheckContext,
+) -> Result<Option<RunBudgetExhaustedV1>, HaiderError> {
+    if let Some(exhausted) = forced_budget(&check.coordinator) {
+        return Ok(Some(exhausted));
+    }
+    let snapshot = run_budget_usage_for_context(check).await?;
+    if !check.coordinator.request_active.load(Ordering::Acquire) {
+        let unresolved = active_projection(&check.coordinator)
+            .map(|projection| {
+                let provider = projection.provider.clone();
+                let model = projection.model.clone();
+                (Some(projection), provider, model)
+            })
+            .or_else(|| {
+                snapshot
+                    .unresolved
+                    .as_ref()
+                    .map(|(provider, model)| (None, provider.clone(), model.clone()))
+            });
+        if let Some((projection, provider, model)) = unresolved
+            && let Some(exhausted) = missing_usage_budget_exhaustion(
+                &check.spec.budget,
+                snapshot.usage.clone(),
+                projection.as_ref(),
+                &provider,
+                &model,
+            )
+        {
+            return Ok(Some(exhausted));
+        }
+    }
+    Ok(exhausted_budget(
+        &check.spec.budget,
+        snapshot.usage,
+        &check.spec.provider,
+        &check.spec.model,
+    ))
+}
+
 async fn check_run_budget(
     store: &HubStoreHandle,
     run_id: &RunId,
@@ -8738,13 +9423,39 @@ async fn check_run_budget(
 ) -> Result<Option<RunBudgetExhaustedV1>, HaiderError> {
     let elapsed_ms = unix_time_ms().saturating_sub(accepted_at_ms);
     let usage = run_budget_usage(store, run_id, &spec.model, elapsed_ms).await?;
-    Ok(exhausted_budget(&spec.budget, usage))
+    Ok(exhausted_budget(
+        &spec.budget,
+        usage,
+        &spec.provider,
+        &spec.model,
+    ))
 }
 
 pub(crate) fn exhausted_budget(
     budget: &RunBudgetV1,
     usage: HeadlessRunUsageV1,
+    provider: &str,
+    model: &str,
 ) -> Option<RunBudgetExhaustedV1> {
+    if let Some(limit) = budget.max_cost_microusd
+        && usage.estimated_cost_microusd.is_none()
+        && usage.total_tokens > 0
+    {
+        return Some(RunBudgetExhaustedV1 {
+            dimension: RunBudgetDimensionV1::Cost,
+            limit,
+            usage,
+            decision: Some(RunBudgetDecisionV1 {
+                spent: 0,
+                projected: None,
+                cap: limit,
+                reason: RunBudgetDecisionReasonV1::PricingUnavailable {
+                    provider: provider.to_owned(),
+                    model: model.to_owned(),
+                },
+            }),
+        });
+    }
     let exhausted = budget
         .max_time_ms
         .filter(|limit| usage.elapsed_ms >= *limit)
@@ -8757,20 +9468,155 @@ pub(crate) fn exhausted_budget(
         })
         .or_else(|| {
             budget.max_cost_microusd.and_then(|limit| {
-                match usage.estimated_cost_microusd {
-                    Some(cost) if cost >= limit => Some((RunBudgetDimensionV1::Cost, limit)),
-                    // A configured cost ceiling must fail closed once
-                    // provider work is visible; unavailable pricing is never
-                    // silently interpreted as zero cost.
-                    None if usage.total_tokens > 0 => Some((RunBudgetDimensionV1::Cost, limit)),
-                    _ => None,
-                }
+                usage
+                    .estimated_cost_microusd
+                    .filter(|cost| *cost >= limit)
+                    .map(|_| (RunBudgetDimensionV1::Cost, limit))
             })
         });
-    exhausted.map(|(dimension, limit)| RunBudgetExhaustedV1 {
+    exhausted.map(|(dimension, limit)| {
+        let spent = usage_for_dimension(&usage, dimension);
+        RunBudgetExhaustedV1 {
+            dimension,
+            limit,
+            usage,
+            decision: Some(RunBudgetDecisionV1 {
+                spent,
+                projected: None,
+                cap: limit,
+                reason: if dimension == RunBudgetDimensionV1::Time {
+                    RunBudgetDecisionReasonV1::TimeElapsed
+                } else {
+                    RunBudgetDecisionReasonV1::ActualUsage
+                },
+            }),
+        }
+    })
+}
+
+fn usage_for_dimension(usage: &HeadlessRunUsageV1, dimension: RunBudgetDimensionV1) -> u64 {
+    match dimension {
+        RunBudgetDimensionV1::Tokens => usage.total_tokens,
+        RunBudgetDimensionV1::Cost => usage.estimated_cost_microusd.unwrap_or(0),
+        RunBudgetDimensionV1::Time => usage.elapsed_ms,
+        RunBudgetDimensionV1::Unknown => 0,
+    }
+}
+
+fn projected_budget_exhaustion(
+    budget: &RunBudgetV1,
+    usage: HeadlessRunUsageV1,
+    request: &ProviderRequestProjection,
+) -> Option<RunBudgetExhaustedV1> {
+    if let Some(cap) = budget.max_cost_microusd
+        && request.estimated_cost_microusd.is_none()
+    {
+        let spent = usage.estimated_cost_microusd.unwrap_or(0);
+        return Some(RunBudgetExhaustedV1 {
+            dimension: RunBudgetDimensionV1::Cost,
+            limit: cap,
+            usage,
+            decision: Some(RunBudgetDecisionV1 {
+                spent,
+                projected: None,
+                cap,
+                reason: RunBudgetDecisionReasonV1::PricingUnavailable {
+                    provider: request.provider.clone(),
+                    model: request.model.clone(),
+                },
+            }),
+        });
+    }
+    if let Some(cap) = budget.max_time_ms
+        && usage.elapsed_ms >= cap
+    {
+        let spent = usage.elapsed_ms;
+        return Some(RunBudgetExhaustedV1 {
+            dimension: RunBudgetDimensionV1::Time,
+            limit: cap,
+            usage,
+            decision: Some(RunBudgetDecisionV1 {
+                spent,
+                projected: None,
+                cap,
+                reason: RunBudgetDecisionReasonV1::TimeElapsed,
+            }),
+        });
+    }
+    let request_tokens = request
+        .input_tokens
+        .saturating_add(request.max_output_tokens);
+    if let Some(cap) = budget.max_tokens {
+        let spent = usage.total_tokens;
+        if spent.saturating_add(request_tokens) > cap {
+            return Some(RunBudgetExhaustedV1 {
+                dimension: RunBudgetDimensionV1::Tokens,
+                limit: cap,
+                usage,
+                decision: Some(RunBudgetDecisionV1 {
+                    spent,
+                    projected: Some(request_tokens),
+                    cap,
+                    reason: RunBudgetDecisionReasonV1::ProjectedRequest,
+                }),
+            });
+        }
+    }
+    if let Some(cap) = budget.max_cost_microusd {
+        let spent = usage.estimated_cost_microusd.unwrap_or(0);
+        let request_cost = request.estimated_cost_microusd.unwrap_or(u64::MAX);
+        if spent.saturating_add(request_cost) > cap {
+            return Some(RunBudgetExhaustedV1 {
+                dimension: RunBudgetDimensionV1::Cost,
+                limit: cap,
+                usage,
+                decision: Some(RunBudgetDecisionV1 {
+                    spent,
+                    projected: Some(request_cost),
+                    cap,
+                    reason: RunBudgetDecisionReasonV1::ProjectedRequest,
+                }),
+            });
+        }
+    }
+    None
+}
+
+fn missing_usage_budget_exhaustion(
+    budget: &RunBudgetV1,
+    usage: HeadlessRunUsageV1,
+    request: Option<&ProviderRequestProjection>,
+    provider: &str,
+    model: &str,
+) -> Option<RunBudgetExhaustedV1> {
+    let (dimension, cap, spent, projected) = if let Some(cap) = budget.max_tokens {
+        let spent = usage.total_tokens;
+        let projected = request.map(|request| {
+            request
+                .input_tokens
+                .saturating_add(request.max_output_tokens)
+        });
+        (RunBudgetDimensionV1::Tokens, cap, spent, projected)
+    } else if let Some(cap) = budget.max_cost_microusd {
+        let spent = usage.estimated_cost_microusd.unwrap_or(0);
+        let projected = request.and_then(|request| request.estimated_cost_microusd);
+        (RunBudgetDimensionV1::Cost, cap, spent, projected)
+    } else {
+        return None;
+    };
+    Some(RunBudgetExhaustedV1 {
         dimension,
-        limit,
+        limit: cap,
         usage,
+        decision: Some(RunBudgetDecisionV1 {
+            spent,
+            projected,
+            cap,
+            reason: RunBudgetDecisionReasonV1::UsageUnavailable {
+                provider: provider.to_owned(),
+                model: model.to_owned(),
+            },
+        }),
     })
 }
 
@@ -8916,15 +9762,7 @@ async fn append_headless_budget_fact(
     event_ids: &EventIdGenerator,
     exhausted: &RunBudgetExhaustedV1,
 ) -> Result<(), HaiderError> {
-    let payload = HeadlessRunEventPayload::RunBudgetExhausted(exhausted.clone())
-        .to_payload_value()
-        .map_err(|error| {
-            HaiderError::new(
-                ErrorCode::Internal,
-                format!("cannot serialize budget-exhaustion fact: {error}"),
-                false,
-            )
-        })?;
+    let payload = budget_fact_payload(exhausted)?;
     let mut envelopes = [supervisor_raw_envelope(
         store,
         device_id,
@@ -8937,6 +9775,47 @@ async fn append_headless_budget_fact(
     Ok(())
 }
 
+async fn append_root_headless_budget_fact(
+    coordinator: &RunBudgetCoordinator,
+    exhausted: &RunBudgetExhaustedV1,
+) -> Result<(), HaiderError> {
+    let mut envelopes = [EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: coordinator.event_ids.next(),
+        seq: 0,
+        session_id: coordinator.root_session_id.clone(),
+        branch_id: coordinator.root_branch_id.clone(),
+        run_id: Some(coordinator.root_run_id.clone()),
+        agent_id: None,
+        device_id: coordinator.device_id.clone(),
+        authority_epoch: 0,
+        worker_generation: coordinator.hub.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: budget_fact_payload(exhausted)?,
+    }];
+    coordinator.hub.append(&mut envelopes).await?;
+    Ok(())
+}
+
+fn budget_fact_payload(exhausted: &RunBudgetExhaustedV1) -> Result<serde_json::Value, HaiderError> {
+    HeadlessRunEventPayload::RunBudgetExhausted(exhausted.clone())
+        .to_payload_value()
+        .map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("cannot serialize budget-exhaustion fact: {error}"),
+                false,
+            )
+        })
+}
+
 async fn persist_headless_budget_fact(
     check: &BudgetCheckContext,
     device_id: &DeviceId,
@@ -8945,6 +9824,19 @@ async fn persist_headless_budget_fact(
     event_ids: &EventIdGenerator,
     exhausted: &RunBudgetExhaustedV1,
 ) -> Result<(), HaiderError> {
+    let coordinator = &check.coordinator;
+    let is_root = check.store.session_id() == &coordinator.root_session_id
+        && run_id == &coordinator.root_run_id;
+    {
+        let mut persisted = coordinator.fact_persisted.lock().await;
+        if !*persisted {
+            append_root_headless_budget_fact(coordinator, exhausted).await?;
+            *persisted = true;
+        }
+    }
+    if is_root {
+        return Ok(());
+    }
     let mut persisted = check.fact_persisted.lock().await;
     if *persisted {
         return Ok(());
@@ -8963,14 +9855,7 @@ async fn persist_headless_budget_fact(
 }
 
 fn budget_exhausted_error(exhausted: &RunBudgetExhaustedV1) -> HaiderError {
-    HaiderError::new(
-        ErrorCode::BudgetExhausted,
-        format!(
-            "headless {:?} budget exhausted at limit {}",
-            exhausted.dimension, exhausted.limit
-        ),
-        false,
-    )
+    HaiderError::new(ErrorCode::BudgetExhausted, exhausted.summary(), false)
 }
 
 /// Commits the terminal direct-command item as prompt-visible immediately
