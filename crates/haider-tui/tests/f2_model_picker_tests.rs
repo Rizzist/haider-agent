@@ -1,13 +1,13 @@
-//! F2a — the full-screen `/model` picker: every model × provider pair,
-//! searchable; receipted live selection rendering the RESOLVED pair.
+//! F2a — the full-screen `/model` picker: exact OAuth subscription pairs plus
+//! one API row per model slug, with an exact-provider second stage;
+//! receipted live selection renders the RESOLVED pair.
 //!
 //! The laws:
-//! * bare `/model` opens a FULL-SCREEN picker with one row per model ×
-//!   provider pair across every enabled provider; `/model <query>`
-//!   pre-fills the search.
+//! * bare `/model` opens a FULL-SCREEN picker with every OAuth pair and one
+//!   collapsed API choice per slug; `/model <query>` pre-fills the search.
 //! * KEY OWNERSHIP (heeded history): while open the picker owns every
-//!   key — ⏎ selects the HIGHLIGHTED row (never an exact-match jump),
-//!   esc closes without selecting, characters edit the search.
+//!   key — ⏎ acts on the HIGHLIGHTED row (never an exact-match jump), esc
+//!   returns from providers before closing, and characters edit stage search.
 //! * live sessions issue `session.select_model` and render the RESOLVED
 //!   pair from the reply — never an echo of the request.
 //! * typed refusals land INLINE; the row stays selectable for a retry;
@@ -17,7 +17,9 @@
 //! * at the launcher a selection sets the default pair new sessions use.
 #![allow(clippy::expect_used)]
 
+use haider_protocol::credential::AuthMethod;
 use haider_protocol::ids::SessionId;
+use haider_rpc::{ProviderAvailabilityWire, ProviderTrustWire};
 use haider_tui::app::{AppModel, AppRequest, Hit, RuntimeMode, Screen};
 use haider_tui::commands::{PaletteItem, palette_items};
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
@@ -59,6 +61,48 @@ fn seeded_session() -> AppModel {
     model
 }
 
+struct ApiProviderFixture<'a> {
+    provider: &'a str,
+    model: &'a str,
+    available: bool,
+    reason: Option<&'a str>,
+    context_window: Option<u64>,
+    fetched_at_ms: Option<u64>,
+    lockdown: bool,
+    is_default: bool,
+}
+
+fn add_api_provider(model: &mut AppModel, fixture: ApiProviderFixture<'_>) {
+    let mut summary = model
+        .providers
+        .providers
+        .iter()
+        .find(|summary| summary.provider == "gemini")
+        .expect("seeded API provider")
+        .clone();
+    summary.provider = fixture.provider.to_owned();
+    summary.models = vec![fixture.model.to_owned()];
+    let mut detail = summary.model_details[0].clone();
+    detail.name = fixture.model.to_owned();
+    detail.context_window = fixture.context_window;
+    summary.model_details = vec![detail];
+    summary.auth_methods = vec![AuthMethod::ApiKey];
+    summary.availability = if fixture.available {
+        ProviderAvailabilityWire::Available
+    } else {
+        ProviderAvailabilityWire::Unavailable
+    };
+    summary.availability_reason = fixture.reason.map(str::to_owned);
+    summary.inventory_fetched_at_ms = fixture.fetched_at_ms;
+    summary.trust = if fixture.lockdown {
+        ProviderTrustWire::Lockdown
+    } else {
+        ProviderTrustWire::Full
+    };
+    summary.default_model = fixture.is_default.then(|| fixture.model.to_owned());
+    model.providers.providers.push(summary);
+}
+
 fn draw_rows(model: &AppModel, width: u16, height: u16) -> Vec<String> {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -86,10 +130,10 @@ fn pass(
 }
 
 /// MUTATION CHECK (F2a): route bare `/model` back to the old flash list.
-/// Expected runtime failure: no picker opens and every pair assertion
-/// below fails.
+/// Expected runtime failure: no picker opens and every visible-choice
+/// assertion below fails.
 #[test]
-fn bare_model_opens_the_full_screen_picker_with_every_pair() {
+fn bare_model_opens_the_full_screen_picker_with_oauth_pairs_and_api_choices() {
     let mut model = seeded_launcher();
     run_slash(&mut model, "/model");
     assert!(model.model_picker.is_some(), "the picker opens");
@@ -136,6 +180,15 @@ fn bare_model_opens_the_full_screen_picker_with_every_pair() {
     let rows_text = draw_rows(&model, 110, 30);
     let text = rows_text.join("\n");
     assert!(text.contains("MODELS"), "full-screen title");
+    assert!(
+        text.contains("OAuth subscriptions + one API choice per model"),
+        "the title names the actual top-level grammar"
+    );
+    assert!(
+        text.contains("choices ·"),
+        "the count names visible choices"
+    );
+    assert!(!text.contains(" pairs ·"), "the stale pair count is gone");
     assert!(text.contains(" ❯ "), "search bar");
     assert!(text.contains("gpt-5.6"), "rows render");
     assert!(
@@ -210,7 +263,8 @@ fn picker_owns_its_keys_while_open() {
     );
 }
 
-/// Live substring search: case-insensitive, over model AND provider.
+/// Live substring search: case-insensitive, over model, provider, and auth
+/// flavor.
 #[test]
 fn search_matches_model_and_provider_case_insensitively() {
     let model = seeded_launcher();
@@ -220,7 +274,334 @@ fn search_matches_model_and_provider_case_insensitively() {
     let by_provider = model.model_picker_filtered("ANTHROpic");
     assert_eq!(by_provider.len(), 2);
     assert!(by_provider.iter().all(|row| row.provider == "anthropic"));
+    let by_oauth = model.model_picker_filtered("OAUTH");
+    assert!(!by_oauth.is_empty());
+    assert!(by_oauth.iter().all(|row| row.auth == "oauth"));
+    let by_api = model.model_picker_filtered("api");
+    assert!(!by_api.is_empty());
+    assert!(by_api.iter().all(|row| row.auth == "api"));
     assert!(model.model_picker_filtered("zz-nothing").is_empty());
+}
+
+/// OAuth subscriptions keep their exact rows and order, while every API
+/// provider for one slug is retained behind a single top-level row. Search
+/// includes providers that are not the aggregate row's first display name.
+#[test]
+fn api_duplicates_collapse_without_merging_the_oauth_pair() {
+    let mut model = seeded_launcher();
+    let oauth_before: Vec<(String, String)> = model
+        .model_picker_rows()
+        .into_iter()
+        .filter(|row| row.auth == "oauth")
+        .map(|row| (row.provider, row.model))
+        .collect();
+    for provider in ["zai-api", "relay-api"] {
+        add_api_provider(
+            &mut model,
+            ApiProviderFixture {
+                provider,
+                model: "gpt-5.6",
+                available: true,
+                reason: None,
+                context_window: Some(128_000),
+                fetched_at_ms: None,
+                lockdown: false,
+                is_default: false,
+            },
+        );
+    }
+
+    let rows = model.model_picker_rows();
+    let same_slug: Vec<_> = rows.iter().filter(|row| row.model == "gpt-5.6").collect();
+    assert_eq!(
+        same_slug.len(),
+        2,
+        "one exact OAuth row plus one collapsed API row"
+    );
+    assert_eq!(same_slug[0].auth, "oauth");
+    assert_eq!(same_slug[0].provider, "openai");
+    assert_eq!(same_slug[1].auth, "api");
+    assert_eq!(same_slug[1].providers, ["zai-api", "relay-api"]);
+    let oauth_after: Vec<(String, String)> = rows
+        .into_iter()
+        .filter(|row| row.auth == "oauth")
+        .map(|row| (row.provider, row.model))
+        .collect();
+    assert_eq!(oauth_after, oauth_before, "OAuth ordering is untouched");
+
+    let by_nonleading_provider = model.model_picker_filtered("RELAY-api");
+    assert_eq!(by_nonleading_provider.len(), 1);
+    assert_eq!(by_nonleading_provider[0].model, "gpt-5.6");
+    assert_eq!(
+        by_nonleading_provider[0].providers,
+        ["zai-api", "relay-api"]
+    );
+
+    model.identity.provider = "relay-api".to_owned();
+    model.identity.model_short = "gpt-5.6".to_owned();
+    model.open_model_picker("relay-api".to_owned());
+    let text = draw_rows(&model, 160, 24).join("\n");
+    assert!(
+        text.contains("current · relay-api"),
+        "the exact live API pair remains visible before drilling in: {text}"
+    );
+}
+
+/// A multi-provider API row opens a searchable provider stage. Its search is
+/// fresh, and esc restores the parent query before a second esc closes.
+#[test]
+fn provider_stage_searches_live_and_escape_returns_before_closing() {
+    let mut model = seeded_launcher();
+    for provider in ["zai-api", "relay-api"] {
+        add_api_provider(
+            &mut model,
+            ApiProviderFixture {
+                provider,
+                model: "shared-api-model",
+                available: true,
+                reason: None,
+                context_window: Some(128_000),
+                fetched_at_ms: None,
+                lockdown: false,
+                is_default: provider == "zai-api",
+            },
+        );
+    }
+    model.open_model_picker("relay-api".to_owned());
+    model.handle(key(KeyCode::Enter));
+
+    let picker = model
+        .model_picker
+        .as_ref()
+        .expect("provider stage remains open");
+    assert_eq!(
+        picker
+            .provider_stage
+            .as_ref()
+            .map(|stage| stage.model.as_str()),
+        Some("shared-api-model")
+    );
+    assert_eq!(picker.query, "", "stage two starts with every provider");
+    assert_eq!(
+        model
+            .model_picker_rows()
+            .into_iter()
+            .map(|row| row.provider)
+            .collect::<Vec<_>>(),
+        ["zai-api", "relay-api"],
+        "provider order follows registry order"
+    );
+    let provider_text = draw_rows(&model, 120, 20).join("\n");
+    assert!(provider_text.contains("PROVIDERS — shared-api-model"));
+    assert!(provider_text.contains("API providers ·"));
+
+    for c in "zai".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    let filtered = model.model_picker_filtered("zai");
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].provider, "zai-api");
+
+    model.handle(key(KeyCode::Esc));
+    let picker = model
+        .model_picker
+        .as_ref()
+        .expect("first esc returns to models");
+    assert!(picker.provider_stage.is_none());
+    assert_eq!(picker.query, "relay-api", "the parent search is restored");
+    model.handle(key(KeyCode::Esc));
+    assert!(
+        model.model_picker.is_none(),
+        "second esc closes the overlay"
+    );
+}
+
+/// Stage two uses the same remembered-top viewport authority as the model
+/// list. Rendering a short window follows a deep provider selection, and esc
+/// restores the parent's independent position.
+#[test]
+fn provider_stage_reuses_the_shared_follow_viewport_rule() {
+    let mut model = seeded_launcher();
+    for index in 0..14 {
+        let provider = format!("viewport-{index:02}");
+        add_api_provider(
+            &mut model,
+            ApiProviderFixture {
+                provider: &provider,
+                model: "viewport-model",
+                available: true,
+                reason: None,
+                context_window: Some(128_000),
+                fetched_at_ms: None,
+                lockdown: false,
+                is_default: false,
+            },
+        );
+    }
+    model.open_model_picker("viewport-model".to_owned());
+    model.handle(key(KeyCode::Enter));
+    for _ in 0..10 {
+        model.handle(key(KeyCode::Down));
+    }
+
+    let text = draw_rows(&model, 120, 10).join("\n");
+    let picker = model.model_picker.as_ref().expect("provider stage open");
+    assert!(
+        picker.scroll.get() > 0,
+        "the shared viewport follows selection"
+    );
+    assert!(
+        text.contains("viewport-10"),
+        "the selected provider is visible"
+    );
+
+    model.handle(key(KeyCode::Esc));
+    let picker = model.model_picker.as_ref().expect("parent list restored");
+    assert!(picker.provider_stage.is_none());
+    assert_eq!(
+        picker.scroll.get(),
+        0,
+        "parent viewport is restored exactly"
+    );
+}
+
+/// Aggregate facts are computed from usable providers: best available
+/// context, freshest available inventory, explicit readiness/lockdown counts,
+/// while stage two retains each provider's exact facts.
+#[test]
+fn api_aggregate_summarizes_divergent_provider_facts() {
+    let mut model = seeded_launcher();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let now = u64::try_from(now).expect("clock fits u64");
+    add_api_provider(
+        &mut model,
+        ApiProviderFixture {
+            provider: "ready-api",
+            model: "aggregate-model",
+            available: true,
+            reason: None,
+            context_window: Some(128_000),
+            fetched_at_ms: Some(now.saturating_sub(10_000)),
+            lockdown: true,
+            is_default: true,
+        },
+    );
+    add_api_provider(
+        &mut model,
+        ApiProviderFixture {
+            provider: "wide-ready-api",
+            model: "aggregate-model",
+            available: true,
+            reason: None,
+            context_window: Some(1_000_000),
+            fetched_at_ms: Some(now.saturating_sub(1_000)),
+            lockdown: false,
+            is_default: false,
+        },
+    );
+    add_api_provider(
+        &mut model,
+        ApiProviderFixture {
+            provider: "newest-offline-api",
+            model: "aggregate-model",
+            available: false,
+            reason: Some("provider has no credential"),
+            context_window: Some(2_000_000),
+            fetched_at_ms: Some(now.saturating_sub(100)),
+            lockdown: false,
+            is_default: false,
+        },
+    );
+
+    let row = model
+        .model_picker_filtered("aggregate-model")
+        .into_iter()
+        .next()
+        .expect("collapsed API row");
+    assert_eq!(
+        row.providers,
+        ["ready-api", "wide-ready-api", "newest-offline-api"]
+    );
+    assert_eq!(row.available_providers, 2);
+    assert_eq!(row.lockdown_providers, 1);
+    assert_eq!(row.default_providers, 1);
+    assert_eq!(row.context_window, None);
+    assert!(
+        row.context_window_varies,
+        "divergent usable limits are not collapsed into a misleading maximum"
+    );
+    assert!(
+        (1_000..=2_000).contains(&row.inventory_age_ms.expect("fresh age")),
+        "the newest unavailable provider does not supply display facts"
+    );
+    assert!(row.available && row.selectable);
+    assert!(!row.lockdown, "lockdown is not falsely claimed for all");
+
+    model.open_model_picker("aggregate-model".to_owned());
+    let text = draw_rows(&model, 170, 20).join("\n");
+    assert!(text.contains("2/3 available"));
+    assert!(text.contains("1/3 lockdown"));
+    assert!(text.contains("varies"));
+    assert!(text.contains("freshest age"));
+    model.handle(key(KeyCode::Enter));
+    let exact = model.model_picker_rows();
+    assert_eq!(exact.len(), 3);
+    assert_eq!(exact[0].context_window, Some(128_000));
+    assert_eq!(exact[1].context_window, Some(1_000_000));
+    assert_eq!(exact[2].context_window, Some(2_000_000));
+    assert!(exact[0].available && exact[1].available && !exact[2].available);
+}
+
+/// An aggregate with no usable provider remains dim/unavailable and refuses
+/// at the top level with every provider-qualified reason.
+#[test]
+fn all_unavailable_api_group_refuses_without_opening_provider_stage() {
+    let mut model = seeded_session();
+    for (provider, reason) in [
+        ("offline-a", "credential missing"),
+        ("offline-b", "endpoint unhealthy"),
+    ] {
+        add_api_provider(
+            &mut model,
+            ApiProviderFixture {
+                provider,
+                model: "offline-model",
+                available: false,
+                reason: Some(reason),
+                context_window: Some(64_000),
+                fetched_at_ms: None,
+                lockdown: false,
+                is_default: false,
+            },
+        );
+    }
+    model.open_model_picker("offline-model".to_owned());
+    model.requests.clear();
+    let row = model.model_picker_filtered("offline-model").remove(0);
+    assert!(!row.available);
+    assert_eq!(row.available_providers, 0);
+    assert!(
+        row.reason
+            .as_deref()
+            .is_some_and(|reason| { reason.contains("offline-a") && reason.contains("offline-b") }),
+        "the aggregate retains both honest reasons"
+    );
+
+    model.handle(key(KeyCode::Enter));
+    let picker = model
+        .model_picker
+        .as_ref()
+        .expect("refusal keeps picker open");
+    assert!(
+        picker.provider_stage.is_none(),
+        "an unusable group never opens an empty provider choice"
+    );
+    let error = picker.error.as_deref().expect("inline refusal");
+    assert!(error.contains("offline-a") && error.contains("offline-b"));
+    assert!(model.requests.is_empty(), "no selection RPC is issued");
 }
 
 /// Rows mark the session's CURRENT pair and each provider's default.
@@ -395,6 +776,85 @@ fn live_selection_is_receipted_and_renders_the_resolved_pair() {
     );
 }
 
+/// Selecting in stage two uses the same exact pending tuple and receipted
+/// reply authority as an OAuth row. The top-level aggregate is never sent.
+#[test]
+fn provider_stage_selection_preserves_pending_and_resolved_truth() {
+    let mut model = seeded_session();
+    for provider in ["stage-a", "stage-b"] {
+        add_api_provider(
+            &mut model,
+            ApiProviderFixture {
+                provider,
+                model: "stage-model",
+                available: true,
+                reason: None,
+                context_window: Some(256_000),
+                fetched_at_ms: None,
+                lockdown: false,
+                is_default: false,
+            },
+        );
+    }
+    let mut driver = LiveDriver::new("provider-stage");
+    run_slash(&mut model, "/model stage-model");
+    model.handle(key(KeyCode::Enter));
+    assert!(
+        model
+            .model_picker
+            .as_ref()
+            .is_some_and(|picker| picker.provider_stage.is_some())
+    );
+    model.handle(key(KeyCode::Down));
+    model.handle(key(KeyCode::Enter));
+
+    let picker = model
+        .model_picker
+        .as_ref()
+        .expect("pending stage remains open");
+    assert_eq!(
+        picker.pending,
+        Some(("stage-b".to_owned(), "stage-model".to_owned()))
+    );
+    assert_eq!(
+        model.identity.model_short, "fable-5",
+        "identity does not move optimistically"
+    );
+    let rendered = draw_rows(&model, 140, 20).join("\n");
+    assert!(
+        rendered.contains('…'),
+        "the exact pending row pulses visibly"
+    );
+
+    let commands = pass(&mut driver, &mut model, None);
+    let command_id = commands
+        .iter()
+        .find_map(|command| match command {
+            LiveCommand::SelectModel {
+                command_id,
+                model,
+                provider,
+                ..
+            } if model == "stage-model" && provider == "stage-b" => Some(command_id.clone()),
+            _ => None,
+        })
+        .expect("exact provider selection issued");
+    pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::ModelSelected {
+            command_id,
+            session: sid(),
+            provider: "resolved-stage".to_owned(),
+            model: "stage-model-v2".to_owned(),
+            worker_generation: 9,
+        }),
+    );
+    assert!(model.model_picker.is_none());
+    assert_eq!(model.identity.provider, "resolved-stage");
+    assert_eq!(model.identity.model_short, "stage-model-v2");
+}
+
 /// A typed refusal lands INLINE with the public code; the pending mark
 /// clears and the row stays selectable — ⏎ again retries.
 #[test]
@@ -452,6 +912,7 @@ fn refusal_after_close_reaches_the_session_view() {
     let mut driver = LiveDriver::new("test");
     run_slash(&mut model, "/model gemini-3");
     model.handle(key(KeyCode::Enter));
+    model.handle(key(KeyCode::Enter));
     let commands = pass(&mut driver, &mut model, None);
     let command_id = commands
         .iter()
@@ -460,6 +921,8 @@ fn refusal_after_close_reaches_the_session_view() {
             _ => None,
         })
         .expect("attempt issued");
+    model.handle(key(KeyCode::Esc));
+    assert!(model.model_picker.is_some(), "first esc returns to models");
     model.handle(key(KeyCode::Esc));
     assert!(model.model_picker.is_none());
     pass(
@@ -519,7 +982,22 @@ fn launcher_selection_sets_the_default_pair() {
     run_slash(&mut model, "/model qwen3");
     model.requests.clear();
     model.handle(key(KeyCode::Enter));
-    assert!(model.model_picker.is_none());
+    assert!(
+        model
+            .model_picker
+            .as_ref()
+            .is_some_and(|picker| picker.provider_stage.is_some()),
+        "even a singleton API choice opens its exact-provider stage"
+    );
+    assert_eq!(
+        model.identity.model_short, "fable-5",
+        "opening providers does not select optimistically"
+    );
+    model.handle(key(KeyCode::Enter));
+    assert!(
+        model.model_picker.is_none(),
+        "the exact provider selection closes the picker"
+    );
     assert_eq!(model.identity.provider, "local");
     assert_eq!(model.identity.model_short, "qwen3-coder");
     assert!(model.identity_pinned, "an explicit choice pins");
@@ -559,8 +1037,8 @@ fn selection_without_the_feature_names_the_stale_daemon() {
     );
 }
 
-/// A row CLICK selects exactly the pair the rect carried (value-carrying
-/// hits — a stale map can never select a different row).
+/// A collapsed API row click opens its provider stage; the exact stage row
+/// then selects the value carried by that row's rect.
 #[test]
 fn clicking_a_row_selects_its_carried_pair() {
     let mut model = seeded_launcher();
@@ -569,6 +1047,19 @@ fn clicking_a_row_selects_its_carried_pair() {
     model.handle_hit(Hit::ModelPickerRow {
         provider: "gemini".to_owned(),
         model: "gemini-3".to_owned(),
+        api_group: true,
+    });
+    assert!(
+        model
+            .model_picker
+            .as_ref()
+            .is_some_and(|picker| picker.provider_stage.is_some()),
+        "the collapsed API click opens providers"
+    );
+    model.handle_hit(Hit::ModelPickerRow {
+        provider: "gemini".to_owned(),
+        model: "gemini-3".to_owned(),
+        api_group: false,
     });
     assert!(model.model_picker.is_none(), "the click selects");
     assert_eq!(model.identity.provider, "gemini");
