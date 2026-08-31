@@ -52,11 +52,15 @@ macro_rules! print {
     }};
 }
 
-// 60s, not 10 (W5f-3): the full per-crate gate runs this suite's daemons
-// under heavy compile/test contention, and the 10s ceiling flaked
-// `worker_aware_drain_terminalizes_durable_queued_turns_before_store_close`
-// three times — always under load, never isolated. A passing run never
-// waits; only real failures pay the longer bound.
+// Windows real-process waits must cover inbox PowerShell's existing 30-second
+// cold-start allowance plus the process supervisor's 60-second wall limit and
+// two-second kill grace. This changes no production deadline. Elsewhere 60s,
+// not 10 (W5f-3), remains the full-suite contention bound established by
+// `worker_aware_drain_terminalizes_durable_queued_turns_before_store_close`.
+// Passing waits return immediately; only real failures pay the longer bound.
+#[cfg(windows)]
+pub const DEADLINE: Duration = Duration::from_secs(92);
+#[cfg(not(windows))]
 pub const DEADLINE: Duration = Duration::from_secs(60);
 
 /// Active test peers ping well inside the daemon's 45-second read-idle
@@ -836,7 +840,10 @@ impl UdsClient {
     pub async fn send(&mut self, frame: &WireFrame, limit: usize) {
         self.record_frame("send", frame);
         let bytes = uds_codec::encode(frame, limit).expect("test frame encodes");
-        self.stream.write_all(&bytes).await.expect("frame writes");
+        if let Err(error) = self.stream.write_all(&bytes).await {
+            self.report_connection_failure(&format!("frame write failed: {error}"));
+            panic!("frame writes: {error}");
+        }
     }
 
     /// Best-effort send for retry loops: a rejected connection may already be
@@ -871,6 +878,12 @@ impl UdsClient {
 
     pub async fn next(&mut self) -> WireFrame {
         self.next_with_keepalive(self.frame_limit).await
+    }
+
+    /// EOF-aware frame wait whose caller owns the one continuous operation
+    /// deadline. The negotiated-peer keepalive remains active while waiting.
+    pub async fn try_next(&mut self) -> Option<WireFrame> {
+        self.try_next_with_keepalive(self.frame_limit).await
     }
 
     /// Deadline-bounded counterpart to [`Self::receive_reply`].
