@@ -41,6 +41,7 @@ fn tuned_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
     anthropic.model_details = vec![
         ModelDetailWire {
             name: "claude-opus-5".into(),
+            display_name: None,
             context_window: Some(1_000_000),
             supported_efforts: ["low", "medium", "high", "xhigh", "max"]
                 .map(str::to_owned)
@@ -51,6 +52,7 @@ fn tuned_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
         },
         ModelDetailWire {
             name: "claude-sonnet-5".into(),
+            display_name: None,
             context_window: Some(1_000_000),
             supported_efforts: ["low", "medium", "high", "xhigh", "max"]
                 .map(str::to_owned)

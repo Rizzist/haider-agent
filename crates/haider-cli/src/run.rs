@@ -680,16 +680,18 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         .provider
         .as_ref()
         .map(|selection| selection.as_str().to_owned());
-    let model = options
-        .model
+    let error_model = options.model.clone().or_else(|| {
+        options
+            .provider
+            .as_ref()
+            .is_some_and(ProviderSelection::is_fake)
+            .then(|| "fake-model".into())
+    });
+    // The profile default is request input, not evidence that any session
+    // bound that model. Pre-result error envelopes may carry only explicit
+    // request identity; accepted results serialize the daemon's own binding.
+    let request_model = error_model
         .clone()
-        .or_else(|| {
-            options
-                .provider
-                .as_ref()
-                .is_some_and(ProviderSelection::is_fake)
-                .then(|| "fake-model".into())
-        })
         .or_else(|| Some(profile.default_model.clone()));
     let cwd = match std::env::current_dir()
         .ok()
@@ -704,7 +706,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                 options.output,
                 &failure,
                 provider.as_deref(),
-                model.as_deref(),
+                error_model.as_deref(),
             ) {
                 eprintln!("haider: stdout failed: {io_error}");
                 return ExitCode::from(EX_IOERR);
@@ -727,7 +729,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                     options.output,
                     &failure,
                     provider.as_deref(),
-                    model.as_deref(),
+                    error_model.as_deref(),
                 ) {
                     eprintln!("haider: stdout failed: {io_error}");
                     return ExitCode::from(EX_IOERR);
@@ -743,7 +745,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         attachments,
         durable_attachments: Vec::new(),
         provider: provider.clone(),
-        model: model.clone(),
+        model: request_model,
         max_tokens: profile.default_max_tokens,
         budget: options.budget.clone(),
         seed: options.seed,
@@ -793,7 +795,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             options.output,
             &failure,
             provider.as_deref(),
-            model.as_deref(),
+            error_model.as_deref(),
         ) {
             eprintln!("haider: stdout failed: {io_error}");
             return ExitCode::from(EX_IOERR);
@@ -855,7 +857,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                 options.output,
                 &failure,
                 provider.as_deref(),
-                model.as_deref(),
+                error_model.as_deref(),
             ) {
                 eprintln!("haider: stdout failed: {io_error}");
                 return ExitCode::from(EX_IOERR);

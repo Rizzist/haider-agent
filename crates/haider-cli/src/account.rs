@@ -19,6 +19,7 @@ use zeroize::Zeroizing;
 use super::run::{EX_IOERR, EX_PROTOCOL, EX_SOFTWARE, EX_UNAVAILABLE, EX_USAGE};
 
 const ACCOUNTS_SCHEMA: &str = "haider.accounts.v1";
+const ADD_AUTH_HINT: &str = "account add requires authentication material: use --api-key-env <VAR>, --api-key-stdin, or intentional --no-auth";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AccountCommand {
@@ -121,6 +122,7 @@ enum AccountError {
     Protocol(&'static str),
     SnapshotUnavailable(String),
     MissingAlias(String),
+    InvalidArgument(String),
     SecretInput(String),
 }
 
@@ -167,6 +169,7 @@ impl std::fmt::Display for AccountError {
             Self::MissingAlias(alias) => {
                 write!(formatter, "account alias `{alias}` does not exist")
             }
+            Self::InvalidArgument(message) => write!(formatter, "{message}"),
             Self::SecretInput(message) => write!(formatter, "{message}"),
         }
     }
@@ -331,7 +334,7 @@ fn parse_custom_options(
         return Err("account add requires --base-url".into());
     }
     if create && secret.is_none() {
-        return Err("account add requires an API-key source or --no-auth".into());
+        return Err(ADD_AUTH_HINT.into());
     }
     if !create
         && base_url.is_none()
@@ -394,12 +397,10 @@ fn parse_duration_ms(flag: &str, value: &str) -> Result<u64, String> {
 }
 
 pub(crate) async fn account_command(rest: &[String]) -> ExitCode {
+    let requested_json = rest.iter().any(|argument| argument == "--json");
     let command = match parse_account_command(rest) {
         Ok(command) => command,
-        Err(message) => {
-            eprintln!("haider account: {message}");
-            return ExitCode::from(EX_USAGE);
-        }
+        Err(message) => return failure(&AccountError::InvalidArgument(message), requested_json),
     };
     // This gate intentionally runs before profile resolution, daemon startup,
     // or any RPC. An unconfirmed invocation cannot reach a mutation surface.
@@ -710,6 +711,9 @@ async fn execute_custom(
     options: CustomAccountOptions,
     create: bool,
 ) -> Result<ExitCode, AccountError> {
+    if create && options.secret.is_none() {
+        return Err(AccountError::InvalidArgument(ADD_AUTH_HINT.into()));
+    }
     let (providers, revision) = provider_snapshot(client).await?;
     let existing = providers
         .iter()
@@ -1213,6 +1217,7 @@ fn failure(error: &AccountError, json: bool) -> ExitCode {
             AccountError::Protocol(_) => ("protocol_error", false, None),
             AccountError::SnapshotUnavailable(_) => ("snapshot_unavailable", true, None),
             AccountError::MissingAlias(_) => ("not_found", false, None),
+            AccountError::InvalidArgument(_) => ("invalid_argument", false, None),
             AccountError::SecretInput(_) => ("invalid_secret_input", false, None),
         };
         let _ = write_json(&AccountErrorDocument {
@@ -1238,6 +1243,7 @@ fn failure(error: &AccountError, json: bool) -> ExitCode {
         | AccountError::Rpc { .. }
         | AccountError::MissingAlias(_)
         | AccountError::SecretInput(_) => EX_SOFTWARE,
+        AccountError::InvalidArgument(_) => EX_USAGE,
     };
     ExitCode::from(code)
 }

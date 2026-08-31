@@ -893,6 +893,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         model_details: vec![
             ModelDetailWire {
                 name: "llama-fixture".to_owned(),
+                display_name: None,
                 context_window: Some(131_072),
                 supported_efforts: Vec::new(),
                 default_effort: None,
@@ -901,6 +902,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
             },
             ModelDetailWire {
                 name: "llama-other".to_owned(),
+                display_name: None,
                 context_window: Some(65_536),
                 supported_efforts: Vec::new(),
                 default_effort: None,
@@ -997,6 +999,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         model_details: vec![
             ModelDetailWire {
                 name: "model-small".to_owned(),
+                display_name: None,
                 context_window: Some(32_000),
                 supported_efforts: Vec::new(),
                 default_effort: None,
@@ -1005,6 +1008,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
             },
             ModelDetailWire {
                 name: "model-large".to_owned(),
+                display_name: None,
                 context_window: Some(128_000),
                 supported_efforts: Vec::new(),
                 default_effort: None,
@@ -1128,6 +1132,7 @@ fn keyless_summary(provider: &str, origin: &str) -> ProviderSummaryWire {
         models: vec!["llama3.1:8b".to_owned()],
         model_details: vec![ModelDetailWire {
             name: "llama3.1:8b".to_owned(),
+            display_name: None,
             context_window: None,
             supported_efforts: Vec::new(),
             default_effort: None,
@@ -2569,6 +2574,30 @@ async fn staged_secrets_expire_after_the_five_minute_ttl() {
     assert!(
         stages.claim(&reference).is_none(),
         "an expired stage must be wiped, forcing restage_required"
+    );
+}
+
+// MUTATION CHECK (R7 stage TTL): remove the expiry wake scheduled by
+// `StagedSecrets::stage`. Expected failure: the idle connection retains one
+// staged entry until a later RPC happens to call `sweep_expired`.
+#[tokio::test(start_paused = true)]
+async fn staged_secret_storage_is_released_at_ttl_without_a_followup_rpc() {
+    let mut stages = StagedSecrets::default();
+    stages
+        .stage("stage-idle", StagePurpose::ApiKey, b"idle-expiry-fixture")
+        .unwrap_or_else(|_| panic!("stage"));
+    assert_eq!(
+        stages.resident_entry_count(),
+        1,
+        "the stage must be resident initially"
+    );
+
+    tokio::time::advance(SECRET_TTL).await;
+    tokio::task::yield_now().await;
+
+    assert!(
+        stages.resident_entry_count() == 0,
+        "the TTL itself must release staged storage without another RPC"
     );
 }
 
@@ -11157,6 +11186,7 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
         model_details: vec![
             ModelDetailWire {
                 name: "gpt-5.5".to_owned(),
+                display_name: None,
                 context_window: Some(400_000),
                 supported_efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
                 default_effort: Some("medium".to_owned()),
@@ -11165,6 +11195,7 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
             },
             ModelDetailWire {
                 name: "gpt-5.6-sol".to_owned(),
+                display_name: None,
                 context_window: Some(400_000),
                 supported_efforts: Vec::new(),
                 default_effort: None,
@@ -12158,6 +12189,7 @@ async fn each_turn_resolves_the_currently_active_account() {
         models: vec!["llama-fixture".to_owned()],
         model_details: vec![ModelDetailWire {
             name: "llama-fixture".to_owned(),
+            display_name: None,
             context_window: Some(131_072),
             supported_efforts: Vec::new(),
             default_effort: None,

@@ -188,7 +188,7 @@ class LoaderContractTests(unittest.TestCase):
             "t0.run.jsonl_contract": 146_000,
             "t0.run.replay_resume_recover": 445_000,
             "t0.sessions.wait_ready_n": 520_000,
-            "t0.tui.catalog_help_command_list_pin": 749_000,
+            "t0.tui.catalog_help_command_list_pin": 277_500,
             "t0.tui.login_paths": 391_500,
             "t0.tui.model_picker_cardinality": 3_149_500,
             "t0.tui.palette_activation_closure": 5_937_500,

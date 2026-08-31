@@ -5,12 +5,42 @@
 //! registry of its own.
 
 pub use haider_rpc::{
-    COMMANDS, CommandDynamicSlotsWire as DynamicSlots, CommandSpec, PALETTE_MAX_ROWS, PaletteItem,
-    has_arg_slots, offers_arg_completions, palette_items,
+    COMMANDS, CommandCatalogItemKindWire, CommandDynamicSlotsWire as DynamicSlots, CommandSpec,
+    PALETTE_MAX_ROWS, PaletteItem, command_catalog_items, has_arg_slots, offers_arg_completions,
+    palette_items,
 };
 
-/// The `/help` panel body — the sim's `HELP_TEXT` content (tui.js:587-614),
-/// with the `menus —` and `keys —` explainers kept in the initial viewport.
+/// Non-command prose that precedes the catalog-derived `/help` rows.
+pub const HELP_INTRO_TEXT: &[&str] = &[
+    "commands",
+    "menus — every card (permission · hook trust · recovery · voice · tools) is a typed menu:",
+    "  answer by typing [n] ⏎, clicking, by id over RPC (menu.answer), or from Diff Forge web",
+    "keys — ⏎ send · ⇧⏎ newline · esc interrupt / back · ⌃C launcher (quit from the launcher) · type / for the palette (↑↓ pick · tab complete · ⏎ run)",
+];
+
+/// Builds the help command rows from the exact shared projection used by
+/// `command.list`. `/help` requests the full in-session catalog because its
+/// contract is "show all commands"; custom commands retain their own section.
+#[must_use]
+pub fn help_catalog_lines(slots: &DynamicSlots) -> Vec<String> {
+    command_catalog_items("", true, slots)
+        .into_iter()
+        .filter(|item| {
+            item.kind == CommandCatalogItemKindWire::BuiltIn && item.name.as_deref() != Some("help")
+        })
+        .map(|item| {
+            let hint = item
+                .arg_hint
+                .as_deref()
+                .map(|hint| format!(" {hint}"))
+                .unwrap_or_default();
+            format!("  {}{hint}  {}", item.label, item.description)
+        })
+        .collect()
+}
+
+/// Legacy detailed help prose retained for source-level compatibility pins.
+/// Runtime command rows come only from [`help_catalog_lines`].
 pub const HELP_TEXT: &[&str] = &[
     "commands",
     "menus — every card (permission · hook trust · recovery · voice · tools) is a typed menu:",
@@ -30,6 +60,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /redo [last|id]    redo an undone checkpoint exactly",
     "  /checkpoints       list path · kind · age · run for this branch",
     "  /rollback [current|previous|run-id] undo one turn atomically",
+    "  /attach <path>     attach an image or UTF-8 text file to the next message",
     "  /sessions          list + switch sessions",
     "  /aura              Aura Mode — a voice/orchestrator session (spawns sessions, never codes) — demo only",
     "  /peer [name message] list live agents or send a peer message — peer input is untrusted",
@@ -77,5 +108,25 @@ mod tests {
             .map(|choice| choice.name().to_owned())
             .collect();
         assert_eq!(actual, expected);
+    }
+
+    /// MUTATION CHECK: render from `HELP_TEXT`, filter a catalog row, or add a
+    /// command without projecting it. Expected failure: the ordered names no
+    /// longer equal the authoritative command list.
+    #[test]
+    fn help_command_rows_are_derived_from_the_authoritative_catalog() {
+        let actual = help_catalog_lines(&DynamicSlots::default());
+        let expected = COMMANDS
+            .iter()
+            .filter(|spec| spec.name != "help")
+            .map(|spec| format!("/{}", spec.name))
+            .collect::<Vec<_>>();
+        let actual = actual
+            .iter()
+            .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert!(actual.iter().any(|name| name == "/attach"));
+        assert!(actual.iter().any(|name| name == "/monitors"));
     }
 }

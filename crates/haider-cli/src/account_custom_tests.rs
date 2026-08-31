@@ -14,8 +14,8 @@ use haider_rpc::{
 };
 
 use super::{
-    AccountClient, AccountCommand, AccountError, SecretInput, custom_document, execute,
-    parse_account_command,
+    AccountClient, AccountCommand, AccountError, CustomAccountOptions, SecretInput,
+    custom_document, execute, execute_custom, parse_account_command,
 };
 
 struct FakeClient {
@@ -133,7 +133,33 @@ fn parser_requires_one_explicit_auth_choice_on_add() {
         "http://127.0.0.1:8080".into(),
     ])
     .expect_err("missing auth is refused");
-    assert!(error.contains("API-key source or --no-auth"));
+    assert!(error.contains("--api-key-env <VAR>"));
+    assert!(error.contains("--api-key-stdin"));
+    assert!(error.contains("--no-auth"));
+}
+
+#[tokio::test]
+async fn direct_add_execution_without_auth_refuses_before_any_request() {
+    let client = FakeClient::new([]);
+    let error = execute_custom(
+        &client,
+        CustomAccountOptions {
+            alias: "router".into(),
+            base_url: Some("http://127.0.0.1:8080".into()),
+            secret: None,
+            api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+            response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
+            trust: None,
+            json: false,
+        },
+        true,
+    )
+    .await
+    .expect_err("missing auth refuses");
+    assert!(matches!(error, AccountError::InvalidArgument(_)));
+    assert!(client.requests().is_empty(), "refusal precedes daemon RPC");
 }
 
 #[test]

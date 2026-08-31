@@ -12,6 +12,9 @@
 //! Surface identity is intentionally absent: preserving that 1:1 fact/event
 //! mapping gives every submission surface identical hook semantics.
 
+#[cfg(test)]
+#[path = "hook_ack_retention_tests.rs"]
+mod ack_retention_tests;
 #[path = "hooks_server.rs"]
 mod hooks_server;
 #[cfg(test)]
@@ -2130,7 +2133,7 @@ async fn drain_hook_dispatch_page(context: HookDrainContext<'_>) -> HookDrainPag
         terminal_snapshot |= outcome.terminal_scope.is_some();
         if !outcome.completed {
             if let Some(scope) = ordered_run_scope {
-                blocked_run_acks.insert(scope);
+                retain_failed_run_ack(blocked_run_acks, &mut ordered_ack_scopes, scope);
             }
             aborted = true;
             break;
@@ -2143,19 +2146,22 @@ async fn drain_hook_dispatch_page(context: HookDrainContext<'_>) -> HookDrainPag
         if acks.len() > ack_count
             && let Some(scope) = outcome.terminal_scope
             && state.terminal_run_trust.contains(&scope)
-            && !blocked_run_acks.contains(&scope)
         {
             terminal_trust_acks.insert(scope);
         }
     }
     let acknowledgements_flushed = flush_hook_dispatch_acks(service, acks).await;
+    let terminal_trust_acks = reconcile_run_ack_retention(
+        blocked_run_acks,
+        ordered_ack_scopes,
+        terminal_trust_acks,
+        acknowledgements_flushed,
+    );
     if acknowledgements_flushed {
         for scope in terminal_trust_acks {
             state.terminal_run_trust.remove(&scope);
             state.run_trust.remove(&scope);
         }
-    } else {
-        blocked_run_acks.extend(ordered_ack_scopes);
     }
     let cadence_due = snapshot_schedule
         .deadline()
@@ -2183,6 +2189,33 @@ async fn drain_hook_dispatch_page(context: HookDrainContext<'_>) -> HookDrainPag
     } else {
         HookDrainPage::Progress
     }
+}
+
+fn retain_failed_run_ack(
+    blocked_run_acks: &mut HashSet<(SessionId, RunId)>,
+    ordered_ack_scopes: &mut HashSet<(SessionId, RunId)>,
+    scope: (SessionId, RunId),
+) {
+    ordered_ack_scopes.remove(&scope);
+    blocked_run_acks.insert(scope);
+}
+
+fn reconcile_run_ack_retention(
+    blocked_run_acks: &mut HashSet<(SessionId, RunId)>,
+    ordered_ack_scopes: HashSet<(SessionId, RunId)>,
+    mut terminal_trust_acks: HashSet<(SessionId, RunId)>,
+    acknowledgements_flushed: bool,
+) -> HashSet<(SessionId, RunId)> {
+    if acknowledgements_flushed {
+        for scope in ordered_ack_scopes {
+            blocked_run_acks.remove(&scope);
+        }
+        terminal_trust_acks.retain(|scope| !blocked_run_acks.contains(scope));
+    } else {
+        blocked_run_acks.extend(ordered_ack_scopes);
+        terminal_trust_acks.clear();
+    }
+    terminal_trust_acks
 }
 
 async fn drain_hook_dispatches_through_session(

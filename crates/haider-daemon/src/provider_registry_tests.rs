@@ -740,6 +740,11 @@ fn summaries_report_pickable_discovered_models_not_profile_literals() {
         .next()
         .expect("summary");
     assert_eq!(summary.models, vec!["frontier-a", "frontier-b"]);
+    let summary_json = serde_json::to_value(&summary).expect("summary JSON");
+    assert_eq!(
+        summary_json["model_details"][0]["display_name"], "Fixture frontier-a",
+        "provider catalog display names must survive the registry projection"
+    );
     assert_eq!(summary.default_model.as_deref(), Some("frontier-a"));
     assert_eq!(summary.availability, ProviderAvailabilityWire::Available);
 }
@@ -850,6 +855,7 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
         vec![
             ModelDetailWire {
                 name: "frontier-a".to_owned(),
+                display_name: Some("Fixture frontier-a".to_owned()),
                 context_window: Some(100_000),
                 supported_efforts: Vec::new(),
                 default_effort: None,
@@ -858,6 +864,7 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
             },
             ModelDetailWire {
                 name: "frontier-b".to_owned(),
+                display_name: Some("Fixture frontier-b".to_owned()),
                 context_window: Some(200_000),
                 supported_efforts: Vec::new(),
                 default_effort: None,

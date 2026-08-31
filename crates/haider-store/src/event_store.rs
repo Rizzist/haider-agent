@@ -123,6 +123,8 @@ use std::time::Duration;
 mod event_store_append_tests;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound the reusable WAL allocation after a checkpoint/reset cycle.
+const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 8 * 1_024 * 1_024;
 const REPLAY_PAGE_SIZE: usize = 1_024;
 /// The store currently has 58 distinct `prepare_cached` call sites. An append
 /// touches 8–12 of them, so 16 entries churned under ordinary mixed traffic;
@@ -22984,6 +22986,9 @@ fn open_connection_with(path: &Path, synchronous: StoreSynchronous) -> StoreResu
         .pragma_update(None, "journal_mode", "WAL")
         .map_err(map_sqlite_error)?;
     connection
+        .pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)
+        .map_err(map_sqlite_error)?;
+    connection
         .pragma_update(None, "synchronous", synchronous.pragma_value())
         .map_err(map_sqlite_error)?;
     Ok(connection)
@@ -26014,6 +26019,82 @@ mod store_synchronous_tests {
         connection
             .pragma_query_value(None, "synchronous", |row| row.get(0))
             .expect("query synchronous pragma")
+    }
+
+    fn queried_i64_pragma(connection: &Connection, pragma: &str) -> i64 {
+        connection
+            .pragma_query_value(None, pragma, |row| row.get(0))
+            .unwrap_or_else(|error| panic!("query {pragma} pragma: {error}"))
+    }
+
+    /// MUTATION CHECK: omit the journal-size pragma or restore SQLite's `-1`
+    /// default. Expected failure: the exact pragma pin fails and the reset WAL
+    /// remains larger than the configured allocation cap.
+    #[test]
+    fn wal_journal_allocation_is_capped_after_checkpoint_reset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database_path = dir.path().join("journal-cap.sqlite");
+        let mut connection =
+            open_connection_with(&database_path, StoreSynchronous::Normal).expect("open store");
+        assert_eq!(
+            queried_i64_pragma(&connection, "journal_size_limit"),
+            WAL_JOURNAL_SIZE_LIMIT_BYTES,
+            "every store connection must install the WAL allocation cap"
+        );
+        assert_eq!(
+            queried_i64_pragma(&connection, "wal_autocheckpoint"),
+            1_000,
+            "the existing 1000-frame autocheckpoint must remain unchanged"
+        );
+
+        connection
+            .execute_batch("CREATE TABLE wal_pressure (payload BLOB NOT NULL)")
+            .expect("create pressure table");
+        let payload = vec![0xA5_u8; 64 * 1_024];
+        let transaction = connection
+            .transaction()
+            .expect("begin pressure transaction");
+        for _ in 0..192 {
+            transaction
+                .execute(
+                    "INSERT INTO wal_pressure(payload) VALUES (?1)",
+                    params![payload.as_slice()],
+                )
+                .expect("insert pressure row");
+        }
+        transaction.commit().expect("commit pressure transaction");
+
+        let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
+        assert!(
+            fs::metadata(&wal_path)
+                .expect("pressure WAL metadata")
+                .len()
+                > u64::try_from(WAL_JOURNAL_SIZE_LIMIT_BYTES).expect("positive cap"),
+            "the fixture must grow the WAL beyond the cap before reset"
+        );
+        let (busy, _, _): (u32, u32, u32) = connection
+            .query_row("PRAGMA wal_checkpoint(RESTART)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("restart checkpoint");
+        assert_eq!(busy, 0, "checkpoint must acquire the writer lock");
+        connection
+            .execute(
+                "INSERT INTO wal_pressure(payload) VALUES (?1)",
+                params![&[0x01_u8]],
+            )
+            .expect("trigger WAL reset");
+        let (busy, _, _): (u32, u32, u32) = connection
+            .query_row("PRAGMA wal_checkpoint(RESTART)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("post-reset checkpoint");
+        assert_eq!(busy, 0, "post-reset checkpoint must succeed");
+        assert!(
+            fs::metadata(&wal_path).expect("reset WAL metadata").len()
+                <= u64::try_from(WAL_JOURNAL_SIZE_LIMIT_BYTES).expect("positive cap"),
+            "checkpoint reset must cap the reusable WAL allocation"
+        );
     }
 
     /// MUTATION CHECK: deleting the `synchronous` `pragma_update` in

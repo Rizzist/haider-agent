@@ -40,6 +40,7 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
         model_details: vec![
             ModelDetailWire {
                 name: "frontier-a".to_owned(),
+                display_name: Some("Frontier A".to_owned()),
                 context_window: Some(200_000),
                 supported_efforts: Vec::new(),
                 default_effort: None,
@@ -48,6 +49,7 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
             },
             ModelDetailWire {
                 name: "frontier-b".to_owned(),
+                display_name: None,
                 context_window: None,
                 supported_efforts: Vec::new(),
                 default_effort: None,
@@ -66,11 +68,20 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
     };
 
     let encoded = serde_json::to_value(&summary).expect("provider summary encodes");
+    assert_eq!(encoded["model_details"][0]["display_name"], "Frontier A");
+    assert!(
+        encoded["model_details"][1].get("display_name").is_none(),
+        "absent labels stay byte-compatible with older model details"
+    );
     let decoded: ProviderSummaryWire =
         serde_json::from_value(encoded).expect("provider summary decodes");
 
     assert_eq!(decoded, summary);
     assert_eq!(decoded.model_details[0].name, "frontier-a");
+    assert_eq!(
+        decoded.model_details[0].display_name.as_deref(),
+        Some("Frontier A")
+    );
     assert_eq!(decoded.model_details[0].context_window, Some(200_000));
     assert_eq!(decoded.model_details[1].name, "frontier-b");
     assert_eq!(decoded.model_details[1].context_window, None);

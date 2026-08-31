@@ -7962,7 +7962,7 @@ impl AppModel {
                             );
                         }
                         Some(PaletteItem::Arg { cmd, value, .. }) => {
-                            self.composer.set_text(format!("/{cmd} {value}"));
+                            self.set_palette_argument(cmd, &value);
                         }
                         // W-C M1: tab on a custom command completes the name
                         // and opens an argument slot (a trailing space) so
@@ -12909,6 +12909,34 @@ impl AppModel {
         }
     }
 
+    /// Replaces only the active argument fragment. Completed slots remain in
+    /// order, so two-stage commands such as `/login <provider> <method>` do
+    /// not lose the provider when the method row is activated.
+    fn set_palette_argument(&mut self, cmd: &str, value: &str) {
+        let body = self.composer.text().trim_start_matches('/');
+        let trailing_space = body.ends_with(char::is_whitespace);
+        let mut words = body.split_whitespace();
+        let current_cmd = words.next().unwrap_or_default();
+        let args = words.collect::<Vec<_>>();
+        let retained = if current_cmd.eq_ignore_ascii_case(cmd) {
+            if trailing_space {
+                args.len()
+            } else {
+                args.len().saturating_sub(1)
+            }
+        } else {
+            0
+        };
+        let mut completed = format!("/{cmd}");
+        for argument in args.into_iter().take(retained) {
+            completed.push(' ');
+            completed.push_str(argument);
+        }
+        completed.push(' ');
+        completed.push_str(value);
+        self.composer.set_text(completed);
+    }
+
     /// Activate one palette row — ⏎ and mouse click share this law (the
     /// click carries the VALUE, so a stale map can never run a different
     /// row). Sim acceptSuggestion (tui.js:2720-2753): a command with
@@ -12939,7 +12967,7 @@ impl AppModel {
                 self.execute_slash();
             }
             PaletteItem::Arg { cmd, value, .. } => {
-                self.composer.set_text(format!("/{cmd} {value}"));
+                self.set_palette_argument(cmd, &value);
                 self.execute_slash();
             }
             // W-C M1: activating a custom command preserves any args the user

@@ -586,6 +586,43 @@ fn account_parser_pins_list_and_remove_grammar() {
     assert!(parse_account_command(&["remove".into(), "--confirm".into()]).is_err());
 }
 
+/// MUTATION CHECK: let parse failure bypass the typed account envelope or
+/// fall through to daemon startup. Expected failure: stdout is not the
+/// actionable invalid_argument document below, or daemon state appears.
+#[test]
+fn account_add_without_auth_refuses_with_typed_actionable_hint() {
+    let mut command = haider();
+    let output = command
+        .args([
+            "account",
+            "add",
+            "router",
+            "--base-url",
+            "http://127.0.0.1:8080",
+            "--json",
+        ])
+        .output()
+        .expect("missing-auth account add runs");
+
+    assert_eq!(output.status.code(), Some(i32::from(EX_USAGE)));
+    assert!(
+        output.stderr.is_empty(),
+        "JSON errors belong on stdout only"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("typed JSON");
+    assert_eq!(value["schema"], "haider.account.error.v1");
+    assert_eq!(value["code"], "invalid_argument");
+    assert_eq!(value["retryable"], false);
+    let message = value["message"].as_str().expect("error message");
+    assert!(message.contains("--api-key-env <VAR>"));
+    assert!(message.contains("--api-key-stdin"));
+    assert!(message.contains("--no-auth"));
+    assert!(
+        !command.profile.join("haiderd.pid").exists(),
+        "typed usage refusal must happen before daemon startup"
+    );
+}
+
 fn seed_cli_account(command: &mut HaiderCommand, alias: &str) -> Vec<u8> {
     let runtime_dir = command._profile_root.path().to_path_buf();
     command
@@ -2152,9 +2189,9 @@ fn unknown_run_provider_surfaces_daemon_create_refusal() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("unsupported session provider"));
 }
 
-/// MUTATION CHECK: fall back to profile defaults when no provider flag is
-/// present. Expected RUNTIME failure: the fresh profile creates a fake session
-/// instead of returning typed no_active_account with an actionable remedy.
+/// MUTATION CHECK: serialize the profile-global default as though it were a
+/// failed session's binding. Expected failure: the pre-acceptance envelope
+/// claims the packaged model even though no session supplied that fact.
 #[test]
 fn flagless_run_without_an_active_account_exits_65_with_remedy() {
     let out = haider()
@@ -2166,7 +2203,18 @@ fn flagless_run_without_an_active_account_exits_65_with_remedy() {
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("error JSON");
     assert_eq!(value["error"]["code"], "no_active_account");
     assert!(value["provider"].is_null());
-    assert_eq!(value["model"], haider_client::PACKAGED_DEFAULT_MODEL);
+    assert!(value["model"].is_null());
+    let packaged_model = haider_client::PACKAGED_DEFAULT_MODEL.as_bytes();
+    assert!(
+        !out.stdout
+            .windows(packaged_model.len())
+            .any(|window| window == packaged_model)
+            && !out
+                .stderr
+                .windows(packaged_model.len())
+                .any(|window| window == packaged_model),
+        "a pre-session failure must not leak the global model as a session binding"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("no_active_account"));
     assert!(stderr.contains("remedy:"));
