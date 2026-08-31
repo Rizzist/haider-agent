@@ -27,24 +27,34 @@ RUN_TEN_SECONDS = BudgetPart(
     10.0,
     "haider run --timeout 10s; crates/haider-cli/src/run.rs:216-223",
 )
+READY_FIVE_SECONDS = BudgetPart(
+    "selected session readiness timeout",
+    5.0,
+    "haider sessions wait-ready --timeout 5s; crates/haider-cli/src/automation.rs:137-201",
+)
 # Registry #94: first account add may start the daemon (30+60), second add 60,
-# run 10+2, session inspection 60, cleanup 60+20+2+2. Total=306s.
+# run 10+2, session readiness 5+2, cleanup 60+20+2+2. Total=253s.
 budget = (
     DAEMON_STARTUP
     + STATUS_REQUEST
     + STATUS_REQUEST
     + RUN_TEN_SECONDS
     + RUN_TERMINAL_GRACE
-    + STATUS_REQUEST
+    + READY_FIVE_SECONDS
+    + RUN_TERMINAL_GRACE
     + STATUS_REQUEST
     + DAEMON_STOP
     + PROCESS_EXIT_GRACE
     + PROCESS_EXIT_GRACE
 )
 timed = False
+ACCOUNT_A_KEY_ENV = "HAIDER_QA_ACCOUNT_A_API_KEY"
+ACCOUNT_B_KEY_ENV = "HAIDER_QA_ACCOUNT_B_API_KEY"
 
 
-def _add_account(ctx, alias: str, server: OpenAIStub, *, first: bool):
+def _add_account(
+    ctx, alias: str, server: OpenAIStub, key_env: str, *, first: bool
+):
     return ctx.run_haider(
         [
             "account",
@@ -54,7 +64,8 @@ def _add_account(ctx, alias: str, server: OpenAIStub, *, first: bool):
             server.base_url,
             "--api-family",
             "openai",
-            "--no-auth",
+            "--api-key-env",
+            key_env,
             "--full",
             "--json",
         ],
@@ -65,13 +76,21 @@ def _add_account(ctx, alias: str, server: OpenAIStub, *, first: bool):
 def run(ctx) -> list[Evidence]:
     # This check owns real loopback listeners and must not use the daemon fake seam.
     ctx.env.pop("HAIDER_TEST_FAKE_PROVIDER", None)
+    # OpenAIStub accepts every bearer value without inspecting it. Keyed adds
+    # can therefore create real credential descriptors without external auth.
+    ctx.env[ACCOUNT_A_KEY_ENV] = "qa-dummy-account-a-key"
+    ctx.env[ACCOUNT_B_KEY_ENV] = "qa-dummy-account-b-key"
     server_a = OpenAIStub("SENTINEL_ACCOUNT_A")
     server_b = OpenAIStub("SENTINEL_ACCOUNT_B")
     server_a.start()
     server_b.start()
     try:
-        add_a = _add_account(ctx, "qa-a", server_a, first=True)
-        add_b = _add_account(ctx, "qa-b", server_b, first=False)
+        add_a = _add_account(
+            ctx, "qa-a", server_a, ACCOUNT_A_KEY_ENV, first=True
+        )
+        add_b = _add_account(
+            ctx, "qa-b", server_b, ACCOUNT_B_KEY_ENV, first=False
+        )
         run_result = ctx.run_haider(
             [
                 "run",
@@ -125,7 +144,18 @@ def run(ctx) -> list[Evidence]:
         persisted_account = None
         if isinstance(session_id, str) and session_id:
             session_result = ctx.run_haider(
-                ["session", session_id, "--json"], timeout=STATUS_REQUEST
+                [
+                    "sessions",
+                    "wait-ready",
+                    "--count",
+                    "1",
+                    "--session",
+                    session_id,
+                    "--timeout",
+                    "5s",
+                    "--json",
+                ],
+                timeout=READY_FIVE_SECONDS + RUN_TERMINAL_GRACE,
             )
             try:
                 session_document = json_document(session_result, "session")
@@ -137,13 +167,35 @@ def run(ctx) -> list[Evidence]:
                     f"session.exit expected=0 actual={session_result.returncode} "
                     f"timed_out={str(session_result.timed_out).lower()}"
                 )
-            persisted_provider = session_document.get("session", {}).get("provider")
+            session_summaries = session_document.get("sessions")
+            session_summary = (
+                next(
+                    (
+                        summary
+                        for summary in session_summaries
+                        if isinstance(summary, dict)
+                        and summary.get("session_id") == session_id
+                    ),
+                    None,
+                )
+                if isinstance(session_summaries, list)
+                else None
+            )
+            if session_summary is None:
+                failures.append(
+                    f"persisted_session expected={session_id!r} actual=missing"
+                )
+                session_summary = {}
+            persisted_provider = session_summary.get("provider")
             if persisted_provider != "qa-b":
                 failures.append(
                     "persisted_provider expected=qa-b "
                     f"actual={persisted_provider!r}"
                 )
-            persisted_account = session_document.get("session", {}).get("account_alias")
+            metadata = session_summary.get("metadata")
+            persisted_account = (
+                metadata.get("account_alias") if isinstance(metadata, dict) else None
+            )
             if persisted_account != "qa-b":
                 failures.append(
                     "persisted_account_alias expected=qa-b "

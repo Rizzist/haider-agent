@@ -149,7 +149,7 @@ class LoaderContractTests(unittest.TestCase):
 
     def test_shipped_check_budget_sums_cover_every_nested_bound(self):
         expected = {
-            "t0.account.alias_selects": 306_000,
+            "t0.account.alias_selects": 253_000,
             "t0.budget.max_cost_binds_before_request": 252_000,
             "t0.budget.max_tokens_binds": 252_000,
             "t0.daemon.status_stop": 310_000,
@@ -157,7 +157,7 @@ class LoaderContractTests(unittest.TestCase):
             "t0.run.exit_codes": 336_000,
             "t0.run.jsonl_contract": 146_000,
             "t0.run.replay_resume_recover": 445_000,
-            "t0.sessions.wait_ready_n": 506_000,
+            "t0.sessions.wait_ready_n": 520_000,
         }
         checks = runner.discover_checks(runner.CHECK_ROOT, "t0")
         self.assertEqual(

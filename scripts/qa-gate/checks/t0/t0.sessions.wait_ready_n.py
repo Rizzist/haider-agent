@@ -1,4 +1,4 @@
-"""N-session readiness is exact, finite, and typed on an unmet count."""
+"""N-session readiness is exact, finite, and independent of turn quiescence."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ READY_FIVE_SECONDS = BudgetPart(
     "haider sessions wait-ready --timeout 5s; crates/haider-cli/src/automation.rs:137-201",
 )
 READY_TWO_SECONDS = BudgetPart(
-    "negative readiness timeout",
+    "mixed-state readiness timeout",
     2.0,
     "haider sessions wait-ready --timeout 2s; crates/haider-cli/src/automation.rs:137-201",
 )
@@ -44,8 +44,8 @@ RESUME_FIVE_SECONDS = BudgetPart(
     "haider resume --timeout 5s; crates/haider-cli/src/automation.rs:204-240",
 )
 # Registry #94: first start 30+60, five resident-daemon starts 5*60,
-# three positive resumes 3*(5+2), positive ready 5+2, negative ready
-# 2+2, cleanup 60+20+2+2. Total=506s.
+# three positive resumes 3*(5+2), positive ready 5+2, two mixed-state
+# resumes 2*(5+2), mixed-state ready 2+2, cleanup 60+20+2+2. Total=520s.
 budget = (
     DAEMON_STARTUP
     + STATUS_REQUEST
@@ -61,6 +61,10 @@ budget = (
     + RESUME_FIVE_SECONDS
     + RUN_TERMINAL_GRACE
     + READY_FIVE_SECONDS
+    + RUN_TERMINAL_GRACE
+    + RESUME_FIVE_SECONDS
+    + RUN_TERMINAL_GRACE
+    + RESUME_FIVE_SECONDS
     + RUN_TERMINAL_GRACE
     + READY_TWO_SECONDS
     + RUN_TERMINAL_GRACE
@@ -189,8 +193,34 @@ def run(ctx) -> list[Evidence]:
         positive_artefacts,
     )
 
-    negative_ids = [_start(ctx, index, first=False) for index in range(4, 7)]
-    negative_args = [
+    mixed_state_ids = []
+    mixed_state_settle_failures = []
+    mixed_state_settle_results = []
+    for index in range(4, 6):
+        session_id = _start(ctx, index, first=False)
+        mixed_state_ids.append(session_id)
+        result = ctx.run_haider(
+            ["resume", session_id, "--json", "--timeout", "5s"],
+            timeout=RESUME_FIVE_SECONDS + RUN_TERMINAL_GRACE,
+        )
+        mixed_state_settle_results.append((index, result))
+        try:
+            document = json_document(result, f"mixed-state resume {index}")
+        except Exception as error:
+            document = {}
+            mixed_state_settle_failures.append(f"resume[{index}] json actual={error}")
+        if result.timed_out or result.returncode != 0:
+            mixed_state_settle_failures.append(
+                f"resume[{index}] exit expected=0 actual={result.returncode} "
+                f"timed_out={str(result.timed_out).lower()}"
+            )
+        if document.get("completed") is not True:
+            mixed_state_settle_failures.append(
+                f"resume[{index}] completed expected=true "
+                f"actual={document.get('completed')!r}"
+            )
+    mixed_state_ids.append(_start(ctx, 6, first=False))
+    mixed_state_args = [
         "sessions",
         "wait-ready",
         "--count",
@@ -199,60 +229,89 @@ def run(ctx) -> list[Evidence]:
         "2s",
         "--json",
     ]
-    for session_id in negative_ids:
-        negative_args.extend(("--session", session_id))
-    negative = ctx.run_haider(
-        negative_args,
+    for session_id in mixed_state_ids:
+        mixed_state_args.extend(("--session", session_id))
+    mixed_state = ctx.run_haider(
+        mixed_state_args,
         timeout=READY_TWO_SECONDS + RUN_TERMINAL_GRACE,
     )
-    negative_failures = []
+    mixed_state_failures = list(mixed_state_settle_failures)
     try:
-        negative_document = json_document(negative, "negative readiness")
+        mixed_state_document = json_document(mixed_state, "mixed-state readiness")
     except Exception as error:
-        negative_document = {}
-        negative_failures.append(f"json actual={error}")
-    if negative.timed_out:
-        negative_failures.append("outer process timed_out actual=true")
-    if negative.returncode != 124:
-        negative_failures.append(f"exit expected=124 actual={negative.returncode}")
-    if negative_document.get("schema") != "haider.sessions.ready.v1":
-        negative_failures.append(
+        mixed_state_document = {}
+        mixed_state_failures.append(f"json actual={error}")
+    if mixed_state.timed_out:
+        mixed_state_failures.append("outer process timed_out actual=true")
+    if mixed_state.returncode != 0:
+        mixed_state_failures.append(f"exit expected=0 actual={mixed_state.returncode}")
+    if mixed_state_document.get("schema") != "haider.sessions.ready.v1":
+        mixed_state_failures.append(
             "schema expected=haider.sessions.ready.v1 "
-            f"actual={negative_document.get('schema')!r}"
+            f"actual={mixed_state_document.get('schema')!r}"
         )
-    if negative_document.get("ready") is not False:
-        negative_failures.append(
-            f"ready expected=false actual={negative_document.get('ready')!r}"
+    if mixed_state_document.get("ready") is not True:
+        mixed_state_failures.append(
+            f"ready expected=true actual={mixed_state_document.get('ready')!r}"
         )
-    if negative_document.get("timed_out") is not True:
-        negative_failures.append(
-            f"timed_out expected=true actual={negative_document.get('timed_out')!r}"
+    if mixed_state_document.get("timed_out") is not False:
+        mixed_state_failures.append(
+            f"timed_out expected=false actual={mixed_state_document.get('timed_out')!r}"
         )
-    if negative_document.get("ready_count") != 2:
-        negative_failures.append(
-            f"ready_count expected=2 actual={negative_document.get('ready_count')!r}"
+    if mixed_state_document.get("ready_count") != 3:
+        mixed_state_failures.append(
+            f"ready_count expected=3 actual={mixed_state_document.get('ready_count')!r}"
         )
-    negative_error = negative_document.get("error")
-    error_code = negative_error.get("code") if isinstance(negative_error, dict) else None
-    if error_code != "timeout":
-        negative_failures.append(
-            f"error.code expected=timeout actual={error_code!r}"
+    if mixed_state_document.get("error") is not None:
+        mixed_state_failures.append(
+            f"error expected=none actual={mixed_state_document.get('error')!r}"
         )
-    state_counts = negative_document.get("state_counts")
-    negative_line = (
-        "; ".join(negative_failures)
-        if negative_failures
-        else "document_count=1 only_two_segments=true third_session=backoff "
-        "ready=false ready_count=2 exit=124 error_code=timeout"
+    # Readiness is current-format roster truth (head_seq + metadata +
+    # run_state), not turn quiescence: crates/haider-cli/src/automation.rs:251-260.
+    state_counts = mixed_state_document.get("state_counts")
+    expected_state_counts = {"idle": 2, "running": 1}
+    if state_counts != expected_state_counts:
+        mixed_state_failures.append(
+            f"state_counts expected={expected_state_counts!r} actual={state_counts!r}"
+        )
+    sessions = mixed_state_document.get("sessions")
+    third_summary = (
+        next(
+            (
+                summary
+                for summary in sessions
+                if isinstance(summary, dict)
+                and summary.get("session_id") == mixed_state_ids[2]
+            ),
+            None,
+        )
+        if isinstance(sessions, list)
+        else None
     )
-    if negative_failures:
-        negative_line += f"; state_counts={state_counts!r}"
-    negative_evidence = Evidence(
-        "third_not_ready",
-        FAIL if negative_failures else PASS,
-        negative_line,
-        [ctx.command_artefact("negative-ready", negative)]
-        if negative_failures
-        else [],
+    third_state = third_summary.get("run_state") if third_summary else None
+    if third_state != "running":
+        mixed_state_failures.append(
+            f"third_session.run_state expected=running actual={third_state!r}"
+        )
+    mixed_state_line = (
+        "; ".join(mixed_state_failures)
+        if mixed_state_failures
+        else "document_count=1 ready=true ready_count=3 state_counts=idle:2,running:1 "
+        f"third_session={mixed_state_ids[2]} third_run_state=running"
     )
-    return [positive_evidence, negative_evidence]
+    mixed_state_artefacts = []
+    if mixed_state_failures:
+        mixed_state_artefacts.append(
+            ctx.command_artefact("mixed-state-ready", mixed_state)
+        )
+        mixed_state_artefacts.extend(
+            ctx.command_artefact(f"mixed-state-resume-{index}", result)
+            for index, result in mixed_state_settle_results
+        )
+    mixed_state_evidence = Evidence(
+        "readiness_is_not_quiescence",
+        FAIL if mixed_state_failures else PASS,
+        mixed_state_line,
+        mixed_state_artefacts,
+    )
+    return [positive_evidence, mixed_state_evidence]

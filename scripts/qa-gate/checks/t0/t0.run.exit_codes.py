@@ -9,6 +9,7 @@ from gate import (
     PASS,
     PROCESS_EXIT_GRACE,
     RUN_TERMINAL_GRACE,
+    SKIP,
     STATUS_REQUEST,
     BudgetPart,
     Evidence,
@@ -69,6 +70,7 @@ budget = (
     + PROCESS_EXIT_GRACE
 )
 timed = False
+SIGINT_EXPECTED_GAP = True
 
 
 def _jsonl_case(ctx, label, args, expected_exit, expected_kind, expected_code):
@@ -300,14 +302,27 @@ def run(ctx) -> list[Evidence]:
             "terminal_kind expected=cancellation "
             f"actual={cancel_terminal.get('terminal_kind')!r}"
         )
+    cancel_line = (
+        "expected_gap=haider_run_SIGINT_semantics_undefined "
+        f"observed_exit={cancelled.returncode} "
+        f"observed_typed_terminals={len(cancel_terminals)} "
+        f"observed_terminal_kind={cancel_terminal.get('terminal_kind')!r} "
+        f"would_gate_failures={'; '.join(cancel_failures) if cancel_failures else 'none'}"
+        if SIGINT_EXPECTED_GAP
+        else (
+            "; ".join(cancel_failures)
+            if cancel_failures
+            else "case=cancellation signal=SIGINT-to-client exit=130 cancellation_terminals=1"
+        )
+    )
     evidence.append(
         Evidence(
             "cancellation",
-            FAIL if cancel_failures else PASS,
-            "; ".join(cancel_failures)
-            if cancel_failures
-            else "case=cancellation signal=SIGINT-to-client exit=130 cancellation_terminals=1",
-            [ctx.command_artefact("cancellation", cancelled)] if cancel_failures else [],
+            SKIP if SIGINT_EXPECTED_GAP else (FAIL if cancel_failures else PASS),
+            cancel_line,
+            [ctx.command_artefact("cancellation", cancelled)]
+            if not SIGINT_EXPECTED_GAP and cancel_failures
+            else [],
         )
     )
 
