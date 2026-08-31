@@ -2281,6 +2281,58 @@ fn cancellable_exec_command() -> String {
 }
 
 #[cfg(windows)]
+fn cancellable_exec_fixture_command(workspace: &std::path::Path) -> String {
+    // Keep the real PowerShell -> cmd.exe -> cmd.exe process tree, but move
+    // the fixture program out of PowerShell's command-line parser. Hosted
+    // Windows runners have taken nearly the entire production process budget
+    // before the former large inline script executed its first statement.
+    // These batch files exercise the same inherited Job membership while
+    // making process readiness depend only on actual child scheduling.
+    fs::write(
+        workspace.join("cancel-descendant.cmd"),
+        concat!(
+            "@echo off\r\n",
+            ">descendant-started.log <nul set /p \"=ready\"\r\n",
+            ":wait_for_heartbeat\r\n",
+            "if not exist heartbeat.log (\r\n",
+            "  \"%SystemRoot%\\System32\\ping.exe\" -n 2 127.0.0.1 >nul\r\n",
+            "  goto wait_for_heartbeat\r\n",
+            ")\r\n",
+            "\"%SystemRoot%\\System32\\ping.exe\" -n 2 127.0.0.1 >nul\r\n",
+            ">descendant-survived.log <nul set /p \"=survived\"\r\n",
+        ),
+    )
+    .expect("write cancellable descendant fixture");
+    fs::write(
+        workspace.join("cancel-parent.cmd"),
+        concat!(
+            "@echo off\r\n",
+            ">ps-alive.log <nul set /p \"=x\"\r\n",
+            "start \"\" /b \"%SystemRoot%\\System32\\cmd.exe\" /d /s /c \"\"cancel-descendant.cmd\"\"\r\n",
+            ":wait_for_descendant\r\n",
+            "if not exist descendant-started.log (\r\n",
+            "  \"%SystemRoot%\\System32\\ping.exe\" -n 2 127.0.0.1 >nul\r\n",
+            "  goto wait_for_descendant\r\n",
+            ")\r\n",
+            ">heartbeat.log <nul set /p \"=xx\"\r\n",
+            "<nul set /p \"=started\"\r\n",
+            ":heartbeat\r\n",
+            ">>heartbeat.log <nul set /p \"=x\"\r\n",
+            "<nul set /p \"=y\"\r\n",
+            "\"%SystemRoot%\\System32\\ping.exe\" -n 2 127.0.0.1 >nul\r\n",
+            "goto heartbeat\r\n",
+        ),
+    )
+    .expect("write cancellable parent fixture");
+    windows_powershell_command(concat!(
+        "[IO.File]::WriteAllText('powershell-parent.pid',",
+        "$PID.ToString([Globalization.CultureInfo]::InvariantCulture),",
+        "[Text.Encoding]::ASCII);",
+        "& '.\\cancel-parent.cmd'"
+    ))
+}
+
+#[cfg(windows)]
 fn cancellable_exec_attempt_script(command: String) -> Vec<FakeStep> {
     vec![
         // `Finish` seals this run's only tool-call segment. Its sole possible
@@ -8795,7 +8847,10 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
     let heartbeat = workspace.join("heartbeat.log");
+    #[cfg(not(windows))]
     let command = cancellable_exec_command();
+    #[cfg(windows)]
+    let command = cancellable_exec_fixture_command(&workspace);
     let config = DaemonConfig::new(
         "w4a2-exec-cancel",
         root.path().join("store"),
