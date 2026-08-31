@@ -11601,11 +11601,11 @@ mod manager_law_tests {
         assert_eq!(error.code, ErrorCode::CredentialMissing);
         assert_eq!(handle.supervisor_count(), 1);
 
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::advance(SUPERVISOR_IDLE_TTL - Duration::from_millis(1)).await;
-        tokio::task::yield_now().await;
+        const TTL_BOUNDARY_STEP: Duration = Duration::from_millis(1);
+        // Paused-time `sleep` lets every ready task run before Tokio advances
+        // the clock. `advance` plus a fixed yield count did not fence the
+        // supervisor's next-loop timer arm on loaded Linux runners.
+        tokio::time::sleep(SUPERVISOR_IDLE_TTL - TTL_BOUNDARY_STEP).await;
         assert_eq!(handle.supervisor_count(), 1, "the full TTL is required");
 
         let activity = handle
@@ -11618,26 +11618,24 @@ mod manager_law_tests {
             .await
             .expect_err("new work resets the supervisor's local idle clock");
         assert_eq!(activity.code, ErrorCode::CredentialMissing);
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::advance(Duration::from_millis(1)).await;
-        tokio::task::yield_now().await;
+        let expected_retirement_at = tokio::time::Instant::now() + SUPERVISOR_IDLE_TTL;
+        tokio::time::sleep(TTL_BOUNDARY_STEP).await;
         assert_eq!(
             handle.supervisor_count(),
             1,
             "the stale pre-activity deadline cannot retire the supervisor"
         );
-        tokio::time::advance(SUPERVISOR_IDLE_TTL - Duration::from_millis(2)).await;
-        tokio::task::yield_now().await;
+        // Registry #94: the fresh-TTL probe is one continuous derived budget:
+        // 1 ms + (SUPERVISOR_IDLE_TTL - 2 ms) + 1 ms = SUPERVISOR_IDLE_TTL.
+        let ttl_interior = SUPERVISOR_IDLE_TTL - TTL_BOUNDARY_STEP - TTL_BOUNDARY_STEP;
+        tokio::time::sleep(ttl_interior).await;
         assert_eq!(
             handle.supervisor_count(),
             1,
             "activity earns a complete fresh idle TTL"
         );
         let joined_before = handle.joined_supervisor_count();
-        let expected_retirement_at = tokio::time::Instant::now() + Duration::from_millis(1);
-        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::time::sleep(TTL_BOUNDARY_STEP).await;
         handle
             .wait_for_joined_supervisor_count(joined_before.saturating_add(1))
             .await;

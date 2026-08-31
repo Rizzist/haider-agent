@@ -348,6 +348,73 @@ fn process_exists(pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// A real `haider run` must pass the configured idle TTL into the daemon, and
+/// the daemon's own deadline wake must terminalize it after the launcher exits.
+///
+/// MUTATION CHECK: removing the idle-deadline branch from the daemon accept
+/// loop leaves the retained process identity alive until this test's derived
+/// deadline expires.
+#[test]
+fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
+    const IDLE_TTL_MS: u64 = 250;
+    const DAEMON_DRAIN_BUDGET_MS: u64 = 5_000;
+    // Registry #94: 250 ms idle TTL + the daemon's 5,000 ms graceful-drain
+    // budget = a 5,250 ms process-exit deadline. The retained kernel identity
+    // reports exit directly, so this boundary needs no polling allowance.
+    const EXIT_DEADLINE: Duration = Duration::from_millis(IDLE_TTL_MS + DAEMON_DRAIN_BUDGET_MS);
+
+    ensure_haiderd_built();
+    let store = tempfile::tempdir().expect("store dir");
+    let profile = resolved_for(store.path());
+    let guard = DaemonGuard {
+        store: store.path().to_path_buf(),
+    };
+    let output = output_with_timeout(
+        haider_command(store.path())
+            .args(["run", "--provider", "fake", "--json", "-p", "hello"])
+            .env(
+                "HAIDER_TEST_FAKE_PROVIDER",
+                r#"[{"step":"emit_text","text":"ok"},{"step":"finish","reason":"end_turn"}]"#,
+            )
+            .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", IDLE_TTL_MS.to_string()),
+        "short-idle-TTL run invocation",
+    );
+    assert!(
+        output.status.success(),
+        "run failed: status={} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let daemon_pid = guard.pid().expect("spawned daemon PID");
+    let process_id = haider_platform::process_id(Some(daemon_pid)).expect("valid daemon PID");
+    match haider_platform::ProcessExitMonitor::capture(process_id) {
+        Ok(exit) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async {
+                tokio::time::timeout(EXIT_DEADLINE, exit.wait())
+                    .await
+                    .expect("spawned daemon exceeded idle TTL plus drain budget")
+                    .expect("wait for spawned daemon exit");
+            });
+        }
+        Err(error) if !process_exists(daemon_pid) => {
+            // A sufficiently fast daemon may exit between reading lock.owner
+            // and retaining its process identity; that is the required state.
+            let _ = error;
+        }
+        Err(error) => panic!("retain spawned daemon process identity: {error}"),
+    }
+    assert!(
+        !profile.endpoint_path.exists(),
+        "idle exit must remove the profile endpoint"
+    );
+}
+
 /// Three real `haider run` processes on one profile must authenticate the
 /// same daemon PID. The bounded idle timer then proves that reuse does not
 /// trade one cold start per invocation for an indefinitely resident child.

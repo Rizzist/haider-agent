@@ -9,7 +9,7 @@ use haider_protocol::effect::{
     AuthorizationSource, AuthorizationVerdict, EffectClass, EffectOutcome, EffectPhase,
     WorkspaceMutation,
 };
-use haider_protocol::ids::{ArtifactRef, SessionId};
+use haider_protocol::ids::{ArtifactRef, EffectId, SessionId};
 use haider_protocol::item::{ItemDelta, ToolStatus};
 use haider_tools::{
     BuiltinResult, CasSink, CommandOutputSink, ComposerSubmission, EffectBroker, JournalSink,
@@ -26,6 +26,7 @@ use tokio::sync::Notify;
 #[derive(Debug, Default)]
 struct SharedJournal {
     payloads: Arc<Mutex<Vec<EventPayload>>>,
+    changed: Arc<Notify>,
 }
 
 struct SwapCwdJournal {
@@ -65,15 +66,23 @@ impl SharedJournal {
     fn observer(&self) -> Arc<Mutex<Vec<EventPayload>>> {
         Arc::clone(&self.payloads)
     }
+
+    fn notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.changed)
+    }
 }
 
 #[async_trait]
 impl JournalSink for SharedJournal {
     async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
+        let terminal = matches!(&payload, EventPayload::Effect(EffectPhase::Outcome { .. }));
         self.payloads
             .lock()
             .map_err(|_| ToolError::journal("recording journal lock poisoned"))?
             .push(payload);
+        if terminal {
+            self.changed.notify_one();
+        }
         Ok(())
     }
 }
@@ -244,6 +253,28 @@ fn phases(observer: &Arc<Mutex<Vec<EventPayload>>>) -> Vec<EffectPhase> {
             _ => None,
         })
         .collect()
+}
+
+async fn wait_for_effect_outcome(
+    observer: &Arc<Mutex<Vec<EventPayload>>>,
+    changed: &Notify,
+    expected_effect: &EffectId,
+) -> EffectOutcome {
+    loop {
+        // Construct the waiter before inspecting the journal. `notify_one`
+        // retains a permit if the append lands between this inspection and
+        // the await, so the terminal fact cannot be lost.
+        let notified = changed.notified();
+        if let Some(outcome) = phases(observer).into_iter().find_map(|phase| match phase {
+            EffectPhase::Outcome {
+                effect, outcome, ..
+            } if &effect == expected_effect => Some(outcome),
+            _ => None,
+        }) {
+            return outcome;
+        }
+        notified.await;
+    }
 }
 
 fn workspace_mutations(observer: &Arc<Mutex<Vec<EventPayload>>>) -> Vec<Option<WorkspaceMutation>> {
@@ -1579,27 +1610,46 @@ async fn broker_teardown_sweeps_a_live_process_group() {
 /// W4a2 cancellation hand-off mutation sentinel.
 ///
 /// MUTATION CHECK: remove the `send_replace(true)` in
-/// `ProcessExecution::drop`. The bounded heartbeat command keeps writing
-/// during the observation window and this test fails. Verified by revert in
-/// W4a2.
+/// `ProcessExecution::drop`. The finite Perl alarm or its derived wall limit
+/// then terminalizes with a non-cancelled outcome, which this test rejects.
+/// Verified by revert in W4a2 and retainfix.
 #[tokio::test]
 async fn dropping_process_execution_cancels_and_kills_the_child_group() {
+    const COMMAND_ALARM_MS: u64 = 1_000;
+    const KILL_GRACE_MS: u64 = 10;
+    const PIPE_DRAIN_GRACE_MS: u64 = KILL_GRACE_MS;
+    // Registry #94: the outer process budget sums the finite command alarm,
+    // TERM -> KILL grace, and the post-sweep pipe-drain grace exactly:
+    // 1,000 ms + 10 ms + 10 ms = 1,020 ms.
+    const TEST_WALL_TIMEOUT: Duration =
+        Duration::from_millis(COMMAND_ALARM_MS + KILL_GRACE_MS + PIPE_DRAIN_GRACE_MS);
+
     let workspace = tempfile::tempdir().expect("tempdir");
-    let heartbeat = workspace.path().join("heartbeat.log");
-    let (mut broker, _journal) = broker(workspace.path());
+    let journal = SharedJournal::default();
+    let journal_observer = journal.observer();
+    let journal_changed = journal.notifier();
+    let mut broker = EffectBroker::new_at(
+        Box::new(journal),
+        workspace.path(),
+        SessionId::new("process-session"),
+        3,
+        1_700_000_000_000,
+    )
+    .expect("create broker");
     let output = RecordingOutput::default();
     let output_observer = output.observer();
     let execution = broker
         .process_exec(
             &ProcessExec::new(
                 "drop-cancel",
-                "printf started; i=0; while [ \"$i\" -lt 100 ]; do printf x >> heartbeat.log; i=$((i+1)); sleep 0.01; done",
+                "exec /usr/bin/perl -MPOSIX -e '$|=1; alarm 1; print q(started); POSIX::pause()'",
             ),
             &process_policy(),
             RecordingCas::default(),
             output,
             ProcessBounds {
-                kill_grace: Duration::from_millis(10),
+                wall_timeout: TEST_WALL_TIMEOUT,
+                kill_grace: Duration::from_millis(KILL_GRACE_MS),
                 ..ProcessBounds::default()
             },
         )
@@ -1608,19 +1658,15 @@ async fn dropping_process_execution_cancels_and_kills_the_child_group() {
     while output_observer.lock().expect("output observer").is_empty() {
         tokio::task::yield_now().await;
     }
+    let effect = execution.effect().clone();
     drop(execution);
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    // Under gate load the kill can land before the child ever CREATES the
-    // heartbeat file — absence is the strongest form of "not running"
-    // (NotFound reads as size 0; a live child would create and grow it).
-    let heartbeat_len =
-        |path: &std::path::Path| fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
-    let stopped_size = heartbeat_len(&heartbeat);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        heartbeat_len(&heartbeat),
-        stopped_size,
-        "dropped execution left the child group running"
+    let outcome = wait_for_effect_outcome(&journal_observer, &journal_changed, &effect).await;
+    assert!(
+        matches!(
+            outcome,
+            EffectOutcome::Cancelled | EffectOutcome::CancelledEscalated { .. }
+        ),
+        "dropping the execution must terminalize it as cancelled, got {outcome:?}"
     );
     broker.close().await.expect("broker closes");
 }

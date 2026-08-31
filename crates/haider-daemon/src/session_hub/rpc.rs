@@ -2027,16 +2027,66 @@ mod observe_cache_retention_tests {
             .map_or_else(|| "unavailable".into(), |output| output.trim().to_owned())
     }
 
+    fn retention_soak_error(context: &str, error: impl std::fmt::Display) -> HaiderError {
+        HaiderError::new(ErrorCode::Internal, format!("{context}: {error}"), false)
+    }
+
+    fn verify_observe_soak_owned_retention(
+        supervisors: usize,
+        observe_ready: usize,
+        observe_building: usize,
+        observe_bytes: usize,
+        actor_tasks: usize,
+    ) -> Result<(), HaiderError> {
+        if supervisors == 0
+            && observe_ready == 0
+            && observe_building == 0
+            && observe_bytes == 0
+            && actor_tasks == 0
+        {
+            return Ok(());
+        }
+        Err(HaiderError::new(
+            ErrorCode::Internal,
+            format!(
+                "deleted session retained daemon-owned state: supervisors={supervisors} observe_ready={observe_ready} observe_building={observe_building} observe_bytes={observe_bytes} actor_tasks={actor_tasks}"
+            ),
+            false,
+        ))
+    }
+
+    #[test]
+    fn observe_soak_owned_retention_failure_is_typed() {
+        let retained_owner_cases = [
+            (1, 0, 0, 0, 0),
+            (0, 1, 0, 0, 0),
+            (0, 0, 1, 0, 0),
+            (0, 0, 0, 1, 0),
+            (0, 0, 0, 0, 1),
+        ];
+        for retained in retained_owner_cases {
+            let error = verify_observe_soak_owned_retention(
+                retained.0, retained.1, retained.2, retained.3, retained.4,
+            )
+            .expect_err("each retained owner must fail the soak");
+            assert_eq!(error.code, ErrorCode::Internal);
+            assert!(!error.retryable);
+            assert!(error.message.contains("retained daemon-owned state"));
+        }
+    }
+
     #[tokio::test]
-    async fn create_two_turn_observe_delete_soak_has_flat_retention_slopes() {
+    async fn create_two_turn_observe_delete_soak_has_flat_retention_slopes()
+    -> Result<(), HaiderError> {
         const CHILD_ENV: &str = "HAIDER_RETAIN_SOAK_CHILD";
         if std::env::var_os(CHILD_ENV).is_none() {
             // RSS is process-global. Run the measurement alone so unrelated
             // parallel daemon tests cannot be mistaken for retained session
             // heap, then preserve the child's complete diagnostic stream.
-            let output = std::process::Command::new(
-                std::env::current_exe().expect("current daemon test binary"),
-            )
+            let test_binary = std::env::current_exe().map_err(|error| {
+                retention_soak_error("cannot locate the current daemon test binary", error)
+            })?;
+            let output = std::process::Command::new(test_binary)
             .env(CHILD_ENV, "1")
             .args([
                 "--exact",
@@ -2045,31 +2095,34 @@ mod observe_cache_retention_tests {
                 "--test-threads=1",
             ])
             .output()
-            .expect("isolated retention soak child");
+            .map_err(|error| retention_soak_error("cannot launch isolated retention soak", error))?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             eprint!("{stdout}{stderr}");
-            assert!(
-                output.status.success(),
-                "isolated retention soak failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-                output.status
-            );
-            return;
+            if !output.status.success() {
+                return Err(retention_soak_error(
+                    "isolated retention soak child failed",
+                    output.status,
+                ));
+            }
+            return Ok(());
         }
 
-        // Old measured retention was (478.74 + 189.57) MiB / 10,000 =
-        // 70,077.38 B/session, or 4.277 MiB over N=64. A 16 KiB/session RSS
-        // ceiling is therefore well below the old signal while 64 immediate
-        // fake-provider cycles remain fast enough for the crate suite. Eight
-        // unmeasured cycles pay one-time allocator/runtime initialization.
+        // Inspect the daemon-owned retention surfaces after every deletion.
+        // Process RSS remains diagnostic: allocator arenas and SQLite page
+        // caches are process-global high-water state and cannot identify an
+        // owner, so their platform-dependent slope is not a correctness gate.
+        // Eight unmeasured cycles pay one-time runtime initialization before
+        // reporting the RSS samples.
         const WARMUP_CYCLES: u64 = 8;
         const CYCLES: u64 = 64;
         const SAMPLE_AT: [u64; 7] = [1, 2, 4, 8, 16, 32, 64];
-        const MAX_FLAT_RSS_SLOPE: f64 = 16.0 * 1024.0;
 
-        let root = tempfile::tempdir().expect("temp store");
-        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
-        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let root = tempfile::tempdir()
+            .map_err(|error| retention_soak_error("cannot create soak store directory", error))?;
+        let store = SqliteStoreHandle::open(root.path()).await?;
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default())
+            .map_err(hub_error_as_store)?;
         let manager = crate::worker::WorkerManager::start(
             hub.clone(),
             crate::worker::WorkerDependencies::unconfigured_for_tests(),
@@ -2077,7 +2130,15 @@ mod observe_cache_retention_tests {
         );
         let workers = manager.handle();
         hub.install_worker_manager(workers.clone())
-            .expect("manager");
+            .map_err(hub_error_as_store)?;
+        let cwd = std::env::current_dir()
+            .map_err(|error| retention_soak_error("cannot read soak working directory", error))?;
+        let cwd = std::fs::canonicalize(cwd)
+            .map_err(|error| {
+                retention_soak_error("cannot canonicalize soak working directory", error)
+            })?
+            .to_string_lossy()
+            .into_owned();
         let mut started = std::time::Instant::now();
         let mut baseline_rss = None;
         let mut supervisor_samples = Vec::new();
@@ -2092,10 +2153,7 @@ mod observe_cache_retention_tests {
                 request_digest: format!("retain-soak-create-digest-{ordinal}"),
                 request_json: "{}".into(),
                 session_id: session_id.clone(),
-                cwd: std::fs::canonicalize(std::env::current_dir().expect("cwd"))
-                    .expect("canonical cwd")
-                    .to_string_lossy()
-                    .into_owned(),
+                cwd: cwd.clone(),
                 provider: "fake".into(),
                 model: "fake-model".into(),
                 max_tokens: 4096,
@@ -2107,8 +2165,7 @@ mod observe_cache_retention_tests {
                 event_id: EventId::new(format!("retain-soak-created-{ordinal}")),
                 device_id: DeviceId::new("retain-soak-device"),
             })
-            .await
-            .expect("session");
+            .await?;
 
             for turn in 0..2_u64 {
                 let run_id = RunId::new(format!("retain-soak-run-{ordinal}-{turn}"));
@@ -2135,31 +2192,39 @@ mod observe_cache_retention_tests {
                         device_id: DeviceId::new("retain-soak-device"),
                     })
                     .await
-                    .expect("turn accepted");
+                    .map_err(hub_error_as_store)?;
                 let accepted = match accepted {
                     TurnAcceptOutcome::Committed { accepted, .. }
                     | TurnAcceptOutcome::IdempotentReplay { accepted } => accepted,
                 };
-                workers.submit(accepted).await.expect("turn handed off");
+                workers.submit(accepted).await?;
                 let mut settled = false;
                 for _ in 0..1_000 {
-                    if !hub
-                        .session_has_nonterminal_runs(&session_id)
-                        .await
-                        .expect("run scan")
-                    {
+                    if !hub.session_has_nonterminal_runs(&session_id).await? {
                         settled = true;
                         break;
                     }
                     tokio::task::yield_now().await;
                 }
-                assert!(settled, "fake-provider turn reaches durable quiescence");
+                if !settled {
+                    return Err(retention_soak_error(
+                        "fake-provider turn did not reach durable quiescence",
+                        format_args!("session={session_id} turn={turn}"),
+                    ));
+                }
             }
 
             let _ = cached_observe_snapshot(&hub, &session_id, "fake-model")
                 .await
-                .expect("observe");
-            hub.delete_session(session_id).await.expect("delete");
+                .map_err(hub_error_as_store)?;
+            hub.delete_session(session_id).await?;
+
+            let (ready, building, bytes) = hub.inner.observe_digests.stats();
+            let supervisors = workers.supervisor_count();
+            let actor_tasks = lock(&hub.inner.session_actor_tasks)
+                .map_err(hub_error_as_store)?
+                .len();
+            verify_observe_soak_owned_retention(supervisors, ready, building, bytes, actor_tasks)?;
 
             if ordinal == WARMUP_CYCLES {
                 baseline_rss = resident_bytes();
@@ -2198,19 +2263,11 @@ mod observe_cache_retention_tests {
         eprintln!(
             "retain_soak slopes supervisors_per_session={supervisor_slope:.6} observe_entries_per_session={observe_slope:.6} targeted_heap_bytes_per_session={targeted_heap_slope:.3} rss_bytes_per_session={rss_slope:?}"
         );
-        assert_eq!(supervisor_slope, 0.0);
-        assert_eq!(observe_slope, 0.0);
-        assert_eq!(targeted_heap_slope, 0.0);
-        if let Some(rss_slope) = rss_slope {
-            assert!(
-                rss_slope <= MAX_FLAT_RSS_SLOPE,
-                "live RSS slope {rss_slope:.1} B/session exceeds the flat ceiling"
-            );
-        }
 
-        manager.shutdown().await.expect("manager shutdown");
-        hub.shutdown().await.expect("hub shutdown");
-        store.close().await.expect("store close");
+        manager.shutdown().await?;
+        let _ = hub.shutdown().await.map_err(hub_error_as_store)?;
+        store.close().await?;
+        Ok(())
     }
 }
 
