@@ -3,12 +3,11 @@
 use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use haider_client::{
     ClientError, EnsureError, EnsureOptions, MenuAnswerRequest, ProfileEnv, resolve_profile,
 };
-use haider_protocol::ids::{MenuId, SessionId};
+use haider_protocol::ids::{MenuId, RunId, SessionId};
 use haider_rpc::{
     AttachMode, AttachmentId, Capability, CapabilitySet, ClientKind, CommandId, ObserveMenuWire,
     ObserveRunStateWire, RequestBody, ResponseBody, SessionObserveDigest,
@@ -70,7 +69,28 @@ struct RecoveryReceiptDocument {
     menu_id: String,
     chosen_option: &'static str,
     resolution_seq: u64,
+    completed: bool,
+    resulting_head_seq: u64,
     resulting_run_state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resulting_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replacement_menu_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RecoveryErrorDocument<'a> {
+    schema: &'static str,
+    session_id: &'a str,
+    completed: bool,
+    error: RecoveryErrorBody,
+}
+
+#[derive(Serialize)]
+struct RecoveryErrorBody {
+    code: &'static str,
+    message: String,
+    retryable: bool,
 }
 
 #[derive(Debug)]
@@ -85,6 +105,11 @@ enum RecoverError {
     },
     Protocol(&'static str),
     NoRecovery {
+        state: &'static str,
+    },
+    IncompleteFollowUp {
+        action: &'static str,
+        resolution_seq: u64,
         state: &'static str,
     },
 }
@@ -114,11 +139,20 @@ impl std::fmt::Display for RecoverError {
                     "no crash window to reconcile — run_state is {state}"
                 )
             }
+            Self::IncompleteFollowUp {
+                action,
+                resolution_seq,
+                state,
+            } => write!(
+                formatter,
+                "recovery `{action}` resolved at seq {resolution_seq}, but its durable follow-up is incomplete (state={state})"
+            ),
         }
     }
 }
 
 pub(crate) async fn session_recover_command(session_id: &str, rest: &[String]) -> ExitCode {
+    let requested_json = rest.iter().any(|argument| argument == "--json");
     let options = match parse_options(rest) {
         Ok(Some(options)) => options,
         Ok(None) => {
@@ -128,15 +162,27 @@ pub(crate) async fn session_recover_command(session_id: &str, rest: &[String]) -
             return ExitCode::SUCCESS;
         }
         Err(message) => {
-            eprintln!("haider session recover: {message}");
-            return ExitCode::from(EX_USAGE);
+            return failure_message(
+                session_id,
+                requested_json,
+                "invalid_argument",
+                message,
+                false,
+                EX_USAGE,
+            );
         }
     };
     let profile = match resolve_profile(&ProfileEnv::capture()) {
         Ok(profile) => profile,
         Err(error) => {
-            eprintln!("haider session recover: {error}");
-            return ExitCode::from(EX_PROTOCOL);
+            return failure_message(
+                session_id,
+                options.json,
+                "protocol_mismatch",
+                error.to_string(),
+                false,
+                EX_PROTOCOL,
+            );
         }
     };
     let mut ensure = EnsureOptions::default();
@@ -153,7 +199,7 @@ pub(crate) async fn session_recover_command(session_id: &str, rest: &[String]) -
     };
     let ensured = match haider_client::ensure_daemon(&profile, ensure).await {
         Ok(ensured) => ensured,
-        Err(error) => return failure(&RecoverError::Ensure(error)),
+        Err(error) => return failure(session_id, options.json, &RecoverError::Ensure(error)),
     };
     let required = BTreeSet::from([haider_rpc::FEATURE_EFFECT_RECOVERY_V1.to_owned()]);
     let missing = required
@@ -162,7 +208,11 @@ pub(crate) async fn session_recover_command(session_id: &str, rest: &[String]) -
         .collect::<BTreeSet<_>>();
     if !missing.is_empty() {
         let _ = ensured.client.close();
-        return failure(&RecoverError::MissingFeatures(missing));
+        return failure(
+            session_id,
+            options.json,
+            &RecoverError::MissingFeatures(missing),
+        );
     }
     let result = execute(&ensured.client, SessionId::new(session_id), options).await;
     let _ = ensured.client.close();
@@ -171,7 +221,7 @@ pub(crate) async fn session_recover_command(session_id: &str, rest: &[String]) -
         Ok(RecoveryOutput::Card(document)) => write_card(&document),
         Ok(RecoveryOutput::Receipt(document)) if options.json => write_json(&document),
         Ok(RecoveryOutput::Receipt(document)) => write_receipt(&document),
-        Err(error) => failure(&error),
+        Err(error) => failure(session_id, options.json, &error),
     }
 }
 
@@ -220,6 +270,7 @@ async fn execute(
 ) -> Result<RecoveryOutput, RecoverError> {
     let digest = session_digest(client, session_id.clone()).await?;
     let menu = recovery_menu(&digest)?.clone();
+    let opening_run_id = digest.run_id.clone();
     let menu_id = menu.menu_id.clone().ok_or(RecoverError::Protocol(
         "effect_recovery_v1 menu omitted menu_id",
     ))?;
@@ -246,7 +297,7 @@ async fn execute(
     let attachment_id = control_attachment(client, session_id.clone(), digest.head_seq).await?;
     let answer = client
         .answer_menu(MenuAnswerRequest {
-            command_id: CommandId::new(command_id("session-recover")),
+            command_id: CommandId::new(recovery_command_id(&session_id, &menu_id, action)),
             session_id: session_id.clone(),
             menu_id: menu_id.clone(),
             request_seq,
@@ -284,18 +335,78 @@ async fn execute(
             return Err(error);
         }
     };
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // A fresh `menu.answer` does not reply until its selected follow-up has
+    // committed, but an idempotent answer can only prove MenuAnswered. The
+    // same-connection digest plus the action-specific check below is the
+    // durable fence; sleeping here made the old surface timing-dependent.
     let resulting = session_digest(client, session_id.clone()).await;
     detach(client, attachment_id).await;
     let resulting = resulting?;
+    if !recovery_postcondition(
+        action,
+        opening_run_id.as_ref(),
+        &menu_id,
+        resolution_seq,
+        &resulting,
+    ) {
+        return Err(RecoverError::IncompleteFollowUp {
+            action: action.key(),
+            resolution_seq,
+            state: run_state_name(resulting.run_state),
+        });
+    }
     Ok(RecoveryOutput::Receipt(RecoveryReceiptDocument {
         schema: RECOVERY_SCHEMA,
         session_id: session_id.as_str().to_owned(),
         menu_id: menu_id.as_str().to_owned(),
         chosen_option: action.key(),
         resolution_seq,
+        completed: true,
+        resulting_head_seq: resulting.head_seq,
         resulting_run_state: run_state_name(resulting.run_state),
+        resulting_run_id: resulting
+            .run_id
+            .as_ref()
+            .map(|run_id| run_id.as_str().to_owned()),
+        replacement_menu_id: probe_replacement_menu(&resulting, &menu_id, resolution_seq)
+            .and_then(|menu| menu.menu_id.as_ref())
+            .map(|menu_id| menu_id.as_str().to_owned()),
     }))
+}
+
+fn recovery_postcondition(
+    action: RecoveryAction,
+    opening_run_id: Option<&RunId>,
+    answered_menu_id: &MenuId,
+    resolution_seq: u64,
+    resulting: &SessionObserveDigest,
+) -> bool {
+    match action {
+        RecoveryAction::Probe => {
+            resulting.run_state == ObserveRunStateWire::EffectUnknown
+                && probe_replacement_menu(resulting, answered_menu_id, resolution_seq).is_some()
+        }
+        RecoveryAction::Retry => resulting.run_id.as_ref().is_some_and(|run_id| {
+            opening_run_id.is_none_or(|opening_run_id| run_id != opening_run_id)
+        }),
+        RecoveryAction::MarkDone => resulting.run_state == ObserveRunStateWire::Idle,
+        RecoveryAction::Abandon => resulting.run_state == ObserveRunStateWire::Errored,
+    }
+}
+
+fn probe_replacement_menu<'a>(
+    digest: &'a SessionObserveDigest,
+    answered_menu_id: &MenuId,
+    resolution_seq: u64,
+) -> Option<&'a ObserveMenuWire> {
+    let expected = format!("{}-probe-{resolution_seq}", answered_menu_id.as_str());
+    digest.pending_menus.iter().find(|menu| {
+        menu.kind == RECOVERY_MENU_WIRE_KIND
+            && menu
+                .menu_id
+                .as_ref()
+                .is_some_and(|menu_id| menu_id.as_str() == expected)
+    })
 }
 
 /// The crash-window reconciliation menu is `MenuKind::Recovery` — wire kind
@@ -457,10 +568,11 @@ fn write_card(document: &RecoveryCardDocument) -> ExitCode {
 
 fn write_receipt(document: &RecoveryReceiptDocument) -> ExitCode {
     write_human(format!(
-        "menu {} · option {} · resolution_seq={} · run_state={}\n",
+        "menu {} · option {} · resolution_seq={} · head_seq={} · run_state={}\n",
         document.menu_id,
         document.chosen_option,
         document.resolution_seq,
+        document.resulting_head_seq,
         document.resulting_run_state
     ))
 }
@@ -479,33 +591,67 @@ fn write_human(text: String) -> ExitCode {
     }
 }
 
-fn failure(error: &RecoverError) -> ExitCode {
+fn failure(session_id: &str, json: bool, error: &RecoverError) -> ExitCode {
     eprintln!("haider session recover: {error}");
-    let code = match error {
+    let (exit_code, code, retryable) = match error {
         RecoverError::Ensure(EnsureError::MissingFeatures { .. })
         | RecoverError::MissingFeatures(_)
-        | RecoverError::Protocol(_) => EX_PROTOCOL,
-        RecoverError::Ensure(_) => EX_UNAVAILABLE,
-        RecoverError::Client(ClientError::Disconnected(_)) => EX_UNAVAILABLE,
-        RecoverError::Client(_) => EX_SOFTWARE,
-        RecoverError::NoRecovery { .. } => EX_BLOCKED,
+        | RecoverError::Protocol(_) => (EX_PROTOCOL, "protocol_mismatch", false),
+        RecoverError::Ensure(_) => (EX_UNAVAILABLE, "unavailable", true),
+        RecoverError::Client(ClientError::Disconnected(_)) => (EX_UNAVAILABLE, "unavailable", true),
+        RecoverError::Client(_) => (EX_SOFTWARE, "client_error", true),
+        RecoverError::NoRecovery { .. } => (EX_BLOCKED, "no_recovery", false),
+        RecoverError::IncompleteFollowUp { .. } => (EX_UNAVAILABLE, "recovery_incomplete", true),
         RecoverError::Rpc { code, .. }
             if matches!(code.as_str(), "capability_denied" | "input_required") =>
         {
-            EX_BLOCKED
+            (EX_BLOCKED, "blocked", false)
         }
-        RecoverError::Rpc { .. } => EX_SOFTWARE,
+        RecoverError::Rpc { retryable, .. } => (EX_SOFTWARE, "rpc_rejected", *retryable),
     };
-    ExitCode::from(code)
+    failure_message(
+        session_id,
+        json,
+        code,
+        error.to_string(),
+        retryable,
+        exit_code,
+    )
 }
 
-fn command_id(prefix: &str) -> String {
+fn failure_message(
+    session_id: &str,
+    json: bool,
+    code: &'static str,
+    message: String,
+    retryable: bool,
+    exit_code: u8,
+) -> ExitCode {
+    if json {
+        let document = RecoveryErrorDocument {
+            schema: RECOVERY_SCHEMA,
+            session_id,
+            completed: false,
+            error: RecoveryErrorBody {
+                code,
+                message,
+                retryable,
+            },
+        };
+        let written = write_json(&document);
+        if written == ExitCode::from(EX_IOERR) {
+            return written;
+        }
+    }
+    ExitCode::from(exit_code)
+}
+
+fn recovery_command_id(session_id: &SessionId, menu_id: &MenuId, action: RecoveryAction) -> String {
     format!(
-        "{prefix}-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_nanos())
+        "session-recover-{}-{}-{}",
+        session_id.as_str(),
+        menu_id.as_str(),
+        action.key()
     )
 }
 
@@ -545,6 +691,89 @@ mod tests {
 
         // --help/-h short-circuits to "no options" (show help).
         assert!(parse_options(&["--help".into()]).expect("ok").is_none());
+    }
+
+    #[test]
+    fn recovery_command_ids_are_stable_for_lost_response_retries() {
+        let session_id = SessionId::new("session-recovery-stable");
+        let menu_id = MenuId::new("menu-recovery-stable");
+        let first = recovery_command_id(&session_id, &menu_id, RecoveryAction::Probe);
+        let second = recovery_command_id(&session_id, &menu_id, RecoveryAction::Probe);
+        assert_eq!(first, second);
+        assert_ne!(
+            first,
+            recovery_command_id(&session_id, &menu_id, RecoveryAction::Retry)
+        );
+    }
+
+    #[test]
+    fn completion_requires_the_selected_actions_durable_follow_up() {
+        let answered_menu = MenuId::new("menu-answered");
+        let opening_run = RunId::new("run-opening");
+
+        let unrelated = wire_menu("recovery", 3);
+        let mut exact_probe = wire_menu("recovery", 10);
+        exact_probe.menu_id = Some(MenuId::new("menu-answered-probe-10"));
+        let probe = digest_with_menus(vec![unrelated.clone(), exact_probe]);
+        assert!(recovery_postcondition(
+            RecoveryAction::Probe,
+            Some(&opening_run),
+            &answered_menu,
+            10,
+            &probe,
+        ));
+        let unrelated_only = digest_with_menus(vec![unrelated]);
+        assert!(!recovery_postcondition(
+            RecoveryAction::Probe,
+            Some(&opening_run),
+            &answered_menu,
+            10,
+            &unrelated_only,
+        ));
+        assert!(!recovery_postcondition(
+            RecoveryAction::Retry,
+            Some(&opening_run),
+            &answered_menu,
+            10,
+            &probe,
+        ));
+
+        let mut retry = digest_with_menus(Vec::new());
+        retry.run_id = Some(RunId::new("run-fresh-retry"));
+        assert!(recovery_postcondition(
+            RecoveryAction::Retry,
+            Some(&opening_run),
+            &answered_menu,
+            10,
+            &retry,
+        ));
+
+        let mut mark_done = digest_with_menus(Vec::new());
+        mark_done.run_state = ObserveRunStateWire::Idle;
+        assert!(recovery_postcondition(
+            RecoveryAction::MarkDone,
+            Some(&opening_run),
+            &answered_menu,
+            10,
+            &mark_done,
+        ));
+        assert!(!recovery_postcondition(
+            RecoveryAction::Abandon,
+            Some(&opening_run),
+            &answered_menu,
+            10,
+            &mark_done,
+        ));
+
+        let mut abandon = digest_with_menus(Vec::new());
+        abandon.run_state = ObserveRunStateWire::Errored;
+        assert!(recovery_postcondition(
+            RecoveryAction::Abandon,
+            Some(&opening_run),
+            &answered_menu,
+            10,
+            &abandon,
+        ));
     }
 
     fn digest_with_menus(menus: Vec<ObserveMenuWire>) -> SessionObserveDigest {

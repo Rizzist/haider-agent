@@ -516,6 +516,13 @@ const EXEC_WRITE_COMMAND: &str = "printf ok > exec-created.txt";
 #[cfg(windows)]
 const EXEC_WRITE_COMMAND: &str = "[IO.File]::WriteAllText('exec-created.txt','ok')";
 
+#[cfg(unix)]
+const REPLAY_BACKGROUND_COMMAND: &str = "while [ ! -f replay-release ]; do sleep 0.02; done";
+
+#[cfg(windows)]
+const REPLAY_BACKGROUND_COMMAND: &str =
+    "while (-not (Test-Path 'replay-release')) { Start-Sleep -Milliseconds 20 }";
+
 #[test]
 fn version_prints_workspace_version() {
     let out = haider().arg("--version").output().expect("binary runs");
@@ -980,7 +987,7 @@ fn unknown_lifecycle_run_is_a_machine_readable_error() {
 }
 
 #[test]
-fn replay_reports_provider_divergence_without_hiding_it() {
+fn replay_is_a_read_only_exact_durable_projection() {
     let mut source = haider();
     source
         .args([
@@ -996,7 +1003,7 @@ fn replay_reports_provider_divergence_without_hiding_it() {
         ])
         .env(
             "HAIDER_TEST_FAKE_PROVIDER",
-            r#"[{"step":"emit_text","text":"same"},{"step":"emit_usage","usage":{"input":2,"output":1,"reasoning":0,"cached":0,"source":"locally_exact"}},{"step":"finish","reason":"end_turn"}]"#,
+            r#"[{"step":"emit_text","text":"ORIGINAL"},{"step":"emit_usage","usage":{"input":2,"output":1,"reasoning":0,"cached":0,"source":"locally_exact"}},{"step":"finish","reason":"end_turn"}]"#,
         )
         .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0");
     let original = output_with_boot_retry(&mut source);
@@ -1008,6 +1015,7 @@ fn replay_reports_provider_divergence_without_hiding_it() {
     let original: serde_json::Value =
         serde_json::from_slice(&original.stdout).expect("source JSON");
     let run_id = original["run_id"].as_str().expect("source run id");
+    let session_id = original["session_id"].as_str().expect("source session id");
     assert!(
         original["events"]
             .as_array()
@@ -1034,7 +1042,7 @@ fn replay_reports_provider_divergence_without_hiding_it() {
         .env("HAIDER_DISCOVERY_DISABLED", "1")
         .env(
             "HAIDER_TEST_FAKE_PROVIDER",
-            r#"[{"step":"emit_text","text":"same"},{"step":"emit_usage","usage":{"input":2,"output":1,"reasoning":0,"cached":0,"source":"estimated"}},{"step":"finish","reason":"end_turn"}]"#,
+            r#"[{"step":"emit_text","text":"REEXECUTED"},{"step":"emit_usage","usage":{"input":7,"output":3,"reasoning":0,"cached":0,"source":"estimated"}},{"step":"finish","reason":"end_turn"}]"#,
         )
         .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0");
     let replay = output_with_boot_retry(&mut replay_command);
@@ -1043,20 +1051,350 @@ fn replay_reports_provider_divergence_without_hiding_it() {
         "stderr: {}",
         String::from_utf8_lossy(&replay.stderr)
     );
+    let replay_bytes = replay.stdout.clone();
     let replay: serde_json::Value = serde_json::from_slice(&replay.stdout).expect("replay JSON");
-    assert_eq!(replay["replay"]["source_run_id"], run_id);
-    assert!(replay["events"].as_array().is_some_and(|events| {
-        events.iter().any(|event| {
-            event["payload"]["type"] == "headless_run_configured"
-                && event["payload"]["replay_of"] == run_id
-                && event["payload"]["seed"] == 0
-                && event["payload"]["provider"] == "fake"
-                && event["payload"]["model"] == "fake-model"
-        })
-    }));
-    assert_eq!(replay["replay"]["final_text_matches"], true);
-    assert_eq!(replay["replay"]["usage_matches"], false);
-    assert_eq!(replay["replay"]["diverged"], true);
+    assert_eq!(replay["schema"], "haider.run.replay.v1");
+    assert_eq!(replay["mode"], "durable_journal");
+    assert_eq!(replay["source_run_id"], run_id);
+    assert_eq!(replay["session_id"], session_id);
+    assert_eq!(replay["provider_requests"], 0);
+    assert_eq!(replay["response"], "ORIGINAL");
+    assert_eq!(replay["events"], original["events"]);
+    assert_eq!(replay["integrity"]["sequences_strictly_increasing"], true);
+    assert_eq!(replay["integrity"]["run_id_stable"], true);
+    assert_eq!(replay["integrity"]["exactly_one_typed_terminal"], true);
+    assert_eq!(replay["integrity"]["terminal_seq_matches_status"], true);
+    assert_eq!(
+        replay["equivalence"]["definition"],
+        "durable_run_projection_v1"
+    );
+    assert_eq!(replay["equivalence"]["final_text_matches"], true);
+    assert_eq!(replay["equivalence"]["tool_trace_matches"], true);
+    assert_eq!(replay["equivalence"]["usage_matches"], true);
+    assert_eq!(replay["equivalence"]["terminal_matches"], true);
+    assert_eq!(replay["equivalence"]["equivalent"], true);
+
+    // The daemon above exits after every command. A second replay therefore
+    // observes a different live daemon/worker generation, but the immutable
+    // source-run projection must remain byte-for-byte identical.
+    let mut repeated_replay = Command::new(env!("CARGO_BIN_EXE_haider"));
+    configure_test_home(&mut repeated_replay, &source.profile);
+    repeated_replay
+        .args(["run", "--replay", run_id])
+        .env("HAIDER_PROFILE_DIR", &source.profile)
+        .env("HAIDER_DISCOVERY_DISABLED", "1")
+        .env_remove("HAIDER_TEST_FAKE_PROVIDER")
+        .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0");
+    let repeated_replay = output_with_boot_retry(&mut repeated_replay);
+    assert!(
+        repeated_replay.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&repeated_replay.stderr)
+    );
+    assert_eq!(repeated_replay.stdout, replay_bytes);
+
+    // A re-execution would consume the poison script above and append a
+    // second session. The read-only command leaves the durable cardinality at
+    // exactly the source session and succeeds without credentials/provider IO.
+    let mut status_command = Command::new(env!("CARGO_BIN_EXE_haider"));
+    configure_test_home(&mut status_command, &source.profile);
+    status_command
+        .args(["status", "--json"])
+        .env("HAIDER_PROFILE_DIR", &source.profile)
+        .env("HAIDER_DISCOVERY_DISABLED", "1")
+        .env_remove("HAIDER_TEST_FAKE_PROVIDER");
+    let status = output_with_boot_retry(&mut status_command);
+    assert!(
+        status.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert_eq!(status["session_count"], 1);
+}
+
+#[test]
+fn replay_is_sealed_at_terminal_before_late_same_run_task_facts() {
+    let script = serde_json::json!([
+        {
+            "step": "emit_tool_call",
+            "call_id": "background-replay-1",
+            "name": "exec",
+            "args": {
+                "command": REPLAY_BACKGROUND_COMMAND,
+                "background": true,
+                "name": "replay-late-task"
+            }
+        },
+        {"step": "finish", "reason": "tool_use"},
+        {"step": "expect_tool_result", "call_id": "background-replay-1"},
+        {"step": "emit_text", "text": "sealed before task completion"},
+        {"step": "finish", "reason": "end_turn"}
+    ])
+    .to_string();
+    let mut source = haider();
+    source
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "--allow-exec",
+            "--json",
+            "-p",
+            "start a background task",
+        ])
+        .env("HAIDER_TEST_FAKE_PROVIDER", script);
+    let source_output = output_with_boot_retry(&mut source);
+    assert!(
+        source_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&source_output.stderr)
+    );
+    let source_json: serde_json::Value =
+        serde_json::from_slice(&source_output.stdout).expect("source JSON");
+    let run_id = source_json["run_id"].as_str().expect("source run id");
+    let session_id = source_json["session_id"]
+        .as_str()
+        .expect("source session id");
+    assert_eq!(
+        source_json["background_tasks_running"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let replay = |profile: &Path| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
+        configure_test_home(&mut command, profile);
+        command
+            .args(["run", "--replay", run_id])
+            .env("HAIDER_PROFILE_DIR", profile)
+            .env("HAIDER_DISCOVERY_DISABLED", "1")
+            .env_remove("HAIDER_TEST_FAKE_PROVIDER");
+        command.output().expect("replay executes")
+    };
+    let before_completion = replay(&source.profile);
+    assert!(
+        before_completion.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&before_completion.stderr)
+    );
+
+    let workspace = source
+        .profile
+        .parent()
+        .expect("profile parent")
+        .join("workspace");
+    std::fs::write(workspace.join("replay-release"), b"release").expect("release background task");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut session = Command::new(env!("CARGO_BIN_EXE_haider"));
+        configure_test_home(&mut session, &source.profile);
+        session
+            .args(["session", session_id, "--json"])
+            .env("HAIDER_PROFILE_DIR", &source.profile)
+            .env("HAIDER_DISCOVERY_DISABLED", "1");
+        let observed = session.output().expect("session observation executes");
+        assert!(observed.status.success());
+        if String::from_utf8_lossy(&observed.stdout).contains("task_completed") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "late task never completed");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let after_completion = replay(&source.profile);
+    assert!(
+        after_completion.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&after_completion.stderr)
+    );
+    assert_eq!(after_completion.stdout, before_completion.stdout);
+    let replay_json: serde_json::Value =
+        serde_json::from_slice(&after_completion.stdout).expect("replay JSON");
+    assert_eq!(
+        replay_json["events"]
+            .as_array()
+            .and_then(|events| events.last())
+            .map(|event| &event["payload"]),
+        Some(&serde_json::json!({"type": "run_state", "state": "done"}))
+    );
+}
+
+#[test]
+fn session_readiness_and_resume_are_finite_event_driven_json_barriers() {
+    let mut source = haider();
+    source
+        .args(["run", "--provider", "fake", "--json", "-p", "ready"])
+        .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0");
+    let source_output = output_with_boot_retry(&mut source);
+    assert!(
+        source_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&source_output.stderr)
+    );
+    let source_json: serde_json::Value =
+        serde_json::from_slice(&source_output.stdout).expect("source JSON");
+    let session_id = source_json["session_id"]
+        .as_str()
+        .expect("source session id");
+
+    let mut ready = Command::new(env!("CARGO_BIN_EXE_haider"));
+    configure_test_home(&mut ready, &source.profile);
+    ready
+        .args([
+            "sessions",
+            "wait-ready",
+            "--count",
+            "1",
+            "--session",
+            session_id,
+            "--timeout",
+            "2s",
+            "--json",
+        ])
+        .env("HAIDER_PROFILE_DIR", &source.profile)
+        .env("HAIDER_DISCOVERY_DISABLED", "1");
+    let ready = output_with_boot_retry(&mut ready);
+    assert!(
+        ready.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ready.stderr)
+    );
+    let ready: serde_json::Value = serde_json::from_slice(&ready.stdout).expect("readiness JSON");
+    assert_eq!(ready["schema"], "haider.sessions.ready.v1");
+    assert_eq!(ready["ready"], true);
+    assert_eq!(ready["daemon_ready"], true);
+    assert_eq!(ready["expected_count"], 1);
+    assert_eq!(ready["ready_count"], 1);
+    assert_eq!(ready["ready_session_ids"], serde_json::json!([session_id]));
+    assert_eq!(ready["state_counts"]["idle"], 1);
+
+    let mut resume = Command::new(env!("CARGO_BIN_EXE_haider"));
+    configure_test_home(&mut resume, &source.profile);
+    resume
+        .args(["resume", session_id, "--json", "--timeout", "2s"])
+        .env("HAIDER_PROFILE_DIR", &source.profile)
+        .env("HAIDER_DISCOVERY_DISABLED", "1");
+    let resume = output_with_boot_retry(&mut resume);
+    assert!(
+        resume.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    let resume: serde_json::Value = serde_json::from_slice(&resume.stdout).expect("resume JSON");
+    assert_eq!(resume["schema"], "haider.session.resume.v1");
+    assert_eq!(resume["session_id"], session_id);
+    assert_eq!(resume["completed"], true);
+    assert_eq!(resume["outcome"], "idle");
+    assert_eq!(resume["run_state"], "idle");
+
+    let mut unmet = Command::new(env!("CARGO_BIN_EXE_haider"));
+    configure_test_home(&mut unmet, &source.profile);
+    unmet
+        .args([
+            "sessions",
+            "wait-ready",
+            "--count",
+            "2",
+            "--timeout",
+            "50ms",
+            "--json",
+        ])
+        .env("HAIDER_PROFILE_DIR", &source.profile)
+        .env("HAIDER_DISCOVERY_DISABLED", "1");
+    let unmet = unmet.output().expect("unmet readiness command runs");
+    assert_eq!(unmet.status.code(), Some(i32::from(EX_TIMEOUT)));
+    let unmet: serde_json::Value = serde_json::from_slice(&unmet.stdout).expect("unmet JSON");
+    assert_eq!(unmet["daemon_ready"], true);
+    assert!(
+        unmet["daemon_generation"]
+            .as_u64()
+            .is_some_and(|value| value > 0)
+    );
+    assert_eq!(unmet["expected_count"], 2);
+    assert_eq!(unmet["ready_count"], 1);
+    assert_eq!(unmet["total_session_count"], 1);
+    assert_eq!(unmet["sessions"].as_array().map(Vec::len), Some(1));
+    assert_eq!(unmet["error"]["code"], "timeout");
+
+    let mut timeout = Command::new(env!("CARGO_BIN_EXE_haider"));
+    configure_test_home(&mut timeout, &source.profile);
+    timeout
+        .args([
+            "sessions",
+            "wait-ready",
+            "--count",
+            "1",
+            "--session",
+            "session-does-not-exist",
+            "--timeout",
+            "10ms",
+            "--json",
+        ])
+        .env("HAIDER_PROFILE_DIR", &source.profile)
+        .env("HAIDER_DISCOVERY_DISABLED", "1");
+    let timeout = timeout.output().expect("readiness timeout command runs");
+    assert_eq!(timeout.status.code(), Some(i32::from(EX_TIMEOUT)));
+    let timeout: serde_json::Value = serde_json::from_slice(&timeout.stdout).expect("timeout JSON");
+    assert_eq!(timeout["ready"], false);
+    assert_eq!(timeout["timed_out"], true);
+    assert_eq!(timeout["error"]["code"], "timeout");
+
+    let mut hanging = haider();
+    hanging
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "--start",
+            "--json",
+            "-p",
+            "stay running",
+        ])
+        .env("HAIDER_TEST_FAKE_PROVIDER", r#"[{"step":"hang"}]"#);
+    let hanging_started = output_with_boot_retry(&mut hanging);
+    assert!(
+        hanging_started.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&hanging_started.stderr)
+    );
+    let hanging_started: serde_json::Value =
+        serde_json::from_slice(&hanging_started.stdout).expect("hanging start JSON");
+    let hanging_session = hanging_started["session_id"]
+        .as_str()
+        .expect("hanging session id");
+    let hanging_run = hanging_started["run_id"].as_str().expect("hanging run id");
+    thread::sleep(Duration::from_millis(100));
+
+    let mut running_resume = Command::new(env!("CARGO_BIN_EXE_haider"));
+    configure_test_home(&mut running_resume, &hanging.profile);
+    running_resume
+        .args(["resume", hanging_session, "--json", "--timeout", "50ms"])
+        .env("HAIDER_PROFILE_DIR", &hanging.profile)
+        .env("HAIDER_DISCOVERY_DISABLED", "1");
+    let running_resume = running_resume.output().expect("running resume executes");
+    assert_eq!(running_resume.status.code(), Some(i32::from(EX_TIMEOUT)));
+    let running_resume: serde_json::Value =
+        serde_json::from_slice(&running_resume.stdout).expect("running resume JSON");
+    assert_eq!(running_resume["daemon_ready"], true);
+    assert_eq!(running_resume["session_id"], hanging_session);
+    assert_eq!(running_resume["run_id"], hanging_run);
+    assert_eq!(running_resume["run_state"], "running");
+    assert_eq!(running_resume["outcome"], "timeout");
+    assert_eq!(running_resume["error"]["code"], "timeout");
+
+    let mut stop = Command::new(env!("CARGO_BIN_EXE_haider"));
+    configure_test_home(&mut stop, &hanging.profile);
+    stop.args(["run", "--stop", hanging_run, "--json"])
+        .env("HAIDER_PROFILE_DIR", &hanging.profile)
+        .env("HAIDER_DISCOVERY_DISABLED", "1");
+    let stopped = bounded_output(&mut stop, None);
+    assert!(
+        stopped.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
 }
 
 /// MUTATION CHECK: remove the raw JSONL pre-scan, restrict the typed emitter

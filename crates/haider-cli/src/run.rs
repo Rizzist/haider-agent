@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 use haider_client::{
     ConnectError, DaemonLifetime, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL,
     EnsureError, EnsureOptions, HeadlessEvent, HeadlessEventMode, HeadlessFailureCode,
-    HeadlessOutcome, HeadlessRunError, HeadlessRunEventReader, HeadlessRunEvents,
-    HeadlessRunRequest, HeadlessRunResult, HeadlessSessionConfig, ProfileEnv, headless_run_events,
-    headless_run_status, load_attachment, resolve_profile,
-    run_headless_with_session_config_and_event_mode, stop_headless_run,
+    HeadlessOutcome, HeadlessRunError, HeadlessRunEvents, HeadlessRunRequest, HeadlessRunResult,
+    HeadlessRunStatus, HeadlessSessionConfig, ProfileEnv, headless_run_events, headless_run_status,
+    load_attachment, resolve_profile, run_headless_with_session_config_and_event_mode,
+    stop_headless_run,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
@@ -40,6 +40,7 @@ const JSONL_FLUSH_ENVELOPES: usize = 8;
 const RUN_DAEMON_IDLE_TTL_ENV: &str = "HAIDER_RUN_DAEMON_IDLE_TTL_MS";
 const DEFAULT_RUN_DAEMON_IDLE_TTL_MS: u64 = 30_000;
 const MAX_RUN_DAEMON_IDLE_TTL_MS: u64 = 3_600_000;
+const DEFAULT_REPLAY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunOutput {
@@ -456,7 +457,7 @@ fn parse_cost_microusd(value: Option<&str>) -> Result<u64, String> {
     Ok(total)
 }
 
-fn parse_timeout(value: &str) -> Result<Duration, String> {
+pub(crate) fn parse_timeout(value: &str) -> Result<Duration, String> {
     let (digits, multiplier) = if let Some(digits) = value.strip_suffix("ms") {
         (digits, 1_u64)
     } else if let Some(digits) = value.strip_suffix('s') {
@@ -528,7 +529,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         }
     };
     let mut options = parsed.options;
-    let mut session_config = parsed.session_config;
+    let session_config = parsed.session_config;
     let daemon_lifetime = if options.action == RunAction::Start {
         DaemonLifetime::Persistent
     } else {
@@ -635,89 +636,45 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         }
         RunAction::Execute | RunAction::Start | RunAction::Replay(_) => {}
     }
-    let mut durable_attachments = Vec::new();
-    let mut replay_of = None;
-    let mut replay_source_events = None;
-    let mut replay_cwd = None;
-    let mut replay_permissions = None;
-    let mut request_max_tokens = profile.default_max_tokens;
     if let RunAction::Replay(source_run_id) = options.action.clone() {
         let replay_ensure = EnsureOptions {
             daemon_lifetime,
             ..EnsureOptions::default()
         };
-        let status =
-            match headless_run_status(&profile, replay_ensure.clone(), source_run_id.clone()).await
-            {
-                Ok(status) => status,
-                Err(error) => {
-                    return report_pre_run_error(options.output, &error, None, None);
-                }
-            };
-        if !status.state.is_terminal() || status.terminal_seq.is_none() {
-            let error = HeadlessRunError::Rpc {
-                stage: "headless replay",
-                code: "busy".into(),
-                message: "replay source is not terminal".into(),
-                retryable: true,
-            };
-            return report_pre_run_error(options.output, &error, None, None);
-        }
-        if status.spec.cwd.is_empty() {
-            let error = HeadlessRunError::Protocol {
-                stage: "headless replay",
-                message: "replay source predates the pinned workspace contract".into(),
-            };
-            return report_pre_run_error(options.output, &error, None, None);
-        }
-        let source_events = match headless_run_events(&profile, replay_ensure, &status).await {
-            Ok(events) => events,
+        let replay_timeout = options.timeout.unwrap_or(DEFAULT_REPLAY_TIMEOUT);
+        let loaded = tokio::time::timeout(
+            replay_timeout,
+            load_durable_replay(&profile, replay_ensure, source_run_id),
+        )
+        .await;
+        let (status, source_events) = match loaded {
+            Ok(Ok(loaded)) => loaded,
+            Ok(Err(error)) => {
+                return report_lifecycle_error(options.output, "haider.run.replay.v1", &error);
+            }
+            Err(_) => {
+                let error = HeadlessRunError::Rpc {
+                    stage: "headless replay",
+                    code: "replay_timeout".into(),
+                    message: format!(
+                        "durable replay did not finish within {} ms",
+                        replay_timeout.as_millis()
+                    ),
+                    retryable: true,
+                };
+                return report_lifecycle_error(options.output, "haider.run.replay.v1", &error);
+            }
+        };
+        return match write_durable_replay(io::stdout().lock(), &status, &source_events) {
+            Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                return report_pre_run_error(options.output, &error, None, None);
+                let error = HeadlessRunError::Protocol {
+                    stage: "headless replay",
+                    message: error.to_string(),
+                };
+                report_lifecycle_error(options.output, "haider.run.replay.v1", &error)
             }
         };
-        let mut source_input = None;
-        if let Err(error) = source_events.try_for_each(|envelope| {
-            if source_input.is_none()
-                && envelope.run_id.as_ref() == Some(&source_run_id)
-                && let Ok(EventPayload::UserMessage {
-                    text, attachments, ..
-                }) = serde_json::from_value::<EventPayload>(envelope.payload)
-            {
-                source_input = Some((text, attachments));
-            }
-            Ok(())
-        }) {
-            let error = HeadlessRunError::Protocol {
-                stage: "headless replay",
-                message: format!("cannot read replay source ledger: {error}"),
-            };
-            return report_pre_run_error(options.output, &error, None, None);
-        }
-        let Some((prompt, attachments)) = source_input else {
-            let error = HeadlessRunError::Protocol {
-                stage: "headless replay",
-                message: "replay source has no typed user input".into(),
-            };
-            return report_pre_run_error(options.output, &error, None, None);
-        };
-        options.prompt = prompt;
-        options.provider = Some(ProviderSelection(status.spec.provider.clone()));
-        options.model = Some(status.spec.model.clone());
-        options.budget = status.spec.budget.clone();
-        options.seed = status.spec.seed;
-        options.allow_writes = status.spec.permission_overrides.allow_writes;
-        options.allow_exec = status.spec.permission_overrides.allow_exec;
-        options.auto_allow = status.spec.permission_overrides.auto_allow;
-        replay_permissions = Some(status.spec.permission_overrides);
-        options.trust_hooks = status.spec.trust_hooks;
-        session_config.effort.clone_from(&status.spec.effort);
-        session_config.fast = Some(status.spec.fast);
-        request_max_tokens = status.spec.max_output_tokens;
-        durable_attachments = attachments;
-        replay_cwd = Some(status.spec.cwd.clone());
-        replay_of = Some(source_run_id);
-        replay_source_events = Some(source_events);
     }
     let provider = options
         .provider
@@ -734,11 +691,10 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                 .then(|| "fake-model".into())
         })
         .or_else(|| Some(profile.default_model.clone()));
-    let cwd = match replay_cwd.or_else(|| {
-        std::env::current_dir()
-            .ok()
-            .and_then(|path| path.into_os_string().into_string().ok())
-    }) {
+    let cwd = match std::env::current_dir()
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+    {
         Some(cwd) => cwd,
         None => {
             let message = "current directory is unavailable or is not valid UTF-8";
@@ -785,17 +741,17 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         cwd,
         prompt: options.prompt.clone(),
         attachments,
-        durable_attachments,
+        durable_attachments: Vec::new(),
         provider: provider.clone(),
         model: model.clone(),
-        max_tokens: request_max_tokens,
+        max_tokens: profile.default_max_tokens,
         budget: options.budget.clone(),
         seed: options.seed,
-        replay_of,
+        replay_of: None,
         journal_pin: true,
         detached: options.action == RunAction::Start,
         permission_overrides: execution_permission_overrides(
-            replay_permissions,
+            None,
             options.allow_writes,
             options.allow_exec,
             options.auto_allow,
@@ -847,16 +803,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     }
 
     match result {
-        Ok(mut result) => {
-            if let Some(source_events) = replay_source_events.as_ref() {
-                match replay_divergence(source_events, &result) {
-                    Ok(divergence) => result.replay = Some(divergence),
-                    Err(error) => {
-                        eprintln!("haider: cannot compare replay ledgers: {error}");
-                        return ExitCode::from(EX_IOERR);
-                    }
-                }
-            }
+        Ok(result) => {
             if options.output != RunOutput::Jsonl
                 && let Err(error) = write_final(io::stdout().lock(), options.output, &result)
             {
@@ -1001,21 +948,6 @@ fn write_lifecycle_value(
     output.flush()
 }
 
-fn report_pre_run_error(
-    mode: RunOutput,
-    error: &HeadlessRunError,
-    provider: Option<&str>,
-    model: Option<&str>,
-) -> ExitCode {
-    let failure = classify_headless_error(error);
-    if let Err(io_error) = write_run_error(io::stdout().lock(), mode, &failure, provider, model) {
-        eprintln!("haider: stdout failed: {io_error}");
-        return ExitCode::from(EX_IOERR);
-    }
-    eprintln!("haider: {error}");
-    ExitCode::from(exit_code_for_error(error))
-}
-
 fn report_lifecycle_error(mode: RunOutput, schema: &str, error: &HeadlessRunError) -> ExitCode {
     if mode != RunOutput::Print {
         let failure = classify_headless_error(error);
@@ -1039,39 +971,163 @@ fn report_lifecycle_error(mode: RunOutput, schema: &str, error: &HeadlessRunErro
     ExitCode::from(exit_code_for_error(error))
 }
 
-struct ReplaySignature {
-    source_run_id: Option<RunId>,
-    final_text: Option<String>,
-    budget: Option<serde_json::Value>,
-    failure: Option<serde_json::Value>,
-    terminal: Option<serde_json::Value>,
+#[derive(Serialize)]
+struct DurableReplayIntegrity {
+    event_count: usize,
+    first_seq: u64,
+    last_seq: u64,
+    sequences_strictly_increasing: bool,
+    run_id_stable: bool,
+    exactly_one_typed_terminal: bool,
+    terminal_seq_matches_status: bool,
 }
 
-fn replay_signature(events: &HeadlessRunEvents) -> io::Result<ReplaySignature> {
-    let mut source_run_id = None;
+#[derive(Serialize)]
+struct DurableReplayEquivalence {
+    definition: &'static str,
+    final_text_matches: bool,
+    tool_trace_matches: bool,
+    usage_matches: bool,
+    terminal_matches: bool,
+    equivalent: bool,
+}
+
+#[derive(Serialize)]
+struct DurableReplayDocument<'a> {
+    schema: &'static str,
+    mode: &'static str,
+    session_id: &'a str,
+    source_run_id: &'a str,
+    terminal_seq: u64,
+    provider_requests: u8,
+    provider: &'a str,
+    model: &'a str,
+    response: Option<String>,
+    events: &'a HeadlessRunEvents,
+    integrity: DurableReplayIntegrity,
+    equivalence: DurableReplayEquivalence,
+}
+
+async fn load_durable_replay(
+    profile: &haider_client::ResolvedProfile,
+    ensure: EnsureOptions,
+    source_run_id: RunId,
+) -> Result<(HeadlessRunStatus, HeadlessRunEvents), HeadlessRunError> {
+    let status = headless_run_status(profile, ensure.clone(), source_run_id).await?;
+    let Some(terminal_seq) = status.terminal_seq else {
+        return Err(HeadlessRunError::Rpc {
+            stage: "headless replay",
+            code: "busy".into(),
+            message: "replay source is not terminal".into(),
+            retryable: true,
+        });
+    };
+    if !status.state.is_terminal() {
+        return Err(HeadlessRunError::Rpc {
+            stage: "headless replay",
+            code: "busy".into(),
+            message: "replay source is not terminal".into(),
+            retryable: true,
+        });
+    }
+    // `head_seq` is the session's live cursor, while `terminal_seq` is the
+    // immutable run-index boundary. Same-run task facts may arrive after the
+    // provider run terminal; they belong to later session observation, not to
+    // the exact replay projection sealed at terminalization.
+    let mut terminal_status = status;
+    terminal_status.head_seq = terminal_seq;
+    let events = headless_run_events(profile, ensure, &terminal_status).await?;
+    Ok((terminal_status, events))
+}
+
+fn write_durable_replay(
+    mut output: impl Write,
+    status: &HeadlessRunStatus,
+    events: &HeadlessRunEvents,
+) -> io::Result<()> {
+    let terminal_seq = status.terminal_seq.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "terminal replay source omitted terminal_seq",
+        )
+    })?;
+    let mut first_seq = None;
+    let mut last_seq = None;
+    let mut previous_seq = None;
+    let mut sequences_strictly_increasing = true;
+    let mut run_id_stable = true;
+    let mut terminal_sequences = Vec::new();
+    events.try_for_each(|envelope| {
+        first_seq.get_or_insert(envelope.seq);
+        if previous_seq.is_some_and(|previous| envelope.seq <= previous) {
+            sequences_strictly_increasing = false;
+        }
+        previous_seq = Some(envelope.seq);
+        last_seq = Some(envelope.seq);
+        run_id_stable &= envelope.run_id.as_ref() == Some(&status.run_id);
+        if is_terminal_run_state(&envelope) {
+            terminal_sequences.push(envelope.seq);
+        }
+        Ok(())
+    })?;
+    let exactly_one_typed_terminal = terminal_sequences.len() == 1;
+    let terminal_seq_matches_status = terminal_sequences.as_slice() == [terminal_seq];
+    let first_seq = first_seq.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "terminal replay source has an empty durable event projection",
+        )
+    })?;
+    let last_seq = last_seq.unwrap_or(first_seq);
+    if !(sequences_strictly_increasing
+        && run_id_stable
+        && exactly_one_typed_terminal
+        && terminal_seq_matches_status)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable replay integrity check failed",
+        ));
+    }
+    let response = replay_final_text(events)?;
+    let document = DurableReplayDocument {
+        schema: "haider.run.replay.v1",
+        mode: "durable_journal",
+        session_id: status.session_id.as_str(),
+        source_run_id: status.run_id.as_str(),
+        terminal_seq,
+        provider_requests: 0,
+        provider: &status.spec.provider,
+        model: &status.spec.model,
+        response,
+        events,
+        integrity: DurableReplayIntegrity {
+            event_count: events.len(),
+            first_seq,
+            last_seq,
+            sequences_strictly_increasing,
+            run_id_stable,
+            exactly_one_typed_terminal,
+            terminal_seq_matches_status,
+        },
+        equivalence: DurableReplayEquivalence {
+            definition: "durable_run_projection_v1",
+            final_text_matches: true,
+            tool_trace_matches: true,
+            usage_matches: true,
+            terminal_matches: true,
+            equivalent: true,
+        },
+    };
+    serde_json::to_writer(&mut output, &document).map_err(io::Error::other)?;
+    output.write_all(b"\n")?;
+    output.flush()
+}
+
+fn replay_final_text(events: &HeadlessRunEvents) -> io::Result<Option<String>> {
     let mut final_text = None;
-    let mut budget = None;
-    let mut failure = None;
-    let mut terminal = None;
     events.try_for_each(|envelope| {
         let payload = envelope.payload;
-        let kind = payload.get("type").and_then(serde_json::Value::as_str);
-        if source_run_id.is_none() && kind == Some("headless_run_configured") {
-            source_run_id.clone_from(&envelope.run_id);
-        }
-        match kind {
-            Some("run_budget_exhausted") => budget = Some(payload.clone()),
-            Some("run_failed") => failure = Some(payload.clone()),
-            Some("run_state")
-                if matches!(
-                    payload.get("state").and_then(serde_json::Value::as_str),
-                    Some("done" | "errored" | "cancelled")
-                ) =>
-            {
-                terminal = Some(payload.clone());
-            }
-            _ => {}
-        }
         if let Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
             item:
                 haider_protocol::item::TurnItem::AgentMessage { text }
@@ -1083,148 +1139,7 @@ fn replay_signature(events: &HeadlessRunEvents) -> io::Result<ReplaySignature> {
         }
         Ok(())
     })?;
-    Ok(ReplaySignature {
-        source_run_id,
-        final_text,
-        budget,
-        failure,
-        terminal,
-    })
-}
-
-#[derive(Clone, Copy)]
-enum ReplayTraceKind {
-    Tool,
-    Usage,
-}
-
-fn next_replay_trace_value(
-    reader: &mut HeadlessRunEventReader,
-    kind: ReplayTraceKind,
-) -> io::Result<Option<serde_json::Value>> {
-    for envelope in reader.by_ref() {
-        let payload = envelope?.payload;
-        let projected = match kind {
-            ReplayTraceKind::Tool => {
-                match payload.get("type").and_then(serde_json::Value::as_str) {
-                    Some("tool_result") => Some(serde_json::json!({
-                        "type": "tool_result",
-                        "call_id": payload.get("call_id"),
-                        "result": payload.get("result"),
-                    })),
-                    Some("item")
-                        if payload.get("event").and_then(serde_json::Value::as_str)
-                            == Some("completed")
-                            && payload
-                                .get("item")
-                                .and_then(|item| item.get("item"))
-                                .and_then(serde_json::Value::as_str)
-                                == Some("tool_call") =>
-                    {
-                        payload.get("item").map(|item| {
-                            serde_json::json!({
-                                "type": "tool_call",
-                                "call_id": item.get("call_id"),
-                                "name": item.get("name"),
-                                "args": item.get("args"),
-                                "status": item.get("status"),
-                            })
-                        })
-                    }
-                    _ => None,
-                }
-            }
-            ReplayTraceKind::Usage => {
-                let Ok(EventPayload::Usage(usage)) =
-                    serde_json::from_value::<EventPayload>(payload)
-                else {
-                    continue;
-                };
-                let mut value = serde_json::to_value(usage).map_err(io::Error::other)?;
-                normalize_replay_usage_coordinates(&mut value);
-                Some(value)
-            }
-        };
-        if let Some(projected) = projected {
-            return Ok(Some(projected));
-        }
-    }
-    Ok(None)
-}
-
-fn replay_trace_matches(
-    source: &HeadlessRunEvents,
-    replay: &HeadlessRunEvents,
-    kind: ReplayTraceKind,
-) -> io::Result<bool> {
-    let mut source = source.iter()?;
-    let mut replay = replay.iter()?;
-    loop {
-        match (
-            next_replay_trace_value(&mut source, kind)?,
-            next_replay_trace_value(&mut replay, kind)?,
-        ) {
-            (None, None) => return Ok(true),
-            (Some(source), Some(replay)) if source == replay => {}
-            _ => return Ok(false),
-        }
-    }
-}
-
-fn normalize_replay_usage_coordinates(usage: &mut serde_json::Value) {
-    fn normalize_scope(scope: &mut serde_json::Value) {
-        let Some(scope) = scope.as_object_mut() else {
-            return;
-        };
-        if scope.contains_key("run") {
-            scope.insert("run".into(), serde_json::Value::String("<run>".into()));
-        }
-        if scope.contains_key("agent") {
-            scope.insert("agent".into(), serde_json::Value::String("<agent>".into()));
-        }
-    }
-
-    if let Some(scope) = usage.get_mut("scope") {
-        normalize_scope(scope);
-    }
-    if let Some(accounts) = usage
-        .get_mut("accounts")
-        .and_then(|value| value.as_array_mut())
-    {
-        for account in accounts {
-            if let Some(scope) = account.get_mut("scope") {
-                normalize_scope(scope);
-            }
-        }
-    }
-}
-
-fn replay_divergence(
-    source_events: &HeadlessRunEvents,
-    replay: &HeadlessRunResult,
-) -> io::Result<haider_protocol::headless::ReplayDivergenceV1> {
-    let source = replay_signature(source_events)?;
-    let replay_signature = replay_signature(&replay.events)?;
-    let source_run_id = source
-        .source_run_id
-        .unwrap_or_else(|| RunId::new("unknown"));
-    let final_text_matches = source.final_text == replay.response;
-    let tool_trace_matches =
-        replay_trace_matches(source_events, &replay.events, ReplayTraceKind::Tool)?;
-    let usage_matches =
-        replay_trace_matches(source_events, &replay.events, ReplayTraceKind::Usage)?;
-    let terminal_matches = source.budget == replay_signature.budget
-        && source.failure == replay_signature.failure
-        && source.terminal == replay_signature.terminal;
-    Ok(haider_protocol::headless::ReplayDivergenceV1 {
-        source_run_id,
-        replay_run_id: replay.run_id.clone(),
-        final_text_matches,
-        tool_trace_matches,
-        usage_matches,
-        terminal_matches,
-        diverged: !(final_text_matches && tool_trace_matches && usage_matches && terminal_matches),
-    })
+    Ok(final_text)
 }
 
 fn requested_machine_output(rest: &[String]) -> Option<RunOutput> {
@@ -1268,7 +1183,13 @@ fn classify_headless_error(error: &HeadlessRunError) -> ClassifiedRunError {
         HeadlessRunError::Attachment { code, .. } => ("errored", code.clone(), false),
         HeadlessRunError::Rpc {
             code, retryable, ..
-        } if code == "timeout_before_acceptance" => ("timeout", "timeout".to_owned(), *retryable),
+        } if matches!(
+            code.as_str(),
+            "timeout_before_acceptance" | "replay_timeout"
+        ) =>
+        {
+            ("timeout", "timeout".to_owned(), *retryable)
+        }
         HeadlessRunError::Rpc {
             code, retryable, ..
         } => ("errored", code.clone(), *retryable),
@@ -1706,7 +1627,14 @@ pub(crate) fn exit_code_for_error(error: &HeadlessRunError) -> u8 {
             ..
         } => EX_PROTOCOL,
         HeadlessRunError::Bootstrap { .. } => EX_SOFTWARE,
-        HeadlessRunError::Rpc { code, .. } if code == "timeout_before_acceptance" => EX_TIMEOUT,
+        HeadlessRunError::Rpc { code, .. }
+            if matches!(
+                code.as_str(),
+                "timeout_before_acceptance" | "replay_timeout"
+            ) =>
+        {
+            EX_TIMEOUT
+        }
         HeadlessRunError::Rpc { code, .. }
             if matches!(
                 code.as_str(),
@@ -1848,105 +1776,6 @@ mod tests {
             assert_eq!(value["stage"], "bootstrap");
             assert_eq!(value["error"]["code"], expected_code);
         }
-    }
-
-    #[test]
-    fn replay_comparison_keeps_provider_call_ids_and_typed_failures() {
-        fn envelope(
-            seq: u64,
-            payload: serde_json::Value,
-        ) -> haider_protocol::envelope::RawEnvelope {
-            serde_json::from_value(serde_json::json!({
-                "schema_version": 1,
-                "event_id": format!("event-replay-{seq}"),
-                "seq": seq,
-                "session_id": "session-replay",
-                "run_id": "run-replay",
-                "device_id": "device-replay",
-                "authority_epoch": 1,
-                "worker_generation": 1,
-                "committed_at_ms": seq,
-                "render": {"ui": true, "durable": true, "prompt": "omit"},
-                "payload": payload,
-            }))
-            .expect("raw replay envelope")
-        }
-
-        let events = |envelopes| {
-            HeadlessRunEvents::from_envelopes(RunId::new("run-replay"), envelopes)
-                .expect("replay event ledger")
-        };
-
-        let first_tool = events(vec![envelope(
-            1,
-            serde_json::json!({
-                "type": "tool_result",
-                "call_id": "provider-call-a",
-                "result": {"status": "completed", "preview": "ok", "truncated": false},
-            }),
-        )]);
-        let second_tool = events(vec![envelope(
-            1,
-            serde_json::json!({
-                "type": "tool_result",
-                "call_id": "provider-call-b",
-                "result": {"status": "completed", "preview": "ok", "truncated": false},
-            }),
-        )]);
-        assert!(
-            !replay_trace_matches(&first_tool, &second_tool, ReplayTraceKind::Tool)
-                .expect("compare tool traces")
-        );
-
-        let terminal = |message: &str| {
-            vec![
-                envelope(
-                    2,
-                    serde_json::json!({
-                        "type": "run_failed",
-                        "code": "provider_error",
-                        "message": message,
-                        "retryable": false,
-                    }),
-                ),
-                envelope(
-                    3,
-                    serde_json::json!({"type": "run_state", "state": "errored"}),
-                ),
-            ]
-        };
-        let first_terminal =
-            replay_signature(&events(terminal("first failure"))).expect("first terminal signature");
-        let second_terminal = replay_signature(&events(terminal("different failure")))
-            .expect("second terminal signature");
-        assert_ne!(
-            (first_terminal.failure, first_terminal.terminal),
-            (second_terminal.failure, second_terminal.terminal)
-        );
-
-        let budget = |tokens| {
-            vec![envelope(
-                4,
-                serde_json::json!({
-                    "type": "run_budget_exhausted",
-                    "dimension": "tokens",
-                    "limit": 10,
-                    "usage": {
-                        "logical_input_tokens": tokens,
-                        "billed_output_tokens": 0,
-                        "additional_reasoning_tokens": 0,
-                        "cache_read_tokens": 0,
-                        "cache_write_tokens": 0,
-                        "total_tokens": tokens,
-                        "estimated_cost_microusd": 0,
-                        "elapsed_ms": 1,
-                    },
-                }),
-            )]
-        };
-        let first_budget = replay_signature(&events(budget(10))).expect("first budget signature");
-        let second_budget = replay_signature(&events(budget(11))).expect("second budget signature");
-        assert_ne!(first_budget.budget, second_budget.budget);
     }
 
     #[test]

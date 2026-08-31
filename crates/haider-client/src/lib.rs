@@ -72,7 +72,8 @@ pub use lockdown::{
 };
 pub use observe::{
     DescendantLiveAttachment, DescendantView, ObserveClient, ObserveError, ObserveStatusSnapshot,
-    observe_stream_all, observe_stream_session, observe_stream_session_after,
+    SessionReadinessSnapshot, SessionResumeSnapshot, observe_stream_all, observe_stream_session,
+    observe_stream_session_after, wait_for_session_resume, wait_for_sessions_ready,
 };
 pub use peer::{
     PeerClientError, PeerDelivery, PeerDeliveryReason, PeerDescriptor, PeerEvent,

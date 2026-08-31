@@ -15,12 +15,13 @@ use haider_rpc::{
     AttachMode, AttachmentId, Capability, CapabilitySet, ClientKind, DescendantReplayCursorWire,
     ERROR_CODE_NOT_FOUND, FEATURE_EFFECT_RECOVERY_V1, FEATURE_SESSION_DESCENDANT_STREAM_V1,
     FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_LIST_WATCH_V1, FEATURE_SESSION_OBSERVE_BATCH_V1,
-    FEATURE_SESSION_OBSERVE_V1, LifecyclePhase, RequestBody, ResponseBody,
+    FEATURE_SESSION_OBSERVE_V1, LifecyclePhase, ObserveRunStateWire, RequestBody, ResponseBody,
     SessionDescendantBaselineWire, SessionFleetSnapshot, SessionObserveDigest, SessionSummary,
     Welcome, WireFrame,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 
 use crate::client::{
     ClientCloseOutcome, ClientConfig, ClientError, ClientHealthWait, ConnectError, ConnectionState,
@@ -115,6 +116,31 @@ pub struct ObserveStatusSnapshot {
     /// The daemon's serving edge. For pre-feature daemons, a negotiated
     /// Ready Welcome is the compatible source of the same lifecycle fact.
     pub ready: bool,
+}
+
+/// Finite result from the event-driven durable-roster barrier.
+///
+/// `ready` is true only when the daemon is at `Ready` (enforced by
+/// [`ObserveClient::connect`]) and the requested current-format session rows
+/// have all been published. The barrier never requires a provider run to be
+/// idle: a resource orchestrator can deliberately hold live running sessions.
+pub struct SessionReadinessSnapshot {
+    pub daemon_ready: bool,
+    pub daemon_generation: u64,
+    pub expected_count: usize,
+    pub ready_count: usize,
+    pub total_session_count: usize,
+    pub timed_out: bool,
+    pub summaries: Vec<SessionSummary>,
+}
+
+/// Finite result from waiting for one durable session to leave its running
+/// state. Parked and recovery-required states are settled results, not hangs.
+pub struct SessionResumeSnapshot {
+    pub daemon_ready: bool,
+    pub daemon_generation: u64,
+    pub timed_out: bool,
+    pub summary: Option<SessionSummary>,
 }
 
 /// Feature-negotiated descendant view. `Snapshot` is deliberately a separate
@@ -825,6 +851,388 @@ async fn open_session_list_watch(
         }
     }
     Ok((watcher, events, baseline_lost))
+}
+
+/// Waits without polling until at least `count` current-format durable session
+/// summaries are roster-visible, or until `timeout` expires. When `expected`
+/// is nonempty, every named id must be ready and `count` must equal its length.
+pub async fn wait_for_sessions_ready(
+    profile: &ResolvedProfile,
+    spawn: bool,
+    count: usize,
+    expected: &[SessionId],
+    timeout: Duration,
+) -> Result<SessionReadinessSnapshot, ObserveError> {
+    let deadline = Instant::now() + timeout;
+    let expected_ids = expected
+        .iter()
+        .map(|session_id| session_id.as_str().to_owned())
+        .collect::<HashSet<_>>();
+    let (watcher, mut events, mut baseline_lost) =
+        match tokio::time::timeout_at(deadline, open_session_list_watch(profile, spawn)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Ok(readiness_snapshot(
+                    false,
+                    0,
+                    count,
+                    &expected_ids,
+                    0,
+                    true,
+                    HashMap::new(),
+                ));
+            }
+        };
+    let daemon_generation = watcher.welcome.daemon_generation;
+    let Some(mut summaries) = roster_before_deadline(&watcher, deadline).await? else {
+        let _ = watcher.close();
+        return Ok(readiness_snapshot(
+            true,
+            daemon_generation,
+            count,
+            &expected_ids,
+            0,
+            true,
+            HashMap::new(),
+        ));
+    };
+    let health = watcher.client.health_watch();
+    let mut health_wait = Box::pin(health.wait(
+        "session-readiness roster health",
+        STREAM_HEALTH_REPAIR_INTERVAL,
+    ));
+    loop {
+        let ready_count = readiness_count(&summaries, &expected_ids);
+        let satisfied = if expected_ids.is_empty() {
+            ready_count >= count
+        } else {
+            ready_count == expected_ids.len()
+        };
+        if satisfied {
+            let snapshot = readiness_snapshot(
+                true,
+                daemon_generation,
+                count,
+                &expected_ids,
+                ready_count,
+                false,
+                summaries,
+            );
+            let _ = watcher.close();
+            return Ok(snapshot);
+        }
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => {
+                let ready_count = readiness_count(&summaries, &expected_ids);
+                let snapshot = readiness_snapshot(
+                    true,
+                    daemon_generation,
+                    count,
+                    &expected_ids,
+                    ready_count,
+                    true,
+                    summaries,
+                );
+                let _ = watcher.close();
+                return Ok(snapshot);
+            }
+            outcome = &mut health_wait => {
+                let (health, outcome) = outcome;
+                if outcome.channel_closed()
+                    || matches!(outcome.snapshot().state, ConnectionState::Disconnected(_))
+                {
+                    let _ = watcher.close();
+                    return Err(ObserveError::Protocol(
+                        "daemon disconnected before the session-readiness barrier completed",
+                    ));
+                }
+                if outcome.snapshot().lost_events != baseline_lost {
+                    let Some(refreshed) = roster_before_deadline(&watcher, deadline).await? else {
+                        let ready_count = readiness_count(&summaries, &expected_ids);
+                        let snapshot = readiness_snapshot(
+                            true,
+                            daemon_generation,
+                            count,
+                            &expected_ids,
+                            ready_count,
+                            true,
+                            summaries,
+                        );
+                        let _ = watcher.close();
+                        return Ok(snapshot);
+                    };
+                    summaries = refreshed;
+                    baseline_lost = outcome.snapshot().lost_events;
+                }
+                health_wait = Box::pin(health.wait(
+                    "session-readiness roster health",
+                    STREAM_HEALTH_REPAIR_INTERVAL,
+                ));
+            }
+            frame = events.recv() => match frame {
+                Some(WireFrame::SessionRosterDelta { summaries: changed }) => {
+                    for summary in changed {
+                        summaries.insert(summary.session_id.as_str().to_owned(), summary);
+                    }
+                    if watcher.lost_events() != baseline_lost {
+                        let Some(refreshed) = roster_before_deadline(&watcher, deadline).await? else {
+                            let ready_count = readiness_count(&summaries, &expected_ids);
+                            let snapshot = readiness_snapshot(
+                                true,
+                                daemon_generation,
+                                count,
+                                &expected_ids,
+                                ready_count,
+                                true,
+                                summaries,
+                            );
+                            let _ = watcher.close();
+                            return Ok(snapshot);
+                        };
+                        summaries = refreshed;
+                        baseline_lost = watcher.lost_events();
+                    }
+                }
+                Some(WireFrame::ServerDraining { .. }) | None => {
+                    let _ = watcher.close();
+                    return Err(ObserveError::Protocol(
+                        "daemon stopped before the session-readiness barrier completed",
+                    ));
+                }
+                Some(_) => {
+                    if watcher.lost_events() != baseline_lost {
+                        let Some(refreshed) = roster_before_deadline(&watcher, deadline).await? else {
+                            let ready_count = readiness_count(&summaries, &expected_ids);
+                            let snapshot = readiness_snapshot(
+                                true,
+                                daemon_generation,
+                                count,
+                                &expected_ids,
+                                ready_count,
+                                true,
+                                summaries,
+                            );
+                            let _ = watcher.close();
+                            return Ok(snapshot);
+                        };
+                        summaries = refreshed;
+                        baseline_lost = watcher.lost_events();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Reconnects through the ordinary daemon-ready seam and waits without
+/// polling until `session_id` is durably non-running, or until `timeout`.
+pub async fn wait_for_session_resume(
+    profile: &ResolvedProfile,
+    spawn: bool,
+    session_id: SessionId,
+    timeout: Duration,
+) -> Result<SessionResumeSnapshot, ObserveError> {
+    let deadline = Instant::now() + timeout;
+    let (watcher, mut events, mut baseline_lost) =
+        match tokio::time::timeout_at(deadline, open_session_list_watch(profile, spawn)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Ok(SessionResumeSnapshot {
+                    daemon_ready: false,
+                    daemon_generation: 0,
+                    timed_out: true,
+                    summary: None,
+                });
+            }
+        };
+    let daemon_generation = watcher.welcome.daemon_generation;
+    let key = session_id.as_str().to_owned();
+    let Some(mut summaries) = roster_before_deadline(&watcher, deadline).await? else {
+        let _ = watcher.close();
+        return Ok(SessionResumeSnapshot {
+            daemon_ready: true,
+            daemon_generation,
+            timed_out: true,
+            summary: None,
+        });
+    };
+    let health = watcher.client.health_watch();
+    let mut health_wait = Box::pin(health.wait(
+        "session-resume roster health",
+        STREAM_HEALTH_REPAIR_INTERVAL,
+    ));
+    loop {
+        let summary = summaries.get(&key).cloned();
+        if summary.as_ref().is_some_and(session_summary_is_settled) {
+            let _ = watcher.close();
+            return Ok(SessionResumeSnapshot {
+                daemon_ready: true,
+                daemon_generation,
+                timed_out: false,
+                summary,
+            });
+        }
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => {
+                let summary = summaries.get(&key).cloned();
+                let _ = watcher.close();
+                return Ok(SessionResumeSnapshot {
+                    daemon_ready: true,
+                    daemon_generation,
+                    timed_out: true,
+                    summary,
+                });
+            }
+            outcome = &mut health_wait => {
+                let (health, outcome) = outcome;
+                if outcome.channel_closed()
+                    || matches!(outcome.snapshot().state, ConnectionState::Disconnected(_))
+                {
+                    let _ = watcher.close();
+                    return Err(ObserveError::Protocol(
+                        "daemon disconnected before the resume barrier completed",
+                    ));
+                }
+                if outcome.snapshot().lost_events != baseline_lost {
+                    let Some(refreshed) = roster_before_deadline(&watcher, deadline).await? else {
+                        let summary = summaries.get(&key).cloned();
+                        let _ = watcher.close();
+                        return Ok(SessionResumeSnapshot {
+                            daemon_ready: true,
+                            daemon_generation,
+                            timed_out: true,
+                            summary,
+                        });
+                    };
+                    summaries = refreshed;
+                    baseline_lost = outcome.snapshot().lost_events;
+                }
+                health_wait = Box::pin(health.wait(
+                    "session-resume roster health",
+                    STREAM_HEALTH_REPAIR_INTERVAL,
+                ));
+            }
+            frame = events.recv() => match frame {
+                Some(WireFrame::SessionRosterDelta { summaries: changed }) => {
+                    for changed_summary in changed {
+                        summaries.insert(
+                            changed_summary.session_id.as_str().to_owned(),
+                            changed_summary,
+                        );
+                    }
+                    if watcher.lost_events() != baseline_lost {
+                        let Some(refreshed) = roster_before_deadline(&watcher, deadline).await? else {
+                            let summary = summaries.get(&key).cloned();
+                            let _ = watcher.close();
+                            return Ok(SessionResumeSnapshot {
+                                daemon_ready: true,
+                                daemon_generation,
+                                timed_out: true,
+                                summary,
+                            });
+                        };
+                        summaries = refreshed;
+                        baseline_lost = watcher.lost_events();
+                    }
+                }
+                Some(WireFrame::ServerDraining { .. }) | None => {
+                    let _ = watcher.close();
+                    return Err(ObserveError::Protocol(
+                        "daemon stopped before the resume barrier completed",
+                    ));
+                }
+                Some(_) => {
+                    if watcher.lost_events() != baseline_lost {
+                        let Some(refreshed) = roster_before_deadline(&watcher, deadline).await? else {
+                            let summary = summaries.get(&key).cloned();
+                            let _ = watcher.close();
+                            return Ok(SessionResumeSnapshot {
+                                daemon_ready: true,
+                                daemon_generation,
+                                timed_out: true,
+                                summary,
+                            });
+                        };
+                        summaries = refreshed;
+                        baseline_lost = watcher.lost_events();
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn roster_before_deadline(
+    watcher: &ObserveClient,
+    deadline: Instant,
+) -> Result<Option<HashMap<String, SessionSummary>>, ObserveError> {
+    match tokio::time::timeout_at(deadline, watcher.session_summaries()).await {
+        Ok(result) => result.map(summaries_by_id).map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
+fn summaries_by_id(summaries: Vec<SessionSummary>) -> HashMap<String, SessionSummary> {
+    summaries
+        .into_iter()
+        .map(|summary| (summary.session_id.as_str().to_owned(), summary))
+        .collect()
+}
+
+fn session_summary_is_ready(summary: &SessionSummary) -> bool {
+    summary.head_seq > 0 && summary.metadata.is_some() && summary.run_state.is_some()
+}
+
+fn session_summary_is_settled(summary: &SessionSummary) -> bool {
+    !matches!(
+        summary.run_state,
+        None | Some(ObserveRunStateWire::Running | ObserveRunStateWire::Unknown)
+    )
+}
+
+fn readiness_count(
+    summaries: &HashMap<String, SessionSummary>,
+    expected_ids: &HashSet<String>,
+) -> usize {
+    summaries
+        .iter()
+        .filter(|(session_id, summary)| {
+            (expected_ids.is_empty() || expected_ids.contains(*session_id))
+                && session_summary_is_ready(summary)
+        })
+        .count()
+}
+
+fn readiness_snapshot(
+    daemon_ready: bool,
+    daemon_generation: u64,
+    count: usize,
+    expected_ids: &HashSet<String>,
+    ready_count: usize,
+    timed_out: bool,
+    summaries: HashMap<String, SessionSummary>,
+) -> SessionReadinessSnapshot {
+    let total_session_count = summaries.len();
+    let mut summaries = summaries.into_values().collect::<Vec<_>>();
+    if !expected_ids.is_empty() {
+        summaries.retain(|summary| expected_ids.contains(summary.session_id.as_str()));
+    }
+    summaries.sort_by(|left, right| left.session_id.as_str().cmp(right.session_id.as_str()));
+    SessionReadinessSnapshot {
+        daemon_ready,
+        daemon_generation,
+        expected_count: if expected_ids.is_empty() {
+            count
+        } else {
+            expected_ids.len()
+        },
+        ready_count,
+        total_session_count,
+        timed_out,
+        summaries,
+    }
 }
 
 async fn list_session_ids(
