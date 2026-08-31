@@ -33,7 +33,6 @@ use crate::session_hub::SessionHub;
 pub(crate) const PLAN_REFRESH_FALLBACK: Duration = Duration::from_secs(60);
 pub(crate) const PLAN_REFRESH_FLOOR: Duration = Duration::from_secs(15);
 const PLAN_RESPONSE_LIMIT: usize = 256 * 1024;
-const PLAN_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PLAN_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,26 +85,21 @@ pub(crate) trait HaiderCodePlanHttp: Send + Sync {
 }
 
 pub(crate) struct ProductionHaiderCodePlanHttp {
-    client: Option<reqwest::Client>,
+    transport: crate::http_transport::SharedHttpTransport,
 }
 
 impl ProductionHaiderCodePlanHttp {
     fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(PLAN_CONNECT_TIMEOUT)
-            .timeout(PLAN_REQUEST_TIMEOUT)
-            .build()
-            .ok();
-        Self { client }
+        Self {
+            transport: crate::http_transport::SharedHttpTransport,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl HaiderCodePlanHttp for ProductionHaiderCodePlanHttp {
     async fn get_account(&self, credential: &SecretHandle) -> PlanFetchOutcome {
-        let Some(client) = &self.client else {
+        let Some(client) = self.transport.client() else {
             return PlanFetchOutcome::Transient(PlanTransientFailure::Network);
         };
         let mut authorization = Zeroizing::new(Vec::with_capacity(
@@ -123,6 +117,7 @@ impl HaiderCodePlanHttp for ProductionHaiderCodePlanHttp {
 
         let response = match client
             .get(HAIDER_CODE_ACCOUNT_URL)
+            .timeout(PLAN_REQUEST_TIMEOUT)
             .header(AUTHORIZATION, header)
             .send()
             .await

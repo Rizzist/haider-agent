@@ -100,19 +100,14 @@ pub(crate) trait UsageMeterHttp: Send + Sync {
 /// redirects, bounded timeouts). A client that cannot be built degrades to
 /// typed unavailability, never a panic.
 pub(crate) struct ReqwestUsageMeterHttp {
-    client: Option<reqwest::Client>,
+    transport: crate::http_transport::SharedHttpTransport,
 }
 
 impl ReqwestUsageMeterHttp {
     pub(crate) fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
-            .build()
-            .ok();
-        Self { client }
+        Self {
+            transport: crate::http_transport::SharedHttpTransport,
+        }
     }
 }
 
@@ -125,7 +120,7 @@ impl UsageMeterHttp for ReqwestUsageMeterHttp {
         extra_headers: &[(&'static str, &'static str)],
         chatgpt_account_id: Option<&str>,
     ) -> Result<(u16, Vec<u8>), MeterUnavailable> {
-        let Some(client) = &self.client else {
+        let Some(client) = self.transport.client() else {
             return Err(MeterUnavailable::new("transport_unavailable"));
         };
         let token = std::str::from_utf8(bearer.expose_secret())
@@ -135,6 +130,7 @@ impl UsageMeterHttp for ReqwestUsageMeterHttp {
         authorization.set_sensitive(true);
         let mut request = client
             .get(url)
+            .timeout(Duration::from_secs(15))
             .header(reqwest::header::AUTHORIZATION, authorization);
         for (name, value) in extra_headers {
             request = request.header(*name, *value);
