@@ -1,0 +1,100 @@
+# qagate3 CI error registry walk
+
+Read against the final uncommitted tree before verification. “checked: none” means this Python-only QA lane does not touch that error surface.
+
+- #1 checked: none — no affected surface in this lane
+- #2 checked: none — no affected surface in this lane
+- #3 checked: none — no affected surface in this lane
+- #4 checked: none — no affected surface in this lane
+- #5 fixed — lazy POSIX harness load after need resolution (`gate/tui_probe.py`)
+- #6 checked: none — no affected surface in this lane
+- #7 checked: none — no Cargo manifest or lockfile change
+- #8 checked: none — no affected surface in this lane
+- #9 checked: none — no affected surface in this lane
+- #10 fixed — Python self-tests and `py_compile`; no dead Rust helpers added
+- #11 checked: none — no affected surface in this lane
+- #12 checked: none — no affected surface in this lane
+- #13 checked: none — no affected surface in this lane
+- #14 checked: none — no affected surface in this lane
+- #15 checked: none — no affected surface in this lane
+- #16 checked: none — no affected surface in this lane
+- #17 checked: none — no affected surface in this lane
+- #18 checked: none — no affected surface in this lane
+- #19 fixed — `git diff --check`; no Rust formatting surface changed
+- #20 checked: none — no Rust test-count change
+- #21 checked: none — no affected surface in this lane
+- #22 checked: none — no tracing/global-state installation
+- #23 checked: none — no affected surface in this lane
+- #24 checked: none — no affected surface in this lane
+- #25 checked: none — no affected surface in this lane
+- #26 checked: none — no affected surface in this lane
+- #27 checked: none — no affected surface in this lane
+- #28 checked: none — no affected surface in this lane
+- #29 fixed — runner-owned status PID and no-orphan cleanup remain authoritative
+- #30 fixed — named action/receipt actuals replace silent timeout-only evidence
+- #31 checked: none — no affected surface in this lane
+- #32 checked: none — no affected surface in this lane
+- #33 fixed — runner metadata extension is additive and self-tested
+- #34 checked: none — no affected surface in this lane
+- #35 checked: none — no affected surface in this lane
+- #36 checked: none — no affected surface in this lane
+- #37 checked: none — no affected surface in this lane
+- #38 checked: none — no Rust collection key seam
+- #39 checked: none — no affected surface in this lane
+- #40 checked: none — no affected surface in this lane
+- #41 fixed — existing short hermetic root contract retained and exercised
+- #42 fixed — installed-binary warmup remains runner-owned
+- #43 checked: none — no affected surface in this lane
+- #44 fixed — real UDS daemon/TUI probes executed in the allowed environment
+- #45 checked: none — no affected surface in this lane
+- #46 checked: none — no affected surface in this lane
+- #47 checked: none — no affected surface in this lane
+- #48 checked: none — no affected surface in this lane
+- #49 checked: none — no affected surface in this lane
+- #50 checked: none — no affected surface in this lane
+- #51 checked: none — no affected surface in this lane
+- #52 fixed — help and every required surface are pinned at 118x36 and 80x24
+- #53 checked: none — no affected surface in this lane
+- #54 checked: none — no affected surface in this lane
+- #55 checked: none — no affected surface in this lane
+- #56 checked: none — no affected surface in this lane
+- #57 fixed — source help list, rendered help, and RPC catalog are reconciled together
+- #58 checked: none — no affected surface in this lane
+- #59 checked: none — no affected surface in this lane
+- #60 checked: none — no affected surface in this lane
+- #61 checked: none — no affected surface in this lane
+- #62 checked: none — no affected surface in this lane
+- #63 checked: none — no affected surface in this lane
+- #64 checked — installed `haider`/`haiderd` inspected before final verdict
+- #65 checked: none — no affected surface in this lane
+- #66 checked: none — no affected surface in this lane
+- #67 checked: none — no affected surface in this lane
+- #68 checked: none — no affected surface in this lane
+- #69 checked: none — no affected surface in this lane
+- #70 checked: none — no affected surface in this lane
+- #71 fixed — real installed artefact is exercised end-to-end, not inferred from tests
+- #72 checked — fake-provider hermetic lane intentionally disables native discovery
+- #73 checked: none — no fixed-byte source window
+- #74 fixed — existing check context supplies throwaway HOME and profile
+- #75 checked: none — no affected surface in this lane
+- #76 checked: none — no affected surface in this lane
+- #77 fixed — repository Python guard/self-test order executed before final run
+- #78 checked: none — no affected surface in this lane
+- #79 checked: none — no affected surface in this lane
+- #80 checked: none — no affected surface in this lane
+- #81 checked: none — no affected surface in this lane
+- #82 checked: none — no affected surface in this lane
+- #83 checked: none — no affected surface in this lane
+- #84 checked: none — no affected surface in this lane
+- #85 checked: none — no affected surface in this lane
+- #86 checked: none — no affected surface in this lane
+- #87 checked: none — no affected surface in this lane
+- #88 checked: none — no affected surface in this lane
+- #89 checked: none — no affected surface in this lane
+- #90 checked: none — no affected surface in this lane
+- #91 checked: none — no affected surface in this lane
+- #92 checked: none — no affected surface in this lane
+- #93 checked: none — no affected surface in this lane
+- #94 fixed — every nested wait is a named product budget; arithmetic is in each check
+- #95 fixed — retained RPC links have a dedicated Ping/Pong reader and continuous request deadline
+
