@@ -717,6 +717,7 @@ fn enter_on_a_partial_arg_command_enters_its_slot() {
             "grok",
             "xai",
             "deepseek",
+            "custom",
         ],
         "slot rows now offered"
     );

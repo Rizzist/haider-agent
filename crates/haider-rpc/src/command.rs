@@ -320,9 +320,32 @@ pub fn offers_arg_completions(name: &str) -> bool {
     matches!(name, "theme" | "model" | "usage" | "effort") || has_arg_slots(name)
 }
 
-fn login_args(slot: usize, fragment: &str) -> Vec<PaletteItem> {
-    let candidates: &[(&str, &str)] = match slot {
-        0 => &[
+fn login_args(slot: usize, provider: &str, fragment: &str) -> Vec<PaletteItem> {
+    const API: &[(&str, &str)] = &[(
+        "api",
+        "paste an API key (masked, stored in the daemon vault)",
+    )];
+    const OAUTH: &[(&str, &str)] = &[(
+        "oauth",
+        "browser sign-in — loopback PKCE (device code for kimi/grok)",
+    )];
+    const API_AND_OAUTH: &[(&str, &str)] = &[
+        (
+            "api",
+            "paste an API key (masked, stored in the daemon vault)",
+        ),
+        (
+            "oauth",
+            "browser sign-in — loopback PKCE (device code for kimi/grok)",
+        ),
+    ];
+    const CUSTOM: &[(&str, &str)] = &[(
+        "api",
+        "name + base URL + optional API key (masked, stored in the daemon vault)",
+    )];
+
+    let candidates: &[(&str, &str)] = match (slot, provider) {
+        (0, _) => &[
             ("anthropic", "Anthropic — Claude (oauth · api)"),
             ("openai", "OpenAI — ChatGPT (oauth · api)"),
             ("gemini", "Google — Gemini (api)"),
@@ -330,14 +353,19 @@ fn login_args(slot: usize, fragment: &str) -> Vec<PaletteItem> {
             ("grok", "xAI — Grok (oauth, device code)"),
             ("xai", "xAI — Grok (api)"),
             ("deepseek", "DeepSeek (api)"),
-        ],
-        1 => &[
-            ("api", "paste an API key (masked, stored in the OS vault)"),
             (
-                "oauth",
-                "browser sign-in — loopback PKCE (device code for kimi/grok)",
+                "custom",
+                "Custom server — name + base URL + optional API key",
             ),
         ],
+        (1, "anthropic" | "openai") => API_AND_OAUTH,
+        (1, "kimi" | "grok") => OAUTH,
+        (1, "custom") => CUSTOM,
+        // Named API-only builtins, plus configured custom providers typed
+        // directly. OAuth is authoritative and finite; API providers can be
+        // added through `provider.configure`, so an unknown name gets the
+        // API-key route rather than a fictitious OAuth choice.
+        (1, _) => API,
         _ => &[],
     };
     candidates
@@ -420,7 +448,7 @@ pub fn palette_items(
             && matches!(matches[0], PaletteItem::Cmd(spec) if spec.name == first)
         {
             return match first.as_str() {
-                "login" => login_args(0, ""),
+                "login" => login_args(0, "", ""),
                 "model" => dynamic_args("model", &slots.models, ""),
                 "provider" => dynamic_args("provider", &slots.providers, ""),
                 "account" => dynamic_args("account", &slots.accounts, ""),
@@ -441,7 +469,9 @@ pub fn palette_items(
     };
     match first.as_str() {
         "theme" if done_args == 0 => theme_args(&fragment),
-        "login" if done_args < 2 => login_args(done_args, &fragment),
+        "login" if done_args < 2 => {
+            login_args(done_args, rest.first().copied().unwrap_or(""), &fragment)
+        }
         "model" if done_args == 0 => dynamic_args("model", &slots.models, &fragment),
         "provider" if in_session && done_args == 0 => {
             dynamic_args("provider", &slots.providers, &fragment)

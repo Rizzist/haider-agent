@@ -163,6 +163,14 @@ fn typing_pasting_and_redrawing_never_put_the_key_on_screen() {
     assert_eq!(pasted.composer.text(), "");
     let text = frame_text(&pasted, 118, 36);
     assert!(!text.contains(SENTINEL), "a pasted key appeared on screen");
+    assert!(
+        text.contains("stored only in the daemon vault"),
+        "the card tells the truth about successful persistence"
+    );
+    assert!(
+        !text.contains("never stored"),
+        "a key is deliberately stored in the daemon vault after validation"
+    );
 
     // A REDRAW after the card closes leaves nothing behind.
     model.handle(key(KeyCode::Esc));

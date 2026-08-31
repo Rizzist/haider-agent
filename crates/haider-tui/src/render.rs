@@ -10787,7 +10787,7 @@ fn login_lines(card: &crate::app::LoginCard, theme: &Theme, width: u16) -> Vec<L
     };
     let hint = match &card.stage {
         LoginStage::Entry => {
-            "    the key is masked and never stored · tab field · ⏎ commit · esc cancel"
+            "    the key is masked · stored only in the daemon vault · tab field · ⏎ commit · esc cancel"
         }
         LoginStage::Submitting => "    staging and validating with the provider…",
         LoginStage::Failed(_) => "    ⏎ try again · tab field · esc cancel",

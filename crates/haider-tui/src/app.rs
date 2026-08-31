@@ -13092,15 +13092,29 @@ impl AppModel {
             // ONE account command this release makes executable.
             "login" => {
                 let mut words = remainder.split_whitespace();
-                let provider = words.next().unwrap_or("");
-                let method = words.next().unwrap_or("");
+                let provider = words.next().unwrap_or("").to_ascii_lowercase();
+                let method = words.next().unwrap_or("").to_ascii_lowercase();
                 let alias = words.next().map(str::to_owned);
-                match (provider, method) {
+                match (provider.as_str(), method.as_str()) {
                     ("", _) => {
                         self.flash = Some(
                             "· /login <provider> <oauth|api> — e.g. /login anthropic api"
                                 .to_owned(),
                         );
+                    }
+                    // The custom route is the existing Accounts add card:
+                    // name + base URL + auth choice + optional masked key.
+                    // Its feature gate, alias allocation, keyless branch,
+                    // staging and daemon configure/login chain remain owned
+                    // by the one AccountAdd arm.
+                    ("custom", "api") => {
+                        self.enter_accounts();
+                        self.handle_hit(Hit::AccountAdd(AccountAddKind::Custom));
+                    }
+                    ("kimi" | "grok", "api") => {
+                        self.flash = Some(format!(
+                            "· /login {provider} api — no API-key flow for this provider; try /login {provider} oauth"
+                        ));
                     }
                     (provider, "api") => self.open_login_card(provider, alias),
                     // B6b/B2b-m3: every `/login <provider> oauth` mirrors
@@ -13132,9 +13146,22 @@ impl AppModel {
                             "· /login {provider} oauth — no OAuth flow for this provider; try /login {provider} api"
                         ));
                     }
+                    // A provider row is the FIRST slot, not a complete
+                    // command. Keep the chosen provider in the composer and
+                    // visibly advance to the provider-aware method slot. This
+                    // covers both palette activation and a directly typed
+                    // `/login <provider>` after the palette was dismissed.
+                    (provider, "") => {
+                        self.composer.set_text(format!("/login {provider} "));
+                        self.palette_selection = 0;
+                        self.palette_scroll = 0;
+                        self.palette_dismissed = false;
+                        self.dirty = true;
+                    }
                     (provider, _) => {
-                        self.flash =
-                            Some(format!("· /login {provider} <oauth|api> — pick a method"));
+                        self.flash = Some(format!(
+                            "· /login {provider} <oauth|api> — pick a supported method"
+                        ));
                     }
                 }
             }
