@@ -3612,9 +3612,9 @@ pub enum AppRequest {
         expected_revision: u64,
     },
     /// F2a: receipted live-session model selection (`session.select_model`)
-    /// — the picker's ⏎ on an attached session. The provider always rides
-    /// along (a picker row IS a model × provider pair); the identity pair
-    /// moves only on the correlated RESOLVED reply.
+    /// — the picker's ⏎ on an exact OAuth row or API-provider-stage row.
+    /// The provider always rides along; the identity pair moves only on the
+    /// correlated RESOLVED reply.
     SelectModel {
         session: SessionId,
         model: String,
@@ -3891,11 +3891,12 @@ pub enum Hit {
     /// One `/effort` picker row (G3).
     EffortOption(usize),
     /// One `/model` picker row (F2a). VALUE-CARRYING (review r2 P2-2): the
-    /// rect holds the pair it was rendered for, so a stale hit map can
-    /// never select a different row.
+    /// rect holds the row identity and whether it was an API aggregate, so a
+    /// stale first-stage hit can never select a provider-stage pair.
     ModelPickerRow {
         provider: String,
         model: String,
+        api_group: bool,
     },
     /// Persistent provider-lockdown status segment.
     LockdownStatus,
@@ -4395,14 +4396,17 @@ pub struct EffortPickerRow {
     pub is_current: bool,
 }
 
-/// The full-screen `/model` picker (F2a): one row per model × provider
-/// pair across EVERY enabled provider, searchable. MODEL-LOCAL overlay —
-/// it owns the keyboard while open (⏎ selects the HIGHLIGHTED row, esc
-/// closes without selecting; the palette's exact-match lead jump never
-/// gets near it — heeded history).
+/// The full-screen `/model` picker (F2a): OAuth subscriptions remain exact
+/// model × provider pairs, while API inventory is one row per model slug and
+/// expands to an API-provider stage when more than one provider serves it.
+/// MODEL-LOCAL overlay — it owns the keyboard while open (⏎ acts on the
+/// HIGHLIGHTED row; esc backs out one stage before closing; the palette's
+/// exact-match lead jump never gets near it — heeded history).
 #[derive(Debug, Default)]
 pub struct ModelPicker {
-    /// Live substring search over model + provider (+ auth flavor).
+    /// Live substring search over model + every represented provider (+ auth
+    /// flavor). The provider stage owns a fresh query and restores this one
+    /// when esc returns to the model list.
     pub query: String,
     /// Index into the FILTERED row list.
     pub selection: usize,
@@ -4417,6 +4421,20 @@ pub struct ModelPicker {
     pub pending: Option<(String, String)>,
     /// Honest inline error — a typed refusal or an unavailability reason.
     pub error: Option<String>,
+    /// Present only while choosing which API provider serves a collapsed
+    /// model slug. Parent navigation is restored exactly on esc.
+    pub provider_stage: Option<ModelProviderStage>,
+}
+
+/// Parent-list state retained while the `/model` picker is choosing an API
+/// provider. The provider-stage query/selection/scroll live in `ModelPicker`
+/// itself so the existing viewport-follow rule is shared by both stages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProviderStage {
+    pub model: String,
+    parent_query: String,
+    parent_selection: usize,
+    parent_scroll: usize,
 }
 
 /// The `/` palette's viewport-follow rule, shared by the `/model` picker: the
@@ -4439,11 +4457,33 @@ pub fn follow_viewport(top: usize, selection: usize, len: usize, window: usize) 
     top.min(max_start)
 }
 
-/// One `/model` picker row: a model × provider pair (or an honest
-/// placeholder for a provider with nothing discovered).
+/// One visible `/model` picker row: an exact OAuth/API provider pair, an API
+/// model-slug aggregate at the first stage, or an honest placeholder for a
+/// provider with nothing discovered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelPickerRow {
+    /// The exact provider for pair rows and the first provider (in registry
+    /// order) for a collapsed API row.
     pub provider: String,
+    /// Every provider represented by this row. Exact pair rows contain one;
+    /// collapsed API rows retain the complete set for provider-name search
+    /// and honest aggregate status.
+    pub providers: Vec<String>,
+    /// Number of represented providers that are both selectable and
+    /// currently available.
+    pub available_providers: usize,
+    /// Number of represented providers currently in lockdown.
+    pub lockdown_providers: usize,
+    /// Number of represented providers that declare this slug as their
+    /// default. Exact rows contain zero or one.
+    pub default_providers: usize,
+    /// The exact live provider when any represented pair is current. This
+    /// keeps the pair visible even when the provider column is aggregated.
+    pub current_provider: Option<String>,
+    /// True when usable providers disagree about the declared context
+    /// window (including known versus unknown). The aggregate must not
+    /// imply that one provider's limit applies to every provider.
+    pub context_window_varies: bool,
     pub lockdown: bool,
     /// The model slug; empty for a provider placeholder row.
     pub model: String,
@@ -13383,10 +13423,10 @@ impl AppModel {
             // W5e-3: choose from the DISCOVERED catalog. Both are
             // feature-gated BEFORE shipping this time (the W5e-1b lesson).
             "model" => {
-                // F2a: `/model [query]` opens the FULL-SCREEN picker —
-                // one row per model × provider pair across every enabled
-                // provider, query pre-filled. An empty registry keeps the
-                // honest flash (stale daemon named when undiscoverable).
+                // F2a: `/model [query]` opens the FULL-SCREEN picker — exact
+                // OAuth subscription rows plus one API choice per model
+                // slug, query pre-filled. An empty registry keeps the honest
+                // flash (stale daemon named when undiscoverable).
                 let requested = remainder.trim().to_owned();
                 if self.providers.providers.is_empty() {
                     self.flash = Some(
@@ -16123,13 +16163,22 @@ impl AppModel {
             // F2a: a picker row click selects exactly the pair the rect
             // was rendered for (value-carrying — a stale map can never
             // select a different row).
-            Hit::ModelPickerRow { provider, model } if self.model_picker.is_some() => {
-                if let Some(row) = self
-                    .model_picker_rows()
-                    .into_iter()
-                    .find(|row| row.provider == provider && row.model == model)
-                {
-                    self.select_model_row(&row);
+            Hit::ModelPickerRow {
+                provider,
+                model,
+                api_group,
+            } if self.model_picker.is_some() => {
+                let in_provider_stage = self
+                    .model_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.provider_stage.is_some());
+                if let Some(row) = self.model_picker_rows().into_iter().find(|row| {
+                    row.provider == provider
+                        && row.model == model
+                        && api_group
+                            == (!in_provider_stage && row.auth == "api" && !row.model.is_empty())
+                }) {
+                    self.activate_model_picker_row(&row);
                 }
             }
             Hit::MenuOption { menu, index } => {
@@ -16690,12 +16739,10 @@ impl AppModel {
         self.dirty = true;
     }
 
-    /// Every `/model` picker row: one per model × provider pair across
-    /// ALL enabled providers (daemon truth — `provider.list` order); an
-    /// enabled provider with nothing discovered contributes one honest
-    /// placeholder row carrying its reason.
-    #[must_use]
-    pub fn model_picker_rows(&self) -> Vec<ModelPickerRow> {
+    /// The daemon's exact model × provider pairs in `provider.list` order.
+    /// This is the lossless source for both picker stages; presentation-only
+    /// grouping never changes the request authority below.
+    fn model_picker_pair_rows(&self) -> Vec<ModelPickerRow> {
         use haider_protocol::credential::AuthMethod;
         let mut rows = Vec::new();
         let now_ms = std::time::SystemTime::now()
@@ -16734,7 +16781,10 @@ impl AppModel {
                 }
             } else {
                 match summary.auth_methods.as_slice() {
-                    [] => "none",
+                    // An unauthenticated endpoint is still API-side for the
+                    // picker's binary metering decision: only OAuth is a
+                    // distinct paid subscription that must remain exact.
+                    [] => "api",
                     [AuthMethod::OAuth] => "oauth",
                     _ => "api",
                 }
@@ -16742,6 +16792,15 @@ impl AppModel {
             if summary.models.is_empty() {
                 rows.push(ModelPickerRow {
                     provider: summary.provider.clone(),
+                    providers: vec![summary.provider.clone()],
+                    available_providers: 0,
+                    lockdown_providers: usize::from(!matches!(
+                        summary.trust,
+                        haider_rpc::ProviderTrustWire::Full
+                    )),
+                    default_providers: 0,
+                    current_provider: None,
+                    context_window_varies: false,
                     lockdown: !matches!(summary.trust, haider_rpc::ProviderTrustWire::Full),
                     model: String::new(),
                     auth,
@@ -16758,6 +16817,17 @@ impl AppModel {
             for model in &summary.models {
                 rows.push(ModelPickerRow {
                     provider: summary.provider.clone(),
+                    providers: vec![summary.provider.clone()],
+                    available_providers: usize::from(available),
+                    lockdown_providers: usize::from(!matches!(
+                        summary.trust,
+                        haider_rpc::ProviderTrustWire::Full
+                    )),
+                    default_providers: usize::from(summary.default_model.as_deref() == Some(model)),
+                    current_provider: (self.identity.provider == summary.provider
+                        && self.identity.model_short == *model)
+                        .then(|| summary.provider.clone()),
+                    context_window_varies: false,
                     lockdown: !matches!(summary.trust, haider_rpc::ProviderTrustWire::Full),
                     model: model.clone(),
                     auth,
@@ -16788,6 +16858,15 @@ impl AppModel {
             {
                 rows.push(ModelPickerRow {
                     provider: summary.provider.clone(),
+                    providers: vec![summary.provider.clone()],
+                    available_providers: 0,
+                    lockdown_providers: usize::from(!matches!(
+                        summary.trust,
+                        haider_rpc::ProviderTrustWire::Full
+                    )),
+                    default_providers: 0,
+                    current_provider: Some(summary.provider.clone()),
+                    context_window_varies: false,
                     lockdown: !matches!(summary.trust, haider_rpc::ProviderTrustWire::Full),
                     model: self.identity.model_short.clone(),
                     auth,
@@ -16804,9 +16883,135 @@ impl AppModel {
         rows
     }
 
+    /// Rows visible in the picker's current stage. The top level preserves
+    /// every OAuth pair and every provider placeholder in source order, but
+    /// emits each API model slug once at its first pair's position. The
+    /// provider stage returns the exact API pairs for its chosen slug.
+    #[must_use]
+    pub fn model_picker_rows(&self) -> Vec<ModelPickerRow> {
+        let pair_rows = self.model_picker_pair_rows();
+        if let Some(stage) = self
+            .model_picker
+            .as_ref()
+            .and_then(|picker| picker.provider_stage.as_ref())
+        {
+            return pair_rows
+                .into_iter()
+                .filter(|row| row.auth == "api" && row.model == stage.model)
+                .collect();
+        }
+
+        enum TopEntry {
+            Exact(ModelPickerRow),
+            ApiGroup(usize),
+        }
+
+        let mut entries = Vec::new();
+        let mut groups: Vec<Vec<ModelPickerRow>> = Vec::new();
+        for row in pair_rows {
+            if row.auth != "api" || row.model.is_empty() {
+                entries.push(TopEntry::Exact(row));
+                continue;
+            }
+            if let Some(index) = groups
+                .iter()
+                .position(|group| group.first().is_some_and(|first| first.model == row.model))
+            {
+                groups[index].push(row);
+            } else {
+                let index = groups.len();
+                groups.push(vec![row]);
+                entries.push(TopEntry::ApiGroup(index));
+            }
+        }
+
+        entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                TopEntry::Exact(row) => Some(row),
+                TopEntry::ApiGroup(index) => Self::collapse_api_group(&groups[index]),
+            })
+            .collect()
+    }
+
+    fn collapse_api_group(group: &[ModelPickerRow]) -> Option<ModelPickerRow> {
+        let first = group.first()?;
+        let ready = |row: &&ModelPickerRow| row.available && row.selectable;
+        let available_providers = group.iter().filter(ready).count();
+        let fact_rows: Vec<&ModelPickerRow> = if available_providers > 0 {
+            group.iter().filter(ready).collect()
+        } else {
+            group.iter().collect()
+        };
+        let first_context_window = fact_rows.first().and_then(|row| row.context_window);
+        let context_window_varies = fact_rows
+            .iter()
+            .any(|row| row.context_window != first_context_window);
+        let context_window = if context_window_varies {
+            None
+        } else {
+            first_context_window
+        };
+        let inventory_age_ms = fact_rows
+            .iter()
+            .filter_map(|row| row.inventory_age_ms)
+            .min();
+        let reason = if available_providers == 0 {
+            if group.len() == 1 {
+                first
+                    .reason
+                    .clone()
+                    .or_else(|| Some("provider unavailable".to_owned()))
+            } else {
+                Some(format!(
+                    "all {} API providers unavailable — {}",
+                    group.len(),
+                    group
+                        .iter()
+                        .map(|row| format!(
+                            "{}: {}",
+                            row.provider,
+                            row.reason.as_deref().unwrap_or("provider unavailable")
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ))
+            }
+        } else {
+            None
+        };
+        let lockdown_providers = group.iter().filter(|row| row.lockdown).count();
+        let default_providers = group.iter().filter(|row| row.is_default).count();
+        let current_provider = group
+            .iter()
+            .find(|row| row.is_current)
+            .map(|row| row.provider.clone());
+
+        Some(ModelPickerRow {
+            provider: first.provider.clone(),
+            providers: group.iter().map(|row| row.provider.clone()).collect(),
+            available_providers,
+            lockdown_providers,
+            default_providers,
+            current_provider,
+            context_window_varies,
+            lockdown: lockdown_providers == group.len(),
+            model: first.model.clone(),
+            auth: "api",
+            context_window,
+            inventory_age_ms,
+            available: available_providers > 0,
+            reason,
+            is_default: default_providers > 0,
+            is_current: group.iter().any(|row| row.is_current),
+            selectable: group.iter().any(|row| row.selectable),
+        })
+    }
+
     /// The picker's LIVE search: case-insensitive; every whitespace-
-    /// separated token must substring-match the row's model + provider
-    /// (+ auth flavor) haystack.
+    /// separated token must substring-match the row's model + every provider
+    /// represented by it (+ auth flavor) haystack. Grouping happens before
+    /// filtering, so a provider-name query never changes aggregate facts.
     #[must_use]
     pub fn model_picker_filtered(&self, query: &str) -> Vec<ModelPickerRow> {
         let needle = query.to_ascii_lowercase();
@@ -16814,8 +17019,8 @@ impl AppModel {
         self.model_picker_rows()
             .into_iter()
             .filter(|row| {
-                let haystack =
-                    format!("{} {} {}", row.model, row.provider, row.auth).to_ascii_lowercase();
+                let haystack = format!("{} {} {}", row.model, row.providers.join(" "), row.auth)
+                    .to_ascii_lowercase();
                 tokens.iter().all(|token| haystack.contains(token))
             })
             .collect()
@@ -16823,14 +17028,26 @@ impl AppModel {
 
     /// KEY-OWNERSHIP LAW (F2a, heeded history): while the picker is open
     /// it owns every key — ⏎ selects the HIGHLIGHTED row (never an
-    /// exact-match jump), esc closes WITHOUT selecting, characters edit
-    /// the search, ↑/↓ move the highlight (wrapping).
+    /// exact-match jump), esc backs out one stage before closing WITHOUT
+    /// selecting, characters edit the search, ↑/↓ move the highlight
+    /// (wrapping).
     fn handle_model_picker_key(&mut self, code: KeyCode) {
         self.dirty = true;
         match code {
             KeyCode::Esc => {
-                // Closes WITHOUT selecting — nothing else moves.
-                self.model_picker = None;
+                let Some(picker) = self.model_picker.as_mut() else {
+                    return;
+                };
+                if let Some(stage) = picker.provider_stage.take() {
+                    picker.query = stage.parent_query;
+                    picker.selection = stage.parent_selection;
+                    picker.scroll.set(stage.parent_scroll);
+                    picker.error = None;
+                } else {
+                    // Top-level esc closes WITHOUT selecting — nothing else
+                    // moves. A provider-stage esc only returned here first.
+                    self.model_picker = None;
+                }
             }
             KeyCode::Up | KeyCode::Down => {
                 let Some(query) = self.model_picker.as_ref().map(|p| p.query.clone()) else {
@@ -16863,7 +17080,7 @@ impl AppModel {
                 }
                 let rows = self.model_picker_filtered(&query);
                 if let Some(row) = rows.get(selection).cloned() {
-                    self.select_model_row(&row);
+                    self.activate_model_picker_row(&row);
                 }
             }
             KeyCode::Tab => {
@@ -16879,12 +17096,18 @@ impl AppModel {
                 if pending {
                     return;
                 }
-                if let Some(provider) = self
-                    .model_picker_filtered(&query)
-                    .get(selection)
-                    .map(|row| row.provider.clone())
-                {
-                    self.toggle_provider_trust(&provider);
+                if let Some(row) = self.model_picker_filtered(&query).get(selection).cloned() {
+                    let is_top_api_choice = self
+                        .model_picker
+                        .as_ref()
+                        .is_some_and(|picker| picker.provider_stage.is_none())
+                        && row.auth == "api"
+                        && !row.model.is_empty();
+                    if is_top_api_choice {
+                        self.activate_model_picker_row(&row);
+                    } else {
+                        self.toggle_provider_trust(&row.provider);
+                    }
                 }
             }
             KeyCode::Backspace => {
@@ -16905,6 +17128,52 @@ impl AppModel {
             }
             _ => {}
         }
+    }
+
+    /// Act on the highlighted visible row without ever sending an aggregate
+    /// provider identity to the existing pair-selection authority.
+    fn activate_model_picker_row(&mut self, row: &ModelPickerRow) {
+        let is_top_api = self
+            .model_picker
+            .as_ref()
+            .is_some_and(|picker| picker.provider_stage.is_none())
+            && row.auth == "api"
+            && !row.model.is_empty();
+        if !is_top_api {
+            self.select_model_row(row);
+            return;
+        }
+        if !row.available || !row.selectable {
+            // An all-unavailable group refuses with its aggregate,
+            // provider-qualified reason instead of opening a useless stage.
+            let reason = row
+                .reason
+                .clone()
+                .unwrap_or_else(|| "API providers unavailable".to_owned());
+            if let Some(picker) = self.model_picker.as_mut() {
+                picker.error = Some(format!("{} — {reason}", row.model));
+            }
+            return;
+        }
+        self.enter_model_provider_stage(&row.model);
+    }
+
+    fn enter_model_provider_stage(&mut self, model: &str) {
+        let Some(picker) = self.model_picker.as_mut() else {
+            return;
+        };
+        if picker.provider_stage.is_some() {
+            return;
+        }
+        picker.provider_stage = Some(ModelProviderStage {
+            model: model.to_owned(),
+            parent_query: std::mem::take(&mut picker.query),
+            parent_selection: picker.selection,
+            parent_scroll: picker.scroll.get(),
+        });
+        picker.selection = 0;
+        picker.scroll.set(0);
+        picker.error = None;
     }
 
     fn toggle_provider_trust(&mut self, provider_name: &str) {

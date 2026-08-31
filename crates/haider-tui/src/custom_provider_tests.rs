@@ -482,6 +482,15 @@ fn provider_list_and_model_picker_both_offer_the_trust_toggle() {
     model.open_model_picker(String::new());
     model.requests.clear();
     key(&mut model, KeyCode::Tab);
+    assert!(
+        model
+            .model_picker
+            .as_ref()
+            .is_some_and(|picker| picker.provider_stage.is_some()),
+        "top-level tab opens the exact API-provider stage"
+    );
+    assert!(model.requests.is_empty(), "opening providers is local-only");
+    key(&mut model, KeyCode::Tab);
     assert!(matches!(
         model.requests.pop(),
         Some(AppRequest::ProviderSetTrust {

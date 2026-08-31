@@ -3691,10 +3691,10 @@ fn render_usage(
     }
 }
 
-/// F2a — the full-screen `/model` picker: search bar on top, one row per
-/// model × provider pair (auth flavor + context window beside), the
-/// session's CURRENT pair and each provider's default marked, unavailable
-/// rows dimmed with their reason, honest inline errors.
+/// F2a — the full-screen `/model` picker: OAuth subscriptions remain exact
+/// rows; API models expand to an exact-provider stage when necessary. Both
+/// stages keep live search, current/pending identity, aggregate availability,
+/// and honest inline errors visible.
 fn render_model_picker(
     model: &AppModel,
     theme: &Theme,
@@ -3708,6 +3708,7 @@ fn render_model_picker(
     if area.height < 4 || area.width < 8 {
         return;
     }
+    let top_level = picker.provider_stage.is_none();
     let rows = model.model_picker_filtered(&picker.query);
     let [title_area, search_area, note_area, list_area, hint_area] = Layout::vertical([
         Constraint::Length(1),
@@ -3718,22 +3719,30 @@ fn render_model_picker(
     ])
     .areas(area);
 
+    let (title, title_note) = if let Some(stage) = &picker.provider_stage {
+        (
+            " PROVIDERS",
+            format!(" — {} · choose which API serves it", stage.model),
+        )
+    } else {
+        (
+            " MODELS",
+            " — OAuth subscriptions + one API choice per model".to_owned(),
+        )
+    };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                " MODELS",
+                title,
                 theme
                     .bright_style()
                     .add_modifier(ratatui::style::Modifier::BOLD),
             ),
-            Span::styled(
-                " — every provider · one line per model × provider pair",
-                theme.dim_style(),
-            ),
+            Span::styled(title_note, theme.dim_style()),
         ])),
         title_area,
     );
-    // The search band: live substring over model + provider.
+    // The search band: live substring over model + represented providers.
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" ❯ ", theme.gold_style()),
@@ -3753,16 +3762,33 @@ fn render_model_picker(
             note_area,
         );
     } else {
+        let count = if top_level {
+            format!(
+                "   {} choices · ⏎ selects OAuth or opens API providers",
+                rows.len()
+            )
+        } else {
+            format!(
+                "   {} API providers · ⏎ selects the highlighted provider",
+                rows.len()
+            )
+        };
         frame.render_widget(
-            Paragraph::new(Line::styled(
-                format!("   {} pairs · ⏎ selects the highlighted row", rows.len()),
-                theme.faint_style(),
-            )),
+            Paragraph::new(Line::styled(count, theme.faint_style())),
             note_area,
         );
     }
 
     // Column budget: model + provider columns sized to content, capped.
+    let is_top_api_group =
+        |row: &crate::app::ModelPickerRow| top_level && row.auth == "api" && !row.model.is_empty();
+    let provider_label = |row: &crate::app::ModelPickerRow| {
+        if is_top_api_group(row) && row.providers.len() > 1 {
+            format!("{} providers", row.providers.len())
+        } else {
+            row.provider.clone()
+        }
+    };
     let model_w = rows
         .iter()
         .map(|row| row.model.chars().count().max(1))
@@ -3771,7 +3797,7 @@ fn render_model_picker(
         .clamp(8, 30);
     let provider_w = rows
         .iter()
-        .map(|row| row.provider.chars().count())
+        .map(|row| provider_label(row).chars().count())
         .max()
         .unwrap_or(8)
         .clamp(8, 22);
@@ -3801,7 +3827,12 @@ fn render_model_picker(
             .pending
             .as_ref()
             .is_some_and(|(provider, model_name)| {
-                *provider == row.provider && *model_name == row.model
+                *model_name == row.model
+                    && if is_top_api_group(row) {
+                        row.providers.contains(provider)
+                    } else {
+                        *provider == row.provider
+                    }
             });
         let hidden_above = offset == 0 && start > 0;
         let hidden_below = offset + 1 == window_len && start + window_len < rows.len();
@@ -3827,7 +3858,13 @@ fn render_model_picker(
         } else {
             row.model.clone()
         };
-        let default_mark = if row.is_default { "*" } else { " " };
+        let default_mark = if row.default_providers > 0 { "*" } else { " " };
+        let provider_cell = provider_label(row);
+        let provider_cell = if row.lockdown {
+            format!("🔒 {provider_cell}")
+        } else {
+            provider_cell
+        };
         let mut spans = vec![
             Span::styled(format!(" {gutter} "), gutter_style),
             Span::styled(
@@ -3844,35 +3881,31 @@ fn render_model_picker(
             ),
             Span::styled(default_mark.to_owned(), theme.gold_style()),
             Span::raw(" "),
-            Span::styled(
-                format!(
-                    "{:<provider_w$}",
-                    if row.lockdown {
-                        format!("🔒 {}", row.provider)
-                    } else {
-                        row.provider.clone()
-                    }
-                ),
-                ink,
-            ),
+            Span::styled(format!("{provider_cell:<provider_w$}"), ink),
             Span::raw(" "),
             Span::styled(format!("{:<5}", row.auth), theme.dim_style()),
             Span::styled(
-                row.context_window.map_or_else(
-                    || format!("{:>8}", "—"),
-                    |window| format!("{:>8}", crate::format::fmt_tok(window)),
-                ),
+                if row.context_window_varies {
+                    format!("{:>8}", "varies")
+                } else {
+                    row.context_window.map_or_else(
+                        || format!("{:>8}", "—"),
+                        |window| format!("{:>8}", crate::format::fmt_tok(window)),
+                    )
+                },
                 theme.dim_style(),
             ),
         ];
-        if let Some(age) = row.inventory_age_ms {
-            spans.push(Span::styled(
-                format!("  age {}", fmt_inventory_age(age)),
-                theme.faint_style(),
-            ));
-        }
         if row.is_current {
-            spans.push(Span::styled("  current", theme.gold_style()));
+            let current = if is_top_api_group(row) && row.providers.len() > 1 {
+                format!(
+                    "  current · {}",
+                    row.current_provider.as_deref().unwrap_or(&row.provider)
+                )
+            } else {
+                "  current".to_owned()
+            };
+            spans.push(Span::styled(current, theme.gold_style()));
         }
         if pending {
             spans.push(Span::styled(
@@ -3880,8 +3913,47 @@ fn render_model_picker(
                 theme.pulse_ink(theme.gold, model.anim_phase),
             ));
         }
+        // Refusal truth is mandatory row grammar; aggregate diagnostics are
+        // optional detail and must never displace it at bounded widths.
         if let Some(reason) = row.reason.as_ref().filter(|_| !row.available) {
             spans.push(Span::styled(format!("  {reason}"), theme.faint_style()));
+        }
+        if is_top_api_group(row) {
+            spans.push(Span::styled(
+                format!(
+                    "  {}/{} available",
+                    row.available_providers,
+                    row.providers.len()
+                ),
+                theme.faint_style(),
+            ));
+            if row.lockdown_providers > 0 {
+                spans.push(Span::styled(
+                    format!(
+                        " · {}/{} lockdown",
+                        row.lockdown_providers,
+                        row.providers.len()
+                    ),
+                    theme.faint_style(),
+                ));
+            }
+            if row.default_providers > 0 {
+                spans.push(Span::styled(
+                    format!(" · {} default", row.default_providers),
+                    theme.faint_style(),
+                ));
+            }
+        }
+        if let Some(age) = row.inventory_age_ms {
+            let label = if is_top_api_group(row) {
+                "freshest age"
+            } else {
+                "age"
+            };
+            spans.push(Span::styled(
+                format!("  {label} {}", fmt_inventory_age(age)),
+                theme.faint_style(),
+            ));
         }
         let mut line = Line::from(spans);
         if selected {
@@ -3906,14 +3978,17 @@ fn render_model_picker(
             Hit::ModelPickerRow {
                 provider: row.provider.clone(),
                 model: row.model.clone(),
+                api_group: top_level && row.auth == "api" && !row.model.is_empty(),
             },
         ));
     }
+    let hint = if top_level {
+        " ⏎ select OAuth / open API providers · tab providers/trust · esc close · ↑↓ move · type to search"
+    } else {
+        " ⏎ select provider · tab toggle trust · esc models · ↑↓ move · type to search"
+    };
     frame.render_widget(
-        Paragraph::new(Line::styled(
-            " ⏎ select · tab toggle trust · esc close · ↑↓ move · type to search",
-            theme.faint_style(),
-        )),
+        Paragraph::new(Line::styled(hint, theme.faint_style())),
         hint_area,
     );
 }

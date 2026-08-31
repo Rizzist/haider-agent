@@ -89,27 +89,44 @@ fn model_slot_follows_the_active_provider() {
 }
 
 #[test]
-fn model_picker_rows_surface_provider_inventory_age() {
+fn model_picker_aggregate_uses_freshest_available_inventory_age() {
     let mut model = model_with_catalog();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_millis();
     let now = u64::try_from(now).expect("clock fits u64");
-    let openai = model
+    let gemini = model
         .providers
         .providers
         .iter_mut()
-        .find(|summary| summary.provider == "openai")
-        .expect("openai summary");
-    openai.inventory_fetched_at_ms = Some(now.saturating_sub(42_000));
-    let age = model
+        .find(|summary| summary.provider == "gemini")
+        .expect("gemini summary");
+    gemini.inventory_fetched_at_ms = Some(now.saturating_sub(42_000));
+    let mut mirror = gemini.clone();
+    mirror.provider = "gemini-mirror".to_owned();
+    mirror.inventory_fetched_at_ms = Some(now.saturating_sub(12_000));
+    model.providers.providers.push(mirror);
+
+    let aggregate = model
+        .model_picker_filtered("gemini-3")
+        .into_iter()
+        .next()
+        .expect("collapsed Gemini row");
+    assert_eq!(aggregate.providers, ["gemini", "gemini-mirror"]);
+    let age = aggregate.inventory_age_ms.expect("aggregate inventory age");
+    assert!((12_000..=13_000).contains(&age));
+
+    model.open_model_picker("gemini-3".to_owned());
+    model.handle(common::key(ratatui::crossterm::event::KeyCode::Enter));
+    let exact_ages: Vec<u64> = model
         .model_picker_rows()
         .into_iter()
-        .find(|row| row.provider == "openai" && !row.model.is_empty())
-        .and_then(|row| row.inventory_age_ms)
-        .expect("inventory age");
-    assert!((42_000..=43_000).contains(&age));
+        .filter_map(|row| row.inventory_age_ms)
+        .collect();
+    assert_eq!(exact_ages.len(), 2, "stage two retains exact ages");
+    assert!((42_000..=43_000).contains(&exact_ages[0]));
+    assert!((12_000..=13_000).contains(&exact_ages[1]));
 }
 
 #[test]
