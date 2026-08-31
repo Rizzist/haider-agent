@@ -37,6 +37,23 @@ impl StartupJournalVisitor for RecordingVisitor {
     }
 }
 
+#[test]
+fn provider_attempt_after_workflow_deferral_remains_fail_closed() {
+    assert!(provider_request_precedes_deferral(Some(20), 21));
+    assert!(
+        !provider_request_precedes_deferral(Some(22), 21),
+        "a later attempt marker means provider delivery may have begun"
+    );
+    assert!(
+        !provider_request_precedes_deferral(Some(21), 21),
+        "an equal coordinate is not a committed-before relationship"
+    );
+    assert!(
+        !provider_request_precedes_deferral(None, 21),
+        "a deferral without a durable provider attempt is corrupt/ambiguous"
+    );
+}
+
 fn fact(
     store: &SqliteStoreHandle,
     session_id: &SessionId,

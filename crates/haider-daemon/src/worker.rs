@@ -248,6 +248,13 @@ pub trait ProviderFactory: Send + Sync {
     /// Gives production factories a chance to delete provider-owned
     /// ephemeral cache resources when a session switches wire families.
     async fn reconcile_cache_scope(&self, _session_id: &SessionId, _provider: &str) {}
+
+    /// Integration-test seam for proving the actor's request-loop budget
+    /// through the real daemon. Production factories keep the core default.
+    #[doc(hidden)]
+    fn max_provider_requests_per_turn_override(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// W-B: session-scoped web-capability degrades (hub-owned, in-memory).
@@ -763,6 +770,14 @@ impl DaemonGraphFinalizationGuard {
 #[async_trait]
 impl FinalizationGuard for DaemonGraphFinalizationGuard {
     async fn before_done(&self, run_id: &RunId) -> Result<FinalizationGuardDecision, HaiderError> {
+        self.before_done_after_requests(run_id, 0).await
+    }
+
+    async fn before_done_after_requests(
+        &self,
+        run_id: &RunId,
+        provider_requests_consumed: usize,
+    ) -> Result<FinalizationGuardDecision, HaiderError> {
         self.reject_exhausted_budget(run_id).await?;
         let outcome = self
             .store
@@ -773,6 +788,8 @@ impl FinalizationGuard for DaemonGraphFinalizationGuard {
                 run_id: run_id.clone(),
                 worker_generation: self.store.worker_generation(),
                 device_id: self.device_id.clone(),
+                provider_requests_consumed: u64::try_from(provider_requests_consumed)
+                    .unwrap_or(u64::MAX),
             })
             .await
             .map_err(hub_error)?;
@@ -820,14 +837,14 @@ fn workflow_unfinished_error(graph_id: &GraphId, state_digest: &str) -> HaiderEr
     let mut error = HaiderError::new(
         ErrorCode::WorkflowUnfinished,
         format!(
-            "workflow_unfinished: graph {graph_id} remains unfinished after its one autonomous continuation (state {state_digest})"
+            "workflow_unfinished: graph {graph_id} repeated the same unfinished workflow state after an autonomous continuation (state {state_digest})"
         ),
         false,
     )
     .with_presentation(ErrorPresentation::new(
         "workflow_unfinished",
         "Workflow remains unfinished",
-        "The workflow still has unmet obligations after one autonomous continuation. It was not abandoned.",
+        "The workflow repeated the same unmet obligations after an autonomous continuation. It was not abandoned.",
         ErrorScope::Turn,
         [ErrorAction::None],
     ));
@@ -1922,6 +1939,9 @@ struct PendingTurn {
     partial_stream: Option<PartialStreamCheckpoint>,
     child_wait: Option<ChildWaitCheckpoint>,
     committed_answer: Option<haider_protocol::envelope::RawEnvelope>,
+    provider_requests_already_made: usize,
+    provider_request_ordinal_already_made: u64,
+    workflow_continuation: bool,
     recovery_ready: Option<oneshot::Sender<Result<(), HaiderError>>>,
     /// Recovery semantics outlive the pre-Ready acknowledgement. In
     /// particular, a queued recovery may be acknowledged behind a parked
@@ -1949,6 +1969,9 @@ impl PendingTurn {
             partial_stream: None,
             child_wait: None,
             committed_answer: None,
+            provider_requests_already_made: 0,
+            provider_request_ordinal_already_made: 0,
+            workflow_continuation: false,
             recovery_ready: None,
             recovering: false,
         }
@@ -1971,6 +1994,9 @@ impl PendingTurn {
             partial_stream: None,
             child_wait: None,
             committed_answer: None,
+            provider_requests_already_made: 0,
+            provider_request_ordinal_already_made: 0,
+            workflow_continuation: false,
             recovery_ready: None,
             recovering: false,
         }
@@ -2252,6 +2278,9 @@ impl WorkerManagerHandle {
             partial_stream: None,
             child_wait: None,
             committed_answer,
+            provider_requests_already_made: 0,
+            provider_request_ordinal_already_made: 0,
+            workflow_continuation: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2272,6 +2301,9 @@ impl WorkerManagerHandle {
             partial_stream: Some(partial_stream),
             child_wait: None,
             committed_answer,
+            provider_requests_already_made: 0,
+            provider_request_ordinal_already_made: 0,
+            workflow_continuation: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2287,6 +2319,32 @@ impl WorkerManagerHandle {
             partial_stream: None,
             child_wait: None,
             committed_answer: None,
+            provider_requests_already_made: 0,
+            provider_request_ordinal_already_made: 0,
+            workflow_continuation: false,
+            recovery_ready: Some(completed),
+            recovering: true,
+        })?;
+        response.await.map_err(|_| manager_stopped())?
+    }
+
+    pub(crate) async fn recover_workflow_continuation(
+        &self,
+        accepted: AcceptedTurn,
+        provider_requests_already_made: usize,
+        provider_request_ordinal_already_made: u64,
+    ) -> Result<(), HaiderError> {
+        let (completed, response) = oneshot::channel();
+        self.send_recovery(PendingTurn {
+            accepted,
+            prompt_run_id: None,
+            checkpoint: None,
+            partial_stream: None,
+            child_wait: None,
+            committed_answer: None,
+            provider_requests_already_made,
+            provider_request_ordinal_already_made,
+            workflow_continuation: true,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2318,6 +2376,9 @@ impl WorkerManagerHandle {
             partial_stream: None,
             child_wait: Some(child_wait),
             committed_answer: None,
+            provider_requests_already_made: 0,
+            provider_request_ordinal_already_made: 0,
+            workflow_continuation: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -4087,7 +4148,8 @@ async fn admit_pending(
     active_run: Option<&RunId>,
     mut pending: PendingTurn,
 ) -> bool {
-    if pending.checkpoint.is_some() || pending.child_wait.is_some() {
+    if pending.checkpoint.is_some() || pending.child_wait.is_some() || pending.workflow_continuation
+    {
         let queue_changed = queue.len() < SUPERVISOR_CAPACITY;
         if queue.len() < SUPERVISOR_CAPACITY {
             queue.push_back(pending);
@@ -6211,6 +6273,9 @@ async fn start_turn(
         partial_stream,
         child_wait,
         mut committed_answer,
+        provider_requests_already_made,
+        provider_request_ordinal_already_made,
+        workflow_continuation: _,
         recovery_ready: _,
         recovering: _,
     } = pending;
@@ -6732,6 +6797,14 @@ async fn start_turn(
     config.max_tokens = metadata.max_tokens;
     config.interaction_policy =
         haider_core::InteractionResolutionPolicy::new(metadata.interaction_mode);
+    config.provider_requests_already_made = provider_requests_already_made;
+    config.provider_request_ordinal_already_made = provider_request_ordinal_already_made;
+    if let Some(limit) = dependencies
+        .provider_factory
+        .max_provider_requests_per_turn_override()
+    {
+        config.max_provider_requests_per_turn = limit;
+    }
     config.reserved_output_tokens = metadata.max_tokens;
     if let Some(window) = config.context_window
         && config.reserved_output_tokens >= window

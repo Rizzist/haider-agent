@@ -202,6 +202,7 @@ fn finalization_command(
         run_id: run_id.clone(),
         worker_generation: store.worker_generation(),
         device_id: DeviceId::new("graph-test"),
+        provider_requests_consumed: 0,
     }
 }
 
@@ -4416,7 +4417,7 @@ fn m2c_first_finalization_defers_and_second_requires_explicit_exit() {
 }
 
 #[test]
-fn autonomous_finalization_continues_once_then_fails_without_abandon_menu() {
+fn autonomous_finalization_continues_after_progress_but_same_state_fails_closed() {
     let root = tempfile::tempdir().expect("tempdir");
     let store = Store::open(root.path()).expect("open store");
     let session_id = create_autonomous_session(&store, "m2c-autonomous-finalization");
@@ -4433,9 +4434,8 @@ fn autonomous_finalization_continues_once_then_fails_without_abandon_menu() {
             ..
         }
     ));
-    // Make real workflow progress so the state digest changes. Autonomous
-    // mode still grants only one continuation for this run, not one per
-    // distinct unfinished digest.
+    // Make real workflow progress so the state digest changes. Each changed
+    // digest is a new durable workflow obligation and may continue.
     let status = store
         .graph_status(&session_id)
         .expect("status after first guard")
@@ -4449,7 +4449,20 @@ fn autonomous_finalization_continues_once_then_fails_without_abandon_menu() {
     let mut serial = 77_000;
     record_catalog_green(&store, &session_id, &next, &mut serial);
     assert!(matches!(
-        store.guard_graph_finalization(&command).expect("recurrence"),
+        store
+            .guard_graph_finalization(&command)
+            .expect("progressed finalization"),
+        GraphFinalizationOutcome::Deferred {
+            emit_reminder: false,
+            ..
+        }
+    ));
+    // Replaying that exact obligation is ambiguous after a crash and proves
+    // no further progress. It remains fail-closed in autonomous mode.
+    assert!(matches!(
+        store
+            .guard_graph_finalization(&command)
+            .expect("same-state recurrence"),
         GraphFinalizationOutcome::WorkflowUnfinished {
             graph_id: returned,
             ..
@@ -5292,6 +5305,7 @@ fn m2c_rollups_count_misgates_overrides_completion_and_abandonment() {
                 graph_id: graph_one.clone(),
                 run_id: RunId::new("run-scripted-one"),
                 state_digest: "state-one".into(),
+                provider_requests_consumed: 0,
                 unmet_nodes: vec![GraphNodeName::new("START").expect("node")],
             }),
         ),
@@ -5324,6 +5338,7 @@ fn m2c_rollups_count_misgates_overrides_completion_and_abandonment() {
                 graph_id: graph_two.clone(),
                 run_id: run_two,
                 state_digest: "state-two".into(),
+                provider_requests_consumed: 0,
                 unmet_nodes: vec![GraphNodeName::new("START").expect("node")],
             }),
         ),

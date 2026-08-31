@@ -145,11 +145,10 @@ fn message_contains_text(message: &haider_provider::Message, expected: &str) -> 
         .any(|block| matches!(block, Block::Text { text } if text == expected))
 }
 
-/// HAIDER962 LAW. MUTATION CHECKS: move the snapshot back to the request tail
-/// or refresh it inside the provider loop. Either mutation rewrites request
-/// two/three's serialized prefix or increments the first-turn refresh count.
+/// HAIDER968 LAW. MUTATION CHECKS: moving refresh back outside the logical
+/// request loop makes the count and per-request snapshot assertions fail.
 #[tokio::test]
-async fn volatile_snapshot_is_append_only_across_tool_rounds_and_refreshes_once_per_turn() {
+async fn volatile_snapshot_refreshes_at_each_logical_request_boundary() {
     let provider = Arc::new(FakeProvider::new(vec![
         FakeStep::EmitToolCall {
             call_id: "round-1".into(),
@@ -208,41 +207,35 @@ async fn volatile_snapshot_is_append_only_across_tool_rounds_and_refreshes_once_
         .expect("first turn completes");
     assert_eq!(
         dispatcher.refresh_count(),
-        1,
-        "all same-turn provider rounds share one snapshot"
+        3,
+        "each same-turn logical provider request refreshes its snapshot"
     );
 
     let first_turn_requests = provider.requests();
     assert_eq!(first_turn_requests.len(), 3);
-    let first_turn_epoch = first_turn_requests[0]
-        .cache_metadata
-        .as_ref()
-        .expect("first-round cache metadata")
-        .cache_epoch
-        .clone();
-    for (round, requests) in first_turn_requests.windows(2).enumerate() {
-        let previous = serde_json::to_vec(&requests[0].messages)
-            .expect("previous provider message prefix serializes");
-        let current = serde_json::to_vec(&requests[1].messages[..requests[0].messages.len()])
-            .expect("current provider message prefix serializes");
-        assert_eq!(
-            current,
-            previous,
-            "provider message prefix changed before tool round {}",
-            round + 2
-        );
-    }
-    for request in &first_turn_requests {
-        let metadata = request.cache_metadata.as_ref().expect("cache metadata");
-        assert_eq!(
-            metadata.cache_epoch, first_turn_epoch,
-            "every same-turn continuation retains the frozen snapshot epoch"
-        );
+    let first_turn_epochs = first_turn_requests
+        .iter()
+        .map(|request| {
+            request
+                .cache_metadata
+                .as_ref()
+                .expect("cache metadata")
+                .cache_epoch
+                .clone()
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        first_turn_epochs.len(),
+        3,
+        "each refreshed logical request declares its exact-view epoch"
+    );
+    for (index, request) in first_turn_requests.iter().enumerate() {
+        let expected = format!("GraphBrief snapshot {}", index + 1);
         let snapshot = request
             .messages
             .iter()
-            .position(|message| message_contains_text(message, "GraphBrief snapshot 1"))
-            .expect("first-turn snapshot is provider-visible");
+            .position(|message| message_contains_text(message, &expected))
+            .expect("current logical-request snapshot is provider-visible");
         let current_user = request
             .messages
             .iter()
@@ -253,10 +246,10 @@ async fn volatile_snapshot_is_append_only_across_tool_rounds_and_refreshes_once_
             request
                 .messages
                 .iter()
-                .filter(|message| message_contains_text(message, "GraphBrief snapshot 1"))
+                .filter(|message| message_contains_text(message, &expected))
                 .count(),
             1,
-            "the frozen snapshot is inserted exactly once per request"
+            "the current snapshot is inserted exactly once per request"
         );
     }
 
@@ -269,8 +262,8 @@ async fn volatile_snapshot_is_append_only_across_tool_rounds_and_refreshes_once_
         .expect("second turn completes");
     assert_eq!(
         dispatcher.refresh_count(),
-        2,
-        "the next turn boundary refreshes exactly once"
+        4,
+        "the next turn's logical request refreshes again"
     );
     let requests = provider.requests();
     assert_eq!(requests.len(), 4);
@@ -281,20 +274,24 @@ async fn volatile_snapshot_is_append_only_across_tool_rounds_and_refreshes_once_
             .as_ref()
             .expect("second-turn cache metadata")
             .cache_epoch,
-        first_turn_epoch,
+        first_turn_requests[2]
+            .cache_metadata
+            .as_ref()
+            .expect("third request cache metadata")
+            .cache_epoch,
         "the accepted turn boundary declares a new snapshot epoch"
     );
     assert!(
         second_turn
             .messages
             .iter()
-            .any(|message| message_contains_text(message, "GraphBrief snapshot 2"))
+            .any(|message| message_contains_text(message, "GraphBrief snapshot 4"))
     );
     assert!(
         second_turn
             .messages
             .iter()
-            .all(|message| !message_contains_text(message, "GraphBrief snapshot 1"))
+            .all(|message| !message_contains_text(message, "GraphBrief snapshot 3"))
     );
 
     handle.stop().await.expect("actor stops");

@@ -3570,6 +3570,14 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
                 )
                 .await
                 .expect("recover partial stream"),
+            RecoveredWork::WorkflowContinuation(recovered) => manager_handle
+                .recover_workflow_continuation(
+                    recovered.accepted,
+                    recovered.provider_requests_consumed,
+                    recovered.provider_request_ordinal,
+                )
+                .await
+                .expect("recover workflow continuation"),
         }
     }
     assert!(resumed_parent, "parent child wait must survive restart");
