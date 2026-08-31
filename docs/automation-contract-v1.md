@@ -191,6 +191,10 @@ and must be placed in the corresponding `Request` or `Response` frame.
 Sources: `wire_transcript.json:95`, `:99`; types
 `crates/haider-rpc/src/frame.rs:3025-3079`, `:4157-4165`.
 
+`haider run --account` and wire `account_alias` name a credential descriptor; a
+no-auth custom provider has no credential alias and is selected with
+`--provider` plus `--model`.
+
 #### `session.list`
 
 ```json wire.request
@@ -459,6 +463,10 @@ ends with exactly one typed terminal discriminator: `success`, `failure`,
 ordinary durable run-state envelope and its sequence; it is not emitted twice
 (`crates/haider-client/src/headless.rs:468-486`;
 `docs/jsonl-run-contract-v1.md:78-102`).
+
+SIGINT semantics are currently undefined for `haider run` and have no binding
+to `turn.cancel`; orchestrators must use `turn.cancel` or the `--timeout`
+budget, and exit 130 is produced only by the product's own cancellation path.
 
 Tool correlation has no Haider-generated substitute ID. The provider call ID
 is `TurnItem::ToolCall.call_id`; argument deltas join through `item_id`, the

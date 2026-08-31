@@ -125,7 +125,9 @@ trusted PID. The harness never uses `pgrep` or `pgrep -f`. The second stop's shi
   a second `not_running`/69 stop, and a no-spawn status probe that remains
   unavailable.
 - `t0.run.exit_codes` records one evidence row for provider error, product
-  timeout, max-time budget, a real client SIGINT, and missing credentials.
+  timeout, max-time budget, a real client SIGINT, and missing credentials. The
+  SIGINT row is a non-gating expected gap until the product defines signal
+  semantics; every other row remains gating.
 - `t0.budget.max_cost_binds_before_request` and
   `t0.budget.max_tokens_binds` count completed durable request-attempt facts,
   require a typed budget terminal before any below-bound exchange, and reserve
@@ -135,11 +137,13 @@ trusted PID. The harness never uses `pgrep` or `pgrep -f`. The second stop's shi
   `expected_fail_until=0.0.968`; this metadata never turns a failure into a
   pass.
 - `t0.sessions.wait_ready_n` starts three sessions and proves both the exact
-  positive barrier document and the finite typed timeout when only two of
-  three scripted sessions can complete.
+  positive barrier document and the distinction between readiness and turn
+  quiescence: three current-format sessions are ready while state counts remain
+  exactly two idle and one running.
 - `t0.account.alias_selects` removes the daemon fake seam and owns two
   loopback-only stdlib OpenAI-compatible listeners, each with a distinct
-  response. The listener implementation is kept below 150 lines.
+  response. Hermetic dummy API-key environment variables create credential
+  descriptors, and the listener implementation is kept below 150 lines.
 - `t0.run.replay_resume_recover` compares durable replay against a read-only
   SQLite source projection, verifies replay consumes no provider request, then
   exercises finite typed resume and recovery commands.
