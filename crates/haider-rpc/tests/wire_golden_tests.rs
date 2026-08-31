@@ -80,6 +80,7 @@ fn status_runtime_fields_are_additive_in_both_client_directions() {
     let current = serde_json::to_value(ResponseBody::StatusSnapshot {
         active_account: None,
         session_count: 3,
+        waiting_for_route_count: 0,
         adoption_available: Vec::new(),
         daemon_pid: Some(4242),
         socket_path: Some("/tmp/haider/h.sock".into()),

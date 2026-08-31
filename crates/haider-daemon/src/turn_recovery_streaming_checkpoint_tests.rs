@@ -84,6 +84,384 @@ fn fact(
     }
 }
 
+fn extension_fact(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    run_id: &RunId,
+    event_id: &str,
+    kind: &str,
+    data: serde_json::Value,
+) -> RawEnvelope {
+    fact(
+        store,
+        session_id,
+        run_id,
+        event_id,
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new(format!("{event_id}-item")),
+            item: TurnItem::Extension {
+                kind: kind.into(),
+                data,
+            },
+        }),
+    )
+}
+
+#[tokio::test]
+async fn daemon_restart_preserves_route_wait_with_partial_and_completed_tool_effects() {
+    let root = tempfile::tempdir().expect("profile");
+    let first = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("first store");
+    let session_id = SessionId::new("route-wait-restart");
+    let run_id = RunId::new("route-wait-run");
+    let item_id = ItemId::new("route-wait-message");
+    let tool_item_id = ItemId::new("route-wait-tool");
+    let completed_tool_item_id = ItemId::new("route-wait-completed-tool");
+    let device_id = DeviceId::new("route-wait-device");
+    first
+        .create_session(haider_core::SessionCreateCommand {
+            command_id: "create-route-wait".into(),
+            request_digest: "create-route-wait-digest".into(),
+            request_json: r#"{"session":"route-wait"}"#.into(),
+            session_id: session_id.clone(),
+            cwd: std::env::current_dir()
+                .expect("cwd")
+                .to_string_lossy()
+                .into_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new("create-route-wait-event"),
+            device_id: device_id.clone(),
+        })
+        .await
+        .expect("create session");
+    let completed_args = serde_json::json!({"path":"completed.rs"});
+    let completed_result = haider_protocol::tool::BoundedResult {
+        preview: "completed once".into(),
+        truncated: false,
+        data: None,
+        artifact: None,
+        images: Vec::new(),
+        cursor: None,
+        status: haider_protocol::tool::ToolResultStatus::Completed,
+        reason: None,
+        presentation: None,
+    };
+    let request_attempt = CacheRequestAttemptV1 {
+        ordinal: 11,
+        diagnostic: haider_protocol::provider::CacheRequestDiagnosticV1 {
+            history_message_count: 1,
+            stable_prefix_tokens: 8,
+            breakpoint_hashes: Default::default(),
+            cache_domain_hash: Some("route-wait-domain".into()),
+            cache_domain_changed: None,
+            previous_breakpoint: None,
+            prefix_match: haider_protocol::provider::CachePrefixMatchV1::Unavailable,
+            control: haider_protocol::provider::CacheControlObservationV1::NotRequired,
+            cacheable_minimum_tokens: None,
+            reuse_gap_ms: None,
+            rewarm: None,
+            classification: None,
+        },
+    }
+    .extension_item()
+    .expect("cache request attempt");
+    let mut interrupted = vec![
+        fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-wait-user",
+            EventPayload::UserMessage {
+                text: "keep going after reconnect".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Steer,
+            },
+        ),
+        fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-wait-request-attempt",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("route-wait-request-attempt-item"),
+                item: request_attempt,
+            }),
+        ),
+        fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-wait-item-started",
+            EventPayload::Item(ItemEvent::Started {
+                item_id: item_id.clone(),
+                item: TurnItem::AgentMessage {
+                    text: String::new(),
+                },
+            }),
+        ),
+        extension_fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-replay-attempt",
+            ROUTE_REPLAY_ATTEMPT_EXTENSION_KIND,
+            serde_json::json!({"response_epoch": 7}),
+        ),
+        fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-wait-item-delta",
+            EventPayload::Item(ItemEvent::Delta {
+                item_id: item_id.clone(),
+                delta: ItemDelta::Text {
+                    text: "durable ".into(),
+                },
+            }),
+        ),
+        fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-wait-item-second-delta",
+            EventPayload::Item(ItemEvent::Delta {
+                item_id: item_id.clone(),
+                delta: ItemDelta::Text {
+                    text: "prefix".into(),
+                },
+            }),
+        ),
+        fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-wait-item-completed-before-tool",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id,
+                item: TurnItem::AgentMessage {
+                    text: "durable prefix".into(),
+                },
+            }),
+        ),
+        extension_fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-replay-partial-start",
+            ROUTE_REPLAY_EVENT_EXTENSION_KIND,
+            serde_json::json!({
+                "response_epoch": 7,
+                "stream_event": StreamEvent::ToolCallStart {
+                    call_id: "route-tool-call".into(),
+                    name: "inspect".into(),
+                }
+            }),
+        ),
+        fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-wait-tool-started",
+            EventPayload::Item(ItemEvent::Started {
+                item_id: tool_item_id.clone(),
+                item: TurnItem::ToolCall {
+                    call_id: "route-tool-call".into(),
+                    name: "inspect".into(),
+                    args: serde_json::json!({}),
+                    status: ToolStatus::InProgress,
+                },
+            }),
+        ),
+        extension_fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-replay-partial-args",
+            ROUTE_REPLAY_EVENT_EXTENSION_KIND,
+            serde_json::json!({
+                "response_epoch": 7,
+                "stream_event": StreamEvent::ToolCallArgsDelta {
+                    call_id: "route-tool-call".into(),
+                    args_fragment: r#"{"path":"src"#.into(),
+                }
+            }),
+        ),
+        fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-wait-completed-tool-started",
+            EventPayload::Item(ItemEvent::Started {
+                item_id: completed_tool_item_id.clone(),
+                item: TurnItem::ToolCall {
+                    call_id: "completed-before-restart".into(),
+                    name: "inspect".into(),
+                    args: serde_json::json!({}),
+                    status: ToolStatus::InProgress,
+                },
+            }),
+        ),
+        extension_fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-replay-completed-start",
+            ROUTE_REPLAY_EVENT_EXTENSION_KIND,
+            serde_json::json!({
+                "response_epoch": 7,
+                "stream_event": StreamEvent::ToolCallStart {
+                    call_id: "completed-before-restart".into(),
+                    name: "inspect".into(),
+                }
+            }),
+        ),
+        fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-wait-completed-tool-delta",
+            EventPayload::Item(ItemEvent::Delta {
+                item_id: completed_tool_item_id.clone(),
+                delta: ItemDelta::ToolArgs {
+                    fragment: completed_args.to_string(),
+                },
+            }),
+        ),
+        extension_fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-replay-completed-args",
+            ROUTE_REPLAY_EVENT_EXTENSION_KIND,
+            serde_json::json!({
+                "response_epoch": 7,
+                "stream_event": StreamEvent::ToolCallArgsDelta {
+                    call_id: "completed-before-restart".into(),
+                    args_fragment: completed_args.to_string(),
+                }
+            }),
+        ),
+        fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-wait-completed-tool-closed",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: completed_tool_item_id,
+                item: TurnItem::ToolCall {
+                    call_id: "completed-before-restart".into(),
+                    name: "inspect".into(),
+                    args: completed_args.clone(),
+                    status: ToolStatus::Completed,
+                },
+            }),
+        ),
+        fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-wait-completed-tool-result",
+            EventPayload::ToolResult {
+                call_id: "completed-before-restart".into(),
+                result: completed_result.clone(),
+            },
+        ),
+        extension_fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-replay-completed-end",
+            ROUTE_REPLAY_EVENT_EXTENSION_KIND,
+            serde_json::json!({
+                "response_epoch": 7,
+                "stream_event": StreamEvent::ToolCallEnd {
+                    call_id: "completed-before-restart".into(),
+                }
+            }),
+        ),
+        fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-wait-tool-delta",
+            EventPayload::Item(ItemEvent::Delta {
+                item_id: tool_item_id.clone(),
+                delta: ItemDelta::ToolArgs {
+                    fragment: r#"{"path":"src"#.into(),
+                },
+            }),
+        ),
+        fact(
+            &first,
+            &session_id,
+            &run_id,
+            "route-wait-state",
+            EventPayload::RunState(RunState::Waiting {
+                reason: WaitReason::NetworkUnavailable,
+            }),
+        ),
+    ];
+    StoreHandle::append(&first, &mut interrupted)
+        .await
+        .expect("append interrupted wait");
+    first.close().await.expect("close first generation");
+
+    let recovered_store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen store");
+    let recovered = recover_interrupted_turns(&recovered_store, &device_id)
+        .await
+        .expect("recover route wait");
+    let [RecoveredWork::RouteWait(recovered)] = recovered.as_slice() else {
+        panic!("expected exactly one route-wait recovery");
+    };
+    assert_eq!(recovered.accepted.run_id, run_id);
+    assert_eq!(recovered.provider_requests_consumed, 8);
+    assert_eq!(recovered.provider_request_ordinal, 11);
+    assert_eq!(recovered.checkpoint.message, None);
+    assert_eq!(recovered.checkpoint.response_epoch, 7);
+    assert_eq!(recovered.checkpoint.structured_events.len(), 7);
+    assert_eq!(
+        recovered.checkpoint.completed_tools,
+        [RouteWaitCompletedToolCheckpoint {
+            call_id: "completed-before-restart".into(),
+            name: "inspect".into(),
+            args: completed_args,
+            result: Some(completed_result),
+        }]
+    );
+    assert_eq!(
+        recovered.checkpoint.tools,
+        [RouteWaitToolCheckpoint {
+            item_id: tool_item_id,
+            call_id: "route-tool-call".into(),
+            name: "inspect".into(),
+            args: r#"{"path":"src"#.into(),
+        }]
+    );
+    let events = StoreHandle::read(&recovered_store, &session_id, 0, 128)
+        .await
+        .expect("read recovered journal");
+    assert!(events.iter().any(|event| matches!(
+        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        Ok(EventPayload::RunState(RunState::Waiting {
+            reason: WaitReason::NetworkUnavailable
+        }))
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        Ok(EventPayload::RunFailed { .. } | EventPayload::RunState(RunState::Errored))
+    )));
+}
+
 #[tokio::test]
 async fn turn_recovery_checkpoint_resumes_at_its_journal_high_water() {
     let root = tempfile::tempdir().expect("profile");

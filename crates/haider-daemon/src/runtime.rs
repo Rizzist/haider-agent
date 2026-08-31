@@ -1146,6 +1146,16 @@ async fn run_inner(
                     )
                     .await
             }
+            RecoveredWork::RouteWait(recovered) => {
+                worker_handle
+                    .recover_route_wait(
+                        recovered.accepted,
+                        recovered.checkpoint,
+                        recovered.provider_requests_consumed,
+                        recovered.provider_request_ordinal,
+                    )
+                    .await
+            }
             RecoveredWork::ChildWait(recovered) => {
                 worker_handle
                     .recover_child_wait(recovered.accepted, recovered.checkpoint)

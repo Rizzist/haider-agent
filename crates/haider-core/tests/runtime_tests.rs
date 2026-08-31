@@ -6,9 +6,11 @@ use haider_core::{
     FinalizationGuardDecision, HarnessActor, HarnessConfig, HarnessHandle, MemoryStore,
     PromptHistoryCompiler, ProviderAttemptDecision, ProviderAttemptResolver, ProviderPairSwitch,
     ProviderPairSwitchCause, ProviderPairSwitchCommitter, ProviderPairSwitchTarget,
-    ResolvedProviderAttempt, StoreHandle, SubmitCommittedTurn, SubmitTurn, ToolDispatchResult,
+    ResolvedProviderAttempt, RouteWaitCheckpoint, RouteWaitTextCheckpoint, RouteWaitToolCheckpoint,
+    StoreHandle, SubmitCommittedTurn, SubmitRouteWaitTurn, SubmitTurn, ToolDispatchResult,
     ToolDispatcher, VISION_IMAGE_ESTIMATE_TOKENS, estimate_provider_request_input_tokens,
 };
+use haider_platform::RouteStatus;
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::cache::CACHE_REQUEST_ATTEMPT_EXTENSION_KIND;
@@ -391,7 +393,7 @@ async fn full_turn_commits_exact_projected_sequence() {
         .await
         .expect("turn accepted");
     let outcome = turn.wait().await.expect("actor reports outcome");
-    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(outcome.state, RunState::Done, "outcome: {outcome:?}");
     assert_eq!(outcome.finish_reason, FinishReason::ToolUse);
 
     let events = store.events(&SessionId::new(SESSION)).await;
@@ -508,11 +510,79 @@ async fn full_turn_commits_exact_projected_sequence() {
         }),
         serde_json::json!({
             "type":"item",
+            "event":"started",
+            "item_id":"<item>",
+            "item":{
+                "item":"extension",
+                "kind":"haider.route_replay_event.v1",
+                "data":{
+                    "response_epoch":0,
+                    "stream_event":{
+                        "event":"tool_call_start",
+                        "call_id":"call-1",
+                        "name":"inspect"
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "type":"item",
+            "event":"completed",
+            "item_id":"<item>",
+            "item":{
+                "item":"extension",
+                "kind":"haider.route_replay_event.v1",
+                "data":{
+                    "response_epoch":0,
+                    "stream_event":{
+                        "event":"tool_call_start",
+                        "call_id":"call-1",
+                        "name":"inspect"
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "type":"item",
             "event":"delta",
             "item_id":"<item>",
             "delta":{
                 "delta":"tool_args",
                 "fragment":"{\"path\":\"src/lib.rs\"}"
+            }
+        }),
+        serde_json::json!({
+            "type":"item",
+            "event":"started",
+            "item_id":"<item>",
+            "item":{
+                "item":"extension",
+                "kind":"haider.route_replay_event.v1",
+                "data":{
+                    "response_epoch":0,
+                    "stream_event":{
+                        "event":"tool_call_args_delta",
+                        "call_id":"call-1",
+                        "args_fragment":"{\"path\":\"src/lib.rs\"}"
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "type":"item",
+            "event":"completed",
+            "item_id":"<item>",
+            "item":{
+                "item":"extension",
+                "kind":"haider.route_replay_event.v1",
+                "data":{
+                    "response_epoch":0,
+                    "stream_event":{
+                        "event":"tool_call_args_delta",
+                        "call_id":"call-1",
+                        "args_fragment":"{\"path\":\"src/lib.rs\"}"
+                    }
+                }
             }
         }),
         serde_json::json!({
@@ -535,6 +605,38 @@ async fn full_turn_commits_exact_projected_sequence() {
                 "kind":"tool_exchange",
                 "tool":"inspect",
                 "summary":"tool call settled as Pending"
+            }
+        }),
+        serde_json::json!({
+            "type":"item",
+            "event":"started",
+            "item_id":"<item>",
+            "item":{
+                "item":"extension",
+                "kind":"haider.route_replay_event.v1",
+                "data":{
+                    "response_epoch":0,
+                    "stream_event":{
+                        "event":"tool_call_end",
+                        "call_id":"call-1"
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "type":"item",
+            "event":"completed",
+            "item_id":"<item>",
+            "item":{
+                "item":"extension",
+                "kind":"haider.route_replay_event.v1",
+                "data":{
+                    "response_epoch":0,
+                    "stream_event":{
+                        "event":"tool_call_end",
+                        "call_id":"call-1"
+                    }
+                }
             }
         }),
         serde_json::json!({
@@ -2033,6 +2135,36 @@ impl ToolDispatcher for CompletingDispatcher {
     }
 }
 
+struct CountingCompletingDispatcher {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl ToolDispatcher for CountingCompletingDispatcher {
+    async fn execute(
+        &self,
+        _run_id: &RunId,
+        _item_id: &ItemId,
+        _call_id: &str,
+        _name: &str,
+        _args: serde_json::Value,
+        _cancel: &haider_core::CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolDispatchResult::Completed(BoundedResult {
+            preview: "done once".into(),
+            truncated: false,
+            data: None,
+            artifact: None,
+            images: Vec::new(),
+            cursor: None,
+            status: haider_protocol::tool::ToolResultStatus::Completed,
+            reason: None,
+            presentation: None,
+        }))
+    }
+}
+
 struct DelayedCompletingDispatcher {
     delay: Duration,
 }
@@ -2691,27 +2823,48 @@ async fn transport_error_after_first_event_is_typed_failure_not_input_required()
 
 #[tokio::test]
 async fn link_drop_mid_stream_is_waiting_not_a_provider_fault() {
-    let (handle, store, provider) = runtime(vec![
-        FakeStep::EmitText {
-            text: "before".into(),
-        },
-        FakeStep::EmitNetworkUnavailable,
-        FakeStep::Delay { ms: 10 },
-        FakeStep::EmitNetworkRestored,
-        FakeStep::EmitText {
-            text: " after".into(),
-        },
-        FakeStep::Finish {
-            reason: FinishReason::EndTurn,
-        },
-    ]);
-    let outcome = handle
+    let route = Arc::new(Mutex::new(RouteStatus::Unavailable));
+    let provider = Arc::new(
+        FakeProvider::new(vec![
+            FakeStep::EmitText {
+                text: "before".into(),
+            },
+            FakeStep::EmitNetworkUnavailable,
+            FakeStep::Delay { ms: 250 },
+            FakeStep::EmitNetworkRestored,
+            FakeStep::EmitText {
+                text: " after".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ])
+        .with_route_status(Arc::clone(&route)),
+    );
+    let store = Arc::new(MemoryStore::new());
+    let handle = HarnessActor::spawn(config(), provider.clone(), store.clone());
+    let mut states = handle.state_receiver();
+    let turn = handle
         .submit_turn(SubmitTurn::new("survive a local link drop"))
         .await
-        .expect("turn accepted")
-        .wait()
-        .await
-        .expect("outcome");
+        .expect("turn accepted");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                states.borrow().as_ref(),
+                Some(RunState::Waiting {
+                    reason: WaitReason::NetworkUnavailable
+                })
+            ) {
+                break;
+            }
+            states.changed().await.expect("state sender remains open");
+        }
+    })
+    .await
+    .expect("eight 250ms observations reveal the route wait");
+    *route.lock().expect("route lock") = RouteStatus::Available;
+    let outcome = turn.wait().await.expect("outcome");
     assert_eq!(outcome.state, RunState::Done);
     assert_eq!(provider.requests().len(), 1, "link recovery never replays");
 
@@ -2747,6 +2900,800 @@ async fn link_drop_mid_stream_is_waiting_not_a_provider_fault() {
         !payloads
             .iter()
             .any(|payload| matches!(payload, EventPayload::RunFailed { .. }))
+    );
+    handle.stop().await.expect("actor stops");
+}
+
+#[tokio::test]
+async fn network_transport_break_mid_stream_waits_resumes_same_run_without_duplicate_transcript() {
+    let route = Arc::new(Mutex::new(RouteStatus::Unavailable));
+    let provider = Arc::new(
+        FakeProvider::new(vec![
+            FakeStep::EmitText {
+                text: "before".into(),
+            },
+            FakeStep::Error {
+                kind: ProviderErrorKind::NetworkUnavailable,
+                message: "connection reset".into(),
+                retry_after_ms: None,
+            },
+            FakeStep::EmitText {
+                text: "before after".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ])
+        .with_route_status(route.clone()),
+    );
+    let store = Arc::new(MemoryStore::new());
+    let handle = HarnessActor::spawn(config(), provider.clone(), store.clone());
+    let mut states = handle.state_receiver();
+    let turn = handle
+        .submit_turn(SubmitTurn::new("resume after reconnect"))
+        .await
+        .expect("turn accepted");
+    timeout(
+        // Outer observation bound = 8 × the 250ms route backstop period.
+        Duration::from_secs(2),
+        async {
+            loop {
+                if matches!(
+                    states.borrow().as_ref(),
+                    Some(RunState::Waiting {
+                        reason: WaitReason::NetworkUnavailable
+                    })
+                ) {
+                    break;
+                }
+                states.changed().await.expect("state sender remains open");
+            }
+        },
+    )
+    .await
+    .expect("route wait becomes visible");
+    *route.lock().expect("route lock") = RouteStatus::Available;
+
+    let outcome = timeout(
+        // Completion bound = 8 × the 250ms route backstop period.
+        Duration::from_secs(2),
+        turn.wait(),
+    )
+    .await
+    .expect("resumed turn completes")
+    .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0], requests[1],
+        "the provider view is replayed exactly"
+    );
+
+    let completed_text = store
+        .events(&SessionId::new(SESSION))
+        .await
+        .into_iter()
+        .filter_map(|event| match typed(&event) {
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::AgentMessage { text },
+                ..
+            }) => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(completed_text, ["before after"]);
+    handle.stop().await.expect("actor stops");
+}
+
+#[tokio::test]
+async fn network_break_after_tool_effect_replays_without_redispatch() {
+    let route = Arc::new(Mutex::new(RouteStatus::Unavailable));
+    let call = FakeStep::EmitToolCall {
+        call_id: "resume-tool".into(),
+        name: "inspect".into(),
+        args: serde_json::json!({"path":"src/lib.rs"}),
+    };
+    let provider = Arc::new(
+        FakeProvider::new(vec![
+            FakeStep::EmitText {
+                text: "before structured tool".into(),
+            },
+            call.clone(),
+            FakeStep::Error {
+                kind: ProviderErrorKind::NetworkUnavailable,
+                message: "connection reset after tool completion".into(),
+                retry_after_ms: None,
+            },
+            FakeStep::EmitText {
+                text: "before structured tool".into(),
+            },
+            call,
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::ExpectToolResult {
+                call_id: "resume-tool".into(),
+            },
+            FakeStep::EmitText {
+                text: "tool result retained".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ])
+        .with_route_status(route.clone()),
+    );
+    let dispatcher = Arc::new(CountingCompletingDispatcher {
+        calls: AtomicUsize::new(0),
+    });
+    let store = Arc::new(MemoryStore::new());
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        config(),
+        provider.clone(),
+        store.clone(),
+        Some(dispatcher.clone()),
+    );
+    let actor_task = tokio::spawn(actor.run());
+    let mut states = handle.state_receiver();
+    let turn = handle
+        .submit_turn(SubmitTurn::new("resume structured output"))
+        .await
+        .expect("turn accepted");
+    timeout(
+        // Outer observation bound = 8 × the 250ms route backstop period.
+        Duration::from_secs(2),
+        async {
+            loop {
+                if matches!(
+                    states.borrow().as_ref(),
+                    Some(RunState::Waiting {
+                        reason: WaitReason::NetworkUnavailable
+                    })
+                ) {
+                    break;
+                }
+                states.changed().await.expect("state sender remains open");
+            }
+        },
+    )
+    .await
+    .expect("route wait becomes visible");
+    *route.lock().expect("route lock") = RouteStatus::Available;
+
+    let outcome = timeout(
+        // Completion bound = 8 × the 250ms route backstop period.
+        Duration::from_secs(2),
+        turn.wait(),
+    )
+    .await
+    .expect("resumed structured turn completes")
+    .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.requests().len(), 3);
+
+    let payloads = store
+        .events(&SessionId::new(SESSION))
+        .await
+        .into_iter()
+        .map(|event| typed(&event))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|payload| matches!(
+                payload,
+                EventPayload::Item(ItemEvent::Started {
+                    item: TurnItem::ToolCall { call_id, .. },
+                    ..
+                }) if call_id == "resume-tool"
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|payload| matches!(
+                payload,
+                EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::ToolCall { call_id, .. },
+                    ..
+                }) if call_id == "resume-tool"
+            ))
+            .count(),
+        1
+    );
+    let completed_text = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::AgentMessage { text },
+                ..
+            }) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completed_text,
+        ["before structured tool", "tool result retained"]
+    );
+    handle.stop().await.expect("actor stops");
+    actor_task.await.expect("actor task joins");
+}
+
+#[tokio::test]
+async fn recovered_route_wait_does_not_reissue_until_route_returns() {
+    let route = Arc::new(Mutex::new(RouteStatus::Unavailable));
+    let provider = Arc::new(
+        FakeProvider::new(vec![
+            FakeStep::EmitText {
+                text: "durable prefix after".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ])
+        .with_route_status(route.clone()),
+    );
+    let store = Arc::new(MemoryStore::new());
+    let handle = HarnessActor::spawn(config(), provider.clone(), store.clone());
+    let turn = handle
+        .submit_route_wait_turn(SubmitRouteWaitTurn {
+            run_id: RunId::new("recovered-route-wait"),
+            messages: vec![Message::user_text("continue recovered run")],
+            checkpoint: RouteWaitCheckpoint {
+                message: Some(RouteWaitTextCheckpoint {
+                    item_id: ItemId::new("recovered-message"),
+                    text: "durable prefix".into(),
+                }),
+                reasoning: None,
+                tools: Vec::new(),
+                ..RouteWaitCheckpoint::default()
+            },
+        })
+        .await
+        .expect("recovered route wait accepted");
+
+    // Proof window = 2 × the 250ms cached-route backstop period. The second
+    // observation demonstrates that recovery remains parked without reissue.
+    sleep(Duration::from_millis(500)).await;
+    assert!(provider.requests().is_empty());
+    *route.lock().expect("route lock") = RouteStatus::Available;
+
+    let outcome = timeout(
+        // Completion bound = 8 × the 250ms route backstop period.
+        Duration::from_secs(2),
+        turn.wait(),
+    )
+    .await
+    .expect("recovered turn completes")
+    .expect("recovered outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(provider.requests().len(), 1);
+    let completed_text = store
+        .events(&SessionId::new(SESSION))
+        .await
+        .into_iter()
+        .filter_map(|event| match typed(&event) {
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::AgentMessage { text },
+                ..
+            }) => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(completed_text, ["durable prefix after"]);
+    handle.stop().await.expect("actor stops");
+}
+
+#[tokio::test]
+async fn recovered_route_wait_rebuilds_completed_and_open_text_in_event_order() {
+    let route = Arc::new(Mutex::new(RouteStatus::Unavailable));
+    let provider = Arc::new(
+        FakeProvider::new(vec![
+            FakeStep::EmitText { text: "A".into() },
+            FakeStep::EmitProviderOpaque {
+                provider: "fake".into(),
+                data: serde_json::json!({"state":"between"}),
+            },
+            FakeStep::EmitText { text: "B".into() },
+            FakeStep::EmitText { text: "C".into() },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ])
+        .with_route_status(route.clone()),
+    );
+    let store = Arc::new(MemoryStore::new());
+    let handle = HarnessActor::spawn(config(), provider.clone(), store.clone());
+    let turn = handle
+        .submit_route_wait_turn(SubmitRouteWaitTurn {
+            run_id: RunId::new("recovered-mixed-text-route-wait"),
+            messages: vec![Message::user_text("continue mixed response")],
+            checkpoint: RouteWaitCheckpoint {
+                message: Some(RouteWaitTextCheckpoint {
+                    item_id: ItemId::new("recovered-open-message"),
+                    text: "B".into(),
+                }),
+                structured_events: vec![
+                    haider_protocol::provider::StreamEvent::TextDelta { text: "A".into() },
+                    haider_protocol::provider::StreamEvent::ProviderOpaque {
+                        provider: "fake".into(),
+                        data: serde_json::json!({"state":"between"}),
+                    },
+                    haider_protocol::provider::StreamEvent::TextDelta { text: "B".into() },
+                ],
+                response_epoch: 3,
+                ..RouteWaitCheckpoint::default()
+            },
+        })
+        .await
+        .expect("mixed response recovery accepted");
+
+    // Proof window = 2 × the 250ms cached-route backstop period.
+    sleep(Duration::from_millis(500)).await;
+    assert!(provider.requests().is_empty());
+    *route.lock().expect("route lock") = RouteStatus::Available;
+
+    let outcome = timeout(
+        // Completion bound = 8 × the 250ms route backstop period.
+        Duration::from_secs(2),
+        turn.wait(),
+    )
+    .await
+    .expect("mixed response recovery completes")
+    .expect("mixed response outcome");
+    assert_eq!(outcome.state, RunState::Done, "outcome: {outcome:?}");
+    assert_eq!(provider.requests().len(), 1);
+    let completed_text = store
+        .events(&SessionId::new(SESSION))
+        .await
+        .into_iter()
+        .filter_map(|event| match typed(&event) {
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::AgentMessage { text },
+                ..
+            }) => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(completed_text, ["BC"]);
+    handle.stop().await.expect("actor stops");
+}
+
+#[tokio::test]
+async fn recovered_route_wait_restores_partial_tool_without_duplicate_dispatch() {
+    let route = Arc::new(Mutex::new(RouteStatus::Unavailable));
+    let provider = Arc::new(
+        FakeProvider::new(vec![
+            FakeStep::EmitToolCallStart {
+                call_id: "recovered-tool".into(),
+                name: "inspect".into(),
+            },
+            FakeStep::EmitToolArgsDelta {
+                call_id: "recovered-tool".into(),
+                fragment: "{\"path\":\"".into(),
+            },
+            FakeStep::EmitToolArgsDelta {
+                call_id: "recovered-tool".into(),
+                fragment: "src".into(),
+            },
+            FakeStep::EmitToolArgsDelta {
+                call_id: "recovered-tool".into(),
+                fragment: r#"/lib.rs"}"#.into(),
+            },
+            FakeStep::EmitToolCallEnd {
+                call_id: "recovered-tool".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::ExpectToolResult {
+                call_id: "recovered-tool".into(),
+            },
+            FakeStep::EmitText {
+                text: "recovered tool finished".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ])
+        .with_route_status(route.clone()),
+    );
+    let dispatcher = Arc::new(CountingCompletingDispatcher {
+        calls: AtomicUsize::new(0),
+    });
+    let store = Arc::new(MemoryStore::new());
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        config(),
+        provider.clone(),
+        store.clone(),
+        Some(dispatcher.clone()),
+    );
+    let actor_task = tokio::spawn(actor.run());
+    let turn = handle
+        .submit_route_wait_turn(SubmitRouteWaitTurn {
+            run_id: RunId::new("recovered-tool-route-wait"),
+            messages: vec![Message::user_text("finish recovered tool")],
+            checkpoint: RouteWaitCheckpoint {
+                message: None,
+                reasoning: None,
+                tools: vec![RouteWaitToolCheckpoint {
+                    item_id: ItemId::new("recovered-tool-item"),
+                    call_id: "recovered-tool".into(),
+                    name: "inspect".into(),
+                    args: r#"{"path":"src"#.into(),
+                }],
+                ..RouteWaitCheckpoint::default()
+            },
+        })
+        .await
+        .expect("recovered route wait accepted");
+
+    // Proof window = 2 × the 250ms cached-route backstop period. Recovery
+    // must remain parked without opening or dispatching the provider call.
+    sleep(Duration::from_millis(500)).await;
+    assert!(provider.requests().is_empty());
+    assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 0);
+    *route.lock().expect("route lock") = RouteStatus::Available;
+
+    let outcome = timeout(
+        // Completion bound = 8 × the 250ms route backstop period.
+        Duration::from_secs(2),
+        turn.wait(),
+    )
+    .await
+    .expect("recovered tool turn completes")
+    .expect("recovered tool outcome");
+    assert_eq!(outcome.state, RunState::Done, "outcome: {outcome:?}");
+    assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.requests().len(), 2);
+    let completed_text = store
+        .events(&SessionId::new(SESSION))
+        .await
+        .into_iter()
+        .filter_map(|event| match typed(&event) {
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::AgentMessage { text },
+                ..
+            }) => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(completed_text, ["recovered tool finished"]);
+    handle.stop().await.expect("actor stops");
+    actor_task.await.expect("actor task joins");
+}
+
+#[tokio::test]
+async fn recovered_route_wait_restores_completed_effect_without_redispatch() {
+    let route = Arc::new(Mutex::new(RouteStatus::Unavailable));
+    let provider = Arc::new(
+        FakeProvider::new(vec![
+            FakeStep::EmitText {
+                text: "completed before effect".into(),
+            },
+            FakeStep::EmitToolCall {
+                call_id: "completed-before-crash".into(),
+                name: "inspect".into(),
+                args: serde_json::json!({"path":"src/lib.rs"}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::ExpectToolResult {
+                call_id: "completed-before-crash".into(),
+            },
+            FakeStep::EmitText {
+                text: "effect was not repeated".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ])
+        .with_route_status(route.clone()),
+    );
+    let dispatcher = Arc::new(CountingCompletingDispatcher {
+        calls: AtomicUsize::new(0),
+    });
+    let store = Arc::new(MemoryStore::new());
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        config(),
+        provider.clone(),
+        store.clone(),
+        Some(dispatcher.clone()),
+    );
+    let actor_task = tokio::spawn(actor.run());
+    let call_id = "completed-before-crash".to_owned();
+    let name = "inspect".to_owned();
+    let args = serde_json::json!({"path":"src/lib.rs"});
+    let turn = handle
+        .submit_route_wait_turn(SubmitRouteWaitTurn {
+            run_id: RunId::new("recovered-completed-effect"),
+            messages: vec![Message::user_text("continue after completed effect")],
+            checkpoint: RouteWaitCheckpoint {
+                completed_tools: vec![haider_core::RouteWaitCompletedToolCheckpoint {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    args: args.clone(),
+                    result: Some(BoundedResult {
+                        preview: "done once".into(),
+                        truncated: false,
+                        data: None,
+                        artifact: None,
+                        images: Vec::new(),
+                        cursor: None,
+                        status: haider_protocol::tool::ToolResultStatus::Completed,
+                        reason: None,
+                        presentation: None,
+                    }),
+                }],
+                structured_events: vec![
+                    haider_protocol::provider::StreamEvent::TextDelta {
+                        text: "completed before effect".into(),
+                    },
+                    haider_protocol::provider::StreamEvent::ToolCallStart {
+                        call_id: call_id.clone(),
+                        name,
+                    },
+                    haider_protocol::provider::StreamEvent::ToolCallArgsDelta {
+                        call_id: call_id.clone(),
+                        args_fragment: args.to_string(),
+                    },
+                    haider_protocol::provider::StreamEvent::ToolCallEnd { call_id },
+                ],
+                response_epoch: 7,
+                ..RouteWaitCheckpoint::default()
+            },
+        })
+        .await
+        .expect("completed-effect recovery accepted");
+
+    // Proof window = 2 × the 250ms cached-route backstop period.
+    sleep(Duration::from_millis(500)).await;
+    assert!(provider.requests().is_empty());
+    assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 0);
+    *route.lock().expect("route lock") = RouteStatus::Available;
+
+    let outcome = timeout(
+        // Completion bound = 8 × the 250ms route backstop period.
+        Duration::from_secs(2),
+        turn.wait(),
+    )
+    .await
+    .expect("completed-effect recovery finishes")
+    .expect("completed-effect outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.requests().len(), 2);
+    let completed_text = store
+        .events(&SessionId::new(SESSION))
+        .await
+        .into_iter()
+        .filter_map(|event| match typed(&event) {
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::AgentMessage { text },
+                ..
+            }) => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(completed_text, ["effect was not repeated"]);
+    handle.stop().await.expect("actor stops");
+    actor_task.await.expect("actor task joins");
+}
+
+#[tokio::test]
+async fn route_wait_deadline_keeps_wait_fact_and_never_reissues() {
+    let route = Arc::new(Mutex::new(RouteStatus::Unavailable));
+    let provider = Arc::new(
+        FakeProvider::new(vec![FakeStep::Error {
+            kind: ProviderErrorKind::NetworkUnavailable,
+            message: "dns unavailable".into(),
+            retry_after_ms: None,
+        }])
+        .with_route_status(route),
+    );
+    let store = Arc::new(MemoryStore::new());
+    let mut cfg = config();
+    cfg.provider_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(1_200));
+    let handle = HarnessActor::spawn(cfg, provider.clone(), store.clone());
+    let outcome = timeout(
+        // Outer bound = 1.2s run deadline + 4 × 250ms route observations.
+        Duration::from_millis(2_200),
+        handle
+            .submit_turn(SubmitTurn::new("deadline while offline"))
+            .await
+            .expect("turn accepted")
+            .wait(),
+    )
+    .await
+    .expect("deadline is bounded")
+    .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::ProviderTimeout)
+    );
+    assert_eq!(provider.requests().len(), 1);
+    let payloads = store
+        .events(&SessionId::new(SESSION))
+        .await
+        .into_iter()
+        .map(|event| typed(&event))
+        .collect::<Vec<_>>();
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::RunState(RunState::Waiting {
+            reason: WaitReason::NetworkUnavailable
+        })
+    )));
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|payload| matches!(payload, EventPayload::RunFailed { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|payload| matches!(payload, EventPayload::RunState(RunState::Errored)))
+            .count(),
+        1,
+        "the run owns exactly one terminal state"
+    );
+    handle.stop().await.expect("actor stops");
+}
+
+/// MUTATION CHECK: remove/invert the negative RouteStatus gate. A live route
+/// would then be misreported as `WaitingForRoute` before the retry whose open
+/// future never completes. The outer bound is the 3s provider deadline plus
+/// four 250ms route-observation periods for terminal delivery.
+#[tokio::test(start_paused = true)]
+async fn live_route_failure_retries_to_never_opening_provider_without_route_wait() {
+    let route = Arc::new(Mutex::new(RouteStatus::Available));
+    let provider = Arc::new(NetworkFailureThenNeverOpensProvider::new(Arc::clone(
+        &route,
+    )));
+    let store = Arc::new(MemoryStore::new());
+    let mut cfg = config();
+    let provider_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    cfg.provider_deadline = Some(provider_deadline);
+    let handle = HarnessActor::spawn(cfg, provider.clone(), store.clone());
+    let started = tokio::time::Instant::now();
+    let outcome = timeout(
+        Duration::from_secs(4),
+        handle
+            .submit_turn(SubmitTurn::new("live route must not park"))
+            .await
+            .expect("turn accepted")
+            .wait(),
+    )
+    .await
+    .expect("provider deadline plus route-observation allowance is bounded")
+    .expect("turn outcome");
+
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::ProviderTimeout)
+    );
+    assert!(started.elapsed() < provider_deadline.duration_since(started));
+    assert_eq!(provider.requests.load(Ordering::SeqCst), 2);
+    assert!(
+        !store
+            .events(&SessionId::new(SESSION))
+            .await
+            .iter()
+            .any(|event| matches!(
+                typed(event),
+                EventPayload::RunState(RunState::Waiting {
+                    reason: WaitReason::NetworkUnavailable
+                })
+            ))
+    );
+    handle.stop().await.expect("actor stops");
+}
+
+/// MUTATION CHECK: invert the same negative-only gate. A confirmed down route
+/// would skip the wait, while the live-route sibling above would enter it, so
+/// both tests cannot pass under either polarity mutation. The completion bound
+/// is the 4s provider deadline plus four 250ms route-observation periods.
+#[tokio::test(start_paused = true)]
+async fn actually_down_route_waits_once_then_live_retry_never_opens_and_terminalizes() {
+    let route = Arc::new(Mutex::new(RouteStatus::Unavailable));
+    let provider = Arc::new(NetworkFailureThenNeverOpensProvider::new(Arc::clone(
+        &route,
+    )));
+    let store = Arc::new(MemoryStore::new());
+    let mut cfg = config();
+    cfg.provider_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(4));
+    let handle = HarnessActor::spawn(cfg, provider.clone(), store.clone());
+    let mut states = handle.state_receiver();
+    let turn = handle
+        .submit_turn(SubmitTurn::new("wait only while route is down"))
+        .await
+        .expect("turn accepted");
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                states.borrow().as_ref(),
+                Some(RunState::Waiting {
+                    reason: WaitReason::NetworkUnavailable
+                })
+            ) {
+                break;
+            }
+            states.changed().await.expect("state sender remains open");
+        }
+    })
+    .await
+    .expect("eight 250ms observations reveal the route wait");
+    assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+    *route.lock().expect("route lock") = RouteStatus::Available;
+
+    let outcome = timeout(Duration::from_secs(5), turn.wait())
+        .await
+        .expect("provider deadline plus four route observations is bounded")
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::ProviderTimeout)
+    );
+    assert_eq!(provider.requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        store
+            .events(&SessionId::new(SESSION))
+            .await
+            .iter()
+            .filter(|event| matches!(
+                typed(event),
+                EventPayload::RunState(RunState::Waiting {
+                    reason: WaitReason::NetworkUnavailable
+                })
+            ))
+            .count(),
+        1,
+        "a repeated failure on the restored route must not repark"
+    );
+    handle.stop().await.expect("actor stops");
+}
+
+#[tokio::test]
+async fn provider_http_5xx_never_enters_route_wait() {
+    let mut provider_error =
+        ProviderError::new(ProviderErrorKind::Transport, "provider returned 503")
+            .with_http_metadata(503, Some("request-503"));
+    provider_error.retryable = false;
+    let provider = Arc::new(ImmediateErrorProvider {
+        error: provider_error,
+    });
+    let store = Arc::new(MemoryStore::new());
+    let handle = HarnessActor::spawn(config(), provider, store.clone());
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("do not route-wait on HTTP"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert!(
+        !store
+            .events(&SessionId::new(SESSION))
+            .await
+            .iter()
+            .any(|event| matches!(
+                typed(event),
+                EventPayload::RunState(RunState::Waiting {
+                    reason: WaitReason::NetworkUnavailable
+                })
+            ))
     );
     handle.stop().await.expect("actor stops");
 }
@@ -4714,6 +5661,20 @@ struct ImmediateErrorProvider {
     error: ProviderError,
 }
 
+struct NetworkFailureThenNeverOpensProvider {
+    route: Arc<Mutex<RouteStatus>>,
+    requests: AtomicUsize,
+}
+
+impl NetworkFailureThenNeverOpensProvider {
+    fn new(route: Arc<Mutex<RouteStatus>>) -> Self {
+        Self {
+            route,
+            requests: AtomicUsize::new(0),
+        }
+    }
+}
+
 struct CountingOpeningErrorProvider {
     error: ProviderError,
     requests: AtomicUsize,
@@ -4891,6 +5852,31 @@ impl Provider for ImmediateErrorProvider {
 
     async fn stream_turn(&self, _request: TurnRequest) -> Result<ProviderStream, ProviderError> {
         Err(self.error.clone())
+    }
+}
+
+#[async_trait]
+impl Provider for NetworkFailureThenNeverOpensProvider {
+    fn trusts_default_route_absence(&self) -> bool {
+        true
+    }
+
+    fn route_status(&self) -> RouteStatus {
+        *self.route.lock().expect("route lock")
+    }
+
+    async fn capabilities(&self) -> CapabilityDoc {
+        FakeProvider::new(Vec::new()).capabilities().await
+    }
+
+    async fn stream_turn(&self, _request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        if self.requests.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(ProviderError::new(
+                ProviderErrorKind::NetworkUnavailable,
+                "connection failed before response headers",
+            ));
+        }
+        pending().await
     }
 }
 

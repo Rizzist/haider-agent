@@ -2737,6 +2737,9 @@ pub(crate) fn observe_run_state(state: &RunState) -> haider_rpc::ObserveRunState
         RunState::Errored => haider_rpc::ObserveRunStateWire::Errored,
         RunState::Cancelled => haider_rpc::ObserveRunStateWire::Cancelled,
         RunState::Done => haider_rpc::ObserveRunStateWire::Idle,
+        RunState::Waiting {
+            reason: haider_protocol::state::WaitReason::NetworkUnavailable,
+        } => haider_rpc::ObserveRunStateWire::WaitingForRoute,
         RunState::Queued
         | RunState::Thinking
         | RunState::Streaming
@@ -14377,6 +14380,11 @@ impl HubConnection {
                                 exhausted,
                             ),
                         ) => budget_exhausted = Some(exhausted),
+                        Some(
+                            haider_protocol::headless::HeadlessRunEventPayload::RunDeadlineExceeded(
+                                _,
+                            ),
+                        ) => {}
                         None => {}
                     }
                     if let Ok(EventPayload::RunState(run_state)) =
@@ -15287,12 +15295,24 @@ impl HubConnection {
             None => (None, Vec::new()),
         };
         let session_count = self.hub.roster_session_count().await?;
+        let session_ids = self.hub.roster_session_ids().await?;
+        let waiting_for_route_count = u64::try_from(
+            session_summaries(&self.hub, &session_ids)
+                .await?
+                .iter()
+                .filter(|summary| {
+                    summary.run_state == Some(haider_rpc::ObserveRunStateWire::WaitingForRoute)
+                })
+                .count(),
+        )
+        .unwrap_or(u64::MAX);
         let runtime = self.runtime_paths.as_ref();
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::StatusSnapshot {
                 active_account,
                 session_count,
+                waiting_for_route_count,
                 adoption_available,
                 daemon_pid: Some(std::process::id()),
                 socket_path: runtime.map(|(socket_path, _)| socket_path.display().to_string()),

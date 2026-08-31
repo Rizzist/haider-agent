@@ -801,7 +801,10 @@ impl AnthropicProvider {
         let body = if response.status().is_success() {
             response.bytes().await.map_err(transport_error)?.to_vec()
         } else {
-            read_error_body_bounded(response).await?
+            read_error_body_bounded(response).await.map_err(|error| {
+                classify_http_body_read_error(status, retry_after.as_deref(), error)
+                    .with_http_metadata(status, None)
+            })?
         };
         Ok(AnthropicCapture {
             status,
@@ -1002,11 +1005,11 @@ impl AnthropicProvider {
                 .get(RETRY_AFTER)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
-            let body = read_error_body_bounded(response).await?;
-            return Err(
-                replay_anthropic_http_error(status, retry_after.as_deref(), &body)
-                    .with_http_metadata(status, request_id.as_deref()),
-            );
+            let error = match read_error_body_bounded(response).await {
+                Ok(body) => replay_anthropic_http_error(status, retry_after.as_deref(), &body),
+                Err(error) => classify_http_body_read_error(status, retry_after.as_deref(), error),
+            };
+            return Err(error.with_http_metadata(status, request_id.as_deref()));
         }
 
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
@@ -1487,6 +1490,21 @@ pub(crate) async fn read_error_body_bounded(
     response: reqwest::Response,
 ) -> Result<Vec<u8>, ProviderError> {
     crate::read_http_error_body_bounded(response, "Anthropic").await
+}
+
+fn classify_http_body_read_error(
+    status: u16,
+    retry_after: Option<&str>,
+    mut error: ProviderError,
+) -> ProviderError {
+    // Receiving an HTTP status completes transport classification. A later
+    // diagnostic-body reset cannot turn the provider response into route loss.
+    let classified = replay_anthropic_http_error(status, retry_after, &[]);
+    error.kind = classified.kind;
+    error.retryable = classified.retryable;
+    error.retry_after_ms = classified.retry_after_ms;
+    error.presentation = classified.presentation;
+    error
 }
 
 #[derive(Debug, Clone, Copy)]

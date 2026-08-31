@@ -288,6 +288,7 @@ async fn one_shot_status_is_exactly_one_scalar_rpc() {
             ResponseBody::StatusSnapshot {
                 active_account: None,
                 session_count: 365,
+                waiting_for_route_count: 2,
                 adoption_available: vec![haider_rpc::AccountAdoptionAvailable {
                     source: "codex".into(),
                     email: Some("person@example.invalid".into()),
@@ -317,6 +318,7 @@ async fn one_shot_status_is_exactly_one_scalar_rpc() {
         .expect("connect one-shot observer");
     let status = client.status_snapshot().await.expect("status snapshot");
     assert_eq!(status.session_count, 365);
+    assert_eq!(status.waiting_for_route_count, 2);
     assert!(status.active_account.is_none());
     assert_eq!(status.daemon_pid, Some(42));
     assert_eq!(

@@ -1642,6 +1642,7 @@ struct HeadlessReducer {
     background_tasks: BTreeMap<String, (String, bool)>,
     event_count: usize,
     budget_exhausted: Option<RunBudgetExhaustedV1>,
+    deadline_exceeded: bool,
 }
 
 impl HeadlessReducer {
@@ -1664,6 +1665,7 @@ impl HeadlessReducer {
             background_tasks: BTreeMap::new(),
             event_count: 0,
             budget_exhausted: None,
+            deadline_exceeded: false,
             output,
         }
     }
@@ -1726,6 +1728,15 @@ impl HeadlessReducer {
                 HeadlessRunEventPayload::from_payload_value(&envelope.payload)
         {
             self.budget_exhausted = Some(exhausted);
+        }
+        if correlated
+            && payload_type == Some("run_deadline_exceeded")
+            && matches!(
+                HeadlessRunEventPayload::from_payload_value(&envelope.payload),
+                Some(HeadlessRunEventPayload::RunDeadlineExceeded(_))
+            )
+        {
+            self.deadline_exceeded = true;
         }
         // Only payload families that change the headless projection need a
         // typed decode. Decode from the already-parsed JSON value by reference:
@@ -1918,6 +1929,19 @@ impl HeadlessReducer {
                         retryable: false,
                         presentation: None,
                     });
+                if self.deadline_exceeded {
+                    self.terminal = Some(NaturalTerminal {
+                        outcome: HeadlessOutcome::Timeout,
+                        failure: Some(HeadlessRunFailure {
+                            code: HeadlessFailureCode::Timeout,
+                            message: "run exceeded its wall-clock timeout".into(),
+                            retryable: false,
+                            presentation: None,
+                        }),
+                        seq,
+                    });
+                    return true;
+                }
                 self.terminal = Some(NaturalTerminal {
                     outcome: HeadlessOutcome::Errored,
                     failure: Some(failure),

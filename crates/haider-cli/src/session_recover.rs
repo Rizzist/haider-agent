@@ -524,6 +524,7 @@ fn run_state_name(state: ObserveRunStateWire) -> &'static str {
     match state {
         ObserveRunStateWire::Idle => "idle",
         ObserveRunStateWire::Running => "running",
+        ObserveRunStateWire::WaitingForRoute => "waiting_for_route",
         ObserveRunStateWire::EffectUnknown => "effect_unknown",
         ObserveRunStateWire::ParkedPermission => "parked_permission",
         ObserveRunStateWire::ParkedInput => "parked_input",

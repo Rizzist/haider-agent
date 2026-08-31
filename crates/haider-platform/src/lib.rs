@@ -64,7 +64,7 @@ pub use process::{
     WindowsProcessState, windows_command_interpreter, windows_powershell, windows_process_in_group,
     windows_process_state,
 };
-pub use reachability::{RouteStatus, route_status};
+pub use reachability::{ROUTE_STATUS_CACHE_TTL, RouteStatus, route_status};
 pub use shutdown::{ShutdownInstallError, ShutdownSignal, ShutdownSignals, shutdown_signal};
 pub use spawn::{
     DAEMON_IDLE_LINGER_ARG, DAEMON_LIVENESS_ARG, DAEMON_LOG_DIRECTORY, DAEMON_LOG_FILE,

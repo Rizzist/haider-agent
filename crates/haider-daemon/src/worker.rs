@@ -69,9 +69,10 @@ use haider_core::{
     ProcessSignalCommand, ProcessSignalOutcome, PromptCompactionPlanRequest, PromptHistoryCompiler,
     ProviderBudgetGuard, ProviderBudgetPermit, ProviderDeadlineGuard, ProviderDerivedRequestState,
     ProviderPairSwitch, ProviderPairSwitchCommitter, ProviderViewAppendRequest,
-    RequestInputCheckpoint, SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks,
-    StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
-    SubmitPartialStreamTurn, ToolDispatchResult, ToolDispatcher, TurnHandle, UserCommandOutput,
+    RequestInputCheckpoint, RouteWaitCheckpoint, SessionSelectModelCommand,
+    SessionSelectModelOutcome, SharedToolPacks, StoreHandle, SubmitCheckpointTurn,
+    SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn, SubmitRouteWaitTurn,
+    ToolDispatchResult, ToolDispatcher, TurnHandle, UserCommandOutput,
     build_cache_request_diagnostic, build_context_accounting, classify_cache_request,
     context_soft_threshold_tokens, effect_recovery_evidence,
     estimate_provider_request_bytes_div_four, estimate_provider_request_input_tokens,
@@ -100,6 +101,7 @@ use haider_protocol::graph::{
 use haider_protocol::headless::{
     HeadlessRunEventPayload, HeadlessRunSpecV1, HeadlessRunUsageV1, RunBudgetDecisionReasonV1,
     RunBudgetDecisionV1, RunBudgetDimensionV1, RunBudgetExhaustedV1, RunBudgetV1,
+    RunDeadlineExceededV1,
 };
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
@@ -484,7 +486,7 @@ impl DaemonContextCompactor {
         if error.timeout_reason == Some(haider_provider::ProviderTimeoutReason::DeadlineExhausted)
             && let Some(guard) = self.provider_deadline_guard.as_ref()
         {
-            match guard.map_budget_owned_provider_deadline(run_id).await {
+            match guard.map_provider_deadline(run_id).await {
                 Ok(Some(mapped)) | Err(mapped) => return mapped,
                 Ok(None) => {}
             }
@@ -747,6 +749,8 @@ struct DaemonGraphFinalizationGuard {
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
     budget_check: Option<BudgetCheckContext>,
+    request_deadline_unix_ms: Option<u64>,
+    request_deadline_fact_persisted: Arc<Mutex<bool>>,
 }
 
 impl std::fmt::Debug for DaemonGraphFinalizationGuard {
@@ -777,24 +781,50 @@ impl DaemonGraphFinalizationGuard {
         Ok(())
     }
 
-    async fn map_budget_owned_provider_deadline(
+    async fn map_provider_deadline(
         &self,
         run_id: &RunId,
     ) -> Result<Option<HaiderError>, HaiderError> {
+        let budget_deadline = self.budget_check.as_ref().and_then(|check| {
+            check
+                .spec
+                .budget
+                .max_time_ms
+                .map(|limit| check.accepted_at_ms.saturating_add(limit))
+        });
+        if let Some(request_deadline) = self.request_deadline_unix_ms
+            && budget_deadline.is_none_or(|budget_deadline| request_deadline < budget_deadline)
+        {
+            // Adapter phases reserve exactly PROVIDER_DEADLINE_SAFETY_MARGIN
+            // before the enclosing run deadline. Preserve that reserve for
+            // durable terminal delivery: an early provider timeout is not a
+            // claim that the caller deadline elapsed. Route-wait/recovery can
+            // arrive after the absolute timestamp and records the fact below.
+            if unix_time_ms() < request_deadline {
+                return Ok(None);
+            }
+            let mut persisted = self.request_deadline_fact_persisted.lock().await;
+            if !*persisted {
+                append_headless_deadline_fact(
+                    &self.store,
+                    &self.device_id,
+                    run_id,
+                    self.branch_id.as_ref(),
+                    &self.event_ids,
+                    request_deadline,
+                )
+                .await?;
+                *persisted = true;
+            }
+            return Ok(None);
+        }
+
         let Some(check) = self.budget_check.as_ref() else {
             return Ok(None);
         };
-        let Some(limit) = check.spec.budget.max_time_ms else {
+        let Some(_budget_deadline) = budget_deadline else {
             return Ok(None);
         };
-        let budget_deadline = check.accepted_at_ms.saturating_add(limit);
-        if check
-            .spec
-            .request_deadline_unix_ms
-            .is_some_and(|request_deadline| request_deadline < budget_deadline)
-        {
-            return Ok(None);
-        }
 
         // Provider phases reserve a tiny terminalization margin, so their
         // deadline error may arrive just before the wall-clock budget monitor.
@@ -876,7 +906,7 @@ impl ProviderDeadlineGuard for DaemonGraphFinalizationGuard {
         &self,
         run_id: &RunId,
     ) -> Result<Option<HaiderError>, HaiderError> {
-        self.map_budget_owned_provider_deadline(run_id).await
+        self.map_provider_deadline(run_id).await
     }
 }
 
@@ -908,18 +938,45 @@ impl ProviderBudgetGuard for DaemonGraphFinalizationGuard {
             return Err(budget_exhausted_error(&exhausted));
         }
         let snapshot = run_budget_usage_for_context(check).await?;
-        let unresolved = take_active_projection(&check.coordinator)
-            .map(|projection| {
-                let provider = projection.provider.clone();
-                let model = projection.model.clone();
-                (Some(projection), provider, model)
-            })
-            .or_else(|| {
-                snapshot
-                    .unresolved
-                    .as_ref()
-                    .map(|(provider, model)| (None, provider.clone(), model.clone()))
-            });
+        let route_retry = check
+            .coordinator
+            .route_retry_pending
+            .swap(false, Ordering::AcqRel);
+        let prior_route_projection = route_retry
+            .then(|| take_active_projection(&check.coordinator))
+            .flatten();
+        if route_retry {
+            check
+                .coordinator
+                .superseded_unreported_attempts
+                .fetch_max(snapshot.unresolved_attempts, Ordering::AcqRel);
+        }
+        let unresolved = if route_retry {
+            None
+        } else {
+            take_active_projection(&check.coordinator)
+                .map(|projection| {
+                    let provider = projection.provider.clone();
+                    let model = projection.model.clone();
+                    (Some(projection), provider, model)
+                })
+                .or_else(|| {
+                    has_chargeable_unresolved_attempt(
+                        snapshot.unresolved_attempts,
+                        check
+                            .coordinator
+                            .superseded_unreported_attempts
+                            .load(Ordering::Acquire),
+                    )
+                    .then(|| {
+                        snapshot
+                            .unresolved
+                            .as_ref()
+                            .map(|(provider, model)| (None, provider.clone(), model.clone()))
+                    })
+                    .flatten()
+                })
+        };
         if let Some((projection, provider, model)) = unresolved
             && let Some(exhausted) = missing_usage_budget_exhaustion(
                 &check.spec.budget,
@@ -975,6 +1032,15 @@ impl ProviderBudgetGuard for DaemonGraphFinalizationGuard {
             )
             .map(usd_to_microusd_ceil),
         };
+        if let Some(prior) = prior_route_projection
+            && prior != projection
+        {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "route retry changed the admitted provider-request projection",
+                false,
+            ));
+        }
         if let Some(exhausted) = projected_budget_exhaustion(&check.spec.budget, usage, &projection)
         {
             force_budget(&check.coordinator, &exhausted);
@@ -1017,6 +1083,20 @@ impl ProviderBudgetGuard for DaemonGraphFinalizationGuard {
             .await?;
             return Err(budget_exhausted_error(&exhausted));
         }
+        Ok(())
+    }
+
+    async fn after_route_interruption(&self, _run_id: &RunId) -> Result<(), HaiderError> {
+        let Some(check) = self.budget_check.as_ref() else {
+            return Ok(());
+        };
+        // The permit drop clears request_active after this callback. Keep the
+        // old projection replaceable and suppress only the unmatched physical
+        // attempt(s) that the exact reconnect will supersede.
+        check
+            .coordinator
+            .route_retry_pending
+            .store(true, Ordering::Release);
         Ok(())
     }
 
@@ -2274,6 +2354,7 @@ struct PendingTurn {
     prompt_run_id: Option<RunId>,
     checkpoint: Option<RequestInputCheckpoint>,
     partial_stream: Option<PartialStreamCheckpoint>,
+    route_wait: Option<RouteWaitCheckpoint>,
     child_wait: Option<ChildWaitCheckpoint>,
     committed_answer: Option<haider_protocol::envelope::RawEnvelope>,
     provider_requests_already_made: usize,
@@ -2346,6 +2427,7 @@ impl PendingTurn {
             prompt_run_id: None,
             checkpoint: None,
             partial_stream: None,
+            route_wait: None,
             child_wait: None,
             committed_answer: None,
             provider_requests_already_made: 0,
@@ -2371,6 +2453,7 @@ impl PendingTurn {
             prompt_run_id: Some(accepted.prompt_run_id),
             checkpoint: None,
             partial_stream: None,
+            route_wait: None,
             child_wait: None,
             committed_answer: None,
             provider_requests_already_made: 0,
@@ -2695,6 +2778,7 @@ impl WorkerManagerHandle {
             prompt_run_id: None,
             checkpoint: Some(checkpoint),
             partial_stream: None,
+            route_wait: None,
             child_wait: None,
             committed_answer,
             provider_requests_already_made: 0,
@@ -2718,6 +2802,7 @@ impl WorkerManagerHandle {
             prompt_run_id: None,
             checkpoint: None,
             partial_stream: Some(partial_stream),
+            route_wait: None,
             child_wait: None,
             committed_answer,
             provider_requests_already_made: 0,
@@ -2736,10 +2821,36 @@ impl WorkerManagerHandle {
             prompt_run_id: None,
             checkpoint: None,
             partial_stream: None,
+            route_wait: None,
             child_wait: None,
             committed_answer: None,
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
+            workflow_continuation: false,
+            recovery_ready: Some(completed),
+            recovering: true,
+        })?;
+        response.await.map_err(|_| manager_stopped())?
+    }
+
+    pub(crate) async fn recover_route_wait(
+        &self,
+        accepted: AcceptedTurn,
+        route_wait: RouteWaitCheckpoint,
+        provider_requests_already_made: usize,
+        provider_request_ordinal_already_made: u64,
+    ) -> Result<(), HaiderError> {
+        let (completed, response) = oneshot::channel();
+        self.send_recovery(PendingTurn {
+            accepted,
+            prompt_run_id: None,
+            checkpoint: None,
+            partial_stream: None,
+            route_wait: Some(route_wait),
+            child_wait: None,
+            committed_answer: None,
+            provider_requests_already_made,
+            provider_request_ordinal_already_made,
             workflow_continuation: false,
             recovery_ready: Some(completed),
             recovering: true,
@@ -2759,6 +2870,7 @@ impl WorkerManagerHandle {
             prompt_run_id: None,
             checkpoint: None,
             partial_stream: None,
+            route_wait: None,
             child_wait: None,
             committed_answer: None,
             provider_requests_already_made,
@@ -2793,6 +2905,7 @@ impl WorkerManagerHandle {
             prompt_run_id: None,
             checkpoint: None,
             partial_stream: None,
+            route_wait: None,
             child_wait: Some(child_wait),
             committed_answer: None,
             provider_requests_already_made: 0,
@@ -4346,8 +4459,9 @@ async fn run_supervisor(
                         }
                         Some(SupervisorCommand::Shutdown) | None => {
                             stopping = true;
-                            // P3-4/W6c (park, don't cancel): request-input and
-                            // local-child waits are durable checkpoints. An
+                            // P3-4/W6c (park, don't cancel): request-input,
+                            // route, and local-child waits are durable
+                            // checkpoints. An
                             // active delegated child is also preserved: its
                             // recovered parent re-arms supervision from the
                             // last committed envelope instead of a graceful
@@ -4367,6 +4481,9 @@ async fn run_supervisor(
                                 )
                                     | Some(RunState::Waiting {
                                         reason: haider_protocol::state::WaitReason::LocalChild
+                                    })
+                                    | Some(RunState::Waiting {
+                                        reason: haider_protocol::state::WaitReason::NetworkUnavailable
                                     })
                             ) {
                                 if let Some(parked) = active.take() {
@@ -4898,7 +5015,11 @@ async fn admit_pending(
     active_run: Option<&RunId>,
     mut pending: PendingTurn,
 ) -> bool {
-    if pending.checkpoint.is_some() || pending.child_wait.is_some() || pending.workflow_continuation
+    if pending.checkpoint.is_some()
+        || pending.partial_stream.is_some()
+        || pending.route_wait.is_some()
+        || pending.child_wait.is_some()
+        || pending.workflow_continuation
     {
         let queue_changed = queue.len() < SUPERVISOR_CAPACITY;
         if queue.len() < SUPERVISOR_CAPACITY {
@@ -7022,6 +7143,7 @@ async fn start_turn(
         prompt_run_id,
         checkpoint,
         partial_stream,
+        route_wait,
         child_wait,
         mut committed_answer,
         provider_requests_already_made,
@@ -7145,6 +7267,19 @@ async fn start_turn(
                 coordinator,
             });
         }
+    }
+    if route_wait.is_some()
+        && let Some(check) = budget_check.as_ref()
+    {
+        // Recovery reconstructs coordinators from durable facts, so there is
+        // no in-memory permit/projection to release. Mark the already admitted
+        // physical attempt as the one the exact route retry will supersede
+        // before the budget monitor starts; the run's absolute time/cost
+        // limits remain armed throughout the wait.
+        check
+            .coordinator
+            .route_retry_pending
+            .store(true, Ordering::Release);
     }
     let agent_id = delegation_record
         .as_ref()
@@ -7734,6 +7869,14 @@ async fn start_turn(
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
         budget_check: budget_check.clone(),
+        request_deadline_unix_ms: headless
+            .as_ref()
+            .and_then(|context| context.spec.request_deadline_unix_ms),
+        request_deadline_fact_persisted: Arc::new(Mutex::new(
+            headless
+                .as_ref()
+                .is_some_and(|context| context.deadline_exceeded.is_some()),
+        )),
     });
     // Round 5 (known, accepted): these lane facts FREEZE at turn setup.
     // Mid-turn account rotation or web-tool degradation can drift the live
@@ -7873,8 +8016,8 @@ async fn start_turn(
         harness.apply_committed_menu_event(answer)?;
     }
     let actor = AbortOnDropTask::new(tokio::spawn(actor.run()));
-    let submitted = match (checkpoint, partial_stream, child_wait) {
-        (Some(checkpoint), None, None) => {
+    let submitted = match (checkpoint, partial_stream, route_wait, child_wait) {
+        (Some(checkpoint), None, None, None) => {
             harness
                 .submit_checkpoint_turn(SubmitCheckpointTurn {
                     run_id: accepted.run_id.clone(),
@@ -7883,7 +8026,7 @@ async fn start_turn(
                 })
                 .await
         }
-        (None, Some(checkpoint), None) => {
+        (None, Some(checkpoint), None, None) => {
             harness
                 .submit_partial_stream_turn(SubmitPartialStreamTurn {
                     run_id: accepted.run_id.clone(),
@@ -7892,7 +8035,16 @@ async fn start_turn(
                 })
                 .await
         }
-        (None, None, Some(checkpoint)) => {
+        (None, None, Some(checkpoint), None) => {
+            harness
+                .submit_route_wait_turn(SubmitRouteWaitTurn {
+                    run_id: accepted.run_id.clone(),
+                    messages,
+                    checkpoint,
+                })
+                .await
+        }
+        (None, None, None, Some(checkpoint)) => {
             harness
                 .submit_child_wait_turn(SubmitChildWaitTurn {
                     run_id: accepted.run_id.clone(),
@@ -7901,7 +8053,7 @@ async fn start_turn(
                 })
                 .await
         }
-        (None, None, None) => {
+        (None, None, None, None) => {
             harness
                 .submit_committed_turn(SubmitCommittedTurn {
                     run_id: accepted.run_id.clone(),
@@ -9176,6 +9328,8 @@ pub(crate) struct RunBudgetCoordinator {
     fact_persisted: Arc<Mutex<bool>>,
     request_serial: Arc<tokio::sync::Mutex<()>>,
     request_active: Arc<AtomicBool>,
+    route_retry_pending: Arc<AtomicBool>,
+    superseded_unreported_attempts: Arc<AtomicUsize>,
     active_projection: StdMutex<Option<ProviderRequestProjection>>,
     forced: StdMutex<Option<RunBudgetExhaustedV1>>,
 }
@@ -9199,12 +9353,14 @@ fn new_run_budget_coordinator(
         fact_persisted: Arc::new(Mutex::new(context.exhausted.is_some())),
         request_serial: Arc::new(tokio::sync::Mutex::new(())),
         request_active: Arc::new(AtomicBool::new(false)),
+        route_retry_pending: Arc::new(AtomicBool::new(false)),
+        superseded_unreported_attempts: Arc::new(AtomicUsize::new(0)),
         active_projection: StdMutex::new(None),
         forced: StdMutex::new(context.exhausted.clone()),
     })
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct ProviderRequestProjection {
     provider: String,
     model: String,
@@ -9229,6 +9385,10 @@ fn forced_budget(coordinator: &RunBudgetCoordinator) -> Option<RunBudgetExhauste
         Ok(forced) => forced.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     }
+}
+
+fn has_chargeable_unresolved_attempt(unresolved: usize, superseded_route_attempts: usize) -> bool {
+    unresolved > superseded_route_attempts
 }
 
 fn force_budget(coordinator: &RunBudgetCoordinator, exhausted: &RunBudgetExhaustedV1) {
@@ -9312,6 +9472,7 @@ async fn headless_run_context(
     let mut branch_id = None;
     let mut spec = None;
     let mut exhausted = None;
+    let mut deadline_exceeded = None;
     loop {
         let page = store.read(store.session_id(), cursor, 256).await?;
         if page.is_empty() {
@@ -9334,6 +9495,9 @@ async fn headless_run_context(
                 Some(HeadlessRunEventPayload::RunBudgetExhausted(fact)) => {
                     exhausted = Some(fact);
                 }
+                Some(HeadlessRunEventPayload::RunDeadlineExceeded(fact)) => {
+                    deadline_exceeded = Some(fact);
+                }
                 None => {}
             }
         }
@@ -9346,6 +9510,7 @@ async fn headless_run_context(
         accepted_at_ms: accepted_at_ms.unwrap_or(0),
         branch_id,
         exhausted,
+        deadline_exceeded,
     }))
 }
 
@@ -9359,6 +9524,7 @@ async fn headless_run_context_for_session(
     let mut branch_id = None;
     let mut spec = None;
     let mut exhausted = None;
+    let mut deadline_exceeded = None;
     loop {
         let page = hub.read_internal_session(session_id, cursor, 256).await?;
         if page.is_empty() {
@@ -9381,6 +9547,9 @@ async fn headless_run_context_for_session(
                 Some(HeadlessRunEventPayload::RunBudgetExhausted(fact)) => {
                     exhausted = Some(fact);
                 }
+                Some(HeadlessRunEventPayload::RunDeadlineExceeded(fact)) => {
+                    deadline_exceeded = Some(fact);
+                }
                 None => {}
             }
         }
@@ -9393,6 +9562,7 @@ async fn headless_run_context_for_session(
         accepted_at_ms: accepted_at_ms.unwrap_or(0),
         branch_id,
         exhausted,
+        deadline_exceeded,
     }))
 }
 
@@ -9401,6 +9571,7 @@ struct DurableHeadlessRunContext {
     accepted_at_ms: u64,
     branch_id: Option<BranchId>,
     exhausted: Option<RunBudgetExhaustedV1>,
+    deadline_exceeded: Option<RunDeadlineExceededV1>,
 }
 
 fn provider_request_deadline(context: &DurableHeadlessRunContext) -> Option<tokio::time::Instant> {
@@ -9605,6 +9776,7 @@ type BudgetUsageChunks = BTreeMap<String, BudgetUsageComponent>;
 struct RunBudgetUsageSnapshot {
     usage: HeadlessRunUsageV1,
     unresolved: Option<(String, String)>,
+    unresolved_attempts: usize,
 }
 
 async fn run_budget_usage(
@@ -9649,6 +9821,7 @@ async fn run_budget_usage_for_context(
     )]);
     let mut seen = HashSet::new();
     let mut unresolved = None;
+    let mut unresolved_attempts = 0_usize;
     while let Some((session_id, run_id, fallback_model)) = pending.pop_front() {
         if !seen.insert((session_id.clone(), run_id.clone())) {
             continue;
@@ -9677,7 +9850,9 @@ async fn run_budget_usage_for_context(
                 break;
             }
         }
-        if attempts > chunks.len().saturating_sub(usage_before) && unresolved.is_none() {
+        let run_unresolved = attempts.saturating_sub(chunks.len().saturating_sub(usage_before));
+        unresolved_attempts = unresolved_attempts.saturating_add(run_unresolved);
+        if run_unresolved > 0 && unresolved.is_none() {
             unresolved = Some((coordinator.spec.provider.clone(), fallback_model.clone()));
         }
         for child in coordinator
@@ -9695,6 +9870,7 @@ async fn run_budget_usage_for_context(
     Ok(RunBudgetUsageSnapshot {
         usage: finish_budget_usage(chunks, elapsed_ms),
         unresolved,
+        unresolved_attempts,
     })
 }
 
@@ -9866,6 +10042,14 @@ pub(crate) fn budget_request_is_unresolved_for_test(
 }
 
 #[cfg(test)]
+pub(crate) fn route_retry_unresolved_attempt_is_chargeable_for_test(
+    unresolved: usize,
+    superseded_route_attempts: usize,
+) -> bool {
+    has_chargeable_unresolved_attempt(unresolved, superseded_route_attempts)
+}
+
+#[cfg(test)]
 pub(crate) fn projected_time_budget_exhaustion_for_test(
     budget: &RunBudgetV1,
     usage: HeadlessRunUsageV1,
@@ -9913,7 +10097,16 @@ async fn check_budget_context(
         return Ok(Some(exhausted));
     }
     let snapshot = run_budget_usage_for_context(check).await?;
-    if !check.coordinator.request_active.load(Ordering::Acquire) {
+    if !check.coordinator.request_active.load(Ordering::Acquire)
+        && !check
+            .coordinator
+            .route_retry_pending
+            .load(Ordering::Acquire)
+    {
+        let superseded = check
+            .coordinator
+            .superseded_unreported_attempts
+            .load(Ordering::Acquire);
         let unresolved = active_projection(&check.coordinator)
             .map(|projection| {
                 let provider = projection.provider.clone();
@@ -9921,10 +10114,14 @@ async fn check_budget_context(
                 (Some(projection), provider, model)
             })
             .or_else(|| {
-                snapshot
-                    .unresolved
-                    .as_ref()
-                    .map(|(provider, model)| (None, provider.clone(), model.clone()))
+                has_chargeable_unresolved_attempt(snapshot.unresolved_attempts, superseded)
+                    .then(|| {
+                        snapshot
+                            .unresolved
+                            .as_ref()
+                            .map(|(provider, model)| (None, provider.clone(), model.clone()))
+                    })
+                    .flatten()
             });
         if let Some((projection, provider, model)) = unresolved
             && let Some(exhausted) = missing_usage_budget_exhaustion(
@@ -10345,6 +10542,36 @@ fn budget_fact_payload(exhausted: &RunBudgetExhaustedV1) -> Result<serde_json::V
                 false,
             )
         })
+}
+
+async fn append_headless_deadline_fact(
+    store: &HubStoreHandle,
+    device_id: &DeviceId,
+    run_id: &RunId,
+    branch_id: Option<&BranchId>,
+    event_ids: &EventIdGenerator,
+    deadline_unix_ms: u64,
+) -> Result<(), HaiderError> {
+    let payload =
+        HeadlessRunEventPayload::RunDeadlineExceeded(RunDeadlineExceededV1 { deadline_unix_ms })
+            .to_payload_value()
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("cannot serialize run-deadline fact: {error}"),
+                    false,
+                )
+            })?;
+    let mut envelopes = [supervisor_raw_envelope(
+        store,
+        device_id,
+        branch_id.cloned(),
+        Some(run_id.clone()),
+        event_ids.next(),
+        payload,
+    )];
+    StoreHandle::append(store, &mut envelopes).await?;
+    Ok(())
 }
 
 async fn persist_headless_budget_fact(

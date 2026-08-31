@@ -481,8 +481,11 @@ async fn rejected_combined_append_does_not_publish_or_advance_state() {
             &RunId::new("provider-view-rejected-publication-run"),
             1,
             None,
-            Some(serde_json::json!({"provider_view": "exact"})),
-            serde_json::json!({"cache_attempt": "diagnostic"}),
+            RequestAttemptMarkers {
+                provider_view: Some(serde_json::json!({"provider_view": "exact"})),
+                cache: serde_json::json!({"cache_attempt": "diagnostic"}),
+                response_epoch: 0,
+            },
             &mut thinking_pending,
         )
         .await
@@ -517,8 +520,11 @@ async fn provider_view_and_request_attempt_share_one_ordered_append() {
             &RunId::new("provider-view-request-run"),
             1,
             None,
-            Some(serde_json::json!({"provider_view": "exact"})),
-            serde_json::json!({"cache_attempt": "diagnostic"}),
+            RequestAttemptMarkers {
+                provider_view: Some(serde_json::json!({"provider_view": "exact"})),
+                cache: serde_json::json!({"cache_attempt": "diagnostic"}),
+                response_epoch: 0,
+            },
             &mut thinking_pending,
         )
         .await

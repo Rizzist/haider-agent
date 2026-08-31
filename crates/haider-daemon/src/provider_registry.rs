@@ -54,7 +54,9 @@ impl ProviderEndpointValidator for ProductionProviderEndpointValidator {
         .map_err(|error| {
             let code = match error.kind {
                 ProviderErrorKind::InvalidRequest => ErrorCode::InvalidArgument,
-                ProviderErrorKind::Transport => ErrorCode::ProviderError,
+                ProviderErrorKind::NetworkUnavailable | ProviderErrorKind::Transport => {
+                    ErrorCode::ProviderError
+                }
                 _ => ErrorCode::Internal,
             };
             HaiderError::new(code, error.message, error.retryable)

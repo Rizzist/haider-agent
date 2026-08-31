@@ -48,7 +48,7 @@ use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::loom::{LoomGate, LoomWorkflow, parse_pipe};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuScope};
 use haider_protocol::session::SessionMetadataV1;
-use haider_protocol::state::{RunState, SessionState};
+use haider_protocol::state::{RunState, SessionState, WaitReason};
 use haider_protocol::task::TaskEventPayload;
 use haider_tools::{MessageSubagent, SpawnSubagent};
 #[cfg(unix)]
@@ -299,7 +299,7 @@ impl DelegationHandle {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_wait_budgets(
         hub: SessionHub,
         stall_deadline: Duration,
@@ -2429,7 +2429,7 @@ impl DelegationHandle {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn terminal_mirror_times_out_for_test(
         &self,
         record: &DelegationRecord,
@@ -2881,7 +2881,7 @@ impl DelegationHandle {
         self.hub.append(&mut envelope).await.map(|_| ())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn begin_terminal_mirror_handoff_for_test(
         &self,
         record: &DelegationRecord,
@@ -3273,12 +3273,19 @@ pub(crate) fn same_rollup_transition(
     })
 }
 
-fn chip_for_run_state(state: &RunState) -> Option<ChipState> {
+pub(crate) fn chip_for_run_state(state: &RunState) -> Option<ChipState> {
     match state {
         RunState::Streaming => Some(ChipState::Streaming),
         RunState::RunningTool => Some(ChipState::Tool),
         RunState::InputRequired { .. } => Some(ChipState::InputRequired),
         RunState::PermissionRequired { .. } => Some(ChipState::PermissionRequired),
+        // A child's positively attributed route outage is visible on its
+        // parent-owned chip, but does not alter or cancel the parent's own
+        // Waiting(LocalChild) run. Other waits describe parent/child workflow
+        // coordination and retain the ordinary Thinking projection.
+        RunState::Waiting {
+            reason: WaitReason::NetworkUnavailable,
+        } => Some(ChipState::Waiting),
         RunState::Done | RunState::Errored | RunState::Cancelled => None,
         RunState::Queued
         | RunState::Thinking

@@ -523,6 +523,15 @@ const REPLAY_BACKGROUND_COMMAND: &str = "while [ ! -f replay-release ]; do sleep
 const REPLAY_BACKGROUND_COMMAND: &str =
     "while (-not (Test-Path 'replay-release')) { Start-Sleep -Milliseconds 20 }";
 
+#[cfg(not(windows))]
+const REPLAY_TASK_COMPLETION_DEADLINE: Duration = Duration::from_secs(10);
+
+#[cfg(windows)]
+// Registry #94: 30s established cold inbox-PowerShell allowance + 15s for
+// detached-task scheduling, journal publication, and repeated CLI observation.
+// Background supervision has no foreground 60s wall limit, so it is not added.
+const REPLAY_TASK_COMPLETION_DEADLINE: Duration = Duration::from_secs(45);
+
 #[test]
 fn version_prints_workspace_version() {
     let out = haider().arg("--version").output().expect("binary runs");
@@ -1186,7 +1195,7 @@ fn replay_is_sealed_at_terminal_before_late_same_run_task_facts() {
         .expect("profile parent")
         .join("workspace");
     std::fs::write(workspace.join("replay-release"), b"release").expect("release background task");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + REPLAY_TASK_COMPLETION_DEADLINE;
     loop {
         let mut session = Command::new(env!("CARGO_BIN_EXE_haider"));
         configure_test_home(&mut session, &source.profile);
@@ -1196,10 +1205,16 @@ fn replay_is_sealed_at_terminal_before_late_same_run_task_facts() {
             .env("HAIDER_DISCOVERY_DISABLED", "1");
         let observed = session.output().expect("session observation executes");
         assert!(observed.status.success());
-        if String::from_utf8_lossy(&observed.stdout).contains("task_completed") {
+        let observation = String::from_utf8_lossy(&observed.stdout);
+        if observation.contains("task_completed") {
             break;
         }
-        assert!(Instant::now() < deadline, "late task never completed");
+        assert!(
+            Instant::now() < deadline,
+            "late task never completed within {:?}; last session observation: {}",
+            REPLAY_TASK_COMPLETION_DEADLINE,
+            observation
+        );
         thread::sleep(Duration::from_millis(20));
     }
 
