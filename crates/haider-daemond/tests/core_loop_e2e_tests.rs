@@ -39,6 +39,29 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use support::{UdsClient, ready_with_dependencies, test_root};
+#[cfg(windows)]
+use tokio::sync::Semaphore;
+
+// This binary has five tests that launch the production Windows PowerShell,
+// and two also launch real descendants. Running them concurrently on the
+// hosted Windows runner starves process creation and pushes the whole binary
+// against its 900-second crate cap. Keep protocol-only tests parallel and
+// serialize only these real-process tests, matching live_turn_rpc_tests.
+#[cfg(windows)]
+static WINDOWS_REAL_PROCESS_TEST_GATE: Semaphore = Semaphore::const_new(1);
+
+#[cfg(windows)]
+async fn windows_real_process_test_guard(
+    test_name: &'static str,
+) -> tokio::sync::SemaphorePermit<'static> {
+    eprintln!("haider-daemond windows-process test={test_name} phase=waiting-for-gate");
+    let permit = WINDOWS_REAL_PROCESS_TEST_GATE
+        .acquire()
+        .await
+        .expect("Windows real-process test gate remains open");
+    eprintln!("haider-daemond windows-process test={test_name} phase=running");
+    permit
+}
 
 #[derive(Clone)]
 struct RoutingFactory {
@@ -327,31 +350,62 @@ async fn submit_turn(
 }
 
 async fn events_until_terminal(client: &mut UdsClient, run_id: &RunId) -> Vec<EventPayload> {
-    tokio::time::timeout(support::DEADLINE, async {
-        let mut events = Vec::new();
+    let mut events = Vec::new();
+    let mut last_state = None;
+    let mut failure = None;
+    let completed = tokio::time::timeout(support::DEADLINE, async {
         loop {
-            if let WireFrame::Event { envelope, .. } = client.next().await {
+            let Some(frame) = client.try_next().await else {
+                let reason = format!(
+                    "connection closed while waiting for run {run_id} to terminalize; last_state={last_state:?}; failure={failure:?}; observed_events={}",
+                    events.len()
+                );
+                client.report_connection_failure(&reason);
+                panic!("{reason}");
+            };
+            if let WireFrame::Event { envelope, .. } = frame {
                 if envelope.run_id.as_ref() != Some(run_id) {
                     continue;
                 }
                 let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
                     continue;
                 };
-                let terminal = matches!(
-                    payload,
-                    EventPayload::RunState(
-                        RunState::Done | RunState::Errored | RunState::Cancelled
-                    )
-                );
+                let terminal = match &payload {
+                    EventPayload::RunFailed { code, message, .. } => {
+                        failure = Some((*code, message.clone()));
+                        false
+                    }
+                    EventPayload::RunState(state) => {
+                        last_state = Some(state.clone());
+                        state.is_terminal()
+                    }
+                    _ => false,
+                };
                 events.push(payload);
                 if terminal {
-                    return events;
+                    match last_state.as_ref() {
+                        Some(RunState::Done) => return,
+                        Some(state) => panic!(
+                            "run {run_id} reached unexpected terminal state {state:?}; failure={failure:?}; observed_events={}",
+                            events.len()
+                        ),
+                        None => unreachable!("terminal payload records a run state"),
+                    }
                 }
             }
         }
     })
-    .await
-    .expect("run reaches a terminal event")
+    .await;
+    if completed.is_err() {
+        let reason = format!(
+            "run {run_id} did not reach a terminal event within {:?}; last_state={last_state:?}; failure={failure:?}; observed_events={}",
+            support::DEADLINE,
+            events.len()
+        );
+        client.report_connection_failure(&reason);
+        panic!("{reason}");
+    }
+    events
 }
 
 async fn wait_for_session_idle(client: &mut UdsClient, session_id: &SessionId) {
@@ -826,6 +880,9 @@ fn create_large_sparse_file(path: &Path, length: u64) -> std::io::Result<()> {
 /// marker/output assertion.
 #[tokio::test]
 async fn tool_calls_execute_and_continue_over_real_rpc() {
+    #[cfg(windows)]
+    let _windows_process_test =
+        windows_real_process_test_guard("tool_calls_execute_and_continue_over_real_rpc").await;
     let root = test_root("core-loop-tools-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
@@ -989,6 +1046,11 @@ async fn tool_calls_execute_and_continue_over_real_rpc() {
 /// durable long-running output belongs on `background=true`.
 #[tokio::test]
 async fn process_exec_normal_completion_leaves_outliving_descendant_alone() {
+    #[cfg(windows)]
+    let _windows_process_test = windows_real_process_test_guard(
+        "process_exec_normal_completion_leaves_outliving_descendant_alone",
+    )
+    .await;
     let root = test_root("core-loop-outliving-pipe-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
@@ -1054,6 +1116,9 @@ async fn process_exec_normal_completion_leaves_outliving_descendant_alone() {
 /// output; `coverage=unknown` is receipt truth, never a command failure.
 #[tokio::test]
 async fn process_exec_runs_in_a_non_repository_workspace() {
+    #[cfg(windows)]
+    let _windows_process_test =
+        windows_real_process_test_guard("process_exec_runs_in_a_non_repository_workspace").await;
     let root = test_root("core-loop-nonrepo-");
     let workspace = root.path().join("plain-workspace");
     fs::create_dir(&workspace).expect("non-repository workspace");
@@ -1113,6 +1178,11 @@ async fn process_exec_runs_in_a_non_repository_workspace() {
 /// next provider turn observes the raw command record.
 #[tokio::test]
 async fn direct_shell_rpc_executes_and_is_visible_to_the_next_turn() {
+    #[cfg(windows)]
+    let _windows_process_test = windows_real_process_test_guard(
+        "direct_shell_rpc_executes_and_is_visible_to_the_next_turn",
+    )
+    .await;
     let root = test_root("core-loop-shell-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
@@ -1209,6 +1279,10 @@ async fn direct_shell_rpc_executes_and_is_visible_to_the_next_turn() {
 /// merely returning a timeout/error while leaving either process alive fails.
 #[tokio::test]
 async fn cancelling_process_exec_kills_the_real_process_group() {
+    #[cfg(windows)]
+    let _windows_process_test =
+        windows_real_process_test_guard("cancelling_process_exec_kills_the_real_process_group")
+            .await;
     let root = test_root("core-loop-process-cancel-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
@@ -1261,18 +1335,80 @@ async fn cancelling_process_exec_kills_the_real_process_group() {
     .await;
     let heartbeat = workspace.join("heartbeat.log");
     let descendant_started = workspace.join("descendant-started.log");
-    tokio::time::timeout(support::DEADLINE, async {
+    const STARTUP_KEEPALIVE_NONCE: u64 = u64::MAX - 2;
+    let mut startup_last_state = None;
+    let mut startup_failure = None;
+    let startup = tokio::time::timeout(support::DEADLINE, async {
+        let mut next_keepalive = tokio::time::Instant::now() + support::KEEPALIVE_INTERVAL;
         loop {
             if fs::metadata(&heartbeat).is_ok_and(|metadata| metadata.len() >= 2)
                 && descendant_started.exists()
             {
                 break;
             }
+            if tokio::time::Instant::now() >= next_keepalive {
+                // This wait observes external files rather than wire frames,
+                // but it still owns a negotiated client. Keep that live peer
+                // inside the daemon's 45-second read-idle contract even when
+                // a contended Windows PowerShell start consumes most of the
+                // outer operation budget. The later TurnCancel remains a
+                // strict write; a genuinely closed connection must still fail.
+                client
+                    .send(
+                        &WireFrame::Ping {
+                            nonce: STARTUP_KEEPALIVE_NONCE,
+                        },
+                        config.frame_limit,
+                    )
+                    .await;
+                loop {
+                    let Some(frame) = client.try_next().await else {
+                        let reason = format!(
+                            "connection closed while waiting for process tree in run {run}; last_state={startup_last_state:?}; failure={startup_failure:?}"
+                        );
+                        client.report_connection_failure(&reason);
+                        panic!("{reason}");
+                    };
+                    match frame {
+                        WireFrame::Pong { nonce } if nonce == STARTUP_KEEPALIVE_NONCE => break,
+                        WireFrame::Event { envelope, .. }
+                            if envelope.run_id.as_ref() == Some(&run) =>
+                        {
+                            match serde_json::from_value::<EventPayload>(envelope.payload) {
+                                Ok(EventPayload::RunFailed { code, message, .. }) => {
+                                    startup_failure = Some((code, message));
+                                }
+                                Ok(EventPayload::RunState(state)) => {
+                                    startup_last_state = Some(state.clone());
+                                    if state.is_terminal() {
+                                        panic!(
+                                            "run {run} reached terminal state {state:?} before its process tree started; failure={startup_failure:?}"
+                                        );
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                next_keepalive = tokio::time::Instant::now() + support::KEEPALIVE_INTERVAL;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("leader and descendant actually start before cancellation");
+    .is_ok();
+    if !startup {
+        let heartbeat_bytes = fs::metadata(&heartbeat).map(|metadata| metadata.len()).ok();
+        let reason = format!(
+            "process tree for run {run} did not start within {:?}; heartbeat_bytes={heartbeat_bytes:?}; descendant_started={}; last_state={startup_last_state:?}; failure={startup_failure:?}",
+            support::DEADLINE,
+            descendant_started.exists()
+        );
+        client.report_connection_failure(&reason);
+        panic!("{reason}");
+    }
 
     let cancel_events = cancel_and_collect_terminal(
         &mut client,
