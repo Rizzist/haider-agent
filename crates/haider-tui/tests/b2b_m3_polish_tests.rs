@@ -21,6 +21,7 @@ use haider_tui::mock::{seed_account_rows, seed_provider_summaries};
 use haider_tui::render::render;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::KeyCode;
 
 mod common;
 use common::{key, launcher_model, run_slash};
@@ -166,6 +167,7 @@ fn palette_login_slots_name_the_real_roster() {
             "grok",
             "xai",
             "deepseek",
+            "custom",
         ]
     );
     let methods = palette_items("login anthropic ", true, &slots);
@@ -183,6 +185,180 @@ fn palette_login_slots_name_the_real_roster() {
         "the row describes the real flow: {}",
         oauth.desc()
     );
+}
+
+/// The owner's exact repro: selecting a provider row is a slot transition,
+/// not a completed command. The next frame keeps `/login <provider> ` in the
+/// composer and offers only methods that provider actually serves.
+#[test]
+fn selecting_a_login_provider_visibly_advances_to_its_method_slot() {
+    let cases: [(&str, &[&str]); 8] = [
+        ("anthropic", &["api", "oauth"]),
+        ("openai", &["api", "oauth"]),
+        ("gemini", &["api"]),
+        ("kimi", &["oauth"]),
+        ("grok", &["oauth"]),
+        ("xai", &["api"]),
+        ("deepseek", &["api"]),
+        ("custom", &["api"]),
+    ];
+
+    for (provider, expected_methods) in cases {
+        let mut model = live_model(&[
+            haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1,
+            haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1,
+            haider_rpc::FEATURE_PROVIDER_CONFIGURE_V1,
+        ]);
+        for character in format!("/login {provider}").chars() {
+            model.handle(key(KeyCode::Char(character)));
+        }
+
+        model.handle(key(KeyCode::Enter));
+
+        assert_eq!(
+            model.composer.text(),
+            format!("/login {provider} "),
+            "{provider}: choosing the provider advances instead of executing a dead end"
+        );
+        assert!(model.palette_open(), "{provider}: method choice is visible");
+        let methods: Vec<String> = model
+            .palette_items()
+            .iter()
+            .map(haider_tui::commands::PaletteItem::label)
+            .collect();
+        assert_eq!(methods, expected_methods, "{provider}: truthful methods");
+        assert!(model.login.is_none(), "{provider}: no API card yet");
+        assert!(model.oauth_add.is_none(), "{provider}: no OAuth card yet");
+        assert!(
+            !model.requests.iter().any(|request| matches!(
+                request,
+                AppRequest::LoginApi { .. } | AppRequest::OAuthAddStart { .. }
+            )),
+            "{provider}: choosing a provider alone sends no credential request"
+        );
+    }
+}
+
+/// Dismissing the palette and directly executing `/login <provider>` has the
+/// same visible slot transition as selecting the provider row.
+#[test]
+fn directly_typed_provider_without_a_method_opens_the_method_choice() {
+    for provider in [
+        "anthropic",
+        "openai",
+        "gemini",
+        "kimi",
+        "grok",
+        "xai",
+        "deepseek",
+        "custom",
+    ] {
+        let mut model = live_model(&[]);
+        run_slash(&mut model, &format!("/login {provider}"));
+        assert_eq!(model.composer.text(), format!("/login {provider} "));
+        assert!(model.palette_open(), "{provider}: method choice is visible");
+        assert!(
+            model.flash.is_none(),
+            "{provider}: no transient fallback flash"
+        );
+    }
+}
+
+/// Direct slash commands cover the complete supported matrix. OAuth keeps
+/// routing through the same account-add hit arm; API providers open the same
+/// masked card, and custom opens the existing name/base-url/optional-key card.
+#[test]
+fn directly_typed_login_methods_reach_every_supported_provider_path() {
+    for (provider, wire, feature) in [
+        (
+            "openai",
+            "openai-oauth",
+            haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1,
+        ),
+        (
+            "anthropic",
+            "anthropic-oauth",
+            haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1,
+        ),
+        (
+            "kimi",
+            "kimi-oauth",
+            haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1,
+        ),
+        (
+            "grok",
+            "grok-oauth",
+            haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1,
+        ),
+    ] {
+        let mut model = live_model(&[feature]);
+        run_slash(&mut model, &format!("/login {provider} oauth"));
+        assert_eq!(
+            model.screen,
+            Screen::Accounts,
+            "{provider}: account UI owns OAuth"
+        );
+        assert_eq!(
+            model.oauth_add.as_ref().map(|card| card.provider.as_str()),
+            Some(wire),
+            "{provider}: the existing account-add card opened"
+        );
+        assert!(model.requests.iter().any(|request| matches!(
+            request,
+            AppRequest::OAuthAddStart { provider, .. } if provider == wire
+        )));
+    }
+
+    for provider in ["openai", "anthropic", "gemini", "xai", "deepseek"] {
+        let mut model = live_model(&[]);
+        run_slash(&mut model, &format!("/login {provider} api"));
+        assert_eq!(
+            model.login.as_ref().map(|card| card.provider.as_str()),
+            Some(provider),
+            "{provider}: masked API-key card opened"
+        );
+    }
+
+    let mut custom = live_model(&[haider_rpc::FEATURE_PROVIDER_CONFIGURE_V1]);
+    run_slash(&mut custom, "/login custom api");
+    assert_eq!(custom.screen, Screen::Accounts);
+    let card = custom
+        .custom_add
+        .as_ref()
+        .expect("custom routes through the existing account-add card");
+    assert_eq!(card.name, "custom");
+    assert_eq!(card.origin, "http://127.0.0.1:8000/v1");
+    assert!(!card.keyless, "the key is optional through the auth choice");
+    assert!(custom.login.is_none(), "no parallel plain-key custom flow");
+
+    for provider in ["kimi", "grok"] {
+        let mut model = live_model(&[]);
+        run_slash(&mut model, &format!("/login {provider} api"));
+        assert!(model.login.is_none(), "{provider}: no fictitious API card");
+        assert!(
+            model
+                .flash
+                .as_deref()
+                .is_some_and(|flash| flash.contains("no API-key flow") && flash.contains("oauth")),
+            "{provider}: unsupported direct API is an honest refusal"
+        );
+    }
+
+    for provider in ["gemini", "xai", "deepseek", "custom"] {
+        let mut model = live_model(&[]);
+        run_slash(&mut model, &format!("/login {provider} oauth"));
+        assert!(
+            model.oauth_add.is_none(),
+            "{provider}: no fictitious OAuth card"
+        );
+        assert!(
+            model
+                .flash
+                .as_deref()
+                .is_some_and(|flash| flash.contains("no OAuth flow") && flash.contains("api")),
+            "{provider}: unsupported direct OAuth is an honest refusal"
+        );
+    }
 }
 
 /// LAW — HELP_TEXT names the real provider roster: `google` was never a

@@ -67,12 +67,12 @@ fn discovered_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
 }
 
 #[test]
-fn custom_server_key_is_masked_and_debug_redacted() {
+fn custom_server_key_paste_is_masked_and_debug_redacted() {
     const SENTINEL: &str = "CUSTOM_TUI_SECRET_SENTINEL_4f21";
     let mut model = live_accounts();
     open_custom(&mut model);
     focus_key(&mut model);
-    type_text(&mut model, SENTINEL);
+    model.handle(AppEvent::Paste(SENTINEL.to_owned().into()));
 
     let card = model.custom_add.as_ref().expect("card stays open");
     assert_eq!(card.masked_key_len(), SENTINEL.chars().count());
@@ -95,6 +95,27 @@ fn custom_server_key_is_masked_and_debug_redacted() {
         "a frame must never contain the key"
     );
     assert!(rendered.contains("••••"), "the entry is visibly masked");
+    key(&mut model, KeyCode::Enter);
+    assert!(
+        !format!("{:?}", model.requests).contains(SENTINEL),
+        "the queued configure request's Debug is redacted"
+    );
+    assert_eq!(
+        model
+            .custom_add
+            .as_ref()
+            .expect("card stays open while submitting")
+            .masked_key_len(),
+        0,
+        "submit wiped the card's local copy"
+    );
+
+    // Open a fresh card to pin the no-auth transition independently of the
+    // submitted attempt above.
+    model.cancel_custom_add();
+    open_custom(&mut model);
+    focus_key(&mut model);
+    model.handle(AppEvent::Paste(SENTINEL.to_owned().into()));
 
     key(&mut model, KeyCode::BackTab); // API family
     key(&mut model, KeyCode::BackTab); // auth
