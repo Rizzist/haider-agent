@@ -146,7 +146,10 @@ Evidence: [Loom DSL and type contracts](crates/haider-protocol/src/loom.rs), [wo
 
 Delivery is at least once, so clients advance their cursor only after fully applying a consecutive sequence. On a discontinuity they stop reduction and reattach from the last applied cursor; they never skip the hole. Native sidecar paths are daemon-published rather than guessed, and third-party clients can build on `haider-client` instead of scraping terminal output.
 
-Start with the authoritative [client contract v1](docs/client-contract-v1.md) and the [gap-recovery client tests](crates/haider-client/tests/observe_tests.rs).
+Start with the orchestrator-facing [automation contract v1](docs/automation-contract-v1.md),
+then use the authoritative [client contract v1](docs/client-contract-v1.md), the
+[event schema changelog](docs/event-schema-changelog.md), and the
+[gap-recovery client tests](crates/haider-client/tests/observe_tests.rs).
 
 ## 08 / Voice
 
