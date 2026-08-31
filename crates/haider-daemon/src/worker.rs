@@ -16228,7 +16228,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
         ticket: &DeferredTicket,
         cancel: &CancelToken,
     ) -> Result<DeferredToolResult, HaiderError> {
-        self.delegation.collect(ticket, cancel).await
+        self.delegation
+            .collect(ticket, cancel, self.run_deadline)
+            .await
     }
 
     async fn acknowledge_deferred(&self, ticket: &DeferredTicket) -> Result<(), HaiderError> {
@@ -16246,7 +16248,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
             .cloned()
             .collect::<Vec<_>>();
         for ticket in tickets {
-            self.delegation.cancel_ticket(&ticket).await?;
+            self.delegation
+                .cancel_ticket(&ticket, self.run_deadline)
+                .await?;
         }
         Ok(())
     }

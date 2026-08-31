@@ -34,6 +34,8 @@
 //! writer besides effect reconciliation), and current-generation runs (live
 //! workers own those; the generation fence skips them).
 
+use crate::delegation::{DelegationMirrorHandoff, DelegationMirrorHandoffPhase};
+
 use haider_core::{
     AcceptedRunRetry, AcceptedTurn, ChildWaitCheckpoint, DeferredTicket, DeferredToolCheckpoint,
     PartialStreamCheckpoint, RequestInputCheckpoint, SessionProjectionCheckpoint,
@@ -87,6 +89,12 @@ pub(crate) enum RecoveredWork {
     Checkpoint(Box<RecoveredCheckpoint>),
     PartialStream(Box<RecoveredPartialStream>),
     ChildWait(Box<RecoveredChildWait>),
+    DelegationMirror(Box<RecoveredDelegationMirror>),
+}
+
+pub(crate) struct RecoveredDelegationMirror {
+    pub(crate) record: haider_core::DelegationRecord,
+    pub(crate) handoff: DelegationMirrorHandoff,
 }
 
 pub(crate) struct RecoveredPartialStream {
@@ -127,6 +135,8 @@ struct RunReduction {
     headless_configured: bool,
     #[serde(default)]
     budget_exhausted: Option<RunBudgetExhaustedV1>,
+    #[serde(default)]
+    delegation_mirror_handoffs: HashMap<String, DelegationMirrorHandoff>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -281,6 +291,7 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
             visitor.visit_page(&session_id, &page.envelopes).await?;
             reductions.retain(|_, reduction| {
                 reduction.branch_mismatch
+                    || !reduction.delegation_mirror_handoffs.is_empty()
                     || !reduction
                         .state
                         .as_ref()
@@ -323,7 +334,65 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
             let Some((state, _)) = reduction.state.clone() else {
                 continue;
             };
-            if state.is_terminal() || reduction.state_generation == store.worker_generation() {
+            let mut mirror_handoffs = reduction
+                .delegation_mirror_handoffs
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            mirror_handoffs.sort_by(|left, right| left.handoff_id.cmp(&right.handoff_id));
+            for handoff in &mirror_handoffs {
+                if handoff.child_session_id != session_id || handoff.child_run_id != run_id {
+                    return Err(HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!(
+                            "delegation mirror handoff {} crosses child run coordinates",
+                            handoff.handoff_id
+                        ),
+                        false,
+                    ));
+                }
+                let record = store
+                    .delegation(handoff.agent.clone())
+                    .await?
+                    .ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!(
+                                "delegation mirror handoff {} has no durable delegation",
+                                handoff.handoff_id
+                            ),
+                            false,
+                        )
+                    })?;
+                recovered.push(RecoveredWork::DelegationMirror(Box::new(
+                    RecoveredDelegationMirror {
+                        record,
+                        handoff: handoff.clone(),
+                    },
+                )));
+            }
+            if state.is_terminal() {
+                continue;
+            }
+            if reduction.state_generation == store.worker_generation() {
+                continue;
+            }
+            if !mirror_handoffs.is_empty() {
+                // The pending child-journal fact precedes the live cancellation
+                // wake. A daemon crash in that window therefore recovers as a
+                // cancellation, never as generic interruption; the queued
+                // mirror remains until its completion fact is journaled.
+                terminalize_interrupted(
+                    store,
+                    device_id,
+                    &session_id,
+                    &run_id,
+                    reduction.branch_id.clone(),
+                    reduction,
+                    true,
+                )
+                .await?;
+                touched = true;
                 continue;
             }
             // Acceptance now requires typed metadata, but legacy/CLI journals
@@ -800,6 +869,22 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
             }
         }
         EventPayload::Item(ItemEvent::Completed { item_id, item }) => {
+            if let Some(handoff) = DelegationMirrorHandoff::from_item(&item) {
+                match handoff.phase {
+                    DelegationMirrorHandoffPhase::Pending => {
+                        reduction
+                            .delegation_mirror_handoffs
+                            .insert(handoff.handoff_id.clone(), handoff);
+                    }
+                    DelegationMirrorHandoffPhase::Completed => {
+                        reduction
+                            .delegation_mirror_handoffs
+                            .remove(&handoff.handoff_id);
+                    }
+                }
+                reduction.open_items.remove(&item_id);
+                return;
+            }
             let item = match item {
                 TurnItem::IncompleteAgentMessage { text, .. } => {
                     reduction.open_items.remove(&item_id);

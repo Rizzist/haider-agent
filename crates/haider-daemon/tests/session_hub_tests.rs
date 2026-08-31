@@ -9429,13 +9429,17 @@ async fn native_pipe_resume_skips_the_already_reconciled_batch() {
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
     let mut second = vec![user_pipe_event(&session_id, "second", generation, "two")];
     hub.append(&mut second).await.expect("second commits");
-    let body = stable_sidecar(&sidecar_path(&root, &session_id)).await;
+    // Sidecar maintenance is deliberately off the append path. Drain the
+    // writer before inspecting its final resume cursor: otherwise the prior
+    // batch can look stable for a scheduler tick while this write is queued.
+    hub.shutdown().await.expect("second hub stops");
+    let body =
+        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("settled sidecar reads");
     assert_eq!(
         body,
         expected_sidecar_batches(&session_id, 1, &[&first, &second])
     );
     assert_eq!(body.lines().count(), 5, "current batch must not duplicate");
-    hub.shutdown().await.expect("second hub stops");
 }
 
 /// MUTATION CHECK: treating only row-shaped tails as resumable rebuilds this

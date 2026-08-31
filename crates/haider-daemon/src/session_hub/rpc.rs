@@ -15840,6 +15840,44 @@ impl HubConnection {
         }))
     }
 
+    async fn delegated_menu_opening(
+        &self,
+        session_id: &SessionId,
+        request_seq: u64,
+        menu_id: &MenuId,
+    ) -> Result<bool, SessionHubError> {
+        let opening = self
+            .hub
+            .inner
+            .store
+            .read(session_id, request_seq.saturating_sub(1), 1)
+            .await?
+            .into_iter()
+            .find(|envelope| envelope.seq == request_seq);
+        let Some(opening) = opening else {
+            return Ok(false);
+        };
+        let Ok(EventPayload::MenuOpened(menu)) =
+            serde_json::from_value::<EventPayload>(opening.payload.clone())
+        else {
+            return Ok(false);
+        };
+        let MenuScope::Subagent { agent } = &menu.scope else {
+            return Ok(false);
+        };
+        if menu.id != *menu_id
+            || menu.origin != crate::delegation::DELEGATED_MENU_ORIGIN
+            || opening.agent_id.as_ref() != Some(agent)
+        {
+            return Ok(false);
+        }
+        let Some(record) = self.hub.delegation(agent.clone()).await? else {
+            return Ok(false);
+        };
+        Ok(record.parent_session_id == *session_id
+            && opening.run_id.as_ref() == Some(&record.parent_run_id))
+    }
+
     async fn execute_parked_command(
         &self,
         session_id: SessionId,
@@ -16042,6 +16080,9 @@ impl HubConnection {
                 None,
             );
         }
+        let delegated_menu = self
+            .delegated_menu_opening(&session_id, request_seq, &answer.menu)
+            .await?;
         let command_menu = match self
             .command_menu_lookup(&session_id, request_seq, &answer.menu, &answer)
             .await?
@@ -16070,7 +16111,7 @@ impl HubConnection {
             // checkpoint, a command-door menu has no volatile harness
             // registration to recover after restart, so its exact opening
             // coordinates are the authority for prior-generation recovery.
-            allow_prior_generation: command_menu.is_some(),
+            allow_prior_generation: command_menu.is_some() || delegated_menu,
             answer,
             device_id: self.hub.inner.device_id.clone(),
             input_is_secret_reference: secret_reference,

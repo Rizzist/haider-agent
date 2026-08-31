@@ -1151,6 +1151,11 @@ async fn run_inner(
                     .recover_child_wait(recovered.accepted, recovered.checkpoint)
                     .await
             }
+            RecoveredWork::DelegationMirror(recovered) => {
+                crate::delegation::DelegationHandle::new(hub.clone())
+                    .recover_terminal_mirror_handoff(recovered.record, recovered.handoff)
+                    .await
+            }
         };
         if let Err(error) = result {
             let _ = worker_manager.shutdown().await;

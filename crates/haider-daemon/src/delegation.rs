@@ -20,7 +20,8 @@ use haider_core::{
     AcceptedTurn, CancelToken, ChildGraphAttachCommand, ChildTemplateObservationCommand,
     DeferredTicket, DeferredToolResult, DelegationCreateOutcome, DelegationRecord, DelegationState,
     GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand, GraphEvidenceOutcome,
-    GraphPinCommand, GraphPinOutcome, SessionCreateCommand, TurnAcceptCommand, TurnCancelCommand,
+    GraphPinCommand, GraphPinOutcome, MenuResolutionCommand, MenuResolutionOutcome,
+    SessionCreateCommand, TurnAcceptCommand, TurnCancelCommand,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::agent::{
@@ -32,7 +33,7 @@ use haider_protocol::effect::EffectClass;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::graph::{
     ChildContractRef, ChildGraphAttached, ChildTemplateCacheKey, ChildWorkflowDecision,
     ChildWorkflowTrigger, EvidenceAuthority, EvidenceVerdict, GraphGateKind, GraphPhase,
@@ -41,10 +42,11 @@ use haider_protocol::graph::{
     validate_graph_template,
 };
 use haider_protocol::ids::{
-    AgentId, BranchId, EventId, GraphId, ItemId, LeaseId, RunId, SessionId,
+    AgentId, BranchId, EventId, GraphId, ItemId, LeaseId, MenuId, RunId, SessionId,
 };
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::loom::{LoomGate, LoomWorkflow, parse_pipe};
+use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuScope};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::task::TaskEventPayload;
@@ -58,6 +60,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CHILD_STALL_DEADLINE: Duration = Duration::from_secs(120);
 const CHILD_SETTLEMENT_TAIL_TIMEOUT: Duration = Duration::from_secs(1);
+// Registry #94 production arithmetic: 120s pre-nudge stall attribution +
+// 120s post-nudge grace + 1s cancellation/reap tail = 241s run wait bound.
+// Unlike the two blame clocks, this absolute run clock never pauses.
+const CHILD_RUN_WAIT_TIMEOUT: Duration = Duration::from_secs(241);
+pub(crate) const DELEGATED_MENU_ORIGIN: &str = "delegated-child";
+const DELEGATED_WAIT_TIMEOUT_KIND: &str = "delegated_child_wait_timeout";
+pub(crate) const DELEGATION_MIRROR_HANDOFF_EXTENSION_KIND: &str =
+    "delegation_terminal_mirror_handoff_v1";
 pub(crate) const RECURSION_DEPTH_LIMIT: u32 = 3;
 pub(crate) const RECURSION_LIMIT_MESSAGE: &str = "recursion depth limit";
 const STALL_NUDGE_TEXT: &str = "report your status or conclude";
@@ -71,6 +81,7 @@ const HANDOFF_IGNORE: &[u8] = b"*";
 pub(crate) struct DelegationHandle {
     hub: SessionHub,
     stall_deadline: Duration,
+    run_wait_timeout: Duration,
     settlement_tail_timeout: Duration,
 }
 
@@ -78,17 +89,73 @@ pub(crate) struct DelegationHandle {
 #[must_use = "the terminal child settlement outcome must be handled"]
 enum ChildSettlementOutcome {
     Settled,
+    TerminalTimedOut(haider_platform::WaitTimeout),
     TailTimedOut(haider_platform::WaitTimeout),
 }
 
 fn report_child_settlement_outcome(outcome: ChildSettlementOutcome) {
-    if let ChildSettlementOutcome::TailTimedOut(timeout) = outcome {
-        eprintln!(
+    match outcome {
+        ChildSettlementOutcome::Settled => {}
+        ChildSettlementOutcome::TerminalTimedOut(timeout) => eprintln!(
+            "haiderd: lifecycle event=child_terminal_wait_timeout operation={} timeout_ms={}",
+            timeout.operation(),
+            timeout.limit().as_millis()
+        ),
+        ChildSettlementOutcome::TailTimedOut(timeout) => eprintln!(
             "haiderd: lifecycle event=child_terminal_tail_timeout operation={} timeout_ms={}",
             timeout.operation(),
             timeout.limit().as_millis()
-        );
+        ),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChildWaitBudget {
+    deadline: tokio::time::Instant,
+    active_deadline: tokio::time::Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DelegationMirrorHandoffPhase {
+    Pending,
+    Completed,
+}
+
+/// Daemon-private durable journal fact for a cancellation-tail mirror.
+///
+/// It is stored as a prompt-omitted `TurnItem::Extension` in the child run.
+/// Startup recovery retains terminal runs while a pending fact exists, so a
+/// daemon crash can never turn the detached live wake into lost work.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DelegationMirrorHandoff {
+    pub(crate) handoff_id: String,
+    pub(crate) agent: AgentId,
+    pub(crate) child_session_id: SessionId,
+    pub(crate) child_run_id: RunId,
+    pub(crate) deadline_at_ms: u64,
+    pub(crate) cancel_cause: String,
+    pub(crate) source: String,
+    pub(crate) phase: DelegationMirrorHandoffPhase,
+}
+
+impl DelegationMirrorHandoff {
+    pub(crate) fn from_item(item: &TurnItem) -> Option<Self> {
+        let TurnItem::Extension { kind, data } = item else {
+            return None;
+        };
+        (kind == DELEGATION_MIRROR_HANDOFF_EXTENSION_KIND)
+            .then(|| serde_json::from_value(data.clone()).ok())
+            .flatten()
+    }
+}
+
+enum ChildWaitWake {
+    Ready {
+        record: DelegationRecord,
+        completion: DeferredToolResult,
+    },
+    ParentCancelled(DelegationRecord),
 }
 
 pub(crate) struct SpawnCoordinates {
@@ -136,6 +203,7 @@ impl DelegationHandle {
         Self {
             hub,
             stall_deadline: CHILD_STALL_DEADLINE,
+            run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
             settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
         }
     }
@@ -145,6 +213,7 @@ impl DelegationHandle {
         Self {
             hub,
             stall_deadline,
+            run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
             settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
         }
     }
@@ -157,6 +226,22 @@ impl DelegationHandle {
         Self {
             hub,
             stall_deadline: CHILD_STALL_DEADLINE,
+            run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
+            settlement_tail_timeout,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_wait_budgets(
+        hub: SessionHub,
+        stall_deadline: Duration,
+        run_wait_timeout: Duration,
+        settlement_tail_timeout: Duration,
+    ) -> Self {
+        Self {
+            hub,
+            stall_deadline,
+            run_wait_timeout,
             settlement_tail_timeout,
         }
     }
@@ -808,94 +893,344 @@ impl DelegationHandle {
         &self,
         ticket: &DeferredTicket,
         cancel: &CancelToken,
+        run_deadline: Option<tokio::time::Instant>,
     ) -> Result<DeferredToolResult, HaiderError> {
         let mut chip_mirror = self.load_chip_mirror(ticket).await?;
-        loop {
-            let record = self
-                .hub
-                .delegation(ticket.manifest.agent.clone())
-                .await?
-                .ok_or_else(|| {
-                    HaiderError::new(
-                        ErrorCode::StoreCorrupt,
-                        "deferred ticket has no durable delegation",
-                        false,
-                    )
-                })?;
-            self.mirror_child_chip_states(&record, &mut chip_mirror)
-                .await?;
-            if let Some(report) = record.report.clone() {
-                let settlement = self
-                    .mirror_until_child_terminal(&record, &mut chip_mirror)
-                    .await?;
-                report_child_settlement_outcome(settlement);
-                self.collapse_child_contract(&record, &report).await?;
-                let chip = if report.verified == ReportVerification::Red {
-                    ChipState::Error
-                } else {
-                    ChipState::Done
-                };
-                return Ok(DeferredToolResult {
-                    report,
-                    chip,
-                    truncated: false,
-                });
-            }
-            if let Some(completion) = self.derive_terminal_report(&record).await? {
-                let settlement = self
-                    .mirror_until_child_terminal(&record, &mut chip_mirror)
-                    .await?;
-                report_child_settlement_outcome(settlement);
-                let stored = self
+        let initial = self
+            .hub
+            .delegation(ticket.manifest.agent.clone())
+            .await?
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "deferred ticket has no durable delegation",
+                    false,
+                )
+            })?;
+        let budget = self.child_wait_budget(&initial, run_deadline).await?;
+        let wait = async {
+            loop {
+                let record = self
                     .hub
-                    .record_delegation_report(record.agent_id.clone(), completion.report)
+                    .delegation(ticket.manifest.agent.clone())
+                    .await?
+                    .ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            "deferred ticket has no durable delegation",
+                            false,
+                        )
+                    })?;
+                self.mirror_child_chip_states(&record, &mut chip_mirror)
                     .await?;
-                let report = stored.report.clone().ok_or_else(|| {
-                    HaiderError::new(
-                        ErrorCode::StoreCorrupt,
-                        "reported delegation has no report body",
-                        false,
+                self.forward_parent_menu_answers(&record, &mut chip_mirror)
+                    .await?;
+                if chip_mirror.child_run_terminal {
+                    if let Some(report) = record.report.clone() {
+                        let chip = if report.verified == ReportVerification::Red {
+                            ChipState::Error
+                        } else {
+                            ChipState::Done
+                        };
+                        return Ok(ChildWaitWake::Ready {
+                            record,
+                            completion: DeferredToolResult {
+                                report,
+                                chip,
+                                truncated: false,
+                            },
+                        });
+                    }
+                    if let Some(completion) = self.derive_terminal_report(&record).await? {
+                        let stored = self
+                            .hub
+                            .record_delegation_report(
+                                record.agent_id.clone(),
+                                completion.report.clone(),
+                            )
+                            .await?;
+                        let report = stored.report.clone().ok_or_else(|| {
+                            HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                "reported delegation has no report body",
+                                false,
+                            )
+                        })?;
+                        return Ok(ChildWaitWake::Ready {
+                            record: stored,
+                            completion: DeferredToolResult {
+                                report,
+                                chip: completion.chip,
+                                truncated: completion.truncated,
+                            },
+                        });
+                    }
+                }
+                let progress = self.delegation_progress(&record).await?;
+                if !progress.human_required {
+                    match progress.nudge {
+                        None if deadline_elapsed(progress.latest_at_ms, self.stall_deadline) => {
+                            self.nudge(&record).await?;
+                        }
+                        Some((_, nudge_at_ms))
+                            if deadline_elapsed(
+                                progress.latest_at_ms.max(nudge_at_ms),
+                                self.stall_deadline,
+                            ) =>
+                        {
+                            self.cancel_subtree(&record, CancelCause::Stall).await?;
+                        }
+                        _ => {}
+                    }
+                }
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        return Ok(ChildWaitWake::ParentCancelled(record));
+                    }
+                    () = tokio::time::sleep(CHILD_POLL_INTERVAL) => {}
+                }
+            }
+        };
+        let active_limit = budget
+            .active_deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        match haider_platform::bounded_wait("delegated child active wait", active_limit, wait).await
+        {
+            haider_platform::BoundedWait::Completed(Ok(ChildWaitWake::Ready {
+                record,
+                completion,
+            })) => {
+                let settlement = self
+                    .mirror_until_child_terminal(&record, &mut chip_mirror, budget.deadline)
+                    .await?;
+                report_child_settlement_outcome(settlement);
+                self.collapse_child_contract(&record, &completion.report)
+                    .await?;
+                Ok(completion)
+            }
+            haider_platform::BoundedWait::Completed(Ok(ChildWaitWake::ParentCancelled(record))) => {
+                let handoff = self
+                    .begin_terminal_mirror_handoff(
+                        &record,
+                        &budget,
+                        CancelCause::Parent,
+                        "collector",
                     )
-                })?;
-                self.collapse_child_contract(&stored, &report).await?;
-                return Ok(DeferredToolResult {
-                    report,
-                    chip: completion.chip,
-                    truncated: completion.truncated,
-                });
-            }
-            let progress = self.delegation_progress(&record).await?;
-            if !progress.human_required {
-                match progress.nudge {
-                    None if deadline_elapsed(progress.latest_at_ms, self.stall_deadline) => {
-                        self.nudge(&record).await?;
-                    }
-                    Some((_, nudge_at_ms))
-                        if deadline_elapsed(
-                            progress.latest_at_ms.max(nudge_at_ms),
-                            self.stall_deadline,
-                        ) =>
-                    {
-                        self.cancel_subtree(&record, CancelCause::Stall).await?;
-                    }
-                    _ => {}
-                }
-            }
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => {
-                    self.cancel_subtree(&record, CancelCause::Parent).await?;
-                    let settlement = self
-                        .mirror_until_child_terminal(&record, &mut chip_mirror)
+                    .await?;
+                let terminal_deadline = instant_from_unix_deadline(handoff.deadline_at_ms);
+                let _cancel_issued = self
+                    .cancel_subtree_before(&record, CancelCause::Parent, terminal_deadline)
+                    .await?;
+                let settlement = self
+                    .mirror_until_child_terminal(&record, &mut chip_mirror, terminal_deadline)
+                    .await?;
+                report_child_settlement_outcome(settlement);
+                if chip_mirror.child_run_terminal {
+                    self.complete_terminal_mirror_handoff(&record, handoff)
                         .await?;
-                    report_child_settlement_outcome(settlement);
-                    return Err(HaiderError::new(
-                        ErrorCode::RunNotActive,
-                        "parent cancelled while waiting for local child",
-                        false,
-                    ));
                 }
-                () = tokio::time::sleep(CHILD_POLL_INTERVAL) => {}
+                Err(HaiderError::new(
+                    ErrorCode::RunNotActive,
+                    "parent cancelled while waiting for local child",
+                    false,
+                ))
+            }
+            haider_platform::BoundedWait::Completed(Err(error)) => Err(error),
+            haider_platform::BoundedWait::TimedOut(timeout) => {
+                let record = self
+                    .hub
+                    .delegation(ticket.manifest.agent.clone())
+                    .await?
+                    .ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            "timed-out deferred ticket has no durable delegation",
+                            false,
+                        )
+                    })?;
+                // Registry #94: the pending journal fact is committed before
+                // cancellation, and every following phase consumes the one
+                // original absolute deadline. No awaited receipt/store work
+                // restarts or extends the reserved terminal/reap tail.
+                let handoff = self
+                    .begin_terminal_mirror_handoff(
+                        &record,
+                        &budget,
+                        CancelCause::Deadline,
+                        "collector",
+                    )
+                    .await?;
+                let terminal_deadline = instant_from_unix_deadline(handoff.deadline_at_ms);
+                let _cancel_issued = self
+                    .cancel_subtree_before(&record, CancelCause::Deadline, terminal_deadline)
+                    .await?;
+                let settlement = self
+                    .mirror_until_child_terminal(&record, &mut chip_mirror, terminal_deadline)
+                    .await?;
+                report_child_settlement_outcome(settlement);
+                if chip_mirror.child_run_terminal {
+                    self.complete_terminal_mirror_handoff(&record, handoff)
+                        .await?;
+                }
+                Err(delegated_wait_timeout(timeout, &record))
+            }
+        }
+    }
+
+    async fn child_wait_budget(
+        &self,
+        record: &DelegationRecord,
+        run_deadline: Option<tokio::time::Instant>,
+    ) -> Result<ChildWaitBudget, HaiderError> {
+        // Interactive runs have no explicit client deadline, so their durable
+        // delegation budget starts at the parent run's first committed fact:
+        // one stall interval before the nudge + one grace interval after it +
+        // the terminal/reap tail. Recovery re-derives the same absolute bound
+        // from the journal instead of restarting a relative timer.
+        let default_total = self.run_wait_timeout;
+        let now = tokio::time::Instant::now();
+        let remaining = match run_deadline {
+            Some(deadline) => deadline.saturating_duration_since(now),
+            None => {
+                let started_at_ms = self.parent_run_started_at_ms(record).await?;
+                let deadline_ms = started_at_ms.saturating_add(duration_millis(default_total));
+                Duration::from_millis(deadline_ms.saturating_sub(unix_time_ms()))
+            }
+        }
+        .min(default_total);
+        // Registry #94 arithmetic: active + cancellation_tail == remaining.
+        // The tail is at most the configured settlement budget and at most a
+        // quarter of a short run, so a deadline always reserves a bounded reap
+        // without consuming the entire useful child window.
+        let cancellation_tail = self
+            .settlement_tail_timeout
+            .min(remaining.checked_div(4).unwrap_or_default());
+        let deadline = now + remaining;
+        Ok(ChildWaitBudget {
+            deadline,
+            active_deadline: deadline.checked_sub(cancellation_tail).unwrap_or(now),
+        })
+    }
+
+    async fn parent_run_started_at_ms(
+        &self,
+        record: &DelegationRecord,
+    ) -> Result<u64, HaiderError> {
+        let mut cursor = 0;
+        let mut started_at_ms = None;
+        loop {
+            let page = self
+                .hub
+                .read_internal_session(&record.parent_session_id, cursor, 256)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+            for envelope in page {
+                if envelope.run_id.as_ref() == Some(&record.parent_run_id) {
+                    started_at_ms = Some(
+                        started_at_ms.map_or(envelope.committed_at_ms, |started: u64| {
+                            started.min(envelope.committed_at_ms)
+                        }),
+                    );
+                }
+            }
+        }
+        started_at_ms.ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "delegated child has no durable parent run start",
+                false,
+            )
+        })
+    }
+
+    /// Replays the durable parent decision into the child's ordinary menu CAS.
+    /// A crash after the parent answer but before this wake is repaired by the
+    /// recovered collector invoking the same deterministic command again.
+    async fn forward_parent_menu_answers(
+        &self,
+        record: &DelegationRecord,
+        mirror: &mut ChipMirror,
+    ) -> Result<(), HaiderError> {
+        if mirror.menu_routes.is_empty() {
+            return Ok(());
+        }
+        loop {
+            let page = self
+                .hub
+                .read_internal_session(&record.parent_session_id, mirror.parent_answer_cursor, 256)
+                .await?;
+            if page.is_empty() {
+                return Ok(());
+            }
+            mirror.parent_answer_cursor = page
+                .last()
+                .map_or(mirror.parent_answer_cursor, |envelope| envelope.seq);
+            for envelope in page {
+                // The child's Hook answer is projected back into this journal;
+                // do not feed that projection through the route a second time.
+                // Ordinary parent answers intentionally inherit the opening's
+                // child agent coordinate, so the deterministic projection id
+                // (not `agent_id`) is the discriminator.
+                if envelope
+                    .event_id
+                    .as_str()
+                    .starts_with(&format!("delegation-menu-{}-", record.agent_id.as_str()))
+                {
+                    continue;
+                }
+                let Ok(haider_protocol::EventPayload::MenuAnswered(answer)) =
+                    serde_json::from_value::<haider_protocol::EventPayload>(
+                        envelope.payload.clone(),
+                    )
+                else {
+                    continue;
+                };
+                let Some(route) = mirror.menu_routes.get(&answer.menu) else {
+                    continue;
+                };
+                let child_answer = MenuAnswer {
+                    menu: route.child_menu.id.clone(),
+                    option_key: answer.option_key,
+                    option_index: answer.option_index,
+                    value: answer.value,
+                    via: AnswerVia::Hook,
+                };
+                let outcome = self
+                    .hub
+                    .resolve_hook_menu(MenuResolutionCommand {
+                        command_id: format!(
+                            "delegation-menu-forward-{}-{}",
+                            record.agent_id, envelope.event_id
+                        ),
+                        session_id: record.child_session_id.clone(),
+                        request_seq: route.request_seq,
+                        worker_generation: route.worker_generation,
+                        allow_prior_generation: true,
+                        answer: child_answer,
+                        device_id: self.hub.device_id(),
+                        input_is_secret_reference: matches!(
+                            route.child_menu.kind,
+                            haider_protocol::menu::MenuKind::Secret
+                        ),
+                    })
+                    .await;
+                match outcome {
+                    Ok(
+                        MenuResolutionOutcome::Committed { .. }
+                        | MenuResolutionOutcome::IdempotentReplay { .. }
+                        | MenuResolutionOutcome::AlreadyResolved { .. },
+                    ) => {}
+                    Err(error)
+                        if matches!(
+                            error.code,
+                            ErrorCode::MenuNotFound | ErrorCode::MenuAlreadyAnswered
+                        ) => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
     }
@@ -1022,27 +1357,35 @@ impl DelegationHandle {
             .map(|_| ())
     }
 
-    pub(crate) async fn cancel_ticket(&self, ticket: &DeferredTicket) -> Result<(), HaiderError> {
+    pub(crate) async fn cancel_ticket(
+        &self,
+        ticket: &DeferredTicket,
+        run_deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), HaiderError> {
         let Some(record) = self.hub.delegation(ticket.manifest.agent.clone()).await? else {
             return Ok(());
         };
-        self.cancel_subtree(&record, CancelCause::Parent).await?;
+        let budget = self.child_wait_budget(&record, run_deadline).await?;
+        let handoff = self
+            .begin_terminal_mirror_handoff(
+                &record,
+                &budget,
+                CancelCause::Parent,
+                "cleanup_fallback",
+            )
+            .await?;
         // This cleanup hook runs inside parent terminalization, so waiting for
         // the child here would deadlock the cancellation handoff. The active
-        // collector normally performs the flush; this detached rebuild is the
-        // durable fallback when cancellation drops that collector first.
+        // collector normally performs the flush. The detached wake is safe to
+        // lose because `handoff` is already durable in the child journal and
+        // startup recovery replays it until a completion fact is committed.
         let coordinator = self.clone();
-        let ticket = ticket.clone();
         tokio::spawn(async move {
-            let result = async {
-                let mut mirror = coordinator.load_chip_mirror(&ticket).await?;
-                coordinator
-                    .mirror_until_child_terminal(&record, &mut mirror)
-                    .await
-            }
-            .await;
-            match result {
-                Ok(settlement) => report_child_settlement_outcome(settlement),
+            match coordinator
+                .reconcile_terminal_mirror_handoff(record.clone(), handoff)
+                .await
+            {
+                Ok(()) => {}
                 Err(error) => {
                     tracing::warn!(
                         agent = %record.agent_id,
@@ -1052,6 +1395,65 @@ impl DelegationHandle {
                 }
             }
         });
+        Ok(())
+    }
+
+    /// Reconcile one journal-derived cancellation mirror after startup.
+    ///
+    /// This method is synchronous for the startup caller: Ready is not
+    /// published until the pending durable handoff either settles or spends
+    /// the remainder of its original absolute run deadline.
+    pub(crate) async fn recover_terminal_mirror_handoff(
+        &self,
+        record: DelegationRecord,
+        handoff: DelegationMirrorHandoff,
+    ) -> Result<(), HaiderError> {
+        if record.agent_id != handoff.agent
+            || record.child_session_id != handoff.child_session_id
+            || record.child_run_id != handoff.child_run_id
+        {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "delegation mirror handoff does not match its durable delegation",
+                false,
+            ));
+        }
+        self.reconcile_terminal_mirror_handoff(record, handoff)
+            .await
+    }
+
+    async fn reconcile_terminal_mirror_handoff(
+        &self,
+        record: DelegationRecord,
+        handoff: DelegationMirrorHandoff,
+    ) -> Result<(), HaiderError> {
+        let deadline = instant_from_unix_deadline(handoff.deadline_at_ms);
+        let cause = CancelCause::from_name(&handoff.cancel_cause).unwrap_or(CancelCause::Parent);
+        let cancel_issued = self.cancel_subtree_before(&record, cause, deadline).await?;
+        let ticket = DeferredTicket {
+            id: record.agent_id.as_str().to_owned(),
+            manifest: record.manifest.clone(),
+        };
+        let mut mirror = self.load_chip_mirror(&ticket).await?;
+        // A zero-remaining recovered deadline still performs one durable
+        // reconciliation pass. `bounded_wait(0, ..)` may select its timer
+        // before polling the future, but an expired run must still project the
+        // terminal facts startup recovery just committed.
+        self.mirror_child_chip_states(&record, &mut mirror).await?;
+        let settlement = self
+            .mirror_until_child_terminal(&record, &mut mirror, deadline)
+            .await?;
+        let terminal_seen = mirror.child_run_terminal;
+        report_child_settlement_outcome(settlement);
+        if terminal_seen {
+            self.complete_terminal_mirror_handoff(&record, handoff)
+                .await?;
+        } else if !cancel_issued {
+            tracing::warn!(
+                agent = %record.agent_id,
+                "terminal child cancellation and mirror remain pending for startup recovery"
+            );
+        }
         Ok(())
     }
 
@@ -1892,6 +2294,10 @@ impl DelegationHandle {
                     || envelope
                         .event_id
                         .as_str()
+                        .starts_with(&format!("delegation-menu-{}-", record.agent_id.as_str()))
+                    || envelope
+                        .event_id
+                        .as_str()
                         .starts_with(&format!("delegation-metrics-{}-", record.agent_id.as_str()))
                     || envelope.event_id.as_str().starts_with(&format!(
                         "delegation-graph-rollup-{}-",
@@ -1932,7 +2338,10 @@ impl DelegationHandle {
             .map_or_else(String::new, |metadata| metadata.model);
         Ok(ChipMirror {
             child_cursor: 0,
+            parent_answer_cursor: 0,
             projected_events,
+            menu_routes: HashMap::new(),
+            emit_projections: true,
             last_chip,
             last_rollup,
             graph_envelopes: Vec::new(),
@@ -1940,6 +2349,25 @@ impl DelegationHandle {
             metrics_folder: SessionFolder::new(&initial_model),
             terminal_idle_seen: false,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn terminal_mirror_times_out_for_test(
+        &self,
+        record: &DelegationRecord,
+        limit: Duration,
+    ) -> Result<bool, HaiderError> {
+        let ticket = DeferredTicket {
+            id: record.agent_id.as_str().to_owned(),
+            manifest: record.manifest.clone(),
+        };
+        let mut mirror = self.load_chip_mirror(&ticket).await?;
+        // This observer intentionally shares the production wait loop while
+        // avoiding a second writer racing the active collector in tests.
+        mirror.emit_projections = false;
+        self.mirror_until_child_terminal(record, &mut mirror, tokio::time::Instant::now() + limit)
+            .await
+            .map(|outcome| matches!(outcome, ChildSettlementOutcome::TerminalTimedOut(_)))
     }
 
     async fn mirror_child_chip_states(
@@ -1993,6 +2421,34 @@ impl DelegationHandle {
                     mirror.child_run_terminal = true;
                 }
                 if child_run_event {
+                    if let haider_protocol::EventPayload::MenuOpened(menu) = &payload {
+                        let proxy_menu_id = delegated_menu_id(record, &menu.id);
+                        mirror.menu_routes.insert(
+                            proxy_menu_id.clone(),
+                            ChildMenuRoute {
+                                child_menu: menu.clone(),
+                                request_seq: envelope.seq,
+                                worker_generation: envelope.worker_generation,
+                            },
+                        );
+                    }
+                    if let Some(projected) = delegated_menu_payload(record, &payload) {
+                        let event_id = format!(
+                            "delegation-menu-{}-{}",
+                            record.agent_id.as_str(),
+                            envelope.seq
+                        );
+                        if mirror.projected_events.insert(event_id.clone()) {
+                            projections.push(child_menu_projection_envelope(
+                                record,
+                                &event_id,
+                                envelope.event_id.clone(),
+                                projected,
+                                self.hub.device_id(),
+                                self.hub.worker_generation(),
+                            )?);
+                        }
+                    }
                     if let haider_protocol::EventPayload::UserMessage { text, .. } = &payload {
                         let event_id = format!(
                             "delegation-prompt-{}-{}",
@@ -2099,6 +2555,9 @@ impl DelegationHandle {
                 )?);
                 mirror.projected_events.insert(metrics_event_id);
             }
+            if !mirror.emit_projections {
+                projections.clear();
+            }
             if !projections.is_empty() {
                 self.hub.append(&mut projections).await?;
             }
@@ -2112,15 +2571,34 @@ impl DelegationHandle {
         &self,
         record: &DelegationRecord,
         mirror: &mut ChipMirror,
+        deadline: tokio::time::Instant,
     ) -> Result<ChildSettlementOutcome, HaiderError> {
-        loop {
-            self.mirror_child_chip_states(record, mirror).await?;
-            if mirror.child_run_terminal {
-                break;
+        let terminal = async {
+            loop {
+                self.mirror_child_chip_states(record, mirror).await?;
+                if mirror.child_run_terminal {
+                    return Ok::<(), HaiderError>(());
+                }
+                tokio::time::sleep(CHILD_POLL_INTERVAL).await;
             }
-            tokio::time::sleep(CHILD_POLL_INTERVAL).await;
+        };
+        let terminal_limit = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match haider_platform::bounded_wait(
+            "delegated child terminal mirror",
+            terminal_limit,
+            terminal,
+        )
+        .await
+        {
+            haider_platform::BoundedWait::Completed(result) => result?,
+            haider_platform::BoundedWait::TimedOut(timeout) => {
+                return Ok(ChildSettlementOutcome::TerminalTimedOut(timeout));
+            }
         }
 
+        let tail_limit = self
+            .settlement_tail_timeout
+            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
         let tail = async {
             loop {
                 self.mirror_child_chip_states(record, mirror).await?;
@@ -2139,12 +2617,8 @@ impl DelegationHandle {
                 tokio::time::sleep(CHILD_POLL_INTERVAL).await;
             }
         };
-        match haider_platform::bounded_wait(
-            "terminal child idle/metrics tail",
-            self.settlement_tail_timeout,
-            tail,
-        )
-        .await
+        match haider_platform::bounded_wait("terminal child idle/metrics tail", tail_limit, tail)
+            .await
         {
             haider_platform::BoundedWait::Completed(result) => {
                 result?;
@@ -2231,6 +2705,123 @@ impl DelegationHandle {
         Ok(())
     }
 
+    async fn cancel_subtree_before(
+        &self,
+        record: &DelegationRecord,
+        cause: CancelCause,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, HaiderError> {
+        let limit = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if limit.is_zero() {
+            if self
+                .session_progress(record)
+                .await?
+                .state
+                .is_some_and(|state| state.is_terminal())
+            {
+                return Ok(true);
+            }
+            // Tokio may select a zero-duration timeout before polling the
+            // cancellation future. The pending mirror fact is already
+            // durable, so enqueue the actor's persist-before-wake command
+            // without extending or pausing the exhausted parent deadline.
+            self.hub
+                .try_cancel_internal_turn(self.cancellation_command(record, cause)?)?;
+            return Ok(true);
+        }
+        match haider_platform::bounded_wait(
+            "delegated child cancellation handoff",
+            limit,
+            self.cancel_subtree(record, cause),
+        )
+        .await
+        {
+            haider_platform::BoundedWait::Completed(result) => {
+                result?;
+                Ok(true)
+            }
+            haider_platform::BoundedWait::TimedOut(timeout) => {
+                eprintln!(
+                    "haiderd: lifecycle event=child_cancel_handoff_timeout operation={} timeout_ms={}",
+                    timeout.operation(),
+                    timeout.limit().as_millis()
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    async fn begin_terminal_mirror_handoff(
+        &self,
+        record: &DelegationRecord,
+        budget: &ChildWaitBudget,
+        cause: CancelCause,
+        source: &str,
+    ) -> Result<DelegationMirrorHandoff, HaiderError> {
+        let now = tokio::time::Instant::now();
+        let terminal_deadline = budget.deadline.min(now + self.settlement_tail_timeout);
+        let terminal_remaining = terminal_deadline.saturating_duration_since(now);
+        let deadline_at_ms = unix_time_ms().saturating_add(duration_millis(terminal_remaining));
+        let deadline = deadline_at_ms.to_string();
+        let handoff_id =
+            stable_digest(&[record.agent_id.as_str(), &deadline, cause.name(), source]);
+        let handoff = DelegationMirrorHandoff {
+            handoff_id,
+            agent: record.agent_id.clone(),
+            child_session_id: record.child_session_id.clone(),
+            child_run_id: record.child_run_id.clone(),
+            deadline_at_ms,
+            cancel_cause: cause.name().to_owned(),
+            source: source.to_owned(),
+            phase: DelegationMirrorHandoffPhase::Pending,
+        };
+        self.append_terminal_mirror_handoff(record, &handoff)
+            .await?;
+        Ok(handoff)
+    }
+
+    async fn complete_terminal_mirror_handoff(
+        &self,
+        record: &DelegationRecord,
+        mut handoff: DelegationMirrorHandoff,
+    ) -> Result<(), HaiderError> {
+        handoff.phase = DelegationMirrorHandoffPhase::Completed;
+        self.append_terminal_mirror_handoff(record, &handoff).await
+    }
+
+    async fn append_terminal_mirror_handoff(
+        &self,
+        record: &DelegationRecord,
+        handoff: &DelegationMirrorHandoff,
+    ) -> Result<(), HaiderError> {
+        let mut envelope = [terminal_mirror_handoff_envelope(
+            record,
+            handoff,
+            self.hub.device_id(),
+            self.hub.worker_generation(),
+        )?];
+        self.hub.append(&mut envelope).await.map(|_| ())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn begin_terminal_mirror_handoff_for_test(
+        &self,
+        record: &DelegationRecord,
+        limit: Duration,
+    ) -> Result<DelegationMirrorHandoff, HaiderError> {
+        let now = tokio::time::Instant::now();
+        self.begin_terminal_mirror_handoff(
+            record,
+            &ChildWaitBudget {
+                deadline: now + limit,
+                active_deadline: now,
+            },
+            CancelCause::Parent,
+            "test_crash_window",
+        )
+        .await
+    }
+
     async fn stall_cancel_requested(&self, record: &DelegationRecord) -> Result<bool, HaiderError> {
         let command = self.cancellation_command(record, CancelCause::Stall)?;
         self.hub
@@ -2298,13 +2889,22 @@ struct DelegationProgress {
 
 struct ChipMirror {
     child_cursor: u64,
+    parent_answer_cursor: u64,
     projected_events: HashSet<String>,
+    menu_routes: HashMap<MenuId, ChildMenuRoute>,
+    emit_projections: bool,
     last_chip: Option<ChipState>,
     last_rollup: Option<AgentGraphRollupV1>,
     graph_envelopes: Vec<RawEnvelope>,
     child_run_terminal: bool,
     metrics_folder: SessionFolder,
     terminal_idle_seen: bool,
+}
+
+struct ChildMenuRoute {
+    child_menu: Menu,
+    request_seq: u64,
+    worker_generation: u64,
 }
 
 struct ChildSessionSnapshot {
@@ -2325,6 +2925,7 @@ enum CancelCause {
     Stall,
     Parent,
     Ancestor,
+    Deadline,
 }
 
 impl CancelCause {
@@ -2333,17 +2934,41 @@ impl CancelCause {
             Self::Stall => "stall",
             Self::Parent => "parent",
             Self::Ancestor => "ancestor",
+            Self::Deadline => "deadline",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "stall" => Some(Self::Stall),
+            "parent" => Some(Self::Parent),
+            "ancestor" => Some(Self::Ancestor),
+            "deadline" => Some(Self::Deadline),
+            _ => None,
         }
     }
 }
 
-fn deadline_elapsed(committed_at_ms: u64, deadline: Duration) -> bool {
-    let now_ms = SystemTime::now()
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
-    let committed_at_ms = u128::from(committed_at_ms);
-    now_ms.saturating_sub(committed_at_ms) >= deadline.as_millis()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn instant_from_unix_deadline(deadline_at_ms: u64) -> tokio::time::Instant {
+    tokio::time::Instant::now()
+        + Duration::from_millis(deadline_at_ms.saturating_sub(unix_time_ms()))
+}
+
+fn deadline_elapsed(committed_at_ms: u64, deadline: Duration) -> bool {
+    unix_time_ms().saturating_sub(committed_at_ms) >= duration_millis(deadline)
 }
 
 pub(crate) fn graph_reduction_event(payload: &serde_json::Value) -> bool {
@@ -2634,6 +3259,48 @@ pub(crate) fn metrics_projection_envelope(
     })
 }
 
+fn terminal_mirror_handoff_envelope(
+    record: &DelegationRecord,
+    handoff: &DelegationMirrorHandoff,
+    device_id: haider_protocol::ids::DeviceId,
+    worker_generation: u64,
+) -> Result<RawEnvelope, HaiderError> {
+    let phase = match handoff.phase {
+        DelegationMirrorHandoffPhase::Pending => "pending",
+        DelegationMirrorHandoffPhase::Completed => "completed",
+    };
+    let identity = format!("delegation-terminal-mirror-{}-{phase}", handoff.handoff_id);
+    let payload = serde_json::to_value(haider_protocol::EventPayload::Item(ItemEvent::Completed {
+        item_id: ItemId::new(identity.clone()),
+        item: TurnItem::Extension {
+            kind: DELEGATION_MIRROR_HANDOFF_EXTENSION_KIND.into(),
+            data: serde_json::to_value(handoff).map_err(internal_serialization)?,
+        },
+    }))
+    .map_err(internal_serialization)?;
+    Ok(EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(identity),
+        seq: 0,
+        session_id: record.child_session_id.clone(),
+        branch_id: None,
+        run_id: Some(record.child_run_id.clone()),
+        agent_id: Some(record.agent_id.clone()),
+        device_id,
+        authority_epoch: 0,
+        worker_generation,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: false,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload,
+    })
+}
+
 pub(crate) fn graph_rollup_projection_envelope(
     record: &DelegationRecord,
     event_id: &str,
@@ -2715,6 +3382,79 @@ pub(crate) fn child_prompt_projection_envelope(
     })
 }
 
+fn delegated_menu_id(record: &DelegationRecord, child_menu_id: &MenuId) -> MenuId {
+    MenuId::new(format!(
+        "delegated-{}",
+        stable_digest(&[
+            record.agent_id.as_str(),
+            record.child_session_id.as_str(),
+            child_menu_id.as_str(),
+        ])
+    ))
+}
+
+fn delegated_menu_payload(
+    record: &DelegationRecord,
+    payload: &haider_protocol::EventPayload,
+) -> Option<haider_protocol::EventPayload> {
+    match payload {
+        haider_protocol::EventPayload::MenuOpened(menu) => {
+            let mut menu = menu.clone();
+            menu.id = delegated_menu_id(record, &menu.id);
+            menu.scope = MenuScope::Subagent {
+                agent: record.agent_id.clone(),
+            };
+            menu.origin = DELEGATED_MENU_ORIGIN.into();
+            Some(haider_protocol::EventPayload::MenuOpened(menu))
+        }
+        haider_protocol::EventPayload::MenuAnswered(answer) => {
+            let mut answer = answer.clone();
+            answer.menu = delegated_menu_id(record, &answer.menu);
+            Some(haider_protocol::EventPayload::MenuAnswered(answer))
+        }
+        haider_protocol::EventPayload::MenuClosed { menu, reason } => {
+            Some(haider_protocol::EventPayload::MenuClosed {
+                menu: delegated_menu_id(record, menu),
+                reason: *reason,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn child_menu_projection_envelope(
+    record: &DelegationRecord,
+    event_id: &str,
+    causation_id: EventId,
+    payload: haider_protocol::EventPayload,
+    device_id: haider_protocol::ids::DeviceId,
+    worker_generation: u64,
+) -> Result<RawEnvelope, HaiderError> {
+    Ok(EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(event_id),
+        seq: 0,
+        session_id: record.parent_session_id.clone(),
+        branch_id: record.parent_branch_id.clone(),
+        run_id: Some(record.parent_run_id.clone()),
+        // Existing live clients route a subagent-scoped MenuOpened into this
+        // exact chip transcript using the envelope's agent coordinate.
+        agent_id: Some(record.agent_id.clone()),
+        device_id,
+        authority_epoch: 0,
+        worker_generation,
+        causation_id: Some(causation_id),
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(payload).map_err(internal_serialization)?,
+    })
+}
+
 pub(crate) fn agent_messaged_envelope(
     record: &DelegationRecord,
     event_id: &str,
@@ -2771,6 +3511,40 @@ fn not_owned_child(agent: &AgentId) -> HaiderError {
 fn workflow_rejection(kind: &'static str, message: impl Into<String>) -> HaiderError {
     let mut error = HaiderError::new(ErrorCode::InvalidArgument, message, false);
     error.details = Some(serde_json::json!({ "kind": kind }));
+    error
+}
+
+fn delegated_wait_timeout(
+    timeout: haider_platform::WaitTimeout,
+    record: &DelegationRecord,
+) -> HaiderError {
+    let limit_ms = duration_millis(timeout.limit());
+    let mut error = HaiderError::new(
+        ErrorCode::ProviderTimeout,
+        format!(
+            "delegated child {} did not settle before the run deadline",
+            record.agent_id
+        ),
+        true,
+    )
+    .with_presentation(
+        ErrorPresentation::new(
+            "delegated-child-wait-timeout",
+            "Delegated child timed out",
+            "The child did not finish before this run's wait deadline. It was cancelled and reaped.",
+            ErrorScope::Turn,
+            [ErrorAction::Retry],
+        )
+        .with_timeout_budget(limit_ms, limit_ms),
+    );
+    error.details = Some(serde_json::json!({
+        "kind": DELEGATED_WAIT_TIMEOUT_KIND,
+        "operation": timeout.operation(),
+        "limit_ms": limit_ms,
+        "agent": record.agent_id,
+        "child_session_id": record.child_session_id,
+        "child_run_id": record.child_run_id,
+    }));
     error
 }
 
