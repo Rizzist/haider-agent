@@ -256,7 +256,7 @@ is §4.1.
 | `autonomous_interaction_v1` | `session.create.interaction_mode` and `SessionMetadataV1.interaction_mode` |
 | `turn_control_v1` | `turn.submit`, `turn.cancel` |
 | `headless_run_v1` | `headless.run.start`, `headless.run.status`, `headless.run.stop`, durable `HeadlessRunConfigured`, and typed replay divergence reports |
-| `run_budget_v1` | daemon-enforced token/cost/time limits and durable `RunBudgetExhausted` followed by `RunFailed { code: budget_exhausted }` and `Errored` |
+| `run_budget_v1` | pre-request token/cost/time guards, durable decision detail, and `RunBudgetExhausted` followed by `RunFailed { code: budget_exhausted }` and `Errored` |
 | `queue_control_v1` | `queue.list`, `queue.remove`, `queue.promote_steer`, and durable `QueueChanged` events on an attached session |
 | `peer_messaging_v1` | `peer.list`, `peer.send`, `peer.name`, `PeerMessageReceived`, and `PeerDeliveryChanged` |
 | `run_retry_v1` | `run.retry` |
@@ -2684,14 +2684,36 @@ idempotent and distinguishes accepted cancellation from already-terminal.
 Token and cost accounting is last-snapshot-wins per physical request ordinal.
 All request kinds, including compaction/cache-lifecycle traffic, participate.
 Logical input already includes cache reads; cache read/write counters are
-reported separately but are never added a second time. Enforcement may
-overshoot a token or cost limit by one in-flight provider request. Time is
-measured from durable acceptance. Exhaustion commits `RunBudgetExhausted`
-before cancelling provider/tool work. The daemon's pre-`Done` finalization
-guard rechecks the last durable usage so a fast token/cost response cannot
-commit success first. After effect cleanup, terminalization commits
-`RunFailed(BudgetExhausted)` and `RunState::Errored`; restart recovery finds
-the durable exhaustion fact before starting another provider request.
+reported separately but are never added a second time. Before each provider
+request, the daemon projects the selected dimension's total from committed
+spend plus the known prompt measurement, model pricing, and the request's
+maximum completion tokens. It refuses the request when that total exceeds the
+cap. The provider-neutral prompt measurement is serialized request bytes
+divided by four, with the existing fixed visual-token charge for image blocks;
+each native PDF block additionally counts its resolved base64 request bytes,
+including repeated references to the same artifact. Unknown pricing or
+required usage input is never guessed or treated as zero: under a cap it fails
+closed and names the provider and model in the typed decision reason. Time is
+measured from durable acceptance and is checked at the same request seam.
+Delegated child requests debit the parent run's cap, so no descendant is a
+separate budget namespace.
+
+After a request starts, reported usage reconciles the projection. If streamed
+usage crosses a cap, the daemon stops at the next chunk boundary and commits
+the same typed budget outcome. A cancellation or pre-finish Subturn that leaves
+no usage report fails closed as `usage_unavailable`; after restart, a durable
+request-attempt marker without matching usage has the same meaning. No such
+request can be followed by another paid request. `RunBudgetExhausted.decision` records `spent`,
+`projected`, `cap`, and one reason: `actual_usage`, `time_elapsed`,
+`projected_request`, `pricing_unavailable { provider, model }`, or
+`usage_unavailable { provider, model }`. `projected` is the candidate request's
+incremental estimate, and admission uses `spent + projected > cap`; it is absent
+when unavailable or inapplicable to the decision. Exhaustion
+commits `RunBudgetExhausted` before cancelling provider/tool work. The daemon's
+pre-`Done` finalization guard rechecks the last durable usage so a fast response
+cannot commit success first. After effect cleanup, terminalization commits
+`RunFailed(BudgetExhausted)` and `RunState::Errored`; restart recovery finds the
+durable exhaustion fact before starting another provider request.
 
 `haider run --replay <run-id>` is a read-only durable-journal operation. It
 resolves the terminal source through the durable run index, reads that run's
@@ -2767,6 +2789,9 @@ Absence laws:
   present, fails feature negotiation before session creation or submission.
 - Omitted budget fields are unbounded; a present zero is invalid. `seed: 0`
   remains present and is not treated as omission.
+- A missing budget `decision` means the exhaustion fact was written by an
+  older daemon. A present unavailable-pricing or unavailable-usage reason
+  carries provider/model identity and never substitutes a zero projection.
 - A run without a durable headless configuration fact is not silently treated
   as a detached headless run. Unknown run ids return typed not-found.
 - Budget exhaustion is journal truth and survives reconnect; it is never

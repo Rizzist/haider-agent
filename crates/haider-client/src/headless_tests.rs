@@ -203,7 +203,7 @@ fn account_selection_requires_the_daemon_contract() {
 }
 
 /// MUTATION CHECK: collapse provider timeout into caller timeout, or merge a
-/// cancellation/failure into one generic terminal. The five stable kinds
+/// budget/cancellation/failure into one generic terminal. The six stable kinds
 /// below then stop being distinct.
 #[test]
 fn terminal_kind_vocabulary_is_distinct_and_provider_timeout_stays_provider_owned() {
@@ -231,6 +231,13 @@ fn terminal_kind_vocabulary_is_distinct_and_provider_timeout_stays_provider_owne
             Some(&failure(ErrorCode::StoreFull))
         ),
         HeadlessTerminalKind::Failure
+    );
+    assert_eq!(
+        terminal_kind(
+            HeadlessOutcome::Errored,
+            Some(&failure(ErrorCode::BudgetExhausted))
+        ),
+        HeadlessTerminalKind::Budget
     );
     for code in [ErrorCode::ProviderError, ErrorCode::ProviderTimeout] {
         assert_eq!(

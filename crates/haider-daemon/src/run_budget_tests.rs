@@ -2,16 +2,26 @@
 
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
+use haider_protocol::cache::CacheRequestAttemptV1;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::headless::{
-    HeadlessRunEventPayload, HeadlessRunSpecV1, HeadlessRunUsageV1, RunBudgetDimensionV1,
-    RunBudgetExhaustedV1, RunBudgetV1,
+    HeadlessRunEventPayload, HeadlessRunSpecV1, HeadlessRunUsageV1, RunBudgetDecisionReasonV1,
+    RunBudgetDimensionV1, RunBudgetExhaustedV1, RunBudgetV1,
 };
-use haider_protocol::ids::{DeviceId, EventId, RunId, SessionId};
+use haider_protocol::ids::{DeviceId, EventId, ItemId, RunId, SessionId};
+use haider_protocol::item::ItemEvent;
+use haider_protocol::provider::{
+    CacheBreakpointHashesV1, CacheControlObservationV1, CachePrefixMatchV1,
+    CacheRequestDiagnosticV1, FinishReason, Usage, UsageSource,
+};
 use haider_protocol::session::SessionPermissionOverridesV1;
 use haider_protocol::state::{RunState, SessionState};
-use haider_provider::{FakeProvider, Provider, ProviderError, ProviderStream, TurnRequest};
+use haider_protocol::tool::{AttachmentBlock, PdfDeliveryMode};
+use haider_provider::{
+    FakeProvider, FakeStep, Provider, ProviderError, ProviderStream, TurnRequest,
+};
+use haider_store::TurnCancelCommand;
 use haider_store::{EventStore, Store};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,8 +34,10 @@ use crate::turn_recovery::{
 };
 use crate::worker::{
     BrokerToolFactory, ProviderFactory, QueuedBudgetArm, QueuedBudgetWake, ResolvedTurnProvider,
-    WorkerDependencies, WorkerManager, budget_usage_from_envelopes_for_test, exhausted_budget,
-    signal_queued_budget_change, wait_for_queued_budget_deadline_or_change,
+    WorkerDependencies, WorkerManager, budget_request_is_unresolved_for_test,
+    budget_usage_from_envelopes_for_test, exhausted_budget,
+    projected_time_budget_exhaustion_for_test, signal_queued_budget_change,
+    wait_for_queued_budget_deadline_or_change,
 };
 use haider_core::{SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand};
 use haider_protocol::session::SessionMetadataV1;
@@ -141,6 +153,7 @@ fn budget_exhaustion_is_a_typed_fact_and_terminal_error_code() {
         dimension: RunBudgetDimensionV1::Tokens,
         limit: 100,
         usage,
+        decision: None,
     });
     let encoded = payload.to_payload_value().expect("budget payload encodes");
     assert_eq!(encoded["type"], "run_budget_exhausted");
@@ -171,6 +184,8 @@ fn token_and_cost_limits_use_the_canonical_usage_without_losing_cache_counters()
             ..RunBudgetV1::default()
         },
         usage.clone(),
+        "openai",
+        "gpt-5.6-sol",
     )
     .expect("token ceiling");
     assert_eq!(token.dimension, RunBudgetDimensionV1::Tokens);
@@ -183,6 +198,8 @@ fn token_and_cost_limits_use_the_canonical_usage_without_losing_cache_counters()
             ..RunBudgetV1::default()
         },
         usage,
+        "openai",
+        "gpt-5.6-sol",
     )
     .expect("cost ceiling");
     assert_eq!(cost.dimension, RunBudgetDimensionV1::Cost);
@@ -202,9 +219,39 @@ fn an_unpriced_nonzero_run_fails_a_configured_cost_budget_closed() {
             ..RunBudgetV1::default()
         },
         usage,
+        "custom-provider",
+        "unpriced-model",
     )
     .expect("unknown pricing cannot bypass a cost limit");
     assert_eq!(exhausted.dimension, RunBudgetDimensionV1::Cost);
+    assert!(matches!(
+        exhausted.decision.map(|decision| decision.reason),
+        Some(RunBudgetDecisionReasonV1::PricingUnavailable { provider, model })
+            if provider == "custom-provider" && model == "unpriced-model"
+    ));
+}
+
+/// MUTATION CHECK: remove the time arm from the physical-request projection
+/// reducer and this direct seam test returns no exhaustion.
+#[test]
+fn projected_request_seam_rejects_elapsed_time_without_a_candidate_projection() {
+    let exhausted = projected_time_budget_exhaustion_for_test(
+        &RunBudgetV1 {
+            max_time_ms: Some(25),
+            ..RunBudgetV1::default()
+        },
+        HeadlessRunUsageV1 {
+            elapsed_ms: 25,
+            ..HeadlessRunUsageV1::default()
+        },
+    )
+    .expect("time cap binds at provider admission");
+    let decision = exhausted.decision.expect("time decision");
+    assert_eq!(exhausted.dimension, RunBudgetDimensionV1::Time);
+    assert_eq!(decision.spent, 25);
+    assert_eq!(decision.cap, 25);
+    assert_eq!(decision.projected, None);
+    assert_eq!(decision.reason, RunBudgetDecisionReasonV1::TimeElapsed);
 }
 
 #[test]
@@ -302,6 +349,47 @@ fn journal_usage_fold_replaces_snapshots_and_keeps_cache_lifecycle_requests() {
     assert!(folded.estimated_cost_microusd.is_some_and(|cost| cost > 0));
 }
 
+/// MUTATION CHECK: ignore durable cache-request attempts during coordinator
+/// reconstruction and this crash-boundary request is treated as free.
+#[test]
+fn restart_detects_a_durable_provider_attempt_without_reconciled_usage() {
+    let run_id = RunId::new("budget-restart-unresolved-run");
+    let item = CacheRequestAttemptV1 {
+        ordinal: 1,
+        diagnostic: CacheRequestDiagnosticV1 {
+            history_message_count: 1,
+            stable_prefix_tokens: 8,
+            breakpoint_hashes: CacheBreakpointHashesV1::default(),
+            cache_domain_hash: Some("budget-domain".into()),
+            cache_domain_changed: None,
+            previous_breakpoint: None,
+            prefix_match: CachePrefixMatchV1::Unavailable,
+            control: CacheControlObservationV1::NotRequired,
+            cacheable_minimum_tokens: None,
+            reuse_gap_ms: None,
+            rewarm: None,
+            classification: None,
+        },
+    }
+    .extension_item()
+    .expect("cache-attempt extension");
+    let attempt = envelope(
+        1,
+        &run_id,
+        serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new("budget-restart-attempt"),
+            item,
+        }))
+        .expect("attempt payload"),
+    );
+    assert!(budget_request_is_unresolved_for_test(
+        &SessionId::new("budget-session"),
+        &run_id,
+        "gpt-5.6-sol",
+        vec![attempt],
+    ));
+}
+
 /// MUTATION CHECK: swap the terminal tail or change `Errored` to
 /// `Cancelled`. Expected runtime failure: the durable budget cause no longer
 /// precedes the session-idle fact in the one transactional recovery batch.
@@ -319,6 +407,7 @@ fn restart_recovery_keeps_a_durable_budget_cause_ahead_of_cancellation() {
             elapsed_ms: 25,
             ..HeadlessRunUsageV1::default()
         },
+        decision: None,
     };
     let envelopes = vec![
         envelope(
@@ -380,6 +469,7 @@ fn restart_recovery_does_not_promote_a_budget_fact_without_headless_configuratio
                     elapsed_ms: 25,
                     ..HeadlessRunUsageV1::default()
                 },
+                decision: None,
             })
             .to_payload_value()
             .expect("unconfigured budget payload"),
@@ -411,6 +501,7 @@ fn a_durable_budget_cause_wins_when_stop_races_the_terminal_batch() {
             elapsed_ms: 25,
             ..HeadlessRunUsageV1::default()
         },
+        decision: None,
     };
 
     let mut configured_and_streaming = [
@@ -517,6 +608,7 @@ fn a_budget_fact_without_headless_configuration_is_rejected() {
                 elapsed_ms: 25,
                 ..HeadlessRunUsageV1::default()
             },
+            decision: None,
         })
         .to_payload_value()
         .expect("budget payload"),
@@ -539,6 +631,7 @@ fn a_budget_fact_without_headless_configuration_cannot_override_cancellation() {
             elapsed_ms: 25,
             ..HeadlessRunUsageV1::default()
         },
+        decision: None,
     };
     let mut states_and_untrusted_fact = [
         envelope(
@@ -631,6 +724,913 @@ impl Provider for NeverOpensProvider {
 
 struct DeadlineProviderFactory {
     provider: Arc<NeverOpensProvider>,
+}
+
+struct FakeBudgetProviderFactory {
+    provider: Arc<FakeProvider>,
+}
+
+enum BudgetCaseAction<'a> {
+    Subturn(&'a str),
+    Cancel,
+}
+
+struct BudgetCaseOptions<'a> {
+    action: Option<BudgetCaseAction<'a>>,
+    native_pdf: Option<Vec<u8>>,
+}
+
+// Registry #94: action cases first spend at most 1 s waiting for request one.
+// After that separate bound returns, terminal reconciliation gets 4 s plus
+// one 10 ms journal-poll interval: the complete action case is bounded by
+// 1,000 ms + 4,010 ms = 5,010 ms.
+const BUDGET_CASE_DEADLINE: Duration = Duration::from_millis(4_010);
+const FAKE_REQUEST_START_DEADLINE: Duration = Duration::from_secs(1);
+
+#[async_trait::async_trait]
+impl ProviderFactory for FakeBudgetProviderFactory {
+    async fn resolve_for_turn(
+        &self,
+        metadata: &SessionMetadataV1,
+    ) -> Result<ResolvedTurnProvider, HaiderError> {
+        Ok(ResolvedTurnProvider {
+            provider: Arc::clone(&self.provider) as Arc<dyn Provider>,
+            provider_name: metadata.provider.clone(),
+            model: metadata.model.clone(),
+            context_window: None,
+            account_alias: None,
+            active_no_auth: false,
+            initial_rotation: None,
+            rotation_budget_consumed: false,
+            attempt_resolver: None,
+            compaction_promotion: None,
+        })
+    }
+}
+
+async fn run_provider_budget_case(
+    label: &str,
+    provider_name: &str,
+    model: &str,
+    max_output_tokens: u64,
+    budget: RunBudgetV1,
+    script: Vec<FakeStep>,
+) -> (usize, Vec<RawEnvelope>) {
+    run_provider_budget_case_with_action(
+        label,
+        provider_name,
+        model,
+        max_output_tokens,
+        budget,
+        script,
+        None,
+    )
+    .await
+}
+
+async fn run_provider_budget_case_with_action(
+    label: &str,
+    provider_name: &str,
+    model: &str,
+    max_output_tokens: u64,
+    budget: RunBudgetV1,
+    script: Vec<FakeStep>,
+    action: Option<BudgetCaseAction<'_>>,
+) -> (usize, Vec<RawEnvelope>) {
+    run_provider_budget_case_inner(
+        label,
+        provider_name,
+        model,
+        max_output_tokens,
+        budget,
+        script,
+        BudgetCaseOptions {
+            action,
+            native_pdf: None,
+        },
+    )
+    .await
+}
+
+async fn run_provider_budget_case_with_native_pdf(
+    label: &str,
+    max_output_tokens: u64,
+    budget: RunBudgetV1,
+    script: Vec<FakeStep>,
+    pdf_bytes: Vec<u8>,
+) -> (usize, Vec<RawEnvelope>) {
+    run_provider_budget_case_inner(
+        label,
+        "openai",
+        "gpt-5.6-sol",
+        max_output_tokens,
+        budget,
+        script,
+        BudgetCaseOptions {
+            action: None,
+            native_pdf: Some(pdf_bytes),
+        },
+    )
+    .await
+}
+
+async fn run_provider_budget_case_inner(
+    label: &str,
+    provider_name: &str,
+    model: &str,
+    max_output_tokens: u64,
+    budget: RunBudgetV1,
+    script: Vec<FakeStep>,
+    options: BudgetCaseOptions<'_>,
+) -> (usize, Vec<RawEnvelope>) {
+    let BudgetCaseOptions { action, native_pdf } = options;
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let provider = Arc::new(if native_pdf.is_some() {
+        FakeProvider::new(script).with_pdf_documents_native()
+    } else {
+        FakeProvider::new(script)
+    });
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FakeBudgetProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: Arc::new(BrokerToolFactory),
+            delegation: Some(crate::delegation::DelegationHandle::new(hub.clone())),
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install worker manager");
+
+    let session_id = SessionId::new(format!("{label}-session"));
+    let run_id = RunId::new(format!("{label}-run"));
+    let device_id = DeviceId::new(format!("{label}-device"));
+    let cwd = std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+        .expect("canonical cwd")
+        .to_string_lossy()
+        .into_owned();
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: format!("{label}-create"),
+        request_digest: format!("{label}-create-digest"),
+        request_json: format!(r#"{{"session":"{label}"}}"#),
+        session_id: session_id.clone(),
+        cwd: cwd.clone(),
+        provider: provider_name.to_owned(),
+        model: model.to_owned(),
+        max_tokens: max_output_tokens,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new(format!("{label}-created")),
+        device_id: device_id.clone(),
+    })
+    .await
+    .expect("create session");
+    let spec = HeadlessRunSpecV1 {
+        cwd,
+        provider: provider_name.to_owned(),
+        model: model.to_owned(),
+        max_output_tokens,
+        effort: None,
+        fast: false,
+        seed: None,
+        permission_overrides: SessionPermissionOverridesV1::default(),
+        trust_hooks: false,
+        budget,
+        request_deadline_unix_ms: None,
+        replay_of: None,
+    };
+    let attachments = if let Some(bytes) = native_pdf {
+        let artifact = store.put(bytes).await.expect("store native PDF");
+        vec![AttachmentBlock::Pdf {
+            artifact,
+            name: "budget.pdf".into(),
+            pages: 1,
+            delivery: PdfDeliveryMode::NativeDocument,
+        }]
+    } else {
+        Vec::new()
+    };
+    let request_json = serde_json::json!({
+        "session_id": &session_id,
+        "text": "exercise the provider budget",
+        "headless": spec,
+    })
+    .to_string();
+    let accepted = hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: format!("{label}-turn"),
+            request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+            request_json,
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            run_id: run_id.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "exercise the provider budget".into(),
+            attachments,
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new(format!("{label}-queued")),
+            user_event_id: EventId::new(format!("{label}-user")),
+            active_event_id: EventId::new(format!("{label}-active")),
+            device_id,
+        })
+        .await
+        .expect("accept headless turn");
+    let accepted_seq = accepted.accepted_seq;
+    manager
+        .handle()
+        .submit(accepted)
+        .await
+        .expect("submit headless turn");
+    if let Some(action) = action {
+        timeout(FAKE_REQUEST_START_DEADLINE, async {
+            while provider.requests().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first fake-provider request starts");
+        match action {
+            BudgetCaseAction::Subturn(text) => manager
+                .handle()
+                .subturn(
+                    session_id.clone(),
+                    run_id.clone(),
+                    accepted_seq.saturating_add(1),
+                    text.to_owned(),
+                )
+                .await
+                .expect("deliver budget subturn"),
+            BudgetCaseAction::Cancel => {
+                let request_json = serde_json::json!({
+                    "session_id": &session_id,
+                    "run_id": &run_id,
+                    "reason": "budget-test",
+                })
+                .to_string();
+                hub.cancel_internal_turn(TurnCancelCommand {
+                    command_id: format!("{label}-cancel"),
+                    request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+                    request_json,
+                    session_id: session_id.clone(),
+                    worker_generation: hub.worker_generation(),
+                    run_id: run_id.clone(),
+                    cancelling_event_id: EventId::new(format!("{label}-cancelling")),
+                    device_id: DeviceId::new(format!("{label}-cancel-device")),
+                })
+                .await
+                .expect("cancel budget request");
+            }
+        }
+    }
+    let events = timeout(BUDGET_CASE_DEADLINE, async {
+        loop {
+            let events = store.read(&session_id, 0, 1024).await.expect("read run");
+            if events.iter().any(|event| {
+                event.run_id.as_ref() == Some(&run_id)
+                    && serde_json::from_value::<EventPayload>(event.payload.clone())
+                        .is_ok_and(|payload| {
+                            matches!(payload, EventPayload::RunState(state) if state.is_terminal())
+                        })
+            }) {
+                return events;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("budget case terminalizes");
+    let request_count = provider.requests().len();
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+    (request_count, events)
+}
+
+fn budget_fact(events: &[RawEnvelope]) -> RunBudgetExhaustedV1 {
+    events
+        .iter()
+        .find_map(|event| {
+            HeadlessRunEventPayload::from_payload_value(&event.payload).and_then(|payload| {
+                match payload {
+                    HeadlessRunEventPayload::RunBudgetExhausted(exhausted) => Some(exhausted),
+                    HeadlessRunEventPayload::HeadlessRunConfigured(_) => None,
+                }
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "typed budget fact; payloads={:?}",
+                events
+                    .iter()
+                    .map(|event| &event.payload)
+                    .collect::<Vec<_>>()
+            )
+        })
+}
+
+/// MUTATION CHECK: move provider-budget admission after `stream_turn` and
+/// this sends one request instead of zero.
+#[tokio::test]
+async fn projected_first_request_over_cap_sends_zero_provider_requests() {
+    let (requests, events) = run_provider_budget_case(
+        "budget-preflight-zero",
+        "openai",
+        "gpt-5.6-sol",
+        64,
+        RunBudgetV1 {
+            max_cost_microusd: Some(1),
+            ..RunBudgetV1::default()
+        },
+        vec![
+            FakeStep::EmitText {
+                text: "must stay unused".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ],
+    )
+    .await;
+    assert_eq!(requests, 0);
+    let exhausted = budget_fact(&events);
+    assert_eq!(exhausted.dimension, RunBudgetDimensionV1::Cost);
+    assert!(matches!(
+        exhausted.decision.as_ref().map(|decision| &decision.reason),
+        Some(RunBudgetDecisionReasonV1::ProjectedRequest)
+    ));
+    assert_eq!(
+        exhausted.decision.as_ref().map(|decision| decision.spent),
+        Some(0)
+    );
+    assert!(
+        exhausted
+            .decision
+            .as_ref()
+            .and_then(|decision| decision.projected)
+            .is_some_and(|projected| projected > 1)
+    );
+}
+
+/// MUTATION CHECK: omit resolved native-document bytes from the request
+/// estimate and this 512 KiB PDF is sent under the metadata-only projection.
+#[tokio::test]
+async fn native_pdf_bytes_bind_the_token_cap_before_the_first_request() {
+    let base64_len = 512_u64 * 1024 * 4 / 3;
+    let (requests, events) = run_provider_budget_case_with_native_pdf(
+        "budget-native-pdf-preflight",
+        64,
+        RunBudgetV1 {
+            max_tokens: Some(100_000),
+            ..RunBudgetV1::default()
+        },
+        vec![FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        }],
+        vec![b'P'; 512 * 1024],
+    )
+    .await;
+    assert_eq!(requests, 0);
+    let exhausted = budget_fact(&events);
+    let decision = exhausted.decision.expect("native PDF projection");
+    assert_eq!(exhausted.dimension, RunBudgetDimensionV1::Tokens);
+    assert_eq!(decision.reason, RunBudgetDecisionReasonV1::ProjectedRequest);
+    assert_eq!(decision.spent, 0);
+    assert!(
+        decision
+            .projected
+            .is_some_and(|projected| projected >= base64_len / 4),
+        "projection includes the resolved document payload"
+    );
+}
+
+#[tokio::test]
+async fn projected_token_budget_is_checked_at_the_same_preflight_seam() {
+    let (requests, events) = run_provider_budget_case(
+        "budget-token-preflight",
+        "openai",
+        "gpt-5.6-sol",
+        64,
+        RunBudgetV1 {
+            max_tokens: Some(1),
+            ..RunBudgetV1::default()
+        },
+        vec![FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        }],
+    )
+    .await;
+    assert_eq!(requests, 0);
+    let exhausted = budget_fact(&events);
+    assert_eq!(exhausted.dimension, RunBudgetDimensionV1::Tokens);
+    assert!(matches!(
+        exhausted.decision.map(|decision| decision.reason),
+        Some(RunBudgetDecisionReasonV1::ProjectedRequest)
+    ));
+}
+
+#[tokio::test]
+async fn projected_second_request_over_cap_sends_exactly_one_provider_request() {
+    let usage = Usage {
+        input: 180_000,
+        output: 0,
+        reasoning: 0,
+        cached: 0,
+        source: UsageSource::ProviderReported,
+        account: None,
+        accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
+        request: None,
+    };
+    let (requests, events) = run_provider_budget_case(
+        "budget-preflight-second",
+        "openai",
+        "gpt-5.6-sol",
+        4_096,
+        RunBudgetV1 {
+            max_cost_microusd: Some(1_000_000),
+            ..RunBudgetV1::default()
+        },
+        vec![
+            FakeStep::EmitUsage { usage },
+            FakeStep::EmitToolCall {
+                call_id: "budget-todo".into(),
+                name: "todo_write".into(),
+                args: serde_json::json!({
+                    "items": [{"text": "continue", "status": "in_progress"}]
+                }),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::ExpectToolResult {
+                call_id: "budget-todo".into(),
+            },
+            FakeStep::EmitText {
+                text: "second request must stay unused".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ],
+    )
+    .await;
+    assert_eq!(requests, 1);
+    let exhausted = budget_fact(&events);
+    let decision = exhausted.decision.expect("projected decision");
+    assert_eq!(decision.reason, RunBudgetDecisionReasonV1::ProjectedRequest);
+    assert!(decision.spent < decision.cap);
+    assert!(
+        decision
+            .projected
+            .is_some_and(|projected| { decision.spent.saturating_add(projected) > decision.cap })
+    );
+}
+
+/// MUTATION CHECK: move either compaction admission below its matching
+/// provider-open call and the same capped run can pay for that request first.
+#[test]
+fn compaction_provider_paths_admit_budget_before_transport() {
+    let source = include_str!("worker.rs");
+    let impl_start = source
+        .find("impl ContextCompactor for DaemonContextCompactor")
+        .expect("context compactor implementation");
+    let impl_tail = &source[impl_start..];
+    let mut depth = 0_usize;
+    let mut body_started = false;
+    let impl_end = impl_tail
+        .char_indices()
+        .find_map(|(index, character)| match character {
+            '{' => {
+                body_started = true;
+                depth = depth.saturating_add(1);
+                None
+            }
+            '}' if body_started => {
+                depth = depth.saturating_sub(1);
+                (depth == 0).then_some(index + character.len_utf8())
+            }
+            _ => None,
+        })
+        .expect("complete context compactor implementation body");
+    let impl_source = &impl_tail[..impl_end];
+    let admissions = impl_source
+        .match_indices(".admit_budget_request(")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let provider_opens = impl_source
+        .match_indices("self.provider.stream_")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        admissions.len(),
+        2,
+        "replay and degraded fallback admissions"
+    );
+    assert_eq!(
+        provider_opens.len(),
+        2,
+        "replay and degraded fallback sends"
+    );
+    assert!(
+        admissions
+            .iter()
+            .zip(provider_opens.iter())
+            .all(|(admission, open)| admission < open),
+        "every compaction provider path must bind the budget before transport"
+    );
+}
+
+#[tokio::test]
+async fn streamed_usage_crossing_the_cap_stops_at_that_chunk_boundary() {
+    let usage = Usage {
+        input: 30_000,
+        output: 0,
+        reasoning: 0,
+        cached: 0,
+        source: UsageSource::ProviderReported,
+        account: None,
+        accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
+        request: None,
+    };
+    let (requests, events) = run_provider_budget_case(
+        "budget-stream-crossing",
+        "openai",
+        "gpt-5.6-sol",
+        64,
+        RunBudgetV1 {
+            max_cost_microusd: Some(100_000),
+            ..RunBudgetV1::default()
+        },
+        vec![
+            FakeStep::EmitUsage { usage },
+            FakeStep::EmitText {
+                text: "must not cross the budget chunk".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ],
+    )
+    .await;
+    assert_eq!(requests, 1);
+    let exhausted = budget_fact(&events);
+    assert!(matches!(
+        exhausted.decision.map(|decision| decision.reason),
+        Some(RunBudgetDecisionReasonV1::ActualUsage)
+    ));
+    assert!(events.iter().all(|event| {
+        !event
+            .payload
+            .to_string()
+            .contains("must not cross the budget chunk")
+    }));
+}
+
+#[tokio::test]
+async fn unknown_provider_pricing_fails_closed_before_the_request() {
+    let (requests, events) = run_provider_budget_case(
+        "budget-pricing-unknown",
+        "fake",
+        "fake-model",
+        64,
+        RunBudgetV1 {
+            max_cost_microusd: Some(1_000_000),
+            ..RunBudgetV1::default()
+        },
+        vec![FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        }],
+    )
+    .await;
+    assert_eq!(requests, 0);
+    let exhausted = budget_fact(&events);
+    assert!(matches!(
+        exhausted.decision.map(|decision| decision.reason),
+        Some(RunBudgetDecisionReasonV1::PricingUnavailable { provider, model })
+            if provider == "fake" && model == "fake-model"
+    ));
+}
+
+#[tokio::test]
+async fn unknown_pricing_is_named_even_when_a_token_projection_also_exceeds_its_cap() {
+    let (requests, events) = run_provider_budget_case(
+        "budget-pricing-unknown-combined",
+        "fake",
+        "fake-model",
+        64,
+        RunBudgetV1 {
+            max_tokens: Some(1),
+            max_cost_microusd: Some(1_000_000),
+            ..RunBudgetV1::default()
+        },
+        vec![FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        }],
+    )
+    .await;
+    assert_eq!(requests, 0);
+    assert!(matches!(
+        budget_fact(&events)
+            .decision
+            .map(|decision| decision.reason),
+        Some(RunBudgetDecisionReasonV1::PricingUnavailable { provider, model })
+            if provider == "fake" && model == "fake-model"
+    ));
+}
+
+#[tokio::test]
+async fn elapsed_time_is_checked_before_request_with_no_candidate_projection() {
+    let (requests, events) = run_provider_budget_case(
+        "budget-time-preflight",
+        "openai",
+        "gpt-5.6-sol",
+        64,
+        RunBudgetV1 {
+            max_time_ms: Some(1),
+            ..RunBudgetV1::default()
+        },
+        vec![FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        }],
+    )
+    .await;
+    assert_eq!(requests, 0);
+    let decision = budget_fact(&events).decision.expect("time decision");
+    assert_eq!(decision.reason, RunBudgetDecisionReasonV1::TimeElapsed);
+    assert_eq!(decision.projected, None);
+}
+
+#[tokio::test]
+async fn missing_actual_usage_fails_closed_after_the_request() {
+    let (requests, events) = run_provider_budget_case(
+        "budget-usage-missing",
+        "openai",
+        "gpt-5.6-sol",
+        64,
+        RunBudgetV1 {
+            max_cost_microusd: Some(1_000_000),
+            ..RunBudgetV1::default()
+        },
+        vec![FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        }],
+    )
+    .await;
+    assert_eq!(requests, 1);
+    let exhausted = budget_fact(&events);
+    let decision = exhausted.decision.expect("missing-usage decision");
+    assert!(matches!(
+        decision.reason,
+        RunBudgetDecisionReasonV1::UsageUnavailable { provider, model }
+            if provider == "openai" && model == "gpt-5.6-sol"
+    ));
+    assert_eq!(decision.spent, 0);
+    assert!(decision.projected.is_some());
+}
+
+/// MUTATION CHECK: remove the abandoned-request check from the next budget
+/// admission and the held Subturn opens request two before final usage exists.
+#[tokio::test]
+async fn subturn_before_final_usage_cannot_open_a_second_provider_request() {
+    let (requests, events) = run_provider_budget_case_with_action(
+        "budget-subturn-unreported",
+        "openai",
+        "gpt-5.6-sol",
+        64,
+        RunBudgetV1 {
+            max_cost_microusd: Some(1_000_000),
+            ..RunBudgetV1::default()
+        },
+        vec![
+            FakeStep::EmitText {
+                text: "first request is live".into(),
+            },
+            FakeStep::Delay { ms: 200 },
+            FakeStep::EmitToolCall {
+                call_id: "budget-held-tool".into(),
+                name: "todo_write".into(),
+                args: serde_json::json!({
+                    "items": [{"text": "held", "status": "in_progress"}]
+                }),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::EmitText {
+                text: "second request must stay unused".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ],
+        Some(BudgetCaseAction::Subturn(
+            "change course before the tool runs",
+        )),
+    )
+    .await;
+    assert_eq!(requests, 1);
+    assert!(matches!(
+        budget_fact(&events)
+            .decision
+            .map(|decision| decision.reason),
+        Some(RunBudgetDecisionReasonV1::UsageUnavailable { .. })
+    ));
+}
+
+/// MUTATION CHECK: skip `after_request` on the pending-Subturn continuation
+/// and the durable usage below is misclassified as unavailable instead of
+/// allowing the real spent+projection decision for request two.
+#[tokio::test]
+async fn subturn_after_reported_usage_reconciles_before_the_next_projection() {
+    let usage = Usage {
+        input: 180_000,
+        output: 0,
+        reasoning: 0,
+        cached: 0,
+        source: UsageSource::ProviderReported,
+        account: None,
+        accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
+        request: None,
+    };
+    let (requests, events) = run_provider_budget_case_with_action(
+        "budget-subturn-reported",
+        "openai",
+        "gpt-5.6-sol",
+        4_096,
+        RunBudgetV1 {
+            max_cost_microusd: Some(1_000_000),
+            ..RunBudgetV1::default()
+        },
+        vec![
+            FakeStep::EmitUsage { usage },
+            FakeStep::Delay { ms: 200 },
+            FakeStep::EmitToolCall {
+                call_id: "budget-reported-held-tool".into(),
+                name: "todo_write".into(),
+                args: serde_json::json!({
+                    "items": [{"text": "held", "status": "in_progress"}]
+                }),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::EmitText {
+                text: "request two must be rejected by its real projection".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ],
+        Some(BudgetCaseAction::Subturn(
+            "change course after usage was reported",
+        )),
+    )
+    .await;
+    assert_eq!(requests, 1);
+    let decision = budget_fact(&events)
+        .decision
+        .expect("second-request projection");
+    assert_eq!(decision.reason, RunBudgetDecisionReasonV1::ProjectedRequest);
+    assert!(decision.spent > 0);
+    assert!(
+        decision
+            .projected
+            .is_some_and(|projected| decision.spent.saturating_add(projected) > decision.cap)
+    );
+}
+
+#[tokio::test]
+async fn cancellation_after_send_reconciles_missing_usage_as_a_budget_stop() {
+    let (requests, events) = run_provider_budget_case_with_action(
+        "budget-cancel-unreported",
+        "openai",
+        "gpt-5.6-sol",
+        64,
+        RunBudgetV1 {
+            max_cost_microusd: Some(1_000_000),
+            ..RunBudgetV1::default()
+        },
+        vec![FakeStep::Hang],
+        Some(BudgetCaseAction::Cancel),
+    )
+    .await;
+    assert_eq!(requests, 1);
+    assert!(matches!(
+        budget_fact(&events)
+            .decision
+            .map(|decision| decision.reason),
+        Some(RunBudgetDecisionReasonV1::UsageUnavailable { .. })
+    ));
+}
+
+#[tokio::test]
+async fn child_usage_is_charged_to_the_parent_before_its_next_request() {
+    let parent_usage = Usage {
+        input: 100,
+        output: 0,
+        reasoning: 0,
+        cached: 0,
+        source: UsageSource::ProviderReported,
+        account: None,
+        accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
+        request: None,
+    };
+    let child_usage = Usage {
+        input: 180_000,
+        output: 0,
+        reasoning: 0,
+        cached: 0,
+        source: UsageSource::ProviderReported,
+        account: None,
+        accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
+        request: None,
+    };
+    let (requests, events) = run_provider_budget_case(
+        "budget-child-shared",
+        "openai",
+        "gpt-5.6-sol",
+        4_096,
+        RunBudgetV1 {
+            max_cost_microusd: Some(1_000_000),
+            ..RunBudgetV1::default()
+        },
+        vec![
+            FakeStep::EmitUsage {
+                usage: parent_usage,
+            },
+            FakeStep::EmitToolCall {
+                call_id: "budget-spawn".into(),
+                name: "spawn_subagent".into(),
+                args: serde_json::json!({
+                    "task": "budget child",
+                    "prompt": "report one result",
+                    "budget_tokens": 4096
+                }),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::EmitUsage { usage: child_usage },
+            FakeStep::EmitText {
+                text: "child report".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+            FakeStep::ExpectToolResult {
+                call_id: "budget-spawn".into(),
+            },
+            FakeStep::EmitText {
+                text: "parent request must stay unused".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ],
+    )
+    .await;
+    assert_eq!(
+        requests,
+        2,
+        "only the parent admission and child exchange may reach the provider; payloads={:?}",
+        events
+            .iter()
+            .map(|event| &event.payload)
+            .collect::<Vec<_>>()
+    );
+    let exhausted = budget_fact(&events);
+    let decision = exhausted.decision.expect("parent projected decision");
+    assert_eq!(decision.reason, RunBudgetDecisionReasonV1::ProjectedRequest);
+    assert!(decision.spent < decision.cap);
+    assert!(
+        decision
+            .projected
+            .is_some_and(|projected| { decision.spent.saturating_add(projected) > decision.cap })
+    );
 }
 
 #[async_trait::async_trait]
