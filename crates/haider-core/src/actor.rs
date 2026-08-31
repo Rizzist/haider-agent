@@ -4191,7 +4191,9 @@ impl HarnessActor {
                 };
 
                 match &event {
-                    StreamEvent::NetworkUnavailable => {
+                    StreamEvent::NetworkUnavailable
+                        if provider.route_status() == haider_platform::RouteStatus::Unavailable =>
+                    {
                         if let Err(error) = self
                             .commit_state(
                                 &run_id,
@@ -4205,12 +4207,16 @@ impl HarnessActor {
                         }
                         continue;
                     }
-                    StreamEvent::NetworkRestored => {
+                    StreamEvent::NetworkUnavailable => continue,
+                    StreamEvent::NetworkRestored
+                        if provider.route_status() != haider_platform::RouteStatus::Unavailable =>
+                    {
                         if let Err(error) = self.commit_state(&run_id, RunState::Streaming).await {
                             return self.errored_state_outcome(&run_id, error).await;
                         }
                         continue;
                     }
+                    StreamEvent::NetworkRestored => continue,
                     _ => {}
                 }
 
@@ -4642,6 +4648,7 @@ impl HarnessActor {
                             && pending_usage_commit.is_some()
                             && message.is_some()
                             && self.tree_head_initialized
+                            && !replay.crossed_tool_boundary()
                             && tools.is_empty()
                             && deferred.is_empty()
                             && server_calls.is_empty()
@@ -5357,6 +5364,12 @@ impl HarnessActor {
         self.flush_pending_item_delta()
             .await
             .map_err(DriveError::Store)?;
+        if provider.route_status() != haider_platform::RouteStatus::Unavailable {
+            self.commit_state(run_id, RunState::Thinking)
+                .await
+                .map_err(DriveError::Store)?;
+            return Ok(());
+        }
         self.commit_state(
             run_id,
             RunState::Waiting {
@@ -6262,7 +6275,6 @@ impl HarnessActor {
         }
         let reason = match error.kind {
             ProviderErrorKind::RateLimited => WaitReason::RateLimit,
-            ProviderErrorKind::NetworkUnavailable => WaitReason::NetworkUnavailable,
             _ => WaitReason::ProviderBackoff,
         };
         // `retry_after_ms` (429/529 Retry-After) OVERRIDES the computed
@@ -9695,6 +9707,23 @@ impl ReplayPrefix {
             || !self.structured_applied.is_empty()
     }
 
+    /// A completed tool boundary is an external durability boundary even when
+    /// its accumulator is empty by the time the response finishes. The replay
+    /// ledger survives route retries/restart, so it is the authoritative place
+    /// to retain this fact for the whole logical provider request.
+    fn crossed_tool_boundary(&self) -> bool {
+        self.structured_applied.iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::ToolCallStart { .. }
+                    | StreamEvent::ToolCallArgsDelta { .. }
+                    | StreamEvent::ToolCallEnd { .. }
+                    | StreamEvent::ServerToolUse { .. }
+                    | StreamEvent::ServerToolResult { .. }
+            )
+        })
+    }
+
     fn reset_for_next_request(&mut self) {
         self.message.clear();
         self.reasoning.clear();
@@ -10456,9 +10485,10 @@ fn provider_error_waits_for_route(
     error: &ProviderError,
     route_status: haider_platform::RouteStatus,
 ) -> bool {
-    (error.kind == ProviderErrorKind::NetworkUnavailable
-        || (error.kind == ProviderErrorKind::StreamInterrupted
-            && route_status == haider_platform::RouteStatus::Unavailable))
+    matches!(
+        error.kind,
+        ProviderErrorKind::NetworkUnavailable | ProviderErrorKind::StreamInterrupted
+    ) && route_status == haider_platform::RouteStatus::Unavailable
         && error.timeout_reason.is_none()
         && error.presentation.provider_http_status.is_none()
 }

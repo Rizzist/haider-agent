@@ -633,6 +633,14 @@ impl Drop for InFlightRequest {
 
 #[async_trait::async_trait]
 impl Provider for NeverOpensProvider {
+    fn trusts_default_route_absence(&self) -> bool {
+        true
+    }
+
+    fn route_status(&self) -> haider_platform::RouteStatus {
+        haider_platform::RouteStatus::Available
+    }
+
     async fn capabilities(&self) -> haider_protocol::provider::CapabilityDoc {
         self.fallback.capabilities().await
     }
@@ -841,6 +849,27 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
             .subcode
             .as_str(),
         "provider-timeout"
+    );
+    assert!(
+        !store
+            .read(&session_id, 0, 512)
+            .await
+            .expect("read terminalized run")
+            .iter()
+            .any(|event| {
+                event.run_id.as_ref() == Some(&run_id)
+                    && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                        |payload| {
+                            matches!(
+                                payload,
+                                EventPayload::RunState(RunState::Waiting {
+                                    reason: haider_protocol::state::WaitReason::NetworkUnavailable
+                                })
+                            )
+                        },
+                    )
+            }),
+        "a never-opening provider on a live route must not enter WaitingForRoute"
     );
     timeout(Duration::from_millis(250), async {
         while in_flight.load(Ordering::SeqCst) != 0 {

@@ -740,13 +740,13 @@ impl DaemonGraphFinalizationGuard {
             && budget_deadline.is_none_or(|budget_deadline| request_deadline < budget_deadline)
         {
             // Adapter phases reserve exactly PROVIDER_DEADLINE_SAFETY_MARGIN
-            // before the enclosing run deadline. Keep that terminalization
-            // reserve, but do not claim the caller deadline elapsed until its
-            // persisted absolute timestamp actually arrives.
-            tokio::time::sleep(Duration::from_millis(
-                request_deadline.saturating_sub(unix_time_ms()),
-            ))
-            .await;
+            // before the enclosing run deadline. Preserve that reserve for
+            // durable terminal delivery: an early provider timeout is not a
+            // claim that the caller deadline elapsed. Route-wait/recovery can
+            // arrive after the absolute timestamp and records the fact below.
+            if unix_time_ms() < request_deadline {
+                return Ok(None);
+            }
             let mut persisted = self.request_deadline_fact_persisted.lock().await;
             if !*persisted {
                 append_headless_deadline_fact(

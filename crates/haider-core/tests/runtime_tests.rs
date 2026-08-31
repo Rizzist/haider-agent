@@ -2780,27 +2780,48 @@ async fn transport_error_after_first_event_is_typed_failure_not_input_required()
 
 #[tokio::test]
 async fn link_drop_mid_stream_is_waiting_not_a_provider_fault() {
-    let (handle, store, provider) = runtime(vec![
-        FakeStep::EmitText {
-            text: "before".into(),
-        },
-        FakeStep::EmitNetworkUnavailable,
-        FakeStep::Delay { ms: 10 },
-        FakeStep::EmitNetworkRestored,
-        FakeStep::EmitText {
-            text: " after".into(),
-        },
-        FakeStep::Finish {
-            reason: FinishReason::EndTurn,
-        },
-    ]);
-    let outcome = handle
+    let route = Arc::new(Mutex::new(RouteStatus::Unavailable));
+    let provider = Arc::new(
+        FakeProvider::new(vec![
+            FakeStep::EmitText {
+                text: "before".into(),
+            },
+            FakeStep::EmitNetworkUnavailable,
+            FakeStep::Delay { ms: 250 },
+            FakeStep::EmitNetworkRestored,
+            FakeStep::EmitText {
+                text: " after".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ])
+        .with_route_status(Arc::clone(&route)),
+    );
+    let store = Arc::new(MemoryStore::new());
+    let handle = HarnessActor::spawn(config(), provider.clone(), store.clone());
+    let mut states = handle.state_receiver();
+    let turn = handle
         .submit_turn(SubmitTurn::new("survive a local link drop"))
         .await
-        .expect("turn accepted")
-        .wait()
-        .await
-        .expect("outcome");
+        .expect("turn accepted");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                states.borrow().as_ref(),
+                Some(RunState::Waiting {
+                    reason: WaitReason::NetworkUnavailable
+                })
+            ) {
+                break;
+            }
+            states.changed().await.expect("state sender remains open");
+        }
+    })
+    .await
+    .expect("eight 250ms observations reveal the route wait");
+    *route.lock().expect("route lock") = RouteStatus::Available;
+    let outcome = turn.wait().await.expect("outcome");
     assert_eq!(outcome.state, RunState::Done);
     assert_eq!(provider.requests().len(), 1, "link recovery never replays");
 
@@ -3480,6 +3501,122 @@ async fn route_wait_deadline_keeps_wait_fact_and_never_reissues() {
             .count(),
         1,
         "the run owns exactly one terminal state"
+    );
+    handle.stop().await.expect("actor stops");
+}
+
+/// MUTATION CHECK: remove/invert the negative RouteStatus gate. A live route
+/// would then be misreported as `WaitingForRoute` before the retry whose open
+/// future never completes. The outer bound is the 3s provider deadline plus
+/// four 250ms route-observation periods for terminal delivery.
+#[tokio::test(start_paused = true)]
+async fn live_route_failure_retries_to_never_opening_provider_without_route_wait() {
+    let route = Arc::new(Mutex::new(RouteStatus::Available));
+    let provider = Arc::new(NetworkFailureThenNeverOpensProvider::new(Arc::clone(
+        &route,
+    )));
+    let store = Arc::new(MemoryStore::new());
+    let mut cfg = config();
+    let provider_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    cfg.provider_deadline = Some(provider_deadline);
+    let handle = HarnessActor::spawn(cfg, provider.clone(), store.clone());
+    let started = tokio::time::Instant::now();
+    let outcome = timeout(
+        Duration::from_secs(4),
+        handle
+            .submit_turn(SubmitTurn::new("live route must not park"))
+            .await
+            .expect("turn accepted")
+            .wait(),
+    )
+    .await
+    .expect("provider deadline plus route-observation allowance is bounded")
+    .expect("turn outcome");
+
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::ProviderTimeout)
+    );
+    assert!(started.elapsed() < provider_deadline.duration_since(started));
+    assert_eq!(provider.requests.load(Ordering::SeqCst), 2);
+    assert!(
+        !store
+            .events(&SessionId::new(SESSION))
+            .await
+            .iter()
+            .any(|event| matches!(
+                typed(event),
+                EventPayload::RunState(RunState::Waiting {
+                    reason: WaitReason::NetworkUnavailable
+                })
+            ))
+    );
+    handle.stop().await.expect("actor stops");
+}
+
+/// MUTATION CHECK: invert the same negative-only gate. A confirmed down route
+/// would skip the wait, while the live-route sibling above would enter it, so
+/// both tests cannot pass under either polarity mutation. The completion bound
+/// is the 4s provider deadline plus four 250ms route-observation periods.
+#[tokio::test(start_paused = true)]
+async fn actually_down_route_waits_once_then_live_retry_never_opens_and_terminalizes() {
+    let route = Arc::new(Mutex::new(RouteStatus::Unavailable));
+    let provider = Arc::new(NetworkFailureThenNeverOpensProvider::new(Arc::clone(
+        &route,
+    )));
+    let store = Arc::new(MemoryStore::new());
+    let mut cfg = config();
+    cfg.provider_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(4));
+    let handle = HarnessActor::spawn(cfg, provider.clone(), store.clone());
+    let mut states = handle.state_receiver();
+    let turn = handle
+        .submit_turn(SubmitTurn::new("wait only while route is down"))
+        .await
+        .expect("turn accepted");
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                states.borrow().as_ref(),
+                Some(RunState::Waiting {
+                    reason: WaitReason::NetworkUnavailable
+                })
+            ) {
+                break;
+            }
+            states.changed().await.expect("state sender remains open");
+        }
+    })
+    .await
+    .expect("eight 250ms observations reveal the route wait");
+    assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+    *route.lock().expect("route lock") = RouteStatus::Available;
+
+    let outcome = timeout(Duration::from_secs(5), turn.wait())
+        .await
+        .expect("provider deadline plus four route observations is bounded")
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::ProviderTimeout)
+    );
+    assert_eq!(provider.requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        store
+            .events(&SessionId::new(SESSION))
+            .await
+            .iter()
+            .filter(|event| matches!(
+                typed(event),
+                EventPayload::RunState(RunState::Waiting {
+                    reason: WaitReason::NetworkUnavailable
+                })
+            ))
+            .count(),
+        1,
+        "a repeated failure on the restored route must not repark"
     );
     handle.stop().await.expect("actor stops");
 }
@@ -5481,6 +5618,20 @@ struct ImmediateErrorProvider {
     error: ProviderError,
 }
 
+struct NetworkFailureThenNeverOpensProvider {
+    route: Arc<Mutex<RouteStatus>>,
+    requests: AtomicUsize,
+}
+
+impl NetworkFailureThenNeverOpensProvider {
+    fn new(route: Arc<Mutex<RouteStatus>>) -> Self {
+        Self {
+            route,
+            requests: AtomicUsize::new(0),
+        }
+    }
+}
+
 struct CountingOpeningErrorProvider {
     error: ProviderError,
     requests: AtomicUsize,
@@ -5658,6 +5809,31 @@ impl Provider for ImmediateErrorProvider {
 
     async fn stream_turn(&self, _request: TurnRequest) -> Result<ProviderStream, ProviderError> {
         Err(self.error.clone())
+    }
+}
+
+#[async_trait]
+impl Provider for NetworkFailureThenNeverOpensProvider {
+    fn trusts_default_route_absence(&self) -> bool {
+        true
+    }
+
+    fn route_status(&self) -> RouteStatus {
+        *self.route.lock().expect("route lock")
+    }
+
+    async fn capabilities(&self) -> CapabilityDoc {
+        FakeProvider::new(Vec::new()).capabilities().await
+    }
+
+    async fn stream_turn(&self, _request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        if self.requests.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(ProviderError::new(
+                ProviderErrorKind::NetworkUnavailable,
+                "connection failed before response headers",
+            ));
+        }
+        pending().await
     }
 }
 

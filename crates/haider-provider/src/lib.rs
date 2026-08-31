@@ -1800,11 +1800,10 @@ pub enum ProviderErrorKind {
     /// active model context window. Core may compact and retry this once.
     ContextExceeded,
     InvalidRequest,
-    /// A network-class transport failure: confirmed route loss, DNS/connect
-    /// failure, connection reset/refusal, or a transient TLS handshake break.
-    /// Completed HTTP responses and local timeout/stall decisions never use
-    /// this kind. It is retryable on the same provider/account and must not
-    /// rotate credentials or fallback providers.
+    /// A network-class transport failure observed while the local OS reports
+    /// that no usable route exists. Connect/reset/DNS failures on an available
+    /// or unknown route remain provider transport failures. Completed HTTP
+    /// responses and local timeout/stall decisions never use this kind.
     NetworkUnavailable,
     Transport,
     MalformedFrame,
@@ -2196,10 +2195,9 @@ pub(crate) fn reqwest_transport_error_with_route_gating(
             ),
         )
     } else if !error.is_timeout()
-        && (error.is_connect()
-            || network_io
-            || (route_gating.enabled()
-                && haider_platform::route_status() == haider_platform::RouteStatus::Unavailable))
+        && route_gating.enabled()
+        && haider_platform::route_status() == haider_platform::RouteStatus::Unavailable
+        && (error.is_connect() || network_io)
     {
         ProviderError::new(
             ProviderErrorKind::NetworkUnavailable,
@@ -3099,7 +3097,7 @@ mod e2_contract_tests {
     use super::*;
 
     #[tokio::test]
-    async fn connection_refused_is_network_class_not_generic_transport() {
+    async fn loopback_connection_refusal_without_negative_route_is_transport() {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .expect("reserve loopback port");
         let address = listener.local_addr().expect("listener address");
@@ -3110,7 +3108,7 @@ mod e2_contract_tests {
             .await
             .expect_err("closed port refuses connection");
         let classified = reqwest_transport_error("fixture", error);
-        assert_eq!(classified.kind, ProviderErrorKind::NetworkUnavailable);
+        assert_eq!(classified.kind, ProviderErrorKind::Transport);
         assert!(classified.retryable);
         assert!(classified.timeout_reason.is_none());
         assert!(classified.presentation.provider_http_status.is_none());
