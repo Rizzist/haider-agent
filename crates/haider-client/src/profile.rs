@@ -15,10 +15,13 @@
 //!   base. Resolved filesystem paths are absolute and canonical even when the
 //!   final runtime suffix does not exist yet.
 //! - The complete bind/staging path budget is checked during profile
-//!   resolution. Unix falls back to a short owner- and profile-scoped `/tmp`
-//!   path when the preferred socket path is too long. Windows uses a
-//!   profile-digested named pipe and keeps filesystem runtime state under the
-//!   selected root. Other endpoint failures remain typed and loud.
+//!   resolution. An explicit `HAIDER_RUNTIME_DIR` that exceeds the Unix socket
+//!   path limit fails loudly rather than escaping the operator's isolation
+//!   root. Derived locations may fall back to a short owner- and profile-scoped
+//!   `/tmp` path, and that decision is reported by the detailed resolver.
+//!   Windows uses a profile-digested named pipe and keeps filesystem runtime
+//!   state under the selected root. Other endpoint failures remain typed and
+//!   loud.
 //! - The default model is a release-owned FULL Anthropic model ID: profile
 //!   config (`config.json`) or `HAIDER_MODEL` may override the packaged
 //!   value; the TUI's short product labels never enter this seam.
@@ -127,6 +130,101 @@ pub struct ResolvedProfile {
     pub default_max_tokens: u64,
 }
 
+/// The source that supplied the resolved filesystem runtime directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeDirSource {
+    /// The operator's explicit `HAIDER_RUNTIME_DIR` root.
+    HaiderRuntimeDir,
+    /// A verified owner-private Unix `XDG_RUNTIME_DIR` root.
+    XdgRuntimeDir,
+    /// The resolved user home.
+    Home,
+    /// A platform temporary-directory fallback.
+    TmpFallback,
+}
+
+impl RuntimeDirSource {
+    fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::HaiderRuntimeDir => RUNTIME_DIR_ENV,
+            Self::XdgRuntimeDir => "XDG_RUNTIME_DIR",
+            Self::Home => "HOME/USERPROFILE",
+            Self::TmpFallback => "temporary runtime fallback",
+        }
+    }
+}
+
+/// Why a preferred runtime-directory source could not be used.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuntimeDirRejectionReason {
+    /// The longest Unix bind/staging address exceeded the platform limit.
+    SocketPathTooLong { len: usize, limit: usize },
+    /// A configured Unix runtime base was not owner-private.
+    NotOwnerPrivate { mode: String },
+    /// A configured source or required user home did not exist.
+    Missing,
+}
+
+impl std::fmt::Display for RuntimeDirRejectionReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SocketPathTooLong { len, limit } => {
+                write!(
+                    formatter,
+                    "socket path is {len} bytes; limit is {limit} bytes"
+                )
+            }
+            Self::NotOwnerPrivate { mode } => {
+                write!(formatter, "not owner-private (mode {mode})")
+            }
+            Self::Missing => formatter.write_str("missing"),
+        }
+    }
+}
+
+/// One preferred runtime-directory source that the resolver rejected.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimeDirRejection {
+    pub source: RuntimeDirSource,
+    pub reason: RuntimeDirRejectionReason,
+}
+
+/// Auditable explanation of the runtime-directory selection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimeDirResolution {
+    pub source: RuntimeDirSource,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rejections: Vec<RuntimeDirRejection>,
+}
+
+impl RuntimeDirResolution {
+    /// One-line operator warning for a fallback, when one occurred.
+    #[must_use]
+    pub fn fallback_warning(&self) -> Option<String> {
+        if self.rejections.is_empty() {
+            return None;
+        }
+        let rejected = self
+            .rejections
+            .iter()
+            .map(|rejection| {
+                format!(
+                    "{}: {}",
+                    rejection.source.diagnostic_name(),
+                    rejection.reason
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        Some(format!(
+            "runtime directory fallback selected {} after rejecting {rejected}",
+            self.source.diagnostic_name()
+        ))
+    }
+}
+
 /// Typed profile-resolution failure.
 #[derive(Debug)]
 pub enum ProfileError {
@@ -200,6 +298,15 @@ struct ProfileConfig {
 
 /// Resolves the shared profile from an explicit environment snapshot.
 pub fn resolve_profile(env: &ProfileEnv) -> Result<ResolvedProfile, ProfileError> {
+    resolve_profile_with_store_mode(env, true).map(|(profile, _)| profile)
+}
+
+/// Resolves the shared profile together with an auditable runtime-directory
+/// selection. CLI observation surfaces use this detailed form; callers that
+/// need only rendezvous identity can continue to use [`resolve_profile`].
+pub fn resolve_profile_with_runtime_resolution(
+    env: &ProfileEnv,
+) -> Result<(ResolvedProfile, RuntimeDirResolution), ProfileError> {
     resolve_profile_with_store_mode(env, true)
 }
 
@@ -207,13 +314,13 @@ pub fn resolve_profile(env: &ProfileEnv) -> Result<ResolvedProfile, ProfileError
 /// Lifecycle probes use this so asking whether a daemon exists has no profile
 /// side effect; launch and mutation paths continue to use [`resolve_profile`].
 pub fn resolve_profile_read_only(env: &ProfileEnv) -> Result<ResolvedProfile, ProfileError> {
-    resolve_profile_with_store_mode(env, false)
+    resolve_profile_with_store_mode(env, false).map(|(profile, _)| profile)
 }
 
 fn resolve_profile_with_store_mode(
     env: &ProfileEnv,
     materialize_store: bool,
-) -> Result<ResolvedProfile, ProfileError> {
+) -> Result<(ResolvedProfile, RuntimeDirResolution), ProfileError> {
     let store_dir = match &env.profile_dir {
         Some(dir) => dir.clone(),
         None => profile_home(env)
@@ -246,7 +353,8 @@ fn resolve_profile_with_store_mode(
     hasher.update(store_text.as_bytes());
     let profile_id = hasher.finalize().to_hex().to_string();
 
-    let (runtime_dir, endpoint) = runtime_endpoint(env, &RuntimeEnv::capture(), &profile_id)?;
+    let (runtime_dir, endpoint, runtime_dir_resolution) =
+        runtime_endpoint(env, &RuntimeEnv::capture(), &profile_id)?;
     let endpoint_path = endpoint.into_address();
     let default_model = if materialize_store {
         resolve_default_model(&store_dir, env)?
@@ -256,15 +364,18 @@ fn resolve_profile_with_store_mode(
         PACKAGED_DEFAULT_MODEL.to_owned()
     };
 
-    Ok(ResolvedProfile {
-        profile_id,
-        store_dir,
-        runtime_dir,
-        endpoint_path,
-        default_provider: DEFAULT_PROVIDER.to_owned(),
-        default_model,
-        default_max_tokens: DEFAULT_MAX_TOKENS,
-    })
+    Ok((
+        ResolvedProfile {
+            profile_id,
+            store_dir,
+            runtime_dir,
+            endpoint_path,
+            default_provider: DEFAULT_PROVIDER.to_owned(),
+            default_model,
+            default_max_tokens: DEFAULT_MAX_TOKENS,
+        },
+        runtime_dir_resolution,
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -311,13 +422,25 @@ fn runtime_endpoint(
     env: &ProfileEnv,
     runtime_env: &RuntimeEnv,
     profile_id: &str,
-) -> Result<(PathBuf, haider_platform::Endpoint), ProfileError> {
-    let preferred_runtime_dir =
-        canonicalize_path_allow_missing(runtime_dir(env, runtime_env, profile_id))?;
+) -> Result<(PathBuf, haider_platform::Endpoint, RuntimeDirResolution), ProfileError> {
+    let (preferred_runtime_dir, mut resolution) = runtime_dir(env, runtime_env, profile_id)?;
+    let preferred_runtime_dir = canonicalize_path_allow_missing(preferred_runtime_dir)?;
     let preferred_endpoint = haider_platform::Endpoint::new(&preferred_runtime_dir, profile_id);
     match preferred_endpoint.validate_for_bind(&preferred_runtime_dir) {
-        Ok(()) => return Ok((preferred_runtime_dir, preferred_endpoint)),
-        Err(haider_platform::EndpointError::AddressTooLong { .. }) => {}
+        Ok(()) => {
+            return Ok((preferred_runtime_dir, preferred_endpoint, resolution));
+        }
+        Err(source @ haider_platform::EndpointError::AddressTooLong { .. })
+            if resolution.source == RuntimeDirSource::HaiderRuntimeDir =>
+        {
+            return Err(ProfileError::RuntimeEndpoint { source });
+        }
+        Err(haider_platform::EndpointError::AddressTooLong { length, limit, .. }) => {
+            resolution.rejections.push(RuntimeDirRejection {
+                source: resolution.source,
+                reason: RuntimeDirRejectionReason::SocketPathTooLong { len: length, limit },
+            });
+        }
         Err(source) => return Err(ProfileError::RuntimeEndpoint { source }),
     }
 
@@ -326,17 +449,25 @@ fn runtime_endpoint(
     fallback_endpoint
         .validate_for_bind(&fallback_runtime_dir)
         .map_err(|source| ProfileError::RuntimeEndpoint { source })?;
-    Ok((fallback_runtime_dir, fallback_endpoint))
+    resolution.source = RuntimeDirSource::TmpFallback;
+    Ok((fallback_runtime_dir, fallback_endpoint, resolution))
 }
 
 /// Resolves the runtime directory from verified platform temp bases.
-fn runtime_dir(env: &ProfileEnv, runtime_env: &RuntimeEnv, profile_id: &str) -> PathBuf {
-    let root = runtime_root(env, runtime_env);
+fn runtime_dir(
+    env: &ProfileEnv,
+    runtime_env: &RuntimeEnv,
+    profile_id: &str,
+) -> Result<(PathBuf, RuntimeDirResolution), ProfileError> {
+    let (root, resolution) = runtime_root(env, runtime_env)?;
     let scope = profile_id
         .chars()
         .take(RUNTIME_PROFILE_ID_CHARS)
         .collect::<String>();
-    haider_platform::owner_scoped_runtime_directory(&root.join(scope))
+    Ok((
+        haider_platform::owner_scoped_runtime_directory(&root.join(scope)),
+        resolution,
+    ))
 }
 
 #[cfg(unix)]
@@ -359,40 +490,126 @@ fn short_runtime_dir(profile_id: &str) -> PathBuf {
     std::env::temp_dir().join("haider").join(scope)
 }
 
-fn runtime_root(env: &ProfileEnv, runtime_env: &RuntimeEnv) -> PathBuf {
-    if let Some(override_root) = &env.runtime_dir
-        && !override_root.as_os_str().is_empty()
-    {
-        return override_root.clone();
+fn runtime_root(
+    env: &ProfileEnv,
+    runtime_env: &RuntimeEnv,
+) -> Result<(PathBuf, RuntimeDirResolution), ProfileError> {
+    let mut rejections = Vec::new();
+    if let Some(override_root) = &env.runtime_dir {
+        if !override_root.as_os_str().is_empty() {
+            return Ok((
+                override_root.clone(),
+                RuntimeDirResolution {
+                    source: RuntimeDirSource::HaiderRuntimeDir,
+                    rejections,
+                },
+            ));
+        }
+        rejections.push(RuntimeDirRejection {
+            source: RuntimeDirSource::HaiderRuntimeDir,
+            reason: RuntimeDirRejectionReason::Missing,
+        });
     }
     #[cfg(unix)]
-    if let Some(xdg) = &env.xdg_runtime_dir
-        && verified_owner_private(xdg)
-    {
-        return xdg.join("haider");
+    if let Some(xdg) = &env.xdg_runtime_dir {
+        match owner_private_rejection(xdg)? {
+            None => {
+                return Ok((
+                    xdg.join("haider"),
+                    RuntimeDirResolution {
+                        source: RuntimeDirSource::XdgRuntimeDir,
+                        rejections,
+                    },
+                ));
+            }
+            Some(reason) => rejections.push(RuntimeDirRejection {
+                source: RuntimeDirSource::XdgRuntimeDir,
+                reason,
+            }),
+        }
     }
     if let Some(home) = profile_home(env) {
-        return home.join(".haider").join("runtime");
+        return Ok((
+            home.join(".haider").join("runtime"),
+            RuntimeDirResolution {
+                source: RuntimeDirSource::Home,
+                rejections,
+            },
+        ));
     }
+    rejections.push(RuntimeDirRejection {
+        source: RuntimeDirSource::Home,
+        reason: RuntimeDirRejectionReason::Missing,
+    });
     #[cfg(unix)]
     {
         if let Some(tmpdir) = &runtime_env.tmpdir
             && verified_owner_private(tmpdir)
         {
-            return tmpdir.join("haider");
+            return Ok((
+                tmpdir.join("haider"),
+                RuntimeDirResolution {
+                    source: RuntimeDirSource::TmpFallback,
+                    rejections,
+                },
+            ));
         }
         if let Some(prefix) = &runtime_env.prefix {
             let prefix_tmp = prefix.join("tmp");
             if verified_owner_private(&prefix_tmp) {
-                return prefix_tmp.join("haider");
+                return Ok((
+                    prefix_tmp.join("haider"),
+                    RuntimeDirResolution {
+                        source: RuntimeDirSource::TmpFallback,
+                        rejections,
+                    },
+                ));
             }
         }
-        PathBuf::from("/tmp").join(format!("haider-{}", effective_uid()))
+        Ok((
+            PathBuf::from("/tmp").join(format!("haider-{}", effective_uid())),
+            RuntimeDirResolution {
+                source: RuntimeDirSource::TmpFallback,
+                rejections,
+            },
+        ))
     }
     #[cfg(windows)]
     {
         let _ = runtime_env;
-        std::env::temp_dir().join("haider")
+        Ok((
+            std::env::temp_dir().join("haider"),
+            RuntimeDirResolution {
+                source: RuntimeDirSource::TmpFallback,
+                rejections,
+            },
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn owner_private_rejection(path: &Path) -> Result<Option<RuntimeDirRejectionReason>, ProfileError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.is_dir()
+                && metadata.uid() == effective_uid()
+                && metadata.mode() & 0o077 == 0 =>
+        {
+            Ok(None)
+        }
+        Ok(metadata) => Ok(Some(RuntimeDirRejectionReason::NotOwnerPrivate {
+            mode: format!("{:04o}", metadata.mode() & 0o7777),
+        })),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(Some(RuntimeDirRejectionReason::Missing))
+        }
+        Err(source) => Err(ProfileError::Io {
+            operation: "inspect XDG runtime directory",
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 

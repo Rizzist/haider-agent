@@ -133,8 +133,12 @@ published here for independent implementations, not as permission to diverge.
    symlinks in the deepest existing ancestor; append any not-yet-created suffix
    lexically. This makes macOS `/tmp` and `/private/tmp` one identity without
    creating daemon state during a `--no-spawn` lookup.
-7. Validate the longest bind/staging address during profile resolution. When a
-   preferred Unix address exceeds `sun_path`, fall back to the canonical short,
+7. Validate the longest bind/staging address during profile resolution. When an
+   explicitly configured `HAIDER_RUNTIME_DIR` exceeds the Unix `sun_path`
+   limit, fail with a typed error that reports the computed byte length, the
+   platform limit, and the shorter owner-private-directory remedy. An explicit
+   isolation root is never replaced by a path outside that root. When a derived
+   XDG or home address exceeds the limit, fall back to the canonical short,
    owner- and profile-scoped `/tmp/haider-<effective-uid>/<profile-scope>` path.
    Other endpoint-validation failures remain typed and fatal. Windows retains
    its selected filesystem runtime because its named-pipe address is independent
@@ -144,7 +148,16 @@ published here for independent implementations, not as permission to diverge.
 canonical absolute path. On Windows, `daemon.socket_path` is the sole exception
 because it is a named-pipe address rather than a filesystem path. The reported
 runtime, socket, and PID-file values are the paths the serving daemon actually
-uses after any Unix path-budget fallback.
+uses after any Unix path-budget fallback. The additive
+`runtime_dir_resolution` object names the winning `source` as one of
+`haider_runtime_dir`, `xdg_runtime_dir`, `home`, or `tmp_fallback`. When a
+configured or derived preferred source was rejected, its `rejections` entries
+name each source and one tagged reason: `socket_path_too_long` with `len` and
+`limit`, `not_owner_private` with an operator-readable octal `mode`, or
+`missing`. Unset optional XDG configuration is ordinary precedence and is not a
+rejection. `haider status` also writes exactly one stderr warning line when its
+resolution contains one or more rejections; JSON remains the sole stdout
+document.
 
 The endpoint name is the discovery mechanism. Do not scan the runtime
 directory and do not parse lock files. Connect first. Only a missing or

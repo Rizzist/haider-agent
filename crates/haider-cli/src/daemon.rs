@@ -27,7 +27,8 @@ const STOP_HELP: &str = "usage: haider daemon stop [--json] [--timeout <duration
 durations: integer followed by ms, s, or m (default 20s)\n\
 environment: HAIDER_RUNTIME_DIR overrides the per-user runtime root; on Unix, \
 XDG_RUNTIME_DIR is used next when it is owner-private. Overlong Unix socket \
-paths fall back to the short per-user runtime.\n";
+paths below an explicit root are errors; derived roots may fall back to the \
+short per-user runtime.\n";
 
 #[derive(Debug, Clone, Copy)]
 struct StopOptions {

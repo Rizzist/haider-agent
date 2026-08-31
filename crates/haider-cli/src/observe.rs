@@ -5,7 +5,8 @@ use std::process::ExitCode;
 
 use haider_client::{
     ConnectError, EnsureError, ObserveClient, ObserveError, ProfileEnv, ResolvedProfile,
-    observe_stream_all, observe_stream_session, resolve_profile,
+    RuntimeDirResolution, observe_stream_all, observe_stream_session, resolve_profile,
+    resolve_profile_with_runtime_resolution,
 };
 use haider_protocol::context::ContextFootprintTruth;
 use haider_protocol::ids::SessionId;
@@ -73,6 +74,7 @@ pub(crate) struct StatusDocument {
     pub session_count: u64,
     pub profile_path: String,
     pub runtime_dir: String,
+    pub runtime_dir_resolution: RuntimeDirResolution,
     pub adoption_available: Vec<haider_rpc::AccountAdoptionAvailable>,
 }
 
@@ -107,6 +109,7 @@ struct StatusDocumentWire<'a> {
     kind: &'static str,
     profile_path: &'a str,
     runtime_dir: &'a str,
+    runtime_dir_resolution: &'a RuntimeDirResolution,
     schema: &'static str,
     session_count: u64,
     update: StatusUpdateWire<'a>,
@@ -265,6 +268,7 @@ impl ObserveJson for StatusDocument {
             "session_count": self.session_count,
             "profile_path": self.profile_path,
             "runtime_dir": self.runtime_dir,
+            "runtime_dir_resolution": self.runtime_dir_resolution,
         });
         if !self.adoption_available.is_empty() {
             document["account_adoption_available"] = json!(self.adoption_available);
@@ -549,15 +553,19 @@ pub(crate) async fn status_command(rest: &[String]) -> ExitCode {
             return write_help(
                 "usage: haider status [--json] [--no-spawn]\n\
 environment: HAIDER_RUNTIME_DIR overrides the per-user runtime root; on Unix, XDG_RUNTIME_DIR is used next when owner-private.\n\
+An explicit overlong HAIDER_RUNTIME_DIR is an error; derived Unix roots may fall back with one stderr warning.\n\
 JSON filesystem paths are canonical absolute paths; daemon.socket_path is a Windows named-pipe address on Windows.\n",
             );
         }
         Err(error) => return usage("status", &error),
     };
-    let profile = match profile() {
-        Ok(profile) => profile,
+    let (profile, runtime_dir_resolution) = match status_profile() {
+        Ok(resolved) => resolved,
         Err(code) => return code,
     };
+    if let Some(warning) = runtime_dir_resolution.fallback_warning() {
+        eprintln!("haider: warning: {warning}");
+    }
     let observer = match ObserveClient::connect_one_shot(&profile, !options.no_spawn).await {
         Ok(observer) => observer,
         Err(error) => return observe_failure("status", &error),
@@ -596,6 +604,7 @@ JSON filesystem paths are canonical absolute paths; daemon.socket_path is a Wind
         session_count: snapshot.session_count,
         profile_path: profile.store_dir.display().to_string(),
         runtime_dir: profile.runtime_dir.display().to_string(),
+        runtime_dir_resolution,
         adoption_available: snapshot.adoption_available,
     };
     if options.json {
@@ -894,6 +903,13 @@ fn profile() -> Result<ResolvedProfile, ExitCode> {
     })
 }
 
+fn status_profile() -> Result<(ResolvedProfile, RuntimeDirResolution), ExitCode> {
+    resolve_profile_with_runtime_resolution(&ProfileEnv::capture()).map_err(|error| {
+        eprintln!("haider: {error}");
+        ExitCode::from(EX_PROTOCOL)
+    })
+}
+
 /// v0.0.935: `haider status` never runs the release check itself — the
 /// synchronous discovery curl cost seconds per invocation. It reports the
 /// profile's six-hour stamp cache instead: `checked_recently` when an
@@ -1186,6 +1202,7 @@ fn write_status_document(document: &StatusDocument) -> ExitCode {
         session_count: document.session_count,
         profile_path: &document.profile_path,
         runtime_dir: &document.runtime_dir,
+        runtime_dir_resolution: &document.runtime_dir_resolution,
         account_adoption_available: (!document.adoption_available.is_empty())
             .then_some(document.adoption_available.as_slice()),
     };

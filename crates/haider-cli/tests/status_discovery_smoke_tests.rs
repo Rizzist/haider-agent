@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(20);
@@ -58,8 +59,58 @@ fn assert_real_sibling_artifacts() -> (PathBuf, PathBuf) {
             .unwrap_or_else(|error| panic!("{name} artifact {}: {error}", binary.display()));
         assert!(metadata.is_file(), "{name} artifact is not a file");
         assert!(metadata.len() > 64 * 1024, "{name} artifact is truncated");
+        if name == "haiderd" {
+            assert!(
+                metadata.len() > 10 * 1024 * 1024,
+                "haiderd artifact is smaller than the 10 MiB integrity floor"
+            );
+        }
     }
+    static WARMED: OnceLock<()> = OnceLock::new();
+    WARMED.get_or_init(|| {
+        for (name, binary) in [("haider", &haider), ("haiderd", &haiderd)] {
+            let status = Command::new(binary)
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap_or_else(|error| panic!("warm {name} binary: {error}"));
+            assert!(
+                status.success(),
+                "{name} --version warm-up failed: {status}"
+            );
+        }
+    });
     (haider, haiderd)
+}
+
+fn isolated_status_command(haider: &Path, profile: &Path, machine_home: &Path) -> Command {
+    let mut command = Command::new(haider);
+    command
+        .args(["status", "--json"])
+        .env("HAIDER_PROFILE_DIR", profile)
+        .env("HOME", machine_home)
+        .env("USERPROFILE", machine_home)
+        .env("HAIDER_DISCOVERY_DISABLED", "1")
+        .env("HAIDER_DEVICE_DISCOVERY_DISABLED", "1")
+        .env("HAIDER_TEST_SIBLINGS_PREBUILT", "1")
+        .env_remove("HAIDER_RUNTIME_DIR")
+        .env_remove("XDG_RUNTIME_DIR")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn status_document(output: &Output) -> serde_json::Value {
+    assert!(
+        output.status.success(),
+        "status failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("status stdout is one JSON document")
 }
 
 /// P0 release gate: run the actual CLI and daemon binaries against a fresh
@@ -70,7 +121,7 @@ fn assert_real_sibling_artifacts() -> (PathBuf, PathBuf) {
 /// first status must not wait for the native platform calls: it schedules the
 /// bounded discovery and returns the last completed snapshot immediately.
 #[test]
-fn built_status_json_completes_with_enabled_discovery() {
+fn built_status_json_honors_private_xdg_with_enabled_discovery() {
     let (haider, _haiderd) = assert_real_sibling_artifacts();
     #[cfg(unix)]
     let root = tempfile::Builder::new()
@@ -164,6 +215,19 @@ fn built_status_json_completes_with_enabled_discovery() {
     let document: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("status stdout is one JSON document");
     assert_eq!(document["kind"], "status");
+    #[cfg(unix)]
+    assert_eq!(
+        document["runtime_dir_resolution"]["source"],
+        "xdg_runtime_dir"
+    );
+    #[cfg(windows)]
+    assert_eq!(document["runtime_dir_resolution"]["source"], "home");
+    assert!(
+        document["runtime_dir_resolution"]
+            .get("rejections")
+            .is_none(),
+        "an accepted platform-preferred runtime must not report a rejection"
+    );
     assert_eq!(document["daemon"]["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(document["daemon"]["ready"], true);
     assert!(
@@ -361,4 +425,224 @@ fn built_status_json_completes_with_enabled_discovery() {
         serde_json::from_slice(&output.stdout).expect("wedged stop stdout is JSON");
     assert_eq!(wedged["outcome"], "did_not_stop");
     assert_eq!(wedged["phase"], "connect");
+}
+
+/// MUTATION CHECK (explicit runtime reporting): ignore HAIDER_RUNTIME_DIR or
+/// omit the additive status field. Expected failure: the real CLI either
+/// leaves the configured root or cannot name it as the winning source.
+#[test]
+fn built_status_honors_a_short_explicit_runtime_root() {
+    let (haider, _haiderd) = assert_real_sibling_artifacts();
+    #[cfg(unix)]
+    let root = tempfile::Builder::new()
+        .prefix("hre-")
+        .tempdir_in("/tmp")
+        .expect("short explicit status root");
+    #[cfg(not(unix))]
+    let root = tempfile::tempdir().expect("explicit status root");
+    let profile = root.path().join("profile");
+    let machine_home = root.path().join("home");
+    let runtime_root = root.path().join("runtime");
+    std::fs::create_dir_all(&machine_home).expect("create isolated machine-user home");
+    std::fs::create_dir(&runtime_root).expect("create explicit runtime root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&runtime_root, std::fs::Permissions::from_mode(0o700))
+            .expect("make explicit runtime root owner-private");
+    }
+    let _daemon = DaemonGuard {
+        profile: profile.clone(),
+    };
+
+    let mut command = isolated_status_command(&haider, &profile, &machine_home);
+    command.env("HAIDER_RUNTIME_DIR", &runtime_root);
+    let output = wait_for_output(
+        command.spawn().expect("start explicit-root status"),
+        STATUS_TIMEOUT,
+    );
+    let document = status_document(&output);
+    assert!(
+        output.stderr.is_empty(),
+        "accepted explicit root warned unexpectedly"
+    );
+    assert_eq!(
+        document["runtime_dir_resolution"]["source"],
+        "haider_runtime_dir"
+    );
+    assert!(
+        document["runtime_dir_resolution"]
+            .get("rejections")
+            .is_none(),
+        "accepted explicit root must not report a rejection"
+    );
+    let canonical_runtime = runtime_root
+        .canonicalize()
+        .expect("canonicalize explicit runtime root");
+    assert!(
+        document["runtime_dir"]
+            .as_str()
+            .map(Path::new)
+            .is_some_and(|path| path.starts_with(&canonical_runtime)),
+        "status left the configured explicit root: {document}"
+    );
+}
+
+/// MUTATION CHECK (XDG rejection visibility): restore the boolean-only XDG
+/// selection. Expected failure: status silently uses HOME without the exact
+/// 0755 rejection or emits something other than one warning line.
+#[test]
+#[cfg(unix)]
+fn built_status_reports_non_private_xdg_fallback_to_home() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (haider, _haiderd) = assert_real_sibling_artifacts();
+    let root = tempfile::Builder::new()
+        .prefix("hrx-")
+        .tempdir_in("/tmp")
+        .expect("short rejected-XDG status root");
+    let profile = root.path().join("profile");
+    let machine_home = root.path().join("home");
+    let xdg_runtime = root.path().join("xdg-runtime");
+    std::fs::create_dir_all(&machine_home).expect("create isolated machine-user home");
+    std::fs::create_dir(&xdg_runtime).expect("create non-private XDG runtime");
+    std::fs::set_permissions(&xdg_runtime, std::fs::Permissions::from_mode(0o755))
+        .expect("make XDG runtime non-private");
+    let _daemon = DaemonGuard {
+        profile: profile.clone(),
+    };
+
+    let mut command = isolated_status_command(&haider, &profile, &machine_home);
+    command.env("XDG_RUNTIME_DIR", &xdg_runtime);
+    let output = wait_for_output(
+        command.spawn().expect("start rejected-XDG status"),
+        STATUS_TIMEOUT,
+    );
+    let document = status_document(&output);
+    assert_eq!(document["runtime_dir_resolution"]["source"], "home");
+    assert_eq!(
+        document["runtime_dir_resolution"]["rejections"],
+        serde_json::json!([{
+            "source": "xdg_runtime_dir",
+            "reason": {"kind": "not_owner_private", "mode": "0755"}
+        }])
+    );
+    let canonical_home = machine_home
+        .canonicalize()
+        .expect("canonicalize isolated machine-user home");
+    assert!(
+        document["runtime_dir"]
+            .as_str()
+            .map(Path::new)
+            .is_some_and(|path| path.starts_with(canonical_home.join(".haider/runtime"))),
+        "rejected XDG runtime did not fall back to HOME: {document}"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("warning stderr is UTF-8");
+    assert_eq!(
+        stderr.lines().count(),
+        1,
+        "fallback must emit one warning line"
+    );
+    assert!(
+        stderr.starts_with("haider: warning: runtime directory fallback selected HOME/USERPROFILE")
+    );
+    assert!(stderr.contains("XDG_RUNTIME_DIR: not owner-private (mode 0755)"));
+}
+
+/// MUTATION CHECK (explicit isolation root): restore the Unix `/tmp` escape on
+/// AddressTooLong. Expected failure on Unix: status succeeds outside the 147+
+/// character configured root. Windows intentionally succeeds because the
+/// fixed named-pipe endpoint does not consume filesystem path length.
+#[test]
+fn built_status_fails_loudly_for_an_overlong_explicit_unix_root() {
+    let (haider, _haiderd) = assert_real_sibling_artifacts();
+    #[cfg(unix)]
+    let root = tempfile::Builder::new()
+        .prefix("hrl-")
+        .tempdir_in("/tmp")
+        .expect("short long-root status fixture");
+    #[cfg(not(unix))]
+    let root = tempfile::tempdir().expect("long-root status fixture");
+    let profile = root.path().join("profile");
+    let machine_home = root.path().join("home");
+    std::fs::create_dir_all(&machine_home).expect("create isolated machine-user home");
+    #[cfg(unix)]
+    let long_runtime = tempfile::Builder::new()
+        .prefix(&"r".repeat(147))
+        .tempdir_in("/tmp")
+        .expect("create 147+ character runtime root");
+    #[cfg(not(unix))]
+    let long_runtime = {
+        let path = root.path().join("r".repeat(147));
+        std::fs::create_dir(&path).expect("create 147-character runtime root");
+        path
+    };
+    #[cfg(unix)]
+    let long_runtime_path = long_runtime.path();
+    #[cfg(not(unix))]
+    let long_runtime_path = long_runtime.as_path();
+    let _daemon = DaemonGuard {
+        profile: profile.clone(),
+    };
+
+    let mut command = isolated_status_command(&haider, &profile, &machine_home);
+    command.env("HAIDER_RUNTIME_DIR", long_runtime_path);
+    let output = wait_for_output(
+        command.spawn().expect("start long-root status"),
+        STATUS_TIMEOUT,
+    );
+
+    #[cfg(unix)]
+    {
+        let expected =
+            haider_client::resolve_profile_with_runtime_resolution(&haider_client::ProfileEnv {
+                profile_dir: Some(profile),
+                home: Some(machine_home.clone()),
+                user_profile: Some(machine_home),
+                model: None,
+                runtime_dir: Some(long_runtime_path.to_path_buf()),
+                xdg_runtime_dir: None,
+            })
+            .expect_err("the library resolver must reject the same explicit root");
+        assert_eq!(output.status.code(), Some(76));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("typed failure stderr is UTF-8"),
+            format!("haider: {expected}\n")
+        );
+        let (length, limit) = match &expected {
+            haider_client::ProfileError::RuntimeEndpoint {
+                source: haider_platform::EndpointError::AddressTooLong { length, limit, .. },
+            } => (*length, *limit),
+            other => panic!("unexpected explicit runtime failure: {other}"),
+        };
+        let message = expected.to_string();
+        assert!(message.contains(&format!("is {length} bytes")));
+        assert!(message.contains(&format!("platform IPC limit is {limit} bytes")));
+        assert!(message.contains("set HAIDER_RUNTIME_DIR to a shorter owner-private directory"));
+    }
+
+    #[cfg(windows)]
+    {
+        let document = status_document(&output);
+        let canonical_long_runtime = long_runtime_path
+            .canonicalize()
+            .expect("canonicalize long Windows runtime root");
+        assert_eq!(
+            document["runtime_dir_resolution"]["source"],
+            "haider_runtime_dir"
+        );
+        assert!(
+            document["runtime_dir"]
+                .as_str()
+                .map(Path::new)
+                .is_some_and(|path| path.starts_with(&canonical_long_runtime)),
+            "Windows filesystem runtime left the explicit root: {document}"
+        );
+        let endpoint = document["daemon"]["socket_path"]
+            .as_str()
+            .expect("Windows status named-pipe endpoint");
+        assert!(endpoint.starts_with(r"\\.\pipe\haider-"));
+        assert_eq!(endpoint.len(), r"\\.\pipe\haider-".len() + 32);
+    }
 }
