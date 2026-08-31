@@ -61,6 +61,7 @@ def execute_check(
     *,
     bin_dir: Path,
     measurement_accepted: bool,
+    report_artefact_root: Path | None = None,
 ) -> tuple[dict[str, Any], set[str]]:
     started = time.monotonic()
     unavailable = missing_needs(check, bin_dir=bin_dir, fixture_root=FIXTURE_ROOT)
@@ -97,7 +98,12 @@ def execute_check(
     context: CheckContext | None = None
     evidence: list[Evidence] = []
     try:
-        context = CheckContext(check_id=check.id, bin_dir=bin_dir, script=check.script)
+        context = CheckContext(
+            check_id=check.id,
+            bin_dir=bin_dir,
+            script=check.script,
+            report_artefact_root=report_artefact_root,
+        )
         evidence.extend(validate_evidence_list(check.run(context)))
     except Exception as error:  # runner errors must become diagnostic FAIL rows
         detail = f"runner_error type={type(error).__name__} actual={str(error)!r}"
@@ -253,6 +259,9 @@ def run_tier(args: argparse.Namespace) -> int:
     one_minute, cpus, measurement_reasons = _load_snapshot()
     binary = binary_metadata(bin_dir / executable, "haider")
     daemon_binary = binary_metadata(bin_dir / daemon_executable, "haiderd")
+    report_dir = Path(args.report_dir) if args.report_dir else _default_report_dir(binary["version"])
+    report_path = report_dir / report_filename(args.tier, hostname, created)
+    report_artefact_root = report_path.with_suffix(".artefacts")
 
     required_pair_present = all(
         value.get("sha256") is not None and value.get("version") is not None
@@ -284,6 +293,7 @@ def run_tier(args: argparse.Namespace) -> int:
             check,
             bin_dir=bin_dir,
             measurement_accepted=measurement_accepted,
+            report_artefact_root=report_artefact_root,
         )
         rows.append(row)
         daemon_versions.update(observed)
@@ -316,8 +326,6 @@ def run_tier(args: argparse.Namespace) -> int:
         "summary": counts,
     }
     validate_report(report)
-    report_dir = Path(args.report_dir) if args.report_dir else _default_report_dir(binary["version"])
-    report_path = report_dir / report_filename(args.tier, hostname, created)
     write_report(report_path, report)
 
     for row in rows:

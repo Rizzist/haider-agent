@@ -85,13 +85,49 @@ def process_is_alive(pid: int) -> bool:
     return True
 
 
-def wait_pid_gone(pid: int, budget: BudgetPart) -> bool:
+def wait_pid_gone(pid: int, budget: BudgetPart | BudgetSum) -> bool:
     deadline = time.monotonic() + budget_seconds(budget)
     while time.monotonic() < deadline:
         if not process_is_alive(pid):
             return True
         time.sleep(0.025)
     return not process_is_alive(pid)
+
+
+def _lsof_identity(
+    pid: int,
+    timeout: BudgetPart | BudgetSum,
+) -> tuple[str | None, str | None]:
+    """Resolve one PID's executable and cwd without granting signal authority."""
+
+    lsof = shutil.which("lsof")
+    if lsof is None:
+        return None, None
+    try:
+        result = subprocess.run(
+            [lsof, "-a", "-p", str(pid), "-d", "txt,cwd", "-Fn"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=budget_seconds(timeout),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+    executable = None
+    cwd = None
+    descriptor = None
+    for line in result.stdout.splitlines():
+        if line.startswith("f"):
+            descriptor = line[1:]
+        elif line.startswith("n"):
+            path = line[1:]
+            if descriptor == "cwd":
+                cwd = path
+            elif descriptor == "txt" and executable is None:
+                executable = path
+    return executable, cwd
 
 
 def parse_single_json(stdout: str, label: str) -> dict[str, Any]:
@@ -144,9 +180,16 @@ class CommandResult:
 
 
 class CheckContext:
-    """One short, throwaway profile/runtime and at most one daemon."""
+    """One short, throwaway profile/runtime and at most one live daemon at a time."""
 
-    def __init__(self, *, check_id: str, bin_dir: Path, script: list[dict[str, Any]]):
+    def __init__(
+        self,
+        *,
+        check_id: str,
+        bin_dir: Path,
+        script: list[dict[str, Any]],
+        report_artefact_root: Path | None = None,
+    ):
         self.check_id = check_id
         self.bin_dir = Path(canonical_path(bin_dir))
         self.haider_bin = self.bin_dir / ("haider.exe" if os.name == "nt" else "haider")
@@ -161,6 +204,11 @@ class CheckContext:
         self.home_dir = self.root / "h"
         self.workspace_dir = self.root / "w"
         self.artefact_dir = self.root / "artefacts"
+        self.report_artefact_dir = (
+            Path(report_artefact_root) / self.check_id
+            if report_artefact_root is not None
+            else None
+        )
         for directory in (
             self.profile_dir,
             self.runtime_root,
@@ -213,19 +261,28 @@ class CheckContext:
         self._isolated_active = False
         self._disposed = False
 
-    def run_haider(
+    def run_command(
         self,
-        args: Sequence[str],
+        argv: Sequence[str | os.PathLike[str]],
         *,
         timeout: BudgetPart | BudgetSum,
+        env_overrides: dict[str, str | os.PathLike[str] | None] | None = None,
+        cwd: str | os.PathLike[str] | None = None,
+        may_spawn: bool = False,
     ) -> CommandResult:
-        argv = (str(self.haider_bin), *map(str, args))
-        if self._may_spawn(args):
+        command = tuple(map(os.fspath, argv))
+        if may_spawn:
             self.spawn_possible = True
         started = time.monotonic()
+        child_env = self.env.copy()
+        for key, value in (env_overrides or {}).items():
+            if value is None:
+                child_env.pop(key, None)
+            else:
+                child_env[key] = os.fspath(value)
         popen_kwargs: dict[str, Any] = {
-            "cwd": self.workspace_dir,
-            "env": self.env,
+            "cwd": os.fspath(cwd) if cwd is not None else self.workspace_dir,
+            "env": child_env,
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
             "text": True,
@@ -236,7 +293,7 @@ class CheckContext:
             popen_kwargs["start_new_session"] = True
         elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        process = subprocess.Popen(argv, **popen_kwargs)
+        process = subprocess.Popen(command, **popen_kwargs)
         timed_out = False
         try:
             stdout, stderr = process.communicate(timeout=budget_seconds(timeout))
@@ -251,7 +308,7 @@ class CheckContext:
                 process.kill()
             stdout, stderr = process.communicate()
         result = CommandResult(
-            argv=argv,
+            argv=command,
             returncode=process.returncode,
             stdout=stdout,
             stderr=stderr,
@@ -260,6 +317,40 @@ class CheckContext:
         )
         self.commands.append(result)
         return result
+
+    def run_haider(
+        self,
+        args: Sequence[str],
+        *,
+        timeout: BudgetPart | BudgetSum,
+        env_overrides: dict[str, str | os.PathLike[str] | None] | None = None,
+    ) -> CommandResult:
+        return self.run_command(
+            (self.haider_bin, *map(str, args)),
+            timeout=timeout,
+            env_overrides=env_overrides,
+            may_spawn=self._may_spawn(args),
+        )
+
+    def run_binary(
+        self,
+        binary: str | os.PathLike[str],
+        args: Sequence[str],
+        *,
+        timeout: BudgetPart | BudgetSum,
+        env_overrides: dict[str, str | os.PathLike[str] | None] | None = None,
+        may_spawn: bool = False,
+    ) -> CommandResult:
+        return self.run_command(
+            (binary, *map(str, args)),
+            timeout=timeout,
+            env_overrides=env_overrides,
+            may_spawn=may_spawn,
+        )
+
+    def set_fake_provider_script(self, script: list[dict[str, Any]]) -> None:
+        self.fake_script = json.loads(json.dumps(script))
+        self.env["HAIDER_TEST_FAKE_PROVIDER"] = json.dumps(script, separators=(",", ":"))
 
     def interrupt_haider_after_stdout(
         self,
@@ -423,7 +514,13 @@ class CheckContext:
             return "--no-spawn" not in args
         return args[0] == "status" and "--no-spawn" not in args
 
-    def observe_status(self, document: dict[str, Any]) -> list[str]:
+    def observe_status(
+        self,
+        document: dict[str, Any],
+        *,
+        profile_dir: str | os.PathLike[str] | None = None,
+        runtime_root: str | os.PathLike[str] | None = None,
+    ) -> list[str]:
         """Record the only allowed daemon identity source and validate its root."""
 
         problems: list[str] = []
@@ -438,19 +535,21 @@ class CheckContext:
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
             ownership_problems.append(f"status daemon.pid actual={pid!r}")
             pid = None
+        expected_profile = self.profile_dir if profile_dir is None else profile_dir
+        expected_runtime = self.runtime_root if runtime_root is None else runtime_root
         profile_path = document.get("profile_path")
         if not isinstance(profile_path, str) or not canonical_paths_equal(
-            profile_path, self.profile_dir
+            profile_path, expected_profile
         ):
             ownership_problems.append(
                 "status profile_path escaped root "
-                f"actual={profile_path!r} expected={canonical_path(self.profile_dir)!r}"
+                f"actual={profile_path!r} expected={canonical_path(expected_profile)!r}"
             )
         runtime_dir = document.get("runtime_dir")
-        if not isinstance(runtime_dir, str) or not path_is_within(runtime_dir, self.runtime_root):
+        if not isinstance(runtime_dir, str) or not path_is_within(runtime_dir, expected_runtime):
             ownership_problems.append(
                 "status runtime_dir escaped root "
-                f"actual={runtime_dir!r} expected_under={canonical_path(self.runtime_root)!r}"
+                f"actual={runtime_dir!r} expected_under={canonical_path(expected_runtime)!r}"
             )
         socket_path = daemon.get("socket_path")
         if os.name == "nt":
@@ -477,6 +576,16 @@ class CheckContext:
             if pid is not None:
                 self.untrusted_status_pids.add(pid)
         elif pid is not None:
+            concurrent = sorted(
+                observed
+                for observed in self.daemon_pids
+                if observed != pid and process_is_alive(observed)
+            )
+            if concurrent:
+                problems.append(
+                    "sequential daemon generations expected=retired "
+                    f"actual_live={concurrent} new_pid={pid}"
+                )
             self.daemon_pids.add(pid)
             version = daemon.get("version")
             if not isinstance(version, str) or not version:
@@ -485,6 +594,99 @@ class CheckContext:
                 self.daemon_versions.add(version)
         self.status_violations.extend(problems)
         return problems
+
+    def observe_legacy_status(
+        self,
+        document: dict[str, Any],
+        *,
+        daemon_binary: str | os.PathLike[str],
+        expected_version: str,
+        identity_timeout: BudgetPart | BudgetSum,
+    ) -> tuple[int | None, list[str]]:
+        """Own a legacy daemon only through its exact profile PID and executable."""
+
+        problems: list[str] = []
+        if document.get("schema") != "haider.observe.v1":
+            problems.append(f"legacy status schema actual={document.get('schema')!r}")
+        if not canonical_paths_equal(document.get("profile_path", ""), self.profile_dir):
+            problems.append(
+                "legacy status profile_path escaped root "
+                f"actual={document.get('profile_path')!r} "
+                f"expected={canonical_path(self.profile_dir)!r}"
+            )
+        runtime_dir = document.get("runtime_dir")
+        if not isinstance(runtime_dir, str) or not path_is_within(
+            runtime_dir, self.runtime_root
+        ):
+            problems.append(
+                "legacy status runtime_dir escaped root "
+                f"actual={runtime_dir!r} expected_under={canonical_path(self.runtime_root)!r}"
+            )
+        daemon = document.get("daemon") if isinstance(document.get("daemon"), dict) else {}
+        if daemon.get("version") != expected_version:
+            problems.append(
+                f"legacy daemon version expected={expected_version!r} "
+                f"actual={daemon.get('version')!r}"
+            )
+
+        pid: int | None = None
+        pid_path = Path(runtime_dir) / "haiderd.pid" if isinstance(runtime_dir, str) else None
+        if (
+            pid_path is None
+            or not path_is_within(pid_path, self.runtime_root)
+            or pid_path.is_symlink()
+        ):
+            problems.append(f"legacy daemon pid file refused path={pid_path!r}")
+        else:
+            try:
+                candidate = int(pid_path.read_text(encoding="ascii").strip())
+                if candidate <= 0:
+                    raise ValueError("PID is not positive")
+                pid = candidate
+            except (OSError, UnicodeError, ValueError) as error:
+                problems.append(
+                    f"legacy daemon pid file unreadable path={pid_path} actual={error}"
+                )
+
+        if pid is not None:
+            executable = None
+            proc_exe = Path("/proc") / str(pid) / "exe"
+            if proc_exe.exists():
+                try:
+                    executable = os.readlink(proc_exe).removesuffix(" (deleted)")
+                except OSError:
+                    pass
+            lsof_executable, _cwd = _lsof_identity(pid, identity_timeout)
+            executable = executable or lsof_executable
+            if executable is None or not canonical_paths_equal(executable, daemon_binary):
+                problems.append(
+                    f"legacy daemon executable expected={canonical_path(daemon_binary)!r} "
+                    f"actual={executable!r} pid={pid}"
+                )
+            if not process_is_alive(pid):
+                problems.append(f"legacy daemon pid expected=alive actual=gone pid={pid}")
+
+        if problems:
+            self.ownership_refused = True
+            if pid is not None:
+                self.untrusted_status_pids.add(pid)
+            self.status_violations.extend(problems)
+            return None, problems
+        assert pid is not None
+        concurrent = sorted(
+            observed
+            for observed in self.daemon_pids
+            if observed != pid and process_is_alive(observed)
+        )
+        if concurrent:
+            problems.append(
+                "sequential daemon generations expected=retired "
+                f"actual_live={concurrent} new_pid={pid}"
+            )
+        self.daemon_pids.add(pid)
+        self.daemon_versions.add(expected_version)
+        self.status_violations.extend(problems)
+        return pid, problems
 
     def write_artefact(self, name: str, content: str) -> str:
         safe_name = "".join(character if character.isalnum() or character in ".-_" else "_" for character in name)
@@ -500,6 +702,31 @@ class CheckContext:
             f"--- stderr ---\n{result.stderr}"
         )
         return self.write_artefact(f"{name}.txt", content)
+
+    def publish_artefact(self, name: str, source: str | os.PathLike[str]) -> str:
+        """Copy a PASS-worthy file or directory out of disposable scratch."""
+
+        if self.report_artefact_dir is None:
+            raise ContractError("persistent run artefact directory is unavailable")
+        safe_name = "".join(
+            character if character.isalnum() or character in ".-_" else "_"
+            for character in name
+        )
+        source_path = Path(source)
+        if not source_path.exists():
+            raise ContractError(f"cannot publish missing artefact {source_path}")
+        destination = self.report_artefact_dir / safe_name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            if destination.is_dir():
+                shutil.rmtree(destination)
+            else:
+                destination.unlink()
+        if source_path.is_dir():
+            shutil.copytree(source_path, destination)
+        else:
+            shutil.copy2(source_path, destination)
+        return str(destination)
 
     def cleanup(self) -> Evidence:
         """Stop only the status-observed daemon and fail on any surviving PID."""
@@ -573,8 +800,6 @@ class CheckContext:
                         )
                 except ContractError as error:
                     problems.append(str(error))
-        if len(self.daemon_pids) > 1:
-            problems.append(f"one-daemon law observed pids={sorted(self.daemon_pids)}")
         survivors = [pid for pid in sorted(self.daemon_pids) if not wait_pid_gone(pid, PROCESS_EXIT_GRACE)]
         for pid in survivors:
             problems.append(f"no orphan daemons failed pid={pid} alive_after_stop=true")

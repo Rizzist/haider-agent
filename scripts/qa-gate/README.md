@@ -10,6 +10,7 @@ cannot silently fall back outside the check's runtime root.
 
 ```sh
 scripts/qa-gate/run.sh --tier t0 --bin-dir /usr/local/bin
+scripts/qa-gate/run.sh --tier t1 --bin-dir /usr/local/bin
 scripts/qa-gate/run.sh test
 scripts/qa-gate/run.sh validate docs/testing/v0.0.967/qa-gate-t0-HOST-UTC.json
 scripts/qa-gate/run.sh diff previous.json current.json
@@ -41,7 +42,7 @@ Each `checks/<tier>/*.py` module exports:
 | Export | Contract |
 | --- | --- |
 | `id`, `tier`, `area` | Non-empty strings; `id` begins with `<tier>.` and is globally unique in the tier. |
-| `needs` | Tuple/list drawn from `binary`, `daemon`, `pty`, `network:none`, or `fixture:<relative-path>`. A known unavailable need produces `ENV_BLOCKED` without calling `run`. |
+| `needs` | Tuple/list drawn from `binary`, `daemon`, `pty`, `network:none`, `network:github`, or `fixture:<relative-path>`. A known unavailable need produces `ENV_BLOCKED` without calling `run`; `HAIDER_QA_GATE_OFFLINE=1` explicitly blocks `network:github`. |
 | `script` | List of fake-provider step objects. It is compact-JSON encoded into `HAIDER_TEST_FAKE_PROVIDER` before any process starts. |
 | `turns_expected` | Explicit non-negative integer required by the segment law. This field supplements the base check contract because the runner cannot enforce that law without it. |
 | `budget` | A `BudgetSum` of at least two positive named `BudgetPart` values, each with a source. An `int`, `float`, lone part, or other literal-only deadline is rejected while loading all checks, before any spawn. |
@@ -104,9 +105,11 @@ schema, canonical `profile_path`, runtime-root containment, and socket/PID paths
 all prove that it belongs to this throwaway context. Only then may the runner
 call `daemon stop --json` or signal that PID. A foreign/unverifiable PID is
 diagnostic-only and makes the row FAIL without a stop or signal. Every owned PID
-must disappear. Multiple owned PIDs or a surviving process is a
-`no_orphan_daemons` failure; emergency SIGTERM/SIGKILL is restricted to an exact
-trusted PID. The harness never uses `pgrep` or `pgrep -f`. The second stop's shipped contract is JSON
+must disappear. Concurrent owned PIDs or a surviving process is a
+`no_orphan_daemons` failure. Retired sequential generations remain recorded so
+every historical PID must still be gone; emergency SIGTERM/SIGKILL is
+restricted to an exact trusted PID. The harness never uses `pgrep` or
+`pgrep -f`. The second stop's shipped contract is JSON
 `outcome=not_running` with exit 69, not exit zero.
 
 ## T0 checks
@@ -133,9 +136,9 @@ trusted PID. The harness never uses `pgrep` or `pgrep -f`. The second stop's shi
   require a typed budget terminal before any below-bound exchange, and reserve
   one sole scripted segment in each of two sequential hermetic subcases: an
   above-bound one-request control and a below-bound zero-request probe. Each
-  subcase proves its own no-orphan cleanup. The cost check carries
-  `expected_fail_until=0.0.968`; this metadata never turns a failure into a
-  pass.
+  subcase proves its own no-orphan cleanup. Both checks carry
+  `expected_fail_until=0.0.968` for the installed 0.0.967 baseline; this
+  metadata never turns a failure into a pass.
 - `t0.sessions.wait_ready_n` starts three sessions and proves both the exact
   positive barrier document and the distinction between readiness and turn
   quiescence: three current-format sessions are ready while state counts remain
@@ -153,6 +156,44 @@ trusted PID. The harness never uses `pgrep` or `pgrep -f`. The second stop's shi
 
 All seven Step 2 rows set `timed=False`; they report correctness under load and
 publish no timing verdict.
+
+## T1 installed-artifact checks
+
+T1 is the release-machine pack for the installed pair:
+
+```sh
+scripts/qa-gate/run.sh --tier t1 --bin-dir /usr/local/bin
+```
+
+- `t1.daemon.kill9_midturn` detaches a hanging fake-provider turn, kills only
+  the status-owned daemon PID, proves a generation-incrementing respawn,
+  requires a successful `recover --probe` receipt in `effect_unknown`, requires
+  finite typed resume, then completes a fresh turn and clean stop. Installed
+  0.0.967 currently reports `no_recovery/errored`;
+  `expected_fail_until=0.0.968` records that defect without weakening the FAIL.
+- `t1.daemon.lifecycle_triad` applies a 1,000 ms idle TTL to an autospawned
+  daemon, requires exit within the derived 8,000 ms TTL/drain/observation
+  window, then requires a different PID at generation +1 and a clean stop.
+  Installed 0.0.967 keeps the same live PID/generation; the check carries the
+  same strict expected-fail metadata.
+- `t1.install.paths` runs `scripts/install.sh` with a scratch HOME and prefix,
+  then proves the installed pair's version, readiness, status identity, clean
+  stop, and PID disappearance. The runner bounds the installer as a whole;
+  the installer's curl/wget calls currently have no internal timeout.
+- `t1.store.previous_release_upgrade` downloads and checksum-pins the official
+  v0.0.966 macOS arm64 pair, creates two real old sessions, owns the legacy
+  daemon only through its profile PID file plus exact executable identity,
+  opens the stopped profile with the binary under test, and compares its
+  `PRAGMA user_version` and ordered `sqlite_master` rows with a fresh profile.
+  A passing run publishes the stopped profile archive, checksum, and
+  provenance manifest beside the report.
+
+The old step-4 `t1.tui.ladder` wrapper is intentionally absent: the five direct
+hermetic `t0.tui.*` checks use the current PTY/RPC runner, while the legacy
+14-demo + 2-live ladder remains independently wired in ship-gate. The old
+suite-global process census is also omitted; it attributed unrelated installed
+daemons, whereas every runnable check already ends with exact, status-owned
+no-orphan enforcement.
 
 ## Normative report schema
 

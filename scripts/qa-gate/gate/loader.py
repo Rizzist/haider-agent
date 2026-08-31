@@ -24,7 +24,7 @@ TERMINAL_STEPS = frozenset(
         "malformed_frame",
     )
 )
-KNOWN_NEEDS = frozenset(("binary", "daemon", "network:none", "pty"))
+KNOWN_NEEDS = frozenset(("binary", "daemon", "network:none", "network:github", "pty"))
 
 
 @dataclass(frozen=True)
@@ -214,6 +214,9 @@ def missing_needs(
                 reasons.append(f"fixture unavailable: {relative}")
         elif need == "network:none":
             continue
+        elif need == "network:github":
+            if os.environ.get("HAIDER_QA_GATE_OFFLINE") == "1":
+                reasons.append("GitHub network disabled by HAIDER_QA_GATE_OFFLINE=1")
     return reasons
 
 

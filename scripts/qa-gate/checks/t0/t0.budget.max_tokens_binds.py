@@ -30,6 +30,7 @@ script = [
     {"step": "finish", "reason": "end_turn"},
 ]
 turns_expected = 1
+expected_fail_until = "0.0.968"
 HEADLESS_TEN_SECONDS = BudgetPart(
     "headless budget check --timeout",
     10.0,
