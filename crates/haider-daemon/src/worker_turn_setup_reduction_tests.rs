@@ -686,6 +686,49 @@ fn fused_turn_setup_reduction_rejects_malformed_matching_provider_view() {
     assert!(error.message.contains("provider-view ledger is malformed"));
 }
 
+#[tokio::test]
+async fn idle_release_removes_only_one_sessions_turn_setup_entries() {
+    let cache = TurnSetupReductionCache::default();
+    for name in ["turn-setup-idle-a", "turn-setup-idle-b"] {
+        let session_id = SessionId::new(name);
+        let selector = TurnSetupReductionSelector {
+            run_id: RunId::new(format!("{name}-run")),
+            branch_id: None,
+            agent_id: None,
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            account_scope: None,
+            auth_scope: "measurement".into(),
+        };
+        cache
+            .install(
+                session_id,
+                TurnSetupReductionKey::from(&selector),
+                CachedTurnSetupReduction {
+                    last_touched: 0,
+                    revision: None,
+                    reduction: TurnSetupReduction::new(selector),
+                },
+            )
+            .await;
+    }
+
+    assert_eq!(
+        cache
+            .remove_session(&SessionId::new("turn-setup-idle-a"))
+            .await,
+        1
+    );
+    let entries = cache.entries.lock().await;
+    assert_eq!(entries.reductions.len(), 1);
+    assert!(
+        entries
+            .reductions
+            .keys()
+            .all(|(session_id, _)| session_id.as_str() == "turn-setup-idle-b")
+    );
+}
+
 /// HAIDER963 C3. MUTATION CHECK: ignore the fork audit, use the child session,
 /// treat `fresh` as inherited, or retain the inherited root after the exact
 /// segment diverges. The root/fresh/divergence pins fail.

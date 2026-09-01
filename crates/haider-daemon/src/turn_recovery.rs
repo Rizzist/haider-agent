@@ -26,6 +26,12 @@
 //!   durable child-wait coordinator. W6c re-arms the progress deadline from
 //!   committed envelope time, delivers at most one steer, and then uses the
 //!   ordinary durable cancel path; provider/tool work is never redispatched;
+//! - a first provider request admitted before the crash, but with no durable
+//!   response, parks as an outcome-unknown network effect and recovery menu
+//!   unless an active workflow run has an explicit durable budget. That
+//!   composite admission is a recoverable request boundary: startup restores
+//!   its logical spend and ordinal coordinates and re-enters the worker
+//!   without counting the response-free attempt as completed spend;
 //! - every other nonterminal run terminalizes: open items close `Failed`, an
 //!   open menu closes `RecoveryInterrupted`, one sanitized retryable
 //!   `RunFailed` precedes `Errored`, and the session settles
@@ -50,21 +56,25 @@ use haider_core::{
 };
 use haider_protocol::EventPayload;
 use haider_protocol::cache::CacheRequestAttemptV1;
+use haider_protocol::effect::{
+    AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase,
+};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::graph::{GraphFinalizationDeferred, GraphPhase};
-use haider_protocol::headless::{HeadlessRunEventPayload, RunBudgetExhaustedV1};
+use haider_protocol::headless::{HeadlessRunEventPayload, RunBudgetExhaustedV1, RunBudgetV1};
 use haider_protocol::ids::{
-    AgentId, BranchId, DeviceId, EventId, ItemId, MenuId, RunId, SessionId,
+    AgentId, BranchId, DeviceId, EffectId, EventId, ItemId, MenuId, RunId, SessionId,
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::menu::{Menu, MenuCloseReason, MenuKind};
+use haider_protocol::menu::{Menu, MenuCloseReason, MenuKind, effect_recovery_menu};
 use haider_protocol::provider::{PROVIDER_OPAQUE_EXTENSION_KIND, StreamEvent};
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::state::{RunState, SessionState, WaitReason};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 const PAGE_SIZE: usize = 512;
@@ -95,9 +105,11 @@ const CHECKPOINT_TIMELINE: &str = "session";
 const CHECKPOINT_SHAPE_VERSION: u32 = 1;
 // v6 adds the provider-response coordinate used to distinguish an admitted
 // request with no response from an interrupted response stream. Earlier
-// cursors cannot prove that retry boundary, so reject them and perform one
+// cursors cannot prove that retry boundary. v7 retains the durable run budget
+// needed to distinguish a recoverable active-workflow admission from ordinary
+// ambiguous provider delivery. Reject either older cursor and perform one
 // complete ordered journal reduction.
-const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v6";
+const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v7";
 
 pub(crate) enum RecoveredWork {
     Queued(AcceptedTurn),
@@ -106,8 +118,15 @@ pub(crate) enum RecoveredWork {
     PartialStream(Box<RecoveredPartialStream>),
     RouteWait(Box<RecoveredRouteWait>),
     ChildWait(Box<RecoveredChildWait>),
+    AdmissionRetry(Box<RecoveredAdmissionRetry>),
     WorkflowContinuation(Box<RecoveredWorkflowContinuation>),
     DelegationMirror(Box<RecoveredDelegationMirror>),
+}
+
+pub(crate) struct RecoveredAdmissionRetry {
+    pub(crate) accepted: AcceptedTurn,
+    pub(crate) provider_requests_consumed: usize,
+    pub(crate) provider_request_ordinal: u64,
 }
 
 pub(crate) struct RecoveredWorkflowContinuation {
@@ -166,6 +185,8 @@ struct RunReduction {
     child_results: HashSet<AgentId>,
     #[serde(default)]
     headless_configured: bool,
+    #[serde(default)]
+    headless_budget: RunBudgetV1,
     #[serde(default)]
     budget_exhausted: Option<RunBudgetExhaustedV1>,
     #[serde(default)]
@@ -504,24 +525,19 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                 }
                 continue;
             }
-            if first_provider_delivery_is_ambiguous(&state, &reduction) {
-                // The durable attempt marker precedes provider transport, but
-                // after process death it cannot prove whether the POST reached
-                // the provider. Reissuing the same logical ordinal can create
-                // two physical requests. Fail closed with the ordinary typed
-                // interrupted terminal; the journal remains the sole recovery
-                // authority and replay never contacts the provider.
-                terminalize_interrupted(
-                    store,
-                    device_id,
-                    &session_id,
-                    &run_id,
-                    reduction.branch_id.clone(),
-                    reduction,
-                    matches!(state, RunState::Cancelling),
-                )
-                .await?;
-                touched = true;
+            if let Some(retry) =
+                pending_admission_retry(store, &session_id, &run_id, &state, &reduction)?
+            {
+                let graph_phase = store
+                    .graph_status(&session_id)
+                    .await?
+                    .map(|status| status.phase);
+                if budgeted_workflow_admission_is_recoverable(&reduction, graph_phase) {
+                    recovered.push(RecoveredWork::AdmissionRetry(Box::new(retry)));
+                } else {
+                    park_ambiguous_admission_retry(store, device_id, &retry).await?;
+                    touched = true;
+                }
                 continue;
             }
             if let Some(continuation) =
@@ -790,7 +806,96 @@ pub(crate) async fn recover_interrupted_turns(
     .work)
 }
 
-fn first_provider_delivery_is_ambiguous(state: &RunState, reduction: &RunReduction) -> bool {
+fn pending_admission_retry(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    run_id: &RunId,
+    state: &RunState,
+    reduction: &RunReduction,
+) -> Result<Option<RecoveredAdmissionRetry>, HaiderError> {
+    if !admitted_first_request_has_no_response(state, reduction) {
+        return Ok(None);
+    }
+    let accepted_seq = reduction.user_seq.ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            format!("admission-retry run {run_id} has no user message"),
+            false,
+        )
+    })?;
+    let provider_request_ordinal = reduction
+        .latest_provider_request_attempt
+        .map_or(0, |(_, ordinal)| ordinal.saturating_sub(1));
+    Ok(Some(RecoveredAdmissionRetry {
+        accepted: recovered_acceptance(
+            session_id,
+            run_id,
+            accepted_seq,
+            store.worker_generation(),
+            reduction.branch_id.clone(),
+        ),
+        // This exact shape is the first logical request. Its durable marker
+        // proves admission, not completion, so recovery re-enters request one
+        // with the ordinal seed rewound from 1 to 0.
+        provider_requests_consumed: 0,
+        provider_request_ordinal,
+    }))
+}
+
+async fn park_ambiguous_admission_retry(
+    store: &SqliteStoreHandle,
+    device_id: &DeviceId,
+    retry: &RecoveredAdmissionRetry,
+) -> Result<(), HaiderError> {
+    let attempt = retry.provider_request_ordinal.saturating_add(1);
+    let run_id = &retry.accepted.run_id;
+    let session_id = &retry.accepted.session_id;
+    let effect_id = EffectId::new(format!("provider-admission-{run_id}-{attempt}"));
+    let menu_id = MenuId::new(format!("provider-admission-recovery-{run_id}-{attempt}"));
+    let summary = format!("provider request attempt {attempt} admitted before daemon restart");
+    let args_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(format!("{session_id}\0{run_id}\0{attempt}").as_bytes())
+    );
+    let payloads = vec![
+        EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+            effect: effect_id.clone(),
+            class: EffectClass::Network {
+                host: "provider-request".into(),
+            },
+            summary: summary.clone(),
+            args_digest,
+            workspace_revision: None,
+        })),
+        EventPayload::Effect(EffectPhase::Authorized {
+            effect: effect_id.clone(),
+            verdict: AuthorizationVerdict::Allow,
+        }),
+        EventPayload::Effect(EffectPhase::Dispatched {
+            effect: effect_id.clone(),
+        }),
+        EventPayload::Effect(EffectPhase::Outcome {
+            effect: effect_id.clone(),
+            outcome: EffectOutcome::Unknown,
+            freshness: None,
+            workspace_mutation: None,
+        }),
+        EventPayload::MenuOpened(effect_recovery_menu(menu_id, effect_id, summary)),
+        EventPayload::RunState(RunState::EffectOutcomeUnknown),
+    ];
+    let mut envelopes = recovery_envelopes(
+        store.worker_generation(),
+        device_id,
+        session_id,
+        run_id,
+        retry.accepted.branch_id.as_ref(),
+        payloads,
+    )?;
+    store.append(&mut envelopes).await?;
+    Ok(())
+}
+
+fn admitted_first_request_has_no_response(state: &RunState, reduction: &RunReduction) -> bool {
     let Some((attempt_seq, ordinal)) = reduction.latest_provider_request_attempt else {
         return false;
     };
@@ -816,6 +921,13 @@ fn first_provider_delivery_is_ambiguous(state: &RunState, reduction: &RunReducti
         && reduction
             .latest_provider_response_seq
             .is_none_or(|response_seq| response_seq < attempt_seq)
+}
+
+fn budgeted_workflow_admission_is_recoverable(
+    reduction: &RunReduction,
+    graph_phase: Option<GraphPhase>,
+) -> bool {
+    !reduction.headless_budget.is_empty() && graph_phase == Some(GraphPhase::Active)
 }
 
 async fn pending_workflow_continuation(
@@ -1040,8 +1152,11 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
         return;
     }
     match headless_payload {
-        Some(HeadlessRunEventPayload::HeadlessRunConfigured(_)) if envelope.render.durable => {
+        Some(HeadlessRunEventPayload::HeadlessRunConfigured(configured))
+            if envelope.render.durable =>
+        {
             reduction.headless_configured = true;
+            reduction.headless_budget = configured.budget;
             return;
         }
         Some(HeadlessRunEventPayload::RunBudgetExhausted(exhausted))
@@ -1793,7 +1908,7 @@ mod composite_recovery_tests {
     /// response fact and the final assertion flips true, allowing a daemon
     /// restart to replay provider work after response delivery began.
     #[test]
-    fn first_provider_delivery_is_ambiguous_only_before_any_response_fact() {
+    fn admitted_first_request_retries_only_before_any_response_fact() {
         let mut reduction = RunReduction {
             state: Some((RunState::Thinking, 5)),
             user_seq: Some(1),
@@ -1801,21 +1916,51 @@ mod composite_recovery_tests {
             latest_provider_request_attempt: Some((6, 1)),
             ..RunReduction::default()
         };
-        assert!(first_provider_delivery_is_ambiguous(
+        assert!(admitted_first_request_has_no_response(
             &RunState::Thinking,
             &reduction
         ));
 
         reduction.state = Some((RunState::Streaming, 7));
-        assert!(first_provider_delivery_is_ambiguous(
+        assert!(admitted_first_request_has_no_response(
             &RunState::Streaming,
             &reduction
         ));
 
         reduction.latest_provider_response_seq = Some(8);
-        assert!(!first_provider_delivery_is_ambiguous(
+        assert!(!admitted_first_request_has_no_response(
             &RunState::Streaming,
             &reduction
+        ));
+    }
+
+    /// Cross-contract pin: the max-cost workflow recovery test owns the
+    /// budgeted side of this split, while kill9_midturn owns the unbudgeted
+    /// effect-outcome-unknown side. Removing either discriminator makes one
+    /// of those real-process/restart contracts fail.
+    #[test]
+    fn only_budgeted_active_workflow_admission_is_runnable_recovery_work() {
+        let unbudgeted = RunReduction::default();
+        assert!(!budgeted_workflow_admission_is_recoverable(
+            &unbudgeted,
+            Some(GraphPhase::Active)
+        ));
+
+        let budgeted = RunReduction {
+            headless_budget: RunBudgetV1 {
+                max_cost_microusd: Some(10_000_000),
+                ..RunBudgetV1::default()
+            },
+            ..RunReduction::default()
+        };
+        assert!(!budgeted_workflow_admission_is_recoverable(&budgeted, None));
+        assert!(!budgeted_workflow_admission_is_recoverable(
+            &budgeted,
+            Some(GraphPhase::Completed)
+        ));
+        assert!(budgeted_workflow_admission_is_recoverable(
+            &budgeted,
+            Some(GraphPhase::Active)
         ));
     }
 
@@ -1864,7 +2009,7 @@ mod composite_recovery_tests {
         let encoded = rmp_serde::to_vec(&reduction).expect("encode composite checkpoint");
         let recovered: RunReduction =
             rmp_serde::from_slice(&encoded).expect("decode composite checkpoint");
-        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v6");
+        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v7");
         assert_eq!(
             recovered
                 .workflow_deferral

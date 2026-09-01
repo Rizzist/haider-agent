@@ -311,7 +311,8 @@ def _assert_tool_effect_result_bounds(effects: int, tool_results: int) -> None:
     """Prove at-most-once effect execution across an ambiguous crash.
 
     A crash after a durable successful Effect::Outcome but before ToolResult
-    can legitimately retain one observable effect and then fail closed. A
+    can legitimately retain one observable effect behind the typed recovery
+    door. The matrix probes that door and abandons only to seal the run. A
     durable tool result, when present, must still correspond to exactly one
     observable effect. Neither coordinate may duplicate.
     """
@@ -323,21 +324,132 @@ def _assert_tool_effect_result_bounds(effects: int, tool_results: int) -> None:
         )
 
 
-def _abandon_open_effect_recovery(
-    profile: ThrowawayProfile, session_id: str
+def _validate_probe_receipt(
+    document: Mapping[str, Any], session_id: str
+) -> tuple[str, str]:
+    menu_id = document.get("menu_id")
+    resolution_seq = document.get("resolution_seq")
+    replacement_menu_id = document.get("replacement_menu_id")
+    expected_replacement = (
+        f"{menu_id}-probe-{resolution_seq}"
+        if isinstance(menu_id, str)
+        and menu_id
+        and isinstance(resolution_seq, int)
+        and not isinstance(resolution_seq, bool)
+        else None
+    )
+    if (
+        document.get("schema") != "haider.session_recovery.v1"
+        or document.get("session_id") != session_id
+        or document.get("chosen_option") != "probe"
+        or document.get("completed") is not True
+        or document.get("resulting_run_state") != "effect_unknown"
+        or expected_replacement is None
+        or replacement_menu_id != expected_replacement
+    ):
+        raise ProofError(
+            "typed recovery probe did not preserve the parked retry-pending state "
+            f"document={document!r}"
+        )
+    return menu_id, replacement_menu_id
+
+
+def _reconcile_open_recovery(
+    profile: ThrowawayProfile,
+    proxy: FakeProvider,
+    session_id: str,
 ) -> dict[str, Any]:
-    result = profile.command(
-        ["session", session_id, "recover", "--json", "--abandon"], timeout=10
+    card_deadline = time.monotonic() + 5
+    while True:
+        card_result = profile.command(
+            ["session", session_id, "recover", "--json"], timeout=10
+        )
+        card = parse_single_json(card_result.stdout, "effect recovery card")
+        if card_result.returncode == 0:
+            break
+        error = card.get("error")
+        code = error.get("code") if isinstance(error, Mapping) else None
+        message = error.get("message") if isinstance(error, Mapping) else None
+        if code == "no_recovery":
+            return {"outcome": "not_needed", "document": card}
+        if code == "recovery_incomplete" and isinstance(message, str) and any(
+            f"state={state}" in message for state in ("errored", "cancelled")
+        ):
+            return {"outcome": "terminal_without_card", "document": card}
+        if code == "recovery_incomplete" and time.monotonic() < card_deadline:
+            time.sleep(0.02)
+            continue
+        raise ProofError(
+            f"effect recovery card failed exit={card_result.returncode} document={card!r}"
+        )
+    options = card.get("options")
+    option_values = options if isinstance(options, list) else []
+    option_keys = {
+        option.get("key")
+        for option in option_values
+        if isinstance(option, Mapping)
+    }
+    if (
+        card.get("schema") != "haider.session_recovery.v1"
+        or card.get("session_id") != session_id
+        or card.get("run_state") not in {"running", "effect_unknown"}
+        or not isinstance(card.get("menu_id"), str)
+        or not {"probe", "abandon"}.issubset(option_keys)
+    ):
+        raise ProofError(f"invalid typed recovery card document={card!r}")
+
+    ledger_before_probe = proxy.state.snapshot_case()
+    probe_result = profile.command(
+        ["session", session_id, "recover", "--probe", "--json"], timeout=10
     )
-    document = parse_single_json(result.stdout, "effect recovery abandon")
-    if result.returncode == 0:
-        return {"outcome": "abandoned", "document": document}
-    error = document.get("error")
-    if isinstance(error, Mapping) and error.get("code") == "no_recovery":
-        return {"outcome": "not_needed", "document": document}
-    raise ProofError(
-        f"effect recovery abandon failed exit={result.returncode} document={document!r}"
+    probe = parse_single_json(probe_result.stdout, "effect recovery probe")
+    if probe_result.returncode != 0:
+        raise ProofError(
+            f"effect recovery probe failed exit={probe_result.returncode} document={probe!r}"
+        )
+    menu_id, replacement_menu_id = _validate_probe_receipt(probe, session_id)
+    if menu_id != card.get("menu_id"):
+        raise ProofError(
+            "effect recovery probe answered a different card "
+            f"card={card.get('menu_id')!r} probe={menu_id!r}"
+        )
+    ledger_after_probe = proxy.state.snapshot_case()
+    if ledger_after_probe != ledger_before_probe:
+        raise ProofError(
+            "parked-admission probe issued a duplicate physical provider request "
+            f"before={ledger_before_probe!r} after={ledger_after_probe!r}"
+        )
+
+    abandon_result = profile.command(
+        ["session", session_id, "recover", "--abandon", "--json"], timeout=10
     )
+    abandon = parse_single_json(abandon_result.stdout, "effect recovery abandon")
+    if (
+        abandon_result.returncode != 0
+        or abandon.get("schema") != "haider.session_recovery.v1"
+        or abandon.get("session_id") != session_id
+        or abandon.get("menu_id") != replacement_menu_id
+        or abandon.get("chosen_option") != "abandon"
+        or abandon.get("completed") is not True
+        or abandon.get("resulting_run_state") != "errored"
+    ):
+        raise ProofError(
+            f"effect recovery abandon failed exit={abandon_result.returncode} "
+            f"document={abandon!r}"
+        )
+    ledger_after_abandon = proxy.state.snapshot_case()
+    if ledger_after_abandon != ledger_before_probe:
+        raise ProofError(
+            "typed recovery resolution mutated the physical provider ledger "
+            f"before={ledger_before_probe!r} after={ledger_after_abandon!r}"
+        )
+    return {
+        "outcome": "probed_then_abandoned",
+        "card": card,
+        "probe": probe,
+        "abandon": abandon,
+        "provider_ledger_unchanged": True,
+    }
 
 
 def _case_root(label: str) -> Path:
@@ -468,14 +580,12 @@ def _run_kill_case(
                 "daemon restart identity did not advance "
                 f"old={(old_pid, old_generation)} new={(restarted_pid, restarted_generation)}"
             )
+        if not proxy.state.wait_idle(5):
+            raise ProofError("provider handler did not settle before recovery probe")
         recovery_action = (
-            _abandon_open_effect_recovery(profile, accepted_session_id)
-            if shape == "tool" and accepted_session_id is not None
-            else {
-                "outcome": (
-                    "pre_accept_boundary" if shape == "tool" else "not_applicable"
-                )
-            }
+            _reconcile_open_recovery(profile, proxy, accepted_session_id)
+            if accepted_session_id is not None
+            else {"outcome": "pre_accept_boundary"}
         )
         returncode, stdout, stderr = client.finish(RECOVERY_TIMEOUT)
         parsed = _validate_recovered_jsonl(stdout, shape)

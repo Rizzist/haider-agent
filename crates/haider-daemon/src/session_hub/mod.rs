@@ -191,6 +191,15 @@ const APPEND_QUEUE_MAX_REQUESTS: usize = 128;
 const APPEND_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const APPEND_GROUP_MAX_REQUESTS: usize = 32;
 const APPEND_GROUP_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// These channels carry coalescing wakeups, never authoritative state. A
+/// lagged receiver repairs from its durable cursor, so 256 entries preserve
+/// behavior while bounding two always-live rings at one quarter of the old
+/// capacity.
+const PUBLICATION_RING_CAPACITY: usize = 256;
+/// A tight multi-turn exchange keeps its incremental projections hot. Once
+/// the exact idle journal head remains unchanged for five seconds, all state
+/// released below is reconstructible from that journal and its checkpoints.
+const IDLE_DERIVED_STATE_RELEASE_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FleetNodeIdentity {
@@ -2203,6 +2212,45 @@ impl From<SessionHubError> for DaemonError {
 // ──────────── hub: append seam, attachment lifecycle, shutdown ──────────────
 
 impl SessionHub {
+    fn schedule_idle_derived_state_release(&self, session_id: SessionId, idle_seq: u64) {
+        let weak = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            tokio::time::sleep(IDLE_DERIVED_STATE_RELEASE_DELAY).await;
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            if !matches!(inner.store.latest_seq(&session_id).await, Ok(head) if head == idle_seq) {
+                return;
+            }
+
+            let prompt_bytes = inner.prompt_history.evict_session_bodies(&session_id).await;
+            let turn_setup_entries = inner
+                .turn_setup_reductions
+                .remove_session(&session_id)
+                .await;
+            let observe_bytes = inner
+                .observe_digests
+                .remove_ready_at_head(&session_id, idle_seq);
+            if let Err(error) = inner.store.release_memory().await {
+                tracing::debug!(
+                    session_id = %session_id,
+                    ?error,
+                    "idle SQLite memory release failed"
+                );
+            }
+            let allocator_bytes = haider_platform::allocator_pressure_relief();
+            tracing::debug!(
+                session_id = %session_id,
+                idle_seq,
+                prompt_bytes,
+                turn_setup_entries,
+                observe_bytes,
+                allocator_bytes,
+                "released journal-reconstructible idle session state"
+            );
+        });
+    }
+
     /// Creates a hub with production's no-op boundary observer.
     pub fn new(
         store: SqliteStoreHandle,
@@ -2261,8 +2309,8 @@ impl SessionHub {
             admitted_commits,
         ));
         let (surface_publications, _) = watch::channel(0_u64);
-        let (roster_publications, _) = broadcast::channel(1_024);
-        let (loom_registry_publications, _) = broadcast::channel(1_024);
+        let (roster_publications, _) = broadcast::channel(PUBLICATION_RING_CAPACITY);
+        let (loom_registry_publications, _) = broadcast::channel(PUBLICATION_RING_CAPACITY);
         let (descendant_lineage_publications, _) = watch::channel(0_u64);
         let (haider_code_plan_changes, _) = watch::channel(0_u64);
         let (shell_registry_events_cancel, _) = watch::channel(false);
@@ -5685,6 +5733,20 @@ impl SessionHub {
         self.inner.store.session_ids().await.map_err(Into::into)
     }
 
+    /// Return true only when every durable run in the profile is terminal.
+    ///
+    /// Auto-spawn retirement calls this after the last client disconnects.
+    /// The journal remains the authority: resident-worker count and volatile
+    /// actor state are deliberately insufficient for a shutdown decision.
+    pub(crate) async fn daemon_is_durably_quiescent(&self) -> Result<bool, SessionHubError> {
+        for session_id in self.session_ids().await? {
+            if self.session_has_nonterminal_runs(&session_id).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     async fn roster_session_ids(&self) -> Result<Vec<SessionId>, SessionHubError> {
         let mut session_ids = self.inner.store.session_ids().await?;
         let fork_candidates = lock(&self.inner.fork_candidates)?;
@@ -7753,7 +7815,12 @@ impl HubStoreHandle {
             })
             .await
             .map_err(|_| hub_closed_store_error())?;
-        response.await.map_err(|_| hub_closed_store_error())?
+        let settled = response.await.map_err(|_| hub_closed_store_error())??;
+        if let Some(envelope) = &settled {
+            self.hub
+                .schedule_idle_derived_state_release(self.session_id.clone(), envelope.seq);
+        }
+        Ok(settled)
     }
 
     fn ensure_session(&self, session_id: &SessionId) -> Result<(), HaiderError> {

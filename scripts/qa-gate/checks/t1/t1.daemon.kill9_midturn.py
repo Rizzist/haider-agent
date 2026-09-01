@@ -35,7 +35,6 @@ script = [
 ]
 turns_expected = 2
 timed = True
-expected_fail_until = "0.0.968"
 
 RECOVERY_REQUEST_PATH = BudgetPart(
     "session recover five-request path",

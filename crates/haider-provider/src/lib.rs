@@ -2735,6 +2735,7 @@ pub struct FakeProvider {
     script: Arc<Vec<FakeStep>>,
     next_step: Arc<Mutex<usize>>,
     requests: Arc<Mutex<Vec<TurnRequest>>>,
+    record_requests: bool,
     vision: FeatureResolve,
     pdf_documents: FeatureResolve,
     route_status: Option<Arc<Mutex<haider_platform::RouteStatus>>>,
@@ -2746,6 +2747,7 @@ impl FakeProvider {
             script: Arc::new(script),
             next_step: Arc::new(Mutex::new(0)),
             requests: Arc::new(Mutex::new(Vec::new())),
+            record_requests: true,
             vision: FeatureResolve::Unsupported,
             pdf_documents: FeatureResolve::ExplicitlyEmulated,
             route_status: None,
@@ -2780,6 +2782,16 @@ impl FakeProvider {
         serde_json::from_str(json).map(Self::new)
     }
 
+    /// Disables the fixture-inspection request ledger. Long-horizon process
+    /// measurements use this mode because retaining every complete request
+    /// (including its growing conversation prefix) is test-only behavior that
+    /// production transports do not have.
+    #[must_use]
+    pub fn without_request_recording(mut self) -> Self {
+        self.record_requests = false;
+        self
+    }
+
     /// Requests observed so far, in call order. Poison-tolerant so a panicked
     /// test thread cannot hide the requests it already recorded.
     pub fn requests(&self) -> Vec<TurnRequest> {
@@ -2789,10 +2801,13 @@ impl FakeProvider {
         }
     }
 
-    fn record_request(&self, request: TurnRequest) {
+    fn record_request(&self, request: &TurnRequest) {
+        if !self.record_requests {
+            return;
+        }
         match self.requests.lock() {
-            Ok(mut requests) => requests.push(request),
-            Err(poisoned) => poisoned.into_inner().push(request),
+            Ok(mut requests) => requests.push(request.clone()),
+            Err(poisoned) => poisoned.into_inner().push(request.clone()),
         }
     }
 }
@@ -2822,7 +2837,7 @@ impl Provider for FakeProvider {
     }
 
     async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
-        self.record_request(request.clone());
+        self.record_request(&request);
         let segment = self.next_segment();
         for step in segment.iter() {
             if let FakeStep::ExpectToolResult { call_id } = step

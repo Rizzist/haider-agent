@@ -122,3 +122,57 @@ async fn retained_value_trees_evict_and_the_next_hit_recompiles() {
         .expect("evicted hit recompiles");
     assert_eq!(recompiled.messages, expected);
 }
+
+/// MUTATION CHECK: removing the quiescent-session eviction leaves decoded
+/// envelope trees and compiled provider messages resident after idle.
+#[tokio::test]
+async fn explicit_idle_eviction_drops_bodies_but_keeps_replay_correct() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("prompt-idle-release");
+    let current_run = RunId::new("prompt-idle-release-run");
+    let mut visible = pressure_envelope(&session_id, 1);
+    visible.run_id = Some(current_run.clone());
+    visible.render.prompt = PromptRender::Verbatim;
+    visible.payload = serde_json::json!({
+        "type": "user_message",
+        "text": "rebuild me after idle",
+        "attachments": []
+    });
+    store
+        .append(std::slice::from_mut(&mut visible))
+        .await
+        .expect("append visible prompt fact");
+
+    let cache = PromptHistoryCache::default();
+    let first = cache
+        .compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session_id,
+            None,
+            None,
+            &current_run,
+        )
+        .await
+        .expect("initial cached projection");
+    let released = cache.evict_session_bodies(&session_id).await;
+    assert!(released > 0, "the idle release must own measurable bodies");
+    {
+        let sessions = cache.sessions.lock().await;
+        let cached = sessions.get(&session_id).expect("cursor shell retained");
+        assert!(cached.bodies_evicted);
+        assert_eq!(cached.envelopes.capacity(), 0);
+    }
+    let rebuilt = cache
+        .compile_provider_projection_with_artifacts(
+            &store,
+            &NoArtifacts,
+            &session_id,
+            None,
+            None,
+            &current_run,
+        )
+        .await
+        .expect("idle-evicted projection rebuilds");
+    assert_eq!(rebuilt, first);
+}

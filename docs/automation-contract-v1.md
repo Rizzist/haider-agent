@@ -373,8 +373,26 @@ There is no `recover` RPC. `haider session <id> recover` is a CLI composition:
 it identifies the recovery menu, sends the top-level answer, and immediately
 re-reads `session.observe`. Its output schema is
 `haider.session_recovery.v1` (`crates/haider-cli/src/session_recover.rs:19`,
-`:46-79`). The named fixtures contain no CLI recovery output, so the required
-wire request/response examples for this catalog entry are the independent
+`:46-79`). With `--json`, showing the card emits `schema`, `session_id`,
+`run_state`, `menu_id`, `title`, `body`, `options`, and optional
+`parked_since`. A completed action emits the same schema plus `menu_id`,
+`chosen_option`, `resolution_seq`, `completed: true`, `resulting_head_seq`,
+`resulting_run_state`, and optional resulting-run/replacement-menu IDs. A
+typed failure emits `completed: false` and an `error` object with `code`,
+`message`, and `retryable`.
+
+A successful card or completed action exits 0. `no_recovery` exits 77 and is
+reserved for a clean terminal (`run_state: idle`). A non-terminal digest that
+has lost its required recovery card instead exits 69 with retryable
+`recovery_incomplete`; it is never collapsed to `no_recovery`. In particular,
+after daemon SIGKILL following durable provider admission but before a durable
+response, restart parks the run at `effect_unknown`. `recover --probe --json`
+must exit 0 with `chosen_option: probe`, `completed: true`, and a replacement
+menu ID formed as `<answered-menu-id>-probe-<resolution-seq>`. Probing does not
+reissue the ambiguous provider request.
+
+The named fixtures contain no CLI recovery output, so the required wire
+request/response examples for this catalog entry are the independent
 `menu.answer` request/success shapes and the correlated `session.observe` pair
 below; no recovery document is invented. The golden observe pair is:
 
@@ -464,9 +482,15 @@ ordinary durable run-state envelope and its sequence; it is not emitted twice
 (`crates/haider-client/src/headless.rs:468-486`;
 `docs/jsonl-run-contract-v1.md:78-102`).
 
-SIGINT semantics are currently undefined for `haider run` and have no binding
-to `turn.cancel`; orchestrators must use `turn.cancel` or the `--timeout`
-budget, and exit 130 is produced only by the product's own cancellation path.
+For `haider run` and the reusable headless control attachment, the first
+SIGINT binds to the correlated run as exactly one durable `turn.cancel`.
+Idempotent transport retries reuse one command identity. The client drains the
+same cursor stream through its single typed `cancellation` terminal, bounded
+by the tighter caller deadline, then exits 130. A second SIGINT exits 130
+immediately after the first cancellation receipt is durable; the daemon keeps
+the durable cancel and finishes draining if necessary. This is a process-exit
+contract, not a new RPC, event kind, or terminal shape
+(`docs/jsonl-run-contract-v1.md`).
 
 Tool correlation has no Haider-generated substitute ID. The provider call ID
 is `TurnItem::ToolCall.call_id`; argument deltas join through `item_id`, the
@@ -550,3 +574,15 @@ remains a CLI status field, not `ResponseBody::StatusSnapshot`. The visible
 `lane-968-rtdir` branch defines and projects it at
 `crates/haider-cli/src/observe.rs:67-78`, `:240-272`, `:562-608`; its typed
 meaning is at `crates/haider-client/src/profile.rs:187-200` on that branch.
+
+## Additive changelog
+
+### 2026-09-01 — v0.0.969
+
+- Defined the existing `haider.session_recovery.v1` card, receipt, and error
+  documents and their automation exit codes.
+- Added the kill-9 provider-admission recovery contract: restart exposes a
+  durable recovery card, `--probe` settles to `effect_unknown`, and only a
+  clean terminal returns `no_recovery`.
+- Bound headless SIGINT to one durable `turn.cancel`, one cancellation
+  terminal, and exit 130; a second SIGINT takes the post-receipt fast exit.

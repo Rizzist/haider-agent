@@ -712,9 +712,10 @@ def wait_session_idle(profile: ThrowawayProfile, session_id: str, timeout: float
 def wait_session_settled(profile: ThrowawayProfile, session_id: str, timeout: float = 5) -> str:
     """Wait for a durable non-running session projection after recovery.
 
-    A normal completed turn must reach ``idle``; fail-closed crash recovery is
-    allowed to project ``errored`` or ``cancelled`` after journaling its typed
-    terminal. The matrix validates that terminal and replay separately.
+    A normal completed turn reaches ``idle``. A matrix case parked behind the
+    typed recovery door is explicitly abandoned to project ``errored``; an
+    independently recovered cancellation may project ``cancelled``. The
+    matrix validates the typed terminal and replay separately.
     """
 
     deadline = time.monotonic() + timeout

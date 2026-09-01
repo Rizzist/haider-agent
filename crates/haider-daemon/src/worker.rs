@@ -172,6 +172,7 @@ const SUPERVISOR_CAPACITY: usize = 64;
 pub(crate) fn turn_trace_enabled() -> bool {
     haider_core::turn_trace_enabled()
 }
+
 /// A live session remains cheaply reusable for five minutes after its worker
 /// reports durable quiescence. Activity cancels the owned timer; queued,
 /// active, cancelling, recovery, and menu-parked work never reports this
@@ -2379,6 +2380,7 @@ struct PendingTurn {
     provider_requests_already_made: usize,
     provider_request_ordinal_already_made: u64,
     workflow_continuation: bool,
+    admission_retry: bool,
     recovery_ready: Option<oneshot::Sender<Result<(), HaiderError>>>,
     /// Recovery semantics outlive the pre-Ready acknowledgement. In
     /// particular, a queued recovery may be acknowledged behind a parked
@@ -2452,6 +2454,7 @@ impl PendingTurn {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
+            admission_retry: false,
             recovery_ready: None,
             recovering: false,
         }
@@ -2478,6 +2481,7 @@ impl PendingTurn {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
+            admission_retry: false,
             recovery_ready: None,
             recovering: false,
         }
@@ -2803,6 +2807,7 @@ impl WorkerManagerHandle {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
+            admission_retry: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2827,6 +2832,7 @@ impl WorkerManagerHandle {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
+            admission_retry: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2846,6 +2852,7 @@ impl WorkerManagerHandle {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
+            admission_retry: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2871,6 +2878,32 @@ impl WorkerManagerHandle {
             provider_requests_already_made,
             provider_request_ordinal_already_made,
             workflow_continuation: false,
+            admission_retry: false,
+            recovery_ready: Some(completed),
+            recovering: true,
+        })?;
+        response.await.map_err(|_| manager_stopped())?
+    }
+
+    pub(crate) async fn recover_admission_retry(
+        &self,
+        accepted: AcceptedTurn,
+        provider_requests_already_made: usize,
+        provider_request_ordinal_already_made: u64,
+    ) -> Result<(), HaiderError> {
+        let (completed, response) = oneshot::channel();
+        self.send_recovery(PendingTurn {
+            accepted,
+            prompt_run_id: None,
+            checkpoint: None,
+            partial_stream: None,
+            route_wait: None,
+            child_wait: None,
+            committed_answer: None,
+            provider_requests_already_made,
+            provider_request_ordinal_already_made,
+            workflow_continuation: false,
+            admission_retry: true,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2895,6 +2928,7 @@ impl WorkerManagerHandle {
             provider_requests_already_made,
             provider_request_ordinal_already_made,
             workflow_continuation: true,
+            admission_retry: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2930,6 +2964,7 @@ impl WorkerManagerHandle {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
+            admission_retry: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -5046,6 +5081,7 @@ async fn admit_pending(
         || pending.route_wait.is_some()
         || pending.child_wait.is_some()
         || pending.workflow_continuation
+        || pending.admission_retry
     {
         let queue_changed = queue.len() < SUPERVISOR_CAPACITY;
         if queue.len() < SUPERVISOR_CAPACITY {
@@ -7183,6 +7219,7 @@ async fn start_turn(
         provider_requests_already_made,
         provider_request_ordinal_already_made,
         workflow_continuation: _,
+        admission_retry,
         recovery_ready: _,
         recovering: _,
     } = pending;
@@ -7322,13 +7359,13 @@ async fn start_turn(
             });
         }
     }
-    if route_wait.is_some()
+    if (route_wait.is_some() || admission_retry)
         && let Some(check) = budget_check.as_ref()
     {
         // Recovery reconstructs coordinators from durable facts, so there is
         // no in-memory permit/projection to release. Mark the already admitted
-        // physical attempt as the one the exact route retry will supersede
-        // before the budget monitor starts; the run's absolute
+        // physical attempt as the one the exact route/admission retry will
+        // supersede before the budget monitor starts; the run's absolute
         // time/cost limits remain armed throughout the wait.
         check
             .coordinator
@@ -7797,7 +7834,7 @@ async fn start_turn(
         haider_core::InteractionResolutionPolicy::new(metadata.interaction_mode);
     config.provider_requests_already_made = provider_requests_already_made;
     config.provider_request_ordinal_already_made = provider_request_ordinal_already_made;
-    config.recovery_request_local_usage = false;
+    config.recovery_request_local_usage = admission_retry;
     if let Some(limit) = dependencies
         .provider_factory
         .max_provider_requests_per_turn_override()
@@ -8319,6 +8356,15 @@ pub(crate) struct TurnSetupReductionCache {
 }
 
 impl TurnSetupReductionCache {
+    pub(crate) async fn remove_session(&self, session_id: &SessionId) -> usize {
+        let mut entries = self.entries.lock().await;
+        let before = entries.reductions.len();
+        entries
+            .reductions
+            .retain(|(candidate, _), _| candidate != session_id);
+        before.saturating_sub(entries.reductions.len())
+    }
+
     async fn take(
         &self,
         session_id: &SessionId,

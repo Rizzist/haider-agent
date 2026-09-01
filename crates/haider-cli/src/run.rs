@@ -1,6 +1,5 @@
 //! Manual `haider run` parser and daemon-backed output adapter.
 
-use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -9,10 +8,10 @@ use std::time::{Duration, Instant};
 use haider_client::{
     ConnectError, DaemonLifetime, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL,
     EnsureError, EnsureOptions, HeadlessEvent, HeadlessEventMode, HeadlessFailureCode,
-    HeadlessOutcome, HeadlessRunError, HeadlessRunEvents, HeadlessRunRequest, HeadlessRunResult,
-    HeadlessRunStatus, HeadlessSessionConfig, ProfileEnv, headless_run_events, headless_run_status,
-    load_attachment, resolve_profile, run_headless_with_session_config_and_event_mode,
-    stop_headless_run,
+    HeadlessInterrupt, HeadlessOutcome, HeadlessRunError, HeadlessRunEvents, HeadlessRunRequest,
+    HeadlessRunResult, HeadlessRunStatus, HeadlessSessionConfig, ProfileEnv,
+    autospawn_daemon_lifetime, headless_run_events, headless_run_status, load_attachment,
+    resolve_profile, run_headless_with_session_config_event_mode_and_interrupts, stop_headless_run,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
@@ -37,9 +36,6 @@ const OUTPUT_BUFFER: usize = 64;
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const JSONL_FLUSH_INTERVAL: Duration = Duration::from_millis(3);
 const JSONL_FLUSH_ENVELOPES: usize = 8;
-const RUN_DAEMON_IDLE_TTL_ENV: &str = "HAIDER_RUN_DAEMON_IDLE_TTL_MS";
-const DEFAULT_RUN_DAEMON_IDLE_TTL_MS: u64 = 30_000;
-const MAX_RUN_DAEMON_IDLE_TTL_MS: u64 = 3_600_000;
 const DEFAULT_REPLAY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,33 +481,6 @@ pub(crate) fn parse_timeout(value: &str) -> Result<Duration, String> {
     Ok(duration)
 }
 
-fn run_daemon_lifetime(value: Option<&OsStr>) -> Result<DaemonLifetime, String> {
-    let value = match value {
-        Some(value) => value.to_str().ok_or_else(|| {
-            format!("{RUN_DAEMON_IDLE_TTL_ENV} must be a UTF-8 integer number of milliseconds")
-        })?,
-        None => {
-            return Ok(DaemonLifetime::LingerIfSpawned {
-                idle_ttl: Duration::from_millis(DEFAULT_RUN_DAEMON_IDLE_TTL_MS),
-            });
-        }
-    };
-    let millis = value.parse::<u64>().map_err(|_| {
-        format!("{RUN_DAEMON_IDLE_TTL_ENV} must be an integer number of milliseconds")
-    })?;
-    if millis == 0 {
-        return Ok(DaemonLifetime::EphemeralIfSpawned);
-    }
-    if millis > MAX_RUN_DAEMON_IDLE_TTL_MS {
-        return Err(format!(
-            "{RUN_DAEMON_IDLE_TTL_ENV} must not exceed {MAX_RUN_DAEMON_IDLE_TTL_MS}"
-        ));
-    }
-    Ok(DaemonLifetime::LingerIfSpawned {
-        idle_ttl: Duration::from_millis(millis),
-    })
-}
-
 pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     let machine_output = requested_machine_output(rest);
     let parsed = match parse_run_options_with_config(rest) {
@@ -533,7 +502,9 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     let daemon_lifetime = if options.action == RunAction::Start {
         DaemonLifetime::Persistent
     } else {
-        match run_daemon_lifetime(std::env::var_os(RUN_DAEMON_IDLE_TTL_ENV).as_deref()) {
+        match autospawn_daemon_lifetime(
+            std::env::var_os(haider_client::AUTOSPAWN_DAEMON_IDLE_TTL_ENV).as_deref(),
+        ) {
             Ok(lifetime) => lifetime,
             Err(message) => {
                 let failure = ClassifiedRunError::bootstrap("invalid_argument", message.clone());
@@ -775,15 +746,19 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         RunOutput::Json => HeadlessEventMode::FullRecordSet,
         RunOutput::Print => HeadlessEventMode::Summary,
     };
-    let result = run_headless_with_session_config_and_event_mode(
+    let (interrupt_sender, interrupt_receiver) = mpsc::unbounded_channel();
+    let signal_forwarder = tokio::spawn(forward_sigints(interrupt_sender));
+    let result = run_headless_with_session_config_event_mode_and_interrupts(
         &profile,
         ensure,
         request,
         session_config,
         events,
         event_mode,
+        Some(interrupt_receiver),
     )
     .await;
+    signal_forwarder.abort();
     let adapter_result = match adapter.await {
         Ok(result) => result,
         Err(error) => Err(io::Error::other(format!("output adapter failed: {error}"))),
@@ -875,6 +850,45 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                 );
             }
             ExitCode::from(exit_code_for_error(&error))
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn forward_sigints(interrupts: mpsc::UnboundedSender<HeadlessInterrupt>) {
+    let Ok(mut signals) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+    else {
+        return;
+    };
+    let mut first = true;
+    while signals.recv().await.is_some() {
+        let interrupt = if first {
+            first = false;
+            HeadlessInterrupt::CancelAndDrain
+        } else {
+            HeadlessInterrupt::ExitImmediately
+        };
+        if interrupts.send(interrupt).is_err() {
+            break;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn forward_sigints(interrupts: mpsc::UnboundedSender<HeadlessInterrupt>) {
+    let mut first = true;
+    loop {
+        if tokio::signal::ctrl_c().await.is_err() {
+            break;
+        }
+        let interrupt = if first {
+            first = false;
+            HeadlessInterrupt::CancelAndDrain
+        } else {
+            HeadlessInterrupt::ExitImmediately
+        };
+        if interrupts.send(interrupt).is_err() {
+            break;
         }
     }
 }
@@ -1711,17 +1725,17 @@ mod tests {
     #[test]
     fn run_daemon_linger_defaults_to_thirty_seconds_and_zero_restores_one_shot() {
         assert_eq!(
-            run_daemon_lifetime(None).expect("default linger"),
+            autospawn_daemon_lifetime(None).expect("default linger"),
             DaemonLifetime::LingerIfSpawned {
                 idle_ttl: Duration::from_secs(30),
             }
         );
         assert_eq!(
-            run_daemon_lifetime(Some(OsStr::new("0"))).expect("one-shot opt-out"),
+            autospawn_daemon_lifetime(Some(std::ffi::OsStr::new("0"))).expect("one-shot opt-out"),
             DaemonLifetime::EphemeralIfSpawned
         );
         assert_eq!(
-            run_daemon_lifetime(Some(OsStr::new("1750"))).expect("custom linger"),
+            autospawn_daemon_lifetime(Some(std::ffi::OsStr::new("1750"))).expect("custom linger"),
             DaemonLifetime::LingerIfSpawned {
                 idle_ttl: Duration::from_millis(1_750),
             }
@@ -1731,9 +1745,9 @@ mod tests {
     #[test]
     fn run_daemon_linger_rejects_unbounded_or_malformed_values() {
         for value in ["forever", "3600001"] {
-            let error = run_daemon_lifetime(Some(OsStr::new(value)))
+            let error = autospawn_daemon_lifetime(Some(std::ffi::OsStr::new(value)))
                 .expect_err("invalid idle TTL must be rejected");
-            assert!(error.contains(RUN_DAEMON_IDLE_TTL_ENV));
+            assert!(error.contains(haider_client::AUTOSPAWN_DAEMON_IDLE_TTL_ENV));
         }
     }
 

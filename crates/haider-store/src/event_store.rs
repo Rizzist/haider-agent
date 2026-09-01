@@ -126,10 +126,14 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound the reusable WAL allocation after a checkpoint/reset cycle.
 const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 8 * 1_024 * 1_024;
 const REPLAY_PAGE_SIZE: usize = 1_024;
-/// The store currently has 58 distinct `prepare_cached` call sites. An append
-/// touches 8–12 of them, so 16 entries churned under ordinary mixed traffic;
-/// 128 keeps the full census resident with room for adjacent projections.
-const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 128;
+/// Keep the complete current `prepare_cached` census without the previous 2x
+/// headroom. This cache is an optimization only; eviction reparses SQL and
+/// cannot change journal behavior.
+const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 64;
+/// SQLite interprets a negative cache size as kibibytes. The daemon's access
+/// pattern is indexed and serialized, so a 512 KiB ceiling retains the hot
+/// B-tree path without pinning SQLite's 2 MiB default page cache at idle.
+const SQLITE_PAGE_CACHE_KIB: i64 = -512;
 /// A v25 upgrade may need old graph facts, but profile open must never retain
 /// an unbounded copy of the journal. `envelope_weight_bytes` conservatively
 /// charges the decoded heap representation, not just its compact SQLite bytes.
@@ -1944,7 +1948,6 @@ struct CachedGraphReduction {
     // Volatile graph-forest projection. The connection lock serializes
     // cache extension after commit with every reader; journal facts remain
     // the authority and a restart simply rebuilds this value.
-    envelopes: Vec<RawEnvelope>,
     reductions: GraphReductions,
 }
 
@@ -1955,7 +1958,10 @@ struct GraphTelemetryCache {
 
 struct CachedSessionGraphTelemetry {
     through_seq: u64,
-    accumulator: GraphTelemetryAccumulator,
+    // The projection is cheap and serves graph.inspect without I/O. The
+    // detailed continuation retains per-call arguments and is hydrated from
+    // the journal/persisted row only while a session is actively changing.
+    accumulator: Option<Box<GraphTelemetryAccumulator>>,
     projection: GraphTelemetryProjection,
 }
 
@@ -2029,7 +2035,8 @@ impl Store {
     ///
     /// The connection mutex proves that no store transaction or statement is
     /// live while SQLite performs the release. The daemon calls this once at
-    /// its final pre-listener boundary, after boot-only scans have returned.
+    /// its final pre-listener boundary, after boot-only scans have returned;
+    /// this applies equally to persistent and launcher-liveness daemons.
     pub fn release_memory(&self) -> StoreResult<()> {
         let connection = self.connection()?;
         connection.release_memory().map_err(map_sqlite_error)
@@ -12954,7 +12961,6 @@ impl Store {
             .insert(
                 session_id.clone(),
                 CachedGraphReduction {
-                    envelopes,
                     reductions: reductions.clone(),
                 },
             );
@@ -12972,13 +12978,7 @@ impl Store {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(cached) = graph_reductions.get_mut(session_id) {
-            cached.envelopes.extend(
-                envelopes
-                    .iter()
-                    .filter(|envelope| graph_reduction_event(&envelope.payload))
-                    .cloned(),
-            );
-            cached.reductions = reduce_graphs(&cached.envelopes);
+            cached.reductions.apply_envelopes(envelopes);
         }
         drop(graph_reductions);
         self.extend_graph_telemetry(connection, session_id, envelopes);
@@ -12998,6 +12998,21 @@ impl Store {
         if telemetry_envelopes.is_empty() {
             return;
         }
+        let needs_hydration = self
+            .graph_telemetry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_session
+            .get(session_id)
+            .is_none_or(|cached| cached.accumulator.is_none());
+        let hydrated = needs_hydration
+            .then(|| load_graph_telemetry_continuation(connection, session_id))
+            .transpose();
+        let hydrated = match hydrated {
+            Ok(Some(hydrated)) => hydrated,
+            Ok(None) => empty_graph_telemetry_continuation(),
+            Err(_error) => return,
+        };
         let mut telemetry = self
             .graph_telemetry
             .lock()
@@ -13005,23 +13020,31 @@ impl Store {
         let cached = telemetry
             .by_session
             .entry(session_id.clone())
-            .or_insert_with(|| CachedSessionGraphTelemetry {
-                through_seq: 0,
-                accumulator: GraphTelemetryAccumulator::default(),
-                projection: GraphTelemetryProjection::default(),
-            });
-        for envelope in &telemetry_envelopes {
-            cached.accumulator.apply(envelope);
+            .or_insert_with(empty_graph_telemetry_continuation);
+        if cached.accumulator.is_none() {
+            cached.through_seq = hydrated.through_seq;
+            cached.projection = hydrated.projection;
+            cached.accumulator = hydrated.accumulator;
         }
-        cached.projection = cached.accumulator.projection();
+        let previous_through_seq = cached.through_seq;
+        let accumulator = cached
+            .accumulator
+            .get_or_insert_with(|| Box::new(GraphTelemetryAccumulator::default()));
+        for envelope in telemetry_envelopes
+            .iter()
+            .filter(|envelope| envelope.seq > previous_through_seq)
+        {
+            accumulator.apply(envelope);
+        }
+        let projection = accumulator.projection();
+        let accumulator = (**accumulator).clone();
+        cached.projection = projection.clone();
         cached.through_seq = cached.through_seq.max(
             telemetry_envelopes
                 .last()
                 .map_or(0, |envelope| envelope.seq),
         );
         let through_seq = cached.through_seq;
-        let accumulator = cached.accumulator.clone();
-        let projection = cached.projection.clone();
         drop(telemetry);
         let _ = persist_graph_telemetry_projection(
             connection,
@@ -13030,6 +13053,35 @@ impl Store {
             &accumulator,
             &projection,
         );
+    }
+
+    fn drop_graph_telemetry_accumulator_if_idle(
+        &self,
+        session_id: &SessionId,
+        envelopes: &[RawEnvelope],
+    ) {
+        let became_idle = envelopes.iter().any(|envelope| {
+            envelope
+                .payload
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                == Some("session_state")
+                && envelope
+                    .payload
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("idle")
+        });
+        if became_idle
+            && let Some(cached) = self
+                .graph_telemetry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .by_session
+                .get_mut(session_id)
+        {
+            cached.accumulator = None;
+        }
     }
 
     fn invalidate_graph_reduction(&self, session_id: &SessionId) {
@@ -13995,6 +14047,64 @@ fn load_graph_telemetry_envelopes(
     Ok(envelopes)
 }
 
+fn empty_graph_telemetry_continuation() -> CachedSessionGraphTelemetry {
+    CachedSessionGraphTelemetry {
+        through_seq: 0,
+        accumulator: Some(Box::new(GraphTelemetryAccumulator::default())),
+        projection: GraphTelemetryProjection::default(),
+    }
+}
+
+fn load_graph_telemetry_continuation(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<CachedSessionGraphTelemetry> {
+    let persisted = connection
+        .query_row(
+            "SELECT through_seq, reducer_version, tool_state, projection
+             FROM graph_telemetry_projection WHERE session_id = ?1",
+            [session_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    if let Some((through_seq, version, accumulator, projection)) = persisted
+        && version == GRAPH_TELEMETRY_REDUCER_VERSION
+    {
+        let through_seq = u64::try_from(through_seq)
+            .map_err(|_| corrupt("negative telemetry projection head"))?;
+        if let (Ok(accumulator), Ok(projection)) = (
+            rmp_serde::from_slice::<GraphTelemetryAccumulator>(&accumulator),
+            rmp_serde::from_slice::<GraphTelemetryProjection>(&projection),
+        ) {
+            return Ok(CachedSessionGraphTelemetry {
+                through_seq,
+                accumulator: Some(Box::new(accumulator)),
+                projection,
+            });
+        }
+    }
+
+    let envelopes = load_graph_telemetry_envelopes(connection, session_id)?;
+    let mut accumulator = GraphTelemetryAccumulator::default();
+    for envelope in &envelopes {
+        accumulator.apply(envelope);
+    }
+    let projection = accumulator.projection();
+    Ok(CachedSessionGraphTelemetry {
+        through_seq: envelopes.last().map_or(0, |envelope| envelope.seq),
+        accumulator: Some(Box::new(accumulator)),
+        projection,
+    })
+}
+
 fn persist_graph_telemetry_projection(
     connection: &Connection,
     session_id: &SessionId,
@@ -14068,7 +14178,7 @@ fn rebuild_graph_telemetry_cache(connection: &Connection) -> StoreResult<GraphTe
         }
         let tool_bytes: Vec<u8> = row.get(3).map_err(map_sqlite_error)?;
         let projection_bytes: Vec<u8> = row.get(4).map_err(map_sqlite_error)?;
-        let (Ok(accumulator), Ok(projection)) = (
+        let (Ok(_accumulator), Ok(projection)) = (
             rmp_serde::from_slice::<GraphTelemetryAccumulator>(&tool_bytes),
             rmp_serde::from_slice::<GraphTelemetryProjection>(&projection_bytes),
         ) else {
@@ -14079,7 +14189,7 @@ fn rebuild_graph_telemetry_cache(connection: &Connection) -> StoreResult<GraphTe
             session_id,
             CachedSessionGraphTelemetry {
                 through_seq,
-                accumulator,
+                accumulator: None,
                 projection,
             },
         );
@@ -14126,7 +14236,7 @@ fn rebuild_graph_telemetry_cache(connection: &Connection) -> StoreResult<GraphTe
             session_id,
             CachedSessionGraphTelemetry {
                 through_seq,
-                accumulator,
+                accumulator: None,
                 projection,
             },
         );
@@ -20231,6 +20341,7 @@ fn update_append_caches(
     } else if changes_graph_telemetry {
         store.extend_graph_telemetry(connection, session, envelopes);
     }
+    store.drop_graph_telemetry_accumulator_if_idle(session, envelopes);
 }
 
 fn isolatable_commit_error(error: &HaiderError) -> bool {
@@ -22987,6 +23098,9 @@ fn open_connection_with(path: &Path, synchronous: StoreSynchronous) -> StoreResu
         .map_err(map_sqlite_error)?;
     connection
         .pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)
+        .map_err(map_sqlite_error)?;
+    connection
+        .pragma_update(None, "cache_size", SQLITE_PAGE_CACHE_KIB)
         .map_err(map_sqlite_error)?;
     connection
         .pragma_update(None, "synchronous", synchronous.pragma_value())
@@ -26012,6 +26126,79 @@ mod m2d_law_tests {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+mod memory_projection_tests {
+    use super::*;
+
+    fn idle_envelope(session_id: SessionId) -> RawEnvelope {
+        RawEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new("memory-idle"),
+            seq: 1,
+            session_id,
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: DeviceId::new("memory-test"),
+            authority_epoch: 1,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 1,
+            render: RenderTargets {
+                ui: false,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(EventPayload::SessionState(SessionState::Idle {
+                interrupted: false,
+            }))
+            .expect("encode idle state"),
+        }
+    }
+
+    /// MUTATION CHECK: restoring a retained `Vec<RawEnvelope>` makes the
+    /// cache larger than the projection it is meant to own.
+    #[test]
+    fn graph_reduction_cache_retains_only_the_projection() {
+        assert_eq!(
+            std::mem::size_of::<CachedGraphReduction>(),
+            std::mem::size_of::<GraphReductions>()
+        );
+    }
+
+    /// MUTATION CHECK: removing the unconditional idle-eviction call from
+    /// `update_append_caches` leaves this detailed continuation resident.
+    #[test]
+    fn session_idle_drops_rebuildable_graph_telemetry_continuation() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(root.path()).expect("open store");
+        let session_id = SessionId::new("memory-idle-session");
+        store
+            .graph_telemetry
+            .lock()
+            .expect("telemetry cache")
+            .by_session
+            .insert(session_id.clone(), empty_graph_telemetry_continuation());
+        let envelopes = [idle_envelope(session_id.clone())];
+        let connection = store.connection().expect("store connection");
+        update_append_caches(&store, &connection, &session_id, &envelopes, false, false);
+        drop(connection);
+        assert!(
+            store
+                .graph_telemetry
+                .lock()
+                .expect("telemetry cache")
+                .by_session
+                .get(&session_id)
+                .expect("session projection")
+                .accumulator
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod store_synchronous_tests {
     use super::*;
 
@@ -26094,6 +26281,23 @@ mod store_synchronous_tests {
             fs::metadata(&wal_path).expect("reset WAL metadata").len()
                 <= u64::try_from(WAL_JOURNAL_SIZE_LIMIT_BYTES).expect("positive cap"),
             "checkpoint reset must cap the reusable WAL allocation"
+        );
+    }
+
+    /// MUTATION CHECK: removing or enlarging the explicit page-cache pragma
+    /// must fail this exact resident-memory ceiling pin.
+    #[test]
+    fn sqlite_page_cache_is_right_sized_for_the_daemon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let connection = open_connection_with(
+            &dir.path().join("page-cache.sqlite"),
+            StoreSynchronous::Normal,
+        )
+        .expect("open store");
+        assert_eq!(
+            queried_i64_pragma(&connection, "cache_size"),
+            SQLITE_PAGE_CACHE_KIB,
+            "every store connection must install the measured page-cache ceiling"
         );
     }
 

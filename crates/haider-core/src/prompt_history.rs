@@ -900,6 +900,19 @@ impl PromptHistoryCompiler {
 }
 
 impl PromptHistoryCache {
+    /// Drops journal-reconstructible bodies for one quiescent session while
+    /// retaining its lightweight replay/checkpoint cursors. The daemon calls
+    /// this only after proving the journal is still at the same idle head.
+    pub async fn evict_session_bodies(&self, session_id: &SessionId) -> usize {
+        let mut sessions = self.sessions.lock().await;
+        let Some(cached) = sessions.get_mut(session_id) else {
+            return 0;
+        };
+        let released = cached.retained_heap_bytes();
+        cached.evict_bodies();
+        released
+    }
+
     async fn compile_provider_projection_with_artifacts(
         &self,
         store: &dyn StoreHandle,

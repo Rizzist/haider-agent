@@ -5016,6 +5016,25 @@ fn tool_selection_rollup_counts_repairs_without_flagging_normal_read_edit_read()
             serde_json::json!({"command":"false"}),
             ToolResultStatus::Failed,
         );
+        let mut idle = [raw_envelope(
+            &store,
+            &session_id,
+            &run_id,
+            "telemetry-idle",
+            EventPayload::SessionState(haider_protocol::state::SessionState::Idle {
+                interrupted: false,
+            }),
+        )];
+        store.append(&mut idle).expect("append idle boundary");
+        append_tool_attempt(
+            &store,
+            &session_id,
+            &run_id,
+            "process-after-idle",
+            "process_exec",
+            serde_json::json!({"command":"true"}),
+            ToolResultStatus::Completed,
+        );
 
         let inspect = store
             .graph_inspect(&session_id, None, u32::MAX)
@@ -5031,17 +5050,17 @@ fn tool_selection_rollup_counts_repairs_without_flagging_normal_read_edit_read()
                     redundant_call_count: 1,
                 },
                 haider_protocol::graph::ToolSelectionRow {
+                    tool_name: "process_exec".into(),
+                    total_calls: 2,
+                    error_count: 1,
+                    error_rate_basis_points: 5_000,
+                    redundant_call_count: 0,
+                },
+                haider_protocol::graph::ToolSelectionRow {
                     tool_name: "fs_edit".into(),
                     total_calls: 1,
                     error_count: 0,
                     error_rate_basis_points: 0,
-                    redundant_call_count: 0,
-                },
-                haider_protocol::graph::ToolSelectionRow {
-                    tool_name: "process_exec".into(),
-                    total_calls: 1,
-                    error_count: 1,
-                    error_rate_basis_points: 10_000,
                     redundant_call_count: 0,
                 },
             ]

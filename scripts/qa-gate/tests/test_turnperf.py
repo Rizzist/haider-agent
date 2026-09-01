@@ -9,6 +9,7 @@ from unittest import mock
 from turn_wall_harness import _abba, _trace_records
 from turnperf_sigkill_matrix import (
     _assert_tool_effect_result_bounds,
+    _validate_probe_receipt,
     _validate_recovered_jsonl,
 )
 from gate.loader import load_check
@@ -182,13 +183,29 @@ class TurnPerformanceHarnessTests(unittest.TestCase):
         self.assertEqual(parsed["run_id"], "r")
         self.assertEqual(parsed["terminal"]["seq"], 3)
 
-    def test_tool_effect_can_precede_fail_closed_terminal_without_tool_result(self):
+    def test_tool_effect_can_precede_parked_recovery_without_tool_result(self):
         _assert_tool_effect_result_bounds(1, 0)
         _assert_tool_effect_result_bounds(1, 1)
         with self.assertRaisesRegex(ProofError, "at-most-once"):
             _assert_tool_effect_result_bounds(2, 1)
         with self.assertRaisesRegex(ProofError, "at-most-once"):
             _assert_tool_effect_result_bounds(0, 1)
+
+    def test_probe_receipt_requires_exact_retry_pending_replacement(self):
+        receipt = {
+            "schema": "haider.session_recovery.v1",
+            "session_id": "s",
+            "menu_id": "m",
+            "chosen_option": "probe",
+            "resolution_seq": 9,
+            "completed": True,
+            "resulting_run_state": "effect_unknown",
+            "replacement_menu_id": "m-probe-9",
+        }
+        self.assertEqual(_validate_probe_receipt(receipt, "s"), ("m", "m-probe-9"))
+        receipt["replacement_menu_id"] = "m-probe-8"
+        with self.assertRaisesRegex(ProofError, "retry-pending"):
+            _validate_probe_receipt(receipt, "s")
 
     def test_trace_parser_keeps_only_numeric_allowlist(self):
         records = _trace_records(

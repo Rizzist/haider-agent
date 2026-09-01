@@ -107,6 +107,9 @@ enum RecoverError {
     NoRecovery {
         state: &'static str,
     },
+    MissingRecoveryCard {
+        state: &'static str,
+    },
     IncompleteFollowUp {
         action: &'static str,
         resolution_seq: u64,
@@ -139,6 +142,10 @@ impl std::fmt::Display for RecoverError {
                     "no crash window to reconcile — run_state is {state}"
                 )
             }
+            Self::MissingRecoveryCard { state } => write!(
+                formatter,
+                "non-terminal recovery state has no durable recovery card (state={state})"
+            ),
             Self::IncompleteFollowUp {
                 action,
                 resolution_seq,
@@ -417,14 +424,23 @@ fn probe_replacement_menu<'a>(
 const RECOVERY_MENU_WIRE_KIND: &str = "recovery";
 
 fn recovery_menu(digest: &SessionObserveDigest) -> Result<&ObserveMenuWire, RecoverError> {
-    digest
+    if let Some(menu) = digest
         .pending_menus
         .iter()
         .filter(|menu| menu.kind == RECOVERY_MENU_WIRE_KIND)
         .min_by_key(|menu| menu.request_seq.unwrap_or(u64::MAX))
-        .ok_or(RecoverError::NoRecovery {
+    {
+        return Ok(menu);
+    }
+    if digest.run_state == ObserveRunStateWire::Idle {
+        Err(RecoverError::NoRecovery {
             state: run_state_name(digest.run_state),
         })
+    } else {
+        Err(RecoverError::MissingRecoveryCard {
+            state: run_state_name(digest.run_state),
+        })
+    }
 }
 
 fn card_document(
@@ -602,6 +618,7 @@ fn failure(session_id: &str, json: bool, error: &RecoverError) -> ExitCode {
         RecoverError::Client(ClientError::Disconnected(_)) => (EX_UNAVAILABLE, "unavailable", true),
         RecoverError::Client(_) => (EX_SOFTWARE, "client_error", true),
         RecoverError::NoRecovery { .. } => (EX_BLOCKED, "no_recovery", false),
+        RecoverError::MissingRecoveryCard { .. } => (EX_UNAVAILABLE, "recovery_incomplete", true),
         RecoverError::IncompleteFollowUp { .. } => (EX_UNAVAILABLE, "recovery_incomplete", true),
         RecoverError::Rpc { code, .. }
             if matches!(code.as_str(), "capability_denied" | "input_required") =>
@@ -835,6 +852,13 @@ mod tests {
         let digest = digest_with_menus(vec![wire_menu("error_recovery", 3)]);
         assert!(matches!(
             recovery_menu(&digest),
+            Err(RecoverError::MissingRecoveryCard { .. })
+        ));
+
+        let mut clean_terminal = digest_with_menus(Vec::new());
+        clean_terminal.run_state = ObserveRunStateWire::Idle;
+        assert!(matches!(
+            recovery_menu(&clean_terminal),
             Err(RecoverError::NoRecovery { .. })
         ));
     }

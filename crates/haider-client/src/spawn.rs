@@ -21,6 +21,7 @@
 //!   idle interval.
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::{Child, ExitStatus};
 use std::time::Duration;
@@ -57,6 +58,19 @@ pub const DAEMON_LOG_FILE: &str = haider_platform::DAEMON_LOG_FILE;
 /// R8 step 7: configurable startup deadline for spawn + handshake polling.
 pub const STARTUP_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Legacy-named override shared by every auto-spawn front door.
+///
+/// The name predates broad status/TUI/probe coverage and remains stable for
+/// automation compatibility.
+pub const AUTOSPAWN_DAEMON_IDLE_TTL_ENV: &str = "HAIDER_RUN_DAEMON_IDLE_TTL_MS";
+
+/// Auto-spawned daemons stay warm briefly, then retire once the spawning
+/// client is gone and the daemon is durably quiescent.
+pub const DEFAULT_AUTOSPAWN_DAEMON_IDLE_TTL: Duration = Duration::from_secs(30);
+
+/// Upper bound for the shared environment override.
+pub const MAX_AUTOSPAWN_DAEMON_IDLE_TTL_MS: u64 = 3_600_000;
+
 /// The race loser's expected exit code (`EX_TEMPFAIL`).
 pub const RACE_LOSER_EXIT_CODE: i32 = 75;
 
@@ -75,6 +89,40 @@ pub enum DaemonLifetime {
         idle_ttl: Duration,
     },
     EphemeralIfSpawned,
+}
+
+/// Resolve the one shared auto-spawn lifetime policy.
+///
+/// `None` selects the 30-second linger. Zero retains the established
+/// immediate-after-disconnect test/opt-out behavior; positive values select a
+/// bounded linger.
+pub fn autospawn_daemon_lifetime(value: Option<&OsStr>) -> Result<DaemonLifetime, String> {
+    let value = match value {
+        Some(value) => value.to_str().ok_or_else(|| {
+            format!(
+                "{AUTOSPAWN_DAEMON_IDLE_TTL_ENV} must be a UTF-8 integer number of milliseconds"
+            )
+        })?,
+        None => {
+            return Ok(DaemonLifetime::LingerIfSpawned {
+                idle_ttl: DEFAULT_AUTOSPAWN_DAEMON_IDLE_TTL,
+            });
+        }
+    };
+    let millis = value.parse::<u64>().map_err(|_| {
+        format!("{AUTOSPAWN_DAEMON_IDLE_TTL_ENV} must be an integer number of milliseconds")
+    })?;
+    if millis == 0 {
+        return Ok(DaemonLifetime::EphemeralIfSpawned);
+    }
+    if millis > MAX_AUTOSPAWN_DAEMON_IDLE_TTL_MS {
+        return Err(format!(
+            "{AUTOSPAWN_DAEMON_IDLE_TTL_ENV} must not exceed {MAX_AUTOSPAWN_DAEMON_IDLE_TTL_MS}"
+        ));
+    }
+    Ok(DaemonLifetime::LingerIfSpawned {
+        idle_ttl: Duration::from_millis(millis),
+    })
 }
 
 /// Returns whether the authenticated endpoint is served by this launcher's
@@ -163,12 +211,20 @@ pub struct EnsureOptions {
 
 impl Default for EnsureOptions {
     fn default() -> Self {
+        // `Default` cannot surface a malformed process environment. Callers
+        // that report configuration errors (notably `haider run`) invoke the
+        // same parser directly; other front doors retain the safe 30 s bound.
+        let daemon_lifetime =
+            autospawn_daemon_lifetime(std::env::var_os(AUTOSPAWN_DAEMON_IDLE_TTL_ENV).as_deref())
+                .unwrap_or(DaemonLifetime::LingerIfSpawned {
+                    idle_ttl: DEFAULT_AUTOSPAWN_DAEMON_IDLE_TTL,
+                });
         Self {
             required_features: required_live_features(),
             startup_deadline: STARTUP_DEADLINE,
             daemon_binary: None,
             client: ClientConfig::default(),
-            daemon_lifetime: DaemonLifetime::Persistent,
+            daemon_lifetime,
         }
     }
 }

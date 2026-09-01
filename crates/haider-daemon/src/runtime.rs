@@ -155,15 +155,6 @@ impl PreparedDaemonTask {
     }
 
     fn spawn(self, config: DaemonConfig, dependencies: DaemonDependencies) -> DaemonTask {
-        self.spawn_with_boot_memory_release(config, dependencies, true)
-    }
-
-    fn spawn_with_boot_memory_release(
-        self,
-        config: DaemonConfig,
-        dependencies: DaemonDependencies,
-        release_boot_memory: bool,
-    ) -> DaemonTask {
         let diagnostics = DaemonTaskDiagnostics {
             readiness: self.readiness.clone(),
             completion: Arc::clone(&self.completion),
@@ -178,7 +169,6 @@ impl PreparedDaemonTask {
                 config,
                 dependencies,
                 self.states,
-                release_boot_memory,
                 DaemonTaskControl {
                     shutdown_handle: task_shutdown,
                     shutdown: self.shutdown_receiver,
@@ -549,7 +539,6 @@ pub async fn run_with_signals_and_dependencies_and_readiness_and_liveness(
         })?;
     let prepared = PreparedDaemonTask::new();
     let shutdown = prepared.shutdown_handle();
-    let release_boot_memory = launcher_liveness.is_none();
     let (mut liveness_task, liveness_armed) = launcher_liveness.map_or_else(
         || (None, None),
         |watcher| {
@@ -594,7 +583,7 @@ pub async fn run_with_signals_and_dependencies_and_readiness_and_liveness(
             }
         }
     }
-    let task = prepared.spawn_with_boot_memory_release(config, dependencies, release_boot_memory);
+    let task = prepared.spawn(config, dependencies);
     let mut readiness = task.readiness();
     let mut joined: Pin<Box<dyn Future<Output = Result<ShutdownOutcome, DaemonError>> + Send>> =
         Box::pin(task.join());
@@ -690,10 +679,9 @@ async fn run_owner(
     config: DaemonConfig,
     dependencies: DaemonDependencies,
     states: StatePublisher,
-    release_boot_memory: bool,
     control: DaemonTaskControl,
 ) -> Result<ShutdownOutcome, DaemonError> {
-    let result = run_inner(&config, dependencies, &states, release_boot_memory, control).await;
+    let result = run_inner(&config, dependencies, &states, control).await;
     if let Err(error) = &result {
         states.publish(DaemonState::Failed {
             message: error.to_string(),
@@ -706,7 +694,6 @@ async fn run_inner(
     config: &DaemonConfig,
     dependencies: DaemonDependencies,
     states: &StatePublisher,
-    release_boot_memory: bool,
     control: DaemonTaskControl,
 ) -> Result<ShutdownOutcome, DaemonError> {
     let DaemonTaskControl {
@@ -1161,6 +1148,15 @@ async fn run_inner(
                     .recover_child_wait(recovered.accepted, recovered.checkpoint)
                     .await
             }
+            RecoveredWork::AdmissionRetry(recovered) => {
+                worker_handle
+                    .recover_admission_retry(
+                        recovered.accepted,
+                        recovered.provider_requests_consumed,
+                        recovered.provider_request_ordinal,
+                    )
+                    .await
+            }
             RecoveredWork::WorkflowContinuation(recovered) => {
                 worker_handle
                     .recover_workflow_continuation(
@@ -1315,10 +1311,10 @@ async fn run_inner(
     }
     // Every boot scan, adoption, recovered-work handoff, and optional
     // transport startup has returned, while no endpoint exists for external
-    // requests. A persistent daemon discards pages made cold by this boot.
-    // An ephemeral launcher immediately uses SQLite for its one turn, so it
-    // retains those pages instead of paying to release and fault them back in.
-    if release_boot_memory && let Err(error) = store.release_memory().await {
+    // requests. Every daemon discards pages made cold by this boot. Spawned
+    // liveness daemons use the same boundary: a later turn faults in only the
+    // pages it actually needs instead of retaining the complete boot scan.
+    if let Err(error) = store.release_memory().await {
         tracing::warn!(%error, "SQLite boot-page release failed; continuing startup");
     }
     let mut endpoint = match endpoint::bind(config, runtime_directory).await {
@@ -1782,6 +1778,8 @@ impl ConnectionRuntime {
         let mut listener_error = None;
         let mut idle_wait_logged = None;
         let mut idle_linger_deadline = None;
+        let mut idle_waiting_for_durable_quiescence = false;
+        let mut durable_activity = context.hub.subscribe_peer_reconcile();
         #[cfg(unix)]
         let accept_operation = "accept Unix connection";
         #[cfg(windows)]
@@ -1790,35 +1788,58 @@ impl ConnectionRuntime {
             if *crash.borrow() {
                 break RuntimeStop::Crash;
             }
-            match shutdown.borrow().clone() {
+            let shutdown_request = shutdown.borrow().clone();
+            match shutdown_request {
                 request @ (ShutdownRequest::Graceful { .. } | ShutdownRequest::Forced { .. }) => {
                     break RuntimeStop::Shutdown(request);
                 }
                 ShutdownRequest::GracefulWhenIdle { reason } => {
                     idle_linger_deadline = None;
                     let attached_clients = self.connections.len();
-                    if attached_clients == 0 {
-                        eprintln!(
-                            "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_vanished attached_clients=0 decision=shutdown"
-                        );
-                        tracing::info!(
-                            attached_clients,
-                            reason = %reason,
-                            decision = "shutdown",
-                            "ephemeral daemon reached idle shutdown"
-                        );
-                        break RuntimeStop::Shutdown(ShutdownRequest::Graceful { reason });
+                    if attached_clients == 0 && !idle_waiting_for_durable_quiescence {
+                        match context.hub.daemon_is_durably_quiescent().await {
+                            Ok(true) => {
+                                eprintln!(
+                                    "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_vanished attached_clients=0 durable_quiescent=true decision=shutdown"
+                                );
+                                tracing::info!(
+                                    attached_clients,
+                                    reason = %reason,
+                                    durable_quiescent = true,
+                                    decision = "shutdown",
+                                    "ephemeral daemon reached idle shutdown"
+                                );
+                                break RuntimeStop::Shutdown(ShutdownRequest::Graceful { reason });
+                            }
+                            Ok(false) => {
+                                idle_waiting_for_durable_quiescence = true;
+                            }
+                            Err(error) => {
+                                // A failed journal read can never authorize
+                                // retirement. The next durable publication
+                                // wakes another authoritative check.
+                                idle_waiting_for_durable_quiescence = true;
+                                tracing::warn!(%error, "idle retirement could not prove durable quiescence");
+                            }
+                        }
                     }
-                    if idle_wait_logged != Some(attached_clients) {
+                    if attached_clients > 0 {
+                        idle_waiting_for_durable_quiescence = false;
+                    }
+                    if idle_wait_logged != Some(attached_clients)
+                        || idle_waiting_for_durable_quiescence
+                    {
                         idle_wait_logged = Some(attached_clients);
                         eprintln!(
-                            "haiderd: spawning client vanished; ephemeral daemon is waiting for live clients to disconnect; ephemeral-lifecycle event=shutdown_decision attached_clients={attached_clients} decision=stay_alive"
+                            "haiderd: spawning client vanished; ephemeral daemon is waiting for live clients or non-terminal runs to settle; ephemeral-lifecycle event=shutdown_decision attached_clients={attached_clients} durable_quiescent={} decision=stay_alive",
+                            !idle_waiting_for_durable_quiescence
                         );
                         tracing::info!(
                             attached_clients,
                             reason = %reason,
+                            durable_quiescent = !idle_waiting_for_durable_quiescence,
                             decision = "stay_alive",
-                            "spawning client vanished; ephemeral daemon is waiting for live clients to disconnect"
+                            "spawning client vanished; ephemeral daemon is waiting for durable quiescence"
                         );
                     }
                 }
@@ -1827,26 +1848,44 @@ impl ConnectionRuntime {
                     if attached_clients == 0 {
                         let deadline = *idle_linger_deadline
                             .get_or_insert_with(|| tokio::time::Instant::now() + idle_ttl);
-                        if tokio::time::Instant::now() >= deadline {
-                            eprintln!(
-                                "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_vanished attached_clients=0 decision=shutdown idle_linger_ms={}",
-                                duration_ms(idle_ttl)
-                            );
-                            tracing::info!(
-                                attached_clients,
-                                reason = %reason,
-                                idle_linger_ms = duration_ms(idle_ttl),
-                                decision = "shutdown",
-                                "lingering daemon reached its idle shutdown deadline"
-                            );
-                            break RuntimeStop::Shutdown(ShutdownRequest::Graceful { reason });
+                        if tokio::time::Instant::now() >= deadline
+                            && !idle_waiting_for_durable_quiescence
+                        {
+                            match context.hub.daemon_is_durably_quiescent().await {
+                                Ok(true) => {
+                                    eprintln!(
+                                        "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_vanished attached_clients=0 durable_quiescent=true decision=shutdown idle_linger_ms={}",
+                                        duration_ms(idle_ttl)
+                                    );
+                                    tracing::info!(
+                                        attached_clients,
+                                        reason = %reason,
+                                        idle_linger_ms = duration_ms(idle_ttl),
+                                        durable_quiescent = true,
+                                        decision = "shutdown",
+                                        "lingering daemon reached its idle shutdown deadline"
+                                    );
+                                    break RuntimeStop::Shutdown(ShutdownRequest::Graceful {
+                                        reason,
+                                    });
+                                }
+                                Ok(false) => {
+                                    idle_waiting_for_durable_quiescence = true;
+                                }
+                                Err(error) => {
+                                    idle_waiting_for_durable_quiescence = true;
+                                    tracing::warn!(%error, "idle retirement could not prove durable quiescence");
+                                }
+                            }
                         }
                     } else {
                         idle_linger_deadline = None;
+                        idle_waiting_for_durable_quiescence = false;
                     }
                 }
                 ShutdownRequest::None => {
                     idle_linger_deadline = None;
+                    idle_waiting_for_durable_quiescence = false;
                 }
             }
             tokio::select! {
@@ -1915,7 +1954,18 @@ impl ConnectionRuntime {
                     let attached_clients = self.connections.len();
                     journal_connection_exit(&completed, attached_clients);
                 }
-                () = wait_for_idle_linger(idle_linger_deadline), if idle_linger_deadline.is_some() => {}
+                publication = durable_activity.recv(), if idle_waiting_for_durable_quiescence => {
+                    match publication {
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            idle_waiting_for_durable_quiescence = false;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // The hub still lives for the whole accept loop;
+                            // fail closed if that invariant is ever broken.
+                        }
+                    }
+                }
+                () = wait_for_idle_linger(idle_linger_deadline), if idle_linger_deadline.is_some() && !idle_waiting_for_durable_quiescence => {}
             }
         };
         (stop, listener_error)

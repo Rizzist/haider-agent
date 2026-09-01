@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""Measure and enforce the macOS daemon settled-footprint budget.
+
+The workload keeps one liveness-spawned daemon and one session alive for all
+40 tiny process-exec turns.  Measurements use proc_pid_rusage's physical
+footprint and CPU counters, avoiding `ps` sampling races and measurement
+processes in the daemon tree.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import os
+from pathlib import Path
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+DEFAULT_RUNS = 5
+DEFAULT_TURNS = 40
+DEFAULT_SETTLE_SECONDS = 60
+MAX_LOAD_1M = 4.0
+
+# Calibrated at 1.10x the N=5 final release medians (60 s settled, load1m < 4).
+# Both are upper bounds, so lower footprints always pass.
+DEFAULT_IDLE_BUDGET_BYTES = 6_020_010
+DEFAULT_POST_TURNS_BUDGET_BYTES = 18_167_160
+
+
+class RusageInfoV0(ctypes.Structure):
+    _fields_ = [
+        ("ri_uuid", ctypes.c_uint8 * 16),
+        ("ri_user_time", ctypes.c_uint64),
+        ("ri_system_time", ctypes.c_uint64),
+        ("ri_pkg_idle_wkups", ctypes.c_uint64),
+        ("ri_interrupt_wkups", ctypes.c_uint64),
+        ("ri_pageins", ctypes.c_uint64),
+        ("ri_wired_size", ctypes.c_uint64),
+        ("ri_resident_size", ctypes.c_uint64),
+        ("ri_phys_footprint", ctypes.c_uint64),
+        ("ri_proc_start_abstime", ctypes.c_uint64),
+        ("ri_proc_exit_abstime", ctypes.c_uint64),
+    ]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--daemon", type=Path, required=True)
+    parser.add_argument("--driver", type=Path, required=True)
+    parser.add_argument("--runs", type=int, default=DEFAULT_RUNS)
+    parser.add_argument("--turns", type=int, default=DEFAULT_TURNS)
+    parser.add_argument("--settle-seconds", type=int, default=DEFAULT_SETTLE_SECONDS)
+    parser.add_argument("--idle-budget-bytes", type=int, default=DEFAULT_IDLE_BUDGET_BYTES)
+    parser.add_argument(
+        "--post-turns-budget-bytes",
+        type=int,
+        default=DEFAULT_POST_TURNS_BUDGET_BYTES,
+    )
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--artifacts-dir", type=Path)
+    args = parser.parse_args()
+    if args.runs < 1 or args.turns < 20 or args.settle_seconds < 0:
+        parser.error("runs must be positive, turns >= 20, and settle-seconds non-negative")
+    return args
+
+
+def proc_rusage(pid: int) -> dict[str, int]:
+    if sys.platform != "darwin":
+        raise RuntimeError("proc_pid_rusage footprint guard requires macOS")
+    library = ctypes.CDLL(None, use_errno=True)
+    function = library.proc_pid_rusage
+    function.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    function.restype = ctypes.c_int
+    info = RusageInfoV0()
+    if function(pid, 0, ctypes.byref(info)) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), pid)
+    return {
+        "user_cpu_ns": int(info.ri_user_time),
+        "system_cpu_ns": int(info.ri_system_time),
+        "cpu_ns": int(info.ri_user_time + info.ri_system_time),
+        "rss_bytes": int(info.ri_resident_size),
+        "footprint_bytes": int(info.ri_phys_footprint),
+    }
+
+
+def fake_script(turns: int) -> str:
+    steps: list[dict[str, Any]] = []
+    for turn in range(1, turns + 1):
+        call_id = f"memdaemon-{turn}"
+        steps.extend(
+            [
+                {
+                    "step": "emit_tool_call",
+                    "call_id": call_id,
+                    "name": "process_exec",
+                    "args": {"command": ":"},
+                },
+                {"step": "finish", "reason": "tool_use"},
+                {"step": "expect_tool_result", "call_id": call_id},
+                {"step": "finish", "reason": "end_turn"},
+            ]
+        )
+    return json.dumps(steps, separators=(",", ":"))
+
+
+def checkpoint(pid: int) -> dict[str, Any]:
+    sample = proc_rusage(pid)
+    sample["load_1m"] = os.getloadavg()[0]
+    sample["monotonic_ns"] = time.monotonic_ns()
+    return sample
+
+
+def capture_process_reports(
+    artifacts_dir: Path | None, pid: int, attempt: int, phase: str
+) -> dict[str, Any]:
+    if artifacts_dir is None:
+        return {}
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    reports: dict[str, Any] = {}
+    for name, command in (
+        ("vmmap", ["/usr/bin/vmmap", "-summary", str(pid)]),
+        ("footprint", ["/usr/bin/footprint", str(pid)]),
+    ):
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        path = artifacts_dir / f"run-{attempt}-{phase}-{name}.txt"
+        path.write_text(
+            completed.stdout + completed.stderr,
+            encoding="utf-8",
+        )
+        reports[name] = {
+            "path": str(path),
+            "return_code": completed.returncode,
+        }
+    return reports
+
+
+def acknowledge_checkpoint(process: subprocess.Popen[str]) -> None:
+    if process.stdin is None:
+        raise RuntimeError("workload stdin pipe was not created")
+    process.stdin.write("continue\n")
+    process.stdin.flush()
+
+
+def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
+    # Darwin's AF_UNIX path limit is 103 bytes. The runner's default TMPDIR
+    # lives under /private/var/folders and leaves too little room for the
+    # daemon's authenticated endpoint name, so use the stable short /tmp
+    # alias for this throwaway profile.
+    with tempfile.TemporaryDirectory(
+        prefix=f"hmd-{attempt}-", dir="/tmp"
+    ) as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        environment = os.environ.copy()
+        environment.update(
+            {
+                # The daemon's lockdown ledger is profile-adjacent but still
+                # resolves its default root through HOME. Keep every write in
+                # the throwaway measurement profile instead of touching the
+                # runner's real account state.
+                "HOME": str(home),
+                "RUST_MIN_STACK": "8388608",
+                "HAIDER_DISCOVERY_DISABLED": "1",
+                "HAIDER_TEST_DEVICE_NAME": "test-mac",
+                "HAIDER_TEST_FAKE_PROVIDER": fake_script(args.turns),
+            }
+        )
+        command = [
+            str(args.driver),
+            "--daemon",
+            str(args.daemon),
+            "--root",
+            str(root),
+            "--turns",
+            str(args.turns),
+            "--settle-seconds",
+            str(args.settle_seconds),
+            "--checkpoint-acks",
+        ]
+        uptime_before = subprocess.run(
+            ["uptime"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+        process = subprocess.Popen(
+            command,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        if process.stdout is None:
+            process.kill()
+            raise RuntimeError("workload stdout pipe was not created")
+        samples: dict[str, dict[str, Any]] = {}
+        reports: dict[str, dict[str, Any]] = {}
+        daemon_pid: int | None = None
+        stdout_lines: list[str] = []
+        try:
+            for raw_line in process.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                stdout_lines.append(line)
+                event = json.loads(line)
+                phase = event.get("phase")
+                if phase == "ready":
+                    daemon_pid = int(event["pid"])
+                    samples["ready"] = checkpoint(daemon_pid)
+                    acknowledge_checkpoint(process)
+                elif phase == "idle_settled" and daemon_pid is not None:
+                    samples["idle_settled"] = checkpoint(daemon_pid)
+                    reports["idle_settled"] = capture_process_reports(
+                        args.artifacts_dir, daemon_pid, attempt, "idle-settled"
+                    )
+                    samples["workload_start"] = checkpoint(daemon_pid)
+                    acknowledge_checkpoint(process)
+                elif phase == "turn" and daemon_pid is not None:
+                    turn = int(event["turn"])
+                    if turn in (20, args.turns):
+                        samples[f"turn_{turn}"] = checkpoint(daemon_pid)
+                elif phase == "post_turns_settled" and daemon_pid is not None:
+                    samples["post_turns_settled"] = checkpoint(daemon_pid)
+                    reports["post_turns_settled"] = capture_process_reports(
+                        args.artifacts_dir, daemon_pid, attempt, "post-turns-settled"
+                    )
+                    acknowledge_checkpoint(process)
+            stderr = process.stderr.read() if process.stderr is not None else ""
+            return_code = process.wait(timeout=10)
+        except BaseException:
+            process.kill()
+            process.wait(timeout=10)
+            raise
+        if return_code != 0:
+            daemon_log_path = root / "haiderd.log"
+            daemon_log = (
+                daemon_log_path.read_text(encoding="utf-8", errors="replace")
+                if daemon_log_path.is_file()
+                else "<missing>\n"
+            )
+            raise RuntimeError(
+                f"workload driver failed ({return_code})\n"
+                f"stdout:\n{''.join(line + chr(10) for line in stdout_lines)}"
+                f"stderr:\n{stderr}"
+                f"haiderd.log:\n{daemon_log}"
+            )
+        required = {
+            "ready",
+            "idle_settled",
+            "workload_start",
+            "turn_20",
+            f"turn_{args.turns}",
+            "post_turns_settled",
+        }
+        missing = required.difference(samples)
+        if missing:
+            raise RuntimeError(f"workload omitted checkpoints: {sorted(missing)}")
+        idle = samples["idle_settled"]
+        turn_20 = samples["turn_20"]
+        turn_last = samples[f"turn_{args.turns}"]
+        post = samples["post_turns_settled"]
+        loads = [float(sample["load_1m"]) for sample in samples.values()]
+        return {
+            "attempt": attempt,
+            "accepted": max(loads) < MAX_LOAD_1M,
+            "uptime_before": uptime_before,
+            "load_1m_max": max(loads),
+            "daemon_pid": daemon_pid,
+            "samples": samples,
+            "reports": reports,
+            "idle_cpu_ns": idle["cpu_ns"] - samples["ready"]["cpu_ns"],
+            "turn_20_cpu_ns": turn_20["cpu_ns"]
+            - samples["workload_start"]["cpu_ns"],
+            "immediate_growth_bytes": turn_last["footprint_bytes"]
+            - idle["footprint_bytes"],
+            "settled_growth_bytes": post["footprint_bytes"] - idle["footprint_bytes"],
+            "settled_bytes_per_turn": (
+                post["footprint_bytes"] - idle["footprint_bytes"]
+            )
+            / args.turns,
+        }
+
+
+def median_and_mad(values: list[int | float]) -> tuple[float, float]:
+    median = float(statistics.median(values))
+    mad = float(statistics.median(abs(value - median) for value in values))
+    return median, mad
+
+
+def main() -> int:
+    args = parse_args()
+    if not args.daemon.is_file() or not os.access(args.daemon, os.X_OK):
+        raise SystemExit(f"daemon is not executable: {args.daemon}")
+    if args.daemon.stat().st_size <= 10 * 1024 * 1024:
+        raise SystemExit("daemon binary is implausibly small (must exceed 10 MiB)")
+    if not args.driver.is_file() or not os.access(args.driver, os.X_OK):
+        raise SystemExit(f"workload driver is not executable: {args.driver}")
+
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    attempts = 0
+    while len(accepted) < args.runs:
+        attempts += 1
+        if attempts > args.runs * 4:
+            raise SystemExit("could not admit N runs below load1m < 4")
+        while os.getloadavg()[0] >= MAX_LOAD_1M:
+            time.sleep(5)
+        result = run_once(args, attempts)
+        print(json.dumps(result, separators=(",", ":")), flush=True)
+        (accepted if result["accepted"] else rejected).append(result)
+
+    idle_values = [
+        run["samples"]["idle_settled"]["footprint_bytes"] for run in accepted
+    ]
+    post_values = [
+        run["samples"]["post_turns_settled"]["footprint_bytes"] for run in accepted
+    ]
+    idle_cpu_values = [run["idle_cpu_ns"] for run in accepted]
+    turn_cpu_values = [run["turn_20_cpu_ns"] for run in accepted]
+    growth_values = [run["settled_growth_bytes"] for run in accepted]
+    idle_median, idle_mad = median_and_mad(idle_values)
+    post_median, post_mad = median_and_mad(post_values)
+    idle_cpu_median, idle_cpu_mad = median_and_mad(idle_cpu_values)
+    turn_cpu_median, turn_cpu_mad = median_and_mad(turn_cpu_values)
+    growth_median, growth_mad = median_and_mad(growth_values)
+    summary = {
+        "schema": "haider.daemon-footprint.v1",
+        "runs": args.runs,
+        "turns": args.turns,
+        "settle_seconds": args.settle_seconds,
+        "load_1m_limit": MAX_LOAD_1M,
+        "rejected_runs": len(rejected),
+        "idle": {"median_bytes": idle_median, "mad_bytes": idle_mad},
+        "post_turns": {"median_bytes": post_median, "mad_bytes": post_mad},
+        "settled_growth": {
+            "median_bytes": growth_median,
+            "mad_bytes": growth_mad,
+            "median_bytes_per_turn": growth_median / args.turns,
+        },
+        "idle_cpu": {"median_ns": idle_cpu_median, "mad_ns": idle_cpu_mad},
+        "turn_20_cpu": {"median_ns": turn_cpu_median, "mad_ns": turn_cpu_mad},
+        "budgets": {
+            "idle_bytes": args.idle_budget_bytes,
+            "post_turns_bytes": args.post_turns_budget_bytes,
+            "calibrated_idle_1_10x": int(idle_median * 1.10 + 0.999),
+            "calibrated_post_turns_1_10x": int(post_median * 1.10 + 0.999),
+        },
+        "accepted_runs": accepted,
+        "rejected": rejected,
+    }
+    rendered = json.dumps(summary, indent=2, sort_keys=True) + "\n"
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered, encoding="utf-8")
+    print(rendered, end="")
+
+    failures: list[str] = []
+    if args.idle_budget_bytes and idle_median > args.idle_budget_bytes:
+        failures.append(
+            f"idle median {idle_median:.0f} > budget {args.idle_budget_bytes}"
+        )
+    if args.post_turns_budget_bytes and post_median > args.post_turns_budget_bytes:
+        failures.append(
+            f"post-turn median {post_median:.0f} > budget {args.post_turns_budget_bytes}"
+        )
+    if failures:
+        print("daemon footprint budget: FAIL: " + "; ".join(failures), file=sys.stderr)
+        return 1
+    print("daemon footprint budget: PASS", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

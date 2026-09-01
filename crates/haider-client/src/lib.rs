@@ -57,15 +57,16 @@ pub use headless::{
     DEFAULT_TERMINAL_GRACE, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL,
     HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES, HeadlessAttachment, HeadlessBackgroundTask,
     HeadlessBlockingReason, HeadlessEvent, HeadlessEventMode, HeadlessFailureCode,
-    HeadlessFileAttachment, HeadlessImageAttachment, HeadlessOutcome, HeadlessPdfAttachment,
-    HeadlessPermissionDenial, HeadlessRunError, HeadlessRunEventReader, HeadlessRunEvents,
-    HeadlessRunFailure, HeadlessRunRequest, HeadlessRunResult, HeadlessRunStatus,
-    HeadlessRunStopResult, HeadlessSessionConfig, HeadlessTerminalEvent, HeadlessTerminalKind,
-    headless_run_events, headless_run_status, load_attachment, load_image_attachment,
-    load_pdf_attachment, load_text_attachment, required_headless_features,
+    HeadlessFileAttachment, HeadlessImageAttachment, HeadlessInterrupt, HeadlessOutcome,
+    HeadlessPdfAttachment, HeadlessPermissionDenial, HeadlessRunError, HeadlessRunEventReader,
+    HeadlessRunEvents, HeadlessRunFailure, HeadlessRunRequest, HeadlessRunResult,
+    HeadlessRunStatus, HeadlessRunStopResult, HeadlessSessionConfig, HeadlessTerminalEvent,
+    HeadlessTerminalKind, headless_run_events, headless_run_status, load_attachment,
+    load_image_attachment, load_pdf_attachment, load_text_attachment, required_headless_features,
     required_headless_features_with_attachments, required_headless_features_with_hook_trust,
     run_headless, run_headless_with_session_config,
-    run_headless_with_session_config_and_event_mode, stop_headless_run,
+    run_headless_with_session_config_and_event_mode,
+    run_headless_with_session_config_event_mode_and_interrupts, stop_headless_run,
 };
 pub use lockdown::{
     LockdownClientError, ProviderLockdown, lockdown_set_quota_response, lockdown_status_response,
@@ -106,9 +107,11 @@ pub use shell_registry::{
     shell_event_from_frame, shell_registry, shell_registry_available,
 };
 pub use spawn::{
-    DAEMON_LOG_FILE, DaemonLifetime, DaemonOwnershipToken, EnsureError, EnsureOptions,
-    EnsuredDaemon, RACE_LOSER_EXIT_CODE, STARTUP_DEADLINE, ensure_daemon, required_live_features,
-    signal_authenticated_peer, spawn_daemon_retained,
+    AUTOSPAWN_DAEMON_IDLE_TTL_ENV, DAEMON_LOG_FILE, DEFAULT_AUTOSPAWN_DAEMON_IDLE_TTL,
+    DaemonLifetime, DaemonOwnershipToken, EnsureError, EnsureOptions, EnsuredDaemon,
+    MAX_AUTOSPAWN_DAEMON_IDLE_TTL_MS, RACE_LOSER_EXIT_CODE, STARTUP_DEADLINE,
+    autospawn_daemon_lifetime, ensure_daemon, required_live_features, signal_authenticated_peer,
+    spawn_daemon_retained,
 };
 pub use ssh_profiles::{
     SshProfiles, SshProfilesClientError, ssh_list_response, ssh_profiles, ssh_profiles_available,

@@ -3065,6 +3065,14 @@ async fn durable_parent_answer_replays_into_child_after_coordinator_restart() {
                 )
                 .await
                 .expect("recover route wait"),
+            RecoveredWork::AdmissionRetry(recovered) => manager_handle
+                .recover_admission_retry(
+                    recovered.accepted,
+                    recovered.provider_requests_consumed,
+                    recovered.provider_request_ordinal,
+                )
+                .await
+                .expect("recover admission retry"),
             RecoveredWork::WorkflowContinuation(recovered) => manager_handle
                 .recover_workflow_continuation(
                     recovered.accepted,
@@ -4598,6 +4606,14 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
                 )
                 .await
                 .expect("recover partial stream"),
+            RecoveredWork::AdmissionRetry(recovered) => manager_handle
+                .recover_admission_retry(
+                    recovered.accepted,
+                    recovered.provider_requests_consumed,
+                    recovered.provider_request_ordinal,
+                )
+                .await
+                .expect("recover admission retry"),
             RecoveredWork::WorkflowContinuation(recovered) => manager_handle
                 .recover_workflow_continuation(
                     recovered.accepted,

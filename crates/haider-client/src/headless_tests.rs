@@ -3,10 +3,10 @@
 use super::{
     ApplyStatus, BufferedWireFrames, EnsureOptions, HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES,
     HeadlessAttachment, HeadlessEvent, HeadlessEventLedgerWriter, HeadlessEventMode,
-    HeadlessEventOutput, HeadlessFailureCode, HeadlessOutcome, HeadlessReducer, HeadlessRunError,
-    HeadlessRunEventStorage, HeadlessRunFailure, HeadlessSessionConfig, HeadlessTerminalKind,
-    headless_submit_body, load_attachment, load_pdf_attachment, normalize_session_config_features,
-    terminal_kind,
+    HeadlessEventOutput, HeadlessFailureCode, HeadlessInterrupt, HeadlessOutcome, HeadlessReducer,
+    HeadlessRunError, HeadlessRunEventStorage, HeadlessRunFailure, HeadlessSessionConfig,
+    HeadlessTerminalKind, headless_submit_body, load_attachment, load_pdf_attachment,
+    normalize_session_config_features, terminal_kind, try_take_pending_interrupt,
 };
 use haider_rpc::haider_protocol::EventPayload;
 use haider_rpc::haider_protocol::envelope::RawEnvelope;
@@ -15,6 +15,22 @@ use haider_rpc::haider_protocol::headless::{HeadlessRunEventPayload, RunDeadline
 use haider_rpc::haider_protocol::ids::{RunId, SessionId};
 use haider_rpc::haider_protocol::state::RunState;
 use haider_rpc::{CommandId, RequestBody};
+
+#[test]
+fn pending_second_interrupt_is_consumed_before_terminal_drain() {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut interrupts = Some(receiver);
+    assert!(!try_take_pending_interrupt(&mut interrupts));
+
+    sender
+        .send(HeadlessInterrupt::ExitImmediately)
+        .expect("interrupt receiver remains open");
+    assert!(try_take_pending_interrupt(&mut interrupts));
+
+    drop(sender);
+    assert!(!try_take_pending_interrupt(&mut interrupts));
+    assert!(interrupts.is_none());
+}
 
 #[cfg(unix)]
 use super::reap_owned_daemon;

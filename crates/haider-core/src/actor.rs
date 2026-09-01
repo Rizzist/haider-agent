@@ -318,7 +318,7 @@ pub(crate) fn model_tool_result_preview(tool_name: &str, result: &BoundedResult)
 }
 use haider_tools::{Plan, RequestInput, TodoWrite};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 
@@ -2093,6 +2093,32 @@ struct ProviderRetryWakeState {
     consumed_commands: HashSet<String>,
 }
 
+/// Volatile request phase used only to classify an absolute-deadline terminal.
+///
+/// Durable `Retrying`/provider `Waiting` states cover the backoff itself. This
+/// latch covers the small retry-admission intervals on either side of those
+/// facts: deciding whether to retry and reaching the next provider future.
+/// The provider future clears it on its first poll, so a deadline produced
+/// before that poll remains retry exhaustion rather than an in-flight timeout.
+#[derive(Debug, Default)]
+struct ProviderDeadlineState {
+    retry_admission: AtomicBool,
+}
+
+impl ProviderDeadlineState {
+    fn begin_retry_admission(&self) {
+        self.retry_admission.store(true, Ordering::Release);
+    }
+
+    fn begin_provider_request(&self) {
+        self.retry_admission.store(false, Ordering::Release);
+    }
+
+    fn retry_admission_in_progress(&self) -> bool {
+        self.retry_admission.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Debug, Default)]
 struct PromotedSteerMailbox {
     state: Mutex<PromotedSteerMailboxState>,
@@ -2299,6 +2325,7 @@ pub struct HarnessActor {
     state: watch::Sender<Option<RunState>>,
     committed_menus: watch::Receiver<Option<RawEnvelope>>,
     provider_retry_wake: Arc<ProviderRetryWake>,
+    provider_deadline_state: Arc<ProviderDeadlineState>,
     promoted_steers: Arc<PromotedSteerMailbox>,
     next_run: u64,
     event_ids: Arc<EventIdGenerator>,
@@ -2372,6 +2399,7 @@ impl HarnessActor {
         let (state, state_receiver) = watch::channel(None);
         let (committed_menus, committed_menu_receiver) = watch::channel(None);
         let provider_retry_wake = Arc::new(ProviderRetryWake::default());
+        let provider_deadline_state = Arc::new(ProviderDeadlineState::default());
         let promoted_steers = Arc::new(PromotedSteerMailbox::default());
         let handle = HarnessHandle {
             commands: command_sender,
@@ -2397,6 +2425,7 @@ impl HarnessActor {
                 state,
                 committed_menus: committed_menu_receiver,
                 provider_retry_wake,
+                provider_deadline_state,
                 promoted_steers,
                 next_run: 0,
                 event_ids,
@@ -2686,6 +2715,7 @@ impl HarnessActor {
         // failure may end that turn before a boundary; never leak its input
         // into a later queued turn.
         self.pending_subturns.clear();
+        self.provider_deadline_state.begin_provider_request();
         // Tool definitions are a provider cache ABI. Freeze their order and
         // recursively canonicalize schemas once at the conversation-store
         // boundary so standalone harnesses receive the same stability as
@@ -3824,11 +3854,22 @@ impl HarnessActor {
                 .turn_trace
                 .as_ref()
                 .map(TurnTraceContext::now_us_from_accept);
+            let trusts_default_route_absence = attempt_provider.trusts_default_route_absence();
+            let opening_provider = Arc::clone(&attempt_provider);
+            let provider_deadline_state = Arc::clone(&self.provider_deadline_state);
+            let provider_request_ref = &provider_request;
             let mut opening = Box::pin(before_provider_request_deadline(
                 self.config.provider_deadline,
-                attempt_provider.stream_prepared_turn_ref(&provider_request, prepared),
+                async move {
+                    // `before_provider_request_deadline` polls this future only
+                    // after the next request has positive deadline admission.
+                    // Until then, a prior retry remains in its admission state.
+                    provider_deadline_state.begin_provider_request();
+                    opening_provider
+                        .stream_prepared_turn_ref(provider_request_ref, prepared)
+                        .await
+                },
             ));
-            let trusts_default_route_absence = attempt_provider.trusts_default_route_absence();
             let mut opening_network_waiting = false;
             let mut stream = loop {
                 let opened = tokio::select! {
@@ -6270,6 +6311,12 @@ impl HarnessActor {
         thinking_pending: &mut bool,
         mut error: ProviderError,
     ) -> Result<(), DriveError> {
+        // A deadline that was already produced by an active request keeps its
+        // in-flight classification. Every other pre-first-event failure enters
+        // retry admission before resolver and backoff policy are consulted.
+        if error.timeout_reason != Some(ProviderTimeoutReason::DeadlineExhausted) {
+            self.provider_deadline_state.begin_retry_admission();
+        }
         let hosted_fallback = error.presentation.subcode.as_str() == "provider-web-tool-rejected"
             && !*capability_fallback_consumed;
         if ((!*rotation_budget_consumed && provider_error_allows_rotation(&error))
@@ -9248,7 +9295,18 @@ impl HarnessActor {
         tools: &mut Vec<ToolAccumulator>,
         mut provider_error: ProviderError,
     ) -> TurnOutcome {
-        if provider_error.timeout_reason == Some(ProviderTimeoutReason::DeadlineExhausted)
+        // This is the single deadline-to-terminal classifier. The durable
+        // state wins over whichever timer happened to wake the actor: expiry
+        // during provider backoff/admission is bounded retry exhaustion, while
+        // an active provider request/stream retains `provider_timeout`.
+        let run_state = self.state.borrow().clone();
+        let deadline_expired_during_retry = classify_provider_deadline_terminal(
+            &mut provider_error,
+            run_state.as_ref(),
+            self.provider_deadline_state.retry_admission_in_progress(),
+        );
+        if !deadline_expired_during_retry
+            && provider_error.timeout_reason == Some(ProviderTimeoutReason::DeadlineExhausted)
             && let Some(guard) = self.config.provider_deadline_guard.clone()
         {
             match guard.map_deadline_exhausted(run_id).await {
@@ -10945,6 +11003,47 @@ fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
     error
 }
 
+/// Converts exactly one absolute-deadline outcome into its durable provider
+/// terminal class. Returning `true` means retry state owned the expiry and the
+/// daemon's in-flight deadline mapper must not replace the provider failure.
+fn classify_provider_deadline_terminal(
+    error: &mut ProviderError,
+    run_state: Option<&RunState>,
+    retry_admission_in_progress: bool,
+) -> bool {
+    if error.timeout_reason != Some(ProviderTimeoutReason::DeadlineExhausted)
+        || (!retry_admission_in_progress && !run_state_is_provider_retry(run_state))
+    {
+        return false;
+    }
+
+    error.message =
+        "provider retry budget expired before another provider request was in flight".into();
+    error.retryable = false;
+    let mut presentation = ErrorPresentation::new(
+        "provider-retry-exhausted",
+        "Provider retry budget exhausted",
+        "The run deadline expired during provider retry backoff; another request cannot be admitted.",
+        ErrorScope::Turn,
+        [ErrorAction::None],
+    );
+    copy_provider_metadata(&mut presentation, &error.presentation);
+    error.presentation = presentation;
+    true
+}
+
+fn run_state_is_provider_retry(run_state: Option<&RunState>) -> bool {
+    matches!(
+        run_state,
+        Some(
+            RunState::Retrying { .. }
+                | RunState::Waiting {
+                    reason: WaitReason::RateLimit | WaitReason::ProviderBackoff,
+                }
+        )
+    )
+}
+
 fn specialize_provider_presentation(auth_scope: &str, error: &mut ProviderError) {
     if error.kind != ProviderErrorKind::Authentication {
         return;
@@ -11272,20 +11371,33 @@ fn provider_error_allows_retry(
     let Some(deadline) = deadline else {
         return true;
     };
+    let delay_ms = error
+        .retry_after_ms
+        .unwrap_or_else(|| retry_jittered_backoff_ms(run_id, failed_attempt));
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let delay = std::time::Duration::from_millis(delay_ms);
+    // The retry sleeper is outside `before_provider_request_deadline`, so it
+    // must enforce the enclosing deadline itself. The ordinary provider
+    // margin protects the next request-open cutoff; retry admission reserves
+    // one additional equal interval for scheduler handoff and durable terminal
+    // delivery. Sharing only the ordinary margin let a barely admitted retry
+    // reach the next open at its cutoff, racing this provider failure against
+    // the caller's wall timeout. Equality is already hopeless and is refused.
+    // This is exhaustion for the accepted run: latch a non-retryable terminal
+    // and suppress an action that the same absolute deadline cannot honor. A
+    // newly accepted turn receives a fresh provider error/budget.
+    if !provider_retry_fits_deadline(remaining, delay) {
+        terminalize_provider_retry(error);
+        return false;
+    }
+    let remaining_after_delay = remaining.saturating_sub(delay);
     if error.presentation.subcode.as_str() != "provider-timeout" {
         return true;
     }
     let Some(budget_ms) = error.budget_ms else {
-        error.retryable = false;
-        error.presentation.allowed_actions = vec![ErrorAction::None];
+        terminalize_provider_retry(error);
         return false;
     };
-    let delay_ms = error
-        .retry_after_ms
-        .unwrap_or_else(|| retry_jittered_backoff_ms(run_id, failed_attempt));
-    let remaining_after_delay = deadline
-        .saturating_duration_since(tokio::time::Instant::now())
-        .saturating_sub(std::time::Duration::from_millis(delay_ms));
     let provider_budget = std::time::Duration::from_millis(budget_ms);
     let can_retry = effective_request_budget(
         provider_budget,
@@ -11294,10 +11406,23 @@ fn provider_error_allows_retry(
     )
     .is_ok_and(|selected| selected == provider_budget);
     if !can_retry {
-        error.retryable = false;
-        error.presentation.allowed_actions = vec![ErrorAction::None];
+        terminalize_provider_retry(error);
     }
     can_retry
+}
+
+fn provider_retry_fits_deadline(
+    remaining: std::time::Duration,
+    delay: std::time::Duration,
+) -> bool {
+    let admission_margin =
+        PROVIDER_DEADLINE_SAFETY_MARGIN.saturating_add(PROVIDER_DEADLINE_SAFETY_MARGIN);
+    remaining.saturating_sub(delay) > admission_margin
+}
+
+fn terminalize_provider_retry(error: &mut ProviderError) {
+    error.retryable = false;
+    error.presentation.allowed_actions = vec![ErrorAction::None];
 }
 
 /// Transport failures never require a user decision. Before any provider
