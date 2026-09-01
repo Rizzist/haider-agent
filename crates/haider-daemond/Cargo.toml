@@ -10,6 +10,9 @@ rust-version.workspace = true
 name = "haiderd"
 path = "src/main.rs"
 
+[features]
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
 async-trait.workspace = true
 haider-client = { path = "../haider-client" }
@@ -17,6 +20,7 @@ haider-daemon = { path = "../haider-daemon" }
 haider-platform = { path = "../haider-platform" }
 haider-protocol = { path = "../haider-protocol" }
 haider-provider = { path = "../haider-provider" }
+mimalloc = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 

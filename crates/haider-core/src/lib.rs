@@ -89,8 +89,8 @@ pub use haider_store::{
 };
 pub use prompt_history::{
     ArtifactReader, CompiledPromptProjection, PromptCompactionPlanRequest, PromptHistoryCache,
-    PromptHistoryCompiler, USER_COMMAND_OUTPUT_PREVIEW_BYTES, UserCommandOutput,
-    UserCommandOutputProjection, task_event_notice,
+    PromptHistoryCompiler, PromptHistoryRetentionStats, USER_COMMAND_OUTPUT_PREVIEW_BYTES,
+    UserCommandOutput, UserCommandOutputProjection, task_event_notice,
 };
 pub use recovery::{RecoveryReport, effect_recovery_evidence, reconcile_dispatched_effects};
 pub use sqlite_store::{

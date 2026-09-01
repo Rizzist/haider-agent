@@ -99,6 +99,21 @@ pub struct PromptHistoryCache {
     touch_clock: AtomicU64,
 }
 
+/// Opt-in daemon-retention counters. They expose only allocation/count shape;
+/// journal content never crosses this diagnostic seam.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PromptHistoryRetentionStats {
+    pub sessions: usize,
+    pub body_bytes: usize,
+    pub envelope_bytes: usize,
+    pub projection_bytes: usize,
+    pub envelopes: usize,
+    pub exact_projections: usize,
+    pub append_prefixes: usize,
+    pub journal_index_entries: usize,
+    pub tree_entries: usize,
+}
+
 #[derive(Default)]
 struct CachedPromptSession {
     last_touched: u64,
@@ -900,9 +915,58 @@ impl PromptHistoryCompiler {
 }
 
 impl PromptHistoryCache {
-    /// Drops journal-reconstructible bodies for one quiescent session while
-    /// retaining its lightweight replay/checkpoint cursors. The daemon calls
-    /// this only after proving the journal is still at the same idle head.
+    /// Samples one cache's retained shape for the opt-in memory-attribution
+    /// harness. This is diagnostic only; cache admission never reads it.
+    pub async fn retention_stats(&self) -> PromptHistoryRetentionStats {
+        let sessions = self.sessions.lock().await;
+        let mut stats = PromptHistoryRetentionStats {
+            sessions: sessions.len(),
+            ..PromptHistoryRetentionStats::default()
+        };
+        for cached in sessions.values() {
+            let envelope_bytes = cached.retained_envelope_allocation_bytes();
+            let projection_bytes = cached.retained_projection_bytes();
+            stats.body_bytes = stats
+                .body_bytes
+                .saturating_add(envelope_bytes)
+                .saturating_add(projection_bytes);
+            stats.envelope_bytes = stats.envelope_bytes.saturating_add(envelope_bytes);
+            stats.projection_bytes = stats.projection_bytes.saturating_add(projection_bytes);
+            stats.envelopes = stats.envelopes.saturating_add(cached.envelopes.len());
+            stats.exact_projections = stats
+                .exact_projections
+                .saturating_add(cached.projections.len());
+            stats.append_prefixes = stats
+                .append_prefixes
+                .saturating_add(cached.append_prefixes.len());
+            stats.journal_index_entries = stats
+                .journal_index_entries
+                .saturating_add(cached.render_facts.entry_count());
+            stats.tree_entries = stats
+                .tree_entries
+                .saturating_add(cached.tree_index.ordered.len());
+        }
+        stats
+    }
+
+    /// Retains the compiled cross-run prefix and only the journal suffix after
+    /// that prefix. A terminal idle boundary makes the older decoded journal
+    /// and its indexes redundant: the next run can extend from the compiled
+    /// prefix, while a shape the suffix cannot prove still falls back to a
+    /// complete journal replay.
+    pub async fn compact_session_history(&self, session_id: &SessionId) -> usize {
+        let mut sessions = self.sessions.lock().await;
+        let Some(cached) = sessions.get_mut(session_id) else {
+            return 0;
+        };
+        let before = cached.retained_heap_bytes();
+        cached.compact_to_append_prefixes();
+        before.saturating_sub(cached.retained_heap_bytes())
+    }
+
+    /// Drops journal-reconstructible bodies and compiled cursor shells for one
+    /// quiescent session. The daemon calls this only after proving the journal
+    /// is still at the same idle head.
     pub async fn evict_session_bodies(&self, session_id: &SessionId) -> usize {
         let mut sessions = self.sessions.lock().await;
         let Some(cached) = sessions.get_mut(session_id) else {
@@ -1318,7 +1382,7 @@ async fn replay_cached_session(
 }
 
 impl CachedPromptSession {
-    fn retained_heap_bytes(&self) -> usize {
+    fn retained_envelope_allocation_bytes(&self) -> usize {
         if self.bodies_evicted {
             return 0;
         }
@@ -1330,9 +1394,15 @@ impl CachedPromptSession {
             .capacity()
             .saturating_sub(self.envelopes.len())
             .saturating_mul(std::mem::size_of::<RawEnvelope>());
-        let mut total = self
-            .retained_envelope_bytes
-            .saturating_add(envelope_capacity_slack);
+        self.retained_envelope_bytes
+            .saturating_add(envelope_capacity_slack)
+    }
+
+    fn retained_projection_bytes(&self) -> usize {
+        if self.bodies_evicted {
+            return 0;
+        }
+        let mut total = 0_usize;
         let mut projections = HashSet::new();
         for prefix in self.append_prefixes.values() {
             if let Some(projection) = prefix.projection.as_ref()
@@ -1351,19 +1421,22 @@ impl CachedPromptSession {
         total
     }
 
+    fn retained_heap_bytes(&self) -> usize {
+        self.retained_envelope_allocation_bytes()
+            .saturating_add(self.retained_projection_bytes())
+    }
+
     fn evict_bodies(&mut self) {
         self.retained_envelope_bytes = 0;
         self.bodies_evicted = true;
         // `clear` would drop the values but retain the body-owning allocation.
         self.envelopes = Vec::new();
-        for prefix in self.append_prefixes.values_mut() {
-            prefix.projection = None;
-            prefix.body_bytes = 0;
-        }
-        for exact in self.projections.values_mut() {
-            exact.projection = None;
-            exact.body_bytes = 0;
-        }
+        // These cursor-key maps are derived from the journal too. Replacing
+        // them releases both values and hash-table capacity; keeping empty
+        // projection shells made long-lived idle sessions retain one key per
+        // compiled timeline for no semantic benefit.
+        self.append_prefixes = HashMap::new();
+        self.projections = HashMap::new();
         self.render_facts = JournalFactsIndex::default();
         self.tree_index = TreeProjection::default();
         self.lineage_scopes.clear();
@@ -1371,6 +1444,71 @@ impl CachedPromptSession {
         self.checkpoint_node_collision = false;
         self.boundary_projector = TranscriptProjector::default();
         self.boundaries.clear();
+    }
+
+    fn compact_to_append_prefixes(&mut self) {
+        self.append_prefixes
+            .retain(|_, prefix| prefix.projection.is_some());
+        let Some(retain_after) = self
+            .append_prefixes
+            .values()
+            .map(|prefix| prefix.head_seq)
+            .min()
+        else {
+            self.evict_bodies();
+            return;
+        };
+
+        // Most exact projections name the completed run and cannot answer the
+        // next run. Manual retry is the exception: a fresh run deliberately
+        // recompiles the original failed run's immutable prompt source. Keep
+        // only exact entries for a retained append-prefix source; both maps
+        // share the same Arc, so this retains keys rather than a second body.
+        let retained_source_runs = self
+            .append_prefixes
+            .values()
+            .map(|prefix| prefix.current_run.clone())
+            .collect::<HashSet<_>>();
+        self.projections.retain(|key, projection| {
+            retained_source_runs.contains(&key.current_run) && projection.projection.is_some()
+        });
+        self.envelopes = std::mem::take(&mut self.envelopes)
+            .into_iter()
+            .filter(|envelope| {
+                if envelope.seq > retain_after {
+                    return true;
+                }
+                // The compiled prompt prefix replaces provider-visible journal
+                // bodies, but a newer tree node can still name an older parent.
+                // Retain only that lightweight node ancestry spine so branch,
+                // fork, retry, and compaction lineage remains independently
+                // checkable without retaining tool/event bodies.
+                matches!(
+                    EventPayload::deserialize(&envelope.payload),
+                    Ok(EventPayload::NodeCommitted(_))
+                )
+            })
+            .collect();
+        self.envelopes.shrink_to_fit();
+        self.retained_envelope_bytes = self
+            .envelopes
+            .iter()
+            .map(envelope_weight_bytes)
+            .fold(0_usize, usize::saturating_add);
+        self.render_facts = JournalFactsIndex::build(&self.envelopes);
+        self.tree_index = TreeProjection::build(&self.envelopes);
+        self.checkpoint_node_collision = false;
+
+        let mut boundary_projector = TranscriptProjector::default();
+        let mut boundary_rows = Vec::new();
+        for envelope in &self.envelopes {
+            boundary_rows.extend(boundary_projector.push(envelope));
+        }
+        boundary_rows.extend(boundary_projector.flush_unresolved_tools());
+        self.boundary_projector = boundary_projector;
+        self.boundaries.clear();
+        self.note_boundary_rows(boundary_rows);
+        self.bodies_evicted = false;
     }
 
     fn note_compaction(&mut self, envelope: &RawEnvelope) {
@@ -2178,12 +2316,14 @@ fn lineage_suffix_revises_prior_facts(
                 let Some(indexed) = cached.tree_index.ordered.get(*index) else {
                     return Err(corrupt("prompt tree run index is out of bounds"));
                 };
-                if indexed.envelope_index >= prior.len() {
-                    continue;
-                }
                 let Some(envelope) = cached.envelopes.get(indexed.envelope_index) else {
                     return Err(corrupt("prompt tree envelope index is out of bounds"));
                 };
+                // After terminal-idle compaction, the prefix run's user node
+                // is represented by `prefix_projection` while its assistant
+                // node and terminal fact deliberately remain in `suffix`.
+                // Either side can prove the immutable owner scope; the
+                // terminal check below still rejects an incomplete prefix.
                 if lineage.admits(envelope.branch_id.as_ref(), envelope.seq) {
                     prefix_owner_scopes.insert(envelope.branch_id.clone());
                 }
@@ -3790,6 +3930,22 @@ struct JournalFacts {
 }
 
 impl JournalFactsIndex {
+    fn entry_count(&self) -> usize {
+        self.timelines
+            .values()
+            .map(|state| {
+                state
+                    .facts
+                    .terminal
+                    .len()
+                    .saturating_add(state.facts.partial_menus.len())
+                    .saturating_add(state.facts.continued_partial_items.len())
+                    .saturating_add(state.facts.user_command_origins.len())
+                    .saturating_add(state.facts.user_command_savings.len())
+            })
+            .fold(0_usize, usize::saturating_add)
+    }
+
     fn build(envelopes: &[RawEnvelope]) -> Self {
         let mut index = Self::default();
         for envelope in envelopes {
@@ -4407,17 +4563,13 @@ mod cache_bound_tests {
         assert_eq!(cached.head_seq, 42);
         assert_eq!(cached.compaction_epochs.get(&timeline), Some(&17));
         assert_eq!(cached.saved_boundaries.get(&timeline), Some(&31));
-        let exact = cached
-            .projections
-            .get(&projection_key)
-            .expect("projection hash and cursor remain resident");
-        assert!(exact.projection.is_none());
-        assert!(matches!(exact.cursor, PromptProjectionCursor::Journal));
-        let prefix = cached
-            .append_prefixes
-            .get(&projection_scope)
-            .expect("append hash and cursor remain resident");
-        assert!(prefix.projection.is_none());
-        assert!(matches!(prefix.cursor, PromptProjectionCursor::Tree { .. }));
+        assert!(
+            cached.projections.is_empty(),
+            "body-cap eviction must release exact-key map capacity"
+        );
+        assert!(
+            cached.append_prefixes.is_empty(),
+            "body-cap eviction must release append-prefix map capacity"
+        );
     }
 }

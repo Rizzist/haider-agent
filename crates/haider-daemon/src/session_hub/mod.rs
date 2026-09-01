@@ -201,6 +201,11 @@ const PUBLICATION_RING_CAPACITY: usize = 256;
 /// released below is reconstructible from that journal and its checkpoints.
 const IDLE_DERIVED_STATE_RELEASE_DELAY: Duration = Duration::from_secs(5);
 
+fn retention_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("HAIDER_DAEMON_RETENTION_TRACE").is_some())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FleetNodeIdentity {
     callsign: Option<String>,
@@ -2212,6 +2217,49 @@ impl From<SessionHubError> for DaemonError {
 // ──────────── hub: append seam, attachment lifecycle, shutdown ──────────────
 
 impl SessionHub {
+    async fn trace_retention_snapshot(&self, session_id: &SessionId, head_seq: u64, phase: &str) {
+        if !retention_trace_enabled() {
+            return;
+        }
+        let prompt = self.inner.prompt_history.retention_stats().await;
+        let turn_setup_entries = self
+            .inner
+            .turn_setup_reductions
+            .retention_entry_count()
+            .await;
+        let (
+            observe_ready,
+            observe_building,
+            observe_bytes,
+            observe_session_runs,
+            observe_session_bytes,
+        ) = self.inner.observe_digests.retention_stats(session_id);
+        let attachments = self
+            .inner
+            .attachments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|owner| owner.session_id == *session_id)
+            .count();
+        eprintln!(
+            "haider_retention {}",
+            serde_json::json!({
+                "phase": phase,
+                "session_id": session_id.to_string(),
+                "head_seq": head_seq,
+                "prompt": prompt,
+                "turn_setup_entries": turn_setup_entries,
+                "observe_ready": observe_ready,
+                "observe_building": observe_building,
+                "observe_bytes": observe_bytes,
+                "observe_session_runs": observe_session_runs,
+                "observe_session_bytes": observe_session_bytes,
+                "attachments": attachments,
+            })
+        );
+    }
+
     fn schedule_idle_derived_state_release(&self, session_id: SessionId, idle_seq: u64) {
         let weak = Arc::downgrade(&self.inner);
         tokio::spawn(async move {
@@ -2239,6 +2287,13 @@ impl SessionHub {
                 );
             }
             let allocator_bytes = haider_platform::allocator_pressure_relief();
+            if retention_trace_enabled() {
+                let hub = SessionHub {
+                    inner: Arc::clone(&inner),
+                };
+                hub.trace_retention_snapshot(&session_id, idle_seq, "released")
+                    .await;
+            }
             tracing::debug!(
                 session_id = %session_id,
                 idle_seq,
@@ -7817,6 +7872,32 @@ impl HubStoreHandle {
             .map_err(|_| hub_closed_store_error())?;
         let settled = response.await.map_err(|_| hub_closed_store_error())??;
         if let Some(envelope) = &settled {
+            self.hub
+                .trace_retention_snapshot(&self.session_id, envelope.seq, "idle")
+                .await;
+            let compacted_prompt_bytes = self
+                .hub
+                .inner
+                .prompt_history
+                .compact_session_history(&self.session_id)
+                .await;
+            if retention_trace_enabled() {
+                self.hub
+                    .trace_retention_snapshot(&self.session_id, envelope.seq, "compacted")
+                    .await;
+            }
+            // Each physical request briefly materializes the growing prompt
+            // and provider request. Compact the journal-derived prompt state
+            // first, then scavenge the pages it released at this exact idle
+            // head instead of carrying their high-water into the next turn.
+            let allocator_bytes = haider_platform::allocator_pressure_relief();
+            tracing::debug!(
+                session_id = %self.session_id,
+                idle_seq = envelope.seq,
+                compacted_prompt_bytes,
+                allocator_bytes,
+                "compacted prompt history at terminal idle boundary"
+            );
             self.hub
                 .schedule_idle_derived_state_release(self.session_id.clone(), envelope.seq);
         }

@@ -28,6 +28,7 @@ struct Args {
     root: PathBuf,
     turns: u32,
     settle_seconds: u64,
+    attached_settle_seconds: u64,
     checkpoint_acks: bool,
 }
 
@@ -44,6 +45,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
     let mut root = None;
     let mut turns = 40_u32;
     let mut settle_seconds = 60_u64;
+    let mut attached_settle_seconds = 0_u64;
     let mut checkpoint_acks = false;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -56,6 +58,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--root" => root = Some(PathBuf::from(value()?)),
             "--turns" => turns = value()?.parse()?,
             "--settle-seconds" => settle_seconds = value()?.parse()?,
+            "--attached-settle-seconds" => attached_settle_seconds = value()?.parse()?,
             "--checkpoint-acks" => checkpoint_acks = true,
             _ => return Err(invalid_input(format!("unknown argument: {argument}")).into()),
         }
@@ -68,6 +71,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         root: root.ok_or_else(|| invalid_input("--root is required"))?,
         turns,
         settle_seconds,
+        attached_settle_seconds,
         checkpoint_acks,
     })
 }
@@ -126,7 +130,13 @@ async fn connect_retry(endpoint: &Path) -> Result<haider_client::Connected, Box<
     }
 }
 
-async fn drive_turns(endpoint: &Path, workspace: &Path, turns: u32) -> Result<(), Box<dyn Error>> {
+async fn drive_turns(
+    endpoint: &Path,
+    workspace: &Path,
+    turns: u32,
+    attached_settle_seconds: u64,
+    checkpoint_acks: bool,
+) -> Result<(), Box<dyn Error>> {
     let connected = connect_retry(endpoint).await?;
     let client = connected.client;
     let mut events = client
@@ -278,6 +288,9 @@ async fn drive_turns(endpoint: &Path, workspace: &Path, turns: u32) -> Result<()
         }
         emit(json!({"phase": "turn", "turn": turn}))?;
     }
+    if attached_settle_seconds > 0 {
+        settle_checkpoint(attached_settle_seconds, "attached_settled", checkpoint_acks).await?;
+    }
     let _ = client.close();
     Ok(())
 }
@@ -314,6 +327,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             &endpoint_path_for(&runtime, PROFILE_ID),
             &workspace,
             args.turns,
+            args.attached_settle_seconds,
+            args.checkpoint_acks,
         )
         .await?;
         emit(json!({"phase": "turns_complete", "turns": args.turns}))?;

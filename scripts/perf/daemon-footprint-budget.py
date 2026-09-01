@@ -14,6 +14,7 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import sqlite3
 import statistics
 import subprocess
 import sys
@@ -56,6 +57,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     parser.add_argument("--turns", type=int, default=DEFAULT_TURNS)
     parser.add_argument("--settle-seconds", type=int, default=DEFAULT_SETTLE_SECONDS)
+    parser.add_argument("--attached-settle-seconds", type=int, default=0)
+    parser.add_argument(
+        "--retention-attribution",
+        action="store_true",
+        help="sample journal/CAS structure growth after every turn",
+    )
     parser.add_argument("--idle-budget-bytes", type=int, default=DEFAULT_IDLE_BUDGET_BYTES)
     parser.add_argument(
         "--post-turns-budget-bytes",
@@ -65,8 +72,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--artifacts-dir", type=Path)
     args = parser.parse_args()
-    if args.runs < 1 or args.turns < 20 or args.settle_seconds < 0:
-        parser.error("runs must be positive, turns >= 20, and settle-seconds non-negative")
+    if (
+        args.runs < 1
+        or args.turns < 20
+        or args.settle_seconds < 0
+        or args.attached_settle_seconds < 0
+    ):
+        parser.error("runs must be positive, turns >= 20, and settle times non-negative")
     return args
 
 
@@ -124,10 +136,9 @@ def capture_process_reports(
         return {}
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     reports: dict[str, Any] = {}
-    for name, command in (
-        ("vmmap", ["/usr/bin/vmmap", "-summary", str(pid)]),
-        ("footprint", ["/usr/bin/footprint", str(pid)]),
-    ):
+    # vmmap is unavailable in the managed runner (registry #44). Keep the
+    # optional artifact seam useful without retrying a known-denied command.
+    for name, command in (("footprint", ["/usr/bin/footprint", str(pid)]),):
         completed = subprocess.run(command, capture_output=True, text=True, timeout=60)
         path = artifacts_dir / f"run-{attempt}-{phase}-{name}.txt"
         path.write_text(
@@ -146,6 +157,93 @@ def acknowledge_checkpoint(process: subprocess.Popen[str]) -> None:
         raise RuntimeError("workload stdin pipe was not created")
     process.stdin.write("continue\n")
     process.stdin.flush()
+
+
+def retention_store_snapshot(root: Path) -> dict[str, Any]:
+    store = root / "store"
+    database = store / "store.sqlite"
+    hook_snapshot = store / "hook-engine.snapshot.msgpack"
+    snapshot: dict[str, Any] = {
+        "sqlite_file_bytes": database.stat().st_size if database.is_file() else 0,
+        "sqlite_wal_bytes": (store / "store.sqlite-wal").stat().st_size
+        if (store / "store.sqlite-wal").is_file()
+        else 0,
+        "sqlite_shm_bytes": (store / "store.sqlite-shm").stat().st_size
+        if (store / "store.sqlite-shm").is_file()
+        else 0,
+        "hook_snapshot_bytes": hook_snapshot.stat().st_size
+        if hook_snapshot.is_file()
+        else 0,
+    }
+    if not database.is_file():
+        return snapshot
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2)
+    try:
+        scalar_queries = {
+            "events": "SELECT count(*) FROM events",
+            "journal_json_bytes": "SELECT coalesce(sum(length(envelope_json)), 0) FROM events",
+            "effect_records": (
+                "SELECT count(*) FROM events "
+                "WHERE lower(coalesce(payload_kind, '')) LIKE '%effect%'"
+            ),
+            "hook_outbox_rows": "SELECT count(*) FROM hook_dispatch_outbox",
+            "receipt_rows": "SELECT count(*) FROM command_receipts",
+            "receipt_json_bytes": (
+                "SELECT coalesce(sum(length(request_json)), 0) + "
+                "coalesce(sum(length(response_json)), 0) FROM command_receipts"
+            ),
+            "run_head_rows": "SELECT count(*) FROM run_heads",
+            "run_head_json_bytes": "SELECT coalesce(sum(length(state_json)), 0) FROM run_heads",
+            "provider_view_requests": "SELECT count(*) FROM provider_view_requests",
+            "provider_view_blocks": "SELECT count(*) FROM provider_view_blocks",
+            "provider_view_ref_bytes": (
+                "SELECT coalesce(sum(byte_len), 0) FROM provider_view_blocks"
+            ),
+            "graph_projection_rows": "SELECT count(*) FROM graph_telemetry_projection",
+            "graph_projection_bytes": (
+                "SELECT coalesce(sum(length(tool_state) + length(projection)), 0) "
+                "FROM graph_telemetry_projection"
+            ),
+            "graph_dirty_rows": "SELECT count(*) FROM graph_telemetry_dirty",
+            "projection_checkpoint_rows": "SELECT count(*) FROM session_projection_checkpoints",
+            "projection_checkpoint_bytes": (
+                "SELECT coalesce(sum(length(payload)), 0) FROM session_projection_checkpoints"
+            ),
+            "sqlite_page_count": "PRAGMA page_count",
+            "sqlite_freelist_count": "PRAGMA freelist_count",
+            "sqlite_page_size": "PRAGMA page_size",
+        }
+        for name, query in scalar_queries.items():
+            snapshot[name] = int(connection.execute(query).fetchone()[0] or 0)
+        snapshot["event_kinds"] = {
+            str(kind): int(count)
+            for kind, count in connection.execute(
+                "SELECT coalesce(payload_kind, '<null>'), count(*) "
+                "FROM events GROUP BY payload_kind ORDER BY payload_kind"
+            )
+        }
+    finally:
+        connection.close()
+    cas = store / "provider-view-cas"
+    cas_files = [path for path in cas.rglob("*") if path.is_file()] if cas.is_dir() else []
+    snapshot["provider_view_cas_files"] = len(cas_files)
+    snapshot["provider_view_cas_bytes"] = sum(path.stat().st_size for path in cas_files)
+    return snapshot
+
+
+def retention_trace(log_path: Path) -> list[dict[str, Any]]:
+    if not log_path.is_file():
+        return []
+    snapshots: list[dict[str, Any]] = []
+    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        marker = "haider_retention "
+        if marker not in line:
+            continue
+        try:
+            snapshots.append(json.loads(line.split(marker, 1)[1]))
+        except json.JSONDecodeError:
+            continue
+    return snapshots
 
 
 def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
@@ -173,6 +271,8 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
                 "HAIDER_TEST_FAKE_PROVIDER": fake_script(args.turns),
             }
         )
+        if args.retention_attribution:
+            environment["HAIDER_DAEMON_RETENTION_TRACE"] = "1"
         command = [
             str(args.driver),
             "--daemon",
@@ -183,6 +283,8 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
             str(args.turns),
             "--settle-seconds",
             str(args.settle_seconds),
+            "--attached-settle-seconds",
+            str(args.attached_settle_seconds),
             "--checkpoint-acks",
         ]
         uptime_before = subprocess.run(
@@ -204,6 +306,7 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
         reports: dict[str, dict[str, Any]] = {}
         daemon_pid: int | None = None
         stdout_lines: list[str] = []
+        retention_turns: list[dict[str, Any]] = []
         try:
             for raw_line in process.stdout:
                 line = raw_line.strip()
@@ -225,8 +328,15 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
                     acknowledge_checkpoint(process)
                 elif phase == "turn" and daemon_pid is not None:
                     turn = int(event["turn"])
+                    if args.retention_attribution:
+                        retention_turns.append(
+                            {"turn": turn, **retention_store_snapshot(root)}
+                        )
                     if turn in (20, args.turns):
                         samples[f"turn_{turn}"] = checkpoint(daemon_pid)
+                elif phase == "attached_settled" and daemon_pid is not None:
+                    samples["attached_settled"] = checkpoint(daemon_pid)
+                    acknowledge_checkpoint(process)
                 elif phase == "post_turns_settled" and daemon_pid is not None:
                     samples["post_turns_settled"] = checkpoint(daemon_pid)
                     reports["post_turns_settled"] = capture_process_reports(
@@ -260,6 +370,8 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
             f"turn_{args.turns}",
             "post_turns_settled",
         }
+        if args.attached_settle_seconds > 0:
+            required.add("attached_settled")
         missing = required.difference(samples)
         if missing:
             raise RuntimeError(f"workload omitted checkpoints: {sorted(missing)}")
@@ -276,6 +388,8 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
             "daemon_pid": daemon_pid,
             "samples": samples,
             "reports": reports,
+            "retention_store_turns": retention_turns,
+            "retention_runtime": retention_trace(root / "haiderd.log"),
             "idle_cpu_ns": idle["cpu_ns"] - samples["ready"]["cpu_ns"],
             "turn_20_cpu_ns": turn_20["cpu_ns"]
             - samples["workload_start"]["cpu_ns"],
@@ -336,6 +450,7 @@ def main() -> int:
         "runs": args.runs,
         "turns": args.turns,
         "settle_seconds": args.settle_seconds,
+        "attached_settle_seconds": args.attached_settle_seconds,
         "load_1m_limit": MAX_LOAD_1M,
         "rejected_runs": len(rejected),
         "idle": {"median_bytes": idle_median, "mad_bytes": idle_mad},

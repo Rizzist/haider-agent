@@ -1039,6 +1039,7 @@ pub(super) struct ObserveDigestCache {
 const MAX_OBSERVE_READY_ENTRIES: usize = 256;
 const MAX_OBSERVE_READY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_OBSERVE_BUILDING_ENTRIES: usize = 8;
+const MAX_OBSERVED_RUNS_PER_SESSION: usize = 16;
 
 #[derive(Default)]
 struct ObserveCacheState {
@@ -1676,6 +1677,34 @@ impl ObserveDigestCache {
             .filter(|entry| matches!(entry.as_ref(), ObserveCacheEntry::Building { .. }))
             .count();
         (state.ready_count, building, state.ready_bytes)
+    }
+
+    pub(super) fn retention_stats(
+        &self,
+        session_id: &SessionId,
+    ) -> (usize, usize, usize, usize, usize) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let building = state
+            .sessions
+            .values()
+            .filter(|entry| matches!(entry.as_ref(), ObserveCacheEntry::Building { .. }))
+            .count();
+        let (session_runs, session_bytes) = match state.sessions.get(session_id).map(Box::as_ref) {
+            Some(ObserveCacheEntry::Ready {
+                fold, deep_bytes, ..
+            }) => (fold.projection.runs.len(), *deep_bytes),
+            _ => (0, 0),
+        };
+        (
+            state.ready_count,
+            building,
+            state.ready_bytes,
+            session_runs,
+            session_bytes,
+        )
     }
 
     #[cfg(test)]
@@ -2582,6 +2611,18 @@ impl ObserveProjection {
                             branch_id,
                         },
                     );
+                    while self.runs.len() > MAX_OBSERVED_RUNS_PER_SESSION {
+                        let Some(oldest_terminal) = self
+                            .runs
+                            .iter()
+                            .filter(|(_, run)| run.state.is_terminal())
+                            .min_by_key(|(_, run)| run.seq)
+                            .map(|(run_id, _)| run_id.clone())
+                        else {
+                            break;
+                        };
+                        self.runs.remove(&oldest_terminal);
+                    }
                 }
             }
             EventPayload::MenuOpened(menu) => {
@@ -18750,6 +18791,26 @@ mod run_identity_tests {
             projection.apply(envelope);
         }
         projection.finish(SessionId::new("session-run-identity"), head, 1, None)
+    }
+
+    #[test]
+    fn observe_projection_bounds_terminal_run_history() {
+        let mut projection = ObserveProjection::new(8);
+        let total = MAX_OBSERVED_RUNS_PER_SESSION + 5;
+        for ordinal in 0..total {
+            projection.apply(state_envelope(
+                &format!("terminal-{ordinal}"),
+                ordinal as u64 + 1,
+                RunState::Done,
+            ));
+        }
+        assert_eq!(projection.runs.len(), MAX_OBSERVED_RUNS_PER_SESSION);
+        assert!(!projection.runs.contains_key(&RunId::new("terminal-0")));
+        assert!(
+            projection
+                .runs
+                .contains_key(&RunId::new(format!("terminal-{}", total - 1)))
+        );
     }
 
     fn graph_envelope(seq: u64, payload: EventPayload) -> RawEnvelope {

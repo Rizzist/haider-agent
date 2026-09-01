@@ -13,6 +13,10 @@ use haider_protocol::error::HaiderError;
 use haider_protocol::session::SessionMetadataV1;
 use haider_provider::FakeProvider;
 use std::path::PathBuf;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;

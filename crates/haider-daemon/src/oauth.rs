@@ -2633,7 +2633,7 @@ struct CoordinatorInner {
     shutdown: watch::Sender<bool>,
     tasks: Weak<OwnedTaskSet>,
     next_flow: AtomicU64,
-    client: reqwest::Client,
+    transport: crate::http_transport::SharedHttpTransport,
     vault: Arc<dyn Vault>,
 }
 
@@ -2645,6 +2645,15 @@ impl Drop for CoordinatorInner {
             }
         }
     }
+}
+
+fn coordinator_http_client(
+    inner: &CoordinatorInner,
+) -> Result<&'static reqwest::Client, OAuthPublicError> {
+    inner
+        .transport
+        .client()
+        .ok_or_else(|| OAuthPublicError::new("oauth_transport_unavailable", true))
 }
 
 /// Cloneable coordinator handle. Start is a bounded actor handoff; status,
@@ -2680,13 +2689,6 @@ impl OAuthCoordinator {
         if config.max_flows == 0 || config.max_invalid_callbacks == 0 {
             return Err(OAuthPublicError::new("invalid_oauth_limits", false));
         }
-        // This shallow clone keeps the shared client's pool and exact OAuth
-        // transport policy; it does not construct another transport or alter
-        // the coordinator's request path.
-        let client = crate::http_transport::SharedHttpTransport
-            .client()
-            .cloned()
-            .ok_or_else(|| OAuthPublicError::new("oauth_transport_unavailable", true))?;
         let tasks = Arc::new(OwnedTaskSet::new());
         let inner = Arc::new(CoordinatorInner {
             instance_id,
@@ -2698,7 +2700,9 @@ impl OAuthCoordinator {
             shutdown: watch::channel(false).0,
             tasks: Arc::downgrade(&tasks),
             next_flow: AtomicU64::new(0),
-            client,
+            // Keep startup transport-free. The shared TLS client is acquired
+            // by the first OAuth operation that actually needs HTTP.
+            transport: crate::http_transport::SharedHttpTransport,
             vault,
         });
         let (starts, receiver) = mpsc::channel(config.max_flows);
@@ -3262,6 +3266,13 @@ async fn begin_device_flow(
     job: StartJob,
     registration: Arc<OAuthProviderRegistration>,
 ) {
+    let client = match coordinator_http_client(&inner) {
+        Ok(client) => client,
+        Err(error) => {
+            respond_public_error(&job.route, error);
+            return;
+        }
+    };
     let owner_connection = job.owner.connection_id.clone();
     let device_id = if registration.auth_header_set == OAuthAuthHeaderSet::KimiMsh {
         match load_or_create_kimi_device_id(Arc::clone(&inner.vault)).await {
@@ -3274,19 +3285,14 @@ async fn begin_device_flow(
     } else {
         None
     };
-    let authorization = match request_device_authorization(
-        &inner.client,
-        &registration,
-        device_id.as_ref(),
-    )
-    .await
-    {
-        Ok(authorization) => authorization,
-        Err(error) => {
-            respond_public_error(&job.route, error);
-            return;
-        }
-    };
+    let authorization =
+        match request_device_authorization(client, &registration, device_id.as_ref()).await {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                respond_public_error(&job.route, error);
+                return;
+            }
+        };
     if authorization.expires_in == 0
         || authorization.expires_in > MAX_TOKEN_LIFETIME_SECS
         || authorization.interval == 0
@@ -3446,6 +3452,13 @@ async fn run_device_token_flow(
     flow_ttl: Duration,
     mut cancel: watch::Receiver<bool>,
 ) {
+    let client = match coordinator_http_client(&inner) {
+        Ok(client) => client,
+        Err(error) => {
+            set_terminal(&inner, &flow_id, InternalFlowStatus::Failed(error.code));
+            return;
+        }
+    };
     let deadline = tokio::time::sleep(flow_ttl);
     tokio::pin!(deadline);
     loop {
@@ -3462,12 +3475,7 @@ async fn run_device_token_flow(
             }
             () = tokio::time::sleep(interval) => {}
         }
-        let poll = poll_device_token(
-            &inner.client,
-            &registration,
-            &device_code,
-            device_id.as_ref(),
-        );
+        let poll = poll_device_token(client, &registration, &device_code, device_id.as_ref());
         tokio::pin!(poll);
         let result = tokio::select! {
             _ = &mut deadline => {
@@ -3889,8 +3897,19 @@ async fn run_callback_flow(
                     CallbackResult::Code(code) => {
                         let _ = send_callback_page(&mut stream, 200, SUCCESS_HTML).await;
                         set_terminal(&inner, &flow_id, InternalFlowStatus::Exchanging);
+                        let client = match coordinator_http_client(&inner) {
+                            Ok(client) => client,
+                            Err(error) => {
+                                set_terminal(
+                                    &inner,
+                                    &flow_id,
+                                    InternalFlowStatus::Failed(error.code),
+                                );
+                                return;
+                            }
+                        };
                         let exchange = exchange_authorization_code(
-                            &inner.client,
+                            client,
                             &registration,
                             code.as_slice(),
                             expected_state.as_bytes(),
