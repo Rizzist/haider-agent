@@ -326,7 +326,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     .await;
 
-    drop(liveness);
+    let _ = liveness;
     let exited = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if daemon.child.try_wait()?.is_some() {
