@@ -93,7 +93,7 @@ use haider_protocol::verify::VerifyVerdict;
 use haider_provider::{
     Message, PROVIDER_DEADLINE_SAFETY_MARGIN, PromptCacheMetadata, Provider, ProviderError,
     ProviderErrorKind, ProviderStream, ProviderStreamItem, ProviderTimeoutReason,
-    ROUTE_STATE_POLL_INTERVAL, ResolvedAttachment, ToolDefinition, TurnRequest,
+    ROUTE_STATE_POLL_INTERVAL, ResolvedAttachment, ToolDefinition, TurnRequest, TurnTraceContext,
     apply_tool_result_image_budget, before_provider_request_deadline, canonical_tool_definitions,
     canonical_tool_definitions_digest, deadline_exhausted_error,
     degrade_tool_result_images_to_placeholders, effective_request_budget,
@@ -429,6 +429,89 @@ pub const CONTEXT_SUMMARY_TIER_PERCENT: u64 = 85;
 pub const CONTEXT_STRUCTURAL_TIER_ONE_RETAINED_TOOL_PAIRS: usize = 24;
 pub const CONTEXT_STRUCTURAL_TIER_TWO_RETAINED_TOOL_PAIRS: usize = 12;
 
+static TURN_TRACE_REGISTRY: OnceLock<Mutex<HashMap<RunId, TurnTraceContext>>> = OnceLock::new();
+
+/// Stable numeric correlation shared by daemon and client trace records. The
+/// FNV-1a digest is deliberately one-way diagnostic metadata: the session ID
+/// itself is never emitted, and the accepted sequence disambiguates turns in
+/// one session.
+#[doc(hidden)]
+#[must_use]
+pub fn turn_trace_ordinal(session_id: &SessionId, accepted_seq: u64) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in session_id
+        .as_str()
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(accepted_seq.to_le_bytes())
+    {
+        digest ^= u64::from(byte);
+        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    digest.max(1)
+}
+
+/// Registers one content-free trace context after durable turn acceptance.
+/// The run ID is only an in-process lookup key and is never emitted.
+#[doc(hidden)]
+pub fn register_turn_trace(run_id: RunId, trace: TurnTraceContext) {
+    let mut registry = TURN_TRACE_REGISTRY
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    registry.insert(run_id, trace);
+}
+
+/// Returns the accepted trace context for worker/provider setup.
+#[doc(hidden)]
+#[must_use]
+pub fn registered_turn_trace(run_id: &RunId) -> Option<TurnTraceContext> {
+    TURN_TRACE_REGISTRY.get().and_then(|registry| {
+        registry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(run_id)
+            .cloned()
+    })
+}
+
+/// Resolves a committed run batch without exposing its durable identity to
+/// telemetry. One journal append never spans logical runs.
+#[doc(hidden)]
+#[must_use]
+pub fn turn_trace_for_envelopes(envelopes: &[RawEnvelope]) -> Option<TurnTraceContext> {
+    envelopes
+        .iter()
+        .find_map(|envelope| envelope.run_id.as_ref())
+        .and_then(registered_turn_trace)
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn envelopes_contain_terminal(envelopes: &[RawEnvelope]) -> bool {
+    envelopes.iter().any(raw_envelope_is_terminal)
+}
+
+/// Releases the registry's bounded lookup after a terminal batch has been
+/// committed and published. Live actor/provider owners may retain their Arc
+/// briefly, but no future turn can resolve this entry.
+#[doc(hidden)]
+pub fn unregister_turn_trace_for_envelopes(envelopes: &[RawEnvelope]) {
+    let Some(run_id) = envelopes
+        .iter()
+        .find_map(|envelope| envelope.run_id.as_ref())
+    else {
+        return;
+    };
+    if let Some(registry) = TURN_TRACE_REGISTRY.get() {
+        registry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(run_id);
+    }
+}
+
 /// Immutable identity and fencing parameters for one session actor.
 #[derive(Debug, Clone)]
 pub struct HarnessConfig {
@@ -600,6 +683,9 @@ pub struct HarnessConfig {
     /// to `Duration::ZERO` to disable coalescing and restore one durable
     /// envelope per provider delta for a deployment that needs that cadence.
     pub stream_delta_coalesce_window: std::time::Duration,
+    /// Content-free, opt-in per-turn timing correlation. `None` is the normal
+    /// trace-off path and performs no counters or clock reads.
+    pub turn_trace: Option<TurnTraceContext>,
     /// Optional supervisor-owned event namespace shared by every turn actor
     /// and effect journal in one worker generation.
     event_ids: Option<Arc<EventIdGenerator>>,
@@ -696,6 +782,7 @@ impl HarnessConfig {
             deferred_command_capacity: DEFAULT_DEFERRED_COMMAND_CAPACITY,
             supervisor_commits_cancelled: false,
             stream_delta_coalesce_window: STREAM_DELTA_COALESCE_WINDOW,
+            turn_trace: None,
             event_ids: None,
             started_at_ms: None,
         }
@@ -3442,6 +3529,11 @@ impl HarnessActor {
             } else {
                 provider.prepare_turn_owned(&mut provider_request)
             };
+            if let (Some(prepared), Some(trace)) =
+                (prepared.as_mut(), self.config.turn_trace.as_ref())
+            {
+                prepared.set_turn_trace(trace.clone(), provider_request_ordinal);
+            }
             let retained_wire = prepared
                 .as_ref()
                 .is_some_and(haider_provider::PreparedTurn::has_rendered_wire);
@@ -3683,6 +3775,11 @@ impl HarnessActor {
                 } else {
                     None
                 };
+            let request_attempt_commit_started = self
+                .config
+                .turn_trace
+                .as_ref()
+                .map(TurnTraceContext::now_us_from_accept);
             let persisted_provider_view = match self
                 .commit_request_attempt(
                     &run_id,
@@ -3700,6 +3797,17 @@ impl HarnessActor {
                 Ok(stored) => stored,
                 Err(error) => return self.errored_state_outcome(&run_id, error).await,
             };
+            if let (Some(trace), Some(started)) =
+                (&self.config.turn_trace, request_attempt_commit_started)
+            {
+                trace.emit(
+                    "request_attempt_commit",
+                    provider_request_ordinal,
+                    0,
+                    started,
+                    trace.now_us_from_accept(),
+                );
+            }
             if let Some(stored_provider_view) = persisted_provider_view {
                 previous_provider_view = Some(stored_provider_view);
             }
@@ -3711,6 +3819,11 @@ impl HarnessActor {
             let mut request_usage: Option<Usage> = None;
             let mut pending_usage_commit: Option<PendingUsageCommit> = None;
             let attempt_provider = Arc::clone(&provider);
+            let provider_open_started = self
+                .config
+                .turn_trace
+                .as_ref()
+                .map(TurnTraceContext::now_us_from_accept);
             let mut opening = Box::pin(before_provider_request_deadline(
                 self.config.provider_deadline,
                 attempt_provider.stream_prepared_turn_ref(&provider_request, prepared),
@@ -3929,7 +4042,20 @@ impl HarnessActor {
                     drop(provider_budget_permit.take());
                 }
                 match opened {
-                    Ok(stream) => break stream,
+                    Ok(stream) => {
+                        if let (Some(trace), Some(started)) =
+                            (&self.config.turn_trace, provider_open_started)
+                        {
+                            trace.emit(
+                                "provider_open",
+                                provider_request_ordinal,
+                                0,
+                                started,
+                                trace.now_us_from_accept(),
+                            );
+                        }
+                        break stream;
+                    }
                     Err(error) if error.kind == ProviderErrorKind::ContextExceeded => {
                         let compacted = if request_projection_compacted || compaction_guard_consumed
                         {
@@ -4079,6 +4205,12 @@ impl HarnessActor {
                 message.as_ref().is_some_and(|item| !item.text.is_empty())
                     || reasoning.as_ref().is_some_and(|item| !item.text.is_empty())
                     || replay.has_applied_content();
+            let mut first_provider_event_seen = false;
+            let provider_stream_started = self
+                .config
+                .turn_trace
+                .as_ref()
+                .map(TurnTraceContext::now_us_from_accept);
             loop {
                 // Coalesce only a Finish already buffered immediately after
                 // Usage. If polling would suspend, preserve the old durability
@@ -4302,6 +4434,15 @@ impl HarnessActor {
                 });
                 let event = match next {
                     Ok(event) => {
+                        if !first_provider_event_seen {
+                            first_provider_event_seen = true;
+                            if let (Some(trace), Some(started)) =
+                                (&self.config.turn_trace, provider_stream_started)
+                            {
+                                let _ = started;
+                                trace.emit_first_byte(provider_request_ordinal);
+                            }
+                        }
                         if !matches!(
                             event,
                             StreamEvent::UsageUpdate(_)
@@ -5172,6 +5313,17 @@ impl HarnessActor {
                         }
                     }
                     StreamEvent::Finish { reason } => {
+                        if let (Some(trace), Some(started)) =
+                            (&self.config.turn_trace, provider_stream_started)
+                        {
+                            trace.emit(
+                                "provider_stream",
+                                provider_request_ordinal,
+                                0,
+                                started,
+                                trace.now_us_from_accept(),
+                            );
+                        }
                         if let Some(guard) = self.config.provider_budget_guard.clone()
                             && let Err(error) = guard
                                 .after_request(
@@ -9942,12 +10094,26 @@ impl HarnessActor {
         envelopes: Vec<RawEnvelope>,
     ) -> Result<Arc<[RawEnvelope]>, HaiderError> {
         let committed = self.store.append_owned(envelopes).await?;
+        let fanout_started = self
+            .config
+            .turn_trace
+            .as_ref()
+            .map(TurnTraceContext::now_us_from_accept);
         if self.events.receiver_count() != 0 {
             for envelope in committed.iter() {
                 let _ = self.events.send(envelope.clone());
             }
         }
         let _ = self.committed_batches.send(Arc::clone(&committed));
+        if let (Some(trace), Some(started)) = (&self.config.turn_trace, fanout_started) {
+            trace.emit(
+                "core_event_fanout",
+                0,
+                0,
+                started,
+                trace.now_us_from_accept(),
+            );
+        }
         Ok(committed)
     }
 
@@ -10095,6 +10261,21 @@ impl HarnessActor {
             self.deferred_commands.push_back(command);
         }
     }
+}
+
+fn raw_envelope_is_terminal(envelope: &RawEnvelope) -> bool {
+    envelope
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        == Some("run_state")
+        && matches!(
+            envelope
+                .payload
+                .get("state")
+                .and_then(serde_json::Value::as_str),
+            Some("done" | "errored" | "cancelled")
+        )
 }
 
 fn context_footprint_extension(

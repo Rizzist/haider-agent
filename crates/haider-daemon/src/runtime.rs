@@ -1161,15 +1161,6 @@ async fn run_inner(
                     .recover_child_wait(recovered.accepted, recovered.checkpoint)
                     .await
             }
-            RecoveredWork::AdmissionRetry(recovered) => {
-                worker_handle
-                    .recover_admission_retry(
-                        recovered.accepted,
-                        recovered.provider_requests_consumed,
-                        recovered.provider_request_ordinal,
-                    )
-                    .await
-            }
             RecoveredWork::WorkflowContinuation(recovered) => {
                 worker_handle
                     .recover_workflow_continuation(

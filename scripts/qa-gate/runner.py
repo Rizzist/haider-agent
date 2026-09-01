@@ -76,7 +76,7 @@ def execute_check(
                 "wall_ms": round((time.monotonic() - started) * 1_000),
                 "artefacts": [],
                 "timed": check.timed,
-                "measurement_accepted": measurement_accepted if check.timed else None,
+                "measurement_accepted": False if check.timed else None,
                 "budget": {
                     "total_ms": check.budget.milliseconds,
                     "parts": [
@@ -144,6 +144,9 @@ def execute_check(
             )
         )
     status = aggregate_status(evidence)
+    local_measurement_accepted = measurement_accepted and not any(
+        item.status == "ENV_BLOCKED" for item in evidence
+    )
     artefacts = _artifact_names(evidence)
     daemon_versions: set[str] = set()
     if context is not None:
@@ -160,7 +163,7 @@ def execute_check(
         "wall_ms": wall_ms,
         "artefacts": artefacts,
         "timed": check.timed,
-        "measurement_accepted": measurement_accepted if check.timed else None,
+        "measurement_accepted": local_measurement_accepted if check.timed else None,
         "budget": {
             "total_ms": check.budget.milliseconds,
             "parts": [

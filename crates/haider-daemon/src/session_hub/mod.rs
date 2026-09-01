@@ -135,7 +135,8 @@ use haider_core::{
     SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
     ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, SwitchedGraph, TurnAcceptCommand,
     TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
-    TurnCancellationStatus,
+    TurnCancellationStatus, TurnTraceContext, envelopes_contain_terminal, register_turn_trace,
+    turn_trace_for_envelopes, turn_trace_ordinal, unregister_turn_trace_for_envelopes,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::agent::AgentManifest;
@@ -172,6 +173,7 @@ use haider_rpc::{
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
@@ -803,6 +805,116 @@ struct NoopObserver;
 
 impl SessionHubObserver for NoopObserver {
     fn observe(&self, _observation: HubObservation) {}
+}
+
+/// Test-only process boundary recorder used by the turn durability sweep.
+///
+/// A `Persisted` observation is emitted synchronously after the store reports
+/// a successful transaction and before the actor publishes or starts the next
+/// external action. The observer records that boundary durably, then parks the
+/// actor at one requested ordinal until the owning test sends SIGKILL. Release
+/// builds retain the seam so the installed-binary QA gate can exercise the
+/// real daemon, but it is inert unless the explicitly test-named environment
+/// variables are present.
+struct JournalBoundaryObserver {
+    ledger: PathBuf,
+    kill_after_ordinal: Option<u64>,
+    next_ordinal: Mutex<u64>,
+}
+
+impl SessionHubObserver for JournalBoundaryObserver {
+    fn observe(&self, observation: HubObservation) {
+        let HubObservation::Persisted { through_seq, .. } = observation else {
+            return;
+        };
+        // Allocation, durable row append, and the optional park are one
+        // serialized test boundary. Concurrent session actors therefore
+        // cannot reorder ordinal rows around the process kill.
+        let mut next_ordinal = self
+            .next_ordinal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *next_ordinal = next_ordinal.saturating_add(1);
+        let ordinal = *next_ordinal;
+        let recorded = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut ledger = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.ledger)?;
+            writeln!(ledger, "{ordinal}\t{through_seq}")?;
+            ledger.sync_data()
+        })();
+        if let Err(error) = recorded {
+            tracing::error!(
+                target: "haider.turn",
+                operation_micros = 0_u64,
+                "test journal-boundary ledger write failed: {error}"
+            );
+            return;
+        }
+        if self.kill_after_ordinal == Some(ordinal) {
+            loop {
+                std::thread::park_timeout(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+fn configured_session_hub_observer() -> Result<Arc<dyn SessionHubObserver>, SessionHubError> {
+    const FILE_ENV: &str = "HAIDER_TEST_JOURNAL_BOUNDARY_FILE";
+    const ORDINAL_ENV: &str = "HAIDER_TEST_JOURNAL_KILL_AFTER";
+    let Some(ledger) = std::env::var_os(FILE_ENV) else {
+        if std::env::var_os(ORDINAL_ENV).is_some() {
+            return Err(SessionHubError::Task(format!(
+                "{ORDINAL_ENV} requires {FILE_ENV}"
+            )));
+        }
+        return Ok(Arc::new(NoopObserver));
+    };
+    let ledger = PathBuf::from(ledger);
+    if ledger.as_os_str().is_empty() || !ledger.is_absolute() {
+        return Err(SessionHubError::Task(format!(
+            "{FILE_ENV} must name an absolute test ledger path"
+        )));
+    }
+    let profile = std::env::var_os("HAIDER_PROFILE_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| SessionHubError::Task(format!("{FILE_ENV} requires HAIDER_PROFILE_DIR")))?;
+    let profile = std::fs::canonicalize(&profile).map_err(|error| {
+        SessionHubError::Task(format!("cannot resolve test profile directory: {error}"))
+    })?;
+    let parent = ledger
+        .parent()
+        .ok_or_else(|| SessionHubError::Task(format!("{FILE_ENV} has no parent directory")))?;
+    let parent = std::fs::canonicalize(parent).map_err(|error| {
+        SessionHubError::Task(format!("cannot resolve test boundary directory: {error}"))
+    })?;
+    if !parent.starts_with(&profile) {
+        return Err(SessionHubError::Task(format!(
+            "{FILE_ENV} must stay inside HAIDER_PROFILE_DIR"
+        )));
+    }
+    let kill_after_ordinal = std::env::var(ORDINAL_ENV)
+        .ok()
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| {
+                SessionHubError::Task(format!(
+                    "{ORDINAL_ENV} must be a positive journal boundary ordinal"
+                ))
+            })
+        })
+        .transpose()?;
+    if kill_after_ordinal == Some(0) {
+        return Err(SessionHubError::Task(format!(
+            "{ORDINAL_ENV} must be a positive journal boundary ordinal"
+        )));
+    }
+    Ok(Arc::new(JournalBoundaryObserver {
+        ledger,
+        kill_after_ordinal,
+        next_ordinal: Mutex::new(0),
+    }))
 }
 
 // ──────────────────── hub state, task ownership, errors ─────────────────────
@@ -2106,7 +2218,12 @@ impl SessionHub {
         config: SessionHubConfig,
         pipe_native: Arc<crate::pipe_native::PipeNativeWriter>,
     ) -> Result<Self, SessionHubError> {
-        Self::with_observer_and_pipe_native(store, config, Arc::new(NoopObserver), pipe_native)
+        Self::with_observer_and_pipe_native(
+            store,
+            config,
+            configured_session_hub_observer()?,
+            pipe_native,
+        )
     }
 
     /// Creates a hub with a semantic-boundary observer.

@@ -46,6 +46,7 @@ use haider_protocol::tool::{
 };
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::error::Error as _;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,6 +60,118 @@ use tokio::time::{Duration, Instant, sleep};
 /// reveal fresher state. The absolute run deadline is owned outside these
 /// clocks and is never sampled, moved, or suspended here.
 pub const ROUTE_STATE_POLL_INTERVAL: Duration = haider_platform::ROUTE_STATUS_CACHE_TTL;
+
+/// Process-local opt-in gate shared by every instrumentation layer. Keeping
+/// this one cached branch ahead of task-local, registry, and batch scans makes
+/// the normal trace-off path allocation- and clock-free.
+#[must_use]
+pub fn turn_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("HAIDER_DAEMON_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Content-free timing identity shared by one accepted turn and its provider
+/// decoder tasks. The context exists only when the daemon's audited
+/// `haider.turn` subscriber is enabled; request bodies, run IDs, and session
+/// IDs never enter the trace record.
+#[derive(Debug, Clone)]
+pub struct TurnTraceContext {
+    inner: Arc<TurnTraceInner>,
+}
+
+#[derive(Debug)]
+struct TurnTraceInner {
+    turn_ordinal: u64,
+    accepted_at: Instant,
+    next_txn_ordinal: AtomicU64,
+    txn_ordinals: Mutex<HashMap<String, u64>>,
+    first_byte_requests: AtomicU64,
+}
+
+impl TurnTraceContext {
+    #[must_use]
+    pub fn new(turn_ordinal: u64) -> Self {
+        Self {
+            inner: Arc::new(TurnTraceInner {
+                turn_ordinal,
+                accepted_at: Instant::now(),
+                next_txn_ordinal: AtomicU64::new(1),
+                txn_ordinals: Mutex::new(HashMap::new()),
+                first_byte_requests: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn turn_ordinal(&self) -> u64 {
+        self.inner.turn_ordinal
+    }
+
+    #[must_use]
+    pub fn now_us_from_accept(&self) -> u64 {
+        u64::try_from(self.inner.accepted_at.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+
+    #[must_use]
+    pub fn txn_ordinal_for(&self, durable_event_id: &str) -> u64 {
+        let mut ordinals = self
+            .inner
+            .txn_ordinals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(ordinal) = ordinals.get(durable_event_id) {
+            return *ordinal;
+        }
+        let ordinal = self.inner.next_txn_ordinal.fetch_add(1, Ordering::Relaxed);
+        ordinals.insert(durable_event_id.to_owned(), ordinal);
+        ordinal
+    }
+
+    pub fn emit(
+        &self,
+        phase: &'static str,
+        request_ordinal: u64,
+        txn_ordinal: u64,
+        start_us_from_accept: u64,
+        end_us_from_accept: u64,
+    ) {
+        tracing::trace!(
+            target: "haider.turn",
+            phase,
+            turn_ordinal = self.inner.turn_ordinal,
+            request_ordinal,
+            txn_ordinal,
+            start_us_from_accept,
+            end_us_from_accept,
+            operation_micros = end_us_from_accept.saturating_sub(start_us_from_accept),
+            "turn stage completed"
+        );
+    }
+
+    /// Emits exactly one raw-first-byte point per provider request. Built-in
+    /// HTTP adapters call this before decoding; core calls the same method as
+    /// the compatibility fallback for injected providers.
+    pub fn emit_first_byte(&self, request_ordinal: u64) {
+        let bit = request_ordinal
+            .checked_sub(1)
+            .filter(|ordinal| *ordinal < u64::BITS.into())
+            .map(|ordinal| 1_u64 << ordinal);
+        if let Some(bit) = bit
+            && self
+                .inner
+                .first_byte_requests
+                .fetch_or(bit, Ordering::Relaxed)
+                & bit
+                != 0
+        {
+            return;
+        }
+        let at = self.now_us_from_accept();
+        self.emit("first_byte", request_ordinal, 0, at, at);
+    }
+}
 
 /// Which route-gated provider progress clock exhausted its active time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1666,6 +1779,7 @@ pub struct PreparedTurn {
     pub(crate) provider_view: Option<PreparedProviderView>,
     pub(crate) provider_view_storage_blobs: Vec<haider_protocol::cache::ProviderViewBlobV1>,
     pub(crate) wire: Option<PreparedWire>,
+    pub(crate) turn_trace: Option<(TurnTraceContext, u64)>,
 }
 
 pub(crate) struct PreparedWire {
@@ -1724,10 +1838,21 @@ impl PreparedTurn {
             std::mem::take(&mut self.provider_view_storage_blobs)
         }
     }
+
+    /// Attaches content-free timing coordinates after the request ordinal is
+    /// durably planned. This metadata is process-local and never serialized
+    /// into provider bytes or journal facts.
+    pub fn set_turn_trace(&mut self, trace: TurnTraceContext, request_ordinal: u64) {
+        self.turn_trace = Some((trace, request_ordinal));
+    }
 }
 
 tokio::task_local! {
     static PREPARED_WIRE_PAYLOAD: RefCell<Option<PreparedWire>>;
+}
+
+tokio::task_local! {
+    static TURN_TRACE_CONTEXT: Option<(TurnTraceContext, u64)>;
 }
 
 tokio::task_local! {
@@ -1741,14 +1866,22 @@ pub(crate) fn take_prepared_wire_payload() -> Option<PreparedWire> {
         .flatten()
 }
 
+pub(crate) fn current_turn_trace_context() -> Option<(TurnTraceContext, u64)> {
+    TURN_TRACE_CONTEXT.try_with(Clone::clone).ok().flatten()
+}
+
 pub(crate) async fn scope_prepared_wire<T>(
     prepared: Option<PreparedTurn>,
     future: impl std::future::Future<Output = T>,
 ) -> T {
-    let payload = prepared.and_then(|prepared| prepared.wire);
-    PREPARED_WIRE_PAYLOAD
-        .scope(RefCell::new(payload), future)
-        .await
+    let (payload, turn_trace) = prepared.map_or((None, None), |prepared| {
+        (prepared.wire, prepared.turn_trace)
+    });
+    let wire = PREPARED_WIRE_PAYLOAD.scope(RefCell::new(payload), future);
+    match turn_trace {
+        Some(turn_trace) => TURN_TRACE_CONTEXT.scope(Some(turn_trace), wire).await,
+        None => wire.await,
+    }
 }
 
 /// Typed reason attached to a local provider timeout. Additive serialization
@@ -2375,6 +2508,7 @@ pub trait Provider: Send + Sync {
                 provider_view: None,
                 provider_view_storage_blobs: Vec::new(),
                 wire: None,
+                turn_trace: None,
             })
     }
 
@@ -3095,6 +3229,14 @@ impl Utf8Assembler {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod e2_contract_tests {
     use super::*;
+
+    #[test]
+    fn turn_trace_transaction_ordinal_is_shared_by_batch_identity() {
+        let trace = TurnTraceContext::new(7);
+        assert_eq!(trace.txn_ordinal_for("event-a"), 1);
+        assert_eq!(trace.txn_ordinal_for("event-a"), 1);
+        assert_eq!(trace.txn_ordinal_for("event-b"), 2);
+    }
 
     #[tokio::test]
     async fn loopback_connection_refusal_without_negative_route_is_transport() {

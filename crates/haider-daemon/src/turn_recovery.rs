@@ -106,15 +106,8 @@ pub(crate) enum RecoveredWork {
     PartialStream(Box<RecoveredPartialStream>),
     RouteWait(Box<RecoveredRouteWait>),
     ChildWait(Box<RecoveredChildWait>),
-    AdmissionRetry(Box<RecoveredAdmissionRetry>),
     WorkflowContinuation(Box<RecoveredWorkflowContinuation>),
     DelegationMirror(Box<RecoveredDelegationMirror>),
-}
-
-pub(crate) struct RecoveredAdmissionRetry {
-    pub(crate) accepted: AcceptedTurn,
-    pub(crate) provider_requests_consumed: usize,
-    pub(crate) provider_request_ordinal: u64,
 }
 
 pub(crate) struct RecoveredWorkflowContinuation {
@@ -511,10 +504,24 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                 }
                 continue;
             }
-            if let Some(retry) =
-                pending_admission_retry(store, &session_id, &run_id, &state, &reduction)?
-            {
-                recovered.push(RecoveredWork::AdmissionRetry(Box::new(retry)));
+            if first_provider_delivery_is_ambiguous(&state, &reduction) {
+                // The durable attempt marker precedes provider transport, but
+                // after process death it cannot prove whether the POST reached
+                // the provider. Reissuing the same logical ordinal can create
+                // two physical requests. Fail closed with the ordinary typed
+                // interrupted terminal; the journal remains the sole recovery
+                // authority and replay never contacts the provider.
+                terminalize_interrupted(
+                    store,
+                    device_id,
+                    &session_id,
+                    &run_id,
+                    reduction.branch_id.clone(),
+                    reduction,
+                    matches!(state, RunState::Cancelling),
+                )
+                .await?;
+                touched = true;
                 continue;
             }
             if let Some(continuation) =
@@ -783,43 +790,7 @@ pub(crate) async fn recover_interrupted_turns(
     .work)
 }
 
-fn pending_admission_retry(
-    store: &SqliteStoreHandle,
-    session_id: &SessionId,
-    run_id: &RunId,
-    state: &RunState,
-    reduction: &RunReduction,
-) -> Result<Option<RecoveredAdmissionRetry>, HaiderError> {
-    if !admitted_first_request_has_no_response(state, reduction) {
-        return Ok(None);
-    }
-    let accepted_seq = reduction.user_seq.ok_or_else(|| {
-        HaiderError::new(
-            ErrorCode::StoreCorrupt,
-            format!("admission-retry run {run_id} has no user message"),
-            false,
-        )
-    })?;
-    let provider_request_ordinal = reduction
-        .latest_provider_request_attempt
-        .map_or(0, |(_, ordinal)| ordinal.saturating_sub(1));
-    Ok(Some(RecoveredAdmissionRetry {
-        accepted: recovered_acceptance(
-            session_id,
-            run_id,
-            accepted_seq,
-            store.worker_generation(),
-            reduction.branch_id.clone(),
-        ),
-        // This exact shape is the first logical request. Its durable marker
-        // proves admission, not completion, so recovery re-enters request one
-        // with the ordinal seed rewound from 1 to 0.
-        provider_requests_consumed: 0,
-        provider_request_ordinal,
-    }))
-}
-
-fn admitted_first_request_has_no_response(state: &RunState, reduction: &RunReduction) -> bool {
+fn first_provider_delivery_is_ambiguous(state: &RunState, reduction: &RunReduction) -> bool {
     let Some((attempt_seq, ordinal)) = reduction.latest_provider_request_attempt else {
         return false;
     };
@@ -1822,7 +1793,7 @@ mod composite_recovery_tests {
     /// response fact and the final assertion flips true, allowing a daemon
     /// restart to replay provider work after response delivery began.
     #[test]
-    fn admitted_first_request_retries_only_before_any_response_fact() {
+    fn first_provider_delivery_is_ambiguous_only_before_any_response_fact() {
         let mut reduction = RunReduction {
             state: Some((RunState::Thinking, 5)),
             user_seq: Some(1),
@@ -1830,19 +1801,19 @@ mod composite_recovery_tests {
             latest_provider_request_attempt: Some((6, 1)),
             ..RunReduction::default()
         };
-        assert!(admitted_first_request_has_no_response(
+        assert!(first_provider_delivery_is_ambiguous(
             &RunState::Thinking,
             &reduction
         ));
 
         reduction.state = Some((RunState::Streaming, 7));
-        assert!(admitted_first_request_has_no_response(
+        assert!(first_provider_delivery_is_ambiguous(
             &RunState::Streaming,
             &reduction
         ));
 
         reduction.latest_provider_response_seq = Some(8);
-        assert!(!admitted_first_request_has_no_response(
+        assert!(!first_provider_delivery_is_ambiguous(
             &RunState::Streaming,
             &reduction
         ));

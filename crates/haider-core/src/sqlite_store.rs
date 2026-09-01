@@ -1904,6 +1904,25 @@ impl SqliteStoreHandle {
     ) -> Result<Vec<Result<CommitGroupOutcome, HaiderError>>, HaiderError> {
         let owner = Arc::clone(&self.owner);
         let mut failed_write_ids = Vec::new();
+        let trace_transactions = if crate::turn_trace_enabled() {
+            batches
+                .iter()
+                .filter_map(|batch| match batch {
+                    CommitGroupBatch::Append(batch) => {
+                        let trace = crate::turn_trace_for_envelopes(&batch.envelopes)?;
+                        let event = batch.envelopes.first()?;
+                        let txn_ordinal = trace.txn_ordinal_for(event.event_id.as_str());
+                        let started = trace.now_us_from_accept();
+                        Some((trace, txn_ordinal, started))
+                    }
+                    CommitGroupBatch::CreateSession { .. }
+                    | CommitGroupBatch::AcceptTurn { .. }
+                    | CommitGroupBatch::HookAcks(_) => None,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         for batch in &batches {
             match batch {
                 CommitGroupBatch::Append(batch) => failed_write_ids.extend(
@@ -1970,6 +1989,15 @@ impl SqliteStoreHandle {
                     })
                     .collect::<Vec<_>>();
                 let outcomes = store.commit_group(&mut batches)?;
+                for (trace, txn_ordinal, started) in &trace_transactions {
+                    trace.emit(
+                        "journal_transaction",
+                        0,
+                        *txn_ordinal,
+                        *started,
+                        trace.now_us_from_accept(),
+                    );
+                }
                 Ok(batches
                     .into_iter()
                     .zip(outcomes)
@@ -2468,6 +2496,16 @@ impl SqliteStoreHandle {
         request: ProviderViewAppendRequest,
     ) -> Result<ProviderViewAppendOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
+        let trace_transaction = if crate::turn_trace_enabled() {
+            request.envelopes.first().and_then(|event| {
+                let trace = crate::turn_trace_for_envelopes(&request.envelopes)?;
+                let txn_ordinal = trace.txn_ordinal_for(event.event_id.as_str());
+                let started = trace.now_us_from_accept();
+                Some((trace, txn_ordinal, started))
+            })
+        } else {
+            None
+        };
         let failed_write_ids = request
             .envelopes
             .iter()
@@ -2481,7 +2519,7 @@ impl SqliteStoreHandle {
                 attempt_ordinal,
                 mut envelopes,
             } = request;
-            owner.with_store(|store| {
+            let outcome = owner.with_store(|store| {
                 let ledger = store.persist_provider_view_and_append_owned(
                     &session_id,
                     ledger,
@@ -2493,7 +2531,19 @@ impl SqliteStoreHandle {
                     ledger,
                     envelopes: envelopes.into(),
                 })
-            })
+            });
+            if outcome.is_ok()
+                && let Some((trace, txn_ordinal, started)) = &trace_transaction
+            {
+                trace.emit(
+                    "journal_transaction",
+                    0,
+                    *txn_ordinal,
+                    *started,
+                    trace.now_us_from_accept(),
+                );
+            }
+            outcome
         })
         .await;
         match result {

@@ -341,6 +341,17 @@ pub(super) async fn run_session_actor(
             } => {
                 // INVARIANT 1 (module doc): the append is awaited here, and
                 // `publish` below is synchronous in this same turn.
+                let trace = crate::worker::turn_trace_enabled()
+                    .then(|| turn_trace_for_envelopes(&envelopes))
+                    .flatten();
+                let trace_txn = trace.as_ref().and_then(|trace| {
+                    envelopes.first().map(|event| {
+                        (
+                            trace.txn_ordinal_for(event.event_id.as_str()),
+                            trace.now_us_from_accept(),
+                        )
+                    })
+                });
                 let result = append_committer
                     .commit(AppendCommitKind::General, envelopes)
                     .await;
@@ -355,6 +366,28 @@ pub(super) async fn run_session_actor(
                             session_id: session_id.clone(),
                             through_seq: head,
                         });
+                        let terminal = envelopes_contain_terminal(&envelopes);
+                        if let (Some(trace), Some((txn_ordinal, started))) = (&trace, trace_txn) {
+                            let committed_at = trace.now_us_from_accept();
+                            trace.emit(
+                                "journal_append_wait",
+                                0,
+                                txn_ordinal,
+                                started,
+                                committed_at,
+                            );
+                            if terminal {
+                                trace.emit(
+                                    "terminal_commit",
+                                    0,
+                                    txn_ordinal,
+                                    committed_at,
+                                    committed_at,
+                                );
+                            }
+                        }
+                        let fanout_started =
+                            trace.as_ref().map(TurnTraceContext::now_us_from_accept);
                         pipe_sidecar.enqueue(&envelopes);
                         publish_shared(
                             &mut attachments,
@@ -367,6 +400,20 @@ pub(super) async fn run_session_actor(
                             session_id: session_id.clone(),
                             through_seq: head,
                         });
+                        if let (Some(trace), Some((txn_ordinal, _)), Some(started)) =
+                            (&trace, trace_txn, fanout_started)
+                        {
+                            trace.emit(
+                                "event_fanout_projection",
+                                0,
+                                txn_ordinal,
+                                started,
+                                trace.now_us_from_accept(),
+                            );
+                        }
+                        if terminal {
+                            unregister_turn_trace_for_envelopes(&envelopes);
+                        }
                         let _ = completed.send(Ok(envelopes));
                     }
                     Err(error) => {
@@ -877,10 +924,22 @@ pub(super) async fn run_session_actor(
                 let result = append_committer
                     .accept_turn(command, peer_message, auto_title)
                     .await;
-                if let Ok(TurnAcceptOutcome::Committed { envelopes, .. }) = &result {
+                if let Ok(TurnAcceptOutcome::Committed {
+                    accepted,
+                    envelopes,
+                }) = &result
+                {
                     if let Some(last) = envelopes.last() {
                         head = last.seq;
                         authority_epoch = last.authority_epoch;
+                    }
+                    if crate::worker::turn_trace_enabled() {
+                        let trace = TurnTraceContext::new(turn_trace_ordinal(
+                            &accepted.session_id,
+                            accepted.accepted_seq,
+                        ));
+                        trace.emit("accept", 0, 0, 0, 0);
+                        register_turn_trace(accepted.run_id.clone(), trace);
                     }
                     observer.observe(HubObservation::Persisted {
                         session_id: session_id.clone(),
@@ -1184,6 +1243,17 @@ pub(super) async fn run_session_actor(
                 // batch against the durable run head atomically with append.
                 // Re-routing this to ordinary `append` must make the
                 // cancel-before-Done mutation pin fail.
+                let trace = crate::worker::turn_trace_enabled()
+                    .then(|| turn_trace_for_envelopes(&envelopes))
+                    .flatten();
+                let trace_txn = trace.as_ref().and_then(|trace| {
+                    envelopes.first().map(|event| {
+                        (
+                            trace.txn_ordinal_for(event.event_id.as_str()),
+                            trace.now_us_from_accept(),
+                        )
+                    })
+                });
                 let result = append_committer
                     .commit(AppendCommitKind::Worker, envelopes)
                     .await;
@@ -1198,6 +1268,28 @@ pub(super) async fn run_session_actor(
                             session_id: session_id.clone(),
                             through_seq: head,
                         });
+                        let terminal = envelopes_contain_terminal(&envelopes);
+                        if let (Some(trace), Some((txn_ordinal, started))) = (&trace, trace_txn) {
+                            let committed_at = trace.now_us_from_accept();
+                            trace.emit(
+                                "journal_append_wait",
+                                0,
+                                txn_ordinal,
+                                started,
+                                committed_at,
+                            );
+                            if terminal {
+                                trace.emit(
+                                    "terminal_commit",
+                                    0,
+                                    txn_ordinal,
+                                    committed_at,
+                                    committed_at,
+                                );
+                            }
+                        }
+                        let fanout_started =
+                            trace.as_ref().map(TurnTraceContext::now_us_from_accept);
                         pipe_sidecar.enqueue(&envelopes);
                         publish_shared(
                             &mut attachments,
@@ -1210,6 +1302,20 @@ pub(super) async fn run_session_actor(
                             session_id: session_id.clone(),
                             through_seq: head,
                         });
+                        if let (Some(trace), Some((txn_ordinal, _)), Some(started)) =
+                            (&trace, trace_txn, fanout_started)
+                        {
+                            trace.emit(
+                                "event_fanout_projection",
+                                0,
+                                txn_ordinal,
+                                started,
+                                trace.now_us_from_accept(),
+                            );
+                        }
+                        if terminal {
+                            unregister_turn_trace_for_envelopes(&envelopes);
+                        }
                         let _ = completed.send(Ok(envelopes));
                     }
                     Err(error) => {
@@ -1235,6 +1341,17 @@ pub(super) async fn run_session_actor(
                 // store's one transaction indexes them and appends this exact
                 // attempt batch. Publication remains synchronous after that
                 // commit.
+                let trace = crate::worker::turn_trace_enabled()
+                    .then(|| turn_trace_for_envelopes(&request.envelopes))
+                    .flatten();
+                let trace_txn = trace.as_ref().and_then(|trace| {
+                    request.envelopes.first().map(|event| {
+                        (
+                            trace.txn_ordinal_for(event.event_id.as_str()),
+                            trace.now_us_from_accept(),
+                        )
+                    })
+                });
                 let result = store.persist_provider_view_and_append_owned(request).await;
                 match result {
                     Ok(outcome) => {
@@ -1247,6 +1364,28 @@ pub(super) async fn run_session_actor(
                             session_id: session_id.clone(),
                             through_seq: head,
                         });
+                        let terminal = envelopes_contain_terminal(envelopes);
+                        if let (Some(trace), Some((txn_ordinal, started))) = (&trace, trace_txn) {
+                            let committed_at = trace.now_us_from_accept();
+                            trace.emit(
+                                "journal_append_wait",
+                                0,
+                                txn_ordinal,
+                                started,
+                                committed_at,
+                            );
+                            if terminal {
+                                trace.emit(
+                                    "terminal_commit",
+                                    0,
+                                    txn_ordinal,
+                                    committed_at,
+                                    committed_at,
+                                );
+                            }
+                        }
+                        let fanout_started =
+                            trace.as_ref().map(TurnTraceContext::now_us_from_accept);
                         pipe_sidecar.enqueue(envelopes);
                         publish_shared(
                             &mut attachments,
@@ -1259,6 +1398,20 @@ pub(super) async fn run_session_actor(
                             session_id: session_id.clone(),
                             through_seq: head,
                         });
+                        if let (Some(trace), Some((txn_ordinal, _)), Some(started)) =
+                            (&trace, trace_txn, fanout_started)
+                        {
+                            trace.emit(
+                                "event_fanout_projection",
+                                0,
+                                txn_ordinal,
+                                started,
+                                trace.now_us_from_accept(),
+                            );
+                        }
+                        if terminal {
+                            unregister_turn_trace_for_envelopes(envelopes);
+                        }
                         let _ = completed.send(Ok(outcome));
                     }
                     Err(error) => {

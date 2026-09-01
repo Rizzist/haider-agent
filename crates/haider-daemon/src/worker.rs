@@ -72,11 +72,12 @@ use haider_core::{
     ProviderViewAppendRequest, RequestInputCheckpoint, RouteWaitCheckpoint,
     SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks, StoreHandle,
     SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
-    SubmitRouteWaitTurn, ToolDispatchResult, ToolDispatcher, TurnHandle, UserCommandOutput,
-    build_cache_request_diagnostic, build_context_accounting, classify_cache_request,
-    context_soft_threshold_tokens, effect_recovery_evidence,
+    SubmitRouteWaitTurn, ToolDispatchResult, ToolDispatcher, TurnHandle, TurnTraceContext,
+    UserCommandOutput, build_cache_request_diagnostic, build_context_accounting,
+    classify_cache_request, context_soft_threshold_tokens, effect_recovery_evidence,
     estimate_provider_request_bytes_div_four, estimate_provider_request_input_tokens,
-    presentation_for_haider_error, sanitized_failure_message,
+    presentation_for_haider_error, register_turn_trace, registered_turn_trace,
+    sanitized_failure_message,
 };
 use haider_protocol::agent::Grant;
 use haider_protocol::cache::{
@@ -167,6 +168,10 @@ use tokio::task::{JoinHandle, JoinSet};
 
 const MANAGER_CAPACITY: usize = 128;
 const SUPERVISOR_CAPACITY: usize = 64;
+
+pub(crate) fn turn_trace_enabled() -> bool {
+    haider_core::turn_trace_enabled()
+}
 /// A live session remains cheaply reusable for five minutes after its worker
 /// reports durable quiescence. Activity cancels the owned timer; queued,
 /// active, cancelling, recovery, and menu-parked work never reports this
@@ -2374,7 +2379,6 @@ struct PendingTurn {
     provider_requests_already_made: usize,
     provider_request_ordinal_already_made: u64,
     workflow_continuation: bool,
-    admission_retry: bool,
     recovery_ready: Option<oneshot::Sender<Result<(), HaiderError>>>,
     /// Recovery semantics outlive the pre-Ready acknowledgement. In
     /// particular, a queued recovery may be acknowledged behind a parked
@@ -2448,7 +2452,6 @@ impl PendingTurn {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
-            admission_retry: false,
             recovery_ready: None,
             recovering: false,
         }
@@ -2475,7 +2478,6 @@ impl PendingTurn {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
-            admission_retry: false,
             recovery_ready: None,
             recovering: false,
         }
@@ -2801,7 +2803,6 @@ impl WorkerManagerHandle {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
-            admission_retry: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2826,7 +2827,6 @@ impl WorkerManagerHandle {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
-            admission_retry: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2846,7 +2846,6 @@ impl WorkerManagerHandle {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
-            admission_retry: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2872,32 +2871,6 @@ impl WorkerManagerHandle {
             provider_requests_already_made,
             provider_request_ordinal_already_made,
             workflow_continuation: false,
-            admission_retry: false,
-            recovery_ready: Some(completed),
-            recovering: true,
-        })?;
-        response.await.map_err(|_| manager_stopped())?
-    }
-
-    pub(crate) async fn recover_admission_retry(
-        &self,
-        accepted: AcceptedTurn,
-        provider_requests_already_made: usize,
-        provider_request_ordinal_already_made: u64,
-    ) -> Result<(), HaiderError> {
-        let (completed, response) = oneshot::channel();
-        self.send_recovery(PendingTurn {
-            accepted,
-            prompt_run_id: None,
-            checkpoint: None,
-            partial_stream: None,
-            route_wait: None,
-            child_wait: None,
-            committed_answer: None,
-            provider_requests_already_made,
-            provider_request_ordinal_already_made,
-            workflow_continuation: false,
-            admission_retry: true,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2922,7 +2895,6 @@ impl WorkerManagerHandle {
             provider_requests_already_made,
             provider_request_ordinal_already_made,
             workflow_continuation: true,
-            admission_retry: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -2958,7 +2930,6 @@ impl WorkerManagerHandle {
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             workflow_continuation: false,
-            admission_retry: false,
             recovery_ready: Some(completed),
             recovering: true,
         })?;
@@ -5075,7 +5046,6 @@ async fn admit_pending(
         || pending.route_wait.is_some()
         || pending.child_wait.is_some()
         || pending.workflow_continuation
-        || pending.admission_retry
     {
         let queue_changed = queue.len() < SUPERVISOR_CAPACITY;
         if queue.len() < SUPERVISOR_CAPACITY {
@@ -7213,10 +7183,23 @@ async fn start_turn(
         provider_requests_already_made,
         provider_request_ordinal_already_made,
         workflow_continuation: _,
-        admission_retry,
         recovery_ready: _,
         recovering: _,
     } = pending;
+    let turn_trace = turn_trace_enabled().then(|| {
+        registered_turn_trace(&accepted.run_id).unwrap_or_else(|| {
+            // Recovery and lost-response receipt paths can reach the worker
+            // without the live AcceptTurn arm. Anchor them at worker pickup
+            // while retaining the same accepted-sequence correlation.
+            let trace = TurnTraceContext::new(haider_core::turn_trace_ordinal(
+                &accepted.session_id,
+                accepted.accepted_seq,
+            ));
+            trace.emit("accept", 0, 0, 0, 0);
+            register_turn_trace(accepted.run_id.clone(), trace.clone());
+            trace
+        })
+    });
     let headless = headless_run_context(lease, &accepted.run_id).await?;
     let mut provider_deadline = headless.as_ref().and_then(provider_request_deadline);
     let mut pinned_metadata = metadata.clone();
@@ -7339,13 +7322,13 @@ async fn start_turn(
             });
         }
     }
-    if (route_wait.is_some() || admission_retry)
+    if route_wait.is_some()
         && let Some(check) = budget_check.as_ref()
     {
         // Recovery reconstructs coordinators from durable facts, so there is
         // no in-memory permit/projection to release. Mark the already admitted
-        // physical attempt as the one the exact route/admission retry will
-        // supersede before the budget monitor starts; the run's absolute
+        // physical attempt as the one the exact route retry will supersede
+        // before the budget monitor starts; the run's absolute
         // time/cost limits remain armed throughout the wait.
         check
             .coordinator
@@ -7792,6 +7775,7 @@ async fn start_turn(
         lease.worker_generation(),
     )
     .with_event_ids(Arc::clone(&event_ids));
+    config.turn_trace = turn_trace;
     config.provider_deadline = provider_deadline;
     let provider_request_state = provider_derived_request_state(
         &resolved.provider_name,
@@ -7813,7 +7797,7 @@ async fn start_turn(
         haider_core::InteractionResolutionPolicy::new(metadata.interaction_mode);
     config.provider_requests_already_made = provider_requests_already_made;
     config.provider_request_ordinal_already_made = provider_request_ordinal_already_made;
-    config.recovery_request_local_usage = admission_retry;
+    config.recovery_request_local_usage = false;
     if let Some(limit) = dependencies
         .provider_factory
         .max_provider_requests_per_turn_override()

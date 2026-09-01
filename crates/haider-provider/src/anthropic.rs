@@ -1017,6 +1017,7 @@ impl AnthropicProvider {
         let chunk_idle_timeout = self.transport_config.chunk_idle_timeout;
         let semantic_progress_timeout = self.transport_config.semantic_progress_timeout;
         let route_gating = self.route_gating();
+        let turn_trace = crate::current_turn_trace_context();
         let producer = tokio::spawn(async move {
             stream_response(
                 response,
@@ -1026,6 +1027,7 @@ impl AnthropicProvider {
                 semantic_progress_timeout,
                 native_computer,
                 route_gating,
+                turn_trace,
             )
             .await;
         });
@@ -1378,6 +1380,7 @@ impl AnthropicProvider {
                 payload: full_payload.commit(),
                 history_boundary: None,
             }),
+            turn_trace: None,
         })
     }
 }
@@ -1547,29 +1550,19 @@ async fn stream_response(
     semantic_progress_timeout: Duration,
     native_computer: bool,
     route_gating: crate::RouteGating,
+    turn_trace: Option<(crate::TurnTraceContext, u64)>,
 ) {
-    if native_computer {
-        stream_sse_source_with_native(
-            response,
-            account,
-            sender,
-            chunk_idle_timeout,
-            semantic_progress_timeout,
-            true,
-            route_gating,
-        )
-        .await;
-    } else {
-        stream_sse_source(
-            response,
-            account,
-            sender,
-            chunk_idle_timeout,
-            semantic_progress_timeout,
-            route_gating,
-        )
-        .await;
-    }
+    stream_sse_source_with_native(
+        response,
+        account,
+        sender,
+        chunk_idle_timeout,
+        semantic_progress_timeout,
+        native_computer,
+        route_gating,
+        turn_trace,
+    )
+    .await;
 }
 
 pub(crate) trait SseChunkSource {
@@ -1590,6 +1583,7 @@ impl SseChunkSource for reqwest::Response {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn stream_sse_source<S: SseChunkSource>(
     source: S,
     account: Option<CredentialAlias>,
@@ -1606,6 +1600,7 @@ pub(crate) async fn stream_sse_source<S: SseChunkSource>(
         semantic_progress_timeout,
         false,
         route_gating,
+        crate::current_turn_trace_context(),
     )
     .await;
 }
@@ -1618,6 +1613,7 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
     semantic_progress_timeout: Duration,
     native_computer: bool,
     route_gating: crate::RouteGating,
+    turn_trace: Option<(crate::TurnTraceContext, u64)>,
 ) {
     let mut decoder = SseDecoder::with_native_computer(account, native_computer);
     let mut progress = crate::ProviderProgressClock::new(
@@ -1656,6 +1652,9 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
                 return;
             }
         };
+        if let Some((trace, request_ordinal)) = &turn_trace {
+            trace.emit_first_byte(*request_ordinal);
+        }
         progress.observe_raw_chunk();
         let items = decoder.push(chunk.as_ref());
         if crate::has_semantic_progress(&items) {

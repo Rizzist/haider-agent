@@ -1023,12 +1023,11 @@ fn detached_run_lifecycle_is_addressable_by_run_id() {
 }
 
 /// A process death after durable provider admission but before the first
-/// response is a retry boundary, not an Internal/Errored terminal. The
-/// recovery CLI has no effect-ambiguity card to probe in this case, so its
-/// `no_recovery` diagnostic must observe the replacement run as `running`.
+/// response is ambiguous: the POST may have reached the provider. Recovery
+/// must fail closed instead of issuing the same physical request again.
 #[cfg(unix)]
 #[test]
-fn kill9_after_provider_admission_retries_instead_of_reporting_errored() {
+fn kill9_after_provider_admission_fails_closed_without_reissue() {
     let blocked_script = r#"[{"step":"delay","ms":30000},{"step":"emit_text","text":"too late"},{"step":"finish","reason":"end_turn"}]"#;
     let recovered_script = r#"[{"step":"delay","ms":5000},{"step":"emit_text","text":"recovered"},{"step":"finish","reason":"end_turn"}]"#;
     let mut starter = haider();
@@ -1123,31 +1122,20 @@ fn kill9_after_provider_admission_retries_instead_of_reporting_errored() {
         .as_str()
         .expect("probe diagnostic message");
     assert!(
-        message.contains("run_state is running"),
-        "startup recovery did not re-enter the admitted request: {probe}"
+        message.contains("run_state is errored"),
+        "startup recovery did not fail closed at ambiguous provider delivery: {probe}"
     );
-    assert!(!message.contains("errored"));
 
-    let completion_deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let status = invoke(&["run", "--status", &run_id, "--json"], recovered_script);
-        assert!(
-            status.status.success(),
-            "completion status stderr: {}",
-            String::from_utf8_lossy(&status.stderr)
-        );
-        let status: serde_json::Value =
-            serde_json::from_slice(&status.stdout).expect("completion status JSON");
-        if status["result"]["state"]["state"] == "done" {
-            assert!(status["result"]["terminal_seq"].as_u64().is_some());
-            break;
-        }
-        assert!(
-            Instant::now() < completion_deadline,
-            "recovered run did not finish: {status}"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
+    let status = invoke(&["run", "--status", &run_id, "--json"], recovered_script);
+    assert!(
+        status.status.success(),
+        "terminal status stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("terminal status JSON");
+    assert_eq!(status["result"]["state"]["state"], "errored");
+    assert!(status["result"]["terminal_seq"].as_u64().is_some());
 }
 
 #[test]

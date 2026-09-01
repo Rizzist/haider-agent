@@ -1977,11 +1977,10 @@ async fn headless_workflow_resumes_after_daemon_crash_between_stages() {
 }
 
 /// Seam: a provider attempt admitted and durably marked immediately before a
-/// crash is neither spend nor a reason to forget prior spend. Recovery must
-/// retry the interrupted workflow request once, retain its logical ordinal,
-/// and finish under a cap that covers every completed exchange.
+/// crash has ambiguous physical delivery. Recovery must preserve its marker,
+/// append one typed error terminal, and never issue another provider request.
 #[tokio::test]
-async fn workflow_recovery_after_budget_admission_preserves_spend_and_ordinal() {
+async fn workflow_recovery_after_budget_admission_fails_closed_without_reissue() {
     let test_id = "workflow-budget-admission-recovery";
     let nodes = ["PLAN"];
     let root = test_root("workflow-budget-admission-recovery-");
@@ -2146,25 +2145,25 @@ async fn workflow_recovery_after_budget_admission_preserves_spend_and_ordinal() 
     if let Some(state) = replay_terminal {
         assert_eq!(
             state,
-            RunState::Done,
-            "recovery misclassified the admitted pre-response attempt; failure={replay_failure:?}"
+            RunState::Errored,
+            "recovery did not fail closed at ambiguous provider delivery; failure={replay_failure:?}"
         );
-        assert!(replay_failure.is_none());
+        assert!(replay_failure.is_some());
     } else {
         let (state, failure, _) = events_until_any_terminal(&mut second_client, &run_id).await;
         assert_eq!(
             state,
-            RunState::Done,
-            "recovery misclassified the admitted pre-response attempt; failure={failure:?}"
+            RunState::Errored,
+            "recovery did not fail closed at ambiguous provider delivery; failure={failure:?}"
         );
-        assert!(failure.is_none());
+        assert!(failure.is_some());
     }
     assert_eq!(
         provider.requests().len(),
-        3,
-        "two completed workflow requests plus one abandoned pre-response attempt"
+        1,
+        "ambiguous provider delivery must never be physically reissued"
     );
-    assert_eq!(provider.scripted.requests().len(), 2);
+    assert_eq!(provider.scripted.requests().len(), 0);
     let journal = read_session(
         &mut second_client,
         &config,
@@ -2172,19 +2171,16 @@ async fn workflow_recovery_after_budget_admission_preserves_spend_and_ordinal() 
         "admission-recovery-journal",
     )
     .await;
-    assert!(
-        budget_facts(&journal, &run_id).is_empty(),
-        "a sufficient cap must not become a missing-usage budget terminal"
-    );
+    assert!(budget_facts(&journal, &run_id).is_empty());
     let attempts = provider_request_attempts(&journal, &run_id);
-    assert_eq!(attempts.len(), 3, "one durable marker per physical attempt");
+    assert_eq!(attempts.len(), 1, "the durable attempt marker is retained");
     assert_eq!(
         attempts
             .iter()
             .map(|attempt| attempt.ordinal)
             .collect::<Vec<_>>(),
-        vec![1, 1, 2],
-        "the retried first hop retains its logical ordinal before hop two"
+        vec![1],
+        "no second marker may authorize a duplicate physical request"
     );
     let usage = journal
         .iter()
@@ -2198,24 +2194,9 @@ async fn workflow_recovery_after_budget_admission_preserves_spend_and_ordinal() 
                 })
         })
         .collect::<Vec<_>>();
-    assert_eq!(usage.len(), 2, "only completed exchanges contribute spend");
-    assert_eq!(usage.iter().map(|usage| usage.input).sum::<u64>(), 2_000);
-    let ordinals = usage
-        .iter()
-        .map(|usage| {
-            usage
-                .request
-                .as_ref()
-                .expect("budgeted usage carries request ordinal")
-                .ordinal
-        })
-        .collect::<BTreeSet<_>>();
-    assert_eq!(ordinals.len(), 2, "recovery reused a logical ordinal");
-    assert_eq!(
-        workflow_graph_state(&mut second_client, &config, session_id)
-            .await
-            .phase,
-        haider_protocol::graph::WorkflowGraphPhase::Completed
+    assert!(
+        usage.is_empty(),
+        "an unobserved response contributes no usage"
     );
 
     second_task.shutdown_handle().request("test complete");

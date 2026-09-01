@@ -2,7 +2,7 @@
 //!
 //! The daemon has many tracing events whose fields include paths, errors, and
 //! other user-derived values. This subscriber deliberately enables only the
-//! two timing targets audited for release diagnostics and ignores every field
+//! three timing targets audited for release diagnostics and ignores every field
 //! outside their frozen numeric/phase allow-list.
 
 use std::fmt::Write as _;
@@ -13,6 +13,7 @@ use tracing::subscriber::Interest;
 const TRACE_ENV: &str = "HAIDER_DAEMON_TRACE";
 const STORE_TARGET: &str = "haider.store";
 const RECOVERY_TARGET: &str = "haider.recovery";
+const TURN_TARGET: &str = "haider.turn";
 
 static INSTALL_STATE: OnceLock<bool> = OnceLock::new();
 
@@ -76,7 +77,7 @@ impl tracing::Subscriber for SafeTimingSubscriber {
 }
 
 fn safe_target(target: &str) -> bool {
-    matches!(target, STORE_TARGET | RECOVERY_TARGET)
+    matches!(target, STORE_TARGET | RECOVERY_TARGET | TURN_TARGET)
 }
 
 struct SafeFields<'a> {
@@ -86,6 +87,11 @@ struct SafeFields<'a> {
     phase: Option<String>,
     recovered_work: Option<String>,
     touched_sessions: Option<String>,
+    turn_ordinal: Option<String>,
+    request_ordinal: Option<String>,
+    txn_ordinal: Option<String>,
+    start_us_from_accept: Option<String>,
+    end_us_from_accept: Option<String>,
 }
 
 impl<'a> SafeFields<'a> {
@@ -97,18 +103,28 @@ impl<'a> SafeFields<'a> {
             phase: None,
             recovered_work: None,
             touched_sessions: None,
+            turn_ordinal: None,
+            request_ordinal: None,
+            txn_ordinal: None,
+            start_us_from_accept: None,
+            end_us_from_accept: None,
         }
     }
 
     fn record_value(&mut self, field: &tracing::field::Field, value: String) {
         match (self.target, field.name()) {
             (STORE_TARGET, "queue_wait_micros") => self.queue_wait_micros = Some(value),
-            (STORE_TARGET | RECOVERY_TARGET, "operation_micros") => {
+            (STORE_TARGET | RECOVERY_TARGET | TURN_TARGET, "operation_micros") => {
                 self.operation_micros = Some(value);
             }
-            (RECOVERY_TARGET, "phase") => self.phase = Some(value),
+            (RECOVERY_TARGET | TURN_TARGET, "phase") => self.phase = Some(value),
             (RECOVERY_TARGET, "recovered_work") => self.recovered_work = Some(value),
             (RECOVERY_TARGET, "touched_sessions") => self.touched_sessions = Some(value),
+            (TURN_TARGET, "turn_ordinal") => self.turn_ordinal = Some(value),
+            (TURN_TARGET, "request_ordinal") => self.request_ordinal = Some(value),
+            (TURN_TARGET, "txn_ordinal") => self.txn_ordinal = Some(value),
+            (TURN_TARGET, "start_us_from_accept") => self.start_us_from_accept = Some(value),
+            (TURN_TARGET, "end_us_from_accept") => self.end_us_from_accept = Some(value),
             _ => {}
         }
     }
@@ -121,6 +137,11 @@ impl<'a> SafeFields<'a> {
             ("operation_micros", self.operation_micros.as_deref()),
             ("recovered_work", self.recovered_work.as_deref()),
             ("touched_sessions", self.touched_sessions.as_deref()),
+            ("turn_ordinal", self.turn_ordinal.as_deref()),
+            ("request_ordinal", self.request_ordinal.as_deref()),
+            ("txn_ordinal", self.txn_ordinal.as_deref()),
+            ("start_us_from_accept", self.start_us_from_accept.as_deref()),
+            ("end_us_from_accept", self.end_us_from_accept.as_deref()),
         ] {
             if let Some(value) = value {
                 let _ = write!(rendered, " {name}={value}");
@@ -132,11 +153,29 @@ impl<'a> SafeFields<'a> {
 
 impl tracing::field::Visit for SafeFields<'_> {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if self.target == RECOVERY_TARGET
-            && field.name() == "phase"
-            && matches!(value, "effects" | "turns" | "login_receipts")
-        {
-            self.record_value(field, value.to_owned());
+        if field.name() == "phase" {
+            let allowed = match self.target {
+                RECOVERY_TARGET => matches!(value, "effects" | "turns" | "login_receipts"),
+                TURN_TARGET => matches!(
+                    value,
+                    "accept"
+                        | "request_attempt_commit"
+                        | "provider_open"
+                        | "first_byte"
+                        | "provider_stream"
+                        | "sse_decode"
+                        | "journal_transaction"
+                        | "journal_append_wait"
+                        | "event_fanout_projection"
+                        | "core_event_fanout"
+                        | "terminal_commit"
+                        | "client_terminal_seen"
+                ),
+                _ => false,
+            };
+            if allowed {
+                self.record_value(field, value.to_owned());
+            }
         }
     }
 
@@ -159,6 +198,15 @@ fn safe_numeric_field(target: &str, field: &str) -> bool {
                 RECOVERY_TARGET,
                 "operation_micros" | "recovered_work" | "touched_sessions"
             )
+            | (
+                TURN_TARGET,
+                "operation_micros"
+                    | "turn_ordinal"
+                    | "request_ordinal"
+                    | "txn_ordinal"
+                    | "start_us_from_accept"
+                    | "end_us_from_accept"
+            )
     )
 }
 
@@ -176,5 +224,8 @@ mod tests {
         }
         assert!(!safe_target("haider.hooks"));
         assert!(!safe_target("haider.peer"));
+        assert!(safe_target(TURN_TARGET));
+        assert!(safe_numeric_field(TURN_TARGET, "turn_ordinal"));
+        assert!(!safe_numeric_field(TURN_TARGET, "run_id"));
     }
 }

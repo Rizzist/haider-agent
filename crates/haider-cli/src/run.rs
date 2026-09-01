@@ -1317,6 +1317,7 @@ fn adapt_events_to(
     let mut stdout_dirty = false;
     let mut stdout_unflushed_envelopes = 0_usize;
     let mut last_stdout_flush = Instant::now();
+    let mut turn_trace = None::<(u64, Instant)>;
     let mut next_event = events.blocking_recv();
     while let Some(event) = next_event {
         let mut flush_stdout = false;
@@ -1356,7 +1357,22 @@ fn adapt_events_to(
                 }
                 announced = true;
             }
-            HeadlessEvent::Accepted { .. } => {}
+            HeadlessEvent::Accepted {
+                session_id,
+                head_seq,
+            } => {
+                // The first Accepted announces the newly-created session;
+                // this second coordinate is the durable turn acceptance
+                // returned by TurnSubmit/HeadlessRunStart. Correlate the
+                // client terminal with the daemon's accepted_seq, not the
+                // provisional Created sequence.
+                if haider_core::turn_trace_enabled() {
+                    turn_trace = Some((
+                        haider_core::turn_trace_ordinal(&session_id, head_seq),
+                        Instant::now(),
+                    ));
+                }
+            }
             HeadlessEvent::Envelope(envelope) => {
                 if output == RunOutput::Jsonl {
                     serde_json::to_writer(&mut stdout, envelope.as_ref())
@@ -1370,6 +1386,14 @@ fn adapt_events_to(
                 }
             }
             HeadlessEvent::Terminal(terminal) => {
+                if let Some((turn_ordinal, accepted_at)) = turn_trace {
+                    let end_us = accepted_at.elapsed().as_micros();
+                    eprintln!(
+                        "haider: trace level=TRACE target=haider.turn phase=client_terminal_seen \
+                         operation_micros={end_us} turn_ordinal={turn_ordinal} request_ordinal=0 \
+                         txn_ordinal=0 start_us_from_accept=0 end_us_from_accept={end_us}"
+                    );
+                }
                 if output == RunOutput::Jsonl {
                     let mut envelope = *terminal.envelope;
                     let payload = envelope.payload.as_object_mut().ok_or_else(|| {
