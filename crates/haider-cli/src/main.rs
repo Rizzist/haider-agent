@@ -39,6 +39,8 @@ pub(crate) mod update;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const EX_SOFTWARE: u8 = 70;
 const EX_IOERR: u8 = 74;
+const FOOTPRINT_HOLD_ENV: &str = "HAIDER_CLIENT_FOOTPRINT_HOLD_MS";
+const MAX_FOOTPRINT_HOLD_MS: u64 = 5 * 60 * 1_000;
 
 /// Every workspace crate, asserted linkable by the self-test.
 const CRATES: [&str; 10] = [
@@ -59,17 +61,19 @@ enum RuntimeProfile {
     /// A one-shot client only multiplexes RPC and its stdout adapter. Tool
     /// concurrency lives in `haiderd`, which retains its full runtime.
     EphemeralHeadless,
-    /// TUI and long-lived/general CLI work retain Tokio's default worker pool.
+    /// The TUI keeps two async workers so terminal input/render and the daemon
+    /// link remain independently schedulable without scaling idle client
+    /// threads to host CPU count.
     Full,
 }
 
 impl RuntimeProfile {
     fn for_args(args: &[String]) -> Self {
         match args.first().map(String::as_str) {
-            Some("run" | "status") => Self::EphemeralHeadless,
-            Some("sessions") if args.get(1).is_some_and(|argument| argument == "wait-ready") => {
-                Self::EphemeralHeadless
-            }
+            Some(
+                "run" | "status" | "sessions" | "session" | "fleet" | "events" | "daemon"
+                | "--ready",
+            ) => Self::EphemeralHeadless,
             Some("resume") if args.iter().any(|argument| argument == "--json") => {
                 Self::EphemeralHeadless
             }
@@ -80,7 +84,11 @@ impl RuntimeProfile {
     fn build(self) -> io::Result<tokio::runtime::Runtime> {
         let mut builder = match self {
             Self::EphemeralHeadless => tokio::runtime::Builder::new_current_thread(),
-            Self::Full => tokio::runtime::Builder::new_multi_thread(),
+            Self::Full => {
+                let mut builder = tokio::runtime::Builder::new_multi_thread();
+                builder.worker_threads(2);
+                builder
+            }
         };
         builder.enable_all().build()
     }
@@ -159,30 +167,70 @@ fn run_cli(args: Vec<String>) -> ExitCode {
         RuntimeProfile::EphemeralHeadless => match args.first().map(String::as_str) {
             Some("run") => {
                 let rest = args.get(1..).unwrap_or_default();
-                runtime.block_on(run::run_command(rest))
+                let code = runtime.block_on(run::run_command(rest));
+                footprint_probe_hold();
+                code
             }
             Some("status") => {
                 let rest = args.get(1..).unwrap_or_default();
                 let code = runtime.block_on(observe::status_command(rest));
+                footprint_probe_hold();
                 runtime.shutdown_background();
                 code
             }
             Some("sessions") if args.get(1).is_some_and(|argument| argument == "wait-ready") => {
                 let rest = args.get(2..).unwrap_or_default();
                 let code = runtime.block_on(automation::sessions_wait_ready_command(rest));
+                footprint_probe_hold();
                 runtime.shutdown_background();
                 code
             }
             Some("resume") => {
                 let rest = args.get(1..).unwrap_or_default();
                 let code = runtime.block_on(automation::resume_command(rest));
+                footprint_probe_hold();
                 runtime.shutdown_background();
                 code
             }
-            _ => ExitCode::from(EX_SOFTWARE),
+            // The remaining commands selected for this profile are wire or
+            // control-plane dispatchers. Preserve their existing semantics
+            // while avoiding a host-sized worker pool.
+            _ => {
+                let code = runtime.block_on(dispatch(&args));
+                footprint_probe_hold();
+                runtime.shutdown_background();
+                code
+            }
         },
-        RuntimeProfile::Full => runtime.block_on(dispatch(&args)),
+        RuntimeProfile::Full => {
+            let code = runtime.block_on(dispatch(&args));
+            footprint_probe_hold();
+            code
+        }
     }
+}
+
+/// Keep a completed client process alive for the release footprint harness.
+///
+/// This is deliberately an opt-in measurement seam rather than a command-line
+/// surface: ordinary invocations never read a config file, allocate a timer,
+/// or delay exit. The strict bound prevents a stale CI variable from parking a
+/// client indefinitely.
+fn footprint_probe_hold() {
+    let Some(duration) = std::env::var_os(FOOTPRINT_HOLD_ENV)
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| footprint_hold_ms(&value))
+    else {
+        return;
+    };
+    std::thread::sleep(std::time::Duration::from_millis(duration));
+}
+
+fn footprint_hold_ms(value: &str) -> Option<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|duration| *duration > 0 && *duration <= MAX_FOOTPRINT_HOLD_MS)
 }
 
 #[cfg(test)]
@@ -190,7 +238,7 @@ fn run_cli(args: Vec<String>) -> ExitCode {
 mod runtime_tests {
     use super::{
         AutoHermeticLookup, RuntimeProfile, StartupAutoHermeticTarget, auto_hermetic_status,
-        auto_hermetic_status_for_startup_target, startup_auto_hermetic_target,
+        auto_hermetic_status_for_startup_target, footprint_hold_ms, startup_auto_hermetic_target,
         suppress_automatic_update,
     };
     use tokio::runtime::RuntimeFlavor;
@@ -210,6 +258,12 @@ mod runtime_tests {
             args(&["run", "hello"]),
             args(&["status", "--json"]),
             args(&["sessions", "wait-ready", "--count", "1", "--json"]),
+            args(&["sessions", "--json"]),
+            args(&["session", "session-a", "--json"]),
+            args(&["fleet", "--json"]),
+            args(&["events"]),
+            args(&["daemon", "stop", "--json"]),
+            args(&["--ready"]),
             args(&["resume", "session-a", "--json"]),
         ] {
             let profile = RuntimeProfile::for_args(&arguments);
@@ -219,14 +273,39 @@ mod runtime_tests {
     }
 
     #[test]
-    fn tui_paths_keep_the_full_runtime() {
-        for arguments in [args(&[]), args(&["tui"]), args(&["resume"])] {
+    fn tui_and_non_wire_paths_keep_the_full_runtime() {
+        for arguments in [
+            args(&[]),
+            args(&["tui"]),
+            args(&["resume"]),
+            args(&["resume", "session-a"]),
+            args(&["self-test"]),
+            args(&["account", "list", "--json"]),
+            args(&["update", "--check"]),
+            args(&["--version"]),
+        ] {
             assert_eq!(RuntimeProfile::for_args(&arguments), RuntimeProfile::Full);
         }
         assert_eq!(
             runtime_flavor(RuntimeProfile::Full),
             RuntimeFlavor::MultiThread
         );
+        assert_eq!(
+            RuntimeProfile::Full
+                .build()
+                .expect("TUI runtime builds")
+                .metrics()
+                .num_workers(),
+            2
+        );
+    }
+
+    #[test]
+    fn footprint_hold_is_opt_in_and_bounded() {
+        assert_eq!(footprint_hold_ms("60000"), Some(60_000));
+        assert_eq!(footprint_hold_ms("0"), None);
+        assert_eq!(footprint_hold_ms("300001"), None);
+        assert_eq!(footprint_hold_ms("not-a-duration"), None);
     }
 
     #[test]

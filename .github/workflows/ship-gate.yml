@@ -62,3 +62,52 @@ jobs:
       # an explicit 966 task. This job deliberately stays --release.
       - name: render benchmark (release — ledger row 17 upper bounds)
         run: cargo test --release -p haider-tui --test w3c3_render_bench_tests --locked
+
+  client-footprint:
+    name: client footprint (settled macOS release)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: unsafe-count gate
+        shell: bash
+        run: bash scripts/check-unsafe-counts.sh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-ship-client-footprint-release-profile
+      - name: footprint harness self-test
+        run: python3 scripts/perf/client-footprint-budget.py --self-test
+      - name: build release client and daemon
+        env:
+          RUST_MIN_STACK: 8388608
+          HAIDER_DISCOVERY_DISABLED: 1
+          HAIDER_TEST_DEVICE_NAME: test-mac
+        run: |
+          cargo build --release -p haider-cli -p haider-daemond --locked
+          test "$(stat -f %z target/release/haiderd)" -gt 10485760
+      - name: enforce settled client footprint budgets
+        run: |
+          mkdir -p "$RUNNER_TEMP/client-footprint"
+          python3 scripts/perf/client-footprint-budget.py \
+            --haider target/release/haider \
+            --surface status-post-command \
+            --output "$RUNNER_TEMP/client-footprint/status" \
+            --budget-bytes 2703783
+          python3 scripts/perf/client-footprint-budget.py \
+            --haider target/release/haider \
+            --surface run-post-command \
+            --output "$RUNNER_TEMP/client-footprint/run" \
+            --budget-bytes 3406683
+          python3 scripts/perf/client-footprint-budget.py \
+            --haider target/release/haider \
+            --surface tui-demo-sixel \
+            --output "$RUNNER_TEMP/client-footprint/tui-sixel" \
+            --budget-bytes 6110043
+      - name: upload footprint evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-footprint-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ runner.temp }}/client-footprint
