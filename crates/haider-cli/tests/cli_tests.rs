@@ -1478,7 +1478,11 @@ fn session_readiness_and_resume_are_finite_event_driven_json_barriers() {
             "--count",
             "2",
             "--timeout",
-            "50ms",
+            // Registry #94: this is the same finite 2s barrier used by the
+            // adjacent ready/resume probes. A 50ms total budget also wrapped
+            // the watch handshake, so a loaded Windows runner could expire
+            // before learning the already-running daemon's generation.
+            "2s",
             "--json",
         ])
         .env("HAIDER_PROFILE_DIR", &source.profile)
@@ -1486,7 +1490,7 @@ fn session_readiness_and_resume_are_finite_event_driven_json_barriers() {
     let unmet = unmet.output().expect("unmet readiness command runs");
     assert_eq!(unmet.status.code(), Some(i32::from(EX_TIMEOUT)));
     let unmet: serde_json::Value = serde_json::from_slice(&unmet.stdout).expect("unmet JSON");
-    assert_eq!(unmet["daemon_ready"], true);
+    assert_eq!(unmet["daemon_ready"], true, "readiness snapshot: {unmet}");
     assert!(
         unmet["daemon_generation"]
             .as_u64()
@@ -2507,20 +2511,29 @@ fn run_jsonl_timeout_has_one_distinct_timeout_terminal() {
         String::from_utf8_lossy(&ready.stderr)
     );
 
-    let out = run
-        .args([
-            "run",
-            "--provider",
-            "fake",
-            "hello",
-            "--output",
-            "jsonl",
-            "--timeout",
-            "2s",
-        ])
-        .output()
-        .expect("binary runs");
-    assert_eq!(out.status.code(), Some(124));
+    // Registry #94: the 13s caller deadline leaves 10s for loaded-gate
+    // scheduling/admission, the provider adapter's existing 1s terminal
+    // delivery reserve, and 2s observing the deliberately hanging stream.
+    // The harness's 60s subprocess bound also covers the existing 2s
+    // terminal grace: 13 + 2 < 60.
+    run.args([
+        "run",
+        "--provider",
+        "fake",
+        "hello",
+        "--output",
+        "jsonl",
+        "--timeout",
+        "13s",
+    ]);
+    let out = bounded_output(&mut run, None);
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "stderr: {}; stdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
     let envelopes = parse_jsonl(&out.stdout);
     assert!(
         envelopes
