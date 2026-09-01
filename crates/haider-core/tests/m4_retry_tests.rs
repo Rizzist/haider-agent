@@ -23,6 +23,7 @@ use haider_core::{
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::error::{ErrorAction, ErrorCode};
 use haider_protocol::ids::{DeviceId, EventId, SessionId};
 use haider_protocol::menu::{AnswerVia, MenuAnswer};
 use haider_protocol::provider::FinishReason;
@@ -586,6 +587,79 @@ async fn m4_retry_after_overrides_computed_backoff() {
             delay_ms: 7_000,
             reason: WaitReason::RateLimit,
         }
+    );
+}
+
+/// A deadline that elapses while the durable run is in provider backoff is
+/// retry exhaustion even if the actor next observes it at request admission.
+/// The unopened second provider future proves this classification does not
+/// depend on the backoff timer and request-open cutoff racing to wake first.
+#[tokio::test(start_paused = true)]
+async fn m4_deadline_expiry_in_backoff_is_bounded_provider_failure() {
+    let sleeper = Arc::new(GatedSleeper::default());
+    let mut config = HarnessConfig::for_session(
+        SessionId::new(SESSION),
+        DeviceId::new("m4-backoff-deadline"),
+        1,
+        1,
+    );
+    config.retry_sleeper = sleeper.clone();
+    // Registry #94: 500ms Retry-After + two 1s provider margins = 2.5s,
+    // leaving 500ms inside this explicit 3s run deadline for admission.
+    config.provider_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(3));
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::Error {
+            kind: ProviderErrorKind::RateLimited,
+            message: "wait beyond the run deadline".into(),
+            retry_after_ms: Some(500),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(MemoryStore::new());
+    let handle = HarnessActor::spawn(config, provider.clone(), store.clone());
+    let turn = handle
+        .submit_turn(SubmitTurn::new("deadline during backoff"))
+        .await
+        .expect("turn accepted");
+
+    let retrying = wait_for_retrying_event(&store).await;
+    assert!(matches!(
+        typed(&retrying),
+        EventPayload::RunState(RunState::Retrying {
+            attempt: 2,
+            max: 10,
+            delay_ms: 500,
+            reason: WaitReason::RateLimit,
+        })
+    ));
+    tokio::time::advance(Duration::from_secs(4)).await;
+    sleeper.complete_one_naturally();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(1), turn.wait())
+        .await
+        .expect("state-classified terminal is prompt")
+        .expect("turn outcome");
+    let error = outcome.error.expect("typed terminal error");
+    assert_eq!(error.code, ErrorCode::ProviderError);
+    assert!(!error.retryable);
+    assert_eq!(
+        error
+            .presentation
+            .expect("bounded provider failure presentation")
+            .allowed_actions,
+        vec![ErrorAction::None]
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the expired retry is classified before opening request two"
+    );
+    assert_eq!(
+        terminal_count(&store.events(&SessionId::new(SESSION)).await),
+        1,
+        "the state-derived path commits exactly one terminal"
     );
 }
 
