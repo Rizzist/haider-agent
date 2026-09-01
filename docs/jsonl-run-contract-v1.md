@@ -125,6 +125,25 @@ Detached submission ends at the accepted/started boundary and is outside this
 attached-run terminal guarantee; its terminal is consumed later through the
 detached status/events APIs.
 
+## SIGINT cancellation
+
+For `haider run` and the reusable headless control attachment, the first
+SIGINT after correlation requests exactly one durable `turn.cancel` for that
+run. Transport retries reuse the same command identity and therefore cannot
+append a second cancellation intent. The client retains its attachment and
+continues consuming cursor-ordered envelopes until the one durable
+`cancellation` terminal arrives. The wait never extends past the tighter of
+the caller's `--timeout` deadline and time-budget deadline; without either
+caller deadline, the ordinary terminal-grace bound applies.
+
+After writing that terminal, `haider run` exits 130. The terminal keeps its
+ordinary durable `run_state: cancelled` cursor and appears exactly once; SIGINT
+does not create a CLI-only terminal or an extra JSONL record. A second SIGINT
+stops the client immediately with exit 130. It is acted on only after the
+first signal's durable cancellation receipt, so the fast exit cannot erase or
+outrun the journaled cancel. The daemon continues draining the correlated run
+if its cancellation terminal was not already delivered.
+
 ## Additive persistence commands
 
 This contiguous JSONL contract is unchanged by the finite persistence

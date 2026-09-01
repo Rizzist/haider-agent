@@ -8,7 +8,7 @@
 //! through a drop guard, so no test leaks a process past its assertions.
 #![allow(clippy::expect_used)]
 
-use std::io::Read as _;
+use std::io::{BufRead as _, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::sync::mpsc;
@@ -348,6 +348,91 @@ fn process_exists(pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+fn wait_for_idle_daemon_exit(profile: &ResolvedProfile, daemon_pid: u32, spawn_path: &str) {
+    const IDLE_TTL_MS: u64 = 250;
+    const DAEMON_DRAIN_BUDGET_MS: u64 = 5_000;
+    const PROCESS_EXIT_GRACE_MS: u64 = 2_000;
+    // Registry #94: 250 ms requested idle TTL + the daemon's 5,000 ms
+    // graceful-drain budget + 2,000 ms process-observation grace = 7,250 ms.
+    const EXIT_DEADLINE: Duration =
+        Duration::from_millis(IDLE_TTL_MS + DAEMON_DRAIN_BUDGET_MS + PROCESS_EXIT_GRACE_MS);
+
+    let deadline = Instant::now() + EXIT_DEADLINE;
+    while (process_exists(daemon_pid) || profile.endpoint_path.exists())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !process_exists(daemon_pid),
+        "{spawn_path} daemon {daemon_pid} survived the 7,250 ms idle-exit budget"
+    );
+    assert!(
+        !profile.endpoint_path.exists(),
+        "{spawn_path} idle exit must remove the profile endpoint"
+    );
+}
+
+/// Every short-lived autospawn surface uses the same bounded daemon policy.
+/// `real_run_short_idle_ttl_terminalizes_spawned_daemon` pins the run path;
+/// this table pins status, the non-interactive TUI front door, and the
+/// recovery probe with a real sibling daemon and an isolated profile each.
+///
+/// MUTATION CHECK: making the default lifetime persistent, or reading the
+/// idle-TTL override only in `haider run`, leaves the affected daemon alive
+/// through `wait_for_idle_daemon_exit`.
+#[test]
+fn real_status_tui_and_probe_autospawns_share_short_idle_ttl() {
+    const IDLE_TTL_MS: &str = "250";
+
+    ensure_haiderd_built();
+    for (spawn_path, arguments) in [
+        ("status", vec!["status", "--json"]),
+        ("tui", Vec::new()),
+        (
+            "recovery-probe",
+            vec![
+                "session",
+                "missing-idle-ttl-session",
+                "recover",
+                "--probe",
+                "--json",
+            ],
+        ),
+    ] {
+        let store = tempfile::tempdir().expect("store dir");
+        let profile = resolved_for(store.path());
+        let guard = DaemonGuard {
+            store: store.path().to_path_buf(),
+        };
+        let output = output_with_timeout(
+            haider_command(store.path())
+                .args(arguments)
+                .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", IDLE_TTL_MS),
+            &format!("{spawn_path} short-idle-TTL invocation"),
+        );
+        if spawn_path != "recovery-probe" {
+            assert!(
+                output.status.success(),
+                "{spawn_path} failed: status={} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+
+        let daemon_pid = guard.pid().unwrap_or_else(|| {
+            panic!(
+                "{spawn_path} did not spawn a daemon: status={} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            )
+        });
+        wait_for_idle_daemon_exit(&profile, daemon_pid, spawn_path);
+    }
+}
+
 /// A real `haider run` must pass the configured idle TTL into the daemon, and
 /// the daemon's own deadline wake must terminalize it after the launcher exits.
 ///
@@ -412,6 +497,142 @@ fn real_run_short_idle_ttl_terminalizes_spawned_daemon() {
     assert!(
         !profile.endpoint_path.exists(),
         "idle exit must remove the profile endpoint"
+    );
+}
+
+/// Launcher death may expire the idle TTL while its accepted run is still
+/// non-terminal. The daemon must hold its exact process identity until the
+/// a durable cancellation terminalizes the turn, then the already-expired
+/// idle arm may drain it.
+///
+/// MUTATION CHECK: deleting the durable-quiescence check in the daemon accept
+/// loop makes the process disappear during the 750 ms hold observation.
+#[test]
+fn idle_ttl_never_retires_a_daemon_with_a_nonterminal_run() {
+    const IDLE_TTL_MS: u64 = 250;
+    const NONTERMINAL_HOLD_OBSERVATION: Duration = Duration::from_millis(750);
+    const RUN_DEADLINE_MS: u64 = 5_000;
+    const DAEMON_DRAIN_BUDGET_MS: u64 = 5_000;
+    const PROCESS_EXIT_GRACE_MS: u64 = 2_000;
+    // Registry #94: the 5,000 ms durable run deadline bounding cancellation + 5,000 ms daemon
+    // drain + 2,000 ms process-observation grace = 12,000 ms. The 250 ms idle
+    // TTL has already elapsed inside the run deadline and is not added twice.
+    const EXIT_DEADLINE: Duration =
+        Duration::from_millis(RUN_DEADLINE_MS + DAEMON_DRAIN_BUDGET_MS + PROCESS_EXIT_GRACE_MS);
+
+    ensure_haiderd_built();
+    let store = tempfile::tempdir().expect("store dir");
+    let profile = resolved_for(store.path());
+    let guard = DaemonGuard {
+        store: store.path().to_path_buf(),
+    };
+    let mut launcher = haider_command(store.path())
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "--output",
+            "jsonl",
+            "--timeout",
+            "5s",
+            "-p",
+            "hello",
+        ])
+        .env("HAIDER_TEST_FAKE_PROVIDER", r#"[{"step":"hang"}]"#)
+        .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", IDLE_TTL_MS.to_string())
+        .spawn()
+        .expect("spawn hanging run launcher");
+    let stdout = launcher.stdout.take().expect("launcher stdout");
+    let (nonterminal_tx, nonterminal_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut stdout = std::io::BufReader::new(stdout);
+        let result = loop {
+            let mut line = String::new();
+            match stdout.read_line(&mut line) {
+                Ok(0) => {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "launcher exited before publishing a non-terminal run state",
+                    ));
+                }
+                Ok(_) => {
+                    let Ok(document) = serde_json::from_str::<serde_json::Value>(&line) else {
+                        continue;
+                    };
+                    let payload = document.get("payload");
+                    if payload.and_then(|value| value.get("type"))
+                        == Some(&serde_json::Value::String("run_state".into()))
+                        && payload
+                            .and_then(|value| value.get("state"))
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|state| !matches!(state, "done" | "errored" | "cancelled"))
+                    {
+                        break Ok(line);
+                    }
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        let _ = nonterminal_tx.send(result);
+    });
+    let nonterminal = nonterminal_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("non-terminal run state within daemon startup budget")
+        .expect("read non-terminal run state");
+    let nonterminal: serde_json::Value =
+        serde_json::from_str(&nonterminal).expect("non-terminal run state is JSON");
+    assert_eq!(nonterminal["payload"]["type"], "run_state");
+    let run_id = nonterminal["run_id"]
+        .as_str()
+        .expect("non-terminal envelope run id")
+        .to_owned();
+    let daemon_pid = guard.pid().expect("spawned daemon PID");
+
+    launcher.kill().expect("SIGKILL run launcher");
+    let status = launcher.wait().expect("reap run launcher");
+    assert!(
+        !status.success(),
+        "killed launcher must not exit successfully"
+    );
+    reader.join().expect("join accepted-line reader");
+
+    std::thread::sleep(NONTERMINAL_HOLD_OBSERVATION);
+    let daemon_log = std::fs::read_to_string(store.path().join(haider_client::DAEMON_LOG_FILE))
+        .unwrap_or_else(|error| format!("<daemon log unavailable: {error}>"));
+    assert!(
+        process_exists(daemon_pid),
+        "daemon {daemon_pid} retired after the idle TTL while its run was non-terminal\n{daemon_log}"
+    );
+
+    let cancelled = output_with_timeout(
+        haider_command(store.path())
+            .args(["run", "--stop", &run_id, "--json"])
+            .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", IDLE_TTL_MS.to_string()),
+        "durably cancel non-terminal idle-TTL run",
+    );
+    assert!(
+        cancelled.status.success(),
+        "run stop failed: status={} stdout={} stderr={}",
+        cancelled.status,
+        String::from_utf8_lossy(&cancelled.stdout),
+        String::from_utf8_lossy(&cancelled.stderr)
+    );
+
+    let deadline = Instant::now() + EXIT_DEADLINE;
+    while (process_exists(daemon_pid) || profile.endpoint_path.exists())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !process_exists(daemon_pid),
+        "daemon {daemon_pid} did not retire after the durable run deadline\n{}",
+        std::fs::read_to_string(store.path().join(haider_client::DAEMON_LOG_FILE))
+            .unwrap_or_else(|error| format!("<daemon log unavailable: {error}>"))
+    );
+    assert!(
+        !profile.endpoint_path.exists(),
+        "post-terminal idle exit must remove the profile endpoint"
     );
 }
 

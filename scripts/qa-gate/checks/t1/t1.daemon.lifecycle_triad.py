@@ -24,8 +24,6 @@ needs = ("binary", "daemon", "network:none")
 script = [{"step": "finish", "reason": "end_turn"}]
 turns_expected = 0
 timed = True
-expected_fail_until = "0.0.968"
-
 IDLE_TTL = BudgetPart(
     "requested run-daemon idle TTL",
     1.0,

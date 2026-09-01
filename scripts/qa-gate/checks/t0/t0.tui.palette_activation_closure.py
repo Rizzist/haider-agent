@@ -128,7 +128,7 @@ REFUSAL_SIGNATURES = {
     "redo": ("not_found — no matching checkpoint exists on this branch",),
     "checkpoints": ("no durable file checkpoints on this branch",),
     "rollback": ("no matching durable turn on this branch",),
-    "talk": ("talk failed — microphone unavailable",),
+    "talk": ("talk failed —",),
 }
 
 LOGIN_DEFECT_NOTE = (

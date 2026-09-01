@@ -1023,14 +1023,14 @@ fn detached_run_lifecycle_is_addressable_by_run_id() {
 }
 
 /// A process death after durable provider admission but before the first
-/// response is a retry boundary, not an Internal/Errored terminal. The
-/// recovery CLI has no effect-ambiguity card to probe in this case, so its
-/// `no_recovery` diagnostic must observe the replacement run as `running`.
+/// response is an ambiguous crash window. Restart must park the original run
+/// behind the typed recovery door; probing it must not reissue the provider
+/// request or consume the next fake-provider segment.
 #[cfg(unix)]
 #[test]
-fn kill9_after_provider_admission_retries_instead_of_reporting_errored() {
+fn kill9_after_provider_admission_exposes_typed_probe_recovery() {
     let blocked_script = r#"[{"step":"delay","ms":30000},{"step":"emit_text","text":"too late"},{"step":"finish","reason":"end_turn"}]"#;
-    let recovered_script = r#"[{"step":"delay","ms":5000},{"step":"emit_text","text":"recovered"},{"step":"finish","reason":"end_turn"}]"#;
+    let recovered_script = r#"[{"step":"emit_text","text":"fresh-after-probe"},{"step":"finish","reason":"end_turn"}]"#;
     let mut starter = haider();
     starter
         .args([
@@ -1108,9 +1108,8 @@ fn kill9_after_provider_admission_retries_instead_of_reporting_errored() {
         &["session", &session_id, "recover", "--probe", "--json"],
         recovered_script,
     );
-    assert_eq!(
-        probe.status.code(),
-        Some(i32::from(EX_BLOCKED)),
+    assert!(
+        probe.status.success(),
         "probe stdout: {}; stderr: {}; daemon logs: {}",
         String::from_utf8_lossy(&probe.stdout),
         String::from_utf8_lossy(&probe.stderr),
@@ -1118,36 +1117,47 @@ fn kill9_after_provider_admission_retries_instead_of_reporting_errored() {
     );
     let probe: serde_json::Value =
         serde_json::from_slice(&probe.stdout).expect("recovery probe JSON");
-    assert_eq!(probe["error"]["code"], "no_recovery");
-    let message = probe["error"]["message"]
-        .as_str()
-        .expect("probe diagnostic message");
-    assert!(
-        message.contains("run_state is running"),
-        "startup recovery did not re-enter the admitted request: {probe}"
+    assert_eq!(probe["schema"], "haider.session_recovery.v1");
+    assert_eq!(probe["session_id"], session_id);
+    assert_eq!(probe["chosen_option"], "probe");
+    assert_eq!(probe["completed"], true);
+    assert_eq!(probe["resulting_run_state"], "effect_unknown");
+    assert_eq!(probe["resulting_run_id"], run_id);
+    let menu_id = probe["menu_id"].as_str().expect("opening recovery menu id");
+    let resolution_seq = probe["resolution_seq"]
+        .as_u64()
+        .expect("durable recovery resolution sequence");
+    assert_eq!(
+        probe["replacement_menu_id"],
+        format!("{menu_id}-probe-{resolution_seq}")
     );
-    assert!(!message.contains("errored"));
 
-    let completion_deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let status = invoke(&["run", "--status", &run_id, "--json"], recovered_script);
-        assert!(
-            status.status.success(),
-            "completion status stderr: {}",
-            String::from_utf8_lossy(&status.stderr)
-        );
-        let status: serde_json::Value =
-            serde_json::from_slice(&status.stdout).expect("completion status JSON");
-        if status["result"]["state"]["state"] == "done" {
-            assert!(status["result"]["terminal_seq"].as_u64().is_some());
-            break;
-        }
-        assert!(
-            Instant::now() < completion_deadline,
-            "recovered run did not finish: {status}"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
+    let fresh = invoke(
+        &[
+            "run",
+            "--provider",
+            "fake",
+            "--json",
+            "-p",
+            "fresh request after recovery probe",
+        ],
+        recovered_script,
+    );
+    assert!(
+        fresh.status.success(),
+        "fresh run stdout: {}; stderr: {}; daemon logs: {}",
+        String::from_utf8_lossy(&fresh.stdout),
+        String::from_utf8_lossy(&fresh.stderr),
+        daemon_logs(&starter.profile)
+    );
+    let fresh: serde_json::Value = serde_json::from_slice(&fresh.stdout).expect("fresh run JSON");
+    assert_eq!(fresh["outcome"], "done");
+    assert!(
+        fresh["response"]
+            .as_str()
+            .is_some_and(|response| response.contains("fresh-after-probe")),
+        "recovery probe consumed the fresh provider segment: {fresh}"
+    );
 }
 
 #[test]

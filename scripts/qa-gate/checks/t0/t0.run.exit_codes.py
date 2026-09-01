@@ -70,7 +70,7 @@ budget = (
     + PROCESS_EXIT_GRACE
 )
 timed = False
-SIGINT_EXPECTED_GAP = True
+SIGINT_EXPECTED_GAP = False
 
 
 def _jsonl_case(ctx, label, args, expected_exit, expected_kind, expected_code):

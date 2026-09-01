@@ -216,12 +216,8 @@ class LoaderContractTests(unittest.TestCase):
             self.assertEqual(by_id[check_id].turns_expected, 1)
             self.assertEqual(by_id[check_id].expected_fail_until, "0.0.968")
         self.assertEqual(by_id["t1.daemon.lifecycle_triad"].turns_expected, 0)
-        self.assertEqual(
-            by_id["t1.daemon.lifecycle_triad"].expected_fail_until, "0.0.968"
-        )
-        self.assertEqual(
-            by_id["t1.daemon.kill9_midturn"].expected_fail_until, "0.0.968"
-        )
+        self.assertIsNone(by_id["t1.daemon.lifecycle_triad"].expected_fail_until)
+        self.assertIsNone(by_id["t1.daemon.kill9_midturn"].expected_fail_until)
         for check in runner.discover_checks(runner.CHECK_ROOT, "t1"):
             source = check.path.read_text(encoding="utf-8")
             self.assertNotIn("time.sleep", source, check.id)
