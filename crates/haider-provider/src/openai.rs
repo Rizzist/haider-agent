@@ -2077,7 +2077,7 @@ async fn checked_stream(
         });
     }
     let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
-    let turn_trace = crate::current_turn_trace_context();
+    let context = crate::SseRequestContext::capture(route_gating);
     let producer = tokio::spawn(async move {
         stream_response(
             response,
@@ -2086,8 +2086,7 @@ async fn checked_stream(
             chunk_idle_timeout,
             semantic_progress_timeout,
             decoder,
-            route_gating,
-            turn_trace,
+            context,
         )
         .await;
     });
@@ -2224,8 +2223,7 @@ async fn stream_response(
     chunk_idle_timeout: Duration,
     semantic_progress_timeout: Duration,
     kind: DecoderKind,
-    route_gating: crate::RouteGating,
-    turn_trace: Option<(crate::TurnTraceContext, u64)>,
+    context: crate::SseRequestContext,
 ) {
     stream_sse_source(
         response,
@@ -2234,8 +2232,7 @@ async fn stream_response(
         chunk_idle_timeout,
         semantic_progress_timeout,
         kind,
-        route_gating,
-        turn_trace,
+        context,
     )
     .await;
 }
@@ -2265,9 +2262,12 @@ async fn stream_sse_source<S: SseChunkSource>(
     chunk_idle_timeout: Duration,
     semantic_progress_timeout: Duration,
     kind: DecoderKind,
-    route_gating: crate::RouteGating,
-    turn_trace: Option<(crate::TurnTraceContext, u64)>,
+    context: crate::SseRequestContext,
 ) {
+    let crate::SseRequestContext {
+        route_gating,
+        turn_trace,
+    } = context;
     let mut decoder = match kind {
         DecoderKind::Responses(computer_kind) => {
             OpenAiDecoder::Responses(ResponsesDecoder::new(account, computer_kind))

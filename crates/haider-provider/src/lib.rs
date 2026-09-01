@@ -231,6 +231,34 @@ impl RouteGating {
     }
 }
 
+/// Request-local SSE state that must cross the producer-task boundary
+/// together. In particular, the trace coordinates are captured before
+/// `tokio::spawn` because Tokio task-local values do not propagate to the
+/// spawned decoder task.
+#[derive(Debug)]
+pub(crate) struct SseRequestContext {
+    pub(crate) route_gating: RouteGating,
+    pub(crate) turn_trace: Option<(TurnTraceContext, u64)>,
+}
+
+impl SseRequestContext {
+    #[must_use]
+    pub(crate) fn new(
+        route_gating: RouteGating,
+        turn_trace: Option<(TurnTraceContext, u64)>,
+    ) -> Self {
+        Self {
+            route_gating,
+            turn_trace,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn capture(route_gating: RouteGating) -> Self {
+        Self::new(route_gating, current_turn_trace_context())
+    }
+}
+
 /// Two active-time clocks for one response body. Raw chunks reset only the
 /// byte-idle clock; normalized content/tool/usage events reset the longer
 /// semantic-progress clock. Confirmed route-down intervals decrement neither.

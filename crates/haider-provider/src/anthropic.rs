@@ -1016,8 +1016,7 @@ impl AnthropicProvider {
         let account = self.account.clone();
         let chunk_idle_timeout = self.transport_config.chunk_idle_timeout;
         let semantic_progress_timeout = self.transport_config.semantic_progress_timeout;
-        let route_gating = self.route_gating();
-        let turn_trace = crate::current_turn_trace_context();
+        let context = crate::SseRequestContext::capture(self.route_gating());
         let producer = tokio::spawn(async move {
             stream_response(
                 response,
@@ -1026,8 +1025,7 @@ impl AnthropicProvider {
                 chunk_idle_timeout,
                 semantic_progress_timeout,
                 native_computer,
-                route_gating,
-                turn_trace,
+                context,
             )
             .await;
         });
@@ -1549,8 +1547,7 @@ async fn stream_response(
     chunk_idle_timeout: Duration,
     semantic_progress_timeout: Duration,
     native_computer: bool,
-    route_gating: crate::RouteGating,
-    turn_trace: Option<(crate::TurnTraceContext, u64)>,
+    context: crate::SseRequestContext,
 ) {
     stream_sse_source_with_native(
         response,
@@ -1559,8 +1556,7 @@ async fn stream_response(
         chunk_idle_timeout,
         semantic_progress_timeout,
         native_computer,
-        route_gating,
-        turn_trace,
+        context,
     )
     .await;
 }
@@ -1599,8 +1595,7 @@ pub(crate) async fn stream_sse_source<S: SseChunkSource>(
         chunk_idle_timeout,
         semantic_progress_timeout,
         false,
-        route_gating,
-        crate::current_turn_trace_context(),
+        crate::SseRequestContext::capture(route_gating),
     )
     .await;
 }
@@ -1612,9 +1607,12 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
     chunk_idle_timeout: Duration,
     semantic_progress_timeout: Duration,
     native_computer: bool,
-    route_gating: crate::RouteGating,
-    turn_trace: Option<(crate::TurnTraceContext, u64)>,
+    context: crate::SseRequestContext,
 ) {
+    let crate::SseRequestContext {
+        route_gating,
+        turn_trace,
+    } = context;
     let mut decoder = SseDecoder::with_native_computer(account, native_computer);
     let mut progress = crate::ProviderProgressClock::new(
         chunk_idle_timeout,
