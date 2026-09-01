@@ -586,3 +586,16 @@ meaning is at `crates/haider-client/src/profile.rs:187-200` on that branch.
   clean terminal returns `no_recovery`.
 - Bound headless SIGINT to one durable `turn.cancel`, one cancellation
   terminal, and exit 130; a second SIGINT takes the post-receipt fast exit.
+- Made packaged auto-spawn finite and warm by default: absent
+  `HAIDER_RUN_DAEMON_IDLE_TTL_MS` means a 30,000 ms idle TTL for every front
+  door, including `haider run --start`; zero retains exact-child one-shot
+  accounting and a positive value through 3,600,000 overrides the TTL.
+- Added `daemon.idle_ttl_ms` and `daemon.warm` to `haider status --json`.
+  Positive warm daemons report their effective TTL and `true`; TTL zero reports
+  `0`/`false`; direct, unbounded, and older daemons report `null`/`false`.
+  Automation must use the daemon-published values rather than infer policy from
+  its own environment.
+- Kept `haider daemon stop --json` as the explicit graceful operator exit for a
+  warm resident daemon; a clean result continues to require
+  `outcome: "stopped_cleanly"`, `daemon.process_exited: true`, and no surviving
+  authenticated PID.

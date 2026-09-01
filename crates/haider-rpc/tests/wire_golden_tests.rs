@@ -68,6 +68,8 @@ fn status_runtime_fields_are_additive_in_both_client_directions() {
             socket_path: None,
             pid_file_path: None,
             ready: false,
+            idle_ttl_ms: None,
+            warm: false,
             ..
         }
     ));
@@ -86,6 +88,8 @@ fn status_runtime_fields_are_additive_in_both_client_directions() {
         socket_path: Some("/tmp/haider/h.sock".into()),
         pid_file_path: Some("/tmp/haider/haiderd.pid".into()),
         ready: true,
+        idle_ttl_ms: Some(30_000),
+        warm: true,
     })
     .expect("encode current status response");
     let legacy: LegacyStatusSnapshot =

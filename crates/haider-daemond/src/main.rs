@@ -398,6 +398,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedArgs, String> 
     if idle_linger.is_some() && liveness.is_none() {
         return Err("--idle-linger-ms requires --launcher-liveness".to_owned());
     }
+    config.idle_ttl = liveness
+        .as_ref()
+        .map(|_| idle_linger.unwrap_or(Duration::ZERO));
     Ok(ParsedArgs {
         config,
         readiness,

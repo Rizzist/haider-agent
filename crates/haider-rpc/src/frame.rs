@@ -4213,6 +4213,13 @@ pub enum ResponseBody {
         /// false and is disambiguated by feature negotiation.
         #[serde(default)]
         ready: bool,
+        /// Effective launcher-owned idle TTL. Zero is the explicit one-shot
+        /// policy; absence identifies an unbounded or older daemon.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idle_ttl_ms: Option<u64>,
+        /// True only after the daemon's pre-ready warm-up boundary completed.
+        #[serde(default, skip_serializing_if = "is_false")]
+        warm: bool,
     },
     /// Acknowledges a connection-scoped session roster watch.
     #[serde(rename = "session.list_watch")]

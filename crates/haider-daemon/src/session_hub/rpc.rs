@@ -7271,6 +7271,8 @@ impl HubConnection {
                 sink,
                 transport: self.transport,
                 runtime_paths: None,
+                daemon_idle_ttl_ms: self.daemon_idle_ttl_ms,
+                daemon_warm: self.daemon_warm,
                 stages: Mutex::new(crate::accounts::StagedSecrets::default()),
                 roster_watch: Mutex::new(None),
                 accounts_watch: Mutex::new(None),
@@ -15449,6 +15451,8 @@ impl HubConnection {
                 socket_path: runtime.map(|(socket_path, _)| socket_path.display().to_string()),
                 pid_file_path: runtime
                     .map(|(_, pid_file_path)| pid_file_path.display().to_string()),
+                idle_ttl_ms: self.daemon_idle_ttl_ms,
+                warm: self.daemon_warm,
                 // A request can reach this handler only after the runtime
                 // publishes Ready and starts the accept loop. The same edge
                 // drives DaemonReadyNotifier in runtime.rs.

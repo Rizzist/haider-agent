@@ -117,6 +117,10 @@ pub struct ObserveStatusSnapshot {
     /// The daemon's serving edge. For pre-feature daemons, a negotiated
     /// Ready Welcome is the compatible source of the same lifecycle fact.
     pub ready: bool,
+    /// Effective idle TTL; zero is one-shot and `None` is unbounded/unknown.
+    pub idle_ttl_ms: Option<u64>,
+    /// Whether pre-ready boot work remains resident for the first client.
+    pub warm: bool,
 }
 
 /// Finite result from the event-driven durable-roster barrier.
@@ -267,6 +271,8 @@ impl ObserveClient {
                 socket_path,
                 pid_file_path,
                 ready,
+                idle_ttl_ms,
+                warm,
             } => Ok(ObserveStatusSnapshot {
                 active_account,
                 session_count,
@@ -275,6 +281,8 @@ impl ObserveClient {
                 daemon_pid,
                 socket_path,
                 pid_file_path,
+                idle_ttl_ms,
+                warm,
                 ready: if self
                     .welcome
                     .features

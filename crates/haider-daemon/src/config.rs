@@ -72,6 +72,11 @@ pub struct DaemonConfig {
     /// Disables probing first-party device credential stores for this profile.
     /// The wire reports an explicit disabled state rather than an empty scan.
     pub discovery_disabled: bool,
+    /// Effective idle TTL of a launcher-owned daemon. `Some(Duration::ZERO)`
+    /// is the explicit one-shot policy; `None` is an unbounded/direct daemon.
+    /// Positive TTL daemons retain their pre-ready boot working set.
+    #[doc(hidden)]
+    pub idle_ttl: Option<Duration>,
     /// Overrides the machine-user-global lockdown root for an injected
     /// in-process runtime. Production constructors leave this unset; shared
     /// black-box harnesses use one temporary root instead of mutating process
@@ -109,6 +114,7 @@ impl DaemonConfig {
             session_hub: SessionHubConfig::default(),
             default_model: haider_client::PACKAGED_DEFAULT_MODEL.to_owned(),
             discovery_disabled: false,
+            idle_ttl: None,
             lockdown_root_override: None,
             inject_worker_manager_shutdown_error: false,
         }

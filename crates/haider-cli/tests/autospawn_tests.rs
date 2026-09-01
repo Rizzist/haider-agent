@@ -282,13 +282,15 @@ impl DaemonGuard {
     }
 
     fn terminate_and_wait(&self, endpoint: &Path) {
-        if let Some(pid) = self.pid() {
-            let _ = Command::new("kill").arg(pid.to_string()).status();
-        }
+        let pid = self.pid().expect("running daemon PID before cleanup");
+        let _ = Command::new("kill").arg(pid.to_string()).status();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while endpoint.exists() && Instant::now() < deadline {
+        while (process_exists(pid) || endpoint.exists()) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
+        let alive_after = process_exists(pid);
+        assert!(!alive_after, "daemon {pid} survived test cleanup");
+        assert!(!endpoint.exists(), "daemon endpoint survived test cleanup");
     }
 }
 
@@ -636,11 +638,11 @@ fn idle_ttl_never_retires_a_daemon_with_a_nonterminal_run() {
     );
 }
 
-/// Three real `haider run` processes on one profile must authenticate the
-/// same daemon PID. The bounded idle timer then proves that reuse does not
-/// trade one cold start per invocation for an indefinitely resident child.
+/// Three default-policy `haider run` processes on one profile authenticate
+/// the same warm daemon. Status projects that launch policy, and the operator
+/// stop path proves the daemon does not outlive the test.
 #[test]
-fn repeated_run_invocations_pay_one_cold_daemon_start_then_idle_exit() {
+fn repeated_run_invocations_default_to_one_warm_daemon_until_operator_stop() {
     ensure_haiderd_built();
     let store = tempfile::tempdir().expect("store dir");
     let profile = resolved_for(store.path());
@@ -657,8 +659,7 @@ fn repeated_run_invocations_pay_one_cold_daemon_start_then_idle_exit() {
         let output = output_with_timeout(
             haider_command(store.path())
                 .args(["run", "--provider", "fake", "--json", "-p", "hello"])
-                .env("HAIDER_TEST_FAKE_PROVIDER", fake_script)
-                .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "5000"),
+                .env("HAIDER_TEST_FAKE_PROVIDER", fake_script),
             &format!("same-profile run invocation {invocation}"),
         );
         assert!(
@@ -676,19 +677,49 @@ fn repeated_run_invocations_pay_one_cold_daemon_start_then_idle_exit() {
     );
 
     let daemon_pid = daemon_pids[0];
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while (process_exists(daemon_pid) || profile.endpoint_path.exists())
-        && Instant::now() < deadline
-    {
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    assert!(
-        !process_exists(daemon_pid),
-        "daemon {daemon_pid} survived its bounded idle TTL"
+    let status_output = output_with_timeout(
+        haider_command(store.path()).args(["status", "--json", "--no-spawn"]),
+        "default warm daemon status",
     );
     assert!(
+        status_output.status.success(),
+        "status failed: status={} stdout={} stderr={}",
+        status_output.status,
+        String::from_utf8_lossy(&status_output.stdout),
+        String::from_utf8_lossy(&status_output.stderr),
+    );
+    let status: serde_json::Value =
+        serde_json::from_slice(&status_output.stdout).expect("status stdout is JSON");
+    assert_eq!(status["daemon"]["pid"], daemon_pid);
+    assert_eq!(status["daemon"]["idle_ttl_ms"], 30_000);
+    assert_eq!(status["daemon"]["warm"], true);
+    assert!(
+        process_exists(daemon_pid),
+        "warm daemon must still be alive"
+    );
+
+    let stop_output = output_with_timeout(
+        haider_command(store.path()).args(["daemon", "stop", "--json", "--timeout", "10s"]),
+        "operator daemon stop",
+    );
+    assert!(
+        stop_output.status.success(),
+        "daemon stop failed: status={} stdout={} stderr={}",
+        stop_output.status,
+        String::from_utf8_lossy(&stop_output.stdout),
+        String::from_utf8_lossy(&stop_output.stderr),
+    );
+    let stopped: serde_json::Value =
+        serde_json::from_slice(&stop_output.stdout).expect("daemon stop stdout is JSON");
+    assert_eq!(stopped["outcome"], "stopped_cleanly");
+    assert_eq!(stopped["daemon"]["pid"], daemon_pid);
+    assert_eq!(stopped["daemon"]["process_exited"], true);
+
+    let alive_after = process_exists(daemon_pid);
+    assert!(!alive_after, "daemon {daemon_pid} survived operator stop");
+    assert!(
         !profile.endpoint_path.exists(),
-        "idle exit must remove the profile endpoint"
+        "operator stop must remove the profile endpoint"
     );
 }
 
@@ -859,7 +890,7 @@ fn a_second_daemon_candidate_for_one_profile_exits_seventy_five() {
     let haiderd = ensure_haiderd_built();
     let store = tempfile::tempdir().expect("store dir");
     let profile = resolved_for(store.path());
-    let guard = DaemonGuard {
+    let _guard = DaemonGuard {
         store: store.path().to_path_buf(),
     };
 
@@ -906,6 +937,13 @@ fn a_second_daemon_candidate_for_one_profile_exits_seventy_five() {
         String::from_utf8_lossy(&loser.stderr)
     );
 
-    guard.terminate_and_wait(&profile.endpoint_path);
+    let winner_pid = winner.id();
+    let _ = Command::new("kill").arg(winner_pid.to_string()).status();
     let _ = wait_for_output(winner, "winning daemon to exit after test cleanup");
+    let alive_after = process_exists(winner_pid);
+    assert!(!alive_after, "winning daemon survived test cleanup");
+    assert!(
+        !profile.endpoint_path.exists(),
+        "winning daemon endpoint survived test cleanup"
+    );
 }
