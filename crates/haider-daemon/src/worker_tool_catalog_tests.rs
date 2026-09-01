@@ -321,6 +321,42 @@ fn lockdown_refusal_is_typed_and_compacted_for_the_model() {
     assert_eq!(result.status, ToolResultStatus::Rejected);
 }
 
+/// MUTATION CHECK: return `HaiderError::InvalidArgument` from the cached
+/// parser or map it through `tool_error`. The exact model-authored fixture
+/// then cannot produce this continuable rejected result.
+#[test]
+fn parser_missing_required_path_becomes_typed_rejected_tool_result() {
+    let error = match BrokerToolDispatcher::parse_tool_operation(
+        RegisteredToolRoute::FsRead,
+        "missing-path",
+        &serde_json::json!({"message": "..."}),
+    ) {
+        Ok(_) => panic!("fs_read without path must fail parser validation"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error,
+        ToolError::InvalidArgument {
+            message: "tool argument `path` must be a non-empty string".into(),
+        }
+    );
+
+    let ToolDispatchResult::Completed(result) =
+        model_tool_argument_failure(error).expect("model argument failure is continuable")
+    else {
+        panic!("model argument failure must settle as a completed tool result")
+    };
+    assert_eq!(result.status, ToolResultStatus::Rejected);
+    let preview: serde_json::Value =
+        serde_json::from_str(&result.preview).expect("typed invalid-argument preview");
+    assert_eq!(preview["status"], "rejected");
+    assert_eq!(preview["error"]["kind"], "invalid_argument");
+    assert_eq!(
+        preview["error"]["message"],
+        "tool argument `path` must be a non-empty string"
+    );
+}
+
 #[test]
 fn approval_retry_cache_reuses_typed_operation_and_fences_full_call_identity() {
     let parses = std::cell::Cell::new(0_u32);

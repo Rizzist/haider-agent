@@ -2749,6 +2749,78 @@ fn run_nonpermission_input_rejects_without_guessing_and_continues() {
     );
 }
 
+/// MUTATION CHECK: let the daemon parser raise turn-scope InvalidArgument or
+/// omit the rejected result from provider context. The exact model-authored
+/// fixture then exits 70/errored or the scripted provider rejects the missing
+/// second request instead of reaching Done.
+#[test]
+fn run_model_tool_argument_shape_error_is_rejected_and_continues() {
+    let script = r#"[
+        {"step":"emit_tool_call","call_id":"bad-read","name":"fs_read","args":{"message":"..."}},
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"bad-read"},
+        {"step":"emit_text","text":"continued after correcting tool arguments"},
+        {"step":"finish","reason":"end_turn"}
+    ]"#;
+    let out = haider_with_boot_retry(
+        &["run", "--provider", "fake", "invalid tool args", "--jsonl"],
+        &[("HAIDER_TEST_FAKE_PROVIDER", script)],
+    );
+    assert!(
+        out.status.success(),
+        "exit {:?}, stderr: {}; stdout: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let envelopes = parse_jsonl(&out.stdout);
+    let rejection = envelopes
+        .iter()
+        .find_map(|envelope| match typed(envelope) {
+            Some(EventPayload::ToolResult { call_id, result }) if call_id == "bad-read" => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("invalid fs_read arguments must emit a tool_result");
+    assert_eq!(
+        rejection.status,
+        haider_protocol::tool::ToolResultStatus::Rejected
+    );
+    let preview: serde_json::Value =
+        serde_json::from_str(&rejection.preview).expect("typed invalid-argument preview");
+    assert_eq!(preview["status"], "rejected");
+    assert_eq!(preview["error"]["kind"], "invalid_argument");
+    assert_eq!(
+        preview["error"]["message"],
+        "tool argument `path` must be a non-empty string"
+    );
+    assert!(
+        envelopes.iter().any(|envelope| matches!(
+            typed(envelope),
+            Some(EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::AgentMessage { text },
+                ..
+            })) if text == "continued after correcting tool arguments"
+        )),
+        "the provider must receive a second model turn after the rejected result"
+    );
+    assert!(
+        !envelopes
+            .iter()
+            .any(|envelope| matches!(typed(envelope), Some(EventPayload::RunFailed { .. })))
+    );
+    assert_eq!(
+        envelopes.last().map(typed),
+        Some(Some(EventPayload::RunState(RunState::Done)))
+    );
+    assert_eq!(
+        envelopes.last().expect("done terminal envelope").payload["terminal_kind"],
+        "success"
+    );
+}
+
 /// MUTATION CHECK: allocate a second id while accumulating argument chunks,
 /// omit the provider call id from completion/result, or skip one cursor. The
 /// exact call/result join and the contiguous stream assertions then fail.

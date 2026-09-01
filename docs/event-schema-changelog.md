@@ -161,3 +161,16 @@ surfaces.
 - No envelope field or core `EventPayload`/`TurnItem` kind changed.
   `RunBudgetDimensionV1`, `HeadlessRunUsageV1`, and
   `HeadlessRunEventPayload::RunBudgetExhausted` all predate this release.
+
+### v0.0.969 — tool-argument rejection clarification
+
+- No automation schema changed. A model-authored tool call whose arguments are
+  valid JSON but fail the tool's argument shape now settles through the
+  existing `payload:tool_result` carrier with status `rejected` and a preview
+  error kind of `invalid_argument`; the result is fed back for a corrective
+  provider request. Previously the daemon incorrectly emitted a turn-scope
+  `run_failed` and no tool result.
+- The provider call id, durable sequence, JSONL framing, and exactly-one
+  terminal rules are unchanged. This is a behavioral correction to the
+  existing carrier, not an additive field or kind; the normative automation
+  wording is in `docs/jsonl-run-contract-v1.md` under “Tool-call identity.”
