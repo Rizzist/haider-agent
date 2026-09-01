@@ -1465,6 +1465,8 @@ fn connection_context(
         shutdown: crate::lifecycle::ShutdownHandle::channel().0,
         endpoint_path: std::path::PathBuf::from("/tmp/liveness-test.sock"),
         pid_file_path: std::path::PathBuf::from("/tmp/haiderd.pid"),
+        idle_ttl_ms: None,
+        warm: false,
     }
 }
 

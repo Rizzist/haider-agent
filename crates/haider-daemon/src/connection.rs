@@ -1234,6 +1234,10 @@ pub(crate) struct ConnectionContext {
     pub(crate) endpoint_path: PathBuf,
     /// Exact daemon-owned PID publication file for status automation.
     pub(crate) pid_file_path: PathBuf,
+    /// Effective launcher-owned idle TTL. `None` means direct/unbounded.
+    pub(crate) idle_ttl_ms: Option<u64>,
+    /// True only when pre-ready boot work remains resident for the first client.
+    pub(crate) warm: bool,
 }
 
 /// Runs one client connection to completion: UID gate, framed read loop,
@@ -1818,6 +1822,8 @@ async fn handle_frame(
                         sink,
                         crate::accounts::ConnectionTransport::LocalSameUid,
                         Some((context.endpoint_path.clone(), context.pid_file_path.clone())),
+                        context.idle_ttl_ms,
+                        context.warm,
                     )
                     .map_err(DaemonError::from)?,
             );

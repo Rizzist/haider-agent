@@ -134,6 +134,8 @@ fn connection_context(
         shutdown: crate::lifecycle::ShutdownHandle::channel().0,
         endpoint_path: std::path::PathBuf::from("duplex://cancellation"),
         pid_file_path: std::path::PathBuf::from("duplex://haiderd.pid"),
+        idle_ttl_ms: None,
+        warm: false,
     }
 }
 

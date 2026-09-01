@@ -1607,6 +1607,8 @@ async fn status_snapshot_counts_sessions_without_listing_summaries() {
                         socket_path,
                         pid_file_path,
                         ready,
+                        idle_ttl_ms,
+                        warm,
                     },
             } if request_id.as_str() == "status-scalars" => Some((
                 active_account.clone(),
@@ -1617,6 +1619,8 @@ async fn status_snapshot_counts_sessions_without_listing_summaries() {
                 socket_path.clone(),
                 pid_file_path.clone(),
                 *ready,
+                *idle_ttl_ms,
+                *warm,
             )),
             _ => None,
         })
@@ -1631,7 +1635,9 @@ async fn status_snapshot_counts_sessions_without_listing_summaries() {
             Some(std::process::id()),
             None,
             None,
-            true
+            true,
+            None,
+            false
         )
     );
 

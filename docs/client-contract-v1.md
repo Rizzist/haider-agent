@@ -3367,3 +3367,26 @@ applicable plus used and limit; trust change includes provider, previous trust,
 new trust, and revision. They MUST NOT infer these facts from assistant text or
 error styling. See `docs/provider-lockdown-v1.md` for the normative envelope,
 quota, toggle-boundary, and subagent rules.
+
+## 21. Additive changelog
+
+### 2026-09-01 — v0.0.969 warm-by-default
+
+- Every packaged auto-spawn front door, including `haider run --start`, now
+  selects a finite 30,000 ms idle TTL when
+  `HAIDER_RUN_DAEMON_IDLE_TTL_MS` is absent. The daemon remains available for
+  later authenticated clients and earns a fresh full TTL after its last client
+  disconnects while durable work is quiescent.
+- `HAIDER_RUN_DAEMON_IDLE_TTL_MS=0` retains exact-child one-shot accounting.
+  Positive integer values through 3,600,000 select a custom finite TTL;
+  `haider run` reports malformed, non-UTF-8, and over-limit values as errors.
+  Front doors whose default constructor cannot return a configuration error
+  safely fall back to the same finite 30,000 ms policy. `haider daemon stop`
+  remains the explicit operator-owned graceful exit and never auto-spawns.
+- `status.snapshot` adds optional/default-compatible `idle_ttl_ms` and `warm`
+  fields, projected by `haider status --json` as `daemon.idle_ttl_ms` and
+  `daemon.warm`. A numeric positive TTL with `warm: true` means the daemon
+  retained its completed pre-Ready boot working set. Zero with `warm: false`
+  is one-shot; `null`/absence with `warm: false` is direct, unbounded, or an
+  older daemon. Clients MUST NOT infer either value from their own environment
+  when the daemon omits the fields.

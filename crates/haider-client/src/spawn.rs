@@ -79,9 +79,8 @@ const RACE_LOSER_REAP_POLL: Duration = Duration::from_millis(25);
 
 /// Whether a caller keeps an auto-spawned daemon persistent or tears down
 /// only the exact authenticated child it launched.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonLifetime {
-    #[default]
     Persistent,
     /// Keep the authenticated child available for subsequent clients, then
     /// let the daemon shut itself down after this much time with no clients.
@@ -89,6 +88,14 @@ pub enum DaemonLifetime {
         idle_ttl: Duration,
     },
     EphemeralIfSpawned,
+}
+
+impl Default for DaemonLifetime {
+    fn default() -> Self {
+        Self::LingerIfSpawned {
+            idle_ttl: DEFAULT_AUTOSPAWN_DAEMON_IDLE_TTL,
+        }
+    }
 }
 
 /// Resolve the one shared auto-spawn lifetime policy.

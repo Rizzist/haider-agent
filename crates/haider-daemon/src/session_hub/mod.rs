@@ -2028,6 +2028,8 @@ pub struct HubConnection {
     /// Listener and PID-publication paths carried by the negotiated runtime
     /// connection. Test-only in-memory connections intentionally omit them.
     runtime_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    daemon_idle_ttl_ms: Option<u64>,
+    daemon_warm: bool,
     /// Connection-scoped staged secrets (R7): wiped on close/disconnect.
     stages: Mutex<crate::accounts::StagedSecrets>,
     /// At most one connection-scoped roster ticker. The task owns no
@@ -4373,7 +4375,7 @@ impl SessionHub {
         sink: Arc<dyn FrameSink>,
         transport: crate::accounts::ConnectionTransport,
     ) -> Result<HubConnection, SessionHubError> {
-        self.open_connection_with_runtime_paths(capabilities, sink, transport, None)
+        self.open_connection_with_runtime_paths(capabilities, sink, transport, None, None, false)
     }
 
     pub(crate) fn open_connection_with_runtime_paths(
@@ -4382,6 +4384,8 @@ impl SessionHub {
         sink: Arc<dyn FrameSink>,
         transport: crate::accounts::ConnectionTransport,
         runtime_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+        daemon_idle_ttl_ms: Option<u64>,
+        daemon_warm: bool,
     ) -> Result<HubConnection, SessionHubError> {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(SessionHubError::Closed);
@@ -4444,6 +4448,8 @@ impl SessionHub {
             sink,
             transport,
             runtime_paths,
+            daemon_idle_ttl_ms,
+            daemon_warm,
             stages: Mutex::new(crate::accounts::StagedSecrets::default()),
             roster_watch: Mutex::new(None),
             accounts_watch: Mutex::new(None),

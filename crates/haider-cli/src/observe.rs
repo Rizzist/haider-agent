@@ -86,6 +86,8 @@ pub(crate) struct DaemonView {
     pub socket_path: String,
     pub pid_file_path: Option<String>,
     pub ready: bool,
+    pub idle_ttl_ms: Option<u64>,
+    pub warm: bool,
 }
 
 pub(crate) struct UpdateView {
@@ -124,6 +126,8 @@ struct StatusDaemonWire<'a> {
     pid_file_path: Option<&'a str>,
     pipe_dir: String,
     ready: bool,
+    idle_ttl_ms: Option<u64>,
+    warm: bool,
     socket_path: &'a str,
     version: &'a str,
 }
@@ -251,6 +255,8 @@ impl ObserveJson for StatusDocument {
                 "socket_path": self.daemon.socket_path,
                 "pid_file_path": self.daemon.pid_file_path,
                 "ready": self.daemon.ready,
+                "idle_ttl_ms": self.daemon.idle_ttl_ms,
+                "warm": self.daemon.warm,
                 "pipe_dir": std::path::Path::new(&self.profile_path)
                     .join("pipe")
                     .display()
@@ -600,6 +606,8 @@ JSON filesystem paths are canonical absolute paths; daemon.socket_path is a Wind
             socket_path,
             pid_file_path,
             ready: snapshot.ready,
+            idle_ttl_ms: snapshot.idle_ttl_ms,
+            warm: snapshot.warm,
         },
         update,
         features: welcome.features.into_iter().collect(),
@@ -1188,6 +1196,8 @@ fn write_status_document(document: &StatusDocument) -> ExitCode {
             socket_path: &document.daemon.socket_path,
             pid_file_path: document.daemon.pid_file_path.as_deref(),
             ready: document.daemon.ready,
+            idle_ttl_ms: document.daemon.idle_ttl_ms,
+            warm: document.daemon.warm,
             pipe_dir: std::path::Path::new(&document.profile_path)
                 .join("pipe")
                 .display()

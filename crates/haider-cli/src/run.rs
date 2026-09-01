@@ -5,13 +5,15 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use haider_client::DaemonLifetime;
 use haider_client::{
-    ConnectError, DaemonLifetime, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL,
-    EnsureError, EnsureOptions, HeadlessEvent, HeadlessEventMode, HeadlessFailureCode,
-    HeadlessInterrupt, HeadlessOutcome, HeadlessRunError, HeadlessRunEvents, HeadlessRunRequest,
-    HeadlessRunResult, HeadlessRunStatus, HeadlessSessionConfig, ProfileEnv,
-    autospawn_daemon_lifetime, headless_run_events, headless_run_status, load_attachment,
-    resolve_profile, run_headless_with_session_config_event_mode_and_interrupts, stop_headless_run,
+    ConnectError, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL, EnsureError,
+    EnsureOptions, HeadlessEvent, HeadlessEventMode, HeadlessFailureCode, HeadlessInterrupt,
+    HeadlessOutcome, HeadlessRunError, HeadlessRunEvents, HeadlessRunRequest, HeadlessRunResult,
+    HeadlessRunStatus, HeadlessSessionConfig, ProfileEnv, autospawn_daemon_lifetime,
+    headless_run_events, headless_run_status, load_attachment, resolve_profile,
+    run_headless_with_session_config_event_mode_and_interrupts, stop_headless_run,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
@@ -499,24 +501,20 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     };
     let mut options = parsed.options;
     let session_config = parsed.session_config;
-    let daemon_lifetime = if options.action == RunAction::Start {
-        DaemonLifetime::Persistent
-    } else {
-        match autospawn_daemon_lifetime(
-            std::env::var_os(haider_client::AUTOSPAWN_DAEMON_IDLE_TTL_ENV).as_deref(),
-        ) {
-            Ok(lifetime) => lifetime,
-            Err(message) => {
-                let failure = ClassifiedRunError::bootstrap("invalid_argument", message.clone());
-                if let Err(error) =
-                    write_run_error(io::stdout().lock(), options.output, &failure, None, None)
-                {
-                    eprintln!("haider: stdout failed: {error}");
-                    return ExitCode::from(EX_IOERR);
-                }
-                eprintln!("haider run: {message}");
-                return ExitCode::from(EX_USAGE);
+    let daemon_lifetime = match autospawn_daemon_lifetime(
+        std::env::var_os(haider_client::AUTOSPAWN_DAEMON_IDLE_TTL_ENV).as_deref(),
+    ) {
+        Ok(lifetime) => lifetime,
+        Err(message) => {
+            let failure = ClassifiedRunError::bootstrap("invalid_argument", message.clone());
+            if let Err(error) =
+                write_run_error(io::stdout().lock(), options.output, &failure, None, None)
+            {
+                eprintln!("haider: stdout failed: {error}");
+                return ExitCode::from(EX_IOERR);
             }
+            eprintln!("haider run: {message}");
+            return ExitCode::from(EX_USAGE);
         }
     };
     if options.prompt_stdin {
@@ -1726,6 +1724,12 @@ mod tests {
     fn run_daemon_linger_defaults_to_thirty_seconds_and_zero_restores_one_shot() {
         assert_eq!(
             autospawn_daemon_lifetime(None).expect("default linger"),
+            DaemonLifetime::LingerIfSpawned {
+                idle_ttl: Duration::from_secs(30),
+            }
+        );
+        assert_eq!(
+            DaemonLifetime::default(),
             DaemonLifetime::LingerIfSpawned {
                 idle_ttl: Duration::from_secs(30),
             }

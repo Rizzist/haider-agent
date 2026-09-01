@@ -303,6 +303,8 @@ async fn one_shot_status_is_exactly_one_scalar_rpc() {
                         .to_string(),
                 ),
                 ready: true,
+                idle_ttl_ms: Some(30_000),
+                warm: true,
             },
         )
         .await;
@@ -321,6 +323,8 @@ async fn one_shot_status_is_exactly_one_scalar_rpc() {
     assert_eq!(status.waiting_for_route_count, 2);
     assert!(status.active_account.is_none());
     assert_eq!(status.daemon_pid, Some(42));
+    assert_eq!(status.idle_ttl_ms, Some(30_000));
+    assert!(status.warm);
     assert_eq!(
         status.socket_path.as_deref(),
         Some(profile.endpoint_path.to_string_lossy().as_ref())

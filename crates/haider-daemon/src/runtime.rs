@@ -1311,12 +1311,11 @@ async fn run_inner(
     }
     // Every boot scan, adoption, recovered-work handoff, and optional
     // transport startup has returned, while no endpoint exists for external
-    // requests. Every daemon discards pages made cold by this boot. Spawned
-    // liveness daemons use the same boundary: a later turn faults in only the
-    // pages it actually needs instead of retaining the complete boot scan.
-    if let Err(error) = store.release_memory().await {
-        tracing::warn!(%error, "SQLite boot-page release failed; continuing startup");
-    }
+    // requests. A positive-TTL daemon retains this already-paid working set:
+    // the first client after Ready therefore connects to a prewarmed runtime.
+    // Direct/unbounded and explicit TTL=0 one-shot daemons retain the smaller
+    // historical footprint instead.
+    let daemon_warm = retain_pre_ready_working_set(&store, config.idle_ttl).await;
     let mut endpoint = match endpoint::bind(config, runtime_directory).await {
         Ok(endpoint) => endpoint,
         Err(error) => {
@@ -1368,6 +1367,8 @@ async fn run_inner(
         shutdown: shutdown_handle,
         endpoint_path: endpoint.path().to_path_buf(),
         pid_file_path: config.runtime_dir.join(crate::DAEMON_PID_FILE),
+        idle_ttl_ms: config.idle_ttl.map(duration_ms),
+        warm: daemon_warm,
     };
     // Ready is published under the shutdown transition mutex, so a first
     // signal that races this point either wins (no Ready, drain from
@@ -1629,6 +1630,19 @@ async fn run_inner(
         states.publish(DaemonState::Stopped);
     }
     result
+}
+
+async fn retain_pre_ready_working_set(
+    store: &SqliteStoreHandle,
+    idle_ttl: Option<Duration>,
+) -> bool {
+    if idle_ttl.is_some_and(|ttl| !ttl.is_zero()) {
+        return true;
+    }
+    if let Err(error) = store.release_memory().await {
+        tracing::warn!(%error, "SQLite boot-page release failed; continuing startup");
+    }
+    false
 }
 
 /// Runtime services that may already exist when launcher death arrives before

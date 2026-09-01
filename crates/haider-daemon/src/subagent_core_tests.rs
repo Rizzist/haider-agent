@@ -2485,6 +2485,8 @@ impl UdsControlClient {
             shutdown: crate::lifecycle::ShutdownHandle::channel().0,
             endpoint_path: PathBuf::from("/tmp/w6d-child-control.sock"),
             pid_file_path: PathBuf::from("/tmp/haiderd.pid"),
+            idle_ttl_ms: None,
+            warm: false,
         };
         let (drain_sender, drain) = watch::channel(Option::<DrainNotice>::None);
         let serve_task = tokio::spawn(async move {
