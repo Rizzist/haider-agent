@@ -430,3 +430,123 @@ fn provider_view_request_ordinal_survives_session_id_reuse() {
         .verify_provider_view(&second)
         .expect("reused-session provider view");
 }
+
+/// turnhygiene pin. MUTATION CHECK: treat a request whose blocks are all
+/// already indexed as needing no index row, skip its durability so a reopen
+/// or an older request's expiry drops it, or read a partially shared request
+/// through the wrong cursor. Expected RUNTIME failure: the all-shared or the
+/// partially shared request stops verifying, a block read returns different
+/// bytes, or the shared request no longer survives the older one's expiry.
+#[test]
+fn provider_views_with_preexisting_blocks_stay_readable_across_expiry_and_reopen() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("provider-view-index-proven");
+    create_session(&store, &session_id);
+    // Opening a store sweeps against the wall clock, so only the request
+    // meant to expire carries a tiny expiry; the survivors expire far ahead.
+    const FAR: u64 = u64::MAX / 4;
+
+    let (first_ledger, first_blobs) = provider_view("p", 4 * 1024);
+    let first = store
+        .persist_provider_view_until(&session_id, first_ledger, first_blobs, 10)
+        .expect("persist the first request");
+
+    // Every block of the second request already exists in the index.
+    let (all_shared_ledger, all_shared_blobs) = provider_view("p", 4 * 1024);
+    let all_shared = store
+        .persist_provider_view_until(&session_id, all_shared_ledger, all_shared_blobs, FAR)
+        .expect("persist a request whose blocks all pre-exist");
+    assert_eq!(all_shared.system_block, first.system_block);
+    assert_eq!(all_shared.tool_schema_block, first.tool_schema_block);
+    assert_eq!(all_shared.history_blocks, first.history_blocks);
+    let first_ordinal = first
+        .storage
+        .as_ref()
+        .expect("first storage cursor")
+        .request_ordinal;
+    let all_shared_ordinal = all_shared
+        .storage
+        .as_ref()
+        .expect("all-shared storage cursor")
+        .request_ordinal;
+    assert!(all_shared_ordinal > first_ordinal);
+
+    // The third request shares the system and tool blocks only.
+    let (partial_ledger, partial_blobs) = provider_view("p", 128);
+    let partial = store
+        .persist_provider_view_until(&session_id, partial_ledger, partial_blobs, FAR + 10)
+        .expect("persist a partially shared request");
+    assert_eq!(partial.system_block, first.system_block);
+    assert_ne!(partial.history_blocks, first.history_blocks);
+
+    let read_all = |ledger: &ProviderViewLedgerV1, history_len: usize| {
+        store
+            .verify_provider_view(ledger)
+            .expect("request verifies");
+        assert_eq!(
+            store
+                .read_provider_view_block(ledger, &ledger.system_block)
+                .expect("system block"),
+            b"system-p".to_vec()
+        );
+        assert_eq!(
+            store
+                .read_provider_view_block(ledger, &ledger.tool_schema_block)
+                .expect("tool schema block"),
+            b"tools-p".to_vec()
+        );
+        assert_eq!(
+            store
+                .read_provider_view_block(ledger, &ledger.history_blocks[0])
+                .expect("history block"),
+            vec![b'p'; history_len]
+        );
+    };
+    read_all(&first, 4 * 1024);
+    read_all(&all_shared, 4 * 1024);
+    read_all(&partial, 128);
+
+    // Expiring the request that first published the shared bytes must not
+    // take them away from the later requests that referenced them.
+    assert_eq!(
+        store
+            .sweep_expired_provider_views(10)
+            .expect("sweep the first request"),
+        1
+    );
+    assert!(store.verify_provider_view(&first).is_err());
+    read_all(&all_shared, 4 * 1024);
+    read_all(&partial, 128);
+
+    drop(store);
+    let reopened = Store::open(root.path()).expect("reopen store");
+    reopened
+        .verify_provider_view(&all_shared)
+        .expect("the all-shared request survives a reopen");
+    reopened
+        .verify_provider_view(&partial)
+        .expect("the partially shared request survives a reopen");
+    assert_eq!(
+        reopened
+            .read_provider_view_block(&all_shared, &all_shared.history_blocks[0])
+            .expect("history block after reopen"),
+        vec![b'p'; 4 * 1024]
+    );
+    assert_eq!(
+        reopened
+            .sweep_expired_provider_views(FAR)
+            .expect("sweep the all-shared request"),
+        1
+    );
+    assert!(reopened.verify_provider_view(&all_shared).is_err());
+    reopened
+        .verify_provider_view(&partial)
+        .expect("the partially shared request keeps its shared blocks");
+    assert_eq!(
+        reopened
+            .read_provider_view_block(&partial, &partial.system_block)
+            .expect("shared system block"),
+        b"system-p".to_vec()
+    );
+}

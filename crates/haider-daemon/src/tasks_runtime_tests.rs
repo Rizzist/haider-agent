@@ -1224,3 +1224,86 @@ async fn session_delete_fence_kills_the_running_group() {
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
 }
+
+/// turnhygiene pin. MUTATION CHECK: decode process output before hashing,
+/// drop invalid bytes from the count, or skip the per-call process signal
+/// when the transcript is not UTF-8. Expected RUNTIME failure: the model
+/// projection is not the lossy text, `output_bytes`/digest stop describing
+/// the raw bytes, or the journal lacks exactly one matching signal.
+#[tokio::test]
+async fn foreground_process_exec_projects_non_utf8_output_lossily_and_keeps_the_exact_digest() {
+    let profile = tempfile::tempdir().expect("profile");
+    let (_workspace, cwd) = workspace();
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session_id = create_task_session(&hub, "task-non-utf8-session", &cwd).await;
+    let run_id = RunId::new("task-non-utf8-tool-run");
+    prepare_tool_run(&hub, &session_id, &run_id, "task-non-utf8").await;
+    let dispatcher = task_dispatcher(&hub, &session_id, &cwd, "task-non-utf8", &run_id).await;
+
+    let result = dispatch(
+        &dispatcher,
+        &run_id,
+        "task-non-utf8-call",
+        "process_exec",
+        serde_json::json!({"command": "printf '\\377abc'; printf err >&2"}),
+    )
+    .await;
+    assert_eq!(result["exit_code"], 0);
+    assert_eq!(result["status"], "completed");
+    assert_eq!(
+        result["output_bytes"], 7,
+        "raw byte count includes the invalid byte"
+    );
+    let output = result["output"].as_str().expect("model-visible output");
+    assert!(
+        output.starts_with('\u{FFFD}'),
+        "the invalid byte is projected as U+FFFD, not dropped: {output:?}"
+    );
+    assert!(
+        output.contains("abc"),
+        "valid bytes survive the projection: {output:?}"
+    );
+    assert!(
+        output.contains("err"),
+        "stderr is part of the projection: {output:?}"
+    );
+    let raw_digest = result["transcript_digest"]
+        .as_str()
+        .expect("transcript digest")
+        .to_owned();
+    assert!(raw_digest.starts_with("blake3:"));
+    assert_ne!(
+        raw_digest,
+        format!("blake3:{}", blake3::hash(output.as_bytes()).to_hex()),
+        "the digest covers the raw bytes, never the lossy projection"
+    );
+
+    let envelopes = read_all(&store, &session_id).await;
+    let signals = envelopes
+        .iter()
+        .filter_map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                .ok()
+                .and_then(|payload| match payload {
+                    EventPayload::ProcessSignalRecorded(signal) => Some(signal),
+                    _ => None,
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(signals.len(), 1, "one process signal per foreground call");
+    assert_eq!(signals[0].run_id, run_id);
+    assert_eq!(signals[0].call_id, "task-non-utf8-call");
+    assert_eq!(signals[0].exit_code, Some(0));
+    assert_eq!(signals[0].transcript_digest, raw_digest);
+    assert_eq!(
+        Some(signals[0].subject_digest.as_str()),
+        result["subject_digest"].as_str()
+    );
+
+    dispatcher.close().await.expect("dispatcher close");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
