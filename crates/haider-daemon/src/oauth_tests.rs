@@ -3027,7 +3027,9 @@ fn callback_state_comparison_is_constant_time_and_load_bearing() {
 /// daemon startup, before any OAuth request exists.
 #[test]
 fn oauth_coordinator_constructor_retains_only_the_lazy_transport_handle() {
-    let source = include_str!("oauth.rs");
+    // `include_str!` preserves checkout-time CRLF on Windows. Normalize only
+    // the source view so these semantic mutation pins are platform-neutral.
+    let source = include_str!("oauth.rs").replace("\r\n", "\n");
     let constructor_start = source
         .find("pub(crate) fn new_with_vault(")
         .expect("OAuth coordinator constructor");
