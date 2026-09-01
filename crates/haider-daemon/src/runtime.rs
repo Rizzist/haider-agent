@@ -1791,6 +1791,8 @@ impl ConnectionRuntime {
         let mut listener_error = None;
         let mut idle_wait_logged = None;
         let mut idle_linger_deadline = None;
+        let mut idle_waiting_for_durable_quiescence = false;
+        let mut durable_activity = context.hub.subscribe_peer_reconcile();
         #[cfg(unix)]
         let accept_operation = "accept Unix connection";
         #[cfg(windows)]
@@ -1799,35 +1801,58 @@ impl ConnectionRuntime {
             if *crash.borrow() {
                 break RuntimeStop::Crash;
             }
-            match shutdown.borrow().clone() {
+            let shutdown_request = shutdown.borrow().clone();
+            match shutdown_request {
                 request @ (ShutdownRequest::Graceful { .. } | ShutdownRequest::Forced { .. }) => {
                     break RuntimeStop::Shutdown(request);
                 }
                 ShutdownRequest::GracefulWhenIdle { reason } => {
                     idle_linger_deadline = None;
                     let attached_clients = self.connections.len();
-                    if attached_clients == 0 {
-                        eprintln!(
-                            "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_vanished attached_clients=0 decision=shutdown"
-                        );
-                        tracing::info!(
-                            attached_clients,
-                            reason = %reason,
-                            decision = "shutdown",
-                            "ephemeral daemon reached idle shutdown"
-                        );
-                        break RuntimeStop::Shutdown(ShutdownRequest::Graceful { reason });
+                    if attached_clients == 0 && !idle_waiting_for_durable_quiescence {
+                        match context.hub.daemon_is_durably_quiescent().await {
+                            Ok(true) => {
+                                eprintln!(
+                                    "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_vanished attached_clients=0 durable_quiescent=true decision=shutdown"
+                                );
+                                tracing::info!(
+                                    attached_clients,
+                                    reason = %reason,
+                                    durable_quiescent = true,
+                                    decision = "shutdown",
+                                    "ephemeral daemon reached idle shutdown"
+                                );
+                                break RuntimeStop::Shutdown(ShutdownRequest::Graceful { reason });
+                            }
+                            Ok(false) => {
+                                idle_waiting_for_durable_quiescence = true;
+                            }
+                            Err(error) => {
+                                // A failed journal read can never authorize
+                                // retirement. The next durable publication
+                                // wakes another authoritative check.
+                                idle_waiting_for_durable_quiescence = true;
+                                tracing::warn!(%error, "idle retirement could not prove durable quiescence");
+                            }
+                        }
                     }
-                    if idle_wait_logged != Some(attached_clients) {
+                    if attached_clients > 0 {
+                        idle_waiting_for_durable_quiescence = false;
+                    }
+                    if idle_wait_logged != Some(attached_clients)
+                        || idle_waiting_for_durable_quiescence
+                    {
                         idle_wait_logged = Some(attached_clients);
                         eprintln!(
-                            "haiderd: spawning client vanished; ephemeral daemon is waiting for live clients to disconnect; ephemeral-lifecycle event=shutdown_decision attached_clients={attached_clients} decision=stay_alive"
+                            "haiderd: spawning client vanished; ephemeral daemon is waiting for live clients or non-terminal runs to settle; ephemeral-lifecycle event=shutdown_decision attached_clients={attached_clients} durable_quiescent={} decision=stay_alive",
+                            !idle_waiting_for_durable_quiescence
                         );
                         tracing::info!(
                             attached_clients,
                             reason = %reason,
+                            durable_quiescent = !idle_waiting_for_durable_quiescence,
                             decision = "stay_alive",
-                            "spawning client vanished; ephemeral daemon is waiting for live clients to disconnect"
+                            "spawning client vanished; ephemeral daemon is waiting for durable quiescence"
                         );
                     }
                 }
@@ -1836,26 +1861,44 @@ impl ConnectionRuntime {
                     if attached_clients == 0 {
                         let deadline = *idle_linger_deadline
                             .get_or_insert_with(|| tokio::time::Instant::now() + idle_ttl);
-                        if tokio::time::Instant::now() >= deadline {
-                            eprintln!(
-                                "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_vanished attached_clients=0 decision=shutdown idle_linger_ms={}",
-                                duration_ms(idle_ttl)
-                            );
-                            tracing::info!(
-                                attached_clients,
-                                reason = %reason,
-                                idle_linger_ms = duration_ms(idle_ttl),
-                                decision = "shutdown",
-                                "lingering daemon reached its idle shutdown deadline"
-                            );
-                            break RuntimeStop::Shutdown(ShutdownRequest::Graceful { reason });
+                        if tokio::time::Instant::now() >= deadline
+                            && !idle_waiting_for_durable_quiescence
+                        {
+                            match context.hub.daemon_is_durably_quiescent().await {
+                                Ok(true) => {
+                                    eprintln!(
+                                        "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_vanished attached_clients=0 durable_quiescent=true decision=shutdown idle_linger_ms={}",
+                                        duration_ms(idle_ttl)
+                                    );
+                                    tracing::info!(
+                                        attached_clients,
+                                        reason = %reason,
+                                        idle_linger_ms = duration_ms(idle_ttl),
+                                        durable_quiescent = true,
+                                        decision = "shutdown",
+                                        "lingering daemon reached its idle shutdown deadline"
+                                    );
+                                    break RuntimeStop::Shutdown(ShutdownRequest::Graceful {
+                                        reason,
+                                    });
+                                }
+                                Ok(false) => {
+                                    idle_waiting_for_durable_quiescence = true;
+                                }
+                                Err(error) => {
+                                    idle_waiting_for_durable_quiescence = true;
+                                    tracing::warn!(%error, "idle retirement could not prove durable quiescence");
+                                }
+                            }
                         }
                     } else {
                         idle_linger_deadline = None;
+                        idle_waiting_for_durable_quiescence = false;
                     }
                 }
                 ShutdownRequest::None => {
                     idle_linger_deadline = None;
+                    idle_waiting_for_durable_quiescence = false;
                 }
             }
             tokio::select! {
@@ -1924,7 +1967,18 @@ impl ConnectionRuntime {
                     let attached_clients = self.connections.len();
                     journal_connection_exit(&completed, attached_clients);
                 }
-                () = wait_for_idle_linger(idle_linger_deadline), if idle_linger_deadline.is_some() => {}
+                publication = durable_activity.recv(), if idle_waiting_for_durable_quiescence => {
+                    match publication {
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            idle_waiting_for_durable_quiescence = false;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // The hub still lives for the whole accept loop;
+                            // fail closed if that invariant is ever broken.
+                        }
+                    }
+                }
+                () = wait_for_idle_linger(idle_linger_deadline), if idle_linger_deadline.is_some() && !idle_waiting_for_durable_quiescence => {}
             }
         };
         (stop, listener_error)

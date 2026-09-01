@@ -465,6 +465,17 @@ pub enum HeadlessEvent {
     PermissionDenied(HeadlessPermissionDenial),
 }
 
+/// Process-interrupt intent supplied by a headless surface.
+///
+/// The first interrupt is converted into one idempotent durable
+/// `turn.cancel`. A subsequent interrupt stops waiting for the terminal as
+/// soon as the first cancellation receipt is durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadlessInterrupt {
+    CancelAndDrain,
+    ExitImmediately,
+}
+
 /// Stable terminal vocabulary for attached automation runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1984,6 +1995,7 @@ impl HeadlessReducer {
 enum ForcedOutcome {
     Timeout,
     Blocked(HeadlessBlockingReason),
+    Interrupted,
 }
 
 #[derive(Debug, Clone)]
@@ -2064,6 +2076,31 @@ pub async fn run_headless_with_session_config_and_event_mode(
     output: mpsc::Sender<HeadlessEvent>,
     event_mode: HeadlessEventMode,
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
+    run_headless_with_session_config_event_mode_and_interrupts(
+        profile,
+        ensure,
+        request,
+        session_config,
+        output,
+        event_mode,
+        None,
+    )
+    .await
+}
+
+/// [`run_headless_with_session_config_and_event_mode`] with a surface-owned
+/// interrupt stream. This keeps OS signal registration out of the reusable
+/// client while putting durable cancel/drain ordering beside the correlated
+/// attachment that owns it.
+pub async fn run_headless_with_session_config_event_mode_and_interrupts(
+    profile: &ResolvedProfile,
+    ensure: EnsureOptions,
+    request: HeadlessRunRequest,
+    session_config: HeadlessSessionConfig,
+    output: mpsc::Sender<HeadlessEvent>,
+    event_mode: HeadlessEventMode,
+    interrupts: Option<mpsc::UnboundedReceiver<HeadlessInterrupt>>,
+) -> Result<HeadlessRunResult, HeadlessRunError> {
     let daemon_lifetime = ensure.daemon_lifetime;
     let daemon_ownership = Arc::new(Mutex::new(None));
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
@@ -2077,6 +2114,7 @@ pub async fn run_headless_with_session_config_and_event_mode(
         session_config,
         reducer_output,
         Arc::clone(&daemon_ownership),
+        interrupts,
     )
     .await;
     let forwarding = forwarder.await.map_err(|error| HeadlessRunError::Protocol {
@@ -2572,6 +2610,7 @@ async fn run_headless_inner(
     session_config: HeadlessSessionConfig,
     output: HeadlessEventOutput,
     daemon_ownership: Arc<Mutex<Option<DaemonOwnershipToken>>>,
+    mut interrupts: Option<mpsc::UnboundedReceiver<HeadlessInterrupt>>,
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
     if request.attachments.len() > MAX_HEADLESS_ATTACHMENTS {
         return Err(attachment_error(
@@ -2910,6 +2949,16 @@ async fn run_headless_inner(
         }
     };
     reducer.run_id = Some(run_id.clone());
+    let budget_deadline = request
+        .budget
+        .max_time_ms
+        .map(|millis| Instant::now() + Duration::from_millis(millis));
+    let caller_run_deadline = match (timeout_deadline, budget_deadline) {
+        (Some(timeout), Some(budget)) => Some(timeout.min(budget)),
+        (Some(timeout), None) => Some(timeout),
+        (None, Some(budget)) => Some(budget),
+        (None, None) => None,
+    };
     if request.detached {
         let events = HeadlessRunEvents::empty(run_id.clone());
         let result = HeadlessRunResult {
@@ -2941,6 +2990,7 @@ async fn run_headless_inner(
     let mut cancel_command = submit_timeout_grace.map(|_| CancelCommand {
         command_id: CommandId::new(command_id("headless-cancel")),
     });
+    let mut immediate_interrupt = false;
     if let Some(cancel) = cancel_command.clone()
         && let Some(deadline) = grace_deadline
     {
@@ -3014,6 +3064,12 @@ async fn run_headless_inner(
     .await?;
 
     loop {
+        if matches!(forced, Some(ForcedOutcome::Interrupted))
+            && try_take_pending_interrupt(&mut interrupts)
+        {
+            immediate_interrupt = true;
+            break;
+        }
         if reducer.terminal.is_some()
             || grace_deadline.is_some_and(|deadline| Instant::now() >= deadline)
         {
@@ -3159,15 +3215,90 @@ async fn run_headless_inner(
                     }
                 }
             }
+            interrupt = receive_interrupt(&mut interrupts) => {
+                match interrupt {
+                    Some(HeadlessInterrupt::CancelAndDrain)
+                        if !matches!(forced, Some(ForcedOutcome::Interrupted)) =>
+                    {
+                        forced = Some(ForcedOutcome::Interrupted);
+                        let deadline = caller_run_deadline
+                            .unwrap_or_else(|| Instant::now() + request.terminal_grace);
+                        grace_deadline = Some(deadline);
+                        if cancel_command.is_none() {
+                            cancel_command = Some(CancelCommand {
+                                command_id: CommandId::new(command_id("headless-sigint-cancel")),
+                            });
+                        }
+                        if let Some(cancel) = cancel_command.clone() {
+                            send_cancel_before(
+                                deadline,
+                                profile,
+                                &ensure,
+                                &mut connection,
+                                &mut reducer,
+                                &mut reconnects,
+                                &run_id,
+                                &cancel,
+                            )
+                            .await?;
+                        }
+                    }
+                    Some(HeadlessInterrupt::CancelAndDrain | HeadlessInterrupt::ExitImmediately)
+                        if matches!(forced, Some(ForcedOutcome::Interrupted)) =>
+                    {
+                        // `send_cancel_before` returned only after the
+                        // idempotent durable receipt, so this immediate exit
+                        // cannot outrun the first SIGINT's journal fact.
+                        immediate_interrupt = true;
+                        break;
+                    }
+                    Some(HeadlessInterrupt::ExitImmediately) => {
+                        // Treat an out-of-order surface signal as the first
+                        // interrupt so no immediate exit can precede durable
+                        // cancellation.
+                        forced = Some(ForcedOutcome::Interrupted);
+                        let deadline = caller_run_deadline
+                            .unwrap_or_else(|| Instant::now() + request.terminal_grace);
+                        grace_deadline = Some(deadline);
+                        if cancel_command.is_none() {
+                            cancel_command = Some(CancelCommand {
+                                command_id: CommandId::new(command_id("headless-sigint-cancel")),
+                            });
+                        }
+                        if let Some(cancel) = cancel_command.clone() {
+                            send_cancel_before(
+                                deadline,
+                                profile,
+                                &ensure,
+                                &mut connection,
+                                &mut reducer,
+                                &mut reconnects,
+                                &run_id,
+                                &cancel,
+                            )
+                            .await?;
+                        }
+                    }
+                    None => interrupts = None,
+                    Some(HeadlessInterrupt::CancelAndDrain) => {}
+                }
+            }
         }
     }
 
     let result = finalize(reducer, run_id, provider, model, attachment_refs, forced);
-    let teardown = if ensure.daemon_lifetime == DaemonLifetime::EphemeralIfSpawned {
-        teardown_owned_daemon_on_connection(profile, &mut connection, &daemon_ownership).await
-    } else {
-        Ok(())
-    };
+    if immediate_interrupt {
+        // The durable cancellation receipt is already in the daemon. Relinquish
+        // one-shot lifecycle ownership so the second-interrupt fast exit does
+        // not wait for daemon drain in the outer teardown fallback.
+        lock_daemon_ownership(&daemon_ownership).take();
+    }
+    let teardown =
+        if ensure.daemon_lifetime == DaemonLifetime::EphemeralIfSpawned && !immediate_interrupt {
+            teardown_owned_daemon_on_connection(profile, &mut connection, &daemon_ownership).await
+        } else {
+            Ok(())
+        };
     match (result, teardown) {
         (Ok(result), Ok(())) => Ok(result),
         (Err(error), _) | (Ok(_), Err(error)) => Err(error),
@@ -4414,6 +4545,31 @@ async fn wait_until(deadline: Option<Instant>) {
     }
 }
 
+async fn receive_interrupt(
+    interrupts: &mut Option<mpsc::UnboundedReceiver<HeadlessInterrupt>>,
+) -> Option<HeadlessInterrupt> {
+    match interrupts {
+        Some(interrupts) => interrupts.recv().await,
+        None => pending::<Option<HeadlessInterrupt>>().await,
+    }
+}
+
+fn try_take_pending_interrupt(
+    interrupts: &mut Option<mpsc::UnboundedReceiver<HeadlessInterrupt>>,
+) -> bool {
+    let Some(interrupts_rx) = interrupts.as_mut() else {
+        return false;
+    };
+    match interrupts_rx.try_recv() {
+        Ok(HeadlessInterrupt::CancelAndDrain | HeadlessInterrupt::ExitImmediately) => true,
+        Err(mpsc::error::TryRecvError::Empty) => false,
+        Err(mpsc::error::TryRecvError::Disconnected) => {
+            *interrupts = None;
+            false
+        }
+    }
+}
+
 fn deadline_unix_ms(deadline: Instant) -> u64 {
     let remaining_ms = u64::try_from(
         deadline
@@ -4505,6 +4661,13 @@ fn finalize(
                 terminal.as_ref().map(|terminal| terminal.seq),
             )
         }
+        Some(ForcedOutcome::Interrupted) => (
+            HeadlessOutcome::Cancelled,
+            terminal
+                .as_ref()
+                .and_then(|terminal| terminal.failure.clone()),
+            terminal.as_ref().map(|terminal| terminal.seq),
+        ),
         None => terminal.map_or_else(
             || {
                 (

@@ -5568,6 +5568,20 @@ impl SessionHub {
         self.inner.store.session_ids().await.map_err(Into::into)
     }
 
+    /// Return true only when every durable run in the profile is terminal.
+    ///
+    /// Auto-spawn retirement calls this after the last client disconnects.
+    /// The journal remains the authority: resident-worker count and volatile
+    /// actor state are deliberately insufficient for a shutdown decision.
+    pub(crate) async fn daemon_is_durably_quiescent(&self) -> Result<bool, SessionHubError> {
+        for session_id in self.session_ids().await? {
+            if self.session_has_nonterminal_runs(&session_id).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     async fn roster_session_ids(&self) -> Result<Vec<SessionId>, SessionHubError> {
         let mut session_ids = self.inner.store.session_ids().await?;
         let fork_candidates = lock(&self.inner.fork_candidates)?;

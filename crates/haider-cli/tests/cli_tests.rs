@@ -1023,14 +1023,14 @@ fn detached_run_lifecycle_is_addressable_by_run_id() {
 }
 
 /// A process death after durable provider admission but before the first
-/// response is a retry boundary, not an Internal/Errored terminal. The
-/// recovery CLI has no effect-ambiguity card to probe in this case, so its
-/// `no_recovery` diagnostic must observe the replacement run as `running`.
+/// response is an ambiguous crash window. Restart must park the original run
+/// behind the typed recovery door; probing it must not reissue the provider
+/// request or consume the next fake-provider segment.
 #[cfg(unix)]
 #[test]
-fn kill9_after_provider_admission_retries_instead_of_reporting_errored() {
+fn kill9_after_provider_admission_exposes_typed_probe_recovery() {
     let blocked_script = r#"[{"step":"delay","ms":30000},{"step":"emit_text","text":"too late"},{"step":"finish","reason":"end_turn"}]"#;
-    let recovered_script = r#"[{"step":"delay","ms":5000},{"step":"emit_text","text":"recovered"},{"step":"finish","reason":"end_turn"}]"#;
+    let recovered_script = r#"[{"step":"emit_text","text":"fresh-after-probe"},{"step":"finish","reason":"end_turn"}]"#;
     let mut starter = haider();
     starter
         .args([
@@ -1108,9 +1108,8 @@ fn kill9_after_provider_admission_retries_instead_of_reporting_errored() {
         &["session", &session_id, "recover", "--probe", "--json"],
         recovered_script,
     );
-    assert_eq!(
-        probe.status.code(),
-        Some(i32::from(EX_BLOCKED)),
+    assert!(
+        probe.status.success(),
         "probe stdout: {}; stderr: {}; daemon logs: {}",
         String::from_utf8_lossy(&probe.stdout),
         String::from_utf8_lossy(&probe.stderr),
@@ -1118,36 +1117,47 @@ fn kill9_after_provider_admission_retries_instead_of_reporting_errored() {
     );
     let probe: serde_json::Value =
         serde_json::from_slice(&probe.stdout).expect("recovery probe JSON");
-    assert_eq!(probe["error"]["code"], "no_recovery");
-    let message = probe["error"]["message"]
-        .as_str()
-        .expect("probe diagnostic message");
-    assert!(
-        message.contains("run_state is running"),
-        "startup recovery did not re-enter the admitted request: {probe}"
+    assert_eq!(probe["schema"], "haider.session_recovery.v1");
+    assert_eq!(probe["session_id"], session_id);
+    assert_eq!(probe["chosen_option"], "probe");
+    assert_eq!(probe["completed"], true);
+    assert_eq!(probe["resulting_run_state"], "effect_unknown");
+    assert_eq!(probe["resulting_run_id"], run_id);
+    let menu_id = probe["menu_id"].as_str().expect("opening recovery menu id");
+    let resolution_seq = probe["resolution_seq"]
+        .as_u64()
+        .expect("durable recovery resolution sequence");
+    assert_eq!(
+        probe["replacement_menu_id"],
+        format!("{menu_id}-probe-{resolution_seq}")
     );
-    assert!(!message.contains("errored"));
 
-    let completion_deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let status = invoke(&["run", "--status", &run_id, "--json"], recovered_script);
-        assert!(
-            status.status.success(),
-            "completion status stderr: {}",
-            String::from_utf8_lossy(&status.stderr)
-        );
-        let status: serde_json::Value =
-            serde_json::from_slice(&status.stdout).expect("completion status JSON");
-        if status["result"]["state"]["state"] == "done" {
-            assert!(status["result"]["terminal_seq"].as_u64().is_some());
-            break;
-        }
-        assert!(
-            Instant::now() < completion_deadline,
-            "recovered run did not finish: {status}"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
+    let fresh = invoke(
+        &[
+            "run",
+            "--provider",
+            "fake",
+            "--json",
+            "-p",
+            "fresh request after recovery probe",
+        ],
+        recovered_script,
+    );
+    assert!(
+        fresh.status.success(),
+        "fresh run stdout: {}; stderr: {}; daemon logs: {}",
+        String::from_utf8_lossy(&fresh.stdout),
+        String::from_utf8_lossy(&fresh.stderr),
+        daemon_logs(&starter.profile)
+    );
+    let fresh: serde_json::Value = serde_json::from_slice(&fresh.stdout).expect("fresh run JSON");
+    assert_eq!(fresh["outcome"], "done");
+    assert!(
+        fresh["response"]
+            .as_str()
+            .is_some_and(|response| response.contains("fresh-after-probe")),
+        "recovery probe consumed the fresh provider segment: {fresh}"
+    );
 }
 
 #[test]
@@ -2459,6 +2469,84 @@ fn run_jsonl_exits_65_when_fake_provider_errors() {
     assert_eq!(
         envelopes.last().map(typed),
         Some(Some(EventPayload::RunState(RunState::Errored)))
+    );
+}
+
+#[test]
+fn run_jsonl_bounded_rate_limit_exhaustion_is_one_provider_terminal() {
+    const RUN_BUDGET_MS: u64 = 10_000;
+    const RETRY_AFTER_MS: u64 = 15_000;
+    let provider_margin_ms =
+        u64::try_from(haider_provider::PROVIDER_DEADLINE_SAFETY_MARGIN.as_millis())
+            .expect("provider margin fits u64 milliseconds");
+    let admission_margin_ms = provider_margin_ms.saturating_mul(2);
+    // Registry #94: the first 15s Retry-After plus two 1s provider margins
+    // requires 17s, exactly 7s more than this 10s run budget. The derived gap
+    // keeps daemon bootstrap, the fake response, and admission refusal away
+    // from the request-open cutoff under realistic CI load.
+    assert_eq!(RETRY_AFTER_MS + admission_margin_ms - RUN_BUDGET_MS, 7_000);
+    let script = serde_json::to_string(&vec![
+        serde_json::json!({
+            "step": "error",
+            "kind": "rate_limited",
+            "message": "transient",
+            "retry_after_ms": RETRY_AFTER_MS,
+        });
+        6
+    ])
+    .expect("fake rate-limit ladder serializes");
+    let run_timeout = format!("{RUN_BUDGET_MS}ms");
+    let out = haider_with_boot_retry(
+        &[
+            "run",
+            "--provider",
+            "fake",
+            "--jsonl",
+            "--timeout",
+            &run_timeout,
+            "hello",
+        ],
+        &[("HAIDER_TEST_FAKE_PROVIDER", &script)],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(EX_PROVIDER.into()),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelopes = parse_jsonl(&out.stdout);
+    let failure_index = envelopes
+        .iter()
+        .position(|envelope| envelope.payload["type"] == "run_failed")
+        .expect("bounded rate limit commits run_failed");
+    assert_eq!(
+        envelopes[failure_index].payload["code"],
+        "provider_error",
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(envelopes[failure_index].payload["retryable"], false);
+    assert_eq!(
+        envelopes[failure_index].payload["presentation"]["allowed_actions"],
+        serde_json::json!(["none"])
+    );
+    assert_eq!(
+        envelopes
+            .iter()
+            .filter(|envelope| envelope.payload.get("terminal_kind").is_some())
+            .count(),
+        1,
+        "JSONL exposes exactly one typed terminal"
+    );
+    let terminal = envelopes.last().expect("typed terminal is last");
+    assert_eq!(terminal.payload["type"], "run_state");
+    assert_eq!(terminal.payload["state"], "errored");
+    assert_eq!(terminal.payload["terminal_kind"], "provider_error");
+    assert_eq!(terminal.payload["error_code"], "provider_error");
+    assert_eq!(
+        failure_index + 1,
+        envelopes.len() - 1,
+        "run_failed is adjacent to the typed terminal"
     );
 }
 

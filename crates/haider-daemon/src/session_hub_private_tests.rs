@@ -4,12 +4,16 @@
 use super::*;
 use haider_accounts::Vault as _;
 use haider_protocol::EventPayload;
+use haider_protocol::cache::CacheRequestAttemptV1;
 use haider_protocol::effect::{
     AuthorizationSource, AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome,
     EffectPhase,
 };
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
-use haider_protocol::graph::{EvidenceVerdict, GraphPhase, SHIP_LOOP_TEMPLATE};
+use haider_protocol::graph::{
+    EvidenceVerdict, GraphFinalizationDeferred, GraphPhase, SHIP_LOOP_TEMPLATE,
+};
+use haider_protocol::headless::{HeadlessRunEventPayload, HeadlessRunSpecV1, RunBudgetV1};
 use haider_protocol::history::{NodeKind, TreeNode};
 use haider_protocol::ids::{AgentId, BranchId, EventId, GraphId, ItemId, MenuId, NodeId, RunId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
@@ -332,6 +336,182 @@ async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
     drop(root);
+}
+
+/// The daemon idle-TTL decision must treat a durable workflow continuation as
+/// live work even when no client is needed to drive the next autonomous hop.
+///
+/// MUTATION CHECK: make `daemon_is_durably_quiescent` ignore durable run
+/// heads and the first assertion flips true, authorizing daemon retirement
+/// while the deferred workflow still owns recoverable work. Remove the
+/// request-attempt marker and the restart classifier no longer proves that
+/// the fixture is a runnable workflow continuation.
+#[tokio::test]
+async fn recoverable_workflow_continuation_blocks_daemon_idle_ttl_retirement() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session_id = SessionId::new("workflow-idle-ttl-session");
+    let run_id = RunId::new("workflow-idle-ttl-run");
+    let graph_id = GraphId::new("workflow-idle-ttl-graph");
+    let generation = store.worker_generation();
+
+    hub.create_internal_session(create_command(&session_id, "workflow-idle-ttl"))
+        .await
+        .expect("create session");
+    hub.pin_graph(GraphPinCommand {
+        command_id: "pin-workflow-idle-ttl".into(),
+        request_digest: "pin-workflow-idle-ttl-digest".into(),
+        request_json: r#"{"template":"ship-loop"}"#.into(),
+        session_id: session_id.clone(),
+        worker_generation: generation,
+        graph_id: graph_id.clone(),
+        template: SHIP_LOOP_TEMPLATE.into(),
+        device_id: DeviceId::new("workflow-idle-ttl-device"),
+    })
+    .await
+    .expect("pin workflow");
+    hub.accept_turn(accept_command(
+        &session_id,
+        &run_id,
+        generation,
+        "workflow-idle-ttl",
+    ))
+    .await
+    .expect("accept workflow turn");
+    let status = hub
+        .graph_status(&session_id)
+        .await
+        .expect("graph status")
+        .expect("active graph");
+    assert_eq!(status.phase, GraphPhase::Active);
+    let state_digest =
+        haider_store::graph_finalization_state_digest(&status).expect("graph state digest");
+    let mut configured = run_state_envelope(
+        &session_id,
+        &run_id,
+        generation,
+        "workflow-idle-ttl-configured",
+        RunState::Queued,
+    );
+    configured.payload = HeadlessRunEventPayload::HeadlessRunConfigured(HeadlessRunSpecV1 {
+        cwd: "workflow-idle-ttl-workspace".into(),
+        provider: "fake".into(),
+        model: "workflow-idle-ttl-model".into(),
+        max_output_tokens: 64,
+        effort: None,
+        fast: false,
+        seed: None,
+        permission_overrides: Default::default(),
+        trust_hooks: false,
+        budget: RunBudgetV1 {
+            max_cost_microusd: Some(1_000_000),
+            ..RunBudgetV1::default()
+        },
+        request_deadline_unix_ms: None,
+        replay_of: None,
+    })
+    .to_payload_value()
+    .expect("headless configuration serializes");
+    let request_attempt = CacheRequestAttemptV1 {
+        ordinal: 1,
+        diagnostic: haider_protocol::provider::CacheRequestDiagnosticV1 {
+            history_message_count: 1,
+            stable_prefix_tokens: 8,
+            breakpoint_hashes: Default::default(),
+            cache_domain_hash: Some("workflow-idle-ttl-domain".into()),
+            cache_domain_changed: None,
+            previous_breakpoint: None,
+            prefix_match: haider_protocol::provider::CachePrefixMatchV1::Unavailable,
+            control: haider_protocol::provider::CacheControlObservationV1::NotRequired,
+            cacheable_minimum_tokens: None,
+            reuse_gap_ms: None,
+            rewarm: None,
+            classification: None,
+        },
+    }
+    .extension_item()
+    .expect("provider request attempt serializes");
+    let mut continuation = vec![
+        configured,
+        run_payload_envelope(
+            &session_id,
+            &run_id,
+            generation,
+            "workflow-idle-ttl-attempt",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("workflow-idle-ttl-attempt-item"),
+                item: request_attempt,
+            }),
+        ),
+        run_state_envelope(
+            &session_id,
+            &run_id,
+            generation,
+            "workflow-idle-ttl-streaming",
+            RunState::Streaming,
+        ),
+        run_payload_envelope(
+            &session_id,
+            &run_id,
+            generation,
+            "workflow-idle-ttl-deferred",
+            EventPayload::GraphFinalizationDeferred(GraphFinalizationDeferred {
+                graph_id,
+                run_id: run_id.clone(),
+                state_digest,
+                provider_requests_consumed: 1,
+                unmet_nodes: vec![haider_protocol::graph::verify_node()],
+            }),
+        ),
+    ];
+    StoreHandle::append(&store, &mut continuation)
+        .await
+        .expect("append recoverable continuation");
+
+    assert!(
+        !hub.daemon_is_durably_quiescent()
+            .await
+            .expect("retirement predicate"),
+        "idle TTL cannot retire a daemon with recoverable workflow work"
+    );
+
+    hub.shutdown().await.expect("hub shutdown before restart");
+    store.close().await.expect("store close before restart");
+
+    let restarted = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen store with a new generation");
+    let recovered = crate::turn_recovery::recover_interrupted_turns(
+        &restarted,
+        &DeviceId::new("workflow-idle-ttl-recovery"),
+    )
+    .await
+    .expect("classify restart work");
+    assert_eq!(recovered.len(), 1, "one deferred workflow is runnable");
+    let crate::turn_recovery::RecoveredWork::WorkflowContinuation(work) = &recovered[0] else {
+        panic!("durable fixture must classify as a workflow continuation");
+    };
+    assert_eq!(work.accepted.session_id, session_id);
+    assert_eq!(work.accepted.run_id, run_id);
+    assert_eq!(work.provider_requests_consumed, 1);
+    assert_eq!(work.provider_request_ordinal, 1);
+
+    let restarted_hub =
+        SessionHub::new(restarted.clone(), SessionHubConfig::default()).expect("restart hub");
+    assert!(
+        !restarted_hub
+            .daemon_is_durably_quiescent()
+            .await
+            .expect("restart retirement predicate"),
+        "recovered workflow work must still block idle retirement"
+    );
+
+    restarted_hub
+        .shutdown()
+        .await
+        .expect("restart hub shutdown");
+    restarted.close().await.expect("restart store close");
 }
 
 /// MUTATION CHECK: make `FenceIfQuiescent` answer before prior admissions and let the deleter

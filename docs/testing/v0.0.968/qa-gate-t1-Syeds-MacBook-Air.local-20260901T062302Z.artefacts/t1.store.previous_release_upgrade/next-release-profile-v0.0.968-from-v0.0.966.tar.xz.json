@@ -1,0 +1,18 @@
+{
+  "binary_under_test_version": "0.0.968",
+  "captured_schema_version": 27,
+  "fixture_sha256": "18a572438097bb2f6565ce5d09b223d08d670545bd2511f07582878892627b2d",
+  "new_session_id": "session-369e03f3f87b45dc1bba0629ccb37dd5",
+  "old_session_ids": [
+    "session-0472ecdca5ffe772998ecca15be30d89",
+    "session-056e084483050f6d36cea4a1e72d8dc0"
+  ],
+  "previous_schema_version": 27,
+  "previous_version": "0.0.966",
+  "schema": "haider.qa-gate.store-fixture.v1",
+  "source": {
+    "sha256": "69735f821cb4406f12baad5d2e10981182a260edf1e52d35081d1e964b30dd6e",
+    "url": "https://github.com/Rizzist/haider-agent/releases/download/v0.0.966/haider-v0.0.966-aarch64-apple-darwin.tar.xz"
+  },
+  "sqlite_master_sha256": "30c2e1b731ad616d7368972d381de3fb8529a3bc1bfd2fe9631d8cc4adac4d5a"
+}

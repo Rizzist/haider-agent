@@ -300,6 +300,126 @@ fn provider_timeout_retry_requires_a_full_post_backoff_budget() {
     );
 }
 
+#[test]
+fn automatic_rate_limit_retry_preserves_the_terminal_deadline_margin() {
+    let rate_limit = ProviderError::new(ProviderErrorKind::RateLimited, "rate limited")
+        .with_retry_after_ms(Some(2_000));
+    let run_id = RunId::new("rate-limit-retry-budget");
+
+    let delay = std::time::Duration::from_secs(2);
+    let admission_margin =
+        PROVIDER_DEADLINE_SAFETY_MARGIN.saturating_add(PROVIDER_DEADLINE_SAFETY_MARGIN);
+    assert!(!provider_retry_fits_deadline(
+        delay + admission_margin - std::time::Duration::from_millis(1),
+        delay,
+    ));
+    assert!(
+        !provider_retry_fits_deadline(delay + admission_margin, delay),
+        "equality is a deterministic refusal"
+    );
+    assert!(provider_retry_fits_deadline(
+        delay + admission_margin + std::time::Duration::from_millis(1),
+        delay,
+    ));
+
+    let mut roomy = rate_limit.clone();
+    assert!(provider_error_allows_retry(
+        &mut roomy,
+        Some(tokio::time::Instant::now() + std::time::Duration::from_secs(5)),
+        &run_id,
+        1,
+    ));
+
+    let mut short = rate_limit;
+    assert!(!provider_error_allows_retry(
+        &mut short,
+        Some(tokio::time::Instant::now() + std::time::Duration::from_secs(4)),
+        &run_id,
+        1,
+    ));
+    assert!(
+        !short.retryable,
+        "the accepted run exhausted its retry budget"
+    );
+    assert_eq!(short.presentation.allowed_actions, vec![ErrorAction::None]);
+}
+
+#[test]
+fn deadline_terminal_class_is_derived_from_provider_retry_state() {
+    let retrying = RunState::Retrying {
+        attempt: 2,
+        max: 10,
+        delay_ms: 3_000,
+        reason: WaitReason::RateLimit,
+    };
+    let retry_states = [
+        retrying,
+        RunState::Waiting {
+            reason: WaitReason::RateLimit,
+        },
+        RunState::Waiting {
+            reason: WaitReason::ProviderBackoff,
+        },
+    ];
+    for state in &retry_states {
+        let mut error = deadline_exhausted_error(
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(3),
+        );
+        assert!(classify_provider_deadline_terminal(
+            &mut error,
+            Some(state),
+            false,
+        ));
+        let terminal = provider_error_to_haider(error);
+        assert_eq!(terminal.code, ErrorCode::ProviderError);
+        assert!(!terminal.retryable);
+        assert_eq!(
+            terminal
+                .presentation
+                .expect("state-classified terminal has presentation")
+                .allowed_actions,
+            vec![ErrorAction::None]
+        );
+    }
+
+    let mut admission =
+        deadline_exhausted_error(std::time::Duration::ZERO, std::time::Duration::ZERO);
+    assert!(classify_provider_deadline_terminal(
+        &mut admission,
+        Some(&RunState::Thinking),
+        true,
+    ));
+    assert_eq!(
+        provider_error_to_haider(admission).code,
+        ErrorCode::ProviderError,
+        "an expiry while the next retry is being admitted is the same bounded failure"
+    );
+
+    for state in [
+        RunState::Thinking,
+        RunState::Streaming,
+        RunState::Waiting {
+            reason: WaitReason::NetworkUnavailable,
+        },
+    ] {
+        let mut in_flight = deadline_exhausted_error(
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(3),
+        );
+        assert!(!classify_provider_deadline_terminal(
+            &mut in_flight,
+            Some(&state),
+            false,
+        ));
+        assert_eq!(
+            provider_error_to_haider(in_flight).code,
+            ErrorCode::ProviderTimeout,
+            "non-retry state retains the provider timeout terminal"
+        );
+    }
+}
+
 fn completed_extension_item<'a>(payloads: &'a [EventPayload], expected_kind: &str) -> &'a TurnItem {
     payloads
         .iter()
