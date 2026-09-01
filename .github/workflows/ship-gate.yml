@@ -62,3 +62,41 @@ jobs:
       # an explicit 966 task. This job deliberately stays --release.
       - name: render benchmark (release — ledger row 17 upper bounds)
         run: cargo test --release -p haider-tui --test w3c3_render_bench_tests --locked
+
+  daemon-footprint:
+    name: daemon footprint budget (release profile)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: unsafe-count gate
+        shell: bash
+        run: bash scripts/check-unsafe-counts.sh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-ship-daemon-footprint-release-profile
+      - name: build daemon and deterministic footprint driver
+        env:
+          RUST_MIN_STACK: 8388608
+          HAIDER_DISCOVERY_DISABLED: 1
+          HAIDER_TEST_DEVICE_NAME: test-mac
+        run: |
+          cargo build --release --locked -p haider-daemond
+          cargo build --locked -p haider-client --example memdaemon_workload
+      - name: enforce settled daemon footprint budgets
+        run: >-
+          python3 scripts/perf/daemon-footprint-budget.py
+          --daemon "$GITHUB_WORKSPACE/target/release/haiderd"
+          --driver "$GITHUB_WORKSPACE/target/debug/examples/memdaemon_workload"
+          --output "$GITHUB_WORKSPACE/target/daemon-footprint/measurement.json"
+          --artifacts-dir "$GITHUB_WORKSPACE/target/daemon-footprint/process-reports"
+      - name: upload daemon footprint evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-footprint-release
+          path: target/daemon-footprint/**
+          if-no-files-found: error
+          retention-days: 14

@@ -1,5 +1,26 @@
 use std::process::ExitStatus;
 
+/// Asks the platform allocator to return currently reclaimable dirty pages.
+/// The value is the allocator's best-effort byte count, not a guarantee that
+/// the process footprint falls by the same amount.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn allocator_pressure_relief() -> usize {
+    unsafe extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: usize) -> usize;
+    }
+
+    // SAFETY: a null zone is libmalloc's documented all-zones coordinate;
+    // goal zero requests maximal best-effort relief and transfers no memory
+    // ownership across the FFI boundary.
+    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn allocator_pressure_relief() -> usize {
+    0
+}
+
 #[cfg(test)]
 #[path = "process_tests.rs"]
 mod tests;
