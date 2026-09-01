@@ -2724,6 +2724,19 @@ impl GraphReductions {
         }
     }
 
+    /// Incrementally folds one committed batch and reconciles derived run-set
+    /// aggregates once. Journal caches use this instead of retaining and
+    /// re-reducing the complete source-envelope prefix after every append.
+    pub fn apply_envelopes(&mut self, envelopes: &[RawEnvelope]) {
+        let mut changed = false;
+        for envelope in envelopes {
+            changed |= self.apply_envelope_unprojected(envelope);
+        }
+        if changed {
+            refresh_run_set_projections(self);
+        }
+    }
+
     /// Applies graph facts without rebuilding derived run-set aggregates.
     /// Callers folding a batch must invoke `refresh_run_set_projections` once
     /// after its final envelope.

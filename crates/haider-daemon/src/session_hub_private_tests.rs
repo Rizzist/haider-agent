@@ -43,6 +43,13 @@ fn model_inventory_miss_refreshes_even_without_a_fetch_timestamp() {
         "known-model"
     ));
 }
+
+/// MUTATION CHECK: restoring the two 1,024-slot coalescing wake rings grows
+/// always-live hub capacity without improving durable lag recovery.
+#[test]
+fn publication_wake_rings_are_bounded_to_256() {
+    assert_eq!(PUBLICATION_RING_CAPACITY, 256);
+}
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};

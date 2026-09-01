@@ -155,15 +155,6 @@ impl PreparedDaemonTask {
     }
 
     fn spawn(self, config: DaemonConfig, dependencies: DaemonDependencies) -> DaemonTask {
-        self.spawn_with_boot_memory_release(config, dependencies, true)
-    }
-
-    fn spawn_with_boot_memory_release(
-        self,
-        config: DaemonConfig,
-        dependencies: DaemonDependencies,
-        release_boot_memory: bool,
-    ) -> DaemonTask {
         let diagnostics = DaemonTaskDiagnostics {
             readiness: self.readiness.clone(),
             completion: Arc::clone(&self.completion),
@@ -178,7 +169,6 @@ impl PreparedDaemonTask {
                 config,
                 dependencies,
                 self.states,
-                release_boot_memory,
                 DaemonTaskControl {
                     shutdown_handle: task_shutdown,
                     shutdown: self.shutdown_receiver,
@@ -549,7 +539,6 @@ pub async fn run_with_signals_and_dependencies_and_readiness_and_liveness(
         })?;
     let prepared = PreparedDaemonTask::new();
     let shutdown = prepared.shutdown_handle();
-    let release_boot_memory = launcher_liveness.is_none();
     let (mut liveness_task, liveness_armed) = launcher_liveness.map_or_else(
         || (None, None),
         |watcher| {
@@ -594,7 +583,7 @@ pub async fn run_with_signals_and_dependencies_and_readiness_and_liveness(
             }
         }
     }
-    let task = prepared.spawn_with_boot_memory_release(config, dependencies, release_boot_memory);
+    let task = prepared.spawn(config, dependencies);
     let mut readiness = task.readiness();
     let mut joined: Pin<Box<dyn Future<Output = Result<ShutdownOutcome, DaemonError>> + Send>> =
         Box::pin(task.join());
@@ -690,10 +679,9 @@ async fn run_owner(
     config: DaemonConfig,
     dependencies: DaemonDependencies,
     states: StatePublisher,
-    release_boot_memory: bool,
     control: DaemonTaskControl,
 ) -> Result<ShutdownOutcome, DaemonError> {
-    let result = run_inner(&config, dependencies, &states, release_boot_memory, control).await;
+    let result = run_inner(&config, dependencies, &states, control).await;
     if let Err(error) = &result {
         states.publish(DaemonState::Failed {
             message: error.to_string(),
@@ -706,7 +694,6 @@ async fn run_inner(
     config: &DaemonConfig,
     dependencies: DaemonDependencies,
     states: &StatePublisher,
-    release_boot_memory: bool,
     control: DaemonTaskControl,
 ) -> Result<ShutdownOutcome, DaemonError> {
     let DaemonTaskControl {
@@ -1324,10 +1311,10 @@ async fn run_inner(
     }
     // Every boot scan, adoption, recovered-work handoff, and optional
     // transport startup has returned, while no endpoint exists for external
-    // requests. A persistent daemon discards pages made cold by this boot.
-    // An ephemeral launcher immediately uses SQLite for its one turn, so it
-    // retains those pages instead of paying to release and fault them back in.
-    if release_boot_memory && let Err(error) = store.release_memory().await {
+    // requests. Every daemon discards pages made cold by this boot. Spawned
+    // liveness daemons use the same boundary: a later turn faults in only the
+    // pages it actually needs instead of retaining the complete boot scan.
+    if let Err(error) = store.release_memory().await {
         tracing::warn!(%error, "SQLite boot-page release failed; continuing startup");
     }
     let mut endpoint = match endpoint::bind(config, runtime_directory).await {

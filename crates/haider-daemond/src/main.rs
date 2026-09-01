@@ -55,6 +55,10 @@ const EX_SOFTWARE: u8 = 70;
 // must still be bounded or rewritten iteratively, and every worker reserves
 // this much virtual address space while its committed pages grow on demand.
 const DAEMON_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+/// Four workers retain parallel I/O progress while avoiding one runtime worker
+/// per detected host CPU. Keep the explicit deep stack: actor futures still
+/// exercise the multi-megabyte stack mutation pin below.
+const DAEMON_WORKER_THREADS: usize = 4;
 
 #[cfg(not(windows))]
 fn main() -> ExitCode {
@@ -112,6 +116,7 @@ fn main() -> ExitCode {
 
 fn daemon_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(DAEMON_WORKER_THREADS)
         .enable_all()
         .thread_name("haiderd-worker")
         .thread_stack_size(DAEMON_THREAD_STACK_BYTES)
@@ -231,7 +236,8 @@ fn test_dependencies() -> Result<DaemonDependencies, String> {
         .into_string()
         .map_err(|_| format!("{FAKE_PROVIDER_ENV} is not valid UTF-8"))?;
     let fake = FakeProvider::from_json(&script)
-        .map_err(|error| format!("{FAKE_PROVIDER_ENV} is not a fake-provider script: {error}"))?;
+        .map_err(|error| format!("{FAKE_PROVIDER_ENV} is not a fake-provider script: {error}"))?
+        .without_request_recording();
     eprintln!("haiderd: TEST MODE — every turn resolves to the injected fake provider");
     // Every turn resolves to the fake regardless of what the session was
     // created with, so the creatable set includes the release default too:
@@ -450,5 +456,14 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
+    }
+
+    /// MUTATION CHECK: removing the explicit worker count restores Tokio's
+    /// host-parallelism default (ten workers on the measurement host).
+    #[test]
+    fn daemon_runtime_has_bounded_worker_count() {
+        let runtime = daemon_runtime()
+            .unwrap_or_else(|error| panic!("construct bounded daemon runtime: {error}"));
+        assert_eq!(runtime.metrics().num_workers(), DAEMON_WORKER_THREADS);
     }
 }

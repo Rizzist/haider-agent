@@ -53,11 +53,12 @@ pub use ipc::{
 pub use process::program_on_path;
 pub use process::{
     ProcessExitMonitor, ProcessGroup, ProcessId, ProcessSignal, abandon_process_group,
-    configure_background_process, configure_process_environment, configure_process_group,
-    detach_process_group, exit_signal, kill_process_tree, observe_process_leader_exit,
-    process_error_is_missing, process_error_is_permission, process_group, process_group_exists,
-    process_id, process_leader_exited, register_process_group, release_process_group,
-    signal_process, signal_process_group, signal_process_group_id, wait_for_child_exit,
+    allocator_pressure_relief, configure_background_process, configure_process_environment,
+    configure_process_group, detach_process_group, exit_signal, kill_process_tree,
+    observe_process_leader_exit, process_error_is_missing, process_error_is_permission,
+    process_group, process_group_exists, process_id, process_leader_exited, register_process_group,
+    release_process_group, signal_process, signal_process_group, signal_process_group_id,
+    wait_for_child_exit,
 };
 #[cfg(windows)]
 pub use process::{

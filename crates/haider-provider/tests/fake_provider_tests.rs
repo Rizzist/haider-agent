@@ -84,6 +84,23 @@ async fn json_fixture_drives_events_and_records_request() {
 }
 
 #[tokio::test]
+async fn request_recording_can_be_disabled_for_process_measurements() {
+    let provider = FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }])
+    .without_request_recording();
+    let mut stream = provider
+        .stream_turn(request())
+        .await
+        .expect("stream starts");
+    assert!(stream.recv().await.is_some(), "finish is still delivered");
+    assert!(
+        provider.requests().is_empty(),
+        "the measurement seam must not retain full request prefixes"
+    );
+}
+
+#[tokio::test]
 async fn split_utf8_is_reassembled_without_replacement_characters() {
     let provider = FakeProvider::new(vec![
         FakeStep::SplitUtf8 {

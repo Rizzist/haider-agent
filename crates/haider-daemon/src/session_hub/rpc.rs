@@ -1647,6 +1647,23 @@ impl ObserveDigestCache {
             .remove_ready(session_id);
     }
 
+    /// Evicts only the exact idle-head fold. A later append makes the head
+    /// mismatch, so an old delayed release can never discard current state.
+    pub(super) fn remove_ready_at_head(&self, session_id: &SessionId, head_seq: u64) -> usize {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let released = match state.sessions.get(session_id).map(Box::as_ref) {
+            Some(ObserveCacheEntry::Ready {
+                fold, deep_bytes, ..
+            }) if fold.head_seq == head_seq => *deep_bytes,
+            _ => return 0,
+        };
+        state.remove_ready(session_id);
+        released
+    }
+
     #[cfg(test)]
     fn stats(&self) -> (usize, usize, usize) {
         let state = self
@@ -1784,6 +1801,22 @@ mod observe_cache_retention_tests {
         assert!(cache.contains(&oldest), "a touched Ready remains resident");
         assert!(cache.contains(&newcomer));
         assert!(!cache.contains(&SessionId::new("observe-ready-1")));
+    }
+
+    #[test]
+    fn idle_release_removes_only_the_exact_observe_head() {
+        let cache = ObserveDigestCache::default();
+        let session_id = SessionId::new("observe-idle-release");
+        cache
+            .state
+            .lock()
+            .expect("cache state")
+            .insert_ready(session_id.clone(), fold(&session_id, 7, 128));
+        assert_eq!(cache.remove_ready_at_head(&session_id, 6), 0);
+        assert!(cache.contains(&session_id), "stale idle head cannot evict");
+        assert!(cache.remove_ready_at_head(&session_id, 7) > 0);
+        assert!(!cache.contains(&session_id));
+        assert_eq!(cache.stats(), (0, 0, 0));
     }
 
     #[tokio::test]

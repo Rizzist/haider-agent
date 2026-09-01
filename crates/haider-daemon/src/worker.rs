@@ -8335,6 +8335,15 @@ pub(crate) struct TurnSetupReductionCache {
 }
 
 impl TurnSetupReductionCache {
+    pub(crate) async fn remove_session(&self, session_id: &SessionId) -> usize {
+        let mut entries = self.entries.lock().await;
+        let before = entries.reductions.len();
+        entries
+            .reductions
+            .retain(|(candidate, _), _| candidate != session_id);
+        before.saturating_sub(entries.reductions.len())
+    }
+
     async fn take(
         &self,
         session_id: &SessionId,
