@@ -312,8 +312,7 @@ async fn hanging_openai_fixture_times_out_only_the_idle_chunk_await() {
         Duration::from_secs(90),
         Duration::from_secs(5 * 60),
         DecoderKind::Responses(OpenAiComputerToolKind::Generic),
-        crate::RouteGating::Enabled,
-        None,
+        crate::SseRequestContext::new(crate::RouteGating::Enabled, None),
     ));
 
     assert_eq!(
@@ -685,8 +684,7 @@ async fn dropping_openai_stream_aborts_its_hanging_source() {
         Duration::from_secs(90),
         Duration::from_secs(5 * 60),
         DecoderKind::Responses(OpenAiComputerToolKind::Generic),
-        crate::RouteGating::Enabled,
-        None,
+        crate::SseRequestContext::new(crate::RouteGating::Enabled, None),
     ));
     let mut stream = ProviderStream::owned(receiver, producer);
     assert!(matches!(
