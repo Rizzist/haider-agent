@@ -1,6 +1,6 @@
 # qagate3 CI error registry walk
 
-Read against the final uncommitted tree before verification. “checked: none” means this Python-only QA lane does not touch that error surface.
+Read against the final uncommitted tree before verification. “checked: none” means this turn-proof lane does not touch that error surface.
 
 - #1 checked: none — no affected surface in this lane
 - #2 checked: none — no affected surface in this lane
@@ -8,7 +8,7 @@ Read against the final uncommitted tree before verification. “checked: none”
 - #4 checked: none — no affected surface in this lane
 - #5 fixed — lazy POSIX harness load after need resolution (`gate/tui_probe.py`)
 - #6 checked: none — no affected surface in this lane
-- #7 checked: none — no Cargo manifest or lockfile change
+- #7 fixed — the tracing-only provider dependency is declared in the manifest and lockfile
 - #8 checked: none — no affected surface in this lane
 - #9 checked: none — no affected surface in this lane
 - #10 fixed — Python self-tests and `py_compile`; no dead Rust helpers added
@@ -20,10 +20,10 @@ Read against the final uncommitted tree before verification. “checked: none”
 - #16 checked: none — no affected surface in this lane
 - #17 checked: none — no affected surface in this lane
 - #18 checked: none — no affected surface in this lane
-- #19 fixed — `git diff --check`; no Rust formatting surface changed
+- #19 fixed — `cargo fmt --check` and `git diff --check` cover the Rust/Python/docs surface
 - #20 checked: none — no Rust test-count change
 - #21 checked: none — no affected surface in this lane
-- #22 checked: none — no tracing/global-state installation
+- #22 fixed — `haider.turn` is opt-in and the installed subscriber accepts only audited numeric fields and phase enums
 - #23 checked: none — no affected surface in this lane
 - #24 checked: none — no affected surface in this lane
 - #25 checked: none — no affected surface in this lane
@@ -78,7 +78,7 @@ Read against the final uncommitted tree before verification. “checked: none”
 - #74 fixed — existing check context supplies throwaway HOME and profile
 - #75 checked: none — no affected surface in this lane
 - #76 checked: none — no affected surface in this lane
-- #77 fixed — repository Python guard/self-test order executed before final run
+- #77 fixed — unsafe-count guard ran first and again at close (production=188/test=16); Python syntax/self-tests followed after harness edits
 - #78 checked: none — no affected surface in this lane
 - #79 checked: none — no affected surface in this lane
 - #80 checked: none — no affected surface in this lane
@@ -97,4 +97,4 @@ Read against the final uncommitted tree before verification. “checked: none”
 - #93 checked: none — no affected surface in this lane
 - #94 fixed — every nested wait is a named product budget; arithmetic is in each check
 - #95 fixed — retained RPC links have a dedicated Ping/Pong reader and continuous request deadline
-
+- #96 fixed — turn-wall timing is accepted only for one same-PID/generation warm settled daemon, exactly 25 valid samples per shape, exact physical provider counts 1/2, one monotonic local `process_exec` effect per tool case, and start/mid/end one-minute load strictly below 4; overload or an unsettled harness rejects timing without rewriting correctness. The CI artefact retains raw samples, median/MAD, wall/CPU/peak RSS, request ledgers, and binary/daemon/proxy/harness hashes; the separate exact-cardinality trace-on companion retains correlated stage timestamps.

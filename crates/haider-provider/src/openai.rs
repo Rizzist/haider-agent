@@ -999,6 +999,7 @@ impl Provider for OpenAiProvider {
                 payload: full_payload,
                 history_boundary: None,
             }),
+            turn_trace: None,
         })
     }
 
@@ -1980,6 +1981,7 @@ impl Provider for OpenAiCompatibleProvider {
                 payload: full_payload,
                 history_boundary: None,
             }),
+            turn_trace: None,
         })
     }
 
@@ -2075,6 +2077,7 @@ async fn checked_stream(
         });
     }
     let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
+    let turn_trace = crate::current_turn_trace_context();
     let producer = tokio::spawn(async move {
         stream_response(
             response,
@@ -2084,6 +2087,7 @@ async fn checked_stream(
             semantic_progress_timeout,
             decoder,
             route_gating,
+            turn_trace,
         )
         .await;
     });
@@ -2221,6 +2225,7 @@ async fn stream_response(
     semantic_progress_timeout: Duration,
     kind: DecoderKind,
     route_gating: crate::RouteGating,
+    turn_trace: Option<(crate::TurnTraceContext, u64)>,
 ) {
     stream_sse_source(
         response,
@@ -2230,6 +2235,7 @@ async fn stream_response(
         semantic_progress_timeout,
         kind,
         route_gating,
+        turn_trace,
     )
     .await;
 }
@@ -2260,6 +2266,7 @@ async fn stream_sse_source<S: SseChunkSource>(
     semantic_progress_timeout: Duration,
     kind: DecoderKind,
     route_gating: crate::RouteGating,
+    turn_trace: Option<(crate::TurnTraceContext, u64)>,
 ) {
     let mut decoder = match kind {
         DecoderKind::Responses(computer_kind) => {
@@ -2279,7 +2286,21 @@ async fn stream_sse_source<S: SseChunkSource>(
         {
             Ok(Some(Ok(Some(chunk)))) => chunk,
             Ok(Some(Ok(None))) => {
+                let decode_started = turn_trace
+                    .as_ref()
+                    .map(|(trace, _)| trace.now_us_from_accept());
                 let items = decoder.finish();
+                if let (Some((trace, request_ordinal)), Some(started)) =
+                    (&turn_trace, decode_started)
+                {
+                    trace.emit(
+                        "sse_decode",
+                        *request_ordinal,
+                        0,
+                        started,
+                        trace.now_us_from_accept(),
+                    );
+                }
                 let _ = send_items(&sender, items).await;
                 return;
             }
@@ -2304,8 +2325,23 @@ async fn stream_sse_source<S: SseChunkSource>(
                 return;
             }
         };
+        if let Some((trace, request_ordinal)) = &turn_trace {
+            trace.emit_first_byte(*request_ordinal);
+        }
         progress.observe_raw_chunk();
+        let decode_started = turn_trace
+            .as_ref()
+            .map(|(trace, _)| trace.now_us_from_accept());
         let items = decoder.push(chunk.as_ref());
+        if let (Some((trace, request_ordinal)), Some(started)) = (&turn_trace, decode_started) {
+            trace.emit(
+                "sse_decode",
+                *request_ordinal,
+                0,
+                started,
+                trace.now_us_from_accept(),
+            );
+        }
         if crate::has_semantic_progress(&items) {
             progress.observe_semantic_progress();
         }

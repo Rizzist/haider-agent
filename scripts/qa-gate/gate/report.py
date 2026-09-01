@@ -227,9 +227,9 @@ def validate_report(report: object) -> dict[str, Any]:
                 raise ContractError(
                     f"report timed check {check['id']} measurement_accepted must be bool"
                 )
-            if timing_accepted != root_measurement_accepted:
+            if timing_accepted and not root_measurement_accepted:
                 raise ContractError(
-                    f"report timed check {check['id']} measurement_accepted must equal root"
+                    f"report timed check {check['id']} cannot accept timing when root rejects it"
                 )
         elif timing_accepted is not None:
             raise ContractError(
@@ -254,6 +254,14 @@ def validate_report(report: object) -> dict[str, Any]:
         if actual_status != check["status"]:
             raise ContractError(
                 f"report check {check['id']} status={check['status']} evidence_status={actual_status}"
+            )
+        expected_timing_accepted = root_measurement_accepted and not any(
+            item.status == "ENV_BLOCKED" for item in evidence
+        )
+        if check["timed"] and timing_accepted != expected_timing_accepted:
+            raise ContractError(
+                f"report timed check {check['id']} measurement_accepted must reflect "
+                "root acceptance and local ENV_BLOCKED evidence"
             )
         artefacts = check.get("artefacts")
         if not isinstance(artefacts, list) or not all(

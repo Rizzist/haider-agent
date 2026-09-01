@@ -475,14 +475,16 @@ impl GeminiProvider {
         let account = self.account.clone();
         let chunk_idle_timeout = Self::transport_config().chunk_idle_timeout;
         let semantic_progress_timeout = Self::transport_config().semantic_progress_timeout;
+        let turn_trace = crate::current_turn_trace_context();
         let producer = tokio::spawn(async move {
-            stream_sse_source(
+            stream_sse_source_with_trace(
                 response,
                 account,
                 next_call_index,
                 sender,
                 chunk_idle_timeout,
                 semantic_progress_timeout,
+                turn_trace,
             )
             .await;
         });
@@ -566,6 +568,7 @@ impl GeminiProvider {
                 payload: full_payload.commit(),
                 history_boundary: Some(history_boundary),
             }),
+            turn_trace: None,
         })
     }
 }
@@ -1752,13 +1755,35 @@ impl GeminiSseChunkSource for reqwest::Response {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn stream_sse_source<S: GeminiSseChunkSource>(
+    source: S,
+    account: Option<CredentialAlias>,
+    next_call_index: u64,
+    sender: mpsc::Sender<ProviderStreamItem>,
+    chunk_idle_timeout: Duration,
+    semantic_progress_timeout: Duration,
+) {
+    stream_sse_source_with_trace(
+        source,
+        account,
+        next_call_index,
+        sender,
+        chunk_idle_timeout,
+        semantic_progress_timeout,
+        crate::current_turn_trace_context(),
+    )
+    .await;
+}
+
+async fn stream_sse_source_with_trace<S: GeminiSseChunkSource>(
     mut source: S,
     account: Option<CredentialAlias>,
     next_call_index: u64,
     sender: mpsc::Sender<ProviderStreamItem>,
     chunk_idle_timeout: Duration,
     semantic_progress_timeout: Duration,
+    turn_trace: Option<(crate::TurnTraceContext, u64)>,
 ) {
     let mut decoder = GeminiDecoder::new(account, next_call_index);
     let mut progress = crate::ProviderProgressClock::new(
@@ -1794,6 +1819,9 @@ pub(crate) async fn stream_sse_source<S: GeminiSseChunkSource>(
                 return;
             }
         };
+        if let Some((trace, request_ordinal)) = &turn_trace {
+            trace.emit_first_byte(*request_ordinal);
+        }
         progress.observe_raw_chunk();
         let items = decoder.push(chunk.as_ref());
         if crate::has_semantic_progress(&items) {

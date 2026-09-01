@@ -187,6 +187,34 @@ scripts/qa-gate/run.sh --tier t1 --bin-dir /usr/local/bin
   `PRAGMA user_version` and ordered `sqlite_master` rows with a fresh profile.
   A passing run publishes the stopped profile archive, checksum, and
   provenance manifest beside the report.
+- `t1.turn.wall_budget` runs the stdlib loopback turn harness against one warm,
+  settled daemon: five unreported warm-ups and 25 retained samples for each of
+  the one-request and two-request tool shapes in ABBA order. Each sample gates
+  on one typed terminal, contiguous journal sequence, exact provider request
+  count (1/2), exactly one append-only local `process_exec` effect for the tool
+  shape, durable Idle, and unchanged PID/generation. Timing is accepted
+  only when all one-minute load snapshots at measured start/mid/end are below
+  4; overload is `ENV_BLOCKED` and publishes no timing artifact. An accepted
+  run publishes the raw samples, median/MAD, combined client+daemon CPU, peak
+  RSS, binary/daemon/proxy/harness hashes, provider ledger, and exact-stop
+  receipt.
+
+LAW (TURN-WALL-1): on the pinned quiet runner, one warmed settled daemon plus
+the vendored deterministic loopback provider must produce 25 valid attached
+`haider run` samples per shape. The regression budgets are exactly 1.10 times
+the accepted v0.0.968-main medians recorded in the check, while the owner
+targets remain 40 ms for one physical provider request and 60 ms for exactly
+two. MAD is diagnostic and relaxes neither ceiling. A wrong request count,
+missing/duplicate tool effect, terminal/journal failure, PID/generation change,
+sample failure, or unclean
+exact stop is `FAIL`; a load rejection is
+`measurement_accepted=false`/`ENV_BLOCKED`, never `PASS`.
+
+CPU and peak RSS remain mandatory retained columns for a paired lane verdict,
+but are not one-batch CI ceilings: repeated unchanged-binary batches showed
+CPU movement larger than one batch's MAD. Peak RSS is sampled in page
+granularity. The CI budget gates wall only; MAD never relaxes that budget or
+the 40/60 ms owner targets.
 
 The old step-4 `t1.tui.ladder` wrapper is intentionally absent: the five direct
 hermetic `t0.tui.*` checks use the current PTY/RPC runner, while the legacy
