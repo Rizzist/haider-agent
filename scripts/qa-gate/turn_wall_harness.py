@@ -36,7 +36,7 @@ from turnperf_support import (
 
 WARMUPS_PER_SHAPE = 5
 MEASURED_PER_SHAPE = 25
-LOAD_LIMIT = 4.0
+LOAD_LIMIT = 3.0  # baseline conditions (loads 2.4-2.5); lane load yields ENV_BLOCKED, never a false FAIL
 OWNER_TARGET_MS = {"single": 40.0, "tool": 60.0}
 
 
