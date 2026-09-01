@@ -75,6 +75,15 @@ allocate a second public call id.
 This identity remains unchanged when arguments arrive in multiple provider
 chunks. The daemon's existing by-call-id deduplication is the authority.
 
+A model-authored tool call whose arguments are valid JSON but fail the tool's
+argument shape closes with the existing `payload.type == "tool_result"`. Its
+`result.status` is `rejected`; the JSON text in `result.preview` has
+`status == "rejected"`, `error.kind == "invalid_argument"`, and an
+`error.message` naming the invalid or missing field. The result is returned to
+the model and the turn continues to another provider request. This is not a
+run failure and adds no JSONL field, payload kind, cursor rule, or terminal
+kind.
+
 ## Exactly one typed terminal
 
 An attached run ends with exactly one terminal envelope. It is still the

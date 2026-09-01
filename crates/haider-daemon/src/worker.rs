@@ -14209,6 +14209,26 @@ enum ParsedToolOperation {
     SshShell(SshShellOperation),
 }
 
+fn route_uses_cached_tool_operation(route: RegisteredToolRoute) -> bool {
+    matches!(
+        route,
+        RegisteredToolRoute::FsRead
+            | RegisteredToolRoute::FsGlob
+            | RegisteredToolRoute::FsSearch
+            | RegisteredToolRoute::FsWrite
+            | RegisteredToolRoute::FsEdit
+            | RegisteredToolRoute::FsPath
+            | RegisteredToolRoute::ProcessExec
+            | RegisteredToolRoute::SpawnSubagent
+            | RegisteredToolRoute::TaskKill
+            | RegisteredToolRoute::WebFetch
+            | RegisteredToolRoute::PeerList
+            | RegisteredToolRoute::PeerSend
+            | RegisteredToolRoute::SshList
+            | RegisteredToolRoute::SshShell
+    )
+}
+
 fn cache_parsed_operation<K, T, E>(
     operations: &mut HashMap<K, Arc<T>>,
     key: K,
@@ -14231,6 +14251,20 @@ fn cached_operation_route_mismatch(route: RegisteredToolRoute) -> HaiderError {
         format!("cached operation does not match tool route `{route:?}`"),
         false,
     )
+}
+
+fn model_tool_argument_failure(error: ToolError) -> Result<ToolDispatchResult, HaiderError> {
+    match error {
+        error @ ToolError::InvalidArgument { .. } => {
+            Ok(ToolDispatchResult::Completed(typed_error_result(
+                "rejected",
+                "invalid_argument",
+                &error,
+                serde_json::Value::Null,
+            )))
+        }
+        error => Err(tool_error(error)),
+    }
 }
 
 struct ParsedToolOperationLease<'a> {
@@ -15052,7 +15086,7 @@ impl BrokerToolDispatcher {
         route: RegisteredToolRoute,
         call_id: &str,
         args: &serde_json::Value,
-    ) -> Result<ParsedToolOperation, HaiderError> {
+    ) -> ToolResult<ParsedToolOperation> {
         match route {
             RegisteredToolRoute::FsRead => {
                 let path = required_string(args, "path")?;
@@ -15060,21 +15094,13 @@ impl BrokerToolDispatcher {
                     .map(usize::try_from)
                     .transpose()
                     .map_err(|_| {
-                        HaiderError::new(
-                            ErrorCode::InvalidArgument,
-                            "tool argument `offset` is too large",
-                            false,
-                        )
+                        ToolError::invalid_argument("tool argument `offset` is too large")
                     })?;
                 let limit = optional_u64(args, "limit")?
                     .map(usize::try_from)
                     .transpose()
                     .map_err(|_| {
-                        HaiderError::new(
-                            ErrorCode::InvalidArgument,
-                            "tool argument `limit` is too large",
-                            false,
-                        )
+                        ToolError::invalid_argument("tool argument `limit` is too large")
                     })?;
                 Ok(ParsedToolOperation::FsRead(
                     FsRead::new(path).with_line_range(offset, limit),
@@ -15087,10 +15113,8 @@ impl BrokerToolDispatcher {
                 let query = optional_string(args, "pattern")?
                     .or(optional_string(args, "query")?)
                     .ok_or_else(|| {
-                        HaiderError::new(
-                            ErrorCode::InvalidArgument,
+                        ToolError::invalid_argument(
                             "tool argument `pattern` must be a non-empty string",
-                            false,
                         )
                     })?;
                 let glob = optional_string(args, "glob")?;
@@ -15101,11 +15125,7 @@ impl BrokerToolDispatcher {
                     .map(usize::try_from)
                     .transpose()
                     .map_err(|_| {
-                        HaiderError::new(
-                            ErrorCode::InvalidArgument,
-                            "tool argument `max_matches` is too large",
-                            false,
-                        )
+                        ToolError::invalid_argument("tool argument `max_matches` is too large")
                     })?
                     .unwrap_or(haider_tools::SEARCH_PREVIEW_MATCHES);
                 let (context_before, context_after) = match args.get("context") {
@@ -15116,10 +15136,8 @@ impl BrokerToolDispatcher {
                             .map(usize::try_from)
                             .transpose()
                             .map_err(|_| {
-                                HaiderError::new(
-                                    ErrorCode::InvalidArgument,
+                                ToolError::invalid_argument(
                                     "tool argument `context.before` is too large",
-                                    false,
                                 )
                             })?
                             .unwrap_or(0);
@@ -15127,20 +15145,16 @@ impl BrokerToolDispatcher {
                             .map(usize::try_from)
                             .transpose()
                             .map_err(|_| {
-                                HaiderError::new(
-                                    ErrorCode::InvalidArgument,
+                                ToolError::invalid_argument(
                                     "tool argument `context.after` is too large",
-                                    false,
                                 )
                             })?
                             .unwrap_or(0);
                         (before, after)
                     }
                     Some(_) => {
-                        return Err(HaiderError::new(
-                            ErrorCode::InvalidArgument,
+                        return Err(ToolError::invalid_argument(
                             "tool argument `context` must be an object when provided",
-                            false,
                         ));
                     }
                 };
@@ -15150,11 +15164,9 @@ impl BrokerToolDispatcher {
                     Some("insensitive") => FsCaseMode::Insensitive,
                     Some("smart") => FsCaseMode::Smart,
                     Some(value) => {
-                        return Err(HaiderError::new(
-                            ErrorCode::InvalidArgument,
-                            format!("unsupported fs_search case mode `{value}`"),
-                            false,
-                        ));
+                        return Err(ToolError::invalid_argument(format!(
+                            "unsupported fs_search case mode `{value}`"
+                        )));
                     }
                 };
                 let mode = match optional_string(args, "mode")?.as_deref() {
@@ -15162,11 +15174,9 @@ impl BrokerToolDispatcher {
                     Some("simple") => FsSearchMode::Simple,
                     Some("regex") => FsSearchMode::Regex,
                     Some(value) => {
-                        return Err(HaiderError::new(
-                            ErrorCode::InvalidArgument,
-                            format!("unsupported fs_search pattern mode `{value}`"),
-                            false,
-                        ));
+                        return Err(ToolError::invalid_argument(format!(
+                            "unsupported fs_search pattern mode `{value}`"
+                        )));
                     }
                 };
                 let mut operation = FsSearch::new(root, query)
@@ -15215,14 +15225,13 @@ impl BrokerToolDispatcher {
             }
             RegisteredToolRoute::SpawnSubagent => SpawnSubagent::from_tool_args(args.clone())
                 .map(Box::new)
-                .map(ParsedToolOperation::SpawnSubagent)
-                .map_err(tool_error),
+                .map(ParsedToolOperation::SpawnSubagent),
             RegisteredToolRoute::TaskKill => Ok(ParsedToolOperation::TaskKill(required_string(
                 args, "task_id",
             )?)),
-            RegisteredToolRoute::WebFetch => WebFetch::from_tool_args(args)
-                .map(ParsedToolOperation::WebFetch)
-                .map_err(tool_error),
+            RegisteredToolRoute::WebFetch => {
+                WebFetch::from_tool_args(args).map(ParsedToolOperation::WebFetch)
+            }
             RegisteredToolRoute::PeerList => Ok(ParsedToolOperation::PeerList(
                 optional_bounded_string(args, "filter", PEER_FILTER_MAX_BYTES)?,
             )),
@@ -15248,18 +15257,14 @@ impl BrokerToolDispatcher {
                 let timeout_s = match optional_u64(args, "timeout_s")? {
                     Some(value) if (1..=86_400).contains(&value) => {
                         Some(u32::try_from(value).map_err(|_| {
-                            HaiderError::new(
-                                ErrorCode::InvalidArgument,
+                            ToolError::invalid_argument(
                                 "tool argument `timeout_s` is outside 1..=86400",
-                                false,
                             )
                         })?)
                     }
                     Some(_) => {
-                        return Err(HaiderError::new(
-                            ErrorCode::InvalidArgument,
+                        return Err(ToolError::invalid_argument(
                             "tool argument `timeout_s` is outside 1..=86400",
-                            false,
                         ));
                     }
                     None => None,
@@ -15283,10 +15288,8 @@ impl BrokerToolDispatcher {
                     .and_then(serde_json::Value::as_array)
                     .filter(|edits| !edits.is_empty())
                     .ok_or_else(|| {
-                        HaiderError::new(
-                            ErrorCode::InvalidArgument,
+                        ToolError::invalid_argument(
                             "tool argument `edits` must be a non-empty array",
-                            false,
                         )
                     })?;
                 let mut edits = Vec::with_capacity(requested_edits.len());
@@ -15305,11 +15308,9 @@ impl BrokerToolDispatcher {
                     "delete" => FsPathOperation::Delete,
                     "copy" => FsPathOperation::Copy,
                     value => {
-                        return Err(HaiderError::new(
-                            ErrorCode::InvalidArgument,
-                            format!("unsupported fs_path operation `{value}`"),
-                            false,
-                        ));
+                        return Err(ToolError::invalid_argument(format!(
+                            "unsupported fs_path operation `{value}`"
+                        )));
                     }
                 };
                 let destination = optional_string(args, "destination")?;
@@ -15320,11 +15321,9 @@ impl BrokerToolDispatcher {
                 }
                 Ok(ParsedToolOperation::FsPath(operation))
             }
-            _ => Err(HaiderError::new(
-                ErrorCode::Internal,
-                format!("tool route `{route:?}` has no cached operation"),
-                false,
-            )),
+            _ => Err(ToolError::Runtime {
+                message: format!("tool route `{route:?}` has no cached operation"),
+            }),
         }
     }
 
@@ -15332,7 +15331,7 @@ impl BrokerToolDispatcher {
         &self,
         key: &ParsedToolOperationKey,
         args: &serde_json::Value,
-    ) -> Result<Arc<ParsedToolOperation>, HaiderError> {
+    ) -> ToolResult<Arc<ParsedToolOperation>> {
         let mut operations = self
             .parsed_tool_operations
             .lock()
@@ -15840,11 +15839,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
             Some(route) => route,
             None => {
                 self.clear_cached_call(run_id, item_id, call_id);
-                return Err(HaiderError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("unsupported tool `{name}`"),
-                    false,
-                ));
+                return model_tool_argument_failure(ToolError::invalid_argument(format!(
+                    "unsupported tool `{name}`"
+                )));
             }
         };
         let operation_key = ParsedToolOperationKey {
@@ -15855,6 +15852,14 @@ impl ToolDispatcher for BrokerToolDispatcher {
         };
         let mut operation_lease =
             ParsedToolOperationLease::new(&self.parsed_tool_operations, operation_key.clone());
+        let parsed_operation = if route_uses_cached_tool_operation(route) {
+            match self.cached_tool_operation(&operation_key, args.as_ref()) {
+                Ok(operation) => Some(operation),
+                Err(error) => return model_tool_argument_failure(error),
+            }
+        } else {
+            None
+        };
         if let Some(lockdown) = self.lockdown.as_ref()
             && matches!(
                 route,
@@ -15863,8 +15868,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     | RegisteredToolRoute::FsGlob
             )
         {
-            let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
-            let requested = match operation.as_ref() {
+            let operation = parsed_operation
+                .as_deref()
+                .ok_or_else(|| cached_operation_route_mismatch(route))?;
+            let requested = match operation {
                 ParsedToolOperation::FsRead(operation) => operation.path.as_path(),
                 ParsedToolOperation::FsSearch(operation) => operation.root.as_path(),
                 ParsedToolOperation::FsGlob(operation) => operation.root.as_path(),
@@ -15900,8 +15907,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
         if let Some(lockdown) = self.lockdown.as_ref()
             && route == RegisteredToolRoute::FsWrite
         {
-            let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
-            let ParsedToolOperation::FsWrite(operation) = operation.as_ref() else {
+            let operation = parsed_operation
+                .as_deref()
+                .ok_or_else(|| cached_operation_route_mismatch(route))?;
+            let ParsedToolOperation::FsWrite(operation) = operation else {
                 return Err(cached_operation_route_mismatch(route));
             };
             let relative = match lockdown_write_relative(&lockdown.sandbox, &operation.path) {
@@ -16066,8 +16075,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
         if let Some(lockdown) = self.lockdown.as_ref()
             && route == RegisteredToolRoute::FsRead
         {
-            let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
-            let ParsedToolOperation::FsRead(operation) = operation.as_ref() else {
+            let operation = parsed_operation
+                .as_deref()
+                .ok_or_else(|| cached_operation_route_mismatch(route))?;
+            let ParsedToolOperation::FsRead(operation) = operation else {
                 return Err(cached_operation_route_mismatch(route));
             };
             if operation.path.is_absolute() && operation.path.starts_with(&lockdown.sandbox) {
@@ -16118,8 +16129,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }
         }
         if route == RegisteredToolRoute::Monitor {
-            let request =
-                MonitorRequest::from_tool_args(args.as_ref().clone()).map_err(tool_error)?;
+            let request = match MonitorRequest::from_tool_args(args.as_ref().clone()) {
+                Ok(request) => request,
+                Err(error) => return model_tool_argument_failure(error),
+            };
             let result = self
                 .output
                 .store
@@ -16291,8 +16304,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
             if !authorized {
                 return Ok(ToolDispatchResult::Completed(grant_ceiling_result(name)));
             }
-            let request =
-                WorkflowAuthor::from_tool_args(args.as_ref().clone()).map_err(tool_error)?;
+            let request = match WorkflowAuthor::from_tool_args(args.as_ref().clone()) {
+                Ok(request) => request,
+                Err(error) => return model_tool_argument_failure(error),
+            };
             if request.template.nodes.iter().any(|node| {
                 matches!(
                     node.gate,
@@ -16406,8 +16421,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 self.clear_cached_call(run_id, item_id, call_id);
                 return Err(error);
             }
-            let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
-            let ParsedToolOperation::SpawnSubagent(operation) = operation.as_ref() else {
+            let operation = parsed_operation
+                .as_deref()
+                .ok_or_else(|| cached_operation_route_mismatch(route))?;
+            let ParsedToolOperation::SpawnSubagent(operation) = operation else {
                 return Err(cached_operation_route_mismatch(route));
             };
             let mut request = operation.as_ref().clone();
@@ -16625,8 +16642,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
             return Ok(ToolDispatchResult::Deferred(established.ticket));
         }
         if route == RegisteredToolRoute::MessageSubagent {
-            let request =
-                MessageSubagent::from_tool_args(args.as_ref().clone()).map_err(tool_error)?;
+            let request = match MessageSubagent::from_tool_args(args.as_ref().clone()) {
+                Ok(request) => request,
+                Err(error) => return model_tool_argument_failure(error),
+            };
             let agent = request.agent.clone();
             let receipt = match self
                 .delegation
@@ -16688,8 +16707,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }));
         }
         if route == RegisteredToolRoute::SshList {
-            let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
-            let ParsedToolOperation::SshList = operation.as_ref() else {
+            let operation = parsed_operation
+                .as_deref()
+                .ok_or_else(|| cached_operation_route_mismatch(route))?;
+            let ParsedToolOperation::SshList = operation else {
                 return Err(cached_operation_route_mismatch(route));
             };
             let scope = self
@@ -16746,8 +16767,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }));
         }
         if route == RegisteredToolRoute::SshShell {
-            let parsed = self.cached_tool_operation(&operation_key, args.as_ref())?;
-            let ParsedToolOperation::SshShell(operation) = parsed.as_ref() else {
+            let operation = parsed_operation
+                .as_deref()
+                .ok_or_else(|| cached_operation_route_mismatch(route))?;
+            let ParsedToolOperation::SshShell(operation) = operation else {
                 return Err(cached_operation_route_mismatch(route));
             };
             let (result, retain_for_approval) = self
@@ -16759,8 +16782,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
             return Ok(result);
         }
         if route == RegisteredToolRoute::PeerList {
-            let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
-            let ParsedToolOperation::PeerList(filter) = operation.as_ref() else {
+            let operation = parsed_operation
+                .as_deref()
+                .ok_or_else(|| cached_operation_route_mismatch(route))?;
+            let ParsedToolOperation::PeerList(filter) = operation else {
                 return Err(cached_operation_route_mismatch(route));
             };
             let mut agents = self
@@ -16809,8 +16834,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }));
         }
         if route == RegisteredToolRoute::PeerSend {
-            let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
-            let ParsedToolOperation::PeerSend(operation) = operation.as_ref() else {
+            let operation = parsed_operation
+                .as_deref()
+                .ok_or_else(|| cached_operation_route_mismatch(route))?;
+            let ParsedToolOperation::PeerSend(operation) = operation else {
                 return Err(cached_operation_route_mismatch(route));
             };
             let intent = broker.normalize(operation).await.map_err(tool_error)?;
@@ -16918,8 +16945,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
             .map_or(0, |changes| changes.writes.len());
         let result = match route {
             RegisteredToolRoute::FsRead => {
-                let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
-                let ParsedToolOperation::FsRead(operation) = operation.as_ref() else {
+                let operation = parsed_operation
+                    .as_deref()
+                    .ok_or_else(|| cached_operation_route_mismatch(route))?;
+                let ParsedToolOperation::FsRead(operation) = operation else {
                     return Err(cached_operation_route_mismatch(route));
                 };
                 let mut cas = self.cas.lock().await;
@@ -16928,8 +16957,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     .await
             }
             RegisteredToolRoute::FsSearch => {
-                let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
-                let ParsedToolOperation::FsSearch(operation) = operation.as_ref() else {
+                let operation = parsed_operation
+                    .as_deref()
+                    .ok_or_else(|| cached_operation_route_mismatch(route))?;
+                let ParsedToolOperation::FsSearch(operation) = operation else {
                     return Err(cached_operation_route_mismatch(route));
                 };
                 let mut cas = self.cas.lock().await;
@@ -16938,8 +16969,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     .await
             }
             RegisteredToolRoute::FsGlob => {
-                let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
-                let ParsedToolOperation::FsGlob(operation) = operation.as_ref() else {
+                let operation = parsed_operation
+                    .as_deref()
+                    .ok_or_else(|| cached_operation_route_mismatch(route))?;
+                let ParsedToolOperation::FsGlob(operation) = operation else {
                     return Err(cached_operation_route_mismatch(route));
                 };
                 let mut cas = self.cas.lock().await;
@@ -16952,14 +16985,16 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 // Core durably commits RunningTool before dispatch enters this
                 // exec arm, so reaching this boundary confirms its publication.
                 trace_windows_process_publish("RunningTool", run_id);
-                let parsed = self.cached_tool_operation(&operation_key, args.as_ref())?;
+                let parsed = parsed_operation
+                    .as_deref()
+                    .ok_or_else(|| cached_operation_route_mismatch(route))?;
                 let ParsedToolOperation::ProcessExec {
                     operation,
                     requested_cwd,
                     background,
                     name,
                     remote_profile,
-                } = parsed.as_ref()
+                } = parsed
                 else {
                     return Err(cached_operation_route_mismatch(route));
                 };
@@ -17176,27 +17211,35 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 }
             }
             RegisteredToolRoute::LoomRegister => {
-                let kind = required_string(&args, "kind")?;
-                let expected_rev = optional_u64(&args, "expected_rev")?
-                    .ok_or_else(|| {
-                        HaiderError::new(
-                            ErrorCode::InvalidArgument,
-                            "loom_register requires `expected_rev` (zero creates an absent id)",
-                            false,
-                        )
+                let kind = match required_string(&args, "kind") {
+                    Ok(kind) => kind,
+                    Err(error) => return model_tool_argument_failure(error),
+                };
+                let expected_rev = match optional_u64(&args, "expected_rev")
+                    .and_then(|value| {
+                        value.ok_or_else(|| {
+                            ToolError::invalid_argument(
+                                "loom_register requires `expected_rev` (zero creates an absent id)",
+                            )
+                        })
                     })
                     .and_then(|value| {
                         u32::try_from(value).map_err(|_| {
-                            HaiderError::new(
-                                ErrorCode::InvalidArgument,
+                            ToolError::invalid_argument(
                                 "loom_register `expected_rev` exceeds u32",
-                                false,
                             )
                         })
-                    })?;
+                    }) {
+                    Ok(expected_rev) => expected_rev,
+                    Err(error) => return model_tool_argument_failure(error),
+                };
+                let expected_digest = match optional_string(&args, "expected_digest") {
+                    Ok(expected_digest) => expected_digest,
+                    Err(error) => return model_tool_argument_failure(error),
+                };
                 let expected = haider_protocol::loom::LoomRevisionExpectation {
                     rev: expected_rev,
-                    digest: optional_string(&args, "expected_digest")?,
+                    digest: expected_digest,
                 };
                 let completed = |value: serde_json::Value| BoundedResult {
                     preview: value.to_string(),
@@ -17238,7 +17281,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     accepted_plan_bodies(&self.output.store, self.branch_id.as_ref()).await?;
                 match kind.as_str() {
                     "workflow" => {
-                        let source = required_string(&args, "source")?;
+                        let source = match required_string(&args, "source") {
+                            Ok(source) => source,
+                            Err(error) => return model_tool_argument_failure(error),
+                        };
                         if plan_gate_admits(&bodies, &[source.trim()]) {
                             match self
                                 .output
@@ -17273,25 +17319,26 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         }
                     }
                     "agent_type" => {
-                        let mut value = args.get("record").cloned().ok_or_else(|| {
-                            HaiderError::new(
-                                ErrorCode::InvalidArgument,
+                        let Some(mut value) = args.get("record").cloned() else {
+                            return model_tool_argument_failure(ToolError::invalid_argument(
                                 "kind=agent_type requires `record`",
-                                false,
-                            )
-                        })?;
+                            ));
+                        };
                         if let Some(object) = value.as_object_mut() {
                             // The registry owns revs; the model never picks one.
                             object.insert("rev".into(), serde_json::json!(1));
                         }
                         let record: haider_protocol::loom::LoomAgentType =
-                            serde_json::from_value(value).map_err(|error| {
-                                HaiderError::new(
-                                    ErrorCode::InvalidArgument,
-                                    format!("agent type record does not decode: {error}"),
-                                    false,
-                                )
-                            })?;
+                            match serde_json::from_value(value) {
+                                Ok(record) => record,
+                                Err(error) => {
+                                    return model_tool_argument_failure(
+                                        ToolError::invalid_argument(format!(
+                                            "agent type record does not decode: {error}"
+                                        )),
+                                    );
+                                }
+                            };
                         let signature = format!("{} -> {}", record.in_type, record.out_type);
                         let needles = [record.id.as_str(), record.job.trim(), signature.as_str()];
                         if plan_gate_admits(&bodies, &needles) {
@@ -17330,24 +17377,30 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         }
                     }
                     other => {
-                        return Err(HaiderError::new(
-                            ErrorCode::InvalidArgument,
-                            format!("loom_register kind `{other}` is not workflow|agent_type"),
-                            false,
-                        ));
+                        return model_tool_argument_failure(ToolError::invalid_argument(format!(
+                            "loom_register kind `{other}` is not workflow|agent_type"
+                        )));
                     }
                 }
             }
             RegisteredToolRoute::TaskOutput => {
-                let task_id = required_string(&args, "task_id")?;
-                let cursor = optional_u64(&args, "cursor")?;
+                let task_id = match required_string(&args, "task_id") {
+                    Ok(task_id) => task_id,
+                    Err(error) => return model_tool_argument_failure(error),
+                };
+                let cursor = match optional_u64(&args, "cursor") {
+                    Ok(cursor) => cursor,
+                    Err(error) => return model_tool_argument_failure(error),
+                };
                 self.tasks
                     .task_output(&self.session_id, &task_id, cursor)
                     .await
             }
             RegisteredToolRoute::TaskKill => {
-                let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
-                let ParsedToolOperation::TaskKill(task_id) = operation.as_ref() else {
+                let operation = parsed_operation
+                    .as_deref()
+                    .ok_or_else(|| cached_operation_route_mismatch(route))?;
+                let ParsedToolOperation::TaskKill(task_id) = operation else {
                     return Err(cached_operation_route_mismatch(route));
                 };
                 self.tasks
@@ -17360,8 +17413,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 // HONEST terminal outcome either way. A failed fetch is a
                 // typed tool RESULT the model can react to, never a turn
                 // failure; only journal-append failures abort.
-                let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
-                let ParsedToolOperation::WebFetch(operation) = operation.as_ref() else {
+                let operation = parsed_operation
+                    .as_deref()
+                    .ok_or_else(|| cached_operation_route_mismatch(route))?;
+                let ParsedToolOperation::WebFetch(operation) = operation else {
                     return Err(cached_operation_route_mismatch(route));
                 };
                 // B2 — the use-site host fence: a typed child's grant scopes
@@ -17498,8 +17553,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 }
             }
             RegisteredToolRoute::FsWrite => {
-                let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
-                let ParsedToolOperation::FsWrite(operation) = operation.as_ref() else {
+                let operation = parsed_operation
+                    .as_deref()
+                    .ok_or_else(|| cached_operation_route_mismatch(route))?;
+                let ParsedToolOperation::FsWrite(operation) = operation else {
                     return Err(cached_operation_route_mismatch(route));
                 };
                 let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone())
@@ -17539,8 +17596,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 result
             }
             RegisteredToolRoute::FsEdit => {
-                let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
-                let ParsedToolOperation::FsEdit(operation) = operation.as_ref() else {
+                let operation = parsed_operation
+                    .as_deref()
+                    .ok_or_else(|| cached_operation_route_mismatch(route))?;
+                let ParsedToolOperation::FsEdit(operation) = operation else {
                     return Err(cached_operation_route_mismatch(route));
                 };
                 let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone())
@@ -17557,8 +17616,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     .await
             }
             RegisteredToolRoute::FsPath => {
-                let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
-                let ParsedToolOperation::FsPath(operation) = operation.as_ref() else {
+                let operation = parsed_operation
+                    .as_deref()
+                    .ok_or_else(|| cached_operation_route_mismatch(route))?;
+                let ParsedToolOperation::FsPath(operation) = operation else {
                     return Err(cached_operation_route_mismatch(route));
                 };
                 let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone())
@@ -17580,7 +17641,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 // menu (the request_input pattern). Failures are typed tool
                 // RESULTS; a 404/410 latches the session degrade so the
                 // tool stops advertising next turn (no retry storm).
-                let query = required_string(&args, "query")?;
+                let query = match required_string(&args, "query") {
+                    Ok(query) => query,
+                    Err(error) => return model_tool_argument_failure(error),
+                };
                 match &self.web_search {
                     None => Ok(BoundedResult {
                         preview:
@@ -18068,7 +18132,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             | RegisteredToolRoute::SshList
             | RegisteredToolRoute::SshShell => {
                 return Err(HaiderError::new(
-                    ErrorCode::InvalidArgument,
+                    ErrorCode::Internal,
                     format!("tool `{name}` is not dispatched by the general-tool match"),
                     false,
                 ));
@@ -19404,37 +19468,28 @@ fn process_exec_definition() -> ToolDefinition {
     }
 }
 
-fn required_string(args: &serde_json::Value, field: &str) -> Result<String, HaiderError> {
+fn required_string(args: &serde_json::Value, field: &str) -> ToolResult<String> {
     args.get(field)
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .ok_or_else(|| {
-            HaiderError::new(
-                ErrorCode::InvalidArgument,
-                format!("tool argument `{field}` must be a non-empty string"),
-                false,
-            )
+            ToolError::invalid_argument(format!(
+                "tool argument `{field}` must be a non-empty string"
+            ))
         })
 }
 
-fn required_string_allow_empty(
-    args: &serde_json::Value,
-    field: &str,
-) -> Result<String, HaiderError> {
+fn required_string_allow_empty(args: &serde_json::Value, field: &str) -> ToolResult<String> {
     args.get(field)
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
         .ok_or_else(|| {
-            HaiderError::new(
-                ErrorCode::InvalidArgument,
-                format!("tool argument `{field}` must be a string"),
-                false,
-            )
+            ToolError::invalid_argument(format!("tool argument `{field}` must be a string"))
         })
 }
 
-fn optional_string(args: &serde_json::Value, field: &str) -> Result<Option<String>, HaiderError> {
+fn optional_string(args: &serde_json::Value, field: &str) -> ToolResult<Option<String>> {
     let Some(value) = args.get(field) else {
         return Ok(None);
     };
@@ -19443,11 +19498,9 @@ fn optional_string(args: &serde_json::Value, field: &str) -> Result<Option<Strin
         .filter(|value| !value.is_empty())
         .map(|value| Some(value.to_owned()))
         .ok_or_else(|| {
-            HaiderError::new(
-                ErrorCode::InvalidArgument,
-                format!("tool argument `{field}` must be a non-empty string when provided"),
-                false,
-            )
+            ToolError::invalid_argument(format!(
+                "tool argument `{field}` must be a non-empty string when provided"
+            ))
         })
 }
 
@@ -19455,17 +19508,13 @@ fn required_bounded_string(
     args: &serde_json::Value,
     field: &str,
     max_bytes: usize,
-) -> Result<String, HaiderError> {
+) -> ToolResult<String> {
     let value = required_string(args, field)?;
     if value.len() > max_bytes {
-        return Err(HaiderError::new(
-            ErrorCode::InvalidArgument,
-            format!(
-                "tool argument `{field}` is {} bytes; the limit is {max_bytes}",
-                value.len()
-            ),
-            false,
-        ));
+        return Err(ToolError::invalid_argument(format!(
+            "tool argument `{field}` is {} bytes; the limit is {max_bytes}",
+            value.len()
+        )));
     }
     Ok(value)
 }
@@ -19474,18 +19523,14 @@ fn optional_bounded_string(
     args: &serde_json::Value,
     field: &str,
     max_bytes: usize,
-) -> Result<Option<String>, HaiderError> {
+) -> ToolResult<Option<String>> {
     optional_string(args, field)?
         .map(|value| {
             if value.len() > max_bytes {
-                Err(HaiderError::new(
-                    ErrorCode::InvalidArgument,
-                    format!(
-                        "tool argument `{field}` is {} bytes; the limit is {max_bytes}",
-                        value.len()
-                    ),
-                    false,
-                ))
+                Err(ToolError::invalid_argument(format!(
+                    "tool argument `{field}` is {} bytes; the limit is {max_bytes}",
+                    value.len()
+                )))
             } else {
                 Ok(value)
             }
@@ -19493,60 +19538,50 @@ fn optional_bounded_string(
         .transpose()
 }
 
-fn optional_bool(args: &serde_json::Value, field: &str) -> Result<Option<bool>, HaiderError> {
+fn optional_bool(args: &serde_json::Value, field: &str) -> ToolResult<Option<bool>> {
     let Some(value) = args.get(field) else {
         return Ok(None);
     };
     value.as_bool().map(Some).ok_or_else(|| {
-        HaiderError::new(
-            ErrorCode::InvalidArgument,
-            format!("tool argument `{field}` must be a boolean when provided"),
-            false,
-        )
+        ToolError::invalid_argument(format!(
+            "tool argument `{field}` must be a boolean when provided"
+        ))
     })
 }
 
-fn optional_u64(args: &serde_json::Value, field: &str) -> Result<Option<u64>, HaiderError> {
+fn optional_u64(args: &serde_json::Value, field: &str) -> ToolResult<Option<u64>> {
     let Some(value) = args.get(field) else {
         return Ok(None);
     };
     value.as_u64().map(Some).ok_or_else(|| {
-        HaiderError::new(
-            ErrorCode::InvalidArgument,
-            format!("tool argument `{field}` must be a non-negative integer when provided"),
-            false,
-        )
+        ToolError::invalid_argument(format!(
+            "tool argument `{field}` must be a non-negative integer when provided"
+        ))
     })
 }
 
-fn parse_fs_file_glob(value: Option<&serde_json::Value>) -> Result<FsFileGlob, HaiderError> {
+fn parse_fs_file_glob(value: Option<&serde_json::Value>) -> ToolResult<FsFileGlob> {
     let Some(value) = value else {
         return Ok(FsFileGlob::default());
     };
     let Some(object) = value.as_object() else {
-        return Err(HaiderError::new(
-            ErrorCode::InvalidArgument,
+        return Err(ToolError::invalid_argument(
             "tool argument `file_glob` must be an object when provided",
-            false,
         ));
     };
-    let parse_patterns = |field: &str| -> Result<Vec<String>, HaiderError> {
+    let parse_patterns = |field: &str| -> ToolResult<Vec<String>> {
         let Some(value) = object.get(field) else {
             return Ok(Vec::new());
         };
         let Some(values) = value.as_array() else {
-            return Err(HaiderError::new(
-                ErrorCode::InvalidArgument,
-                format!("tool argument `file_glob.{field}` must be an array"),
-                false,
-            ));
+            return Err(ToolError::invalid_argument(format!(
+                "tool argument `file_glob.{field}` must be an array"
+            )));
         };
         if values.len() > 32 {
-            return Err(HaiderError::new(
-                ErrorCode::InvalidArgument,
-                format!("tool argument `file_glob.{field}` cannot exceed 32 patterns"),
-                false,
-            ));
+            return Err(ToolError::invalid_argument(format!(
+                "tool argument `file_glob.{field}` cannot exceed 32 patterns"
+            )));
         }
         values
             .iter()
@@ -19556,13 +19591,9 @@ fn parse_fs_file_glob(value: Option<&serde_json::Value>) -> Result<FsFileGlob, H
                     .filter(|value| !value.is_empty())
                     .map(ToOwned::to_owned)
                     .ok_or_else(|| {
-                        HaiderError::new(
-                            ErrorCode::InvalidArgument,
-                            format!(
-                                "tool argument `file_glob.{field}` entries must be non-empty strings"
-                            ),
-                            false,
-                        )
+                        ToolError::invalid_argument(format!(
+                            "tool argument `file_glob.{field}` entries must be non-empty strings"
+                        ))
                     })
             })
             .collect()
