@@ -171,7 +171,11 @@ const SUPERVISOR_CAPACITY: usize = 64;
 /// reports durable quiescence. Activity cancels the owned timer; queued,
 /// active, cancelling, recovery, and menu-parked work never reports this
 /// state and therefore cannot be retired by absence of a client.
-const SUPERVISOR_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
+/// Keep tight conversational follow-ups warm, but do not retain a complete
+/// turn/tool dependency graph throughout the daemon's long idle lifetime.
+/// Every supervisor input is journal-backed, so a later turn recreates this
+/// cache from the same durable run-head and session metadata projections.
+const SUPERVISOR_IDLE_TTL: Duration = Duration::from_secs(30);
 const COMPUTER_PERMISSION_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 const COMPUTER_PERMISSION_MENU_ORIGIN: &str = "computer-os-permission";
 
@@ -8335,6 +8339,10 @@ pub(crate) struct TurnSetupReductionCache {
 }
 
 impl TurnSetupReductionCache {
+    pub(crate) async fn retention_entry_count(&self) -> usize {
+        self.entries.lock().await.reductions.len()
+    }
+
     pub(crate) async fn remove_session(&self, session_id: &SessionId) -> usize {
         let mut entries = self.entries.lock().await;
         let before = entries.reductions.len();
@@ -11470,6 +11478,13 @@ mod manager_law_tests {
         assert!(cancellation_fences_start(Some(RunState::Cancelling)));
         assert!(cancellation_fences_start(Some(RunState::Cancelled)));
         assert!(!cancellation_fences_start(Some(RunState::Queued)));
+    }
+
+    /// MUTATION CHECK: restoring the old five-minute cache keeps the complete
+    /// supervisor alive through the lane's 60-second settled measurement.
+    #[test]
+    fn quiescent_supervisor_retention_is_bounded_below_the_settle_window() {
+        assert_eq!(SUPERVISOR_IDLE_TTL, Duration::from_secs(30));
     }
 
     /// Durable state, not attachment/client presence, defines the idle clock.

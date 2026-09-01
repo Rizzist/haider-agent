@@ -3019,6 +3019,35 @@ fn callback_state_comparison_is_constant_time_and_load_bearing() {
     );
 }
 
+/// MUTATION CHECK: calling `SharedHttpTransport.client()` in
+/// `OAuthCoordinator::new_with_vault` reconstructs rustls during ordinary
+/// daemon startup, before any OAuth request exists.
+#[test]
+fn oauth_coordinator_constructor_retains_only_the_lazy_transport_handle() {
+    let source = include_str!("oauth.rs");
+    let constructor_start = source
+        .find("pub(crate) fn new_with_vault(")
+        .expect("OAuth coordinator constructor");
+    let constructor_end = source[constructor_start..]
+        .find("    pub(crate) fn availability(")
+        .map(|offset| constructor_start + offset)
+        .expect("constructor end");
+    let constructor = &source[constructor_start..constructor_end];
+    assert!(
+        constructor.contains("transport: crate::http_transport::SharedHttpTransport"),
+        "the coordinator must retain the zero-sized lazy transport handle"
+    );
+    assert!(
+        !constructor.contains(".client()"),
+        "coordinator construction must not acquire the shared TLS client"
+    );
+    assert!(
+        source.contains("fn coordinator_http_client(")
+            && source.contains("inner\n        .transport\n        .client()"),
+        "the first OAuth HTTP operation must acquire the shared client"
+    );
+}
+
 #[tokio::test]
 async fn code_is_consumed_once_and_listener_rejects_replay() {
     let server = FakeOAuthServer::start(FakeMode::Success, false).await;
