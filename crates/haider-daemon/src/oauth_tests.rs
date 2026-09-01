@@ -422,6 +422,7 @@ struct FakeState {
     expect_code_state: AtomicBool,
     verifiers: Mutex<Vec<String>>,
     refresh_gate: Option<Arc<Semaphore>>,
+    refresh_started: Notify,
     durable: AtomicBool,
     resource_before_durable: AtomicUsize,
 }
@@ -460,6 +461,7 @@ impl FakeOAuthServer {
             verifiers: Mutex::new(Vec::new()),
             refresh_gate: (gated_refresh || mode == FakeMode::SlowExchange)
                 .then(|| Arc::new(Semaphore::new(0))),
+            refresh_started: Notify::new(),
             durable: AtomicBool::new(false),
             resource_before_durable: AtomicUsize::new(0),
         });
@@ -683,6 +685,7 @@ async fn serve_fake_request(mut stream: TcpStream, state: Arc<FakeState>) {
             assert!(!fields.contains_key("audience"));
             assert!(!fields.contains_key("resource"));
         }
+        state.refresh_started.notify_one();
         if let Some(gate) = &state.refresh_gate {
             let permit = gate.acquire().await.expect("gate");
             permit.forget();
@@ -3963,6 +3966,55 @@ async fn wait_for_refresh_calls(server: &FakeOAuthServer, expected: usize) {
     .expect("refresh call count");
 }
 
+/// A distinct file-vault handle that exposes only the contention boundary
+/// needed by `concurrent_refreshers_never_destroy_the_rotated_token`.
+struct ContentionObservedFileVault {
+    inner: haider_accounts::FileVault,
+    refresh_contended: Notify,
+}
+
+impl ContentionObservedFileVault {
+    fn new(root: &Path) -> Self {
+        Self {
+            inner: haider_accounts::FileVault::new(root),
+            refresh_contended: Notify::new(),
+        }
+    }
+
+    async fn wait_for_refresh_contention(&self) {
+        self.refresh_contended.notified().await;
+    }
+}
+
+impl Vault for ContentionObservedFileVault {
+    fn put(&self, alias: &CredentialAlias, secret: &[u8]) -> AccountsResult<()> {
+        self.inner.put(alias, secret)
+    }
+
+    fn resolve(&self, alias: &CredentialAlias) -> AccountsResult<SecretHandle> {
+        self.inner.resolve(alias)
+    }
+
+    fn delete(&self, alias: &CredentialAlias) -> AccountsResult<()> {
+        self.inner.delete(alias)
+    }
+
+    fn list(&self) -> AccountsResult<Vec<CredentialAlias>> {
+        self.inner.list()
+    }
+
+    fn try_refresh_lock(
+        &self,
+        alias: &CredentialAlias,
+    ) -> AccountsResult<Option<VaultRefreshLock>> {
+        let lease = self.inner.try_refresh_lock(alias)?;
+        if lease.is_none() {
+            self.refresh_contended.notify_one();
+        }
+        Ok(lease)
+    }
+}
+
 /// MUTATION CHECK: remove the vault lease, release it before Apply, or remove
 /// the under-lease re-read. Expected RUNTIME failure: the fake rotating
 /// server observes a second use of generation one's refresh token, or one
@@ -3976,7 +4028,7 @@ async fn concurrent_refreshers_never_destroy_the_rotated_token() {
         .store(false, Ordering::SeqCst);
     let directory = tempfile::tempdir().expect("temp vault");
     let first_vault = Arc::new(haider_accounts::FileVault::new(directory.path()));
-    let second_vault = Arc::new(haider_accounts::FileVault::new(directory.path()));
+    let second_vault = Arc::new(ContentionObservedFileVault::new(directory.path()));
     let descriptor = oauth_descriptor_for_test();
     let expired = oauth_bundle_for_test(&server, now_ms().expect("clock").saturating_sub(1))
         .with_refresh_after(0);
@@ -3987,18 +4039,39 @@ async fn concurrent_refreshers_never_destroy_the_rotated_token() {
         independent_serialized_broker(&server, first_vault.clone() as Arc<dyn Vault>, &descriptor);
     let (second, _) =
         independent_serialized_broker(&server, second_vault.clone() as Arc<dyn Vault>, &descriptor);
+    // Registry #94: endpoint entry and contender admission share one absolute
+    // request budget. Arithmetic: start + TOKEN_TIMEOUT; the second wait gets
+    // only the remainder after the first wait, never a reset 2 * timeout.
+    let refresh_deadline = Instant::now()
+        .checked_add(TOKEN_TIMEOUT)
+        .expect("token request deadline");
     let first_resolve = {
         let first = first.clone();
         let descriptor = descriptor.clone();
         tokio::spawn(async move { first.resolve(&descriptor).await })
     };
-    wait_for_refresh_calls(&server, 1).await;
+    // CONTRACT WAIT: the fake signals only after parsing generation one's
+    // token request. The absolute deadline is the production POST budget.
+    tokio::time::timeout_at(refresh_deadline, server.state.refresh_started.notified())
+        .await
+        .expect("first refresh request must reach the token endpoint");
+    assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 1);
     let second_resolve = {
         let second = second.clone();
         let descriptor = descriptor.clone();
         tokio::spawn(async move { second.resolve(&descriptor).await })
     };
-    tokio::task::yield_now().await;
+    // CONTRACT WAIT: release the first request only after the second resolver
+    // has observed the same physical alias lease as contended. A scheduler
+    // yield does not establish this boundary: if the second resolver starts
+    // after generation two is durable, the fake's 120-second token is already
+    // refresh-due under the serialized policy's 300-second threshold and a
+    // second (generation-two) request is legitimate.
+    // The first wait's elapsed time is deducted because both waits reuse the
+    // same absolute deadline.
+    tokio::time::timeout_at(refresh_deadline, second_vault.wait_for_refresh_contention())
+        .await
+        .expect("second refresher must contend before the first token POST expires");
     server.release_refresh();
     let first_access = first_resolve
         .await
@@ -4020,6 +4093,16 @@ async fn concurrent_refreshers_never_destroy_the_rotated_token() {
         server.state.refresh_calls.load(Ordering::SeqCst),
         1,
         "the superseded rotating token must be submitted exactly once"
+    );
+    assert_eq!(
+        server
+            .state
+            .refresh_token_fingerprints
+            .lock()
+            .expect("refresh token fingerprints")
+            .as_slice(),
+        &[*blake3::hash(REFRESH_SENTINEL.as_bytes()).as_bytes()],
+        "the only refresh request must submit generation one's token"
     );
     let stored = second_vault
         .resolve(&descriptor.alias)
