@@ -31,7 +31,7 @@ use haider_protocol::cache::{
 use haider_protocol::checkpoint::{
     CHECKPOINT_LIST_MAX_PAGE, CheckpointCursor, CheckpointListPage, CheckpointRecorded,
 };
-use haider_protocol::context::ContextEconomy;
+use haider_protocol::context::{ContextEconomy, ContextSavingsEvent, ContextSavingsLayer};
 use haider_protocol::credential::CredentialDescriptor;
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectOutcome, EffectPhase, WorkspaceMutation,
@@ -1913,14 +1913,16 @@ pub struct QueueConsumeOutcome {
 
 /// Exact read-only state sampled at one worker turn-start store dispatch.
 ///
-/// The journal head, delegation lineage, and graph projection are observed
-/// while the profile store owner is held. Callers reduce the returned journal
-/// for headless, context-economy, and setup state without re-entering the
-/// blocking store path. No write or publication boundary is part of this
-/// bundle.
+/// The journal head, current-run headless facts, context economy, delegation
+/// lineage, and graph projection are observed while the profile store owner is
+/// held. The journal is validated row by row, but growing unrelated history is
+/// reduced instead of retained in the returned bundle. No write or publication
+/// boundary is part of this bundle.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnStartReadBundle {
-    pub journal: Vec<RawEnvelope>,
+    pub headless_journal: Vec<RawEnvelope>,
+    pub headless_run_start: Option<(u64, Option<BranchId>)>,
+    pub context_economy: Option<ContextEconomy>,
     pub observed_head: Option<(u64, EventId)>,
     pub delegation: Option<DelegationRecord>,
     pub parent_delegation: Option<DelegationRecord>,
@@ -4536,13 +4538,16 @@ impl Store {
     pub fn turn_start_read_bundle(
         &self,
         session_id: &SessionId,
+        run_id: &RunId,
     ) -> StoreResult<TurnStartReadBundle> {
         let connection = self.connection()?;
         require_session(&connection, session_id)?;
-        let journal = read_session_journal(&connection, session_id)?;
-        let observed_head = journal
-            .last()
-            .map(|envelope| (envelope.seq, envelope.event_id.clone()));
+        let TurnStartJournalInputs {
+            headless_journal,
+            headless_run_start,
+            context_economy,
+            observed_head,
+        } = read_turn_start_journal_inputs(&connection, session_id, run_id)?;
         let delegation = lookup_delegation_by_child_session(&connection, session_id)?;
         let parent_delegation = delegation
             .as_ref()
@@ -4555,7 +4560,9 @@ impl Store {
             .active()
             .and_then(|reduction| reduction.status.clone());
         Ok(TurnStartReadBundle {
-            journal,
+            headless_journal,
+            headless_run_start,
+            context_economy,
             observed_head,
             delegation,
             parent_delegation,
@@ -13040,6 +13047,54 @@ impl Store {
         }
     }
 
+    /// Reads a filtered suffix capped by a previously sampled immutable head.
+    /// The exact head row is revalidated under the same connection lock before
+    /// the page is decoded; later appends never enter the returned snapshot.
+    pub fn read_reducer_page_at_boundary(
+        &self,
+        session: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &[&str],
+        boundary: &(u64, EventId),
+    ) -> StoreResult<ReducerPage> {
+        let connection = self.connection()?;
+        validate_journal_boundary(&connection, session, boundary)?;
+        if limit == 0 || payload_kinds.is_empty() {
+            return Ok(ReducerPage {
+                envelopes: Vec::new(),
+                observed_head: Some(boundary.clone()),
+            });
+        }
+        let filtered = read_reducer_page_at_boundary_with_connection(
+            &connection,
+            session,
+            since_seq,
+            boundary.0,
+            limit,
+            byte_budget,
+            payload_kinds,
+        );
+        drop(connection);
+        match filtered {
+            Ok(envelopes) => Ok(ReducerPage {
+                envelopes,
+                observed_head: Some(boundary.clone()),
+            }),
+            Err(FilteredReadError::Decode) => self
+                .read_page(session, since_seq, limit, byte_budget)
+                .map(|mut envelopes| {
+                    envelopes.retain(|envelope| envelope.seq <= boundary.0);
+                    ReducerPage {
+                        envelopes,
+                        observed_head: Some(boundary.clone()),
+                    }
+                }),
+            Err(FilteredReadError::Store(error)) => Err(error),
+        }
+    }
+
     /// Replays a session's complete journal in committed sequence order.
     pub fn journal_replay(&self, session: &SessionId) -> StoreResult<Vec<RawEnvelope>> {
         let mut replay = Vec::new();
@@ -20237,10 +20292,21 @@ impl EventStore for Store {
     }
 }
 
-fn read_session_journal(
+/// Validates the exact journal snapshot without accumulating unrelated rows.
+/// Current-run headless facts are small by construction, and context savings
+/// collapse to their latest per-layer coordinates while the cursor advances.
+struct TurnStartJournalInputs {
+    headless_journal: Vec<RawEnvelope>,
+    headless_run_start: Option<(u64, Option<BranchId>)>,
+    context_economy: Option<ContextEconomy>,
+    observed_head: Option<(u64, EventId)>,
+}
+
+fn read_turn_start_journal_inputs(
     connection: &Connection,
     session: &SessionId,
-) -> StoreResult<Vec<RawEnvelope>> {
+    run_id: &RunId,
+) -> StoreResult<TurnStartJournalInputs> {
     let mut statement = connection
         .prepare_cached(
             "SELECT seq, envelope_json, event_id, committed_at_ms
@@ -20252,7 +20318,12 @@ fn read_session_journal(
     let mut rows = statement
         .query([session.as_str()])
         .map_err(map_sqlite_error)?;
-    let mut envelopes = Vec::new();
+    let mut headless_journal = Vec::new();
+    let mut headless_run_start = None;
+    let mut latest: Option<ContextSavingsEvent> = None;
+    let mut last_conversation = None;
+    let mut last_output = None;
+    let mut observed_head = None;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
         let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
@@ -20269,9 +20340,49 @@ fn read_session_journal(
             stored_committed_at_ms,
             &envelope,
         )?;
-        envelopes.push(envelope);
+        observed_head = Some((envelope.seq, envelope.event_id.clone()));
+
+        if let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            && let Some(event) = ContextSavingsEvent::try_from_extension_item(&item)
+                .map_err(|error| corrupt(format!("context-savings event is malformed: {error}")))?
+        {
+            if let Some(existing) = &latest {
+                if event.session_operation_count < existing.session_operation_count {
+                    return Err(corrupt("context-savings operation count moved backwards"));
+                }
+                if event.session_operation_count == existing.session_operation_count
+                    && event != *existing
+                {
+                    return Err(corrupt("equal context-savings coordinates disagree"));
+                }
+            }
+            match event.layer {
+                ContextSavingsLayer::Conversation => last_conversation = Some(event.clone()),
+                ContextSavingsLayer::ToolOutput => last_output = Some(event.clone()),
+            }
+            latest = Some(event);
+        }
+        if envelope.run_id.as_ref() == Some(run_id) {
+            headless_run_start
+                .get_or_insert_with(|| (envelope.committed_at_ms, envelope.branch_id.clone()));
+            if HeadlessRunEventPayload::from_payload_value(&envelope.payload).is_some() {
+                headless_journal.push(envelope);
+            }
+        }
     }
-    Ok(envelopes)
+    let context_economy = latest.map(|event| ContextEconomy {
+        cumulative_estimated_tokens_saved: event.session_cumulative_estimated_tokens_saved,
+        operation_count: event.session_operation_count,
+        last_event: last_conversation,
+        last_output_event: last_output,
+    });
+    Ok(TurnStartJournalInputs {
+        headless_journal,
+        headless_run_start,
+        context_economy,
+        observed_head,
+    })
 }
 
 struct AppendTransactionOutcome {
@@ -23335,12 +23446,57 @@ fn read_reducer_page_with_connection(
     byte_budget: usize,
     payload_kinds: &[&str],
 ) -> Result<Vec<RawEnvelope>, FilteredReadError> {
-    let (sql, parameter_capacity) = reducer_page_sql(payload_kinds.len())?;
+    read_reducer_page_through_connection(
+        connection,
+        session,
+        since_seq,
+        None,
+        limit,
+        byte_budget,
+        payload_kinds,
+    )
+}
+
+fn read_reducer_page_at_boundary_with_connection(
+    connection: &Connection,
+    session: &SessionId,
+    since_seq: u64,
+    boundary_seq: u64,
+    limit: usize,
+    byte_budget: usize,
+    payload_kinds: &[&str],
+) -> Result<Vec<RawEnvelope>, FilteredReadError> {
+    read_reducer_page_through_connection(
+        connection,
+        session,
+        since_seq,
+        Some(boundary_seq),
+        limit,
+        byte_budget,
+        payload_kinds,
+    )
+}
+
+fn read_reducer_page_through_connection(
+    connection: &Connection,
+    session: &SessionId,
+    since_seq: u64,
+    boundary_seq: Option<u64>,
+    limit: usize,
+    byte_budget: usize,
+    payload_kinds: &[&str],
+) -> Result<Vec<RawEnvelope>, FilteredReadError> {
+    let (sql, parameter_capacity) = reducer_page_sql(payload_kinds.len(), boundary_seq.is_some())?;
     let mut parameters = Vec::with_capacity(parameter_capacity);
     parameters.push(SqlValue::Text(session.as_str().to_owned()));
     parameters.push(SqlValue::Integer(
         to_sqlite_integer(since_seq).map_err(FilteredReadError::Store)?,
     ));
+    if let Some(boundary_seq) = boundary_seq {
+        parameters.push(SqlValue::Integer(
+            to_sqlite_integer(boundary_seq).map_err(FilteredReadError::Store)?,
+        ));
+    }
     parameters.extend(
         payload_kinds
             .iter()
@@ -23420,28 +23576,57 @@ fn journal_boundary_with_connection(
         .transpose()
 }
 
-fn reducer_page_sql(payload_kind_count: usize) -> Result<(String, usize), FilteredReadError> {
-    let parameter_capacity = payload_kind_count.checked_add(3).ok_or_else(|| {
-        FilteredReadError::Store(store_error(
-            ErrorCode::InvalidArgument,
-            "reducer payload-kind filter is too large",
-            false,
-        ))
-    })?;
+fn reducer_page_sql(
+    payload_kind_count: usize,
+    has_boundary: bool,
+) -> Result<(String, usize), FilteredReadError> {
+    let fixed_parameters = if has_boundary { 4 } else { 3 };
+    let parameter_capacity = payload_kind_count
+        .checked_add(fixed_parameters)
+        .ok_or_else(|| {
+            FilteredReadError::Store(store_error(
+                ErrorCode::InvalidArgument,
+                "reducer payload-kind filter is too large",
+                false,
+            ))
+        })?;
+    let kind_parameter_start = if has_boundary { 4 } else { 3 };
     let kind_parameters = (0..payload_kind_count)
-        .map(|index| format!("?{}", index + 3))
+        .map(|index| format!("?{}", index + kind_parameter_start))
         .collect::<Vec<_>>()
         .join(", ");
     let limit_parameter = parameter_capacity;
+    let boundary_clause = if has_boundary { " AND seq <= ?3" } else { "" };
     let sql = format!(
         "SELECT seq, envelope_json, event_id, committed_at_ms
          FROM events INDEXED BY events_payload_kind_session_seq
          WHERE (payload_kind IN ({kind_parameters}) OR payload_kind IS NULL)
-           AND session_id = ?1 AND seq > ?2
+           AND session_id = ?1 AND seq > ?2{boundary_clause}
          ORDER BY seq ASC
          LIMIT ?{limit_parameter}"
     );
     Ok((sql, parameter_capacity))
+}
+
+fn validate_journal_boundary(
+    connection: &Connection,
+    session: &SessionId,
+    boundary: &(u64, EventId),
+) -> StoreResult<()> {
+    let event_id = connection
+        .query_row(
+            "SELECT event_id FROM events WHERE session_id = ?1 AND seq = ?2",
+            params![session.as_str(), to_sqlite_integer(boundary.0)?],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    if event_id.as_deref() != Some(boundary.1.as_str()) {
+        return Err(corrupt(
+            "turn-start reducer boundary does not match the immutable journal head",
+        ));
+    }
+    Ok(())
 }
 
 fn decode_payload<'de, T>(payload: &'de serde_json::Value) -> Result<T, serde_json::Error>
@@ -24868,6 +25053,29 @@ mod reducer_filter_tests {
         let store = Store::open(root.path()).expect("open store");
         let session_id = SessionId::new("turn-start-read-bundle");
         seed_session(&store, &session_id);
+        let (expected_economy, savings) = ContextEconomy::default().record_tool_output(
+            haider_protocol::context::OutputSavings::from_provider_request_bytes(
+                "bundle-output",
+                400,
+                40,
+                360,
+                true,
+            ),
+        );
+        let headless_spec = haider_protocol::headless::HeadlessRunSpecV1 {
+            cwd: "/tmp/bundle".into(),
+            provider: "fixture".into(),
+            model: "fixture-model".into(),
+            max_output_tokens: 64,
+            effort: None,
+            fast: false,
+            seed: None,
+            permission_overrides: SessionPermissionOverridesV1::default(),
+            trust_hooks: false,
+            budget: haider_protocol::headless::RunBudgetV1::default(),
+            request_deadline_unix_ms: None,
+            replay_of: None,
+        };
         let mut events = vec![
             fact(
                 &store,
@@ -24887,13 +25095,38 @@ mod reducer_filter_tests {
                 Some(RunId::new("bundle-run")),
                 typed_payload(EventPayload::RunState(RunState::Thinking)),
             ),
+            fact(
+                &store,
+                &session_id,
+                "bundle-headless-configured",
+                Some(RunId::new("bundle-run")),
+                HeadlessRunEventPayload::HeadlessRunConfigured(headless_spec)
+                    .to_payload_value()
+                    .expect("headless configuration payload"),
+            ),
+            fact(
+                &store,
+                &session_id,
+                "bundle-context-economy",
+                Some(RunId::new("earlier-run")),
+                typed_payload(EventPayload::Item(ItemEvent::Completed {
+                    item_id: ItemId::new("bundle-context-economy"),
+                    item: savings.extension_item().expect("context savings item"),
+                })),
+            ),
         ];
         store.append(&mut events).expect("append bundle fixtures");
+        let run_id = RunId::new("bundle-run");
 
         let bundle = store
-            .turn_start_read_bundle(&session_id)
+            .turn_start_read_bundle(&session_id, &run_id)
             .expect("turn-start bundle");
-        assert_eq!(bundle.journal, events);
+        assert_eq!(bundle.headless_journal, events[2..3]);
+        assert_eq!(
+            bundle.headless_run_start,
+            Some((events[0].committed_at_ms, events[0].branch_id.clone()))
+        );
+        assert_eq!(bundle.context_economy, Some(expected_economy));
         assert_eq!(
             bundle.observed_head,
             events
@@ -24903,6 +25136,188 @@ mod reducer_filter_tests {
         assert_eq!(bundle.delegation, None);
         assert_eq!(bundle.parent_delegation, None);
         assert_eq!(bundle.graph_status, None);
+    }
+
+    #[test]
+    fn turn_start_boundary_excludes_later_rows_and_rejects_a_forged_head() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(root.path()).expect("open store");
+        let session_id = SessionId::new("turn-start-boundary");
+        seed_session(&store, &session_id);
+        let run_id = RunId::new("turn-start-boundary-run");
+        let mut first = [fact(
+            &store,
+            &session_id,
+            "turn-start-boundary-first",
+            Some(run_id.clone()),
+            typed_payload(EventPayload::UserMessage {
+                text: "first".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Steer,
+            }),
+        )];
+        store
+            .append(&mut first)
+            .expect("append first boundary fact");
+        let boundary = (first[0].seq, first[0].event_id.clone());
+        let mut later = [fact(
+            &store,
+            &session_id,
+            "turn-start-boundary-later",
+            Some(run_id),
+            typed_payload(EventPayload::UserMessage {
+                text: "later".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Steer,
+            }),
+        )];
+        store
+            .append(&mut later)
+            .expect("append later boundary fact");
+
+        let page = store
+            .read_reducer_page_at_boundary(
+                &session_id,
+                0,
+                256,
+                usize::MAX,
+                &["user_message"],
+                &boundary,
+            )
+            .expect("read exact turn-start boundary");
+        assert_eq!(page.envelopes, first);
+        assert_eq!(page.observed_head, Some(boundary.clone()));
+
+        let forged = (boundary.0, EventId::new("forged-boundary-event"));
+        let error = store
+            .read_reducer_page_at_boundary(
+                &session_id,
+                0,
+                256,
+                usize::MAX,
+                &["user_message"],
+                &forged,
+            )
+            .expect_err("forged immutable boundary must fail closed");
+        assert_eq!(error.code, ErrorCode::StoreCorrupt);
+        assert!(error.message.contains("boundary does not match"));
+    }
+
+    #[test]
+    fn turn_start_context_economy_rejects_corrupt_history() {
+        let output = |scope: &str, input: usize, output: usize| {
+            haider_protocol::context::OutputSavings::from_provider_request_bytes(
+                scope,
+                input,
+                output,
+                input.saturating_sub(output),
+                true,
+            )
+        };
+        let savings_fact =
+            |store: &Store, session_id: &SessionId, event_id: &str, item: TurnItem| {
+                fact(
+                    store,
+                    session_id,
+                    event_id,
+                    Some(RunId::new("economy-history-run")),
+                    typed_payload(EventPayload::Item(ItemEvent::Completed {
+                        item_id: ItemId::new(format!("{event_id}-item")),
+                        item,
+                    })),
+                )
+            };
+
+        {
+            let root = tempfile::tempdir().expect("malformed tempdir");
+            let store = Store::open(root.path()).expect("open malformed store");
+            let session_id = SessionId::new("turn-start-context-malformed");
+            seed_session(&store, &session_id);
+            let malformed = TurnItem::Extension {
+                kind: haider_protocol::context::CONTEXT_SAVINGS_OUTPUT_EXTENSION_KIND.into(),
+                data: serde_json::json!({"not": "a context savings event"}),
+            };
+            let mut events = [savings_fact(
+                &store,
+                &session_id,
+                "context-malformed",
+                malformed,
+            )];
+            store.append(&mut events).expect("append malformed savings");
+            let error = store
+                .turn_start_read_bundle(&session_id, &RunId::new("accepted-run"))
+                .expect_err("malformed context savings must fail closed");
+            assert_eq!(error.code, ErrorCode::StoreCorrupt);
+            assert!(error.message.contains("context-savings event is malformed"));
+        }
+
+        {
+            let root = tempfile::tempdir().expect("backward tempdir");
+            let store = Store::open(root.path()).expect("open backward store");
+            let session_id = SessionId::new("turn-start-context-backward");
+            seed_session(&store, &session_id);
+            let (after_first, first) =
+                ContextEconomy::default().record_tool_output(output("first", 400, 40));
+            let (_, second) = after_first.record_tool_output(output("second", 800, 80));
+            let mut events = [
+                savings_fact(
+                    &store,
+                    &session_id,
+                    "context-second-first",
+                    second.extension_item().expect("second savings item"),
+                ),
+                savings_fact(
+                    &store,
+                    &session_id,
+                    "context-first-second",
+                    first.extension_item().expect("first savings item"),
+                ),
+            ];
+            store.append(&mut events).expect("append backward savings");
+            let error = store
+                .turn_start_read_bundle(&session_id, &RunId::new("accepted-run"))
+                .expect_err("backward context coordinates must fail closed");
+            assert_eq!(error.code, ErrorCode::StoreCorrupt);
+            assert!(error.message.contains("operation count moved backwards"));
+        }
+
+        {
+            let root = tempfile::tempdir().expect("disagree tempdir");
+            let store = Store::open(root.path()).expect("open disagree store");
+            let session_id = SessionId::new("turn-start-context-disagree");
+            seed_session(&store, &session_id);
+            let (_, first) = ContextEconomy::default().record_tool_output(output("first", 400, 40));
+            let (_, disagreeing) =
+                ContextEconomy::default().record_tool_output(output("other", 800, 80));
+            let mut events = [
+                savings_fact(
+                    &store,
+                    &session_id,
+                    "context-equal-first",
+                    first.extension_item().expect("first equal savings item"),
+                ),
+                savings_fact(
+                    &store,
+                    &session_id,
+                    "context-equal-disagreeing",
+                    disagreeing
+                        .extension_item()
+                        .expect("disagreeing savings item"),
+                ),
+            ];
+            store
+                .append(&mut events)
+                .expect("append disagreeing savings");
+            let error = store
+                .turn_start_read_bundle(&session_id, &RunId::new("accepted-run"))
+                .expect_err("equal context coordinates must agree");
+            assert_eq!(error.code, ErrorCode::StoreCorrupt);
+            assert!(
+                error
+                    .message
+                    .contains("equal context-savings coordinates disagree")
+            );
+        }
     }
 
     #[test]
@@ -24934,6 +25349,7 @@ mod reducer_filter_tests {
         store
             .append(&mut events)
             .expect("append allocation fixtures");
+        let run_id = RunId::new("bundle-allocation-run");
 
         // Warm prepared statements and graph/delegation caches before the
         // allocation comparison. Both sides return the same durable inputs;
@@ -24948,7 +25364,7 @@ mod reducer_filter_tests {
             .read_reducer_page_with_boundary(&session_id, 0, 256, usize::MAX, &["user_message"])
             .expect("warm setup read");
         let _ = store
-            .turn_start_read_bundle(&session_id)
+            .turn_start_read_bundle(&session_id, &run_id)
             .expect("warm bundled read");
 
         let (_, legacy_bytes, legacy_count) = allocation_probe::measure(|| {
@@ -24978,7 +25394,7 @@ mod reducer_filter_tests {
         });
         let (_, bundled_bytes, bundled_count) = allocation_probe::measure(|| {
             let _ = store
-                .turn_start_read_bundle(&session_id)
+                .turn_start_read_bundle(&session_id, &run_id)
                 .expect("bundled turn-start read");
         });
         eprintln!(
@@ -25250,7 +25666,7 @@ mod reducer_filter_tests {
     fn reducer_page_query_is_pinned_to_payload_kind_index() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = Store::open(root.path()).expect("open store");
-        let (sql, _) = reducer_page_sql(4).expect("build reducer SQL");
+        let (sql, _) = reducer_page_sql(4, false).expect("build reducer SQL");
         let explain = format!("EXPLAIN QUERY PLAN {sql}");
         let parameters = [
             SqlValue::Text("session".into()),

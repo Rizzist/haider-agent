@@ -7736,11 +7736,12 @@ impl HubStoreHandle {
     /// setup. The underlying store performs one blocking dispatch.
     pub(crate) async fn turn_start_read_bundle(
         &self,
+        run_id: &RunId,
     ) -> Result<haider_core::TurnStartReadBundle, HaiderError> {
         self.hub
             .inner
             .store
-            .turn_start_read_bundle(&self.session_id)
+            .turn_start_read_bundle(&self.session_id, run_id)
             .await
     }
 

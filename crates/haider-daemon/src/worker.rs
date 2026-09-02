@@ -7182,15 +7182,6 @@ async fn refresh_context_economy(
     reconcile_and_heal_context_economy(lease, metadata, journal).await
 }
 
-async fn refresh_context_economy_from_snapshot(
-    lease: &HubStoreHandle,
-    metadata: &haider_protocol::context::ContextEconomy,
-    journal: &[RawEnvelope],
-) -> Result<haider_protocol::context::ContextEconomy, HaiderError> {
-    let journal = PromptHistoryCompiler::latest_context_economy_from_envelopes(journal)?;
-    reconcile_and_heal_context_economy(lease, metadata, journal).await
-}
-
 async fn reconcile_and_heal_context_economy(
     lease: &HubStoreHandle,
     metadata: &haider_protocol::context::ContextEconomy,
@@ -7258,14 +7249,18 @@ async fn start_turn(
             trace
         })
     });
-    let mut turn_start = lease.turn_start_read_bundle().await?;
-    let headless = headless_run_context_from_envelopes(&turn_start.journal, &accepted.run_id);
+    let mut turn_start = lease.turn_start_read_bundle(&accepted.run_id).await?;
+    let headless = headless_run_context_from_envelopes(
+        &turn_start.headless_journal,
+        &accepted.run_id,
+        turn_start.headless_run_start.clone(),
+    );
     let mut provider_deadline = headless.as_ref().and_then(provider_request_deadline);
     let mut pinned_metadata = metadata.clone();
-    pinned_metadata.context_economy = refresh_context_economy_from_snapshot(
+    pinned_metadata.context_economy = reconcile_and_heal_context_economy(
         lease,
         &pinned_metadata.context_economy,
-        &turn_start.journal,
+        turn_start.context_economy.take(),
     )
     .await?;
     if let Some(context) = headless.as_ref() {
@@ -7647,14 +7642,7 @@ async fn start_turn(
         .account_alias
         .as_deref()
         .map(haider_protocol::ids::CredentialAlias::new);
-    turn_start.journal.retain(|envelope| {
-        envelope
-            .payload
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|kind| TURN_SETUP_REDUCTION_PAYLOAD_KINDS.contains(&kind))
-    });
-    let mut setup_reduction = reduce_turn_setup_journal_snapshot(
+    let mut setup_reduction = reduce_turn_setup_journal_at_boundary(
         lease,
         TurnSetupReductionSelector {
             run_id: accepted.run_id.clone(),
@@ -7665,7 +7653,6 @@ async fn start_turn(
             account_scope: account_scope.clone(),
             auth_scope: auth_scope.clone(),
         },
-        &turn_start.journal,
         turn_start.observed_head,
     )
     .await?;
@@ -8850,6 +8837,29 @@ async fn reduce_turn_setup_journal(
         store.session_id(),
         store.turn_setup_reduction_cache(),
         selector,
+        None,
+    )
+    .await
+}
+
+async fn reduce_turn_setup_journal_at_boundary(
+    store: &HubStoreHandle,
+    selector: TurnSetupReductionSelector,
+    observed_head: Option<(u64, EventId)>,
+) -> Result<TurnSetupReduction, HaiderError> {
+    let boundary = observed_head.ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            "accepted turn has no immutable journal head",
+            false,
+        )
+    })?;
+    reduce_turn_setup_journal_cached(
+        store,
+        store.session_id(),
+        store.turn_setup_reduction_cache(),
+        selector,
+        Some(boundary),
     )
     .await
 }
@@ -8859,6 +8869,7 @@ async fn reduce_turn_setup_journal_cached(
     session_id: &SessionId,
     cache: &TurnSetupReductionCache,
     selector: TurnSetupReductionSelector,
+    fixed_boundary: Option<(u64, EventId)>,
 ) -> Result<TurnSetupReduction, HaiderError> {
     let key = TurnSetupReductionKey::from(&selector);
     let mut cached =
@@ -8880,15 +8891,31 @@ async fn reduce_turn_setup_journal_cached(
     let mut final_revision = None;
     let mut exact_boundary = true;
     loop {
-        let page = StoreHandle::read_reducer_page_with_boundary(
-            store,
-            session_id,
-            cursor,
-            256,
-            usize::MAX,
-            TURN_SETUP_REDUCTION_PAYLOAD_KINDS,
-        )
-        .await?;
+        let page = match fixed_boundary.clone() {
+            Some(boundary) => {
+                StoreHandle::read_reducer_page_at_boundary(
+                    store,
+                    session_id,
+                    cursor,
+                    256,
+                    usize::MAX,
+                    TURN_SETUP_REDUCTION_PAYLOAD_KINDS,
+                    boundary,
+                )
+                .await?
+            }
+            None => {
+                StoreHandle::read_reducer_page_with_boundary(
+                    store,
+                    session_id,
+                    cursor,
+                    256,
+                    usize::MAX,
+                    TURN_SETUP_REDUCTION_PAYLOAD_KINDS,
+                )
+                .await?
+            }
+        };
         let observed_revision = page.observed_head.map(TurnSetupJournalRevision::from);
         if observed_revision.is_none() {
             exact_boundary = false;
@@ -8929,22 +8956,7 @@ async fn reduce_turn_setup_journal_cached(
     }
 }
 
-async fn reduce_turn_setup_journal_snapshot(
-    store: &HubStoreHandle,
-    selector: TurnSetupReductionSelector,
-    envelopes: &[RawEnvelope],
-    observed_head: Option<(u64, EventId)>,
-) -> Result<TurnSetupReduction, HaiderError> {
-    reduce_turn_setup_journal_snapshot_cached(
-        store.session_id(),
-        store.turn_setup_reduction_cache(),
-        selector,
-        envelopes,
-        observed_head,
-    )
-    .await
-}
-
+#[cfg(test)]
 async fn reduce_turn_setup_journal_snapshot_cached(
     session_id: &SessionId,
     cache: &TurnSetupReductionCache,
@@ -9702,15 +9714,19 @@ async fn headless_run_context(
             break;
         }
     }
-    Ok(headless_run_context_from_envelopes(&envelopes, run_id))
+    Ok(headless_run_context_from_envelopes(
+        &envelopes, run_id, None,
+    ))
 }
 
 fn headless_run_context_from_envelopes(
     envelopes: &[RawEnvelope],
     run_id: &RunId,
+    run_start: Option<(u64, Option<BranchId>)>,
 ) -> Option<DurableHeadlessRunContext> {
-    let mut accepted_at_ms = None;
-    let mut branch_id = None;
+    let (mut accepted_at_ms, mut branch_id) = run_start
+        .map(|(accepted_at_ms, branch_id)| (Some(accepted_at_ms), branch_id))
+        .unwrap_or((None, None));
     let mut spec = None;
     let mut exhausted = None;
     let mut deadline_exceeded = None;

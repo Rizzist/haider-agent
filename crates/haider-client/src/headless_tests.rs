@@ -220,6 +220,7 @@ fn submit_race_frame(seq: u64, payload: serde_json::Value) -> WireFrame {
 
 #[test]
 fn submit_race_buffer_keeps_the_normal_prefix_in_memory_and_move_replays_it() {
+    assert_eq!(SUBMIT_RACE_MEMORY_THRESHOLD_BYTES, 32 * 1024);
     let frames = vec![
         submit_race_frame(1, serde_json::json!({"type": "first"})),
         submit_race_frame(2, serde_json::json!({"type": "second"})),

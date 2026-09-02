@@ -62,6 +62,31 @@ impl StoreHandle for CountingTurnSetupStore {
         .await
     }
 
+    async fn read_reducer_page_at_boundary(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &'static [&'static str],
+        boundary: (u64, EventId),
+    ) -> Result<haider_core::ReducerPage, HaiderError> {
+        self.reducer_starts
+            .lock()
+            .expect("counting reducer lock")
+            .push(since_seq);
+        StoreHandle::read_reducer_page_at_boundary(
+            &self.inner,
+            session_id,
+            since_seq,
+            limit,
+            byte_budget,
+            payload_kinds,
+            boundary,
+        )
+        .await
+    }
+
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
         StoreHandle::latest_seq(&self.inner, session_id).await
     }
@@ -547,6 +572,7 @@ async fn fused_turn_setup_reduction_preserves_every_standalone_head() {
         &session_id,
         &cache,
         cached_selector("setup-cache-run-1"),
+        None,
     )
     .await
     .expect("cold turn-setup replay");
@@ -558,6 +584,7 @@ async fn fused_turn_setup_reduction_preserves_every_standalone_head() {
         &session_id,
         &cache,
         cached_selector("setup-cache-run-2"),
+        None,
     )
     .await
     .expect("exact turn-setup cache hit");
@@ -582,6 +609,7 @@ async fn fused_turn_setup_reduction_preserves_every_standalone_head() {
         &session_id,
         &cache,
         cached_selector("setup-cache-run-2"),
+        None,
     )
     .await
     .expect("revision mismatch replays from zero");
@@ -618,6 +646,7 @@ async fn fused_turn_setup_reduction_preserves_every_standalone_head() {
         &session_id,
         &cache,
         cached_selector("setup-cache-run-2"),
+        None,
     )
     .await
     .expect("head advance replays suffix");
@@ -640,6 +669,7 @@ async fn fused_turn_setup_reduction_preserves_every_standalone_head() {
         &session_id,
         &restarted_cache,
         cached_selector("setup-cache-run-2"),
+        None,
     )
     .await
     .expect("restart replays durable authority");
@@ -650,6 +680,113 @@ async fn fused_turn_setup_reduction_preserves_every_standalone_head() {
         .close()
         .await
         .expect("close restarted daemon store");
+}
+
+#[tokio::test]
+async fn production_turn_start_boundary_excludes_later_setup_facts_then_advances_suffix() {
+    let root = tempfile::tempdir().expect("turn-start boundary profile");
+    let sqlite = haider_core::SqliteStoreHandle::open(root.path())
+        .await
+        .expect("turn-start boundary store");
+    let store = CountingTurnSetupStore::new(sqlite.clone());
+    let session_id = SessionId::new("setup-reduction-session");
+    let run_id = RunId::new("turn-start-boundary-run");
+    let selector = TurnSetupReductionSelector {
+        run_id: run_id.clone(),
+        branch_id: None,
+        agent_id: None,
+        provider: "provider-a".into(),
+        model: "model-a".into(),
+        account_scope: None,
+        auth_scope: "api_key".into(),
+    };
+    let instruction = |path: &str| ProjectInstructionsLoaded {
+        files: vec![
+            haider_protocol::project_instructions::ProjectInstructionFileFact {
+                path: path.into(),
+                digest: format!("digest-{path}"),
+                bytes: u64::try_from(path.len()).expect("instruction path length"),
+                truncated: false,
+            },
+        ],
+    };
+    let first_fact = instruction("BOUNDARY.md");
+    let mut first = [setup_reduction_envelope(
+        0,
+        Some(run_id.clone()),
+        None,
+        None,
+        1,
+        first_fact
+            .to_payload_value()
+            .expect("boundary instruction payload"),
+    )];
+    first[0].event_id = EventId::new("turn-start-boundary-first");
+    first[0].worker_generation = sqlite.worker_generation();
+    StoreHandle::append(&store, &mut first)
+        .await
+        .expect("append boundary setup fact");
+    let boundary = (first[0].seq, first[0].event_id.clone());
+
+    let later_fact = instruction("LATER.md");
+    let mut later = [setup_reduction_envelope(
+        0,
+        Some(run_id),
+        None,
+        None,
+        2,
+        later_fact
+            .to_payload_value()
+            .expect("later instruction payload"),
+    )];
+    later[0].event_id = EventId::new("turn-start-boundary-later");
+    later[0].worker_generation = sqlite.worker_generation();
+    StoreHandle::append(&store, &mut later)
+        .await
+        .expect("append post-boundary setup fact");
+
+    let cache = TurnSetupReductionCache::default();
+    let exact = reduce_turn_setup_journal_cached(
+        &store,
+        &session_id,
+        &cache,
+        selector.clone(),
+        Some(boundary),
+    )
+    .await
+    .expect("reduce immutable turn-start boundary");
+    assert_eq!(exact.same_run_instruction_fact, Some(first_fact));
+    assert_eq!(
+        exact.latest_instruction_fact,
+        exact.same_run_instruction_fact
+    );
+    assert_eq!(store.take_reducer_starts(), vec![0, first[0].seq]);
+
+    let later_boundary = (later[0].seq, later[0].event_id.clone());
+    let advanced = reduce_turn_setup_journal_cached(
+        &store,
+        &session_id,
+        &cache,
+        selector,
+        Some(later_boundary),
+    )
+    .await
+    .expect("advance bounded reducer from cached suffix");
+    assert_eq!(advanced.same_run_instruction_fact, Some(later_fact));
+    assert_eq!(
+        advanced.latest_instruction_fact,
+        advanced.same_run_instruction_fact
+    );
+    assert_eq!(
+        store.take_reducer_starts(),
+        vec![first[0].seq, later[0].seq]
+    );
+
+    drop(store);
+    sqlite
+        .close()
+        .await
+        .expect("close turn-start boundary store");
 }
 
 #[test]

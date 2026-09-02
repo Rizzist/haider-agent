@@ -94,7 +94,7 @@ const HEADLESS_EVENT_SPOOL_FLUSH_BYTES: usize = 64 * 1024;
 /// Pre-submit events normally fit in a handful of frames. Keep that race
 /// prefix in memory, but spill before either one unusually large event or a
 /// delayed response can turn it into an unbounded client allocation.
-const SUBMIT_RACE_MEMORY_THRESHOLD_BYTES: usize = 256 * 1024;
+const SUBMIT_RACE_MEMORY_THRESHOLD_BYTES: usize = 32 * 1024;
 const SUBMIT_RACE_MEMORY_MAX_FRAMES: usize = 64;
 
 const MAX_HEADLESS_ATTACHMENTS: usize = 5;

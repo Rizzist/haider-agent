@@ -16,7 +16,7 @@ use haider_protocol::checkpoint::{CheckpointCursor, CheckpointListPage, Checkpoi
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::ids::{
-    AgentId, ArtifactRef, BranchId, CheckpointId, GraphId, RunId, SessionId,
+    AgentId, ArtifactRef, BranchId, CheckpointId, EventId, GraphId, RunId, SessionId,
 };
 use haider_protocol::session::SessionMetadataV1;
 use haider_store::{
@@ -362,11 +362,15 @@ impl SqliteStoreHandle {
     pub async fn turn_start_read_bundle(
         &self,
         session_id: &SessionId,
+        run_id: &RunId,
     ) -> Result<TurnStartReadBundle, HaiderError> {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
-        run_blocking(move || owner.with_store(|store| store.turn_start_read_bundle(&session_id)))
-            .await
+        let run_id = run_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| store.turn_start_read_bundle(&session_id, &run_id))
+        })
+        .await
     }
 
     pub async fn workflow_graph_state(
@@ -2729,6 +2733,32 @@ impl StoreHandle for SqliteStoreHandle {
                     limit,
                     byte_budget,
                     payload_kinds,
+                )
+            })
+        })
+        .await
+    }
+
+    async fn read_reducer_page_at_boundary(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &'static [&'static str],
+        boundary: (u64, EventId),
+    ) -> Result<ReducerPage, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.read_reducer_page_at_boundary(
+                    &session_id,
+                    since_seq,
+                    limit,
+                    byte_budget,
+                    payload_kinds,
+                    &boundary,
                 )
             })
         })

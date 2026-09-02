@@ -102,7 +102,7 @@ use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::cache::{ProviderViewBlobV1, ProviderViewBlockRefV1, ProviderViewLedgerV1};
 use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorCode, HaiderError};
-use haider_protocol::ids::{BranchId, SessionId};
+use haider_protocol::ids::{BranchId, EventId, SessionId};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -265,6 +265,29 @@ pub trait StoreHandle: Send + Sync {
             .map(|envelopes| ReducerPage {
                 envelopes,
                 observed_head: None,
+            })
+    }
+
+    /// Reads a reducer page from one previously sampled immutable journal
+    /// boundary. Appends after `boundary` are excluded, so a caller can defer
+    /// reduction without changing the turn-start snapshot it observed.
+    async fn read_reducer_page_at_boundary(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &'static [&'static str],
+        boundary: (u64, EventId),
+    ) -> Result<ReducerPage, HaiderError> {
+        self.read_reducer_page(session_id, since_seq, limit, byte_budget, payload_kinds)
+            .await
+            .map(|mut envelopes| {
+                envelopes.retain(|envelope| envelope.seq <= boundary.0);
+                ReducerPage {
+                    envelopes,
+                    observed_head: Some(boundary),
+                }
             })
     }
 
