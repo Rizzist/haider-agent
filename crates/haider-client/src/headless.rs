@@ -2612,6 +2612,7 @@ async fn run_headless_inner(
     daemon_ownership: Arc<Mutex<Option<DaemonOwnershipToken>>>,
     mut interrupts: Option<mpsc::UnboundedReceiver<HeadlessInterrupt>>,
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
+    let client_trace = ensure.client.turn_trace.clone();
     if request.attachments.len() > MAX_HEADLESS_ATTACHMENTS {
         return Err(attachment_error(
             "too_many_attachments",
@@ -2844,7 +2845,14 @@ async fn run_headless_inner(
     let mut submit_timeout_grace = None;
     let run_id = loop {
         let pending_response = match connection.client.begin_request(submit_body.clone()).await {
-            Ok(pending_response) => pending_response,
+            Ok(pending_response) => {
+                if let Some(trace) = client_trace.as_ref() {
+                    // `begin_request` returning is the bounded writer-queue
+                    // admission seam, before response waiting begins.
+                    trace.submitted();
+                }
+                pending_response
+            }
             Err(error) => {
                 buffered.clear()?;
                 reconnect_for_submit(SubmitReconnectInput {

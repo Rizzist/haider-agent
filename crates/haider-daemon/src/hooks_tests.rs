@@ -6,9 +6,10 @@ use super::{
     CapturedBytes, DecisionState, EngineState, HOOK_DRAIN_PAGE_MAX_REQUESTS,
     HOOK_ENGINE_SNAPSHOT_FILE, HOOK_ENGINE_SNAPSHOT_VERSION, HookDefinition, HookEngine,
     HookEngineSnapshot, HookEngineSnapshotFile, HookKind, HookMatcher, HookService, HookSource,
-    HookStartupHydrator, HookTrustPolicy, MatchEvent, SnapshotSchedule, classify, discover,
-    encode_hook_snapshot_file, hook_digest, make_output, next_subscriber_backoff,
-    prepare_hook_input, prune_terminal_run_trust, reduce_durable_state, run_command,
+    HookStartupHydrator, HookTrustPolicy, MatchEvent, SnapshotSchedule,
+    batch_discovery_context_with_trace, classify, discover, encode_hook_snapshot_file, hook_digest,
+    make_output, next_subscriber_backoff, prepare_hook_input, prune_terminal_run_trust,
+    purge_discovery_turn_trace, reduce_durable_state, run_command, take_discovery_turn_trace,
 };
 use super::{HookChildReapOutcome, classify_hook_child_reap};
 use crate::runtime::finish_hook_hydration_for_test;
@@ -48,6 +49,41 @@ fn snapshot_schedule_restarts_idle_window_after_a_long_clean_gap() {
     assert_eq!(
         schedule.deadline(),
         Some(commit + super::HOOK_SNAPSHOT_IDLE_DELAY)
+    );
+}
+
+#[test]
+fn hook_discovery_trace_cleanup_closes_awaited_commit_race() {
+    let session_id = SessionId::new("hook-discovery-trace-retained");
+    let trace = haider_core::TurnTraceContext::new(73);
+    let retained = std::sync::Mutex::new(std::collections::HashMap::from([
+        ((session_id.clone(), 17), trace.clone()),
+        ((session_id.clone(), 18), trace),
+    ]));
+    let taken = take_discovery_turn_trace(&retained, &session_id, 17).expect("retained trace");
+    assert_eq!(taken.turn_ordinal(), 73);
+    assert!(
+        retained
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    );
+    assert!(take_discovery_turn_trace(&retained, &session_id, 18).is_none());
+
+    // Model an observe_committed insertion that raced the awaited discovery
+    // after its pre-await take. The post-completion purge must remove even a
+    // coordinate that never entered the hook outbox.
+    retained
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((session_id, 19), taken.clone());
+    taken.mark_phase_complete("hooks_discovery");
+    purge_discovery_turn_trace(&retained, taken.turn_ordinal());
+    assert!(
+        retained
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
     );
 }
 
@@ -1228,6 +1264,47 @@ async fn committed_batch_computes_discovery_stamp_once() {
     )
     .await;
     assert_eq!(fixture.service.discovery_stamp_count() - baseline, 1);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn actual_metadata_discovery_emits_once_and_releases_trace_state() {
+    let command = emit_command("trace-discovery");
+    let fixture = EngineFixture::start(&command, 1_000, false, "exec").await;
+    wait_for_hook_outbox_drain(&fixture.store, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT).await;
+    let trace = haider_core::TurnTraceContext::new(74);
+    fixture
+        .service
+        .inner
+        .turn_traces
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((fixture.session_id.clone(), 101), trace.clone());
+    let baseline = fixture.service.discovery_stamp_count();
+    let mut discoveries = super::BatchDiscoveryCache::new();
+
+    let context = batch_discovery_context_with_trace(
+        &fixture.service,
+        &fixture.session_id,
+        101,
+        &mut discoveries,
+        true,
+    )
+    .await;
+
+    assert!(context.is_some());
+    assert_eq!(fixture.service.discovery_stamp_count() - baseline, 1);
+    assert!(trace.phase_complete("hooks_discovery"));
+    assert!(
+        fixture
+            .service
+            .inner
+            .turn_traces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "actual discovery releases every retained coordinate for the turn"
+    );
     fixture.close().await;
 }
 

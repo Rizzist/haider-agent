@@ -46,7 +46,7 @@ use haider_protocol::tool::{
 };
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error as _;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,9 +85,11 @@ pub struct TurnTraceContext {
 struct TurnTraceInner {
     turn_ordinal: u64,
     accepted_at: Instant,
+    setup_cursor_us: AtomicU64,
     next_txn_ordinal: AtomicU64,
     txn_ordinals: Mutex<HashMap<String, u64>>,
     first_byte_requests: AtomicU64,
+    emitted_phases: Mutex<HashSet<&'static str>>,
 }
 
 impl TurnTraceContext {
@@ -97,9 +99,11 @@ impl TurnTraceContext {
             inner: Arc::new(TurnTraceInner {
                 turn_ordinal,
                 accepted_at: Instant::now(),
+                setup_cursor_us: AtomicU64::new(0),
                 next_txn_ordinal: AtomicU64::new(1),
                 txn_ordinals: Mutex::new(HashMap::new()),
                 first_byte_requests: AtomicU64::new(0),
+                emitted_phases: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -148,6 +152,81 @@ impl TurnTraceContext {
             operation_micros = end_us_from_accept.saturating_sub(start_us_from_accept),
             "turn stage completed"
         );
+    }
+
+    /// Closes the next contiguous worker-setup interval. Setup phases all use
+    /// request/transaction ordinal zero and share this cursor, so their union
+    /// can be subtracted from accept-to-provider-open without double-counting.
+    pub fn emit_setup_phase(&self, phase: &'static str) {
+        let end = self.now_us_from_accept();
+        let start = self.inner.setup_cursor_us.load(Ordering::Relaxed);
+        self.emit(phase, 0, 0, start, end);
+        // The subscriber deliberately writes synchronously. Resume the serial
+        // setup clock only after publication so trace formatting/I/O cannot be
+        // charged to the next measured operation.
+        self.inner
+            .setup_cursor_us
+            .store(self.now_us_from_accept(), Ordering::Relaxed);
+    }
+
+    /// Closes a named setup interval only on its first execution. This lets
+    /// the harness actor close the worker-to-actor handoff without emitting a
+    /// second setup interval for later tool-loop provider requests.
+    pub fn emit_setup_phase_once(&self, phase: &'static str) {
+        let mut emitted = self
+            .inner
+            .emitted_phases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if emitted.insert(phase) {
+            drop(emitted);
+            self.emit_setup_phase(phase);
+        }
+    }
+
+    /// Emits a content-free phase at most once for this accepted turn. This is
+    /// used for asynchronous work such as hook discovery, whose interval is
+    /// intentionally not part of the serial worker-setup cursor.
+    pub fn emit_once(
+        &self,
+        phase: &'static str,
+        request_ordinal: u64,
+        start_us_from_accept: u64,
+        end_us_from_accept: u64,
+    ) {
+        if self.mark_phase_complete(phase) {
+            self.emit(
+                phase,
+                request_ordinal,
+                0,
+                start_us_from_accept,
+                end_us_from_accept,
+            );
+        }
+    }
+
+    /// Claims a one-shot phase without emitting a record. Async consumers use
+    /// this when the operation was already performed by an earlier row in the
+    /// same batch: emitting a cache-hit duration would be dishonest, while
+    /// leaving the phase unclaimed could retain trace-only state indefinitely.
+    #[doc(hidden)]
+    pub fn mark_phase_complete(&self, phase: &'static str) -> bool {
+        self.inner
+            .emitted_phases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(phase)
+    }
+
+    /// Returns whether a one-shot phase has emitted or been honestly skipped.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn phase_complete(&self, phase: &'static str) -> bool {
+        self.inner
+            .emitted_phases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(phase)
     }
 
     /// Emits exactly one raw-first-byte point per provider request. Built-in
@@ -3279,6 +3358,29 @@ mod e2_contract_tests {
         assert_eq!(trace.txn_ordinal_for("event-a"), 1);
         assert_eq!(trace.txn_ordinal_for("event-a"), 1);
         assert_eq!(trace.txn_ordinal_for("event-b"), 2);
+    }
+
+    #[test]
+    fn turn_trace_setup_phase_once_advances_cursor_exactly_once() {
+        let trace = TurnTraceContext::new(7);
+        trace.emit_setup_phase_once("setup-test");
+        let first_cursor = trace.inner.setup_cursor_us.load(Ordering::Relaxed);
+        trace.emit_setup_phase_once("setup-test");
+        assert_eq!(
+            trace.inner.setup_cursor_us.load(Ordering::Relaxed),
+            first_cursor
+        );
+        assert_eq!(
+            trace
+                .inner
+                .emitted_phases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec!["setup-test"]
+        );
     }
 
     #[tokio::test]

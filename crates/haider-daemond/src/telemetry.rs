@@ -156,21 +156,7 @@ impl tracing::field::Visit for SafeFields<'_> {
         if field.name() == "phase" {
             let allowed = match self.target {
                 RECOVERY_TARGET => matches!(value, "effects" | "turns" | "login_receipts"),
-                TURN_TARGET => matches!(
-                    value,
-                    "accept"
-                        | "request_attempt_commit"
-                        | "provider_open"
-                        | "first_byte"
-                        | "provider_stream"
-                        | "sse_decode"
-                        | "journal_transaction"
-                        | "journal_append_wait"
-                        | "event_fanout_projection"
-                        | "core_event_fanout"
-                        | "terminal_commit"
-                        | "client_terminal_seen"
-                ),
+                TURN_TARGET => safe_turn_phase(value),
                 _ => false,
             };
             if allowed {
@@ -188,6 +174,38 @@ impl tracing::field::Visit for SafeFields<'_> {
             self.record_value(field, rendered);
         }
     }
+}
+
+fn safe_turn_phase(value: &str) -> bool {
+    matches!(
+        value,
+        "accept"
+            | "worker_dispatch"
+            | "worker_spawn"
+            | "read_bundle"
+            | "delegation_context"
+            | "graph_context"
+            | "provider_resolution"
+            | "lockdown"
+            | "instructions"
+            | "hooks_discovery"
+            | "tool_catalog"
+            | "prompt_assembly"
+            | "setup_finalize"
+            | "budget_estimate"
+            | "request_prepare"
+            | "budget_enforcement"
+            | "request_attempt_commit"
+            | "provider_open"
+            | "first_byte"
+            | "provider_stream"
+            | "sse_decode"
+            | "journal_transaction"
+            | "journal_append_wait"
+            | "event_fanout_projection"
+            | "core_event_fanout"
+            | "terminal_commit"
+    )
 }
 
 fn safe_numeric_field(target: &str, field: &str) -> bool {
@@ -227,5 +245,32 @@ mod tests {
         assert!(safe_target(TURN_TARGET));
         assert!(safe_numeric_field(TURN_TARGET, "turn_ordinal"));
         assert!(!safe_numeric_field(TURN_TARGET, "run_id"));
+    }
+
+    #[test]
+    fn turngap_phase_allow_list_is_content_free_and_complete() {
+        for phase in [
+            "worker_dispatch",
+            "worker_spawn",
+            "read_bundle",
+            "delegation_context",
+            "graph_context",
+            "provider_resolution",
+            "lockdown",
+            "instructions",
+            "hooks_discovery",
+            "tool_catalog",
+            "prompt_assembly",
+            "setup_finalize",
+            "budget_estimate",
+            "request_prepare",
+            "budget_enforcement",
+            "request_attempt_commit",
+        ] {
+            assert!(safe_turn_phase(phase), "missing turn phase {phase}");
+        }
+        for user_derived in ["prompt", "path", "run_id", "session_id", "tool_args"] {
+            assert!(!safe_turn_phase(user_derived));
+        }
     }
 }

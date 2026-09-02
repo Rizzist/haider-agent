@@ -3,17 +3,18 @@
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use haider_client::DaemonLifetime;
 use haider_client::{
-    ConnectError, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL, EnsureError,
-    EnsureOptions, HeadlessEvent, HeadlessEventMode, HeadlessFailureCode, HeadlessInterrupt,
-    HeadlessOutcome, HeadlessRunError, HeadlessRunEvents, HeadlessRunRequest, HeadlessRunResult,
-    HeadlessRunStatus, HeadlessSessionConfig, ProfileEnv, autospawn_daemon_lifetime,
-    headless_run_events, headless_run_status, load_attachment, resolve_profile,
-    run_headless_with_session_config_event_mode_and_interrupts, stop_headless_run,
+    ClientEnvelopeTrace, ConnectError, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL,
+    EnsureError, EnsureOptions, HeadlessEvent, HeadlessEventMode, HeadlessFailureCode,
+    HeadlessInterrupt, HeadlessOutcome, HeadlessRunError, HeadlessRunEvents, HeadlessRunRequest,
+    HeadlessRunResult, HeadlessRunStatus, HeadlessSessionConfig, ProfileEnv,
+    autospawn_daemon_lifetime, headless_run_events, headless_run_status, load_attachment,
+    resolve_profile, run_headless_with_session_config_event_mode_and_interrupts, stop_headless_run,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
@@ -483,7 +484,10 @@ pub(crate) fn parse_timeout(value: &str) -> Result<Duration, String> {
     Ok(duration)
 }
 
-pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
+pub(crate) async fn run_command(
+    rest: &[String],
+    client_trace: Option<Arc<ClientEnvelopeTrace>>,
+) -> ExitCode {
     let machine_output = requested_machine_output(rest);
     let parsed = match parse_run_options_with_config(rest) {
         Ok(parsed) => parsed,
@@ -562,6 +566,9 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             return ExitCode::from(EX_PROTOCOL);
         }
     };
+    if let Some(trace) = client_trace.as_ref() {
+        trace.profile_resolved();
+    }
     let lifecycle_ensure = EnsureOptions {
         daemon_lifetime,
         ..EnsureOptions::default()
@@ -734,9 +741,15 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
 
     let (events, receiver) = mpsc::channel(OUTPUT_BUFFER);
     let output_mode = options.output;
-    let adapter = tokio::task::spawn_blocking(move || adapt_events(output_mode, receiver));
+    let adapter_trace = client_trace.clone();
+    let adapter =
+        tokio::task::spawn_blocking(move || adapt_events(output_mode, receiver, adapter_trace));
     let ensure = EnsureOptions {
         daemon_lifetime,
+        client: haider_client::ClientConfig {
+            turn_trace: client_trace,
+            ..haider_client::ClientConfig::default()
+        },
         ..EnsureOptions::default()
     };
     let event_mode = match options.output {
@@ -1308,7 +1321,11 @@ struct AcceptedAnnouncement<'a> {
     head_seq: u64,
 }
 
-fn adapt_events(output: RunOutput, events: mpsc::Receiver<HeadlessEvent>) -> io::Result<()> {
+fn adapt_events(
+    output: RunOutput,
+    events: mpsc::Receiver<HeadlessEvent>,
+    client_trace: Option<Arc<ClientEnvelopeTrace>>,
+) -> io::Result<()> {
     let stdout = io::stdout();
     let stderr = io::stderr();
     adapt_events_to(
@@ -1316,6 +1333,7 @@ fn adapt_events(output: RunOutput, events: mpsc::Receiver<HeadlessEvent>) -> io:
         events,
         io::BufWriter::new(stdout.lock()),
         stderr.lock(),
+        client_trace,
     )
 }
 
@@ -1324,12 +1342,12 @@ fn adapt_events_to(
     mut events: mpsc::Receiver<HeadlessEvent>,
     mut stdout: impl Write,
     mut stderr: impl Write,
+    client_trace: Option<Arc<ClientEnvelopeTrace>>,
 ) -> io::Result<()> {
     let mut announced = false;
     let mut stdout_dirty = false;
     let mut stdout_unflushed_envelopes = 0_usize;
     let mut last_stdout_flush = Instant::now();
-    let mut turn_trace = None::<(u64, Instant)>;
     let mut next_event = events.blocking_recv();
     while let Some(event) = next_event {
         let mut flush_stdout = false;
@@ -1378,11 +1396,8 @@ fn adapt_events_to(
                 // returned by TurnSubmit/HeadlessRunStart. Correlate the
                 // client terminal with the daemon's accepted_seq, not the
                 // provisional Created sequence.
-                if haider_core::turn_trace_enabled() {
-                    turn_trace = Some((
-                        haider_core::turn_trace_ordinal(&session_id, head_seq),
-                        Instant::now(),
-                    ));
+                if let Some(trace) = client_trace.as_ref() {
+                    trace.bind_turn_ordinal(haider_core::turn_trace_ordinal(&session_id, head_seq));
                 }
             }
             HeadlessEvent::Envelope(envelope) => {
@@ -1398,13 +1413,8 @@ fn adapt_events_to(
                 }
             }
             HeadlessEvent::Terminal(terminal) => {
-                if let Some((turn_ordinal, accepted_at)) = turn_trace {
-                    let end_us = accepted_at.elapsed().as_micros();
-                    eprintln!(
-                        "haider: trace level=TRACE target=haider.turn phase=client_terminal_seen \
-                         operation_micros={end_us} turn_ordinal={turn_ordinal} request_ordinal=0 \
-                         txn_ordinal=0 start_us_from_accept=0 end_us_from_accept={end_us}"
-                    );
+                if let Some(trace) = client_trace.as_ref() {
+                    trace.terminal_seen();
                 }
                 if output == RunOutput::Jsonl {
                     let mut envelope = *terminal.envelope;
@@ -1868,7 +1878,7 @@ mod tests {
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        adapt_events_to(RunOutput::Jsonl, receiver, &mut stdout, &mut stderr)
+        adapt_events_to(RunOutput::Jsonl, receiver, &mut stdout, &mut stderr, None)
             .expect("adapter succeeds");
 
         let lines: Vec<serde_json::Value> = String::from_utf8(stdout)
@@ -1886,6 +1896,67 @@ mod tests {
         );
         assert_eq!(lines[1]["event_id"], "event-order");
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn adapter_binds_second_acceptance_and_marks_terminal_once() {
+        let session_id = haider_protocol::ids::SessionId::new("session-turn-trace");
+        let accepted_seq = 9;
+        let (sender, receiver) = mpsc::channel(3);
+        sender
+            .try_send(HeadlessEvent::Accepted {
+                session_id: session_id.clone(),
+                head_seq: 1,
+            })
+            .expect("session acceptance queues");
+        sender
+            .try_send(HeadlessEvent::Accepted {
+                session_id: session_id.clone(),
+                head_seq: accepted_seq,
+            })
+            .expect("turn acceptance queues");
+        let terminal = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "event_id": "event-trace-terminal",
+            "seq": 10,
+            "session_id": session_id.as_str(),
+            "run_id": "run-trace",
+            "device_id": "device-trace",
+            "authority_epoch": 1,
+            "worker_generation": 1,
+            "committed_at_ms": 1,
+            "render": {"ui": true, "durable": true, "prompt": "omit"},
+            "payload": {"type": "run_state", "state": "done"}
+        }))
+        .expect("terminal envelope fixture");
+        sender
+            .try_send(HeadlessEvent::Terminal(
+                haider_client::HeadlessTerminalEvent {
+                    envelope: Box::new(terminal),
+                    kind: haider_client::HeadlessTerminalKind::Success,
+                    error_code: None,
+                },
+            ))
+            .expect("terminal queues");
+        drop(sender);
+
+        let trace = ClientEnvelopeTrace::new_if_enabled(true).expect("trace enabled");
+        adapt_events_to(
+            RunOutput::Print,
+            receiver,
+            Vec::new(),
+            Vec::new(),
+            Some(Arc::clone(&trace)),
+        )
+        .expect("adapter succeeds");
+        assert_eq!(
+            trace.audit_snapshot(),
+            (
+                haider_core::turn_trace_ordinal(&session_id, accepted_seq),
+                true
+            )
+        );
     }
 
     /// MUTATION CHECK: restore `flush()` after every envelope. The four-row
@@ -1925,7 +1996,7 @@ mod tests {
 
         let mut stdout = FlushCountingWriter::default();
         let mut stderr = Vec::new();
-        adapt_events_to(RunOutput::Jsonl, receiver, &mut stdout, &mut stderr)
+        adapt_events_to(RunOutput::Jsonl, receiver, &mut stdout, &mut stderr, None)
             .expect("adapter succeeds");
 
         assert_eq!(
@@ -2002,7 +2073,7 @@ mod tests {
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        adapt_events_to(RunOutput::Jsonl, receiver, &mut stdout, &mut stderr)
+        adapt_events_to(RunOutput::Jsonl, receiver, &mut stdout, &mut stderr, None)
             .expect("adapter succeeds");
         let payloads = String::from_utf8(stdout)
             .expect("utf8 output")

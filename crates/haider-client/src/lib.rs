@@ -22,6 +22,7 @@
 
 pub mod checkpoint;
 pub mod client;
+pub mod client_trace;
 pub mod graph;
 pub mod headless;
 pub mod lockdown;
@@ -46,6 +47,7 @@ pub use client::{
     ConnectionUsage, DisconnectReason, MenuAnswerRequest, PING_INTERVAL, PONG_DEADLINE,
     PeerCredentials, PendingResponse, RpcClient, connect,
 };
+pub use client_trace::ClientEnvelopeTrace;
 pub use graph::{
     GraphAbandonResult, GraphClientError, GraphInspectPage, GraphPinResult, GraphRunSetOpenResult,
     GraphSwitchResult, graph_abandon, graph_inspect, graph_pin, graph_pin_template,

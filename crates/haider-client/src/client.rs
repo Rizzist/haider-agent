@@ -85,6 +85,9 @@ pub struct ClientConfig {
     /// Whether this connection will consume asynchronous events and remain
     /// alive long enough to need heartbeat liveness.
     pub connection_usage: ConnectionUsage,
+    /// Content-free timing context for an explicitly traced one-shot client.
+    #[doc(hidden)]
+    pub turn_trace: Option<Arc<crate::client_trace::ClientEnvelopeTrace>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -108,6 +111,7 @@ impl Default for ClientConfig {
             ping_interval: PING_INTERVAL,
             pong_deadline: PONG_DEADLINE,
             connection_usage: ConnectionUsage::LongLived,
+            turn_trace: None,
         }
     }
 }
@@ -293,6 +297,9 @@ pub async fn connect(path: &Path, config: ClientConfig) -> Result<Connected, Con
         Ok(stream) => stream,
         Err(error) => return Err(classify_connect_error(error)),
     };
+    if let Some(trace) = config.turn_trace.as_ref() {
+        trace.connected();
+    }
     // Capture before `RpcClient::start` consumes the stream and splits it.
     // The peer credentials are the update signal authority; the lock-file
     // PID is deliberately never consulted.
@@ -331,6 +338,9 @@ pub async fn connect(path: &Path, config: ClientConfig) -> Result<Connected, Con
             Ok(result) => result?,
             Err(_) => return Err(ConnectError::HandshakeTimeout),
         };
+    if let Some(trace) = config.turn_trace.as_ref() {
+        trace.hello_done();
+    }
     let encoding = match welcome.encoding.as_deref() {
         Some("msgpack") => WireEncoding::MessagePack,
         _ => WireEncoding::Json,

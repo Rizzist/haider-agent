@@ -173,6 +173,19 @@ pub(crate) fn turn_trace_enabled() -> bool {
     haider_core::turn_trace_enabled()
 }
 
+fn with_turn_trace<T>(
+    trace: Option<&TurnTraceContext>,
+    operation: impl FnOnce(&TurnTraceContext) -> T,
+) -> Option<T> {
+    trace.map(operation)
+}
+
+fn registered_turn_trace_if_enabled(run_id: &RunId) -> Option<TurnTraceContext> {
+    turn_trace_enabled()
+        .then(|| registered_turn_trace(run_id))
+        .flatten()
+}
+
 /// A live session remains cheaply reusable for five minutes after its worker
 /// reports durable quiescence. Activity cancels the owned timer; queued,
 /// active, cancelling, recovery, and menu-parked work never reports this
@@ -3067,6 +3080,10 @@ async fn run_manager(
                 accepted,
                 completed,
             } => {
+                let turn_trace = registered_turn_trace_if_enabled(&accepted.run_id);
+                with_turn_trace(turn_trace.as_ref(), |trace| {
+                    trace.emit_setup_phase("worker_dispatch");
+                });
                 let result = match supervisor_for(
                     SupervisorSpawnState {
                         hub: &hub,
@@ -3082,11 +3099,16 @@ async fn run_manager(
                 )
                 .await
                 {
-                    Ok(supervisor) => supervisor
-                        .try_send(SupervisorCommand::Submit(Box::new(PendingTurn::accepted(
-                            accepted,
-                        ))))
-                        .map_err(supervisor_try_send),
+                    Ok(supervisor) => {
+                        with_turn_trace(turn_trace.as_ref(), |trace| {
+                            trace.emit_setup_phase("worker_spawn");
+                        });
+                        supervisor
+                            .try_send(SupervisorCommand::Submit(Box::new(PendingTurn::accepted(
+                                accepted,
+                            ))))
+                            .map_err(supervisor_try_send)
+                    }
                     Err(error) => Err(error),
                 };
                 let _ = completed.send(result);
@@ -5109,6 +5131,10 @@ async fn admit_pending(
         ),
         Err(_) => (None, true),
     };
+    let turn_trace = registered_turn_trace_if_enabled(&run_id);
+    with_turn_trace(turn_trace.as_ref(), |trace| {
+        trace.emit_setup_phase("read_bundle");
+    });
     match state {
         Some(RunState::Queued) => {
             if active_run == Some(&run_id)
@@ -7300,6 +7326,9 @@ async fn start_turn(
             owns_terminal: true,
         });
     }
+    with_turn_trace(turn_trace.as_ref(), |trace| {
+        trace.emit_setup_phase("read_bundle");
+    });
     let metadata = &pinned_metadata;
     // W-B (decision 8): the session's web-capability degrades ride into
     // pair resolution (native declarations) AND the tool pack below — ONE
@@ -7385,6 +7414,9 @@ async fn start_turn(
     if let Some(grant) = delegation_grant.as_ref() {
         validate_grant(grant)?;
     }
+    with_turn_trace(turn_trace.as_ref(), |trace| {
+        trace.emit_setup_phase("delegation_context");
+    });
     // Graph state selects a typed Loom executor before provider/tool setup.
     // A model never chooses, omits, or substitutes the specialist for an OPEN
     // typed node: the pinned digest and current ready node are daemon truth.
@@ -7542,6 +7574,9 @@ async fn start_turn(
         },
         None => None,
     };
+    with_turn_trace(turn_trace.as_ref(), |trace| {
+        trace.emit_setup_phase("graph_context");
+    });
     let resolved = dependencies
         .provider_factory
         .resolve_for_turn_with_web(metadata, web_degrade)
@@ -7564,6 +7599,9 @@ async fn start_turn(
             return Err(error);
         }
     };
+    with_turn_trace(turn_trace.as_ref(), |trace| {
+        trace.emit_setup_phase("provider_resolution");
+    });
     if resolved.provider_name != metadata.provider {
         let _ = lease.hub().bind_lockdown_turn(
             lease.session_id(),
@@ -7606,6 +7644,9 @@ async fn start_turn(
         .provider_factory
         .reconcile_cache_scope(lease.session_id(), &resolved.provider_name)
         .await;
+    with_turn_trace(turn_trace.as_ref(), |trace| {
+        trace.emit_setup_phase("lockdown");
+    });
     // G1 (L5): a delegation-owned session is a child — its tool pack below
     // excludes the root-only planning surface.
     let handoff_dir = delegation
@@ -7647,6 +7688,9 @@ async fn start_turn(
         &mut setup_reduction,
     )
     .await?;
+    with_turn_trace(turn_trace.as_ref(), |trace| {
+        trace.emit_setup_phase("instructions");
+    });
     let prewarm = (std::env::var_os("HAIDER_PROVIDER_PREWARM").as_deref()
         == Some(std::ffi::OsStr::new("1")))
     .then(|| {
@@ -7772,6 +7816,9 @@ async fn start_turn(
             "The daemon selects and capability-scopes each typed node. The current volatile typed-executor binding is authoritative; stop using a prior specialist role whenever that binding changes.",
         );
     }
+    with_turn_trace(turn_trace.as_ref(), |trace| {
+        trace.emit_setup_phase("prompt_assembly");
+    });
     let DurableToolState {
         grants: durable_grants,
         bindings: durable_bindings,
@@ -7816,7 +7863,7 @@ async fn start_turn(
         lease.worker_generation(),
     )
     .with_event_ids(Arc::clone(&event_ids));
-    config.turn_trace = turn_trace;
+    config.turn_trace = turn_trace.clone();
     config.provider_deadline = provider_deadline;
     let provider_request_state = provider_derived_request_state(
         &resolved.provider_name,
@@ -7926,6 +7973,9 @@ async fn start_turn(
             web_degrade.anthropic_web_tools, web_degrade.openai_alpha_search
         ),
         reasoning_settings: config.reasoning_settings.clone(),
+    });
+    with_turn_trace(turn_trace.as_ref(), |trace| {
+        trace.emit_setup_phase("tool_catalog");
     });
     surface_request_cache_transitions(
         lease,
@@ -11392,6 +11442,35 @@ fn peer_error(error: crate::peer::PeerError) -> HaiderError {
 #[allow(clippy::expect_used, clippy::items_after_test_module)]
 mod manager_law_tests {
     use super::*;
+
+    #[test]
+    fn daemon_turngap_phases_are_clock_free_when_trace_is_off() {
+        let clock_reads = std::cell::Cell::new(0_u32);
+        for phase in [
+            "worker_dispatch",
+            "worker_spawn",
+            "read_bundle",
+            "delegation_context",
+            "graph_context",
+            "provider_resolution",
+            "lockdown",
+            "instructions",
+            "hooks_discovery",
+            "tool_catalog",
+            "prompt_assembly",
+            "setup_finalize",
+            "budget_estimate",
+            "request_prepare",
+            "budget_enforcement",
+        ] {
+            let emitted = with_turn_trace(None, |_| {
+                clock_reads.set(clock_reads.get().saturating_add(1));
+                phase
+            });
+            assert!(emitted.is_none(), "trace-off phase emitted: {phase}");
+        }
+        assert_eq!(clock_reads.get(), 0);
+    }
 
     fn output_savings(scope: &str, before: usize, after: usize) -> OutputSavings {
         OutputSavings::from_provider_request_bytes(

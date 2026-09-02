@@ -27,6 +27,7 @@ mod tests;
 use crate::session_hub::SessionHub;
 use haider_core::{
     HookTrustChange, HookTrustCommand, MenuResolutionCommand, MenuResolutionOutcome, StoreHandle,
+    registered_turn_trace,
 };
 use haider_protocol::effect::{AuthorizationVerdict, EffectIntent, EffectPhase};
 use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION};
@@ -344,6 +345,10 @@ struct HookServiceInner {
     /// Canonical workspace → mtime-keyed discovery result. Decision hooks
     /// deliberately bypass this cache again immediately before execution.
     discovery_cache: Mutex<HashMap<PathBuf, CachedDiscovery>>,
+    /// Trace-only handoff from committed publication to the asynchronous hook
+    /// engine. The core registry is released at terminal publication, which
+    /// can precede discovery of that durable row.
+    turn_traces: Mutex<HashMap<(SessionId, u64), haider_core::TurnTraceContext>>,
     /// A newly discovered non-empty or invalid hook document can make rows
     /// behind the metadata cursor relevant. The next drain restarts at the
     /// durable beginning exactly once for that discovery change.
@@ -355,6 +360,30 @@ struct HookServiceInner {
     discovery_stamp_count: AtomicU64,
     #[cfg(test)]
     dispatch_metadata_scan_count: AtomicU64,
+}
+
+fn take_discovery_turn_trace(
+    retained: &Mutex<HashMap<(SessionId, u64), haider_core::TurnTraceContext>>,
+    session_id: &SessionId,
+    seq: u64,
+) -> Option<haider_core::TurnTraceContext> {
+    let mut retained = retained
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let trace = retained.remove(&(session_id.clone(), seq))?;
+    let ordinal = trace.turn_ordinal();
+    retained.retain(|_, candidate| candidate.turn_ordinal() != ordinal);
+    Some(trace)
+}
+
+fn purge_discovery_turn_trace(
+    retained: &Mutex<HashMap<(SessionId, u64), haider_core::TurnTraceContext>>,
+    turn_ordinal: u64,
+) {
+    retained
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|_, candidate| candidate.turn_ordinal() != turn_ordinal);
 }
 
 impl HookService {
@@ -409,6 +438,21 @@ impl HookService {
             .all(|envelope| HookEventPayload::is_engine_fact(&envelope.payload))
         {
             return;
+        }
+        if crate::worker::turn_trace_enabled() {
+            let mut retained = self
+                .inner
+                .turn_traces
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (coordinate, trace) in envelopes.iter().filter_map(|envelope| {
+                let run_id = envelope.run_id.as_ref()?;
+                let trace = registered_turn_trace(run_id)?;
+                (!trace.phase_complete("hooks_discovery"))
+                    .then(|| ((envelope.session_id.clone(), envelope.seq), trace))
+            }) {
+                retained.insert(coordinate, trace);
+            }
         }
         if let Some(last) = envelopes.last() {
             self.inner
@@ -924,6 +968,7 @@ impl HookEngine {
                 workspace_baselines: Mutex::new(workspace_baselines),
                 observed_trusted: Mutex::new(observed_trusted),
                 discovery_cache: Mutex::new(HashMap::new()),
+                turn_traces: Mutex::new(HashMap::new()),
                 dispatch_rescan_required: AtomicBool::new(false),
                 next_event: AtomicU64::new(0),
                 #[cfg(test)]
@@ -1891,6 +1936,40 @@ async fn batch_discovery_context(
     context
 }
 
+async fn batch_discovery_context_with_trace(
+    service: &HookService,
+    session_id: &SessionId,
+    seq: u64,
+    batch_discoveries: &mut BatchDiscoveryCache,
+    trace_enabled: bool,
+) -> Option<(SessionMetadataV1, Result<Discovery, String>)> {
+    let discovery_was_cached = batch_discoveries.contains_key(session_id);
+    let hook_trace = trace_enabled
+        .then(|| take_discovery_turn_trace(&service.inner.turn_traces, session_id, seq))
+        .flatten();
+    let hook_started = (!discovery_was_cached)
+        .then(|| {
+            hook_trace
+                .as_ref()
+                .map(haider_core::TurnTraceContext::now_us_from_accept)
+        })
+        .flatten();
+    let discovery = batch_discovery_context(service, session_id, batch_discoveries).await;
+    if let Some(trace) = hook_trace.as_ref() {
+        if let Some(started) = hook_started {
+            trace.emit_once("hooks_discovery", 0, started, trace.now_us_from_accept());
+        } else {
+            trace.mark_phase_complete("hooks_discovery");
+        }
+        // A commit can observe the phase as incomplete and retain another
+        // coordinate while discovery is awaited. Purge again after marking
+        // completion; the observer checks completion while holding this same
+        // map lock, so either ordering leaves no trace-only residue.
+        purge_discovery_turn_trace(&service.inner.turn_traces, trace.turn_ordinal());
+    }
+    discovery
+}
+
 fn metadata_dispatch_disposition(
     payload_kind: Option<&str>,
     context: &Option<(SessionMetadataV1, Result<Discovery, String>)>,
@@ -2081,8 +2160,14 @@ async fn drain_hook_dispatch_page(context: HookDrainContext<'_>) -> HookDrainPag
             waiting_on_inflight = true;
             continue;
         }
-        let discovery =
-            batch_discovery_context(service, &metadata.session_id, &mut batch_discoveries).await;
+        let discovery = batch_discovery_context_with_trace(
+            service,
+            &metadata.session_id,
+            metadata.seq,
+            &mut batch_discoveries,
+            crate::worker::turn_trace_enabled(),
+        )
+        .await;
         match metadata_dispatch_disposition(
             metadata.payload_kind.as_deref(),
             &discovery,

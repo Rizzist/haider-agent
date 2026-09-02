@@ -3281,6 +3281,10 @@ impl HarnessActor {
             }
         }
         'requests: loop {
+            let prompt_assembly_started = self.config.turn_trace.as_ref().map(|trace| {
+                trace.emit_setup_phase_once("setup_finalize");
+                trace.now_us_from_accept()
+            });
             if provider_attempt == 0 {
                 if let Some(dispatcher) = self.dispatcher.as_ref() {
                     match dispatcher.refresh_volatile_context_tail().await {
@@ -3546,6 +3550,13 @@ impl HarnessActor {
                 attachments: request_attachments,
                 cache_metadata: Some(cache_metadata.clone()),
             };
+            let budget_estimate_started = self.config.turn_trace.as_ref().map(|trace| {
+                let end = trace.now_us_from_accept();
+                if let Some(start) = prompt_assembly_started {
+                    trace.emit("prompt_assembly", provider_request_ordinal, 0, start, end);
+                }
+                trace.now_us_from_accept()
+            });
             let projected_input_tokens = estimate_provider_request_input_tokens(
                 &provider_request.messages,
                 &provider_request.system_prompt,
@@ -3554,6 +3565,13 @@ impl HarnessActor {
                     .map_or(provider_request.tools.as_slice(), |tools| tools),
                 &provider_request.attachments,
             );
+            let request_prepare_started = self.config.turn_trace.as_ref().map(|trace| {
+                let end = trace.now_us_from_accept();
+                if let Some(start) = budget_estimate_started {
+                    trace.emit("budget_estimate", provider_request_ordinal, 0, start, end);
+                }
+                trace.now_us_from_accept()
+            });
             let mut prepared = if let Some(tools) = shared_request_tools.as_ref() {
                 provider.prepare_turn_with_tools_owned(&mut provider_request, tools)
             } else {
@@ -3773,6 +3791,13 @@ impl HarnessActor {
                         .await;
                 }
             };
+            let budget_enforcement_started = self.config.turn_trace.as_ref().map(|trace| {
+                let end = trace.now_us_from_accept();
+                if let Some(start) = request_prepare_started {
+                    trace.emit("request_prepare", provider_request_ordinal, 0, start, end);
+                }
+                trace.now_us_from_accept()
+            });
             // P0 hard-budget boundary: the daemon sees the fully shaped
             // physical request before either its durable attempt marker or
             // provider transport can observe it. The returned permit keeps
@@ -3805,11 +3830,19 @@ impl HarnessActor {
                 } else {
                     None
                 };
-            let request_attempt_commit_started = self
-                .config
-                .turn_trace
-                .as_ref()
-                .map(TurnTraceContext::now_us_from_accept);
+            let request_attempt_commit_started = self.config.turn_trace.as_ref().map(|trace| {
+                let end = trace.now_us_from_accept();
+                if let Some(start) = budget_enforcement_started {
+                    trace.emit(
+                        "budget_enforcement",
+                        provider_request_ordinal,
+                        0,
+                        start,
+                        end,
+                    );
+                }
+                trace.now_us_from_accept()
+            });
             let persisted_provider_view = match self
                 .commit_request_attempt(
                     &run_id,

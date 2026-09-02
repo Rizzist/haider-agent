@@ -96,7 +96,9 @@ impl RuntimeProfile {
 
 #[cfg(not(windows))]
 fn main() -> ExitCode {
-    run_cli(std::env::args().skip(1).collect())
+    let trace =
+        haider_client::ClientEnvelopeTrace::new_if_enabled(haider_core::turn_trace_enabled());
+    run_cli(std::env::args().skip(1).collect(), trace)
 }
 
 // The CLI dispatcher composes several large async command futures. Windows
@@ -105,11 +107,13 @@ fn main() -> ExitCode {
 // otherwise identical on every platform.
 #[cfg(windows)]
 fn main() -> ExitCode {
+    let trace =
+        haider_client::ClientEnvelopeTrace::new_if_enabled(haider_core::turn_trace_enabled());
     let args = std::env::args().skip(1).collect();
     let launched = std::thread::Builder::new()
         .name("haider-main".into())
         .stack_size(8 * 1024 * 1024)
-        .spawn(|| run_cli(args));
+        .spawn(|| run_cli(args, trace));
     let code = match launched {
         Ok(thread) => match thread.join() {
             Ok(code) => code,
@@ -154,7 +158,10 @@ fn hold_explorer_console_on_failure(code: ExitCode) {
 /// Select the runtime before constructing an async command future. In
 /// particular, one-shot `haider run` and `haider status` commands never
 /// construct the omnibus dispatcher/TUI future or initialize terminal state.
-fn run_cli(args: Vec<String>) -> ExitCode {
+fn run_cli(
+    args: Vec<String>,
+    client_trace: Option<Arc<haider_client::ClientEnvelopeTrace>>,
+) -> ExitCode {
     let profile = RuntimeProfile::for_args(&args);
     let runtime = match profile.build() {
         Ok(runtime) => runtime,
@@ -167,8 +174,12 @@ fn run_cli(args: Vec<String>) -> ExitCode {
         RuntimeProfile::EphemeralHeadless => match args.first().map(String::as_str) {
             Some("run") => {
                 let rest = args.get(1..).unwrap_or_default();
-                let code = runtime.block_on(run::run_command(rest));
+                let code = runtime.block_on(run::run_command(rest, client_trace.clone()));
                 footprint_probe_hold();
+                drop(runtime);
+                if let Some(trace) = client_trace.as_ref() {
+                    trace.emit_exit();
+                }
                 code
             }
             Some("status") => {
@@ -383,7 +394,7 @@ async fn dispatch(args: &[String]) -> ExitCode {
         // leaving the daemon running. The scriptable half of the front
         // door (bare `haider` on a TTY enters the live TUI instead).
         [command] if command == "--ready" => front_door(FrontDoor::Report).await,
-        [command, rest @ ..] if command == "run" => run::run_command(rest).await,
+        [command, rest @ ..] if command == "run" => run::run_command(rest, None).await,
         [command, rest @ ..] if command == "status" => observe::status_command(rest).await,
         [command, subcommand, rest @ ..] if command == "sessions" && subcommand == "wait-ready" => {
             automation::sessions_wait_ready_command(rest).await

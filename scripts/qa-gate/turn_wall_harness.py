@@ -64,16 +64,318 @@ def _trace_records(text: str) -> list[dict[str, int | str]]:
                 "txn_ordinal",
                 "start_us_from_accept",
                 "end_us_from_accept",
+                "start_us_from_exec",
+                "end_us_from_exec",
             }:
                 try:
                     record[key] = int(value)
                 except ValueError:
                     continue
-            elif key in {"target", "phase", "level"}:
+            elif key in {"target", "phase", "level", "side", "clock"}:
                 record[key] = value
         if record.get("target") == "haider.turn" and isinstance(record.get("phase"), str):
+            if "start_us_from_exec" in record or "end_us_from_exec" in record:
+                record.setdefault("side", "client")
+                record.setdefault("clock", "client_exec")
+            else:
+                record.setdefault("side", "daemon")
+                record.setdefault("clock", "daemon_accept")
             records.append(record)
     return records
+
+
+def _contains_turn_trace(text: str) -> bool:
+    return any("target=haider.turn" in line for line in text.splitlines())
+
+
+def _record_interval(record: dict[str, int | str]) -> tuple[int, int] | None:
+    clock = record.get("clock")
+    fields = (
+        ("start_us_from_exec", "end_us_from_exec")
+        if clock == "client_exec"
+        else ("start_us_from_accept", "end_us_from_accept")
+    )
+    start, end = (record.get(field) for field in fields)
+    if isinstance(start, int) and isinstance(end, int):
+        return start, end
+    return None
+
+
+def _trace_record_error(record: dict[str, int | str]) -> str | None:
+    ordinal = record.get("turn_ordinal")
+    phase = record.get("phase")
+    if not isinstance(ordinal, int) or ordinal <= 0:
+        return f"trace record has invalid turn_ordinal={ordinal!r}"
+    for field in ("operation_micros", "request_ordinal", "txn_ordinal"):
+        value = record.get(field)
+        if not isinstance(value, int) or value < 0:
+            return f"trace turn={ordinal} phase={phase} has invalid {field}={value!r}"
+    side_clock = (record.get("side"), record.get("clock"))
+    coordinate_fields = {
+        ("daemon", "daemon_accept"): (
+            "start_us_from_accept",
+            "end_us_from_accept",
+            "start_us_from_exec",
+            "end_us_from_exec",
+        ),
+        ("client", "client_exec"): (
+            "start_us_from_exec",
+            "end_us_from_exec",
+            "start_us_from_accept",
+            "end_us_from_accept",
+        ),
+    }
+    if side_clock not in coordinate_fields:
+        return f"trace turn={ordinal} phase={phase} has invalid side/clock={side_clock!r}"
+    start_field, end_field, foreign_start, foreign_end = coordinate_fields[side_clock]
+    start, end = record.get(start_field), record.get(end_field)
+    if not isinstance(start, int) or not isinstance(end, int):
+        return f"trace turn={ordinal} phase={phase} lacks its clock coordinates"
+    if foreign_start in record or foreign_end in record:
+        return f"trace turn={ordinal} phase={phase} mixes clock coordinates"
+    if start < 0 or end < start:
+        return f"trace turn={ordinal} phase={phase} has invalid interval=({start},{end})"
+    duration = record["operation_micros"]
+    if duration != end - start:
+        return (
+            f"trace turn={ordinal} phase={phase} duration={duration} "
+            f"does not match coordinates={end - start}"
+        )
+    return None
+
+
+def _client_process_residual_micros(wall_ms: float, exit_end_us: int) -> float:
+    residual = wall_ms * 1_000.0 - exit_end_us
+    if residual < 0:
+        raise ValueError(
+            f"client exit coordinate {exit_end_us}us exceeds process wall {wall_ms * 1_000.0:.1f}us"
+        )
+    return residual
+
+
+def _interval_union_micros(intervals: list[tuple[int, int]], cutoff: int) -> int:
+    clipped = sorted(
+        (max(0, start), min(cutoff, end))
+        for start, end in intervals
+        if end >= 0 and start <= cutoff and min(cutoff, end) >= max(0, start)
+    )
+    covered = 0
+    cursor_start: int | None = None
+    cursor_end = 0
+    for start, end in clipped:
+        if cursor_start is None:
+            cursor_start, cursor_end = start, end
+        elif start <= cursor_end:
+            cursor_end = max(cursor_end, end)
+        else:
+            covered += cursor_end - cursor_start
+            cursor_start, cursor_end = start, end
+    if cursor_start is not None:
+        covered += cursor_end - cursor_start
+    return covered
+
+
+def _phase_row(
+    *,
+    shape: str,
+    side: str,
+    clock: str,
+    phase: str,
+    values: list[float],
+    spans: list[float] | None,
+    records: int,
+    turns: int,
+) -> dict[str, Any]:
+    median, mad = median_mad(values)
+    span_median, span_mad = median_mad(spans or values)
+    return {
+        "shape": shape,
+        "side": side,
+        "clock": clock,
+        "phase": phase,
+        "present_turns": len(values),
+        "measured_turns": turns,
+        "records": records,
+        "records_per_present_turn": records / len(values),
+        "operation_micros_per_turn": {"median": median, "mad": mad},
+        "coordinate_span_micros_per_turn": {
+            "median": span_median,
+            "mad": span_mad,
+        },
+    }
+
+
+def _phase_table_key(record: dict[str, int | str]) -> tuple[str, str, str]:
+    phase = str(record.get("phase"))
+    if phase == "prompt_assembly":
+        scope = "setup" if record.get("request_ordinal") == 0 else "request"
+        phase = f"{phase}.{scope}"
+    return str(record.get("side")), str(record.get("clock")), phase
+
+
+def _build_phase_table(
+    samples: dict[str, list[dict[str, Any]]],
+    grouped: dict[int, list[dict[str, int | str]]],
+    correctness_failures: list[str] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    table: dict[str, list[dict[str, Any]]] = {"single": [], "tool": []}
+    for shape in ("single", "tool"):
+        turns: list[tuple[dict[str, Any], list[dict[str, int | str]]]] = []
+        for sample in samples[shape]:
+            ordinal = sample.get("turn_ordinal")
+            if isinstance(ordinal, int):
+                turns.append((sample, grouped.get(ordinal, [])))
+        keys = sorted(
+            {
+                _phase_table_key(record)
+                for _, records in turns
+                for record in records
+            }
+        )
+        for side, clock, phase in keys:
+            values: list[float] = []
+            spans: list[float] = []
+            record_count = 0
+            for _, records in turns:
+                matching = [
+                    record
+                    for record in records
+                    if _phase_table_key(record) == (side, clock, phase)
+                ]
+                if not matching:
+                    continue
+                values.append(sum(float(record["operation_micros"]) for record in matching))
+                intervals = [
+                    interval
+                    for record in matching
+                    if (interval := _record_interval(record)) is not None
+                ]
+                if intervals:
+                    spans.append(
+                        float(
+                            max(end for _, end in intervals)
+                            - min(start for start, _ in intervals)
+                        )
+                    )
+                record_count += len(matching)
+            table[shape].append(
+                _phase_row(
+                    shape=shape,
+                    side=side,
+                    clock=clock,
+                    phase=phase,
+                    values=values,
+                    spans=spans,
+                    records=record_count,
+                    turns=len(turns),
+                )
+            )
+
+        daemon_request_starts: list[float] = []
+        daemon_open_ends: list[float] = []
+        daemon_residuals: list[float] = []
+        client_walls: list[float] = []
+        client_residuals: list[float] = []
+        for sample, records in turns:
+            first_open = next(
+                (
+                    record
+                    for record in records
+                    if record.get("phase") == "provider_open"
+                    and record.get("request_ordinal") == 1
+                ),
+                None,
+            )
+            if first_open is not None:
+                interval = _record_interval(first_open)
+                if interval is not None:
+                    cutoff = interval[0]
+                    covered = _interval_union_micros(
+                        [
+                            candidate_interval
+                            for record in records
+                            if record.get("clock") == "daemon_accept"
+                            and record.get("phase") != "hooks_discovery"
+                            and (candidate_interval := _record_interval(record)) is not None
+                        ],
+                        cutoff,
+                    )
+                    daemon_request_starts.append(float(cutoff))
+                    daemon_open_ends.append(float(interval[1]))
+                    daemon_residuals.append(float(max(0, cutoff - covered)))
+            exit_record = next(
+                (record for record in records if record.get("phase") == "exit"), None
+            )
+            if exit_record is not None:
+                interval = _record_interval(exit_record)
+                if interval is not None:
+                    client_walls.append(float(interval[1]))
+                    try:
+                        client_residuals.append(
+                            _client_process_residual_micros(
+                                float(sample["wall_ms"]), interval[1]
+                            )
+                        )
+                    except ValueError as error:
+                        if correctness_failures is None:
+                            raise
+                        correctness_failures.append(
+                            f"{shape} sample={sample.get('index')} {error}"
+                        )
+        for phase, side, clock, values in [
+            (
+                "daemon_accept_to_provider_open_start",
+                "daemon",
+                "daemon_accept",
+                daemon_request_starts,
+            ),
+            (
+                "daemon_accept_to_first_provider_open_end",
+                "daemon",
+                "daemon_accept",
+                daemon_open_ends,
+            ),
+            (
+                "daemon_unattributed_to_provider_open_start",
+                "derived",
+                "daemon_accept",
+                daemon_residuals,
+            ),
+            ("client_exec_to_exit", "client", "client_exec", client_walls),
+            ("client_process_residual", "derived", "process_wall", client_residuals),
+        ]:
+            if values:
+                table[shape].append(
+                    _phase_row(
+                        shape=shape,
+                        side=side,
+                        clock=clock,
+                        phase=phase,
+                        values=values,
+                        spans=None,
+                        records=len(values),
+                        turns=len(turns),
+                    )
+                )
+        table[shape].sort(key=lambda row: (row["side"], row["clock"], row["phase"]))
+    return table
+
+
+def _render_phase_table(table: dict[str, list[dict[str, Any]]]) -> str:
+    lines = [
+        "turn-wall phase attribution (per-turn sums; microseconds)",
+        "shape   side     clock          phase                                      turns  rec/turn    median       MAD",
+    ]
+    for shape in ("single", "tool"):
+        for row in table.get(shape, []):
+            operation = row["operation_micros_per_turn"]
+            lines.append(
+                f"{shape:<7} {row['side']:<8} {row['clock']:<14} {row['phase']:<42} "
+                f"{row['present_turns']:>2}/{row['measured_turns']:<2} "
+                f"{row['records_per_present_turn']:>8.2f} "
+                f"{operation['median']:>9.1f} {operation['mad']:>9.1f}"
+            )
+    return "\n".join(lines)
 
 
 def _daemon_trace(profile: ThrowawayProfile) -> str:
@@ -190,10 +492,14 @@ def run_harness(
                 daemon_cpu_ms = max(0.0, daemon_cpu_after - daemon_cpu_before)
                 daemon_peak_rss_kib = max(daemon_peak_rss_kib, daemon_peak)
                 client_trace = _trace_records(result.stderr) if trace else []
+                if not trace and _contains_turn_trace(result.stderr):
+                    correctness_failures.append(
+                        f"{shape} case={case_id} emitted client trace while {TRACE_ENV} was off"
+                    )
                 client_terminal = [
                     record
                     for record in client_trace
-                    if record.get("phase") == "client_terminal_seen"
+                    if record.get("phase") == "terminal_seen"
                 ]
                 if trace and len(client_terminal) != 1:
                     raise ProofError(
@@ -369,32 +675,22 @@ def run_harness(
                 f"{peak_limit:.0f}+{peak_tolerance:.0f}KiB"
             )
 
-    trace_text = "".join(trace_stderr) + (_daemon_trace(profile) if profile else "")
+    daemon_trace_text = _daemon_trace(profile) if profile else ""
+    if not trace and _contains_turn_trace(daemon_trace_text):
+        correctness_failures.append(
+            f"daemon emitted trace while {TRACE_ENV} was off"
+        )
+    trace_text = "".join(trace_stderr) + daemon_trace_text
     trace_records = _trace_records(trace_text) if trace else []
     trace_stage_summary: dict[str, Any] = {}
+    trace_phase_table: dict[str, list[dict[str, Any]]] = {"single": [], "tool": []}
     if trace:
         grouped: dict[int, list[dict[str, int | str]]] = {}
         for record in trace_records:
-            ordinal = record.get("turn_ordinal")
-            if not isinstance(ordinal, int) or ordinal <= 0:
-                correctness_failures.append(f"trace record has invalid turn_ordinal={ordinal!r}")
+            if error := _trace_record_error(record):
+                correctness_failures.append(error)
                 continue
-            numeric = (
-                "operation_micros",
-                "request_ordinal",
-                "txn_ordinal",
-                "start_us_from_accept",
-                "end_us_from_accept",
-            )
-            if any(not isinstance(record.get(field), int) for field in numeric):
-                correctness_failures.append(
-                    f"trace turn={ordinal} phase={record.get('phase')} lacks numeric coordinates"
-                )
-                continue
-            if record["end_us_from_accept"] < record["start_us_from_accept"]:
-                correctness_failures.append(
-                    f"trace turn={ordinal} phase={record.get('phase')} has reversed timestamps"
-                )
+            ordinal = int(record["turn_ordinal"])
             grouped.setdefault(ordinal, []).append(record)
         seen_ordinals: set[int] = set()
         for shape in ("single", "tool"):
@@ -410,15 +706,99 @@ def run_harness(
                     correctness_failures.append(f"trace turn ordinal reused={ordinal}")
                 seen_ordinals.add(ordinal)
                 records = grouped.get(ordinal, [])
-                phases = [record.get("phase") for record in records]
-                for phase in ("accept", "terminal_commit", "client_terminal_seen"):
-                    if phases.count(phase) != 1:
-                        correctness_failures.append(
-                            f"trace turn={ordinal} phase={phase} expected=1 "
-                            f"actual={phases.count(phase)}"
+
+                def matching(
+                    phase: str,
+                    side: str,
+                    clock: str,
+                    request_ordinal: int | None = None,
+                    txn_ordinal: int | None = None,
+                ) -> list[dict[str, int | str]]:
+                    return [
+                        record
+                        for record in records
+                        if record.get("phase") == phase
+                        and record.get("side") == side
+                        and record.get("clock") == clock
+                        and (
+                            request_ordinal is None
+                            or record.get("request_ordinal") == request_ordinal
                         )
-                for phase in ("request_attempt_commit", "provider_open", "first_byte"):
-                    phase_records = [record for record in records if record.get("phase") == phase]
+                        and (
+                            txn_ordinal is None
+                            or record.get("txn_ordinal") == txn_ordinal
+                        )
+                    ]
+
+                for phase in (
+                    "accept",
+                    "worker_dispatch",
+                    "worker_spawn",
+                    "provider_resolution",
+                    "lockdown",
+                    "instructions",
+                    "delegation_context",
+                    "graph_context",
+                    "tool_catalog",
+                    "setup_finalize",
+                ):
+                    actual = len(matching(phase, "daemon", "daemon_accept", 0, 0))
+                    if actual != 1:
+                        correctness_failures.append(
+                            f"trace turn={ordinal} daemon phase={phase} expected=1 actual={actual}"
+                        )
+                for phase in (
+                    "exec_start",
+                    "profile_resolved",
+                    "connected",
+                    "hello_done",
+                    "submitted",
+                    "terminal_seen",
+                    "exit",
+                ):
+                    actual = len(matching(phase, "client", "client_exec", 0, 0))
+                    if actual != 1:
+                        correctness_failures.append(
+                            f"trace turn={ordinal} client phase={phase} expected=1 actual={actual}"
+                        )
+                read_bundle_count = len(
+                    matching("read_bundle", "daemon", "daemon_accept", 0, 0)
+                )
+                if read_bundle_count != 2:
+                    correctness_failures.append(
+                        f"trace turn={ordinal} phase=read_bundle expected=2 "
+                        f"actual={read_bundle_count}"
+                    )
+                hook_count = len(
+                    matching("hooks_discovery", "daemon", "daemon_accept", 0, 0)
+                )
+                if hook_count > 1:
+                    correctness_failures.append(
+                        f"trace turn={ordinal} phase=hooks_discovery expected<=1 "
+                        f"actual={hook_count}"
+                    )
+                setup_prompt_count = len(
+                    matching("prompt_assembly", "daemon", "daemon_accept", 0, 0)
+                )
+                if setup_prompt_count != 1:
+                    correctness_failures.append(
+                        f"trace turn={ordinal} setup prompt_assembly expected=1 "
+                        f"actual={setup_prompt_count}"
+                    )
+                for phase in (
+                    "prompt_assembly",
+                    "budget_estimate",
+                    "request_prepare",
+                    "budget_enforcement",
+                    "request_attempt_commit",
+                    "provider_open",
+                    "first_byte",
+                ):
+                    phase_records = [
+                        record
+                        for record in matching(phase, "daemon", "daemon_accept", None, 0)
+                        if int(record["request_ordinal"]) > 0
+                    ]
                     ordinals = sorted(
                         record["request_ordinal"] for record in phase_records
                     )
@@ -428,13 +808,17 @@ def run_harness(
                         )
                 journal_txns = sorted(
                     int(record["txn_ordinal"])
-                    for record in records
-                    if record.get("phase") == "journal_transaction"
+                    for record in matching(
+                        "journal_transaction", "daemon", "daemon_accept", 0, None
+                    )
+                    if int(record["txn_ordinal"]) > 0
                 )
                 append_txns = sorted(
                     int(record["txn_ordinal"])
-                    for record in records
-                    if record.get("phase") == "journal_append_wait"
+                    for record in matching(
+                        "journal_append_wait", "daemon", "daemon_accept", 0, None
+                    )
+                    if int(record["txn_ordinal"]) > 0
                 )
                 if journal_txns != append_txns or any(value <= 0 for value in journal_txns):
                     correctness_failures.append(
@@ -447,36 +831,25 @@ def run_harness(
                         f"trace turn={ordinal} complete transaction count "
                         f"expected={expected_transactions} actual={len(journal_txns)}"
                     )
-        measured_trace = [
-            record for record in trace_records if record.get("turn_ordinal") in seen_ordinals
-        ]
-        for phase in sorted(
-            {str(record["phase"]) for record in measured_trace if "phase" in record}
-        ):
-            phase_records = [
-                record for record in measured_trace if record.get("phase") == phase
-            ]
-            durations = [float(record["operation_micros"]) for record in phase_records]
-            duration_median, duration_mad = median_mad(durations)
-            request_counts: dict[str, int] = {}
-            for record in phase_records:
-                key = str(record["request_ordinal"])
-                request_counts[key] = request_counts.get(key, 0) + 1
-            trace_stage_summary[phase] = {
-                "count": len(phase_records),
-                "operation_micros": {
-                    "median": duration_median,
-                    "mad": duration_mad,
-                },
-                "request_ordinal_counts": request_counts,
-                "txn_ordinals": sorted(
-                    {
-                        int(record["txn_ordinal"])
-                        for record in phase_records
-                        if int(record["txn_ordinal"]) > 0
-                    }
-                ),
-            }
+                terminal_records = [
+                    record
+                    for record in matching(
+                        "terminal_commit", "daemon", "daemon_accept", 0, None
+                    )
+                    if int(record["txn_ordinal"]) > 0
+                ]
+                if len(terminal_records) != 1:
+                    correctness_failures.append(
+                        f"trace turn={ordinal} phase=terminal_commit expected=1 "
+                        f"actual={len(terminal_records)}"
+                    )
+        trace_phase_table = _build_phase_table(
+            samples, grouped, correctness_failures
+        )
+        trace_stage_summary = {
+            "aggregation": "per-turn phase sums separated by shape",
+            "replacement_field": "trace_phase_table",
+        }
 
     report = {
         "schema": "haider.turn-wall.v1",
@@ -513,6 +886,12 @@ def run_harness(
         "summary": summary,
         "trace_records": trace_records,
         "trace_stage_summary": trace_stage_summary,
+        "trace_phase_table": trace_phase_table,
+        "trace_off_silent": (
+            None
+            if trace
+            else not any("trace" in failure and "off" in failure for failure in correctness_failures)
+        ),
         "provider_ledger": provider_ledger,
         "provider_ledger_sha256": sha256_file(proxy_ledger),
         "correctness_failures": correctness_failures,
@@ -581,6 +960,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"turn-wall harness failed: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    if args.trace:
+        print(_render_phase_table(report["trace_phase_table"]), file=sys.stderr)
     if not report["measurement_accepted"]:
         print(rendered, file=sys.stderr, end="")
         if report["failures"]:
