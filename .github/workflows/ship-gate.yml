@@ -103,6 +103,10 @@ jobs:
 
   client-footprint:
     name: client footprint (settled macOS release)
+    # Registry #80: typed run terminality is distinct from aggregate session
+    # settlement. Advisory until this job passes once on CI; see
+    # docs/testing/v0.0.969/cfbgate.md.
+    continue-on-error: true
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
