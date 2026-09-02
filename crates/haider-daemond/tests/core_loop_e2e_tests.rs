@@ -4029,3 +4029,308 @@ async fn terminal_child_run_without_session_idle_still_releases_parent() {
         .expect("daemon shutdown stays bounded")
         .expect("daemon joins");
 }
+
+// ---------------------------------------------------------------------------
+// One-shot boot behaviour-preservation pins (lane oneshotboot). These observe
+// what a LATER daemon on the same profile can read back through the public
+// doors; see docs/testing/v0.0.969/oneshotboot-tests.md.
+// ---------------------------------------------------------------------------
+
+/// The very first Loom read on a fresh profile sees the two owner-specified
+/// default agent types, and a restarted daemon on the same store answers
+/// with the identical registry.
+///
+/// MUTATION CHECK: deferring the seed past the first `loom.list` answers an
+/// empty registry; re-seeding on the second boot advances a rev.
+#[tokio::test]
+async fn fresh_daemon_first_loom_list_returns_the_two_seeded_defaults_across_restart() {
+    let root = test_root("oneshot-loom-seed-");
+    let config = DaemonConfig::new(
+        "oneshot-loom-seed",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+
+    async fn loom_agent_types(
+        client: &mut UdsClient,
+        config: &DaemonConfig,
+        request_id: &str,
+    ) -> Vec<LoomAgentType> {
+        send_request(
+            client,
+            config,
+            request_id,
+            RequestBody::LoomList {
+                include_archived: false,
+            },
+        )
+        .await;
+        match next_response(client).await {
+            WireFrame::Response {
+                body: ResponseBody::LoomList { agent_types, .. },
+                ..
+            } => agent_types,
+            other => panic!("expected loom.list response, got {other:?}"),
+        }
+    }
+
+    let first_task = support::ready(&config).await;
+    let mut first_client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "oneshot-loom-seed",
+        "first-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let first = loom_agent_types(&mut first_client, &config, "loom-first").await;
+    let mut ids = first
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, ["reviewer", "scout"], "fresh registry: {first:?}");
+    for record in &first {
+        assert_eq!(
+            record.rev, 1,
+            "the registry owns the seeded rev: {record:?}"
+        );
+        assert!(!record.job.is_empty());
+    }
+    let scout = first
+        .iter()
+        .find(|record| record.id == "scout")
+        .expect("scout seeded");
+    assert_eq!(
+        (
+            scout.name.as_str(),
+            scout.color.as_str(),
+            scout.glyph.as_str()
+        ),
+        ("Scout", "#7aa2f7", "⌖")
+    );
+    let reviewer = first
+        .iter()
+        .find(|record| record.id == "reviewer")
+        .expect("reviewer seeded");
+    assert_eq!(
+        (
+            reviewer.name.as_str(),
+            reviewer.color.as_str(),
+            reviewer.glyph.as_str()
+        ),
+        ("Reviewer", "#bb9af7", "⚖")
+    );
+    drop(first_client);
+    first_task.shutdown_handle().request("restart");
+    first_task.join().await.expect("first daemon joins");
+
+    let second_task = support::ready(&config).await;
+    let mut second_client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "oneshot-loom-seed",
+        "second-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let second = loom_agent_types(&mut second_client, &config, "loom-second").await;
+    assert_eq!(
+        second, first,
+        "a restart neither re-seeds nor loses the defaults"
+    );
+    drop(second_client);
+    second_task.shutdown_handle().request("test complete");
+    second_task.join().await.expect("second daemon joins");
+}
+
+/// A text-file attachment put into the CAS and accepted by the first daemon
+/// is re-read from the CAS by the NEXT daemon when it projects the session
+/// history: the second turn's provider request still carries the file text.
+///
+/// MUTATION CHECK: losing the CAS object or its directory entry on the first
+/// daemon's shutdown makes the second turn fail to resolve the attachment
+/// (no Done terminal) or project it without the marker text.
+#[tokio::test]
+async fn attachment_written_by_the_first_daemon_is_projected_by_the_next_daemon() {
+    const NOTE: &str = "oneshot cas marker alpha\nsecond line of the note\n";
+    let root = test_root("oneshot-cas-restart-");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let (dependencies, fake) = fake_dependencies(vec![
+        FakeStep::EmitText {
+            text: "first answer".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitText {
+            text: "second answer".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let config = DaemonConfig::new(
+        "oneshot-cas-restart",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+
+    let first_task = ready_with_dependencies(&config, dependencies.clone()).await;
+    let mut first_client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "oneshot-cas-restart",
+        "first-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(
+        &mut first_client,
+        &config,
+        &workspace,
+        "fake",
+        "fake-v1",
+        None,
+        None,
+    )
+    .await;
+    send_request(
+        &mut first_client,
+        &config,
+        "put-note",
+        RequestBody::ArtifactPut {
+            data_base64: BASE64.encode(NOTE.as_bytes()),
+        },
+    )
+    .await;
+    let artifact = match next_response(&mut first_client).await {
+        WireFrame::Response {
+            body: ResponseBody::ArtifactPut { artifact, bytes },
+            ..
+        } => {
+            assert_eq!(bytes, NOTE.len() as u64);
+            artifact
+        }
+        other => panic!("expected artifact.put response, got {other:?}"),
+    };
+    assert!(
+        root.path()
+            .join("store")
+            .join("cas")
+            .join(&artifact.as_str()["blake3:".len().."blake3:".len() + 2])
+            .join(&artifact.as_str()["blake3:".len()..])
+            .is_file(),
+        "the CAS object is published under the store namespace"
+    );
+    send_request(
+        &mut first_client,
+        &config,
+        "submit-with-note",
+        RequestBody::TurnSubmit {
+            command_id: CommandId::new("submit-with-note"),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            text: "read the note".into(),
+            attachments: vec![haider_protocol::tool::AttachmentBlock::File {
+                artifact: artifact.clone(),
+                name: "note.txt".into(),
+                lines: 2,
+            }],
+            mode: DeliveryMode::Queue,
+        },
+    )
+    .await;
+    let first_run = loop {
+        match first_client.next().await {
+            WireFrame::Response {
+                body: ResponseBody::TurnSubmit { run_id, .. },
+                ..
+            } => break run_id,
+            WireFrame::Response {
+                body: ResponseBody::Error { code, message, .. },
+                ..
+            } => panic!("turn.submit with attachment failed ({code}): {message}"),
+            _ => {}
+        }
+    };
+    events_until_terminal(&mut first_client, &first_run).await;
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        request_contains(&requests[0], "oneshot cas marker alpha"),
+        "the first daemon inlines the attachment from its own CAS"
+    );
+    drop(first_client);
+    first_task.shutdown_handle().request("restart");
+    first_task.join().await.expect("first daemon joins");
+
+    let second_task = ready_with_dependencies(&config, dependencies).await;
+    let mut second_client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "oneshot-cas-restart",
+        "second-client",
+        ClientKind::Headless,
+    )
+    .await;
+    send_request(
+        &mut second_client,
+        &config,
+        "list-after-restart",
+        RequestBody::SessionList {
+            cursor: None,
+            limit: 10,
+        },
+    )
+    .await;
+    let restarted_generation = match next_response(&mut second_client).await {
+        WireFrame::Response {
+            body: ResponseBody::SessionList { sessions, .. },
+            ..
+        } => {
+            let row = sessions
+                .iter()
+                .find(|row| row.session_id == session_id)
+                .expect("the session survives the restart");
+            row.worker_generation
+        }
+        other => panic!("expected session.list response, got {other:?}"),
+    };
+    assert!(restarted_generation > generation);
+    let replay = attach_existing(
+        &mut second_client,
+        &config,
+        session_id.clone(),
+        "attach-after-restart",
+    )
+    .await;
+    assert!(
+        replay.iter().any(|envelope| {
+            envelope.payload["type"] == "user_message"
+                && envelope.payload["attachments"][0]["artifact"] == artifact.as_str()
+        }),
+        "the replayed journal names the attachment address"
+    );
+    let second_run = submit_turn(
+        &mut second_client,
+        &config,
+        "submit-after-restart",
+        session_id,
+        restarted_generation,
+        "and again",
+    )
+    .await;
+    events_until_terminal(&mut second_client, &second_run).await;
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        request_contains(&requests[1], "oneshot cas marker alpha"),
+        "the restarted daemon re-reads the attachment from the CAS for the history projection"
+    );
+    assert!(request_contains(&requests[1], "and again"));
+    drop(second_client);
+    second_task.shutdown_handle().request("test complete");
+    second_task.join().await.expect("second daemon joins");
+}

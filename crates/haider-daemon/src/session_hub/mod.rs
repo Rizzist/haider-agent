@@ -3231,6 +3231,20 @@ impl SessionHub {
         Ok(())
     }
 
+    /// Publishes the implicit `All` scope only after a new session creation
+    /// commits. This must never run for a receipt/idempotent replay: after a
+    /// restart the empty cache may hide a narrower durable scope. `or_insert`
+    /// also preserves a narrowing that races the fresh commit's publication.
+    pub(crate) fn cache_default_ssh_scope_after_create(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), SessionHubError> {
+        lock(&self.inner.ssh_scopes)?
+            .entry(session_id)
+            .or_insert(crate::ssh::SshScope::All);
+        Ok(())
+    }
+
     /// Snapshots the source scope and durably installs the exact same value
     /// for a candidate fork while holding the scope serialization lock. A
     /// missing source record legitimately decodes as historical `All`, but

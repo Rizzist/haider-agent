@@ -1,0 +1,432 @@
+{
+  "providers": [
+    {
+      "api_family": "anthropic_messages",
+      "auth_methods": [
+        "api_key"
+      ],
+      "auth_state": "missing",
+      "availability": "unavailable",
+      "availability_reason": "provider model inventory is unavailable",
+      "default_model": null,
+      "enabled": true,
+      "endpoint": "https://api.anthropic.com/v1/messages",
+      "fetched_at": "<volatile>",
+      "has_credential": false,
+      "inventory_age": "<volatile>",
+      "models": [],
+      "provider": "anthropic"
+    },
+    {
+      "api_family": "anthropic_messages",
+      "auth_methods": [
+        "oauth"
+      ],
+      "auth_state": "missing",
+      "availability": "unavailable",
+      "availability_reason": "provider model inventory is unavailable",
+      "default_model": null,
+      "enabled": true,
+      "endpoint": "https://api.anthropic.com",
+      "fetched_at": "<volatile>",
+      "has_credential": false,
+      "inventory_age": "<volatile>",
+      "models": [],
+      "provider": "anthropic-oauth"
+    },
+    {
+      "api_family": "anthropic_messages",
+      "auth_methods": [
+        "api_key"
+      ],
+      "auth_state": "missing",
+      "availability": "unavailable",
+      "availability_reason": "provider has no credential",
+      "default_model": "anthropic.claude-fable-5",
+      "enabled": true,
+      "endpoint": "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+      "fetched_at": "<volatile>",
+      "has_credential": false,
+      "inventory_age": "<volatile>",
+      "models": [
+        {
+          "context_window": null,
+          "default_effort": "high",
+          "model": "anthropic.claude-fable-5",
+          "supported_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": null,
+          "default_effort": "high",
+          "model": "anthropic.claude-opus-5",
+          "supported_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": null,
+          "default_effort": "high",
+          "model": "anthropic.claude-opus-4-8",
+          "supported_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": null,
+          "default_effort": "high",
+          "model": "anthropic.claude-opus-4-7",
+          "supported_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": null,
+          "default_effort": "high",
+          "model": "anthropic.claude-sonnet-5",
+          "supported_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": null,
+          "default_effort": null,
+          "model": "anthropic.claude-haiku-4-5",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        }
+      ],
+      "provider": "bedrock"
+    },
+    {
+      "api_family": "openai_chat_completions",
+      "auth_methods": [
+        "api_key"
+      ],
+      "auth_state": "missing",
+      "availability": "unavailable",
+      "availability_reason": "provider has no credential",
+      "default_model": "deepseek-chat",
+      "enabled": true,
+      "endpoint": "https://api.deepseek.com",
+      "fetched_at": "<volatile>",
+      "has_credential": false,
+      "inventory_age": "<volatile>",
+      "models": [
+        {
+          "context_window": null,
+          "default_effort": null,
+          "model": "deepseek-chat",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": null,
+          "default_effort": null,
+          "model": "deepseek-reasoner",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        }
+      ],
+      "provider": "deepseek"
+    },
+    {
+      "api_family": "gemini_generate_content",
+      "auth_methods": [
+        "api_key"
+      ],
+      "auth_state": "missing",
+      "availability": "unavailable",
+      "availability_reason": "provider model inventory is unavailable",
+      "default_model": null,
+      "enabled": true,
+      "endpoint": "https://generativelanguage.googleapis.com/v1beta",
+      "fetched_at": "<volatile>",
+      "has_credential": false,
+      "inventory_age": "<volatile>",
+      "models": [],
+      "provider": "gemini"
+    },
+    {
+      "api_family": "openai_chat_completions",
+      "auth_methods": [
+        "oauth"
+      ],
+      "auth_state": "missing",
+      "availability": "unavailable",
+      "availability_reason": "provider model inventory is unavailable",
+      "default_model": null,
+      "enabled": true,
+      "endpoint": "https://cli-chat-proxy.grok.com/v1",
+      "fetched_at": "<volatile>",
+      "has_credential": false,
+      "inventory_age": "<volatile>",
+      "models": [],
+      "provider": "grok-oauth"
+    },
+    {
+      "api_family": "openai_chat_completions",
+      "auth_methods": [
+        "api_key"
+      ],
+      "auth_state": "missing",
+      "availability": "unavailable",
+      "availability_reason": "provider has no credential",
+      "default_model": "Go",
+      "enabled": true,
+      "endpoint": "https://haidercode.ai/v1",
+      "fetched_at": "<volatile>",
+      "has_credential": false,
+      "inventory_age": "<volatile>",
+      "models": [
+        {
+          "context_window": null,
+          "default_effort": null,
+          "model": "Go",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": null,
+          "default_effort": null,
+          "model": "Go Max",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        }
+      ],
+      "provider": "haider-code"
+    },
+    {
+      "api_family": "openai_chat_completions",
+      "auth_methods": [
+        "oauth"
+      ],
+      "auth_state": "missing",
+      "availability": "unavailable",
+      "availability_reason": "provider model inventory is unavailable",
+      "default_model": null,
+      "enabled": true,
+      "endpoint": "https://api.kimi.com/coding/v1",
+      "fetched_at": "<volatile>",
+      "has_credential": false,
+      "inventory_age": "<volatile>",
+      "models": [],
+      "provider": "kimi-oauth"
+    },
+    {
+      "api_family": "openai_responses",
+      "auth_methods": [
+        "api_key"
+      ],
+      "auth_state": "missing",
+      "availability": "unavailable",
+      "availability_reason": "provider model inventory is unavailable",
+      "default_model": null,
+      "enabled": true,
+      "endpoint": "https://api.openai.com/v1/responses",
+      "fetched_at": "<volatile>",
+      "has_credential": false,
+      "inventory_age": "<volatile>",
+      "models": [],
+      "provider": "openai"
+    },
+    {
+      "api_family": "openai_chat_completions",
+      "auth_methods": [
+        "api_key"
+      ],
+      "auth_state": "missing",
+      "availability": "unavailable",
+      "availability_reason": "provider is disabled",
+      "default_model": null,
+      "enabled": false,
+      "endpoint": null,
+      "fetched_at": "<volatile>",
+      "has_credential": false,
+      "inventory_age": "<volatile>",
+      "models": [],
+      "provider": "openai-compatible"
+    },
+    {
+      "api_family": "openai_responses",
+      "auth_methods": [
+        "oauth"
+      ],
+      "auth_state": "missing",
+      "availability": "unavailable",
+      "availability_reason": "provider model inventory is unavailable",
+      "default_model": null,
+      "enabled": true,
+      "endpoint": "https://chatgpt.com/backend-api/codex/responses",
+      "fetched_at": "<volatile>",
+      "has_credential": false,
+      "inventory_age": "<volatile>",
+      "models": [],
+      "provider": "openai-oauth"
+    },
+    {
+      "api_family": "anthropic_messages",
+      "auth_methods": [
+        "api_key"
+      ],
+      "auth_state": "missing",
+      "availability": "unavailable",
+      "availability_reason": "provider endpoint is not configured",
+      "default_model": "claude-fable-5",
+      "enabled": true,
+      "endpoint": null,
+      "fetched_at": "<volatile>",
+      "has_credential": false,
+      "inventory_age": "<volatile>",
+      "models": [
+        {
+          "context_window": null,
+          "default_effort": "high",
+          "model": "claude-fable-5",
+          "supported_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": null,
+          "default_effort": "high",
+          "model": "claude-opus-5",
+          "supported_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": null,
+          "default_effort": "high",
+          "model": "claude-sonnet-5",
+          "supported_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": null,
+          "default_effort": null,
+          "model": "claude-sonnet-4-5@20250929",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": null,
+          "default_effort": null,
+          "model": "claude-haiku-4-5@20251001",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        }
+      ],
+      "provider": "vertex"
+    },
+    {
+      "api_family": "openai_chat_completions",
+      "auth_methods": [
+        "api_key"
+      ],
+      "auth_state": "missing",
+      "availability": "unavailable",
+      "availability_reason": "provider has no credential",
+      "default_model": "grok-4.6",
+      "enabled": true,
+      "endpoint": "https://api.x.ai/v1",
+      "fetched_at": "<volatile>",
+      "has_credential": false,
+      "inventory_age": "<volatile>",
+      "models": [
+        {
+          "context_window": 500000,
+          "default_effort": null,
+          "model": "grok-4.6",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 500000,
+          "default_effort": null,
+          "model": "grok-4.5",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 1000000,
+          "default_effort": null,
+          "model": "grok-4.3",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        },
+        {
+          "context_window": 256000,
+          "default_effort": null,
+          "model": "grok-build-0.1",
+          "supported_efforts": [],
+          "supported_speeds": [],
+          "supports_thinking_type": null
+        }
+      ],
+      "provider": "xai"
+    }
+  ],
+  "revision": 0,
+  "schema": "haider.models.v1"
+}
