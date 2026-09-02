@@ -8,7 +8,9 @@ use haider_protocol::project_instructions::{
     ProjectInstructionFileFact, ProjectInstructionsLoaded,
 };
 #[cfg(unix)]
-use rustix::fs::{FileType, Mode, OFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+#[cfg(unix)]
+use std::collections::VecDeque;
 use std::fs;
 use std::io::Read;
 #[cfg(unix)]
@@ -16,11 +18,17 @@ use std::os::fd::OwnedFd;
 #[cfg(unix)]
 use std::path::Component;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::{Mutex, OnceLock};
 
 #[cfg(unix)]
 type DirectoryHandle = OwnedFd;
 #[cfg(windows)]
 type DirectoryHandle = PathBuf;
+#[cfg(unix)]
+type DirectoryIdentity = (u64, u64);
+#[cfg(windows)]
+type DirectoryIdentity = PathBuf;
 #[cfg(unix)]
 type DirectoryOpenError = rustix::io::Errno;
 #[cfg(windows)]
@@ -30,6 +38,10 @@ pub(crate) const MAX_PROJECT_INSTRUCTION_FILE_BYTES: usize = 48 * 1024;
 pub(crate) const MAX_PROJECT_INSTRUCTION_TOTAL_BYTES: usize = 96 * 1024;
 pub(crate) const MAX_PROJECT_INSTRUCTION_ANCESTORS: usize = 256;
 const CANDIDATE_NAMES: [&str; 2] = ["HAIDER.md", "AGENTS.md"];
+#[cfg(unix)]
+const PROJECT_INSTRUCTION_CACHE_ENTRIES: usize = 4;
+#[cfg(unix)]
+const PROJECT_INSTRUCTION_CACHE_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct LoadedProjectInstructions {
@@ -91,13 +103,46 @@ pub(crate) async fn load(canonical_cwd: &str) -> Option<LoadedProjectInstruction
 }
 
 fn load_blocking(canonical_cwd: &Path) -> Option<LoadedProjectInstructions> {
-    let Some(mut directory) = open_canonical_directory(canonical_cwd) else {
+    #[cfg(unix)]
+    {
+        let before = discovery_stamp(canonical_cwd);
+        if let Some(stamp) = before.as_ref()
+            && let Some(loaded) = instruction_cache()
+                .lock_or_recover()
+                .lookup(canonical_cwd, stamp)
+        {
+            #[cfg(test)]
+            PROJECT_INSTRUCTION_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return loaded;
+        }
+
+        let loaded = load_uncached_blocking(canonical_cwd);
+        let after = discovery_stamp(canonical_cwd);
+        if let (Some(before), Some(after)) = (before, after)
+            && before == after
+        {
+            instruction_cache().lock_or_recover().insert(
+                canonical_cwd.to_path_buf(),
+                after,
+                loaded.clone(),
+            );
+        }
+        loaded
+    }
+
+    #[cfg(not(unix))]
+    load_uncached_blocking(canonical_cwd)
+}
+
+fn load_uncached_blocking(canonical_cwd: &Path) -> Option<LoadedProjectInstructions> {
+    let Some((mut directory, identities)) = open_canonical_directory_chain(canonical_cwd) else {
         instruction_notice(
             canonical_cwd,
             "workspace is not a canonical symlink-free directory",
         );
         return None;
     };
+    let mut identity_index = identities.len().checked_sub(1)?;
     let mut display_directory = canonical_cwd.to_path_buf();
     let mut nearest_first = Vec::new();
     let mut remaining = MAX_PROJECT_INSTRUCTION_TOTAL_BYTES;
@@ -122,6 +167,9 @@ fn load_blocking(canonical_cwd: &Path) -> Option<LoadedProjectInstructions> {
             CandidateRead::Missing | CandidateRead::Skipped => {}
         }
 
+        if identity_index == 0 {
+            break;
+        }
         let parent = match open_directory_at(&directory, Path::new("..")) {
             Ok(parent) => parent,
             Err(error) => {
@@ -132,21 +180,12 @@ fn load_blocking(canonical_cwd: &Path) -> Option<LoadedProjectInstructions> {
                 break;
             }
         };
-        if same_directory(&directory, &parent) {
-            break;
-        }
         if !display_directory.pop() {
             instruction_notice(&display_directory, "parent walk lost its absolute path");
             break;
         }
-        let Some(expected_parent) = open_canonical_directory(&display_directory) else {
-            instruction_notice(
-                &display_directory,
-                "parent changed or contains a symlink; upward walk stopped",
-            );
-            break;
-        };
-        if !same_directory(&parent, &expected_parent) {
+        identity_index = identity_index.saturating_sub(1);
+        if directory_identity(&parent).as_ref() != Some(&identities[identity_index]) {
             instruction_notice(
                 &display_directory,
                 "parent identity changed during upward walk",
@@ -155,7 +194,7 @@ fn load_blocking(canonical_cwd: &Path) -> Option<LoadedProjectInstructions> {
         }
         directory = parent;
 
-        if depth + 1 == MAX_PROJECT_INSTRUCTION_ANCESTORS {
+        if depth + 1 == MAX_PROJECT_INSTRUCTION_ANCESTORS && identity_index > 0 {
             push_budgeted_elision_marker(
                 &mut nearest_first,
                 &mut remaining,
@@ -175,6 +214,206 @@ fn load_blocking(canonical_cwd: &Path) -> Option<LoadedProjectInstructions> {
     (!nearest_first.is_empty()).then_some(LoadedProjectInstructions {
         files: nearest_first,
     })
+}
+
+#[cfg(unix)]
+#[derive(Clone, PartialEq, Eq)]
+struct DiscoveryStamp {
+    directories: Vec<DirectoryIdentity>,
+    candidates: Vec<[CandidateStamp; 2]>,
+    ancestor_depth_capped: bool,
+}
+
+#[cfg(unix)]
+#[derive(Clone, PartialEq, Eq)]
+enum CandidateStamp {
+    Missing,
+    Present {
+        device: u64,
+        inode: u64,
+        mode: u64,
+        size: u64,
+        modified_seconds: i64,
+        modified_nanoseconds: i64,
+        changed_seconds: i64,
+        changed_nanoseconds: i64,
+    },
+}
+
+#[cfg(unix)]
+fn discovery_stamp(canonical_cwd: &Path) -> Option<DiscoveryStamp> {
+    let (mut directory, identities) = open_canonical_directory_chain(canonical_cwd)?;
+    let mut identity_index = identities.len().checked_sub(1)?;
+    let mut directories = Vec::new();
+    let mut candidates = Vec::new();
+
+    for _ in 0..MAX_PROJECT_INSTRUCTION_ANCESTORS {
+        directories.push(identities[identity_index]);
+        candidates.push([
+            candidate_stamp(&directory, CANDIDATE_NAMES[0])?,
+            candidate_stamp(&directory, CANDIDATE_NAMES[1])?,
+        ]);
+        if identity_index == 0 {
+            break;
+        }
+        let parent = open_directory_at(&directory, Path::new("..")).ok()?;
+        identity_index = identity_index.saturating_sub(1);
+        if directory_identity(&parent).as_ref() != Some(&identities[identity_index]) {
+            return None;
+        }
+        directory = parent;
+    }
+
+    Some(DiscoveryStamp {
+        directories,
+        candidates,
+        ancestor_depth_capped: identity_index > 0,
+    })
+}
+
+#[cfg(unix)]
+fn candidate_stamp(directory: &DirectoryHandle, name: &str) -> Option<CandidateStamp> {
+    let metadata = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(metadata) => metadata,
+        Err(rustix::io::Errno::NOENT) => return Some(CandidateStamp::Missing),
+        Err(_) => return None,
+    };
+    Some(CandidateStamp::Present {
+        device: metadata.st_dev as u64,
+        inode: metadata.st_ino as u64,
+        mode: metadata.st_mode as u64,
+        size: metadata.st_size.max(0) as u64,
+        modified_seconds: metadata.st_mtime,
+        modified_nanoseconds: metadata.st_mtime_nsec as i64,
+        changed_seconds: metadata.st_ctime,
+        changed_nanoseconds: metadata.st_ctime_nsec as i64,
+    })
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct InstructionCacheEntry {
+    cwd: PathBuf,
+    stamp: DiscoveryStamp,
+    loaded: Option<LoadedProjectInstructions>,
+    retained_bytes: usize,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct InstructionCache {
+    entries: VecDeque<InstructionCacheEntry>,
+    retained_bytes: usize,
+}
+
+#[cfg(unix)]
+impl InstructionCache {
+    fn lookup(
+        &mut self,
+        cwd: &Path,
+        stamp: &DiscoveryStamp,
+    ) -> Option<Option<LoadedProjectInstructions>> {
+        let position = self.entries.iter().position(|entry| entry.cwd == cwd)?;
+        if self.entries[position].stamp != *stamp {
+            let removed = self.entries.remove(position)?;
+            self.retained_bytes = self.retained_bytes.saturating_sub(removed.retained_bytes);
+            return None;
+        }
+        let entry = self.entries.remove(position)?;
+        let loaded = entry.loaded.clone();
+        self.entries.push_back(entry);
+        Some(loaded)
+    }
+
+    fn insert(
+        &mut self,
+        cwd: PathBuf,
+        stamp: DiscoveryStamp,
+        loaded: Option<LoadedProjectInstructions>,
+    ) {
+        if let Some(position) = self.entries.iter().position(|entry| entry.cwd == cwd)
+            && let Some(removed) = self.entries.remove(position)
+        {
+            self.retained_bytes = self.retained_bytes.saturating_sub(removed.retained_bytes);
+        }
+        let retained_bytes = cache_entry_bytes(&cwd, &stamp, loaded.as_ref());
+        if retained_bytes > PROJECT_INSTRUCTION_CACHE_BYTES {
+            return;
+        }
+        while self.entries.len() >= PROJECT_INSTRUCTION_CACHE_ENTRIES
+            || self.retained_bytes.saturating_add(retained_bytes) > PROJECT_INSTRUCTION_CACHE_BYTES
+        {
+            let Some(removed) = self.entries.pop_front() else {
+                break;
+            };
+            self.retained_bytes = self.retained_bytes.saturating_sub(removed.retained_bytes);
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.entries.push_back(InstructionCacheEntry {
+            cwd,
+            stamp,
+            loaded,
+            retained_bytes,
+        });
+    }
+}
+
+#[cfg(unix)]
+fn cache_entry_bytes(
+    cwd: &Path,
+    stamp: &DiscoveryStamp,
+    loaded: Option<&LoadedProjectInstructions>,
+) -> usize {
+    let snapshot_bytes = loaded.map_or(0, |loaded| {
+        loaded
+            .files
+            .iter()
+            .map(|file| file.path.len() + file.text.len() + file.digest.len())
+            .sum()
+    });
+    cwd.as_os_str().len()
+        + snapshot_bytes
+        + stamp.directories.len() * std::mem::size_of::<DirectoryIdentity>()
+        + stamp.candidates.len() * std::mem::size_of::<[CandidateStamp; 2]>()
+}
+
+#[cfg(unix)]
+trait LockOrRecover<T> {
+    fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+#[cfg(unix)]
+impl<T> LockOrRecover<T> for Mutex<T> {
+    fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[cfg(unix)]
+fn instruction_cache() -> &'static Mutex<InstructionCache> {
+    static CACHE: OnceLock<Mutex<InstructionCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(InstructionCache::default()))
+}
+
+#[cfg(all(test, unix))]
+static PROJECT_INSTRUCTION_CACHE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(test, unix))]
+pub(crate) fn project_instruction_cache_hits() -> usize {
+    PROJECT_INSTRUCTION_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn project_instruction_cache_usage() -> (usize, usize) {
+    let cache = instruction_cache().lock_or_recover();
+    (cache.entries.len(), cache.retained_bytes)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn canonical_directory_chain_len(path: &Path) -> Option<usize> {
+    open_canonical_directory_chain(path).map(|(_, identities)| identities.len())
 }
 
 fn push_budgeted_elision_marker(
@@ -442,7 +681,9 @@ fn bounded_utf8(bytes: Vec<u8>, cap: usize) -> BoundedUtf8 {
 }
 
 #[cfg(unix)]
-fn open_canonical_directory(path: &Path) -> Option<DirectoryHandle> {
+fn open_canonical_directory_chain(
+    path: &Path,
+) -> Option<(DirectoryHandle, Vec<DirectoryIdentity>)> {
     if !path.is_absolute() || fs::canonicalize(path).ok().as_deref() != Some(path) {
         return None;
     }
@@ -453,13 +694,15 @@ fn open_canonical_directory(path: &Path) -> Option<DirectoryHandle> {
         Mode::empty(),
     )
     .ok()?;
+    let mut identities = vec![directory_identity(&directory)?];
     for component in path.components() {
         let Component::Normal(component) = component else {
             continue;
         };
         directory = open_directory_at(&directory, Path::new(component)).ok()?;
+        identities.push(directory_identity(&directory)?);
     }
-    Some(directory)
+    Some((directory, identities))
 }
 
 #[cfg(unix)]
@@ -476,22 +719,24 @@ fn open_directory_at(
 }
 
 #[cfg(unix)]
-fn same_directory(left: &DirectoryHandle, right: &DirectoryHandle) -> bool {
-    let (Ok(left), Ok(right)) = (rustix::fs::fstat(left), rustix::fs::fstat(right)) else {
-        return false;
-    };
-    left.st_dev == right.st_dev && left.st_ino == right.st_ino
+fn directory_identity(directory: &DirectoryHandle) -> Option<DirectoryIdentity> {
+    let metadata = rustix::fs::fstat(directory).ok()?;
+    Some((metadata.st_dev as u64, metadata.st_ino as u64))
 }
 
 #[cfg(windows)]
-fn open_canonical_directory(path: &Path) -> Option<DirectoryHandle> {
+fn open_canonical_directory_chain(
+    path: &Path,
+) -> Option<(DirectoryHandle, Vec<DirectoryIdentity>)> {
     if !path.is_absolute() || fs::canonicalize(path).ok().as_deref() != Some(path) {
         return None;
     }
     fs::symlink_metadata(path)
         .ok()
         .filter(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())?;
-    Some(path.to_path_buf())
+    let mut identities = path.ancestors().map(Path::to_path_buf).collect::<Vec<_>>();
+    identities.reverse();
+    Some((path.to_path_buf(), identities))
 }
 
 #[cfg(windows)]
@@ -509,8 +754,8 @@ fn open_directory_at(
 }
 
 #[cfg(windows)]
-fn same_directory(left: &DirectoryHandle, right: &DirectoryHandle) -> bool {
-    left == right
+fn directory_identity(directory: &DirectoryHandle) -> Option<DirectoryIdentity> {
+    Some(directory.clone())
 }
 
 fn instruction_notice(path: &Path, reason: &str) {

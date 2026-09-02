@@ -256,12 +256,21 @@ impl PromptHistoryCompiler {
         session_id: &SessionId,
     ) -> Result<Option<haider_protocol::context::ContextEconomy>, HaiderError> {
         let envelopes = read_all(store, session_id).await?;
+        Self::latest_context_economy_from_envelopes(&envelopes)
+    }
+
+    /// Reduces context-economy truth from an already validated exact journal
+    /// snapshot. Worker turn start uses this to share its single store read;
+    /// the standalone entry point above preserves the legacy store surface.
+    pub fn latest_context_economy_from_envelopes(
+        envelopes: &[RawEnvelope],
+    ) -> Result<Option<haider_protocol::context::ContextEconomy>, HaiderError> {
         let mut latest: Option<haider_protocol::context::ContextSavingsEvent> = None;
         let mut last_conversation = None;
         let mut last_output = None;
         for envelope in envelopes {
             let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
+                serde_json::from_value::<EventPayload>(envelope.payload.clone())
             else {
                 continue;
             };

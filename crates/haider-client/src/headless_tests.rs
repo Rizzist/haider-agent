@@ -1,11 +1,12 @@
 #![allow(clippy::expect_used)]
 
 use super::{
-    ApplyStatus, BufferedWireFrames, EnsureOptions, HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES,
-    HeadlessAttachment, HeadlessEvent, HeadlessEventLedgerWriter, HeadlessEventMode,
-    HeadlessEventOutput, HeadlessFailureCode, HeadlessInterrupt, HeadlessOutcome, HeadlessReducer,
-    HeadlessRunError, HeadlessRunEventStorage, HeadlessRunFailure, HeadlessSessionConfig,
-    HeadlessTerminalKind, headless_submit_body, load_attachment, load_pdf_attachment,
+    ApplyStatus, BufferedWireFrameStorage, BufferedWireFrames, EnsureOptions,
+    HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES, HeadlessAttachment, HeadlessEvent,
+    HeadlessEventLedgerWriter, HeadlessEventMode, HeadlessEventOutput, HeadlessFailureCode,
+    HeadlessInterrupt, HeadlessOutcome, HeadlessReducer, HeadlessRunError, HeadlessRunEventStorage,
+    HeadlessRunFailure, HeadlessSessionConfig, HeadlessTerminalKind, SUBMIT_RACE_MEMORY_MAX_FRAMES,
+    SUBMIT_RACE_MEMORY_THRESHOLD_BYTES, headless_submit_body, load_attachment, load_pdf_attachment,
     normalize_session_config_features, terminal_kind, try_take_pending_interrupt,
 };
 use haider_rpc::haider_protocol::EventPayload;
@@ -14,7 +15,7 @@ use haider_rpc::haider_protocol::error::ErrorCode;
 use haider_rpc::haider_protocol::headless::{HeadlessRunEventPayload, RunDeadlineExceededV1};
 use haider_rpc::haider_protocol::ids::{RunId, SessionId};
 use haider_rpc::haider_protocol::state::RunState;
-use haider_rpc::{CommandId, RequestBody};
+use haider_rpc::{AttachmentId, CommandId, RequestBody, WireFrame};
 
 #[test]
 fn pending_second_interrupt_is_consumed_before_terminal_drain() {
@@ -197,12 +198,96 @@ async fn timed_out_owned_daemon_reap_terminates_and_reaps_the_process_group() {
 #[test]
 fn empty_replay_buffer_is_lazy_even_when_read_or_cleared() {
     let mut buffered = BufferedWireFrames::new();
-    assert!(buffered.file.is_none());
-    assert!(buffered.cleanup.is_none());
+    assert!(matches!(
+        buffered.storage,
+        BufferedWireFrameStorage::Memory { .. }
+    ));
     assert_eq!(buffered.reader().expect("empty reader").count(), 0);
     buffered.clear().expect("clear empty replay buffer");
-    assert!(buffered.file.is_none());
-    assert!(buffered.cleanup.is_none());
+    assert!(matches!(
+        buffered.storage,
+        BufferedWireFrameStorage::Memory { .. }
+    ));
+}
+
+fn submit_race_frame(seq: u64, payload: serde_json::Value) -> WireFrame {
+    WireFrame::Event {
+        attachment_id: AttachmentId::new("submit-race-attachment"),
+        session_id: SessionId::new("spool-session"),
+        envelope: spool_test_envelope(seq, payload),
+    }
+}
+
+#[test]
+fn submit_race_buffer_keeps_the_normal_prefix_in_memory_and_move_replays_it() {
+    let frames = vec![
+        submit_race_frame(1, serde_json::json!({"type": "first"})),
+        submit_race_frame(2, serde_json::json!({"type": "second"})),
+    ];
+    let mut buffered = BufferedWireFrames::new();
+    for frame in frames.clone() {
+        buffered.push(frame).expect("buffer frame in memory");
+    }
+    assert!(matches!(
+        buffered.storage,
+        BufferedWireFrameStorage::Memory { .. }
+    ));
+    let replayed = buffered
+        .reader()
+        .expect("open memory reader")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("replay memory frames");
+    assert_eq!(replayed, frames);
+}
+
+#[test]
+fn submit_race_buffer_spills_large_or_overlong_prefixes_without_loss() {
+    let large = submit_race_frame(
+        1,
+        serde_json::json!({
+            "type": "large",
+            "value": "x".repeat(SUBMIT_RACE_MEMORY_THRESHOLD_BYTES)
+        }),
+    );
+    let mut large_buffer = BufferedWireFrames::new();
+    large_buffer.push(large.clone()).expect("spill large frame");
+    assert!(matches!(
+        large_buffer.storage,
+        BufferedWireFrameStorage::Spool { .. }
+    ));
+    assert_eq!(
+        large_buffer
+            .reader()
+            .expect("large spool reader")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("large spool replay"),
+        vec![large]
+    );
+
+    let frames = (1..=SUBMIT_RACE_MEMORY_MAX_FRAMES + 1)
+        .map(|seq| {
+            submit_race_frame(
+                u64::try_from(seq).expect("frame sequence"),
+                serde_json::json!({"type": "small"}),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut overlong = BufferedWireFrames::new();
+    for frame in frames.clone() {
+        overlong.push(frame).expect("buffer bounded prefix");
+    }
+    assert!(matches!(
+        overlong.storage,
+        BufferedWireFrameStorage::Spool { .. }
+    ));
+    assert_eq!(
+        overlong
+            .reader()
+            .expect("overlong spool reader")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("overlong spool replay"),
+        frames
+    );
 }
 
 /// MUTATION CHECK: omit the account-selection feature precondition. The

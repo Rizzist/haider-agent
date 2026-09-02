@@ -38,7 +38,7 @@ use haider_store::{
     SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
     SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
     ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
-    TurnCancelOutcome, TypedAgentInstallCas,
+    TurnCancelOutcome, TurnStartReadBundle, TypedAgentInstallCas,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
@@ -356,6 +356,17 @@ impl SqliteStoreHandle {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
         run_blocking(move || owner.with_store(|store| store.graph_status(&session_id))).await
+    }
+
+    /// Loads all read-only worker turn-start inputs in one blocking dispatch.
+    pub async fn turn_start_read_bundle(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<TurnStartReadBundle, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || owner.with_store(|store| store.turn_start_read_bundle(&session_id)))
+            .await
     }
 
     pub async fn workflow_graph_state(

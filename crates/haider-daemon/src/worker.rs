@@ -7179,6 +7179,23 @@ async fn refresh_context_economy(
     metadata: &haider_protocol::context::ContextEconomy,
 ) -> Result<haider_protocol::context::ContextEconomy, HaiderError> {
     let journal = PromptHistoryCompiler::latest_context_economy(lease, lease.session_id()).await?;
+    reconcile_and_heal_context_economy(lease, metadata, journal).await
+}
+
+async fn refresh_context_economy_from_snapshot(
+    lease: &HubStoreHandle,
+    metadata: &haider_protocol::context::ContextEconomy,
+    journal: &[RawEnvelope],
+) -> Result<haider_protocol::context::ContextEconomy, HaiderError> {
+    let journal = PromptHistoryCompiler::latest_context_economy_from_envelopes(journal)?;
+    reconcile_and_heal_context_economy(lease, metadata, journal).await
+}
+
+async fn reconcile_and_heal_context_economy(
+    lease: &HubStoreHandle,
+    metadata: &haider_protocol::context::ContextEconomy,
+    journal: Option<haider_protocol::context::ContextEconomy>,
+) -> Result<haider_protocol::context::ContextEconomy, HaiderError> {
     let (economy, heal_metadata) = reconcile_context_economy(metadata, journal)?;
     if heal_metadata {
         lease
@@ -7241,11 +7258,16 @@ async fn start_turn(
             trace
         })
     });
-    let headless = headless_run_context(lease, &accepted.run_id).await?;
+    let mut turn_start = lease.turn_start_read_bundle().await?;
+    let headless = headless_run_context_from_envelopes(&turn_start.journal, &accepted.run_id);
     let mut provider_deadline = headless.as_ref().and_then(provider_request_deadline);
     let mut pinned_metadata = metadata.clone();
-    pinned_metadata.context_economy =
-        refresh_context_economy(lease, &pinned_metadata.context_economy).await?;
+    pinned_metadata.context_economy = refresh_context_economy_from_snapshot(
+        lease,
+        &pinned_metadata.context_economy,
+        &turn_start.journal,
+    )
+    .await?;
     if let Some(context) = headless.as_ref() {
         let spec = &context.spec;
         pinned_metadata.provider.clone_from(&spec.provider);
@@ -7312,7 +7334,13 @@ async fn start_turn(
             false,
         )
     })?;
-    let delegation_record = delegation.record_for_session(lease.session_id()).await?;
+    let delegation_record = match turn_start.delegation.take() {
+        Some(record) => DelegationHandle::validate_turn_start_record(
+            record,
+            turn_start.parent_delegation.take(),
+        )?,
+        None => None,
+    };
     if let Some(record) = delegation_record.as_ref() {
         let (root_session_id, root_run_id) = root_budget_owner(&delegation, record.clone()).await?;
         let coordinator = match lease
@@ -7390,11 +7418,7 @@ async fn start_turn(
     // typed node: the pinned digest and current ready node are daemon truth.
     // Native graph.pin/switch applies to delegated sessions too, so graph
     // discovery cannot depend on the child's pre-existing spawn grant.
-    let graph_status = lease
-        .hub()
-        .graph_status(lease.session_id())
-        .await
-        .map_err(hub_error)?;
+    let graph_status = turn_start.graph_status.take();
     let loom_workflow = match graph_status.as_ref() {
         Some(status) => {
             lease
@@ -7623,7 +7647,14 @@ async fn start_turn(
         .account_alias
         .as_deref()
         .map(haider_protocol::ids::CredentialAlias::new);
-    let mut setup_reduction = reduce_turn_setup_journal(
+    turn_start.journal.retain(|envelope| {
+        envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| TURN_SETUP_REDUCTION_PAYLOAD_KINDS.contains(&kind))
+    });
+    let mut setup_reduction = reduce_turn_setup_journal_snapshot(
         lease,
         TurnSetupReductionSelector {
             run_id: accepted.run_id.clone(),
@@ -7634,6 +7665,8 @@ async fn start_turn(
             account_scope: account_scope.clone(),
             auth_scope: auth_scope.clone(),
         },
+        &turn_start.journal,
+        turn_start.observed_head,
     )
     .await?;
     journal_project_instructions_if_changed(
@@ -8896,6 +8929,67 @@ async fn reduce_turn_setup_journal_cached(
     }
 }
 
+async fn reduce_turn_setup_journal_snapshot(
+    store: &HubStoreHandle,
+    selector: TurnSetupReductionSelector,
+    envelopes: &[RawEnvelope],
+    observed_head: Option<(u64, EventId)>,
+) -> Result<TurnSetupReduction, HaiderError> {
+    reduce_turn_setup_journal_snapshot_cached(
+        store.session_id(),
+        store.turn_setup_reduction_cache(),
+        selector,
+        envelopes,
+        observed_head,
+    )
+    .await
+}
+
+async fn reduce_turn_setup_journal_snapshot_cached(
+    session_id: &SessionId,
+    cache: &TurnSetupReductionCache,
+    selector: TurnSetupReductionSelector,
+    envelopes: &[RawEnvelope],
+    observed_head: Option<(u64, EventId)>,
+) -> Result<TurnSetupReduction, HaiderError> {
+    let key = TurnSetupReductionKey::from(&selector);
+    let mut cached =
+        cache
+            .take(session_id, &key)
+            .await
+            .unwrap_or_else(|| CachedTurnSetupReduction {
+                last_touched: 0,
+                revision: None,
+                reduction: TurnSetupReduction::new(selector.clone()),
+            });
+    if cached.revision.is_some() {
+        cached.reduction.retarget(selector.clone());
+    } else {
+        cached.reduction = TurnSetupReduction::new(selector);
+    }
+    let observed_revision = observed_head.map(TurnSetupJournalRevision::from);
+    let cursor = match (&cached.revision, &observed_revision) {
+        (Some(expected), Some(observed))
+            if observed.head_seq > expected.head_seq || observed == expected =>
+        {
+            expected.head_seq
+        }
+        (Some(_), _) => {
+            cached.revision = None;
+            cached.reduction = TurnSetupReduction::new(cached.reduction.selector.clone());
+            0
+        }
+        (None, _) => 0,
+    };
+    for envelope in envelopes.iter().filter(|envelope| envelope.seq > cursor) {
+        cached.reduction.observe_envelope(envelope.clone())?;
+    }
+    cached.revision = observed_revision;
+    let reduction = cached.reduction.clone();
+    cache.install(session_id.clone(), key, cached).await;
+    Ok(reduction)
+}
+
 fn inherited_fork_cache_segment(record: SessionForked) -> Option<ForkCacheSegmentV1> {
     if record.context_epoch != ForkContextEpoch::Inherited {
         return None;
@@ -9595,50 +9689,59 @@ async fn headless_run_context(
     run_id: &RunId,
 ) -> Result<Option<DurableHeadlessRunContext>, HaiderError> {
     let mut cursor = 0_u64;
-    let mut accepted_at_ms = None;
-    let mut branch_id = None;
-    let mut spec = None;
-    let mut exhausted = None;
-    let mut deadline_exceeded = None;
+    let mut envelopes = Vec::new();
     loop {
         let page = store.read(store.session_id(), cursor, 256).await?;
         if page.is_empty() {
             break;
         }
         let page_len = page.len();
-        for envelope in page {
-            cursor = envelope.seq;
-            if envelope.run_id.as_ref() != Some(run_id) {
-                continue;
-            }
-            if accepted_at_ms.is_none() {
-                accepted_at_ms = Some(envelope.committed_at_ms);
-                branch_id = envelope.branch_id.clone();
-            }
-            match HeadlessRunEventPayload::from_payload_value(&envelope.payload) {
-                Some(HeadlessRunEventPayload::HeadlessRunConfigured(configured)) => {
-                    spec = Some(configured);
-                }
-                Some(HeadlessRunEventPayload::RunBudgetExhausted(fact)) => {
-                    exhausted = Some(fact);
-                }
-                Some(HeadlessRunEventPayload::RunDeadlineExceeded(fact)) => {
-                    deadline_exceeded = Some(fact);
-                }
-                None => {}
-            }
-        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        envelopes.extend(page);
         if page_len < 256 {
             break;
         }
     }
-    Ok(spec.map(|spec| DurableHeadlessRunContext {
+    Ok(headless_run_context_from_envelopes(&envelopes, run_id))
+}
+
+fn headless_run_context_from_envelopes(
+    envelopes: &[RawEnvelope],
+    run_id: &RunId,
+) -> Option<DurableHeadlessRunContext> {
+    let mut accepted_at_ms = None;
+    let mut branch_id = None;
+    let mut spec = None;
+    let mut exhausted = None;
+    let mut deadline_exceeded = None;
+    for envelope in envelopes {
+        if envelope.run_id.as_ref() != Some(run_id) {
+            continue;
+        }
+        if accepted_at_ms.is_none() {
+            accepted_at_ms = Some(envelope.committed_at_ms);
+            branch_id = envelope.branch_id.clone();
+        }
+        match HeadlessRunEventPayload::from_payload_value(&envelope.payload) {
+            Some(HeadlessRunEventPayload::HeadlessRunConfigured(configured)) => {
+                spec = Some(configured);
+            }
+            Some(HeadlessRunEventPayload::RunBudgetExhausted(fact)) => {
+                exhausted = Some(fact);
+            }
+            Some(HeadlessRunEventPayload::RunDeadlineExceeded(fact)) => {
+                deadline_exceeded = Some(fact);
+            }
+            None => {}
+        }
+    }
+    spec.map(|spec| DurableHeadlessRunContext {
         spec,
         accepted_at_ms: accepted_at_ms.unwrap_or(0),
         branch_id,
         exhausted,
         deadline_exceeded,
-    }))
+    })
 }
 
 async fn headless_run_context_for_session(

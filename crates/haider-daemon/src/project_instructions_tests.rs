@@ -4,6 +4,10 @@ use crate::project_instructions::{
     MAX_PROJECT_INSTRUCTION_ANCESTORS, MAX_PROJECT_INSTRUCTION_FILE_BYTES,
     MAX_PROJECT_INSTRUCTION_TOTAL_BYTES, load,
 };
+#[cfg(unix)]
+use crate::project_instructions::{
+    canonical_directory_chain_len, project_instruction_cache_hits, project_instruction_cache_usage,
+};
 use crate::session_hub::{SessionHub, SessionHubConfig};
 use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
 use crate::worker::{
@@ -444,6 +448,66 @@ async fn nearest_instructions_compose_last_and_haider_wins_within_directory() {
         assert!(prompt.contains(&format!("Project instructions ({}):", file.path)));
     }
     assert!(prompt.find("parent-haider") < prompt.find("nearest-agents"));
+}
+
+/// MUTATION CHECK: reintroduce the per-ancestor root-prefix reopen or reuse a
+/// cache entry without checking every candidate stamp. Expected RUNTIME
+/// failure: the chain has duplicate/missing identities, the second load misses
+/// the cache, or a same-sized edit/deletion remains stale.
+#[tokio::test]
+async fn linear_walk_cache_is_bounded_and_loss_detecting() {
+    let root = tempfile::tempdir().expect("workspace");
+    let nested = root.path().join("a").join("b").join("c");
+    std::fs::create_dir_all(&nested).expect("nested workspace");
+    let instruction = root.path().join("HAIDER.md");
+    std::fs::write(&instruction, "fact-alpha").expect("initial instructions");
+    let canonical = std::fs::canonicalize(&nested).expect("canonical nested workspace");
+    #[cfg(unix)]
+    {
+        let expected_chain_len = canonical
+            .components()
+            .filter(|component| matches!(component, std::path::Component::Normal(_)))
+            .count()
+            + 1;
+        assert_eq!(
+            canonical_directory_chain_len(&canonical),
+            Some(expected_chain_len),
+            "one anchored identity is retained for root and each path component"
+        );
+    }
+    let canonical = canonical.to_str().expect("UTF-8 workspace");
+
+    let first = load(canonical).await.expect("first snapshot");
+    #[cfg(unix)]
+    let hits_before = project_instruction_cache_hits();
+    let second = load(canonical).await.expect("cached snapshot");
+    assert!(first == second);
+    #[cfg(unix)]
+    assert!(
+        project_instruction_cache_hits() > hits_before,
+        "an unchanged cwd reuses its bounded snapshot"
+    );
+
+    std::fs::write(&instruction, "fact-bravo").expect("same-sized edit");
+    let edited = load(canonical).await.expect("edited snapshot");
+    assert!(edited.files().iter().any(|file| file.text == "fact-bravo"));
+    assert!(edited.files().iter().all(|file| file.text != "fact-alpha"));
+
+    std::fs::remove_file(&instruction).expect("delete instructions");
+    let deleted = load(canonical).await;
+    assert!(deleted.as_ref().is_none_or(|loaded| {
+        loaded.files().iter().all(|file| {
+            !file
+                .path
+                .starts_with(root.path().to_str().expect("UTF-8 root"))
+        })
+    }));
+    #[cfg(unix)]
+    {
+        let (entries, retained_bytes) = project_instruction_cache_usage();
+        assert!(entries <= 4);
+        assert!(retained_bytes <= 256 * 1024);
+    }
 }
 
 /// MUTATION CHECK: truncate bytes without reserving the marker or split a
