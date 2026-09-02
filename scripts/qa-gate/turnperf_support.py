@@ -11,23 +11,30 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import stat
 import statistics
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 try:
     import resource
 except ImportError:  # pragma: no cover - Windows reports zero resource counters
     resource = None  # type: ignore[assignment]
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no POSIX profile lock
+    fcntl = None  # type: ignore[assignment]
+
 
 PROVIDER_ID = "turnperf-proxy"
 MODEL_ID = "turnperf-model"
 TRACE_ENV = "HAIDER_DAEMON_TRACE"
+CLIENT_TRACE_ENV = "HAIDER_CLIENT_LIFECYCLE_TRACE"
 BOUNDARY_FILE_ENV = "HAIDER_TEST_JOURNAL_BOUNDARY_FILE"
 BOUNDARY_TARGET_ENV = "HAIDER_TEST_JOURNAL_KILL_AFTER"
 TERMINAL_STATES = frozenset(("done", "errored", "cancelled"))
@@ -48,6 +55,8 @@ class CommandResult:
     child_peak_rss_kib: int
     observed_peak_rss_kib: int
     combined_peak_rss_kib: int
+    ended_unix_micros: int
+    observed_pid: int | None
     timed_out: bool = False
 
 
@@ -58,6 +67,7 @@ def run_command(
     cwd: Path,
     timeout: float,
     observe_pid: int | None = None,
+    observe_pid_resolver: Callable[[], int | None] | None = None,
 ) -> CommandResult:
     command = tuple(os.fspath(value) for value in argv)
     before_usage = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
@@ -77,15 +87,22 @@ def run_command(
     sampled_peak_rss_kib = 0
     sampled_observed_peak_rss_kib = 0
     sampled_combined_peak_rss_kib = 0
+    sampled_observed_pid = observe_pid
     sampling_done = threading.Event()
 
     def sample_peak() -> None:
         nonlocal sampled_peak_rss_kib
         nonlocal sampled_observed_peak_rss_kib
         nonlocal sampled_combined_peak_rss_kib
+        nonlocal sampled_observed_pid
         while not sampling_done.is_set():
             value = process_rss_kib(process.pid)
-            observed = process_rss_kib(observe_pid) if observe_pid is not None else 0
+            dynamic_pid = observe_pid
+            if dynamic_pid is None and observe_pid_resolver is not None:
+                dynamic_pid = observe_pid_resolver()
+            if dynamic_pid is not None:
+                sampled_observed_pid = dynamic_pid
+            observed = process_rss_kib(dynamic_pid) if dynamic_pid is not None else 0
             with peak_lock:
                 sampled_peak_rss_kib = max(sampled_peak_rss_kib, value)
                 sampled_observed_peak_rss_kib = max(
@@ -111,6 +128,7 @@ def run_command(
     sampling_done.set()
     sampler.join(timeout=1)
     ended = time.monotonic_ns()
+    ended_unix_micros = time.time_ns() // 1_000
     after_usage = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
     cpu_ms = 0.0
     peak_rss_kib = sampled_peak_rss_kib
@@ -132,6 +150,8 @@ def run_command(
         child_peak_rss_kib=peak_rss_kib,
         observed_peak_rss_kib=sampled_observed_peak_rss_kib,
         combined_peak_rss_kib=sampled_combined_peak_rss_kib,
+        ended_unix_micros=ended_unix_micros,
+        observed_pid=sampled_observed_pid,
         timed_out=timed_out,
     )
 
@@ -511,7 +531,7 @@ class ThrowawayProfile:
         self.haiderd = self.bin_dir / ("haiderd.exe" if os.name == "nt" else "haiderd")
         if not self.haider.is_file() or not self.haiderd.is_file():
             raise ProofError(f"installed haider/haiderd pair missing under {self.bin_dir}")
-        self.root = root or Path(tempfile.mkdtemp(prefix="htp-", dir="/tmp"))
+        self.root = root or Path(tempfile.mkdtemp(prefix="htp-"))
         self.profile = self.root / "p"
         self.runtime = self.root / "r"
         self.home = self.root / "h"
@@ -573,6 +593,7 @@ class ThrowawayProfile:
         timeout: float = 30,
         overrides: Mapping[str, str | None] | None = None,
         observe_pid: int | None = None,
+        observe_spawned_daemon: bool = False,
     ) -> CommandResult:
         environment = self.env.copy()
         for key, value in (overrides or {}).items():
@@ -586,6 +607,11 @@ class ThrowawayProfile:
             cwd=self.workspace,
             timeout=timeout,
             observe_pid=observe_pid,
+            observe_pid_resolver=(
+                lambda: profile_daemon_pid(self.profile)
+                if observe_spawned_daemon
+                else None
+            ),
         )
 
     def ready(self, overrides: Mapping[str, str | None] | None = None) -> None:
@@ -621,8 +647,51 @@ class ThrowawayProfile:
     def stop(self) -> CommandResult:
         return self.command(["daemon", "stop", "--json"], timeout=30)
 
-    def dispose(self) -> None:
-        shutil.rmtree(self.root, ignore_errors=True)
+    def dispose(
+        self,
+        *,
+        observed_pid: int | None = None,
+        remove_root: bool = True,
+    ) -> None:
+        """Stop only this profile's daemon, prove release, then remove its files."""
+        owner_pid = profile_daemon_pid(self.profile)
+        if owner_pid is not None and process_is_alive(owner_pid):
+            try:
+                self.stop()
+            except (OSError, ProofError):
+                pass
+            wait_pid_gone(owner_pid, 2)
+
+        owner_pid = profile_daemon_pid(self.profile)
+        if owner_pid is not None and process_is_alive(owner_pid):
+            # The PID remains tied to this exact profile by lock.owner. Never
+            # signal a process discovered by name, port, or a broad scan.
+            try:
+                os.kill(owner_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            if not wait_pid_gone(owner_pid, 2) and hasattr(signal, "SIGKILL"):
+                try:
+                    os.kill(owner_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                wait_pid_gone(owner_pid, 2)
+
+        failures: list[str] = []
+        if observed_pid is not None and process_is_alive(observed_pid):
+            failures.append(f"observed daemon pid remains alive: {observed_pid}")
+        final_owner = profile_daemon_pid(self.profile)
+        if final_owner is not None and process_is_alive(final_owner):
+            failures.append(f"profile owner remains alive: {final_owner}")
+        if not profile_lock_is_free(self.profile):
+            failures.append("profile lifetime lock remains held")
+        sockets = runtime_socket_paths(self.runtime)
+        if sockets:
+            failures.append(f"runtime sockets remain: {[str(path) for path in sockets]}")
+        if failures:
+            raise ProofError("exact profile cleanup failed: " + "; ".join(failures))
+        if remove_root:
+            shutil.rmtree(self.root)
 
 
 def run_arguments(shape: str) -> list[str]:
@@ -642,6 +711,77 @@ def run_arguments(shape: str) -> list[str]:
     if shape == "tool":
         arguments.extend(("--auto-allow", "--allow-writes", "--allow-exec"))
     return arguments
+
+
+def profile_daemon_pid(profile: Path) -> int | None:
+    """Read the diagnostic owner PID without treating it as authority."""
+    try:
+        lines = (profile / "lock.owner").read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if not line.startswith("pid="):
+            continue
+        try:
+            pid = int(line.removeprefix("pid=").strip())
+        except ValueError:
+            return None
+        return pid if pid > 0 else None
+    return None
+
+
+def process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def wait_pid_gone(pid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not process_is_alive(pid):
+            return True
+        time.sleep(0.01)
+    return not process_is_alive(pid)
+
+
+def profile_lock_is_free(profile: Path) -> bool:
+    """Probe the real profile lock without creating or mutating it."""
+    lock_path = profile / "lock"
+    if not lock_path.exists():
+        return True
+    if fcntl is None:
+        # Windows exclusion is a mandatory file lock and cannot be probed
+        # portably from the Python stdlib without mutating the empty lock file.
+        return True
+    try:
+        with lock_path.open("r+b", buffering=0) as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, BlockingIOError):
+        return False
+    return True
+
+
+def runtime_socket_paths(runtime: Path) -> list[Path]:
+    if os.name != "posix" or not runtime.exists():
+        return []
+    sockets: list[Path] = []
+    for path in runtime.rglob("*"):
+        try:
+            if stat.S_ISSOCK(path.lstat().st_mode):
+                sockets.append(path)
+        except OSError:
+            continue
+    return sockets
 
 
 def validate_jsonl(stdout: str, shape: str) -> dict[str, Any]:

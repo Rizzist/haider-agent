@@ -223,6 +223,109 @@ fn cache_diagnostic_key_is_persistent_exact_length_and_private() {
     }
 }
 
+/// R2-18 hold-out pin: the known-zero probe elision regressed and was
+/// reverted. A fresh session still attaches at its exact durable head, replays
+/// Created at sequence 1, and an absent durable head remains typed NotFound.
+#[tokio::test]
+async fn r2_18_fresh_actor_and_attach_preserve_exact_head_semantics() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub opens");
+    let session_id = SessionId::new("r2-18-fresh-head");
+    hub.create_internal_session(create_command(&session_id, "r2-18-fresh-head"))
+        .await
+        .expect("fresh session commits");
+    assert_eq!(
+        store.latest_seq(&session_id).await.expect("durable head"),
+        1
+    );
+
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::View]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("view connection");
+    sink.0.lock().expect("frames").clear();
+    connection
+        .request(
+            RequestId::new("r2-18-attach"),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: 0,
+                mode: AttachMode::View,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("fresh attach");
+    // Registry #94: 5s = 50 * 100ms CI scheduling quanta for one in-process
+    // attach publication; this loop contains no nested process deadline.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if sink.0.lock().expect("frames").iter().any(|frame| {
+                matches!(
+                    frame,
+                    WireFrame::AttachCaughtUp {
+                        high_water_seq: 1,
+                        ..
+                    }
+                )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fresh attach catches up");
+    {
+        let frames = sink.0.lock().expect("frames");
+        assert!(frames.iter().any(|frame| matches!(
+            frame,
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionAttach { attach_state, .. },
+            } if request_id.as_str() == "r2-18-attach"
+                && attach_state.replay_through_seq == 1
+        )));
+        assert!(frames.iter().any(|frame| matches!(
+            frame,
+            WireFrame::Event { envelope, .. }
+                if envelope.session_id == session_id && envelope.seq == 1
+        )));
+    }
+
+    connection
+        .request(
+            RequestId::new("r2-18-missing"),
+            RequestBody::SessionAttach {
+                session_id: SessionId::new("r2-18-missing-head"),
+                after_seq: 0,
+                mode: AttachMode::View,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("missing attach response");
+    assert!(sink.0.lock().expect("frames").iter().any(|frame| matches!(
+        frame,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::Error { code, .. },
+        } if request_id.as_str() == "r2-18-missing"
+            && code == haider_rpc::ERROR_CODE_NOT_FOUND
+    )));
+
+    drop(connection);
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 /// CG-M1 LAW: an open VERIFY obligation is graph-local state, not a session
 /// park. An ordinary turn acceptance still commits its normal queued/user
 /// facts and never synthesizes a graph-specific run wait state.
@@ -1755,6 +1858,327 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
     drop(connection);
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
+}
+
+/// R2-03: absent storage is the canonical default `All` scope. A later
+/// narrowing must survive exact create-receipt replay, while an explicitly
+/// non-default create still persists its scope before returning.
+#[tokio::test]
+async fn r2_03_default_scope_is_absent_and_create_replay_never_reopens_it() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let vault: Arc<dyn haider_accounts::Vault> = Arc::new(haider_accounts::MemoryVault::default());
+    let mut provider = provider_summary("fake");
+    provider.models = vec!["fake-v1".into()];
+    provider.default_model = Some("fake-v1".into());
+    hub.install_accounts(crate::accounts::AccountsFacade {
+        login: None,
+        oauth: None,
+        snapshot: Arc::new(Mutex::new(Vec::new())),
+        management: crate::accounts::ManagementSnapshot::new(0, Vec::new(), vec![provider]),
+        vault_supported: true,
+        discovery_disabled: true,
+        device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+        vault: Some(vault.clone()),
+    })
+    .expect("accounts install");
+    hub.install_creatable_providers(std::collections::BTreeSet::from(["fake".into()]))
+        .expect("creatable provider install");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::Control,
+                haider_rpc::Capability::View,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("create connection");
+    sink.0.lock().expect("frames").clear();
+    let cwd = std::env::current_dir()
+        .expect("cwd")
+        .to_string_lossy()
+        .into_owned();
+    let create = |command_id: &str, ssh_scope| RequestBody::SessionCreateWithPermissionOverrides {
+        command_id: haider_rpc::CommandId::new(command_id),
+        cwd: cwd.clone(),
+        provider: "fake".into(),
+        model: "fake-v1".into(),
+        max_tokens: 4_096,
+        permission_overrides: None,
+        cache_policy: None,
+        interaction_mode: haider_protocol::session::SessionInteractionModeV1::Autonomous,
+        ssh_scope,
+        account_alias: None,
+        resolve_provider: false,
+        resolve_model: false,
+        effort: None,
+        fast: None,
+    };
+    let response_session = |sink: &CapturingFrameSink, request_id: &str| {
+        sink.0
+            .lock()
+            .expect("frames")
+            .iter()
+            .find_map(|frame| match frame {
+                WireFrame::Response {
+                    request_id: seen,
+                    body: ResponseBody::SessionCreate { session_id, .. },
+                } if seen.as_str() == request_id => Some(session_id.clone()),
+                _ => None,
+            })
+            .expect("session.create response")
+    };
+    let scopes = crate::ssh::SshProfileStore::new(vault.clone());
+
+    connection
+        .request(
+            RequestId::new("default-scope-create"),
+            create("default-scope-command", None),
+        )
+        .await
+        .expect("default create");
+    let default_session = response_session(&sink, "default-scope-create");
+    assert_eq!(
+        lock(&hub.inner.ssh_scopes)
+            .expect("scope cache")
+            .get(&default_session),
+        Some(&crate::ssh::SshScope::All),
+        "a committed default scope must be cached without a vault write"
+    );
+    assert_eq!(
+        scopes
+            .session_scope_if_present(&default_session)
+            .expect("read default scope"),
+        None,
+        "default All must have no durable row"
+    );
+
+    hub.set_ssh_scope(default_session.clone(), crate::ssh::SshScope::None)
+        .expect("later narrowing");
+    connection
+        .request(
+            RequestId::new("default-scope-replay"),
+            create("default-scope-command", None),
+        )
+        .await
+        .expect("create receipt replay");
+    assert_eq!(
+        response_session(&sink, "default-scope-replay"),
+        default_session
+    );
+    assert_eq!(
+        scopes
+            .session_scope_if_present(&default_session)
+            .expect("read narrowed scope"),
+        Some(crate::ssh::SshScope::None),
+        "create replay must not apply its original default scope"
+    );
+
+    connection
+        .request(
+            RequestId::new("explicit-scope-create"),
+            create(
+                "explicit-scope-command",
+                Some(haider_rpc::SshScopeWire::None),
+            ),
+        )
+        .await
+        .expect("explicit scope create");
+    let explicit_session = response_session(&sink, "explicit-scope-create");
+    assert_eq!(
+        scopes
+            .session_scope_if_present(&explicit_session)
+            .expect("read explicit scope"),
+        Some(crate::ssh::SshScope::None)
+    );
+    connection
+        .request(
+            RequestId::new("explicit-scope-replay"),
+            create(
+                "explicit-scope-command",
+                Some(haider_rpc::SshScopeWire::None),
+            ),
+        )
+        .await
+        .expect("explicit scope replay");
+    assert_eq!(
+        response_session(&sink, "explicit-scope-replay"),
+        explicit_session
+    );
+    assert_eq!(
+        scopes
+            .session_scope_if_present(&explicit_session)
+            .expect("read replayed explicit scope"),
+        Some(crate::ssh::SshScope::None)
+    );
+
+    drop(connection);
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+
+    let restarted_store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("restarted store");
+    let restarted_hub = SessionHub::new(restarted_store.clone(), SessionHubConfig::default())
+        .expect("restarted hub");
+    let mut restarted_provider = provider_summary("fake");
+    restarted_provider.models = vec!["fake-v1".into()];
+    restarted_provider.default_model = Some("fake-v1".into());
+    restarted_hub
+        .install_accounts(crate::accounts::AccountsFacade {
+            login: None,
+            oauth: None,
+            snapshot: Arc::new(Mutex::new(Vec::new())),
+            management: crate::accounts::ManagementSnapshot::new(
+                0,
+                Vec::new(),
+                vec![restarted_provider],
+            ),
+            vault_supported: true,
+            discovery_disabled: true,
+            device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+            vault: Some(vault),
+        })
+        .expect("restarted accounts install");
+    restarted_hub
+        .install_creatable_providers(std::collections::BTreeSet::from(["fake".into()]))
+        .expect("restarted creatable provider install");
+    let restarted_sink = Arc::new(CapturingFrameSink::default());
+    let restarted_connection = restarted_hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::Control,
+                haider_rpc::Capability::View,
+            ]),
+            restarted_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("restarted connection");
+    restarted_sink.0.lock().expect("restarted frames").clear();
+    restarted_connection
+        .request(
+            RequestId::new("default-scope-replay-after-restart"),
+            create("default-scope-command", None),
+        )
+        .await
+        .expect("create receipt replay after restart");
+    assert_eq!(
+        response_session(&restarted_sink, "default-scope-replay-after-restart"),
+        default_session
+    );
+    assert!(
+        lock(&restarted_hub.inner.ssh_scopes)
+            .expect("restarted scope cache")
+            .get(&default_session)
+            .is_none(),
+        "receipt replay after restart must not synthesize default All in an empty cache"
+    );
+    assert_eq!(
+        restarted_hub
+            .ssh_scope(&default_session)
+            .expect("load restarted durable scope"),
+        crate::ssh::SshScope::None,
+        "receipt replay after restart must preserve a later durable narrowing"
+    );
+    drop(restarted_connection);
+    restarted_hub
+        .shutdown()
+        .await
+        .expect("restarted hub shutdown");
+    restarted_store
+        .close()
+        .await
+        .expect("restarted store close");
+
+    let failure_root = tempfile::tempdir().expect("failure profile");
+    let failure_store = SqliteStoreHandle::open(failure_root.path())
+        .await
+        .expect("failure store");
+    let failure_hub =
+        SessionHub::new(failure_store.clone(), SessionHubConfig::default()).expect("failure hub");
+    let failure_vault = Arc::new(FailingScopePutVault {
+        inner: haider_accounts::MemoryVault::default(),
+        fail_scope_put: AtomicBool::new(true),
+    });
+    let mut failure_provider = provider_summary("fake");
+    failure_provider.models = vec!["fake-v1".into()];
+    failure_provider.default_model = Some("fake-v1".into());
+    failure_hub
+        .install_accounts(crate::accounts::AccountsFacade {
+            login: None,
+            oauth: None,
+            snapshot: Arc::new(Mutex::new(Vec::new())),
+            management: crate::accounts::ManagementSnapshot::new(
+                0,
+                Vec::new(),
+                vec![failure_provider],
+            ),
+            vault_supported: true,
+            discovery_disabled: true,
+            device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+            vault: Some(failure_vault.clone()),
+        })
+        .expect("failure accounts install");
+    failure_hub
+        .install_creatable_providers(std::collections::BTreeSet::from(["fake".into()]))
+        .expect("failure creatable provider install");
+    let failure_sink = Arc::new(CapturingFrameSink::default());
+    let failure_connection = failure_hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::Control,
+                haider_rpc::Capability::View,
+            ]),
+            failure_sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("failure connection");
+    failure_sink.0.lock().expect("failure frames").clear();
+    let sessions_before = failure_store.session_ids().await.expect("sessions before");
+    let failure = failure_connection
+        .request(
+            RequestId::new("explicit-scope-failure"),
+            create(
+                "explicit-scope-failure-command",
+                Some(haider_rpc::SshScopeWire::None),
+            ),
+        )
+        .await
+        .expect_err("scope persistence failure must fail the create request");
+    assert!(
+        failure
+            .to_string()
+            .contains("injected SSH scope persistence failure")
+    );
+    assert!(
+        failure_sink.0.lock().expect("failure frames").is_empty(),
+        "a failed previsibility create must publish no session response"
+    );
+    assert_eq!(
+        failure_store.session_ids().await.expect("sessions after"),
+        sessions_before,
+        "scope persistence failure must precede durable session visibility"
+    );
+    assert!(
+        lock(&failure_hub.inner.actors)
+            .expect("failure actors")
+            .is_empty(),
+        "scope persistence failure must precede actor visibility"
+    );
+    assert!(
+        failure_vault
+            .list()
+            .expect("failure vault aliases")
+            .iter()
+            .all(|alias| !alias.as_str().starts_with("haider.ssh.scope.")),
+        "a failed previsibility scope write must leave no vault row"
+    );
+    drop(failure_connection);
+    failure_hub.shutdown().await.expect("failure hub shutdown");
+    failure_store.close().await.expect("failure store close");
 }
 
 /// The durable child row is not the roster linearization point. While a fork

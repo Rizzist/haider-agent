@@ -111,7 +111,7 @@ pub use spawn::{
     DaemonLifetime, DaemonOwnershipToken, EnsureError, EnsureOptions, EnsuredDaemon,
     MAX_AUTOSPAWN_DAEMON_IDLE_TTL_MS, RACE_LOSER_EXIT_CODE, STARTUP_DEADLINE,
     autospawn_daemon_lifetime, ensure_daemon, required_live_features, signal_authenticated_peer,
-    spawn_daemon_retained,
+    spawn_daemon_retained, take_spawn_ready_trace,
 };
 pub use ssh_profiles::{
     SshProfiles, SshProfilesClientError, ssh_list_response, ssh_profiles, ssh_profiles_available,

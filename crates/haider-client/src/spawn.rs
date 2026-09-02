@@ -24,6 +24,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::{Child, ExitStatus};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use haider_rpc::{
@@ -34,6 +35,16 @@ use tokio::time::{Instant, sleep};
 
 use crate::client::{ClientConfig, ConnectError, Connected, connect};
 use crate::profile::ResolvedProfile;
+
+static SPAWN_READY_TRACE: Mutex<Option<(u128, u128)>> = Mutex::new(None);
+
+/// Takes the launcher-owned spawn-to-Ready timestamp, if client lifecycle
+/// tracing recorded one for this process. The CLI output adapter owns stderr,
+/// so it emits the marker without cross-thread lock inversion.
+#[doc(hidden)]
+pub fn take_spawn_ready_trace() -> Option<(u128, u128)> {
+    SPAWN_READY_TRACE.lock().ok()?.take()
+}
 
 /// Feature families bare `haider` requires for live turns (R7).
 ///
@@ -410,6 +421,11 @@ pub async fn ensure_daemon(
     profile: &ResolvedProfile,
     options: EnsureOptions,
 ) -> Result<EnsuredDaemon, EnsureError> {
+    let trace_enabled = matches!(
+        std::env::var_os("HAIDER_DAEMON_TRACE").as_deref(), Some(value) if value == "1"
+    ) || matches!(
+        std::env::var_os("HAIDER_CLIENT_LIFECYCLE_TRACE").as_deref(), Some(value) if value == "1"
+    );
     let mut log_path = None;
     let mut child: Option<Child> = None;
     let mut readiness: Option<haider_platform::DaemonReadiness> = None;
@@ -419,6 +435,7 @@ pub async fn ensure_daemon(
     let mut race_lost = false;
     let mut child_status: Option<ExitStatus> = None;
     let mut last_error: Option<ConnectError> = None;
+    let mut spawned_at = None;
 
     let deadline = Instant::now() + options.startup_deadline;
     let mut backoff = Duration::from_millis(25);
@@ -483,7 +500,9 @@ pub async fn ensure_daemon(
                     // The one spawn decision (R8 step 5): only a missing or
                     // refused endpoint ever launches a candidate, and only
                     // one candidate per launcher.
+                    let started = Instant::now();
                     let candidate = spawn_daemon(profile, &options)?;
+                    spawned_at = Some(started);
                     child = Some(candidate.child);
                     readiness = Some(candidate.readiness);
                     liveness = candidate.liveness;
@@ -547,7 +566,19 @@ pub async fn ensure_daemon(
             // solely after NotFound/ConnectionRefused authorized this exact
             // candidate. The buffered byte also covers Ready-before-await.
             match tokio::time::timeout_at(deadline, notification.wait()).await {
-                Ok(Ok(())) => continue,
+                Ok(Ok(())) => {
+                    if trace_enabled && let Some(started) = spawned_at {
+                        let operation_micros = started.elapsed().as_micros();
+                        let unix_micros = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_micros();
+                        if let Ok(mut trace) = SPAWN_READY_TRACE.lock() {
+                            *trace = Some((operation_micros, unix_micros));
+                        }
+                    }
+                    continue;
+                }
                 Ok(Err(error)) => {
                     readiness_channel_error = Some(error.to_string());
                     let Some(active) = child.take() else {
