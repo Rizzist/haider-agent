@@ -33,6 +33,7 @@ import sys
 import tempfile
 import termios
 import time
+from urllib.parse import urlsplit
 
 
 RUSAGE_INFO_V4 = 4
@@ -44,6 +45,24 @@ HOLD_MARGIN_SECONDS = 15
 SIXEL_RESPONSE = b"\x1b[?64;4c\x1b[6;20;10t\x1b[0n"
 WIRE_PROVIDER = "footprint-proxy"
 WIRE_MODEL = "fixture-model"
+PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+LOOPBACK_NO_PROXY = "127.0.0.1,localhost"
+HEADLESS_RUN_TIMEOUT_SECONDS = 45
+# The observation deadline is derived as 2 * the product timeout. This leaves
+# one full product-timeout window for cold spawn, terminal publication, and CI
+# scheduling after the product has committed to a typed outcome (registry #94).
+HEADLESS_TERMINAL_DEADLINE_SECONDS = HEADLESS_RUN_TIMEOUT_SECONDS * 2
+STUB_PROBE_IO_TIMEOUT_SECONDS = 5
+# One I/O timeout plus the same allowance for interpreter startup and exit.
+STUB_PROBE_DEADLINE_SECONDS = STUB_PROBE_IO_TIMEOUT_SECONDS * 2
+DIAGNOSTIC_SECTION_CHARS = 750
 
 
 class RusageInfoV4(ctypes.Structure):
@@ -190,6 +209,8 @@ def hermetic_env(root: Path) -> dict[str, str]:
     for key in tuple(env):
         if key.startswith("HAIDER_") or key.endswith(("_API_KEY", "_TOKEN", "_SECRET")):
             env.pop(key, None)
+    for key in PROXY_ENV_KEYS:
+        env.pop(key, None)
     for key in ("NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR", "COLORTERM"):
         env.pop(key, None)
     profile = root / "p"
@@ -213,9 +234,65 @@ def hermetic_env(root: Path) -> dict[str, str]:
             "XDG_STATE_HOME": str(home / ".local" / "state"),
             "TMPDIR": str(root),
             "TERM": "xterm-256color",
+            "NO_PROXY": LOOPBACK_NO_PROXY,
+            "no_proxy": LOOPBACK_NO_PROXY,
         }
     )
     return env
+
+
+def require_ipv4_loopback_base_url(base_url: str) -> None:
+    parsed = urlsplit(base_url)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.port is None
+    ):
+        raise RuntimeError(
+            "client footprint stub must advertise an exact IPv4 loopback URL; "
+            f"got {base_url!r}"
+        )
+
+
+def verify_stub_reachable(
+    base_url: str, env: dict[str, str], artefact_dir: Path
+) -> None:
+    require_ipv4_loopback_base_url(base_url)
+    probe_url = f"{base_url.rstrip('/')}/models"
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            (
+                "import sys, urllib.request; "
+                "response = urllib.request.urlopen("
+                f"sys.argv[1], timeout={STUB_PROBE_IO_TIMEOUT_SECONDS}); "
+                "print(response.status); response.close()"
+            ),
+            probe_url,
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=STUB_PROBE_DEADLINE_SECONDS,
+        check=False,
+    )
+    evidence = {
+        "url": probe_url,
+        "exit": probe.returncode,
+        "stdout": probe.stdout,
+        "stderr": probe.stderr,
+    }
+    (artefact_dir / "stub-reachability.json").write_text(
+        json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    if probe.returncode != 0 or probe.stdout.strip() != "200":
+        raise RuntimeError(
+            "loopback stub subprocess probe failed "
+            f"exit={probe.returncode} stdout={probe.stdout!r} stderr={probe.stderr!r}"
+        )
 
 
 def save_vmmap(pid: int, path: Path) -> dict[str, object]:
@@ -425,7 +502,195 @@ def openai_stub() -> object:
     qa_gate = Path(__file__).resolve().parents[1] / "qa-gate"
     sys.path.insert(0, str(qa_gate))
     module = importlib.import_module("gate.openai_stub")
-    return module.OpenAIStub("client-footprint-ok", WIRE_MODEL).start()
+    stub = module.OpenAIStub("client-footprint-ok", WIRE_MODEL).start()
+    try:
+        require_ipv4_loopback_base_url(stub.base_url)
+    except Exception:
+        stub.close()
+        raise
+    return stub
+
+
+def read_headless_terminal(
+    child: subprocess.Popen[bytes], stdout_parts: list[bytes]
+) -> dict[str, object]:
+    assert child.stdout is not None
+    pending = bytearray()
+    deadline = time.monotonic() + HEADLESS_TERMINAL_DEADLINE_SECONDS
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                "headless run did not emit a terminal within "
+                f"{HEADLESS_TERMINAL_DEADLINE_SECONDS} seconds"
+            )
+        ready, _, _ = select.select([child.stdout], [], [], min(remaining, 0.1))
+        if not ready:
+            continue
+        chunk = os.read(child.stdout.fileno(), 65_536)
+        if not chunk:
+            raise RuntimeError(
+                "headless run closed stdout before its terminal "
+                f"exit={child.poll()}"
+            )
+        stdout_parts.append(chunk)
+        pending.extend(chunk)
+        while b"\n" in pending:
+            raw_line, _, remainder = pending.partition(b"\n")
+            pending = bytearray(remainder)
+            if not raw_line.strip():
+                continue
+            document = json.loads(raw_line.decode("utf-8"))
+            payload = document.get("payload")
+            if isinstance(payload, dict) and payload.get("terminal_kind") is not None:
+                return document
+
+
+def require_successful_headless_terminal(terminal: dict[str, object]) -> None:
+    terminal_payload = terminal.get("payload")
+    if not isinstance(terminal_payload, dict):
+        raise RuntimeError(f"headless terminal has no payload: {terminal!r}")
+    if terminal_payload.get("terminal_kind") != "success":
+        raise RuntimeError(
+            "headless fixture emitted a typed terminal but the footprint "
+            f"surface requires success: {terminal_payload!r}"
+        )
+
+
+def collect_child_output(
+    child: subprocess.Popen[bytes], stdout_parts: list[bytes], stderr_path: Path
+) -> tuple[str, str, int | None]:
+    if child.poll() is None:
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    try:
+        remaining_stdout, _ = child.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        remaining_stdout, _ = child.communicate(timeout=5)
+    if remaining_stdout:
+        stdout_parts.append(remaining_stdout)
+    stdout = b"".join(stdout_parts).decode("utf-8", "replace")
+    try:
+        stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        stderr = ""
+    return stdout, stderr, child.returncode
+
+
+def snapshot_daemon_logs(
+    env: dict[str, str], artefact_dir: Path
+) -> list[Path]:
+    profile = Path(env["HAIDER_PROFILE_DIR"])
+    candidates = [profile / "daemon.log"]
+    daemon_log_dir = profile / "daemon-logs"
+    if daemon_log_dir.is_dir():
+        candidates.extend(sorted(daemon_log_dir.glob("*.log")))
+    destination = artefact_dir / "daemon-logs"
+    copied: list[Path] = []
+    errors: list[str] = []
+    for source in candidates:
+        if not source.is_file():
+            continue
+        target = destination / source.name
+        try:
+            destination.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+            copied.append(target)
+        except OSError as error:
+            errors.append(f"{source}: {error}")
+    if errors:
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "copy-errors.txt").write_text(
+            "\n".join(errors) + "\n", encoding="utf-8"
+        )
+    return copied
+
+
+def diagnostic_tail(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return "(empty)"
+    return stripped[-DIAGNOSTIC_SECTION_CHARS:]
+
+
+def persist_run_failure_diagnostics(
+    *,
+    artefact_dir: Path,
+    env: dict[str, str],
+    stub: object,
+    failure: BaseException,
+    child_stdout: str,
+    child_stderr: str,
+    child_exit: int | None,
+    terminal: dict[str, object] | None,
+    cleanup_errors: list[str],
+) -> None:
+    (artefact_dir / "run.stdout").write_text(child_stdout, encoding="utf-8")
+    (artefact_dir / "run.stderr").write_text(child_stderr, encoding="utf-8")
+    requests = list(getattr(stub, "requests", getattr(stub, "chat_requests", [])))
+    stub_evidence = {
+        "request_count": len(requests),
+        "chat_request_count": int(getattr(stub, "chat_count", 0)),
+        "requests": requests,
+    }
+    (artefact_dir / "stub-requests.json").write_text(
+        json.dumps(stub_evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    copied_logs = snapshot_daemon_logs(env, artefact_dir)
+    terminal_payload = terminal.get("payload") if terminal is not None else None
+    terminal_kind = (
+        terminal_payload.get("terminal_kind")
+        if isinstance(terminal_payload, dict)
+        else None
+    )
+    failure_evidence = {
+        "error_type": type(failure).__name__,
+        "error": str(failure),
+        "child_exit": child_exit,
+        "terminal_seen": terminal is not None,
+        "terminal_kind": terminal_kind,
+        "daemon_logs": [str(path.relative_to(artefact_dir)) for path in copied_logs],
+        "cleanup_errors": cleanup_errors,
+    }
+    (artefact_dir / "failure.json").write_text(
+        json.dumps(failure_evidence, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    daemon_excerpt = "\n".join(
+        f"[{path.name}]\n{diagnostic_tail(path.read_text(encoding='utf-8', errors='replace'))}"
+        for path in copied_logs
+    )
+    request_excerpt = "\n".join(
+        f"{request.get('method', '?')} {request.get('path', '?')}"
+        for request in requests
+        if isinstance(request, dict)
+    )
+    excerpt = "\n".join(
+        (
+            f"failure={type(failure).__name__}: {failure}",
+            f"child_exit={child_exit} terminal_seen={terminal is not None} "
+            f"terminal_kind={terminal_kind}",
+            f"stub_requests={len(requests)} chat_requests={stub_evidence['chat_request_count']}",
+            "stub request log:\n" + diagnostic_tail(request_excerpt),
+            "child stdout tail:\n" + diagnostic_tail(child_stdout),
+            "child stderr tail:\n" + diagnostic_tail(child_stderr),
+            "daemon log tail:\n" + diagnostic_tail(daemon_excerpt),
+        )
+    )
+    (artefact_dir / "diagnostic-excerpt.txt").write_text(
+        excerpt + "\n", encoding="utf-8"
+    )
+    print(
+        f"client-footprint diagnostics ({artefact_dir}):\n{excerpt}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def measure_status(
@@ -498,66 +763,57 @@ def measure_run(
     del load_wait_seconds
     stub = openai_stub()
     configure_wire_fixture(env, stub.base_url)
-    child: subprocess.Popen[str] | None = None
-    lines: list[str] = []
+    child: subprocess.Popen[bytes] | None = None
+    stdout_parts: list[bytes] = []
+    stderr_path = artefact_dir / "run.stderr"
+    terminal: dict[str, object] | None = None
+    failure: BaseException | None = None
+    child_stdout = ""
+    child_stderr = ""
+    child_exit: int | None = None
+    daemon_stopped = False
+    cleanup_errors: list[str] = []
     try:
+        verify_stub_reachable(stub.base_url, env, artefact_dir)
         ensure_profile_daemon_ready(haider, env)
         held_env = env.copy()
         held_env["HAIDER_CLIENT_FOOTPRINT_HOLD_MS"] = str(
             math.ceil((settle_seconds + HOLD_MARGIN_SECONDS) * 1000)
         )
-        child = subprocess.Popen(
-            [
-                str(haider),
-                "run",
-                "client footprint fixture",
-                "--output",
-                "jsonl",
-                "--timeout",
-                "30s",
-                "--provider",
-                WIRE_PROVIDER,
-                "--model",
-                WIRE_MODEL,
-            ],
-            env=held_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
-        assert child.stdout is not None
-        terminal: dict[str, object] | None = None
-        terminal_deadline = time.monotonic() + 30.0
-        while terminal is None:
-            remaining = terminal_deadline - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError("headless run did not emit a terminal within 30 seconds")
-            ready, _, _ = select.select([child.stdout], [], [], min(remaining, 0.1))
-            if not ready:
-                if child.poll() is not None:
-                    raise RuntimeError("headless run exited before its terminal")
-                continue
-            line = child.stdout.readline()
-            if not line:
-                raise RuntimeError("headless run closed stdout before its terminal")
-            lines.append(line)
-            document = json.loads(line)
-            payload = document.get("payload")
-            if isinstance(payload, dict) and payload.get("terminal_kind") is not None:
-                if payload.get("terminal_kind") != "success":
-                    raise RuntimeError(f"headless fixture failed: {payload!r}")
-                terminal = document
-        (artefact_dir / "run.jsonl").write_text("".join(lines), encoding="utf-8")
+        stderr_handle = stderr_path.open("wb")
+        try:
+            child = subprocess.Popen(
+                [
+                    str(haider),
+                    "run",
+                    "client footprint fixture",
+                    "--output",
+                    "jsonl",
+                    "--timeout",
+                    f"{HEADLESS_RUN_TIMEOUT_SECONDS}s",
+                    "--provider",
+                    WIRE_PROVIDER,
+                    "--model",
+                    WIRE_MODEL,
+                ],
+                env=held_env,
+                stdout=subprocess.PIPE,
+                stderr=stderr_handle,
+                bufsize=0,
+                start_new_session=True,
+            )
+        finally:
+            stderr_handle.close()
+        terminal = read_headless_terminal(child, stdout_parts)
+        (artefact_dir / "run.jsonl").write_bytes(b"".join(stdout_parts))
+        require_successful_headless_terminal(terminal)
         if stub.chat_count != 1:
             raise RuntimeError(f"headless fixture saw {stub.chat_count} provider requests")
         settle_deadline = time.monotonic() + settle_seconds
         while time.monotonic() < settle_deadline:
             returncode = child.poll()
             if returncode is not None:
-                assert child.stderr is not None
-                stderr = child.stderr.read()
-                (artefact_dir / "run.stderr").write_text(stderr, encoding="utf-8")
+                stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
                 raise RuntimeError(
                     f"held headless run exited during settle exit={returncode} "
                     f"stderr={stderr!r}"
@@ -575,17 +831,53 @@ def measure_run(
             }
         )
         return sample
+    except Exception as error:
+        failure = error
+        raise
     finally:
-        stub.close()
-        if child is not None and child.poll() is None:
-            os.killpg(child.pid, signal.SIGTERM)
         if child is not None:
             try:
-                child.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGKILL)
-                child.communicate(timeout=5)
-        stop_profile_daemon(haider, env)
+                child_stdout, child_stderr, child_exit = collect_child_output(
+                    child, stdout_parts, stderr_path
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                cleanup_errors.append(f"collect child output: {error}")
+        try:
+            stop_profile_daemon(haider, env)
+            daemon_stopped = True
+        except (OSError, subprocess.TimeoutExpired) as error:
+            cleanup_errors.append(f"stop profile daemon: {error}")
+        if failure is not None:
+            try:
+                persist_run_failure_diagnostics(
+                    artefact_dir=artefact_dir,
+                    env=env,
+                    stub=stub,
+                    failure=failure,
+                    child_stdout=child_stdout,
+                    child_stderr=child_stderr,
+                    child_exit=child_exit,
+                    terminal=terminal,
+                    cleanup_errors=cleanup_errors,
+                )
+            except (OSError, TypeError, ValueError) as error:
+                print(
+                    f"client-footprint: could not persist complete diagnostics: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        try:
+            stub.close()
+        except Exception as error:
+            if failure is None:
+                raise
+            print(
+                f"client-footprint: stub cleanup after failure also failed: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if not daemon_stopped and failure is None:
+            stop_profile_daemon(haider, env)
 
 
 def median_absolute_deviation(values: list[int]) -> float:

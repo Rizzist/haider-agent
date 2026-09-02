@@ -103,13 +103,17 @@ class OpenAIStub:
         return f"http://{host}:{port}/v1"
 
     @property
-    def chat_requests(self) -> list[dict[str, Any]]:
+    def requests(self) -> list[dict[str, Any]]:
         with self._server.lock:
-            return [
-                dict(request)
-                for request in self._server.requests
-                if request["method"] == "POST" and request["path"].endswith("/chat/completions")
-            ]
+            return [dict(request) for request in self._server.requests]
+
+    @property
+    def chat_requests(self) -> list[dict[str, Any]]:
+        return [
+            request
+            for request in self.requests
+            if request["method"] == "POST" and request["path"].endswith("/chat/completions")
+        ]
 
     @property
     def chat_count(self) -> int:
