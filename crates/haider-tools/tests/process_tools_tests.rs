@@ -10,7 +10,7 @@ use haider_protocol::effect::{
     WorkspaceMutation,
 };
 use haider_protocol::ids::{ArtifactRef, EffectId, SessionId};
-use haider_protocol::item::{ItemDelta, ToolStatus};
+use haider_protocol::item::{ItemDelta, OutputStream, ToolStatus};
 use haider_tools::{
     BuiltinResult, CasSink, CommandOutputSink, ComposerSubmission, EffectBroker, JournalSink,
     PROCESS_ADAPTER_INPUT_BYTES, PROCESS_OUTPUT_CHUNK_BYTES, PermissionPolicy, ProcessBounds,
@@ -1926,4 +1926,154 @@ fn env_view_redacts_secret_names_and_preserves_non_secret_values() {
             .and_then(|entry| entry.value.as_deref()),
         Some("/visible/test/home")
     );
+}
+
+// ---------------------------------------------------------------------------
+// turnhygiene behaviour-preservation pins (v0.0.969)
+// ---------------------------------------------------------------------------
+
+fn stream_bytes(chunks: &[ProcessOutputChunk], stream: OutputStream) -> Vec<u8> {
+    chunks
+        .iter()
+        .filter(|chunk| chunk.stream == stream)
+        .flat_map(|chunk| BASE64.decode(&chunk.chunk_b64).expect("valid base64"))
+        .collect()
+}
+
+fn delta_stream_bytes(deltas: &[ItemDelta], wanted: OutputStream) -> Vec<u8> {
+    deltas
+        .iter()
+        .filter_map(|delta| match delta {
+            ItemDelta::CommandOutput { stream, chunk_b64 } if *stream == wanted => {
+                Some(BASE64.decode(chunk_b64).expect("valid base64"))
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// MUTATION CHECK: merge stdout and stderr into one untagged stream, drop
+/// bytes written after a stderr write, map a nonzero exit to `Completed`, or
+/// hash a projection instead of the exact captured bytes. Expected RUNTIME
+/// failure: a stream partition, the typed status/exit pair, or the digest
+/// over the capture-order transcript differs.
+#[tokio::test]
+async fn process_exec_keeps_stdout_and_stderr_apart_and_reports_a_nonzero_exit() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let (mut broker, journal) = broker(workspace.path());
+    let output = RecordingOutput::default();
+    let output_observer = output.observer();
+    let cas = RecordingCas::default();
+    let result = broker
+        .process_exec(
+            &ProcessExec::new(
+                "streams",
+                "printf out-a; printf err-b >&2; printf out-c; exit 3",
+            ),
+            &process_policy(),
+            cas,
+            output,
+            ProcessBounds::default(),
+        )
+        .await
+        .expect("process starts")
+        .wait()
+        .await
+        .expect("process completes");
+
+    assert_eq!(result.status, ToolStatus::Failed);
+    assert_eq!(result.exit_code, Some(3));
+    assert_eq!(result.signal, None);
+    assert_eq!(result.limit_reached, None);
+    assert_eq!(result.output_bytes, 15);
+    assert_eq!(result.output_elided_bytes_at_least, 0);
+    assert!(
+        result.artifact.is_none(),
+        "a 15-byte transcript stays inline"
+    );
+
+    assert_eq!(
+        stream_bytes(&result.inline_output, OutputStream::Stdout),
+        b"out-aout-c"
+    );
+    assert_eq!(
+        stream_bytes(&result.inline_output, OutputStream::Stderr),
+        b"err-b"
+    );
+    {
+        let deltas = output_observer.lock().expect("output observer");
+        assert_eq!(
+            delta_stream_bytes(&deltas, OutputStream::Stdout),
+            b"out-aout-c"
+        );
+        assert_eq!(delta_stream_bytes(&deltas, OutputStream::Stderr), b"err-b");
+    }
+
+    let capture_order = result
+        .inline_output
+        .iter()
+        .flat_map(|chunk| BASE64.decode(&chunk.chunk_b64).expect("valid base64"))
+        .collect::<Vec<u8>>();
+    assert_eq!(capture_order.len(), 15);
+    assert_eq!(
+        result.transcript_digest,
+        format!("blake3:{}", blake3::hash(&capture_order).to_hex()),
+        "the digest covers the exact bytes in capture order"
+    );
+
+    let phases = phases(&journal);
+    assert_eq!(phases.len(), 4);
+    assert!(
+        matches!(
+            phases[3],
+            EffectPhase::Outcome {
+                outcome: EffectOutcome::Ok,
+                ..
+            }
+        ),
+        "a nonzero exit is a completed effect with a failed tool status"
+    );
+    broker.close().await.expect("broker closes");
+}
+
+/// MUTATION CHECK: report a signal-killed leader as an exit code, as
+/// `Completed`, or as a limit. Expected RUNTIME failure: `exit_code` is not
+/// `None`, `signal` is not the delivered signal, or the status is not
+/// `Failed` with no limit reached.
+#[tokio::test]
+async fn process_exec_reports_a_signal_killed_leader_as_a_signal_not_an_exit_code() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let (mut broker, journal) = broker(workspace.path());
+    let result = broker
+        .process_exec(
+            &ProcessExec::new("signalled", "printf before; kill -9 $$"),
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds::default(),
+        )
+        .await
+        .expect("process starts")
+        .wait()
+        .await
+        .expect("process settles");
+
+    assert_eq!(result.status, ToolStatus::Failed);
+    assert_eq!(result.exit_code, None);
+    assert_eq!(result.signal, Some(9));
+    assert_eq!(result.limit_reached, None);
+    assert_eq!(
+        stream_bytes(&result.inline_output, OutputStream::Stdout),
+        b"before",
+        "bytes written before the signal are retained"
+    );
+    assert!(matches!(
+        phases(&journal)[3],
+        EffectPhase::Outcome {
+            outcome: EffectOutcome::Ok,
+            ..
+        }
+    ));
+    broker.close().await.expect("broker closes");
 }

@@ -7732,6 +7732,18 @@ impl HubStoreHandle {
         &self.hub.inner.turn_setup_reductions
     }
 
+    /// Samples the exact post-accept read-only state used by worker turn
+    /// setup. The underlying store performs one blocking dispatch.
+    pub(crate) async fn turn_start_read_bundle(
+        &self,
+    ) -> Result<haider_core::TurnStartReadBundle, HaiderError> {
+        self.hub
+            .inner
+            .store
+            .turn_start_read_bundle(&self.session_id)
+            .await
+    }
+
     pub fn worker_generation(&self) -> u64 {
         self.worker_generation
     }

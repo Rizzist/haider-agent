@@ -122,6 +122,83 @@ use std::time::Duration;
 #[path = "event_store_append_tests.rs"]
 mod event_store_append_tests;
 
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod allocation_probe {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+        static BYTES: Cell<usize> = const { Cell::new(0) };
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct CountingAllocator;
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    fn allocated(bytes: usize) {
+        ACTIVE.with(|active| {
+            if active.get() {
+                BYTES.with(|total| total.set(total.get().saturating_add(bytes)));
+                COUNT.with(|total| total.set(total.get().saturating_add(1)));
+            }
+        });
+    }
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                allocated(layout.size());
+            }
+            pointer
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                allocated(layout.size());
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(pointer, layout) };
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let resized = unsafe { System.realloc(pointer, layout, new_size) };
+            if !resized.is_null() && new_size > layout.size() {
+                allocated(new_size - layout.size());
+            }
+            resized
+        }
+    }
+
+    struct ProbeGuard;
+
+    impl Drop for ProbeGuard {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| active.set(false));
+        }
+    }
+
+    pub(super) fn measure<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
+        BYTES.with(|total| total.set(0));
+        COUNT.with(|total| total.set(0));
+        ACTIVE.with(|active| active.set(true));
+        let guard = ProbeGuard;
+        let result = operation();
+        let bytes = BYTES.with(Cell::get);
+        let count = COUNT.with(Cell::get);
+        drop(guard);
+        (result, bytes, count)
+    }
+}
+
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound the reusable WAL allocation after a checkpoint/reset cycle.
 const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 8 * 1_024 * 1_024;
@@ -1832,6 +1909,22 @@ pub struct QueueConsumeOutcome {
     pub revision: u64,
     pub id: EventId,
     pub envelope: Box<RawEnvelope>,
+}
+
+/// Exact read-only state sampled at one worker turn-start store dispatch.
+///
+/// The journal head, delegation lineage, and graph projection are observed
+/// while the profile store owner is held. Callers reduce the returned journal
+/// for headless, context-economy, and setup state without re-entering the
+/// blocking store path. No write or publication boundary is part of this
+/// bundle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnStartReadBundle {
+    pub journal: Vec<RawEnvelope>,
+    pub observed_head: Option<(u64, EventId)>,
+    pub delegation: Option<DelegationRecord>,
+    pub parent_delegation: Option<DelegationRecord>,
+    pub graph_status: Option<GraphStatus>,
 }
 
 impl CommittedSeqRange {
@@ -4435,6 +4528,39 @@ impl Store {
             .graph_reductions(&connection, session_id)?
             .active()
             .and_then(|reduction| reduction.status.clone()))
+    }
+
+    /// Samples the read-only worker turn-start inputs under one connection
+    /// ownership interval. The bundle is deliberately post-accept and does
+    /// not include any mutation that could move a durability boundary.
+    pub fn turn_start_read_bundle(
+        &self,
+        session_id: &SessionId,
+    ) -> StoreResult<TurnStartReadBundle> {
+        let connection = self.connection()?;
+        require_session(&connection, session_id)?;
+        let journal = read_session_journal(&connection, session_id)?;
+        let observed_head = journal
+            .last()
+            .map(|envelope| (envelope.seq, envelope.event_id.clone()));
+        let delegation = lookup_delegation_by_child_session(&connection, session_id)?;
+        let parent_delegation = delegation
+            .as_ref()
+            .and_then(|record| record.parent_agent_id.as_ref())
+            .map(|parent| lookup_delegation_by_agent(&connection, parent))
+            .transpose()?
+            .flatten();
+        let graph_status = self
+            .graph_reductions(&connection, session_id)?
+            .active()
+            .and_then(|reduction| reduction.status.clone());
+        Ok(TurnStartReadBundle {
+            journal,
+            observed_head,
+            delegation,
+            parent_delegation,
+            graph_status,
+        })
     }
 
     /// Reads the same-transaction indexed activation projection. When no id
@@ -20111,6 +20237,43 @@ impl EventStore for Store {
     }
 }
 
+fn read_session_journal(
+    connection: &Connection,
+    session: &SessionId,
+) -> StoreResult<Vec<RawEnvelope>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT seq, envelope_json, event_id, committed_at_ms
+             FROM events
+             WHERE session_id = ?1
+             ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session.as_str()])
+        .map_err(map_sqlite_error)?;
+    let mut envelopes = Vec::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
+        let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
+        let stored_committed_at_ms: i64 = row.get(3).map_err(map_sqlite_error)?;
+        let envelope = decode_envelope_column(row, 1).map_err(|error| {
+            corrupt(format!(
+                "invalid envelope for session {session}, seq {stored_seq}: {error}"
+            ))
+        })?;
+        validate_stored_envelope(
+            session,
+            stored_seq,
+            &stored_event_id,
+            stored_committed_at_ms,
+            &envelope,
+        )?;
+        envelopes.push(envelope);
+    }
+    Ok(envelopes)
+}
+
 struct AppendTransactionOutcome {
     range: CommittedSeqRange,
     changes_graph_reduction: bool,
@@ -24697,6 +24860,138 @@ mod reducer_filter_tests {
             failed_turn: latest_main_timeline_failed_turn(&connection, session_id)?,
             tree_head: latest_tree_head(&connection, session_id, None, None)?,
         })
+    }
+
+    #[test]
+    fn turn_start_read_bundle_matches_the_exact_journal_and_head() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(root.path()).expect("open store");
+        let session_id = SessionId::new("turn-start-read-bundle");
+        seed_session(&store, &session_id);
+        let mut events = vec![
+            fact(
+                &store,
+                &session_id,
+                "bundle-user",
+                Some(RunId::new("bundle-run")),
+                typed_payload(EventPayload::UserMessage {
+                    text: "bundle prompt".into(),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Steer,
+                }),
+            ),
+            fact(
+                &store,
+                &session_id,
+                "bundle-state",
+                Some(RunId::new("bundle-run")),
+                typed_payload(EventPayload::RunState(RunState::Thinking)),
+            ),
+        ];
+        store.append(&mut events).expect("append bundle fixtures");
+
+        let bundle = store
+            .turn_start_read_bundle(&session_id)
+            .expect("turn-start bundle");
+        assert_eq!(bundle.journal, events);
+        assert_eq!(
+            bundle.observed_head,
+            events
+                .last()
+                .map(|envelope| (envelope.seq, envelope.event_id.clone()))
+        );
+        assert_eq!(bundle.delegation, None);
+        assert_eq!(bundle.parent_delegation, None);
+        assert_eq!(bundle.graph_status, None);
+    }
+
+    #[test]
+    fn turn_start_read_bundle_reduces_fixture_allocation_bytes_and_count() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(root.path()).expect("open store");
+        let session_id = SessionId::new("turn-start-read-bundle-allocation");
+        seed_session(&store, &session_id);
+        let mut events = vec![
+            fact(
+                &store,
+                &session_id,
+                "bundle-allocation-user",
+                Some(RunId::new("bundle-allocation-run")),
+                typed_payload(EventPayload::UserMessage {
+                    text: "allocation fixture".repeat(32),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Steer,
+                }),
+            ),
+            fact(
+                &store,
+                &session_id,
+                "bundle-allocation-state",
+                Some(RunId::new("bundle-allocation-run")),
+                typed_payload(EventPayload::RunState(RunState::Thinking)),
+            ),
+        ];
+        store
+            .append(&mut events)
+            .expect("append allocation fixtures");
+
+        // Warm prepared statements and graph/delegation caches before the
+        // allocation comparison. Both sides return the same durable inputs;
+        // the legacy shape enters the store six times for this one-page root
+        // session, while the candidate enters it once.
+        let _ = store.read(&session_id, 0, 256).expect("warm journal read");
+        let _ = store
+            .delegation_for_child_session(&session_id)
+            .expect("warm delegation read");
+        let _ = store.graph_status(&session_id).expect("warm graph read");
+        let _ = store
+            .read_reducer_page_with_boundary(&session_id, 0, 256, usize::MAX, &["user_message"])
+            .expect("warm setup read");
+        let _ = store
+            .turn_start_read_bundle(&session_id)
+            .expect("warm bundled read");
+
+        let (_, legacy_bytes, legacy_count) = allocation_probe::measure(|| {
+            let _ = store
+                .read(&session_id, 0, 256)
+                .expect("legacy headless read");
+            let _ = store
+                .read(&session_id, 0, 256)
+                .expect("legacy economy read");
+            let _ = store
+                .delegation_for_child_session(&session_id)
+                .expect("legacy delegation read");
+            let _ = store.graph_status(&session_id).expect("legacy graph read");
+            let page = store
+                .read_reducer_page_with_boundary(&session_id, 0, 256, usize::MAX, &["user_message"])
+                .expect("legacy setup page");
+            let cursor = page.envelopes.last().map_or(0, |envelope| envelope.seq);
+            let _ = store
+                .read_reducer_page_with_boundary(
+                    &session_id,
+                    cursor,
+                    256,
+                    usize::MAX,
+                    &["user_message"],
+                )
+                .expect("legacy setup boundary page");
+        });
+        let (_, bundled_bytes, bundled_count) = allocation_probe::measure(|| {
+            let _ = store
+                .turn_start_read_bundle(&session_id)
+                .expect("bundled turn-start read");
+        });
+        eprintln!(
+            "turn_start_allocations legacy_bytes={legacy_bytes} legacy_count={legacy_count} bundled_bytes={bundled_bytes} bundled_count={bundled_count}"
+        );
+        assert!(
+            bundled_bytes < legacy_bytes,
+            "bundle bytes {bundled_bytes} must be below legacy {legacy_bytes}"
+        );
+        assert!(
+            bundled_count < legacy_count,
+            "bundle count {bundled_count} must be below legacy {legacy_count}"
+        );
     }
 
     /// MUTATION CHECK: remove any production reducer kind or its `NULL`

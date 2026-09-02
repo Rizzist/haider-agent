@@ -1559,13 +1559,28 @@ impl DelegationHandle {
         let Some(record) = record else {
             return Ok(None);
         };
+        let parent = match &record.parent_agent_id {
+            Some(parent_agent) => self.hub.delegation(parent_agent.clone()).await?,
+            None => None,
+        };
+        Self::validate_turn_start_record(record, parent)
+    }
+
+    /// Validates a delegation and its optional durable parent from the exact
+    /// turn-start read bundle, avoiding another store-owner dispatch.
+    pub(crate) fn validate_turn_start_record(
+        record: DelegationRecord,
+        parent: Option<DelegationRecord>,
+    ) -> Result<Option<DelegationRecord>, HaiderError> {
         crate::worker::validate_grant(&record.manifest.grant)?;
         if let Some(parent_agent) = &record.parent_agent_id {
-            let parent = self
-                .hub
-                .delegation(parent_agent.clone())
-                .await?
+            let parent = parent
                 .ok_or_else(|| grant_state_corrupt("delegated child has no durable parent"))?;
+            if &parent.agent_id != parent_agent {
+                return Err(grant_state_corrupt(
+                    "delegated child bundle resolved the wrong durable parent",
+                ));
+            }
             crate::worker::validate_grant(&parent.manifest.grant)?;
             if crate::worker::intersect_grant(record.manifest.grant.clone(), &parent.manifest.grant)
                 != record.manifest.grant

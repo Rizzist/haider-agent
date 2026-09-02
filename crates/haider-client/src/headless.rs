@@ -91,6 +91,11 @@ static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub const HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES: usize = 256 * 1024;
 /// A spilled ledger is flushed in bounded batches and once more at terminal.
 const HEADLESS_EVENT_SPOOL_FLUSH_BYTES: usize = 64 * 1024;
+/// Pre-submit events normally fit in a handful of frames. Keep that race
+/// prefix in memory, but spill before either one unusually large event or a
+/// delayed response can turn it into an unbounded client allocation.
+const SUBMIT_RACE_MEMORY_THRESHOLD_BYTES: usize = 256 * 1024;
+const SUBMIT_RACE_MEMORY_MAX_FRAMES: usize = 64;
 
 const MAX_HEADLESS_ATTACHMENTS: usize = 5;
 const MAX_HEADLESS_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
@@ -1186,87 +1191,180 @@ impl Drop for HeadlessEventSpoolCleanup {
 }
 
 struct BufferedWireFrames {
-    file: Option<BufWriter<File>>,
+    storage: BufferedWireFrameStorage,
     len: usize,
-    cleanup: Option<Arc<HeadlessEventSpoolCleanup>>,
+}
+
+enum BufferedWireFrameStorage {
+    Memory {
+        frames: Vec<WireFrame>,
+        estimated_bytes: usize,
+    },
+    Spool {
+        file: BufWriter<File>,
+        cleanup: Arc<HeadlessEventSpoolCleanup>,
+    },
 }
 
 impl BufferedWireFrames {
     fn new() -> Self {
         Self {
-            file: None,
+            storage: BufferedWireFrameStorage::Memory {
+                frames: Vec::with_capacity(8),
+                estimated_bytes: 0,
+            },
             len: 0,
-            cleanup: None,
         }
-    }
-
-    fn ensure_file(&mut self) -> Result<&mut BufWriter<File>, HeadlessRunError> {
-        if self.file.is_none() {
-            let (file, cleanup) = create_private_spool("haider-replay", "submit replay spool")?;
-            self.file = Some(file);
-            self.cleanup = Some(cleanup);
-        }
-        self.file
-            .as_mut()
-            .ok_or_else(|| protocol_error("submit replay spool", "replay spool was not created"))
     }
 
     fn clear(&mut self) -> Result<(), HeadlessRunError> {
-        if let Some(file) = self.file.as_mut() {
-            file.flush()
+        match &mut self.storage {
+            BufferedWireFrameStorage::Memory {
+                frames,
+                estimated_bytes,
+            } => {
+                frames.clear();
+                *estimated_bytes = 0;
+            }
+            BufferedWireFrameStorage::Spool { file, .. } => file
+                .flush()
                 .and_then(|()| file.get_mut().set_len(0))
                 .and_then(|()| file.get_mut().seek(std::io::SeekFrom::Start(0)))
+                .map(|_| ())
                 .map_err(|error| HeadlessRunError::Protocol {
                     stage: "submit replay spool",
                     message: format!("cannot reset replay spool: {error}"),
-                })?;
+                })?,
         }
         self.len = 0;
         Ok(())
     }
 
-    fn push(&mut self, frame: &WireFrame) -> Result<(), HeadlessRunError> {
-        let file = self.ensure_file()?;
-        serde_json::to_writer(&mut *file, frame)
-            .map_err(std::io::Error::other)
-            .and_then(|()| file.write_all(b"\n"))
-            .and_then(|()| file.flush())
-            .map_err(|error| HeadlessRunError::Protocol {
-                stage: "submit replay spool",
-                message: format!("cannot write replay spool: {error}"),
-            })?;
+    fn push(&mut self, frame: WireFrame) -> Result<(), HeadlessRunError> {
+        let estimate = buffered_wire_frame_weight_bytes(&frame);
+        if let BufferedWireFrameStorage::Memory {
+            frames,
+            estimated_bytes,
+        } = &mut self.storage
+            && frames.len() < SUBMIT_RACE_MEMORY_MAX_FRAMES
+            && estimated_bytes.saturating_add(estimate) <= SUBMIT_RACE_MEMORY_THRESHOLD_BYTES
+        {
+            frames.push(frame);
+            *estimated_bytes = estimated_bytes.saturating_add(estimate);
+            self.len = self.len.saturating_add(1);
+            return Ok(());
+        }
+
+        if let BufferedWireFrameStorage::Spool { file, .. } = &mut self.storage {
+            write_submit_replay_record(file, &frame, true)?;
+            self.len = self.len.saturating_add(1);
+            return Ok(());
+        }
+
+        let previous = std::mem::replace(
+            &mut self.storage,
+            BufferedWireFrameStorage::Memory {
+                frames: Vec::new(),
+                estimated_bytes: 0,
+            },
+        );
+        let BufferedWireFrameStorage::Memory { frames, .. } = previous else {
+            return Err(protocol_error(
+                "submit replay spool",
+                "replay buffer changed storage while spilling",
+            ));
+        };
+        let (mut file, cleanup) = create_private_spool("haider-replay", "submit replay spool")?;
+        for buffered in &frames {
+            write_submit_replay_record(&mut file, buffered, false)?;
+        }
+        write_submit_replay_record(&mut file, &frame, false)?;
+        file.flush().map_err(|error| HeadlessRunError::Protocol {
+            stage: "submit replay spool",
+            message: format!("cannot write replay spool: {error}"),
+        })?;
+        self.storage = BufferedWireFrameStorage::Spool { file, cleanup };
         self.len = self.len.saturating_add(1);
         Ok(())
     }
 
     fn reader(&mut self) -> Result<BufferedWireFrameReader, HeadlessRunError> {
-        if let Some(file) = self.file.as_mut() {
-            file.flush().map_err(|error| HeadlessRunError::Protocol {
-                stage: "submit replay spool",
-                message: format!("cannot flush replay spool: {error}"),
-            })?;
-        }
-        let file = self
-            .cleanup
-            .as_ref()
-            .map(|cleanup| File::open(&cleanup.path).map(BufReader::new))
-            .transpose()
-            .map_err(|error| HeadlessRunError::Protocol {
-                stage: "submit replay spool",
-                message: format!("cannot open replay spool: {error}"),
-            })?;
+        let expected = self.len;
+        let (storage, cleanup) = match &mut self.storage {
+            BufferedWireFrameStorage::Memory {
+                frames,
+                estimated_bytes,
+            } => {
+                *estimated_bytes = 0;
+                (
+                    BufferedWireFrameReaderStorage::Memory(std::mem::take(frames).into_iter()),
+                    None,
+                )
+            }
+            BufferedWireFrameStorage::Spool { file, cleanup } => {
+                file.flush().map_err(|error| HeadlessRunError::Protocol {
+                    stage: "submit replay spool",
+                    message: format!("cannot flush replay spool: {error}"),
+                })?;
+                let reader = File::open(&cleanup.path)
+                    .map(BufReader::new)
+                    .map_err(|error| HeadlessRunError::Protocol {
+                        stage: "submit replay spool",
+                        message: format!("cannot open replay spool: {error}"),
+                    })?;
+                (
+                    BufferedWireFrameReaderStorage::Spool(reader),
+                    Some(Arc::clone(cleanup)),
+                )
+            }
+        };
+        self.len = 0;
         Ok(BufferedWireFrameReader {
-            file,
-            expected: self.len,
+            storage,
+            expected,
             yielded: 0,
             failed: false,
-            _cleanup: self.cleanup.clone(),
+            _cleanup: cleanup,
         })
     }
 }
 
+fn buffered_wire_frame_weight_bytes(frame: &WireFrame) -> usize {
+    match frame {
+        WireFrame::Event {
+            attachment_id,
+            session_id,
+            envelope,
+        } => std::mem::size_of::<WireFrame>()
+            .saturating_add(attachment_id.as_str().len())
+            .saturating_add(session_id.as_str().len())
+            .saturating_add(envelope_weight_bytes(envelope)),
+        _ => usize::MAX,
+    }
+}
+
+fn write_submit_replay_record(
+    file: &mut BufWriter<File>,
+    frame: &WireFrame,
+    flush: bool,
+) -> Result<(), HeadlessRunError> {
+    serde_json::to_writer(&mut *file, frame)
+        .map_err(std::io::Error::other)
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| if flush { file.flush() } else { Ok(()) })
+        .map_err(|error| HeadlessRunError::Protocol {
+            stage: "submit replay spool",
+            message: format!("cannot write replay spool: {error}"),
+        })
+}
+
+enum BufferedWireFrameReaderStorage {
+    Memory(std::vec::IntoIter<WireFrame>),
+    Spool(BufReader<File>),
+}
+
 struct BufferedWireFrameReader {
-    file: Option<BufReader<File>>,
+    storage: BufferedWireFrameReaderStorage,
     expected: usize,
     yielded: usize,
     failed: bool,
@@ -1280,15 +1378,28 @@ impl Iterator for BufferedWireFrameReader {
         if self.failed {
             return None;
         }
-        let Some(file) = self.file.as_mut() else {
+        if let BufferedWireFrameReaderStorage::Memory(frames) = &mut self.storage {
+            let frame = frames.next();
             if self.yielded == self.expected {
-                return None;
+                frame.as_ref()?;
+                self.failed = true;
+                return Some(Err(protocol_error(
+                    "submit replay spool",
+                    "memory replay buffer contains more frames than recorded",
+                )));
             }
-            self.failed = true;
-            return Some(Err(protocol_error(
-                "submit replay spool",
-                "replay spool is absent before its recorded frame count",
-            )));
+            let Some(frame) = frame else {
+                self.failed = true;
+                return Some(Err(protocol_error(
+                    "submit replay spool",
+                    "memory replay buffer ended before its recorded frame count",
+                )));
+            };
+            self.yielded = self.yielded.saturating_add(1);
+            return Some(Ok(frame));
+        }
+        let BufferedWireFrameReaderStorage::Spool(file) = &mut self.storage else {
+            return None;
         };
         let mut record = Vec::new();
         let read = match file.read_until(b'\n', &mut record) {
@@ -2877,7 +2988,7 @@ async fn run_headless_inner(
                         break Err(ClientError::Disconnected(connection_reason(&connection.client)));
                     };
                     if frame_matches_attachment(&frame, connection.attachment_id.as_ref()) {
-                        buffered.push(&frame)?;
+                        buffered.push(frame)?;
                     }
                 }
                 () = wait_until(response_deadline) => {
@@ -3820,7 +3931,7 @@ async fn attach_buffered_once(
                 session_id,
                 ..
             } if event_attachment == &attachment_id && session_id == &reducer.session_id => {
-                buffered.push(&frame)?;
+                buffered.push(frame)?;
             }
             WireFrame::Lagged {
                 attachment_id: lagged,

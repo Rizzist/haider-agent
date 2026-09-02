@@ -865,3 +865,84 @@ fn turn_setup_cache_cohort_tracks_the_active_inherited_fork_segment() {
         .expect("reduce fresh fork");
     assert_eq!(fresh.cache_cohort(), None);
 }
+
+#[tokio::test]
+async fn turn_start_snapshot_reducer_reuses_exact_prefix_and_applies_suffix() {
+    let session_id = SessionId::new("setup-reduction-session");
+    let branch_id = BranchId::new("snapshot-branch");
+    let selector = |run: &str| TurnSetupReductionSelector {
+        run_id: RunId::new(run),
+        branch_id: Some(branch_id.clone()),
+        agent_id: None,
+        provider: "provider-a".into(),
+        model: "model-a".into(),
+        account_scope: None,
+        auth_scope: "api_key".into(),
+    };
+    let instruction = |path: &str| ProjectInstructionsLoaded {
+        files: vec![
+            haider_protocol::project_instructions::ProjectInstructionFileFact {
+                path: path.into(),
+                digest: format!("digest-{path}"),
+                bytes: u64::try_from(path.len()).expect("instruction path length"),
+                truncated: false,
+            },
+        ],
+    };
+    let first_fact = instruction("FIRST.md");
+    let first = setup_reduction_envelope(
+        1,
+        Some(RunId::new("snapshot-run-1")),
+        Some(branch_id.clone()),
+        None,
+        1,
+        first_fact
+            .to_payload_value()
+            .expect("first instruction payload"),
+    );
+    let cache = TurnSetupReductionCache::default();
+    let cold = reduce_turn_setup_journal_snapshot_cached(
+        &session_id,
+        &cache,
+        selector("snapshot-run-1"),
+        std::slice::from_ref(&first),
+        Some((first.seq, first.event_id.clone())),
+    )
+    .await
+    .expect("cold snapshot reduction");
+    assert_eq!(cold.same_run_instruction_fact, Some(first_fact.clone()));
+
+    let exact = reduce_turn_setup_journal_snapshot_cached(
+        &session_id,
+        &cache,
+        selector("snapshot-run-2"),
+        std::slice::from_ref(&first),
+        Some((first.seq, first.event_id.clone())),
+    )
+    .await
+    .expect("exact snapshot cache hit");
+    assert_eq!(exact.same_run_instruction_fact, None);
+    assert_eq!(exact.latest_instruction_fact, Some(first_fact));
+
+    let second_fact = instruction("SECOND.md");
+    let second = setup_reduction_envelope(
+        2,
+        Some(RunId::new("snapshot-run-2")),
+        Some(branch_id.clone()),
+        None,
+        2,
+        second_fact
+            .to_payload_value()
+            .expect("second instruction payload"),
+    );
+    let advanced = reduce_turn_setup_journal_snapshot_cached(
+        &session_id,
+        &cache,
+        selector("snapshot-run-2"),
+        &[first, second.clone()],
+        Some((second.seq, second.event_id.clone())),
+    )
+    .await
+    .expect("snapshot suffix reduction");
+    assert_eq!(advanced.same_run_instruction_fact, Some(second_fact));
+}

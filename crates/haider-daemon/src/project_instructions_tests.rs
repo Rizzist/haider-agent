@@ -4,6 +4,10 @@ use crate::project_instructions::{
     MAX_PROJECT_INSTRUCTION_ANCESTORS, MAX_PROJECT_INSTRUCTION_FILE_BYTES,
     MAX_PROJECT_INSTRUCTION_TOTAL_BYTES, load,
 };
+#[cfg(unix)]
+use crate::project_instructions::{
+    canonical_directory_chain_len, project_instruction_cache_hits, project_instruction_cache_usage,
+};
 use crate::session_hub::{SessionHub, SessionHubConfig};
 use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
 use crate::worker::{
@@ -444,6 +448,66 @@ async fn nearest_instructions_compose_last_and_haider_wins_within_directory() {
         assert!(prompt.contains(&format!("Project instructions ({}):", file.path)));
     }
     assert!(prompt.find("parent-haider") < prompt.find("nearest-agents"));
+}
+
+/// MUTATION CHECK: reintroduce the per-ancestor root-prefix reopen or reuse a
+/// cache entry without checking every candidate stamp. Expected RUNTIME
+/// failure: the chain has duplicate/missing identities, the second load misses
+/// the cache, or a same-sized edit/deletion remains stale.
+#[tokio::test]
+async fn linear_walk_cache_is_bounded_and_loss_detecting() {
+    let root = tempfile::tempdir().expect("workspace");
+    let nested = root.path().join("a").join("b").join("c");
+    std::fs::create_dir_all(&nested).expect("nested workspace");
+    let instruction = root.path().join("HAIDER.md");
+    std::fs::write(&instruction, "fact-alpha").expect("initial instructions");
+    let canonical = std::fs::canonicalize(&nested).expect("canonical nested workspace");
+    #[cfg(unix)]
+    {
+        let expected_chain_len = canonical
+            .components()
+            .filter(|component| matches!(component, std::path::Component::Normal(_)))
+            .count()
+            + 1;
+        assert_eq!(
+            canonical_directory_chain_len(&canonical),
+            Some(expected_chain_len),
+            "one anchored identity is retained for root and each path component"
+        );
+    }
+    let canonical = canonical.to_str().expect("UTF-8 workspace");
+
+    let first = load(canonical).await.expect("first snapshot");
+    #[cfg(unix)]
+    let hits_before = project_instruction_cache_hits();
+    let second = load(canonical).await.expect("cached snapshot");
+    assert!(first == second);
+    #[cfg(unix)]
+    assert!(
+        project_instruction_cache_hits() > hits_before,
+        "an unchanged cwd reuses its bounded snapshot"
+    );
+
+    std::fs::write(&instruction, "fact-bravo").expect("same-sized edit");
+    let edited = load(canonical).await.expect("edited snapshot");
+    assert!(edited.files().iter().any(|file| file.text == "fact-bravo"));
+    assert!(edited.files().iter().all(|file| file.text != "fact-alpha"));
+
+    std::fs::remove_file(&instruction).expect("delete instructions");
+    let deleted = load(canonical).await;
+    assert!(deleted.as_ref().is_none_or(|loaded| {
+        loaded.files().iter().all(|file| {
+            !file
+                .path
+                .starts_with(root.path().to_str().expect("UTF-8 root"))
+        })
+    }));
+    #[cfg(unix)]
+    {
+        let (entries, retained_bytes) = project_instruction_cache_usage();
+        assert!(entries <= 4);
+        assert!(retained_bytes <= 256 * 1024);
+    }
 }
 
 /// MUTATION CHECK: truncate bytes without reserving the marker or split a
@@ -1194,4 +1258,130 @@ async fn footprint_and_manual_compaction_fit_include_instruction_bytes() {
         .expect("manual compaction footprint");
     assert_eq!(footprint.input_tokens, expected);
     worker.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// turnhygiene behaviour-preservation pins (v0.0.969)
+// ---------------------------------------------------------------------------
+
+fn text_turns(count: usize) -> Vec<FakeStep> {
+    (0..count)
+        .flat_map(|index| {
+            [
+                FakeStep::EmitText {
+                    text: format!("done-{index}"),
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::EndTurn,
+                },
+            ]
+        })
+        .collect()
+}
+
+/// MUTATION CHECK: cache the directory winner across turns, skip the
+/// same-directory fallback when the winner disappears, or keep a removed
+/// file's bytes. Expected RUNTIME failure: the second turn still carries the
+/// removed `HAIDER.md`, never surfaces the shadowed `AGENTS.md`, or the third
+/// turn still carries any instruction block; the change-only fact count
+/// stops being three.
+#[tokio::test]
+async fn removing_the_directory_winner_between_turns_promotes_the_shadowed_agents_file() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let haider = workspace.path().join("HAIDER.md");
+    let agents = workspace.path().join("AGENTS.md");
+    std::fs::write(&haider, "winner-haider").expect("HAIDER.md");
+    std::fs::write(&agents, "shadowed-agents").expect("AGENTS.md");
+    let fake = Arc::new(FakeProvider::new(text_turns(3)));
+    let worker = TestWorker::start(
+        workspace.path(),
+        fake.clone(),
+        "winner-flip",
+        4096,
+        Some(64_000),
+    )
+    .await;
+
+    worker.submit("flip-one").await;
+    std::fs::remove_file(&haider).expect("remove the winner");
+    worker.submit("flip-two").await;
+    std::fs::remove_file(&agents).expect("remove the fallback");
+    worker.submit("flip-three").await;
+
+    let requests = fake.requests();
+    assert_eq!(requests.len(), 3);
+    let first = daemon_session_context(&requests[0]);
+    assert!(first.contains("winner-haider"));
+    assert!(!first.contains("shadowed-agents"));
+    let second = daemon_session_context(&requests[1]);
+    assert!(second.contains("shadowed-agents"));
+    assert!(!second.contains("winner-haider"));
+    let third = daemon_session_context(&requests[2]);
+    assert!(!third.contains("Project instructions ("));
+    assert_eq!(
+        requests[0].system_prompt, requests[2].system_prompt,
+        "instruction churn never rotates the shared base"
+    );
+
+    let events = worker
+        .store
+        .read(&worker.session_id, 0, 512)
+        .await
+        .expect("journal");
+    let facts = project_facts(&events);
+    assert_eq!(facts.len(), 3, "one change-only fact per distinct snapshot");
+    assert_eq!(facts[0].1.files.len(), 1);
+    assert!(facts[0].1.files[0].path.ends_with("HAIDER.md"));
+    assert_eq!(facts[1].1.files.len(), 1);
+    assert!(facts[1].1.files[0].path.ends_with("AGENTS.md"));
+    assert!(facts[2].1.files.is_empty());
+    worker.close().await;
+}
+
+/// MUTATION CHECK: key an instruction snapshot on anything other than the
+/// session's canonical cwd (a process-wide slot, the profile, or the last
+/// loaded directory). Expected RUNTIME failure: a request for one workspace
+/// carries the other workspace's bytes, or the alternating third turn no
+/// longer sees its own file.
+#[tokio::test]
+async fn sibling_workspaces_in_one_process_load_only_their_own_instructions() {
+    let alpha = tempfile::tempdir().expect("alpha workspace");
+    let beta = tempfile::tempdir().expect("beta workspace");
+    std::fs::write(alpha.path().join("AGENTS.md"), "alpha-only-policy").expect("alpha");
+    std::fs::write(beta.path().join("AGENTS.md"), "beta-only-policy").expect("beta");
+    let alpha_fake = Arc::new(FakeProvider::new(text_turns(2)));
+    let beta_fake = Arc::new(FakeProvider::new(text_turns(1)));
+    let alpha_worker = TestWorker::start(
+        alpha.path(),
+        alpha_fake.clone(),
+        "alpha",
+        4096,
+        Some(64_000),
+    )
+    .await;
+    let beta_worker =
+        TestWorker::start(beta.path(), beta_fake.clone(), "beta", 4096, Some(64_000)).await;
+
+    alpha_worker.submit("alpha-one").await;
+    beta_worker.submit("beta-one").await;
+    alpha_worker.submit("alpha-two").await;
+
+    let alpha_requests = alpha_fake.requests();
+    let beta_requests = beta_fake.requests();
+    assert_eq!(alpha_requests.len(), 2);
+    assert_eq!(beta_requests.len(), 1);
+    for request in &alpha_requests {
+        let context = daemon_session_context(request);
+        assert!(context.contains("alpha-only-policy"));
+        assert!(!context.contains("beta-only-policy"));
+    }
+    let beta_context = daemon_session_context(&beta_requests[0]);
+    assert!(beta_context.contains("beta-only-policy"));
+    assert!(!beta_context.contains("alpha-only-policy"));
+    assert_eq!(
+        alpha_requests[0].system_prompt, beta_requests[0].system_prompt,
+        "sibling sessions share the byte-stable base"
+    );
+    alpha_worker.close().await;
+    beta_worker.close().await;
 }
