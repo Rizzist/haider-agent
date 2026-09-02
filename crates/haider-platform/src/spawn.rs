@@ -636,6 +636,9 @@ fn spawn_daemon_with_stderr(
         .stdout(Stdio::from(log))
         .stderr(stderr);
     command.env(DAEMON_LOG_PATH_ENV, spec.log_path);
+    // The one-shot wall harness traces launcher-owned boundaries only. Never
+    // leak that client diagnostic switch into the daemon's startup surface.
+    command.env_remove("HAIDER_CLIENT_LIFECYCLE_TRACE");
     if let Some(machine_user_home) = machine_user_home {
         command
             .env("HOME", machine_user_home)

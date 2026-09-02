@@ -15028,8 +15028,6 @@ impl HubConnection {
             .await
         {
             Ok(Some(created)) => {
-                self.hub
-                    .set_ssh_scope(created.session_id.clone(), ssh_scope)?;
                 return self.respond_created(request_id, created);
             }
             Ok(None) => {}
@@ -15302,11 +15300,13 @@ impl HubConnection {
         // Keep the opened directory descriptor alive until the transaction
         // returns. M3 transfers the same canonical identity into its broker.
         let _descriptor = workspace.descriptor;
-        // Scope must be durable before the session can become observable. A
-        // vault failure therefore leaves no committed session that defaults
-        // open to `All`. A concurrent idempotent creator stages the same
-        // requested scope under its winning session id before its commit.
-        self.hub.set_ssh_scope(session_id, ssh_scope.clone())?;
+        // Absence is the durable representation of the default `All` scope.
+        // A non-default scope must still commit before the session can become
+        // visible. Concurrent creators each stage their own candidate; the
+        // transaction winner therefore already owns its exact durable scope.
+        if !matches!(&ssh_scope, crate::ssh::SshScope::All) {
+            self.hub.set_ssh_scope(session_id, ssh_scope.clone())?;
+        }
         match self
             .hub
             .create_session_with_interaction_mode(
@@ -15316,10 +15316,14 @@ impl HubConnection {
             )
             .await
         {
-            Ok(SessionCreateOutcome::Committed { created, .. })
-            | Ok(SessionCreateOutcome::IdempotentReplay { created }) => {
-                self.hub
-                    .set_ssh_scope(created.session_id.clone(), ssh_scope)?;
+            Ok(SessionCreateOutcome::Committed { created, .. }) => {
+                if matches!(&ssh_scope, crate::ssh::SshScope::All) {
+                    self.hub
+                        .cache_default_ssh_scope_after_create(created.session_id.clone())?;
+                }
+                self.respond_created(request_id, created)
+            }
+            Ok(SessionCreateOutcome::IdempotentReplay { created }) => {
                 self.respond_created(request_id, created)
             }
             Err(SessionHubError::Store(error)) => self.respond_error(

@@ -1,7 +1,9 @@
 #![allow(clippy::expect_used)]
 
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+use haider_protocol::headless::{HeadlessRunEventPayload, HeadlessRunSpecV1, RunBudgetV1};
 use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, RunId, SessionId};
+use haider_protocol::session::{SessionInteractionModeV1, SessionPermissionOverridesV1};
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::{AttachmentBlock, PdfAttachmentReceipt, PdfDeliveryMode};
 use haider_protocol::{DeliveryMode, EventPayload};
@@ -88,6 +90,117 @@ fn submit_atomically_commits_receipt_and_runnable_prefix() {
         [2, 3, 4, 5]
     );
     assert_eq!(store.latest_seq(&session_id).expect("head"), 5);
+}
+
+/// R2-09 hold-out pin: a fresh acceptance and its idempotent receipt replay
+/// must make exactly the same admission decision. The attempted process-local
+/// capsule regressed wall/CPU, so the durable receipt remains the authority.
+#[test]
+fn r2_09_admission_decisions_match_durable_receipt_replay() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("session-admission-parity");
+    let permissions = SessionPermissionOverridesV1 {
+        allow_writes: true,
+        allow_exec: true,
+        allow_mobile: false,
+        auto_allow: false,
+    };
+    store
+        .create_session_with_configuration(
+            &SessionCreateCommand {
+                command_id: "create-admission-parity".into(),
+                request_digest: "create-admission-parity-digest".into(),
+                request_json: r#"{"fixture":"admission-parity"}"#.into(),
+                session_id: session_id.clone(),
+                cwd: "/tmp/admission-parity".into(),
+                provider: "admission-provider".into(),
+                model: "admission-model".into(),
+                max_tokens: 8_192,
+                permission_overrides: Some(permissions),
+                effort: Some("high".into()),
+                fast: true,
+                cache_policy: Default::default(),
+                system_prompt_version: "admission-system-v1".into(),
+                event_id: EventId::new("created-admission-parity"),
+                device_id: DeviceId::new("test-daemon"),
+            },
+            SessionInteractionModeV1::Autonomous,
+            None,
+        )
+        .expect("create autonomous session");
+    let metadata = store
+        .session_metadata(&session_id)
+        .expect("metadata read")
+        .expect("metadata exists");
+    assert_eq!(metadata.cwd, "/tmp/admission-parity");
+    assert_eq!(metadata.provider, "admission-provider");
+    assert_eq!(metadata.model, "admission-model");
+    assert_eq!(metadata.max_tokens, 8_192);
+    assert_eq!(metadata.permission_overrides, Some(permissions));
+    assert_eq!(
+        metadata.interaction_mode,
+        SessionInteractionModeV1::Autonomous
+    );
+    assert_eq!(metadata.effort.as_deref(), Some("high"));
+    assert!(metadata.fast);
+
+    let spec = HeadlessRunSpecV1 {
+        cwd: metadata.cwd.clone(),
+        provider: metadata.provider.clone(),
+        model: metadata.model.clone(),
+        max_output_tokens: metadata.max_tokens,
+        effort: metadata.effort.clone(),
+        fast: metadata.fast,
+        seed: Some(7),
+        permission_overrides: permissions,
+        trust_hooks: false,
+        budget: RunBudgetV1 {
+            max_tokens: Some(123),
+            max_cost_microusd: Some(456),
+            max_time_ms: Some(789),
+        },
+        request_deadline_unix_ms: Some(9_999),
+        replay_of: None,
+    };
+    let mut command = submit(
+        &store,
+        "submit-admission-parity",
+        &session_id,
+        "run-admission-parity",
+    );
+    command.request_json = serde_json::json!({
+        "headless": &spec,
+        "trust_hooks": false,
+    })
+    .to_string();
+    command.request_digest = blake3::hash(command.request_json.as_bytes())
+        .to_hex()
+        .to_string();
+
+    let TurnAcceptOutcome::Committed {
+        accepted: committed,
+        envelopes,
+    } = store
+        .accept_turn_with_auto_title(&command, "admission parity")
+        .expect("fresh acceptance")
+    else {
+        panic!("fresh acceptance must commit");
+    };
+    assert!(envelopes.iter().any(|envelope| matches!(
+        HeadlessRunEventPayload::from_payload_value(&envelope.payload),
+        Some(HeadlessRunEventPayload::HeadlessRunConfigured(ref configured))
+            if configured == &spec
+    )));
+    let TurnAcceptOutcome::IdempotentReplay { accepted: replayed } = store
+        .accept_turn_with_auto_title(&command, "admission parity")
+        .expect("receipt replay")
+    else {
+        panic!("second acceptance must replay");
+    };
+
+    assert_eq!(replayed, committed);
+    assert_eq!(replayed.disposition, TurnAdmissionDisposition::Started);
 }
 
 /// MUTATION CHECK: move the automatic title back to a second transaction.

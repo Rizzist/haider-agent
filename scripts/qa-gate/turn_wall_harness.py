@@ -16,6 +16,7 @@ import tempfile
 from typing import Any
 
 from turnperf_support import (
+    CLIENT_TRACE_ENV,
     FakeProvider,
     ProofError,
     TRACE_ENV,
@@ -25,17 +26,24 @@ from turnperf_support import (
     load_one_minute,
     median_mad,
     process_cpu_ms,
+    profile_lock_is_free,
     process_peak_rss_kib,
     process_rss_kib,
+    profile_daemon_pid,
+    runtime_socket_paths,
     run_arguments,
     sha256_file,
     validate_jsonl,
+    wait_pid_gone,
     wait_session_idle,
 )
 
 
 WARMUPS_PER_SHAPE = 5
 MEASURED_PER_SHAPE = 25
+ONE_SHOT_WARMUPS = 5
+ONE_SHOT_MEASURED = 21
+ONE_SHOT_MIN_MEASURED = 21
 LOAD_LIMIT = 3.0  # baseline conditions (loads 2.4-2.5); lane load yields ENV_BLOCKED, never a false FAIL
 OWNER_TARGET_MS = {"single": 40.0, "tool": 60.0}
 
@@ -64,6 +72,7 @@ def _trace_records(text: str) -> list[dict[str, int | str]]:
                 "txn_ordinal",
                 "start_us_from_accept",
                 "end_us_from_accept",
+                "unix_micros",
             }:
                 try:
                     record[key] = int(value)
@@ -72,6 +81,31 @@ def _trace_records(text: str) -> list[dict[str, int | str]]:
             elif key in {"target", "phase", "level"}:
                 record[key] = value
         if record.get("target") == "haider.turn" and isinstance(record.get("phase"), str):
+            records.append(record)
+    return records
+
+
+def _lifecycle_trace_records(text: str) -> list[dict[str, int | str]]:
+    records: list[dict[str, int | str]] = []
+    for line in text.splitlines():
+        if "target=haider.lifecycle" not in line:
+            continue
+        record: dict[str, int | str] = {}
+        for token in line.split():
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            if key in {"operation_micros", "unix_micros"}:
+                try:
+                    record[key] = int(value)
+                except ValueError:
+                    continue
+            elif key in {"target", "phase", "level"}:
+                record[key] = value
+        if record.get("target") == "haider.lifecycle" and record.get("phase") in {
+            "spawn_ready",
+            "client_accepted_seen",
+        }:
             records.append(record)
     return records
 
@@ -110,6 +144,355 @@ def _host_facts() -> dict[str, Any]:
         "python": platform.python_version(),
         "power": os.environ.get("HAIDER_TURNPERF_POWER", "unrecorded"),
     }
+
+
+def _one_shot_parameter_reasons(
+    warmups: int, measured: int, load_limit: float
+) -> list[str]:
+    reasons: list[str] = []
+    if warmups < ONE_SHOT_WARMUPS:
+        reasons.append(
+            f"warmups={warmups} is below one-shot proof minimum {ONE_SHOT_WARMUPS}"
+        )
+    if measured < ONE_SHOT_MIN_MEASURED:
+        reasons.append(
+            f"measured={measured} is below one-shot proof minimum {ONE_SHOT_MIN_MEASURED}"
+        )
+    if not math.isfinite(load_limit) or load_limit != LOAD_LIMIT:
+        reasons.append(f"load_limit={load_limit!r} is not proof pin {LOAD_LIMIT:.1f}")
+    return reasons
+
+
+def _stage_summary(values: list[float]) -> dict[str, float | int]:
+    median, mad = median_mad(values)
+    return {"count": len(values), "median": median, "mad": mad}
+
+
+def run_one_shot_harness(
+    bin_dir: Path,
+    *,
+    warmups: int = ONE_SHOT_WARMUPS,
+    measured: int = ONE_SHOT_MEASURED,
+    load_limit: float = LOAD_LIMIT,
+    trace: bool = False,
+    keep_root: bool = False,
+    budget_ms: float | None = None,
+    cpu_total_21_budget_ms: float | None = None,
+    peak_rss_budget_kib: float | None = None,
+    commit_label: str | None = None,
+) -> dict[str, Any]:
+    """Measure complete TTL=0 run lifecycles on a virgin profile per sample."""
+    if warmups < 0 or measured < 1:
+        raise ProofError("warmups must be non-negative and measured must be positive")
+    for name, value in (
+        ("wall budget", budget_ms),
+        ("CPU-total budget", cpu_total_21_budget_ms),
+        ("peak-RSS budget", peak_rss_budget_kib),
+    ):
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise ProofError(f"{name} must be finite and positive")
+    root = Path(tempfile.mkdtemp(prefix="htp-one-shot-"))
+    proxy_ledger = root / "provider-ledger.jsonl"
+    samples: list[dict[str, Any]] = []
+    warmup_rows: list[dict[str, Any]] = []
+    correctness_failures: list[str] = []
+    budget_failures: list[str] = []
+    load: dict[str, float] = {}
+    trace_records: list[dict[str, int | str]] = []
+    lifecycle_trace_records: list[dict[str, int | str]] = []
+    retained_profiles: list[str] = []
+    try:
+        with FakeProvider(proxy_ledger) as proxy:
+
+            def one_case(sample_index: int, reported: bool) -> None:
+                phase = "measured" if reported else "warmup"
+                profile = ThrowawayProfile(
+                    bin_dir,
+                    proxy.base_url,
+                    root=root / f"{phase}-{sample_index:03d}",
+                )
+                case_id = proxy.state.begin_case("single")
+                overrides = {
+                    "HAIDER_RUN_DAEMON_IDLE_TTL_MS": "0",
+                    # One-shot lifecycle markers are client-only: propagating
+                    # the daemon's full trace port perturbs pre-Ready startup.
+                    CLIENT_TRACE_ENV: "1" if trace else None,
+                    TRACE_ENV: None,
+                }
+                observed_pid: int | None = None
+                try:
+                    result = profile.command(
+                        run_arguments("single"),
+                        timeout=82,
+                        overrides=overrides,
+                        observe_spawned_daemon=True,
+                    )
+                    observed_pid = result.observed_pid
+                    daemon_trace = _daemon_trace(profile)
+                    if result.timed_out or result.returncode != 0:
+                        raise ProofError(
+                            f"one-shot case={case_id} process failed exit={result.returncode} "
+                            f"timed_out={result.timed_out} stderr={result.stderr[-500:]!r}"
+                        )
+                    parsed = validate_jsonl(result.stdout, "single")
+                    if not proxy.state.wait_idle(2):
+                        raise ProofError(
+                            f"one-shot case={case_id} proxy handlers did not settle"
+                        )
+                    ledger = proxy.state.snapshot_case()
+                    assert_provider_ledger(ledger, "single")
+                    if proxy.state.read_disk_ledger() != proxy.state.snapshot_all():
+                        raise ProofError("on-disk provider ledger diverged from proxy memory")
+                    if result.observed_pid is None or result.observed_peak_rss_kib <= 0:
+                        raise ProofError(
+                            f"one-shot case={case_id} did not observe spawned daemon RSS"
+                        )
+                    if not wait_pid_gone(result.observed_pid, 2):
+                        raise ProofError(
+                            f"one-shot case={case_id} returned before observed daemon exited "
+                            f"pid={result.observed_pid}"
+                        )
+                    owner_after_exit = profile_daemon_pid(profile.profile)
+                    if owner_after_exit is not None or (profile.profile / "lock.owner").exists():
+                        raise ProofError(
+                            f"one-shot case={case_id} returned with daemon owner "
+                            f"pid={owner_after_exit!r}"
+                        )
+                    if not profile_lock_is_free(profile.profile):
+                        raise ProofError(
+                            f"one-shot case={case_id} returned with profile lock held"
+                        )
+                    sockets_after_exit = runtime_socket_paths(profile.runtime)
+                    if sockets_after_exit:
+                        raise ProofError(
+                            f"one-shot case={case_id} left runtime sockets "
+                            f"{[str(path) for path in sockets_after_exit]}"
+                        )
+                    no_spawn_status = profile.command(
+                        ["status", "--json", "--no-spawn"], timeout=10
+                    )
+                    if no_spawn_status.returncode != 69:
+                        raise ProofError(
+                            f"one-shot case={case_id} left a reachable daemon; "
+                            f"status exit={no_spawn_status.returncode}"
+                        )
+                    row: dict[str, Any] = {
+                        "index": sample_index,
+                        "case_id": case_id,
+                        "wall_ms": result.wall_ms,
+                        # The CLI reaps its owned daemon, so RUSAGE_CHILDREN for
+                        # the CLI process includes the daemon it waited for.
+                        "process_tree_cpu_ms": result.cpu_ms,
+                        "client_peak_rss_kib": result.child_peak_rss_kib,
+                        "daemon_peak_rss_kib": result.observed_peak_rss_kib,
+                        "combined_peak_rss_kib": result.combined_peak_rss_kib,
+                        "daemon_pid": result.observed_pid,
+                        "terminal_kind": parsed["terminal_kind"],
+                        "terminal_seq": parsed["terminal_seq"],
+                        "provider_requests": len(ledger),
+                    }
+                    if trace:
+                        case_turn_records = _trace_records(result.stderr + daemon_trace)
+                        case_lifecycle_records = _lifecycle_trace_records(result.stderr)
+                        client_terminal = [
+                            record
+                            for record in case_turn_records
+                            if record.get("phase") == "client_terminal_seen"
+                        ]
+                        spawn_ready = [
+                            record
+                            for record in case_lifecycle_records
+                            if record.get("phase") == "spawn_ready"
+                        ]
+                        client_accepted = [
+                            record
+                            for record in case_lifecycle_records
+                            if record.get("phase") == "client_accepted_seen"
+                        ]
+                        if (
+                            len(client_terminal) != 1
+                            or len(spawn_ready) != 1
+                            or len(client_accepted) != 1
+                        ):
+                            raise ProofError(
+                                f"one-shot case={case_id} trace cardinality "
+                                f"terminal={len(client_terminal)} spawn_ready={len(spawn_ready)} "
+                                f"client_accepted={len(client_accepted)}"
+                            )
+                        terminal_unix = client_terminal[0].get("unix_micros")
+                        if not isinstance(terminal_unix, int):
+                            raise ProofError(
+                                f"one-shot case={case_id} terminal trace lacks unix_micros"
+                            )
+                        terminal_to_exit = result.ended_unix_micros - terminal_unix
+                        if terminal_to_exit < 0:
+                            raise ProofError(
+                                f"one-shot case={case_id} terminal trace follows process exit"
+                            )
+                        row["stages_ms"] = {
+                            "spawn_to_ready": float(spawn_ready[0]["operation_micros"])
+                            / 1_000,
+                            "ready_to_accept": float(
+                                client_accepted[0]["operation_micros"]
+                            )
+                            / 1_000,
+                            "accept_to_terminal": float(
+                                client_terminal[0]["operation_micros"]
+                            )
+                            / 1_000,
+                            "terminal_to_exit": float(terminal_to_exit) / 1_000,
+                        }
+                        if reported:
+                            trace_records.extend(case_turn_records)
+                            lifecycle_trace_records.extend(case_lifecycle_records)
+                    (samples if reported else warmup_rows).append(row)
+                finally:
+                    if keep_root:
+                        retained_profiles.append(str(profile.root))
+                    profile.dispose(
+                        observed_pid=observed_pid,
+                        remove_root=not keep_root,
+                    )
+
+            for index in range(1, warmups + 1):
+                one_case(index, False)
+
+            load["start"] = load_one_minute()
+            midpoint = measured // 2
+            for index in range(1, measured + 1):
+                one_case(index, True)
+                if index == midpoint:
+                    load["mid"] = load_one_minute()
+            load["end"] = load_one_minute()
+    finally:
+        if not keep_root:
+            try:
+                proxy_ledger.unlink()
+                root.rmdir()
+            except OSError:
+                pass
+
+    overload = [name for name, value in load.items() if value >= load_limit]
+    measurement_reasons = [
+        f"load {name}={load[name]:.2f} is not below {load_limit:.2f}" for name in overload
+    ] + _one_shot_parameter_reasons(warmups, measured, load_limit)
+    measurement_accepted = not measurement_reasons
+    if len(samples) != measured:
+        correctness_failures.append(
+            f"measured count expected={measured} actual={len(samples)}"
+        )
+    wall_median, wall_mad = median_mad([row["wall_ms"] for row in samples])
+    cpu_median, cpu_mad = median_mad(
+        [row["process_tree_cpu_ms"] for row in samples]
+    )
+    cpu_total = sum(row["process_tree_cpu_ms"] for row in samples)
+    cpu_total_21 = cpu_total * 21 / measured
+    peak_rss = max(row["combined_peak_rss_kib"] for row in samples)
+    if measurement_accepted and budget_ms is not None and wall_median > budget_ms:
+        budget_failures.append(
+            f"one-shot wall median {wall_median:.3f}ms exceeds budget {budget_ms:.3f}ms"
+        )
+    if (
+        measurement_accepted
+        and cpu_total_21_budget_ms is not None
+        and cpu_total_21 > cpu_total_21_budget_ms
+    ):
+        budget_failures.append(
+            f"one-shot CPU total normalized to 21 {cpu_total_21:.3f}ms exceeds "
+            f"budget {cpu_total_21_budget_ms:.3f}ms"
+        )
+    if (
+        measurement_accepted
+        and peak_rss_budget_kib is not None
+        and peak_rss > peak_rss_budget_kib
+    ):
+        budget_failures.append(
+            f"one-shot combined peak RSS {peak_rss:.0f}KiB exceeds budget "
+            f"{peak_rss_budget_kib:.0f}KiB"
+        )
+    stage_summary: dict[str, Any] = {}
+    if trace:
+        for stage in (
+            "spawn_to_ready",
+            "ready_to_accept",
+            "accept_to_terminal",
+            "terminal_to_exit",
+        ):
+            stage_summary[stage] = _stage_summary(
+                [row["stages_ms"][stage] for row in samples]
+            )
+    report = {
+        "schema": "haider.turn-wall.v1",
+        "mode": "one-shot",
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "commit": commit_label or _git_commit(),
+        "host": _host_facts(),
+        "binaries": {
+            "haider": {
+                "path": str((bin_dir / "haider").resolve()),
+                "sha256": sha256_file(bin_dir / "haider"),
+            },
+            "haiderd": {
+                "path": str((bin_dir / "haiderd").resolve()),
+                "sha256": sha256_file(bin_dir / "haiderd"),
+            },
+            "proxy_source_sha256": sha256_file(
+                Path(__file__).with_name("turnperf_support.py")
+            ),
+            "harness_source_sha256": sha256_file(Path(__file__)),
+        },
+        "parameters": {
+            "warmups": warmups,
+            "measured": measured,
+            "order": "fresh-profile-per-sample",
+            "daemon_idle_ttl_ms": 0,
+            "load_limit_one_minute": load_limit,
+            "trace": trace,
+        },
+        "load_one_minute": load,
+        "measurement_accepted": measurement_accepted,
+        "measurement_reasons": measurement_reasons,
+        "warmups": warmup_rows,
+        "samples": samples,
+        "summary": {
+            "wall_ms": {"median": wall_median, "mad": wall_mad},
+            "process_tree_cpu_ms": {"median": cpu_median, "mad": cpu_mad},
+            "process_tree_cpu_total_ms": cpu_total,
+            "process_tree_cpu_total_21_normalized_ms": cpu_total_21,
+            "peak_rss_kib": peak_rss,
+            "client_peak_rss_kib": max(row["client_peak_rss_kib"] for row in samples),
+            "daemon_peak_rss_kib": max(row["daemon_peak_rss_kib"] for row in samples),
+            "budget_ms": budget_ms,
+            "budget_pass": (
+                None
+                if budget_ms is None or not measurement_accepted
+                else wall_median <= budget_ms
+            ),
+            "cpu_total_21_budget_ms": cpu_total_21_budget_ms,
+            "cpu_total_21_budget_pass": (
+                None
+                if cpu_total_21_budget_ms is None or not measurement_accepted
+                else cpu_total_21 <= cpu_total_21_budget_ms
+            ),
+            "peak_rss_budget_kib": peak_rss_budget_kib,
+            "peak_rss_budget_pass": (
+                None
+                if peak_rss_budget_kib is None or not measurement_accepted
+                else peak_rss <= peak_rss_budget_kib
+            ),
+        },
+        "trace_records": trace_records,
+        "lifecycle_trace_records": lifecycle_trace_records,
+        "trace_stage_summary": stage_summary,
+        "correctness_failures": correctness_failures,
+        "budget_failures": budget_failures,
+        "failures": correctness_failures + budget_failures,
+        "passed": not correctness_failures and not budget_failures and measurement_accepted,
+    }
+    if keep_root:
+        report["retained_root"] = str(root)
+        report["retained_profiles"] = retained_profiles
+    return report
 
 
 def run_harness(
@@ -536,19 +919,28 @@ def _arguments(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--warmups", type=int, default=WARMUPS_PER_SHAPE)
-    parser.add_argument("--measured", type=int, default=MEASURED_PER_SHAPE)
+    parser.add_argument("--one-shot", action="store_true")
+    parser.add_argument("--warmups", type=int)
+    parser.add_argument("--measured", type=int)
     parser.add_argument("--load-limit", type=float, default=LOAD_LIMIT)
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--keep-root", action="store_true")
     parser.add_argument("--single-budget-ms", type=float)
     parser.add_argument("--tool-budget-ms", type=float)
+    parser.add_argument("--cpu-total-21-budget-ms", type=float)
+    parser.add_argument("--peak-rss-budget-kib", type=float)
     parser.add_argument("--commit-label")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _arguments(list(sys.argv[1:] if argv is None else argv))
+    warmups = args.warmups
+    if warmups is None:
+        warmups = ONE_SHOT_WARMUPS if args.one_shot else WARMUPS_PER_SHAPE
+    measured = args.measured
+    if measured is None:
+        measured = ONE_SHOT_MEASURED if args.one_shot else MEASURED_PER_SHAPE
     budgets = None
     if args.single_budget_ms is not None or args.tool_budget_ms is not None:
         budgets = {
@@ -567,16 +959,36 @@ def main(argv: list[str] | None = None) -> int:
             print("turn-wall harness failed: budgets must be finite and positive", file=sys.stderr)
             return 2
     try:
-        report = run_harness(
-            args.bin_dir,
-            warmups=args.warmups,
-            measured=args.measured,
-            load_limit=args.load_limit,
-            trace=args.trace,
-            keep_root=args.keep_root,
-            budget_ms=budgets,
-            commit_label=args.commit_label,
-        )
+        if args.one_shot:
+            if args.tool_budget_ms is not None:
+                raise ProofError("--tool-budget-ms is not valid with --one-shot")
+            report = run_one_shot_harness(
+                args.bin_dir,
+                warmups=warmups,
+                measured=measured,
+                load_limit=args.load_limit,
+                trace=args.trace,
+                keep_root=args.keep_root,
+                budget_ms=args.single_budget_ms,
+                cpu_total_21_budget_ms=args.cpu_total_21_budget_ms,
+                peak_rss_budget_kib=args.peak_rss_budget_kib,
+                commit_label=args.commit_label,
+            )
+        else:
+            if args.cpu_total_21_budget_ms is not None or args.peak_rss_budget_kib is not None:
+                raise ProofError(
+                    "--cpu-total-21-budget-ms and --peak-rss-budget-kib require --one-shot"
+                )
+            report = run_harness(
+                args.bin_dir,
+                warmups=warmups,
+                measured=measured,
+                load_limit=args.load_limit,
+                trace=args.trace,
+                keep_root=args.keep_root,
+                budget_ms=budgets,
+                commit_label=args.commit_label,
+            )
     except Exception as error:
         print(f"turn-wall harness failed: {type(error).__name__}: {error}", file=sys.stderr)
         return 1

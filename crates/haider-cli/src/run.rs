@@ -1338,6 +1338,27 @@ fn adapt_events_to(
                 session_id,
                 head_seq,
             } if !announced => {
+                if let Some((operation_micros, unix_micros)) =
+                    haider_client::take_spawn_ready_trace()
+                {
+                    writeln!(
+                        stderr,
+                        "haider: trace level=TRACE target=haider.lifecycle phase=spawn_ready \
+                         operation_micros={operation_micros} unix_micros={unix_micros}"
+                    )?;
+                    let accepted_unix_micros = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros();
+                    let ready_to_accept_micros = accepted_unix_micros.saturating_sub(unix_micros);
+                    writeln!(
+                        stderr,
+                        "haider: trace level=TRACE target=haider.lifecycle \
+                         phase=client_accepted_seen operation_micros={ready_to_accept_micros} \
+                         unix_micros={accepted_unix_micros}"
+                    )?;
+                    stderr.flush()?;
+                }
                 let accepted = AcceptedAnnouncement {
                     event: "accepted",
                     session_id: session_id.as_str(),
@@ -1378,7 +1399,7 @@ fn adapt_events_to(
                 // returned by TurnSubmit/HeadlessRunStart. Correlate the
                 // client terminal with the daemon's accepted_seq, not the
                 // provisional Created sequence.
-                if haider_core::turn_trace_enabled() {
+                if client_turn_trace_enabled() {
                     turn_trace = Some((
                         haider_core::turn_trace_ordinal(&session_id, head_seq),
                         Instant::now(),
@@ -1400,11 +1421,18 @@ fn adapt_events_to(
             HeadlessEvent::Terminal(terminal) => {
                 if let Some((turn_ordinal, accepted_at)) = turn_trace {
                     let end_us = accepted_at.elapsed().as_micros();
-                    eprintln!(
+                    let unix_micros = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros();
+                    writeln!(
+                        stderr,
                         "haider: trace level=TRACE target=haider.turn phase=client_terminal_seen \
                          operation_micros={end_us} turn_ordinal={turn_ordinal} request_ordinal=0 \
-                         txn_ordinal=0 start_us_from_accept=0 end_us_from_accept={end_us}"
-                    );
+                         txn_ordinal=0 start_us_from_accept=0 end_us_from_accept={end_us} \
+                         unix_micros={unix_micros}"
+                    )?;
+                    stderr.flush()?;
                 }
                 if output == RunOutput::Jsonl {
                     let mut envelope = *terminal.envelope;
@@ -1461,6 +1489,16 @@ fn adapt_events_to(
         stdout.flush()?;
     }
     Ok(())
+}
+
+fn client_turn_trace_enabled() -> bool {
+    matches!(
+        std::env::var_os("HAIDER_DAEMON_TRACE").as_deref(),
+        Some(value) if value == "1"
+    ) || matches!(
+        std::env::var_os("HAIDER_CLIENT_LIFECYCLE_TRACE").as_deref(),
+        Some(value) if value == "1"
+    )
 }
 
 fn is_terminal_run_state(envelope: &RawEnvelope) -> bool {

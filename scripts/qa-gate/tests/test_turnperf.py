@@ -6,7 +6,16 @@ import tempfile
 import unittest
 from unittest import mock
 
-from turn_wall_harness import _abba, _trace_records
+from turn_wall_harness import (
+    ONE_SHOT_MEASURED,
+    ONE_SHOT_WARMUPS,
+    _abba,
+    _arguments,
+    _lifecycle_trace_records,
+    _one_shot_parameter_reasons,
+    _stage_summary,
+    _trace_records,
+)
 from turnperf_sigkill_matrix import (
     _assert_tool_effect_result_bounds,
     _validate_probe_receipt,
@@ -109,7 +118,7 @@ class TurnPerformanceHarnessTests(unittest.TestCase):
         self.assertEqual(name, "process_exec")
         self.assertEqual(set(arguments), {"command"})
 
-    def test_ci_budget_is_exactly_baseline_times_one_point_one(self):
+    def test_warm_ci_budget_uses_the_accepted_release_pins(self):
         path = (
             Path(__file__).parents[1]
             / "checks"
@@ -117,10 +126,8 @@ class TurnPerformanceHarnessTests(unittest.TestCase):
             / "t1.turn.wall_budget.py"
         )
         check = load_check(path, "t1")
-        for shape, baseline in check.module.BASELINE.items():
-            self.assertEqual(
-                check.module.WALL_BUDGET_MS[shape], baseline["wall_ms"] * 1.10
-            )
+        self.assertEqual(check.module.WALL_BUDGET_MS, {"single": 56.7, "tool": 78.0})
+        for baseline in check.module.BASELINE.values():
             self.assertGreater(baseline["combined_cpu_mad_ms"], 0)
             self.assertEqual(baseline["combined_peak_rss_tolerance_kib"], 64.0)
 
@@ -216,6 +223,66 @@ class TurnPerformanceHarnessTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["operation_micros"], 7)
         self.assertNotIn("prompt", records[0])
+
+    def test_one_shot_proof_requires_twenty_one_samples_and_five_warmups(self):
+        self.assertEqual(_one_shot_parameter_reasons(5, 21, 3.0), [])
+        reasons = _one_shot_parameter_reasons(4, 20, 3.0)
+        self.assertEqual(len(reasons), 2)
+        self.assertIn("warmups=4", reasons[0])
+        self.assertIn("measured=20", reasons[1])
+
+    def test_one_shot_lifecycle_trace_accepts_stage_boundaries_only(self):
+        records = _lifecycle_trace_records(
+            "haider: trace level=TRACE target=haider.lifecycle phase=spawn_ready "
+            "operation_micros=31415 unix_micros=123456 secret=nope\n"
+            "haider: trace level=TRACE target=haider.lifecycle phase=client_accepted_seen "
+            "operation_micros=2718 unix_micros=126174 secret=nope\n"
+            "haider: trace level=TRACE target=haider.lifecycle phase=other "
+            "operation_micros=1 unix_micros=2\n"
+        )
+        self.assertEqual(
+            records,
+            [
+                {
+                    "level": "TRACE",
+                    "target": "haider.lifecycle",
+                    "phase": "spawn_ready",
+                    "operation_micros": 31415,
+                    "unix_micros": 123456,
+                },
+                {
+                    "level": "TRACE",
+                    "target": "haider.lifecycle",
+                    "phase": "client_accepted_seen",
+                    "operation_micros": 2718,
+                    "unix_micros": 126174,
+                },
+            ],
+        )
+
+    def test_one_shot_ci_gate_enforces_all_accepted_release_pins(self):
+        path = (
+            Path(__file__).parents[1]
+            / "checks"
+            / "t1"
+            / "t1.turn.one_shot_budget.py"
+        )
+        check = load_check(path, "t1")
+        self.assertEqual(check.module.WALL_BUDGET_MS, 124.0)
+        self.assertEqual(check.module.CPU_TOTAL_21_BUDGET_MS, 1_059.0)
+        self.assertEqual(check.module.PEAK_RSS_BUDGET_KIB, 51.2 * 1_024)
+
+    def test_one_shot_cli_defaults_to_proof_sample_counts(self):
+        args = _arguments(["--bin-dir", "/tmp/bin", "--one-shot"])
+        warmups = ONE_SHOT_WARMUPS if args.warmups is None else args.warmups
+        measured = ONE_SHOT_MEASURED if args.measured is None else args.measured
+        self.assertEqual((warmups, measured), (5, 21))
+
+    def test_one_shot_stage_summary_reports_untrimmed_median_and_mad(self):
+        self.assertEqual(
+            _stage_summary([1.0, 2.0, 100.0]),
+            {"count": 3, "median": 2.0, "mad": 1.0},
+        )
 
 
 if __name__ == "__main__":

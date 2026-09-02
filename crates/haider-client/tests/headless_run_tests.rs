@@ -372,6 +372,141 @@ async fn run_with_events(
     (result, events)
 }
 
+/// R2-05 hold-out pin: attach and headless.start remain separate correlated
+/// requests. The start frame cannot be sent until both the attach receipt and
+/// its caught-up barrier have arrived; the attempted pipeline regressed and
+/// was reverted.
+#[tokio::test]
+async fn r2_05_attach_then_start_are_ordered_separate_requests_with_receipts() {
+    let (_root, profile) = profile();
+    let listener = UnixListener::bind(&profile.endpoint_path).expect("bind ordered peer");
+    let mut advertised = welcome(&profile);
+    advertised
+        .features
+        .insert(haider_rpc::FEATURE_HEADLESS_RUN_V1.to_owned());
+    let peer = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener, advertised).await;
+        let (create_request, create) = peer.request().await;
+        assert!(matches!(
+            create,
+            RequestBody::SessionCreateWithPermissionOverrides { .. }
+        ));
+        let session_id = SessionId::new("r2-05-session");
+        peer.respond(
+            create_request,
+            ResponseBody::SessionCreate {
+                session_id: session_id.clone(),
+                created_seq: 0,
+                worker_generation: 7,
+                metadata: SessionMetadataV1 {
+                    cwd: "/tmp".into(),
+                    provider: "fake".into(),
+                    account_alias: None,
+                    model: "fake-model".into(),
+                    max_tokens: 4_096,
+                    permission_overrides: None,
+                    interaction_mode: SessionInteractionModeV1::Autonomous,
+                    system_prompt_version: Some("test".into()),
+                    title: None,
+                    effort: None,
+                    fast: false,
+                    cache_policy: Default::default(),
+                    context_economy: Default::default(),
+                    created_at_ms: 1,
+                    agent_type: None,
+                },
+            },
+        )
+        .await;
+
+        let (attach_request, attach) = peer.request().await;
+        assert!(matches!(
+            attach,
+            RequestBody::SessionAttach {
+                mode: AttachMode::Control,
+                ..
+            }
+        ));
+        assert!(peer.queued.is_empty(), "start was coalesced with attach");
+        // BOUND / 50 = 100 ms: a pipelined frame is already writable in the
+        // same local-socket scheduling turn, while the full test owns 5 s.
+        assert!(
+            tokio::time::timeout(BOUND / 50, peer.next()).await.is_err(),
+            "start arrived before the attach receipt"
+        );
+        let attachment_id = AttachmentId::new("r2-05-attachment");
+        peer.respond(
+            attach_request.clone(),
+            ResponseBody::SessionAttach {
+                attachment_id: attachment_id.clone(),
+                attach_state: AttachState {
+                    session_id: session_id.clone(),
+                    requested_after_seq: 0,
+                    replay_through_seq: 0,
+                    worker_generation: 7,
+                    authority_epoch: 1,
+                },
+            },
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(BOUND / 50, peer.next()).await.is_err(),
+            "start arrived before attach caught-up"
+        );
+        peer.write(&WireFrame::AttachCaughtUp {
+            attachment_id: attachment_id.clone(),
+            high_water_seq: 0,
+        })
+        .await;
+
+        let (start_request, start) = peer.request().await;
+        assert_ne!(
+            start_request, attach_request,
+            "requests need distinct receipts"
+        );
+        let RequestBody::HeadlessRunStart {
+            session_id: started_session,
+            worker_generation,
+            ..
+        } = start
+        else {
+            panic!("expected separate headless.run.start frame");
+        };
+        assert_eq!(started_session, session_id);
+        assert_eq!(worker_generation, 7);
+        let run_id = RunId::new("r2-05-run");
+        peer.respond(
+            start_request,
+            ResponseBody::HeadlessRunStart {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                accepted_seq: 1,
+                worker_generation: 7,
+                disposition: SubmitDisposition::Started,
+            },
+        )
+        .await;
+        send_event(
+            &mut peer,
+            &attachment_id,
+            envelope(
+                &session_id,
+                &run_id,
+                1,
+                EventPayload::RunState(RunState::Done),
+            ),
+        )
+        .await;
+    });
+
+    let mut run = request(None);
+    run.journal_pin = true;
+    let (result, _events) = run_with_events(profile, run, 4, Duration::ZERO).await;
+    peer.await.expect("peer");
+    assert_eq!(result.outcome, HeadlessOutcome::Done);
+    assert_eq!(result.terminal_seq, Some(1));
+}
+
 #[tokio::test]
 async fn headless_pin_feature_is_required_before_session_mutation() {
     let (_root, profile) = profile();

@@ -36,9 +36,9 @@ BASELINE = {
         "combined_peak_rss_tolerance_kib": 64.0,
     },
 }
-WALL_BUDGET_MS = {
-    shape: values["wall_ms"] * 1.10 for shape, values in BASELINE.items()
-}
+# PROPOSAL2 §4 accepted release ceilings. The R2-03 candidate clears these;
+# unlike the earlier general gate, this lane does not permit 10% wall slack.
+WALL_BUDGET_MS = {"single": 56.7, "tool": 78.0}
 
 TURN_CASES = BudgetPart(
     "sixty bounded attached turns",
