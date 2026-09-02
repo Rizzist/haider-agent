@@ -14,6 +14,7 @@ render, and terminal write, so the retained Sixel allocation is measured.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import ctypes
 import ctypes.util
 import fcntl
@@ -41,6 +42,7 @@ PROC_PIDTASKINFO = 4
 DEFAULT_LOAD_LIMIT = 4.0
 DEFAULT_SETTLE_SECONDS = 60.0
 CALIBRATION_RUNS = 5
+BUDGET_HEADROOM_PERCENT = 10
 HOLD_MARGIN_SECONDS = 15
 SIXEL_RESPONSE = b"\x1b[?64;4c\x1b[6;20;10t\x1b[0n"
 WIRE_PROVIDER = "footprint-proxy"
@@ -885,16 +887,47 @@ def median_absolute_deviation(values: list[int]) -> float:
     return float(statistics.median(abs(value - median) for value in values))
 
 
-def summarize(surface: str, samples: list[dict[str, object]]) -> dict[str, object]:
+def runner_context(environment: Mapping[str, str]) -> dict[str, str]:
+    fields = (
+        ("github_run_id", "GITHUB_RUN_ID"),
+        ("github_run_attempt", "GITHUB_RUN_ATTEMPT"),
+        ("github_sha", "GITHUB_SHA"),
+        ("runner_os", "RUNNER_OS"),
+        ("runner_arch", "RUNNER_ARCH"),
+        ("runner_name", "RUNNER_NAME"),
+        ("image_os", "ImageOS"),
+        ("image_version", "ImageVersion"),
+    )
+    return {
+        field: value
+        for field, variable in fields
+        if (value := environment.get(variable)) is not None
+    }
+
+
+def budget_from_median(median_bytes: int | float) -> int:
+    return math.ceil(median_bytes * (100 + BUDGET_HEADROOM_PERCENT) / 100)
+
+
+def summarize(
+    surface: str,
+    samples: list[dict[str, object]],
+    *,
+    calibration: bool = False,
+    environment: Mapping[str, str] = os.environ,
+) -> dict[str, object]:
     footprint = [int(sample["phys_footprint_bytes"]) for sample in samples]
     cpu = [int(sample["cpu_total_us"]) for sample in samples]
+    footprint_median = statistics.median(footprint)
     return {
         "surface": surface,
         "runs": len(samples),
+        "mode": "calibration" if calibration else "guard",
+        "run_context": runner_context(environment),
         "measurement_accepted": all(int(sample["vmmap_exit"]) == 0 for sample in samples),
         "phys_footprint_bytes": {
             "min": min(footprint),
-            "median": statistics.median(footprint),
+            "median": footprint_median,
             "max": max(footprint),
             "mad": median_absolute_deviation(footprint),
         },
@@ -904,7 +937,12 @@ def summarize(surface: str, samples: list[dict[str, object]]) -> dict[str, objec
             "max": max(cpu),
             "mad": median_absolute_deviation(cpu),
         },
-        "derived_budget_bytes": math.ceil(max(footprint) * 1.10),
+        "budget_basis": {
+            "metric": "phys_footprint_bytes.median",
+            "headroom_percent": BUDGET_HEADROOM_PERCENT,
+            "formula": "ceil(median * 1.10)",
+        },
+        "derived_budget_bytes": budget_from_median(footprint_median),
         "samples": samples,
     }
 
@@ -923,7 +961,7 @@ def self_test() -> int:
         "mad": 100.0,
     }:
         raise RuntimeError(f"summary arithmetic drifted: {summary!r}")
-    if summary["derived_budget_bytes"] != 1_210:
+    if summary["derived_budget_bytes"] != 1_100:
         raise RuntimeError(f"budget arithmetic drifted: {summary!r}")
 
     metrics = DarwinProcessMetrics()
@@ -939,7 +977,7 @@ def self_test() -> int:
     return 0
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--haider", type=Path)
@@ -965,7 +1003,7 @@ def parse_args() -> argparse.Namespace:
         help="retain rejected proc_pid_rusage diagnostics when sandboxing denies vmmap",
     )
     parser.add_argument("--keep-profiles", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.self_test:
         incompatible = (
             args.haider is not None
@@ -990,10 +1028,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--runs must be positive")
     if args.settle_seconds <= 0:
         parser.error("--settle-seconds must be positive")
-    if args.calibrate and args.runs < CALIBRATION_RUNS:
-        parser.error(f"--calibrate requires --runs >= {CALIBRATION_RUNS}")
-    if args.calibrate and args.runs > CALIBRATION_RUNS:
-        parser.error(f"--calibrate is bounded to --runs {CALIBRATION_RUNS}")
+    if args.calibrate and args.runs != CALIBRATION_RUNS:
+        parser.error(f"--calibrate requires exactly --runs {CALIBRATION_RUNS}")
     if args.calibrate and args.settle_seconds < DEFAULT_SETTLE_SECONDS:
         parser.error(
             f"--calibrate requires --settle-seconds >= {DEFAULT_SETTLE_SECONDS:g}"
@@ -1013,8 +1049,8 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     if args.self_test:
         return self_test()
     assert args.haider is not None
@@ -1078,7 +1114,7 @@ def main() -> int:
             if not args.keep_profiles:
                 shutil.rmtree(root, ignore_errors=True)
 
-    summary = summarize(args.surface, samples)
+    summary = summarize(args.surface, samples, calibration=args.calibrate)
     summary_path = args.output / "summary.json"
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
