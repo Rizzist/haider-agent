@@ -41,14 +41,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 use tokio::time::{Duration, timeout};
 
-fn daemon_session_context(request: &TurnRequest) -> &str {
+fn daemon_session_context(request: &TurnRequest) -> String {
     request
         .messages
         .iter()
         .rev()
         .find_map(|message| match message.blocks.as_slice() {
             [Block::Text { text }] if text.starts_with("[DAEMON-BOUND SESSION CONTEXT]") => {
-                Some(text.as_str())
+                Some(text.to_owned_string())
             }
             _ => None,
         })
@@ -236,7 +236,7 @@ async fn wait_for_terminal(
             let events = store.read(session_id, 0, 512).await.expect("read events");
             if events.iter().any(|event| {
                 event.run_id.as_ref() == Some(run_id)
-                    && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                    && event.payload.decode_event().is_ok_and(
                         |payload| matches!(payload, EventPayload::RunState(state) if state.is_terminal()),
                     )
             }) {
@@ -259,7 +259,7 @@ async fn wait_for_idle_after_run(
             let events = store.read(session_id, 0, 512).await.expect("read events");
             let terminal_seq = events.iter().rev().find_map(|event| {
                 (event.run_id.as_ref() == Some(run_id)
-                    && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                    && event.payload.decode_event().is_ok_and(
                         |payload| {
                             matches!(payload, EventPayload::RunState(state) if state.is_terminal())
                         },
@@ -269,14 +269,12 @@ async fn wait_for_idle_after_run(
             if terminal_seq.is_some_and(|terminal_seq| {
                 events.iter().any(|event| {
                     event.seq > terminal_seq
-                        && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
-                            |payload| {
-                                matches!(
-                                    payload,
-                                    EventPayload::SessionState(SessionState::Idle { .. })
-                                )
-                            },
-                        )
+                        && event.payload.decode_event().is_ok_and(|payload| {
+                            matches!(
+                                payload,
+                                EventPayload::SessionState(SessionState::Idle { .. })
+                            )
+                        })
                 })
             }) {
                 break;
@@ -902,7 +900,9 @@ async fn loaded_fact_is_durable_omitted_change_only_and_not_a_broker_effect() {
     assert_eq!(facts[1].1.files[0].bytes, 9);
     assert!(facts[2].1.files.is_empty());
     assert!(events.iter().all(|event| {
-        !serde_json::from_value::<EventPayload>(event.payload.clone())
+        !event
+            .payload
+            .decode_event()
             .is_ok_and(|payload| matches!(payload, EventPayload::Effect(_)))
     }));
 
@@ -949,9 +949,7 @@ async fn loaded_fact_keeps_the_accepted_named_branch_coordinate() {
         .iter()
         .filter(|event| event.run_id.as_ref() == Some(&main_run))
         .filter_map(|event| {
-            let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
-            else {
+            let EventPayload::NodeCommitted(node) = event.payload.decode_event().ok()? else {
                 return None;
             };
             Some((node.node, event.seq))
@@ -1077,7 +1075,11 @@ async fn recovery_rereads_and_journals_a_fresh_same_run_fact_on_digest_change() 
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: old_loaded.fact().to_payload_value().expect("old fact"),
+        payload: old_loaded
+            .fact()
+            .to_payload_value()
+            .expect("old fact")
+            .into(),
     }];
     StoreHandle::append(&first, &mut old_fact)
         .await
@@ -1246,7 +1248,7 @@ async fn footprint_and_manual_compaction_fit_include_instruction_bytes() {
             let EventPayload::Item(ItemEvent::Completed {
                 item: TurnItem::Extension { kind, data },
                 ..
-            }) = serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
+            }) = event.payload.decode_event().ok()?
             else {
                 return None;
             };

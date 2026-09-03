@@ -577,7 +577,7 @@ fn m2e_exact_parent_attempt_attaches_once_and_collapses_once_without_authority_g
     let events = store.read(&parent, 0, 1024).expect("read parent journal");
     let collapsed = events
         .into_iter()
-        .filter_map(|envelope| serde_json::from_value::<EventPayload>(envelope.payload).ok())
+        .filter_map(|envelope| serde_json::from_value::<EventPayload>(envelope.payload.into()).ok())
         .filter_map(|payload| match payload {
             EventPayload::EvidenceRecorded(evidence)
                 if matches!(evidence.source, GraphEvidenceSource::ChildContract { .. }) =>

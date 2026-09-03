@@ -50,7 +50,52 @@ pub(crate) fn request_json(
     web_tools: bool,
     cache_ttl: Option<crate::AnthropicCacheTtl>,
 ) -> Result<serde_json::Value, ProviderError> {
+    request_json_inner(
+        request,
+        tools,
+        system_shape,
+        effort,
+        fast,
+        web_tools,
+        cache_ttl,
+        false,
+    )
+    .map(|(payload, _)| payload)
+}
+
+pub(crate) fn request_json_with_reply_bindings(
+    request: &TurnRequest,
+    tools: &[crate::ToolDefinition],
+    system_shape: AnthropicSystemShape,
+    effort: Option<&str>,
+    fast: bool,
+    web_tools: bool,
+    cache_ttl: Option<crate::AnthropicCacheTtl>,
+) -> Result<(serde_json::Value, Vec<crate::PreparedReplyBinding>), ProviderError> {
+    request_json_inner(
+        request,
+        tools,
+        system_shape,
+        effort,
+        fast,
+        web_tools,
+        cache_ttl,
+        true,
+    )
+}
+
+fn request_json_inner(
+    request: &TurnRequest,
+    tools: &[crate::ToolDefinition],
+    system_shape: AnthropicSystemShape,
+    effort: Option<&str>,
+    fast: bool,
+    web_tools: bool,
+    cache_ttl: Option<crate::AnthropicCacheTtl>,
+    bind_large_replies: bool,
+) -> Result<(serde_json::Value, Vec<crate::PreparedReplyBinding>), ProviderError> {
     let attachments = attachment_index(request)?;
+    let mut reply_bindings = Vec::new();
     let native_computer = crate::anthropic::anthropic_computer_tool_version(&request.model)
         .filter(|_| tools.iter().any(|tool| tool.name == "computer"));
     let mut messages = request
@@ -66,11 +111,13 @@ pub(crate) fn request_json(
                 &message.blocks,
                 &attachments,
                 native_computer.is_some(),
+                bind_large_replies,
+                &mut reply_bindings,
             )?;
-            Ok(serde_json::json!({
-                "role": role,
-                "content": content,
-            }))
+            let mut message = serde_json::Map::new();
+            message.insert("role".into(), serde_json::Value::String(role.into()));
+            message.insert("content".into(), serde_json::Value::Array(content));
+            Ok(serde_json::Value::Object(message))
         })
         .collect::<Result<Vec<_>, ProviderError>>()?;
     let mut tools = tools
@@ -147,12 +194,15 @@ pub(crate) fn request_json(
             }
         }
     }
-    let mut payload = serde_json::json!({
-        "model": request.model,
-        "max_tokens": request.max_tokens,
-        "messages": messages,
-        "stream": true,
-    });
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "model".into(),
+        serde_json::Value::String(request.model.clone()),
+    );
+    payload.insert("max_tokens".into(), request.max_tokens.into());
+    payload.insert("messages".into(), serde_json::Value::Array(messages));
+    payload.insert("stream".into(), serde_json::Value::Bool(true));
+    let mut payload = serde_json::Value::Object(payload);
     let Some(object) = payload.as_object_mut() else {
         return Err(ProviderError::new(
             ProviderErrorKind::Internal,
@@ -213,7 +263,7 @@ pub(crate) fn request_json(
     if fast {
         object.insert("speed".into(), serde_json::json!("fast"));
     }
-    Ok(payload)
+    Ok((payload, reply_bindings))
 }
 
 fn anthropic_cache_control(ttl: crate::AnthropicCacheTtl) -> serde_json::Value {
@@ -580,6 +630,8 @@ fn message_content(
     blocks: &[Block],
     attachments: &HashMap<&str, &str>,
     native_computer: bool,
+    bind_large_replies: bool,
+    reply_bindings: &mut Vec<crate::PreparedReplyBinding>,
 ) -> Result<Vec<serde_json::Value>, ProviderError> {
     let mut content = Vec::with_capacity(blocks.len());
     for block in blocks {
@@ -592,7 +644,14 @@ fn message_content(
             content.push(data.clone());
             continue;
         }
-        content.push(content_block(role, block, attachments, native_computer)?);
+        content.push(content_block(
+            role,
+            block,
+            attachments,
+            native_computer,
+            bind_large_replies,
+            reply_bindings,
+        )?);
     }
     Ok(content)
 }
@@ -644,9 +703,23 @@ fn content_block(
     block: &Block,
     attachments: &HashMap<&str, &str>,
     native_computer: bool,
+    bind_large_replies: bool,
+    reply_bindings: &mut Vec<crate::PreparedReplyBinding>,
 ) -> Result<serde_json::Value, ProviderError> {
     match block {
-        Block::Text { text } => Ok(serde_json::json!({"type": "text", "text": text})),
+        Block::Text { text } => {
+            let mut block = serde_json::Map::new();
+            block.insert("type".into(), "text".into());
+            block.insert(
+                "text".into(),
+                if bind_large_replies {
+                    crate::reply_json_value(text, reply_bindings)
+                } else {
+                    serde_json::Value::String(text.to_owned_string())
+                },
+            );
+            Ok(serde_json::Value::Object(block))
+        }
         Block::Reasoning { .. } => Err(invalid_request(
             "normalized reasoning summaries cannot be replayed as signed Anthropic thinking blocks",
         )),

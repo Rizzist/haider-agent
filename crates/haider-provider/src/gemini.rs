@@ -371,12 +371,25 @@ impl GeminiProvider {
         Ok(value)
     }
 
+    #[cfg(test)]
     pub(crate) async fn request_body(
         &self,
         payload: serde_json::Value,
     ) -> Result<reqwest::Request, ProviderError> {
+        self.request_body_prepared(crate::PreparedWire {
+            payload,
+            history_boundary: None,
+            reply_bindings: Vec::new(),
+        })
+        .await
+    }
+
+    async fn request_body_prepared(
+        &self,
+        prepared: crate::PreparedWire,
+    ) -> Result<reqwest::Request, ProviderError> {
         let request = self.request_builder().await?;
-        let body = crate::serialize_json_body(payload)?;
+        let body = crate::serialize_prepared_json_body(prepared)?;
         request.body(body).build().map_err(transport_error)
     }
 
@@ -400,8 +413,8 @@ impl GeminiProvider {
         &self,
         request: &TurnRequest,
     ) -> Result<reqwest::Response, ProviderError> {
-        let (full_payload, history_boundary) = match crate::take_prepared_wire_payload() {
-            Some(prepared) => (prepared.payload, prepared.history_boundary),
+        let mut prepared = match crate::take_prepared_wire_payload() {
+            Some(prepared) => prepared,
             None => {
                 self.validate_model(request)?;
                 let boundary = request
@@ -417,24 +430,28 @@ impl GeminiProvider {
                     self.web_builtins,
                     boundary,
                 )?;
-                (payload, Some(boundary))
+                crate::PreparedWire {
+                    payload,
+                    history_boundary: Some(boundary),
+                    reply_bindings: Vec::new(),
+                }
             }
         };
-        let payload = if let Some(registry) = &self.cache_registry {
+        prepared.payload = if let Some(registry) = &self.cache_registry {
             registry
                 .prepare_generate_payload_with_boundary(
                     request,
-                    full_payload,
-                    history_boundary,
+                    prepared.payload,
+                    prepared.history_boundary,
                     Arc::clone(&self.cache_backend),
                     self.web_builtins
                         && crate::effort::gemini_web_builtins_supported(&request.model),
                 )
                 .await
         } else {
-            full_payload
+            prepared.payload
         };
-        let request = self.request_body(payload).await?;
+        let request = self.request_body_prepared(prepared).await?;
         crate::route_gated_timeout(
             Self::transport_config().response_open_timeout,
             self.client.execute(request),
@@ -501,18 +518,20 @@ impl GeminiProvider {
     ) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.cacheable_history_end();
         self.validate_model(request).ok()?;
-        let (rendered_payload, history_boundary, previous_history_boundary) =
-            gemini_request_json_with_boundary(
+        let (rendered_payload, history_boundary, previous_history_boundary, reply_bindings) =
+            gemini_request_json_with_boundary_inner(
                 request,
                 tools,
                 self.effort.as_deref(),
                 self.web_builtins,
                 boundary,
+                true,
             )
             .ok()?;
         let full_payload = crate::AttachmentMovePayload::new(rendered_payload, attachment_moves);
         let contents = payload_contents(&full_payload)?;
-        let history_blocks = gemini_provider_view_blocks(contents, history_boundary)?;
+        let history_blocks =
+            gemini_provider_view_blocks(contents, history_boundary, &reply_bindings)?;
         let (previous_history_blocks, previous_history_block_len) = match previous_history_boundary
         {
             Some(boundary) => {
@@ -521,6 +540,7 @@ impl GeminiProvider {
                     history_boundary,
                     &history_blocks,
                     boundary,
+                    &reply_bindings,
                 )?;
                 (Some(blocks), reusable_len)
             }
@@ -553,9 +573,8 @@ impl GeminiProvider {
                 previous_history_block_len,
             )?;
         let previous_immutable_history_digest = match previous_history_boundary {
-            Some(previous) => {
-                block_previous_digest.or_else(|| gemini_history_digest(&full_payload, previous))
-            }
+            Some(previous) => block_previous_digest
+                .or_else(|| gemini_history_digest(&full_payload, previous, &reply_bindings)),
             None => None,
         };
         Some(crate::PreparedTurn {
@@ -567,6 +586,7 @@ impl GeminiProvider {
             wire: Some(crate::PreparedWire {
                 payload: full_payload.commit(),
                 history_boundary: Some(history_boundary),
+                reply_bindings,
             }),
             turn_trace: None,
         })
@@ -1110,7 +1130,35 @@ fn gemini_request_json_with_boundary(
     ),
     ProviderError,
 > {
+    gemini_request_json_with_boundary_inner(
+        request,
+        tools,
+        effort,
+        web_builtins,
+        stable_history_end,
+        false,
+    )
+    .map(|(payload, history, previous, _)| (payload, history, previous))
+}
+
+fn gemini_request_json_with_boundary_inner(
+    request: &TurnRequest,
+    tools: &[crate::ToolDefinition],
+    effort: Option<&str>,
+    web_builtins: bool,
+    stable_history_end: usize,
+    bind_large_replies: bool,
+) -> Result<
+    (
+        serde_json::Value,
+        crate::PreparedHistoryBoundary,
+        Option<crate::PreparedHistoryBoundary>,
+        Vec<crate::PreparedReplyBinding>,
+    ),
+    ProviderError,
+> {
     let attachments = attachment_index(request)?;
+    let mut reply_bindings = Vec::new();
     let (tool_names, opaque_calls) = tool_call_index(request)?;
     let mut contents = Vec::<serde_json::Value>::new();
     let mut pending_signed_text = VecDeque::<String>::new();
@@ -1148,14 +1196,23 @@ fn gemini_request_json_with_boundary(
                     if message.role == MessageRole::Assistant
                         && let Some(expected) = pending_signed_text.front()
                     {
-                        if expected != text {
+                        if text != expected.as_str() {
                             return Err(invalid_request(
                                 "Gemini signed text part disagrees with normalized history",
                             ));
                         }
                         pending_signed_text.pop_front();
                     } else {
-                        parts.push(serde_json::json!({"text": text}));
+                        let mut part = serde_json::Map::new();
+                        part.insert(
+                            "text".into(),
+                            if bind_large_replies {
+                                crate::reply_json_value(text, &mut reply_bindings)
+                            } else {
+                                serde_json::Value::String(text.to_owned_string())
+                            },
+                        );
+                        parts.push(serde_json::Value::Object(part));
                     }
                 }
                 Block::Text { .. } => {
@@ -1352,10 +1409,10 @@ fn gemini_request_json_with_boundary(
             .and_then(serde_json::Value::as_array)
             .map_or(0, Vec::len),
     });
-    let mut payload = serde_json::json!({
-        "contents": contents,
-        "generationConfig": generation_config,
-    });
+    let mut payload = serde_json::Map::new();
+    payload.insert("contents".into(), serde_json::Value::Array(contents));
+    payload.insert("generationConfig".into(), generation_config);
+    let mut payload = serde_json::Value::Object(payload);
     let object = payload
         .as_object_mut()
         .ok_or_else(|| internal("Gemini request payload was not an object"))?;
@@ -1380,7 +1437,12 @@ fn gemini_request_json_with_boundary(
     if !tool_entries.is_empty() {
         object.insert("tools".into(), serde_json::Value::Array(tool_entries));
     }
-    Ok((payload, history_boundary, previous_history_boundary))
+    Ok((
+        payload,
+        history_boundary,
+        previous_history_boundary,
+        reply_bindings,
+    ))
 }
 
 struct GeminiContentsPrefix<'a> {
@@ -1441,30 +1503,36 @@ impl Serialize for GeminiContentPrefix<'_> {
 fn gemini_history_digest(
     full_payload: &serde_json::Value,
     boundary: crate::PreparedHistoryBoundary,
+    reply_bindings: &[crate::PreparedReplyBinding],
 ) -> Option<String> {
     let contents = payload_contents(full_payload)?;
-    Some(crate::exact_optional_wire_digest(Some(
-        &GeminiContentsPrefix { contents, boundary },
-    )))
+    crate::exact_json_digest_with_replies(
+        &Some(&GeminiContentsPrefix { contents, boundary }),
+        reply_bindings,
+    )
 }
 
 fn gemini_provider_view_blocks(
     contents: &[serde_json::Value],
     boundary: crate::PreparedHistoryBoundary,
-) -> Option<Vec<Vec<u8>>> {
+    reply_bindings: &[crate::PreparedReplyBinding],
+) -> Option<Vec<haider_protocol::cache::ProviderViewBlobV1>> {
     let end = boundary.items.min(contents.len());
     contents[..end]
         .iter()
         .enumerate()
         .map(|(index, content)| {
-            crate::serialize_json_fragment(&GeminiContentPrefix {
-                content,
-                parts_end: if index + 1 == end {
-                    boundary.last_parts
-                } else {
-                    usize::MAX
+            crate::provider_view_json_blob(
+                &GeminiContentPrefix {
+                    content,
+                    parts_end: if index + 1 == end {
+                        boundary.last_parts
+                    } else {
+                        usize::MAX
+                    },
                 },
-            })
+                reply_bindings,
+            )
         })
         .collect()
 }
@@ -1472,8 +1540,9 @@ fn gemini_provider_view_blocks(
 fn gemini_previous_provider_view_block_refs(
     contents: &[serde_json::Value],
     current_boundary: crate::PreparedHistoryBoundary,
-    current_blocks: &[Vec<u8>],
+    current_blocks: &[haider_protocol::cache::ProviderViewBlobV1],
     previous_boundary: crate::PreparedHistoryBoundary,
+    reply_bindings: &[crate::PreparedReplyBinding],
 ) -> Option<(
     Vec<haider_protocol::cache::ProviderViewBlockRefV1>,
     Option<usize>,
@@ -1502,15 +1571,19 @@ fn gemini_previous_provider_view_block_refs(
                 previous_parts_end.min(parts_len) == current_parts_end.min(parts_len)
             });
         if same_projection {
-            refs.push(haider_protocol::cache::ProviderViewBlockRefV1::for_bytes(
-                &current_blocks[index],
-            ));
+            refs.push(current_blocks[index].block.clone());
         } else {
             all_reused = false;
-            refs.push(crate::exact_wire_block_ref(&GeminiContentPrefix {
-                content,
-                parts_end: previous_parts_end,
-            })?);
+            refs.push(
+                crate::provider_view_json_blob(
+                    &GeminiContentPrefix {
+                        content,
+                        parts_end: previous_parts_end,
+                    },
+                    reply_bindings,
+                )?
+                .block,
+            );
         }
     }
     Some((refs, all_reused.then_some(previous_end)))
@@ -1555,7 +1628,10 @@ fn append_content(
             .ok_or_else(|| internal("Gemini content parts were not an array"))?;
         previous_parts.extend(parts);
     } else {
-        contents.push(serde_json::json!({"role": role, "parts": parts}));
+        let mut content = serde_json::Map::new();
+        content.insert("role".into(), serde_json::Value::String(role.into()));
+        content.insert("parts".into(), serde_json::Value::Array(parts));
+        contents.push(serde_json::Value::Object(content));
     }
     Ok(())
 }

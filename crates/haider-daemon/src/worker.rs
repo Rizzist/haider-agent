@@ -5402,7 +5402,7 @@ async fn durable_runs(
                 continue;
             };
             if let Ok(RunRetryEventPayload::RunRetried { prompt_run_id, .. }) =
-                RunRetryEventPayload::from_payload_value(envelope.payload.clone())
+                RunRetryEventPayload::from_payload_value(envelope.payload.to_json_value())
             {
                 let (state, branch_id) = runs.get(&run_id).map_or(
                     (RunState::Queued, envelope.branch_id.clone()),
@@ -5421,7 +5421,7 @@ async fn durable_runs(
                 );
                 continue;
             }
-            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+            let Ok(payload) = envelope.payload.decode_event() else {
                 continue;
             };
             match payload {
@@ -5494,9 +5494,7 @@ async fn durable_user_command_scope(
             if envelope.run_id.as_ref() != Some(run_id) {
                 continue;
             }
-            let Ok(EventPayload::Item(item_event)) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
-            else {
+            let Ok(EventPayload::Item(item_event)) = envelope.payload.decode_event() else {
                 continue;
             };
             match item_event {
@@ -5573,7 +5571,9 @@ async fn durable_user_message_seqs(store: &HubStoreHandle) -> Result<HashSet<u64
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
         for envelope in page {
-            if serde_json::from_value::<EventPayload>(envelope.payload)
+            if envelope
+                .payload
+                .decode_event()
                 .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. }))
             {
                 sequences.insert(envelope.seq);
@@ -5719,18 +5719,17 @@ async fn scan_unknown_effects(
             {
                 continue;
             }
-            let payload =
-                serde_json::from_value::<EventPayload>(envelope.payload).map_err(|error| {
-                    HaiderError::new(
-                        ErrorCode::StoreCorrupt,
-                        format!(
-                            "invalid effect payload in session {}, seq {}: {error}",
-                            store.session_id(),
-                            envelope.seq
-                        ),
-                        false,
-                    )
-                })?;
+            let payload = envelope.payload.decode_event().map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!(
+                        "invalid effect payload in session {}, seq {}: {error}",
+                        store.session_id(),
+                        envelope.seq
+                    ),
+                    false,
+                )
+            })?;
             match payload {
                 EventPayload::Effect(EffectPhase::Intent(intent)) => {
                     scan.summaries.insert(intent.effect, intent.summary);
@@ -5865,9 +5864,7 @@ async fn durable_queue_consumed(
             if envelope.run_id.as_ref() != Some(run_id) {
                 continue;
             }
-            let Ok(EventPayload::QueueChanged(delta)) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
-            else {
+            let Ok(EventPayload::QueueChanged(delta)) = envelope.payload.decode_event() else {
                 continue;
             };
             match delta.change {
@@ -5910,7 +5907,7 @@ async fn durable_workspace_mutation(
                 effect,
                 workspace_mutation: Some(mutation),
                 ..
-            })) = serde_json::from_value::<EventPayload>(envelope.payload)
+            })) = envelope.payload.decode_event()
             else {
                 continue;
             };
@@ -6021,7 +6018,7 @@ async fn find_compaction_receipt(
             if envelope.branch_id.as_ref() != branch_id {
                 continue;
             }
-            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+            let Ok(payload) = envelope.payload.decode_event() else {
                 continue;
             };
             match payload {
@@ -8530,7 +8527,7 @@ impl TurnSetupReduction {
         let run_id = envelope.run_id;
         let branch_id = envelope.branch_id;
         let agent_id = envelope.agent_id;
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+        let Ok(payload) = envelope.payload.decode_event() else {
             return Ok(());
         };
         self.durable_tools.observe(agent_id.as_ref(), &payload);
@@ -8940,8 +8937,7 @@ async fn accepted_plan_bodies(
             if envelope.branch_id.as_ref() != branch_id {
                 continue;
             }
-            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
-            else {
+            let Ok(payload) = envelope.payload.decode_event() else {
                 continue;
             };
             match payload {
@@ -8977,7 +8973,7 @@ async fn find_committed_menu_answer(
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
         if let Some(answer) = page.into_iter().find(|envelope| {
             envelope.branch_id.as_ref() == branch_id
-                && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                && envelope.payload.decode_event().is_ok_and(
                 |payload| matches!(payload, EventPayload::MenuAnswered(answer) if answer.menu == *menu_id),
             )
         }) {
@@ -9113,7 +9109,7 @@ async fn resolve_prompt_attachments(
                             false,
                         )
                     })?;
-                    *block = haider_protocol::provider::Block::Text { text };
+                    *block = haider_protocol::provider::Block::Text { text: text.into() };
                 }
                 haider_protocol::provider::Block::Attachment(
                     haider_protocol::tool::AttachmentBlock::File {
@@ -9135,7 +9131,7 @@ async fn resolve_prompt_attachments(
                         )
                     })?;
                     *block = haider_protocol::provider::Block::Text {
-                        text: file_attachment_text(name, *lines, &text),
+                        text: file_attachment_text(name, *lines, &text).into(),
                     };
                 }
                 haider_protocol::provider::Block::Attachment(
@@ -9179,7 +9175,7 @@ async fn resolve_prompt_attachments(
                         }
                         haider_protocol::tool::PdfDeliveryMode::ExtractedText => {
                             *block = haider_protocol::provider::Block::Text {
-                                text: extract_pdf_attachment(bytes, name, *pages).await?,
+                                text: extract_pdf_attachment(bytes, name, *pages).await?.into(),
                             };
                         }
                     }
@@ -9309,7 +9305,8 @@ async fn prepare_compaction_messages(
                             false,
                         )
                     })?;
-                    message.blocks[index] = haider_protocol::provider::Block::Text { text };
+                    message.blocks[index] =
+                        haider_protocol::provider::Block::Text { text: text.into() };
                     index += 1;
                 }
                 haider_protocol::provider::Block::Attachment(
@@ -9323,7 +9320,8 @@ async fn prepare_compaction_messages(
                     let bytes = store.get_artifact(artifact).await?;
                     match extract_pdf_attachment(bytes, &name, pages).await {
                         Ok(text) => {
-                            message.blocks[index] = haider_protocol::provider::Block::Text { text };
+                            message.blocks[index] =
+                                haider_protocol::provider::Block::Text { text: text.into() };
                             index += 1;
                         }
                         // A native-only scanned/encrypted PDF was valid for
@@ -9353,7 +9351,7 @@ async fn prepare_compaction_messages(
                         )
                     })?;
                     message.blocks[index] = haider_protocol::provider::Block::Text {
-                        text: file_attachment_text(&name, lines, &text),
+                        text: file_attachment_text(&name, lines, &text).into(),
                     };
                     index += 1;
                 }
@@ -10012,7 +10010,7 @@ fn collect_budget_usage(
     for envelope in envelopes {
         let envelope_run = envelope.run_id.clone();
         let envelope_agent = envelope.agent_id.clone();
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+        let Ok(payload) = envelope.payload.decode_event() else {
             continue;
         };
         if let EventPayload::Item(ItemEvent::Completed { item, .. }) = &payload
@@ -10653,7 +10651,7 @@ async fn append_root_headless_budget_fact(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: budget_fact_payload(exhausted)?,
+        payload: budget_fact_payload(exhausted)?.into(),
     }];
     coordinator.hub.append(&mut envelopes).await?;
     Ok(())
@@ -10896,7 +10894,7 @@ async fn journal_project_instructions_if_changed(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     }];
     StoreHandle::append(store, &mut envelope).await?;
     reduction.record_instruction_fact(current.clone());
@@ -10989,8 +10987,7 @@ async fn prior_cache_request_context(
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
         for envelope in page {
-            if let Ok(EventPayload::Usage(usage)) =
-                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            if let Ok(EventPayload::Usage(usage)) = envelope.payload.decode_event()
                 && envelope.branch_id.as_ref() == branch_id
                 && usage.scope.as_ref().is_some_and(|scope| {
                     scope.request_kind
@@ -11020,14 +11017,14 @@ async fn prior_cache_request_context(
             if let Ok(EventPayload::NodeCommitted(TreeNode {
                 kind: NodeKind::Compaction { .. },
                 ..
-            })) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            })) = envelope.payload.decode_event()
             {
                 latest_deliberate_boundary =
                     Some((envelope.seq, CacheRewarmReasonV1::PlannedCompaction));
                 continue;
             }
             let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
+                envelope.payload.decode_event()
             else {
                 continue;
             };
@@ -11318,7 +11315,7 @@ fn supervisor_raw_envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     }
 }
 
@@ -14747,7 +14744,7 @@ impl BrokerToolDispatcher {
             cursor = page.last().map_or(cursor, |event| event.seq);
             for event in page {
                 let Ok(PermissionEventPayload::PermissionGrantNeeded(needed)) =
-                    PermissionEventPayload::from_payload_value(event.payload)
+                    PermissionEventPayload::from_payload_value(event.payload.to_json_value())
                 else {
                     continue;
                 };
@@ -18579,7 +18576,7 @@ pub(crate) async fn durable_session_tool_state(
                 reduction.reset_at_session_fork();
                 continue;
             }
-            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+            let Ok(payload) = envelope.payload.decode_event() else {
                 continue;
             };
             reduction.observe(envelope.agent_id.as_ref(), &payload);
@@ -20103,13 +20100,15 @@ impl HubCommandOutputContext {
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload: serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
-                item_id,
-                item: TurnItem::Extension {
-                    kind: IMAGE_CREATED_EXTENSION_KIND.into(),
-                    data,
+            payload: haider_protocol::envelope::RawPayload::from_event(EventPayload::Item(
+                ItemEvent::Completed {
+                    item_id,
+                    item: TurnItem::Extension {
+                        kind: IMAGE_CREATED_EXTENSION_KIND.into(),
+                        data,
+                    },
                 },
-            }))
+            ))
             .map_err(|error| ToolError::Runtime {
                 message: format!("cannot serialize image-created envelope: {error}"),
             })?,
@@ -20156,7 +20155,8 @@ impl HubCommandOutputContext {
                 .to_payload_value()
                 .map_err(|error| ToolError::Runtime {
                     message: format!("cannot serialize computer permission envelope: {error}"),
-                })?,
+                })?
+                .into(),
         }];
         StoreHandle::append(&self.store, &mut envelopes)
             .await
@@ -20268,10 +20268,12 @@ impl CommandOutputSink for HubCommandOutputSink {
                 durable: true,
                 prompt: self.prompt,
             },
-            payload: serde_json::to_value(EventPayload::Item(ItemEvent::Delta {
-                item_id: self.item_id.clone(),
-                delta,
-            }))
+            payload: haider_protocol::envelope::RawPayload::from_event(EventPayload::Item(
+                ItemEvent::Delta {
+                    item_id: self.item_id.clone(),
+                    delta,
+                },
+            ))
             .map_err(|error| haider_tools::ToolError::Runtime {
                 message: format!("cannot serialize command output envelope: {error}"),
             })?,
@@ -20407,11 +20409,11 @@ impl JournalSink for HubJournalSink {
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload: serde_json::to_value(payload).map_err(|error| {
-                haider_tools::ToolError::Runtime {
+            payload: haider_protocol::envelope::RawPayload::from_event(payload).map_err(
+                |error| haider_tools::ToolError::Runtime {
                     message: format!("cannot serialize effect envelope: {error}"),
-                }
-            })?,
+                },
+            )?,
         }];
         if effect_was_dispatched {
             // The store actor can commit after cancellation drops this append
@@ -20505,9 +20507,11 @@ impl JournalSink for HubJournalSink {
                     durable: true,
                     prompt: PromptRender::Omit,
                 },
-                payload: serde_json::to_value(payload).map_err(|error| ToolError::Runtime {
-                    message: format!("cannot serialize checkpointed effect envelope: {error}"),
-                })?,
+                payload: haider_protocol::envelope::RawPayload::from_event(payload).map_err(
+                    |error| ToolError::Runtime {
+                        message: format!("cannot serialize checkpointed effect envelope: {error}"),
+                    },
+                )?,
             });
         }
         haider_core::StoreHandle::append(&self.store, &mut envelopes)

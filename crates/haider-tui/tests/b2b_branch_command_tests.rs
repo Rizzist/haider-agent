@@ -48,7 +48,9 @@ fn raw(seq: u64, payload: &EventPayload) -> RawEnvelope {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("payload serializes"),
+        payload: serde_json::to_value(payload)
+            .expect("payload serializes")
+            .into(),
     }
 }
 

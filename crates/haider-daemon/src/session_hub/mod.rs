@@ -6194,9 +6194,7 @@ impl SessionHub {
                 let Some(run_id) = event.run_id else {
                     continue;
                 };
-                if let Ok(EventPayload::RunState(state)) =
-                    serde_json::from_value::<EventPayload>(event.payload)
-                {
+                if let Ok(EventPayload::RunState(state)) = event.payload.decode_event() {
                     states.insert(run_id, state);
                 }
             }
@@ -7558,7 +7556,9 @@ fn inject_test_done_append_failure(envelopes: &[RawEnvelope]) -> bool {
     });
     if !armed.load(Ordering::Acquire)
         || !envelopes.iter().any(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            envelope
+                .payload
+                .decode_event()
                 .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Done))
         })
     {

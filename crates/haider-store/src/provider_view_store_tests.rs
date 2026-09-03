@@ -2,7 +2,10 @@
 
 use super::*;
 use crate::Store;
-use haider_protocol::cache::{ProviderViewBlobV1, ProviderViewBoundaryV1};
+use haider_protocol::cache::{
+    ProviderViewBlobSegmentV1, ProviderViewBlobV1, ProviderViewBoundaryV1,
+};
+use haider_protocol::reply::ReplyArenaWriter;
 use rusqlite::params;
 use std::sync::{Arc, Mutex};
 
@@ -45,6 +48,69 @@ fn provider_view(seed: &str) -> (ProviderViewLedgerV1, Vec<ProviderViewBlobV1>) 
         storage: None,
     };
     (ledger, vec![system, tools, history])
+}
+
+#[test]
+fn segmented_reply_blob_hashes_persists_and_reads_exact_legacy_json() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("provider-view-segmented-reply");
+    create_session(&store, &session_id);
+    let mut arena = ReplyArenaWriter::new();
+    let _ = arena.append("left \"quote\"\n".to_owned());
+    let _ = arena.append("مرز 😀 right".to_owned());
+    let reply = arena.seal();
+    let history = ProviderViewBlobV1::segmented(vec![
+        ProviderViewBlobSegmentV1::Bytes(br#"{"content":"#.to_vec()),
+        ProviderViewBlobSegmentV1::JsonString(reply),
+        ProviderViewBlobSegmentV1::Bytes(br#","role":"assistant"}"#.to_vec()),
+    ])
+    .expect("segmented provider-view blob");
+    assert!(history.is_segmented());
+    let expected = serde_json::to_vec(&serde_json::json!({
+        "role": "assistant",
+        "content": "left \"quote\"\nمرز 😀 right",
+    }))
+    .expect("legacy JSON");
+    assert_eq!(
+        history.computed_block().expect("computed block"),
+        history.block
+    );
+    assert_eq!(history.byte_len(), expected.len());
+
+    let system = ProviderViewBlobV1::new(b"null".to_vec());
+    let tools = ProviderViewBlobV1::new(b"null".to_vec());
+    let ledger = ProviderViewLedgerV1 {
+        provider: "test-provider".into(),
+        model: "test-model".into(),
+        max_tokens: 4_096,
+        dialect: "test-dialect".into(),
+        serialization_version: "haider.provider-view.json.v2".into(),
+        header_epoch: "header".into(),
+        cache_epoch: "cache".into(),
+        compaction_epoch: "root".into(),
+        reasoning_retention: "append_only_provider_opaque_v1:test".into(),
+        account_scope: None,
+        stable_history_end: 1,
+        current_user_start: 1,
+        latest_compaction_summary_end: None,
+        trim_sentinel: "root".into(),
+        boundaries: Vec::new(),
+        system_block: system.block.clone(),
+        tool_schema_block: tools.block.clone(),
+        history_blocks: vec![history.block.clone()],
+        storage: None,
+    };
+    let history_ref = history.block.clone();
+    let stored = store
+        .persist_provider_view(&session_id, ledger, vec![system, tools, history])
+        .expect("persist segmented view");
+    assert_eq!(
+        store
+            .read_provider_view_block(&stored, &history_ref)
+            .expect("read segmented block"),
+        expected
+    );
 }
 
 /// MUTATION CHECK: restore per-blob full syncs, omit/downgrade the trailing

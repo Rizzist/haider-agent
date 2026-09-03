@@ -176,7 +176,8 @@ fn raw(session_id: &SessionId, seq: u64, detail: &str) -> RawEnvelope {
             "type": "future_observe_kind_v9",
             "detail": detail,
             "additive": {"kept": true}
-        }),
+        })
+        .into(),
     }
 }
 

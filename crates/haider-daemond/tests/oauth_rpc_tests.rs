@@ -1393,7 +1393,7 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         loop {
             if let WireFrame::Event { envelope, .. } = after_restart.receive().await
                 && let Ok(EventPayload::RunState(state)) =
-                    serde_json::from_value::<EventPayload>(envelope.payload)
+                    serde_json::from_value::<EventPayload>(envelope.payload.into())
                 && state.is_terminal()
             {
                 break;

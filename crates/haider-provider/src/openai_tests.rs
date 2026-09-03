@@ -2310,9 +2310,9 @@ fn prepared_openai_and_compatible_wire_bytes_match_legacy_final_render() {
         crate::Provider::prepare_turn_with_tools(&openai, &borrowed_request, &shared_tools)
             .expect("borrowed-tools prepared OpenAI turn");
     assert_eq!(
-        serde_json::to_vec(&borrowed.wire.as_ref().expect("borrowed wire").payload)
+        crate::serialize_prepared_json_body_ref(borrowed.wire.as_ref().expect("borrowed wire"))
             .expect("borrowed OpenAI bytes"),
-        serde_json::to_vec(&prepared.wire.as_ref().expect("prepared wire").payload)
+        crate::serialize_prepared_json_body_ref(prepared.wire.as_ref().expect("prepared wire"))
             .expect("prepared OpenAI bytes"),
         "Arc-backed preparation must preserve exact OpenAI wire bytes"
     );
@@ -2331,7 +2331,7 @@ fn prepared_openai_and_compatible_wire_bytes_match_legacy_final_render() {
         .request_payload(&finalized)
         .expect("legacy OpenAI payload");
     assert_eq!(
-        serde_json::to_vec(&prepared.wire.as_ref().expect("prepared wire").payload)
+        crate::serialize_prepared_json_body_ref(prepared.wire.as_ref().expect("prepared wire"))
             .expect("prepared OpenAI bytes"),
         serde_json::to_vec(&legacy).expect("legacy OpenAI bytes")
     );
@@ -2356,20 +2356,18 @@ fn prepared_openai_and_compatible_wire_bytes_match_legacy_final_render() {
     )
     .expect("borrowed-tools prepared compatible turn");
     assert_eq!(
-        serde_json::to_vec(
-            &borrowed_compatible
+        crate::serialize_prepared_json_body_ref(
+            borrowed_compatible
                 .wire
                 .as_ref()
-                .expect("borrowed compatible wire")
-                .payload,
+                .expect("borrowed compatible wire"),
         )
         .expect("borrowed compatible bytes"),
-        serde_json::to_vec(
-            &compatible_prepared
+        crate::serialize_prepared_json_body_ref(
+            compatible_prepared
                 .wire
                 .as_ref()
-                .expect("prepared compatible wire")
-                .payload,
+                .expect("prepared compatible wire"),
         )
         .expect("prepared compatible bytes"),
         "Arc-backed preparation must preserve exact compatible wire bytes"
@@ -2378,16 +2376,84 @@ fn prepared_openai_and_compatible_wire_bytes_match_legacy_final_render() {
         .request_payload(&compatible_request)
         .expect("legacy compatible payload");
     assert_eq!(
-        serde_json::to_vec(
-            &compatible_prepared
+        crate::serialize_prepared_json_body_ref(
+            compatible_prepared
                 .wire
                 .as_ref()
-                .expect("prepared compatible wire")
-                .payload
+                .expect("prepared compatible wire"),
         )
         .expect("prepared compatible bytes"),
         serde_json::to_vec(&compatible_legacy).expect("legacy compatible bytes")
     );
+}
+
+#[test]
+fn large_compatible_reply_uses_segmented_cas_and_exact_final_wire() {
+    use haider_protocol::reply::ReplyArenaWriter;
+
+    let provider = compatible_provider_with_resolver(
+        b"compatible-segmented-reply-key",
+        "https://compatible-segmented.example",
+        Arc::new(StubDnsResolver::new(std::iter::empty::<Vec<SocketAddr>>())),
+    );
+    let mut arena = ReplyArenaWriter::new();
+    let _ = arena.append("left \"quote\"\n".to_owned());
+    let _ = arena.append("x".repeat(96 * 1024));
+    let _ = arena.append("مرز 😀 right".to_owned());
+    let reply = arena.seal();
+    let mut request = probe_request("audit-model");
+    request.messages.push(Message::assistant(vec![Block::Text {
+        text: reply.clone(),
+    }]));
+    request.messages.push(Message::user_text("continue"));
+    request.cache_metadata = Some(cm2_cache_metadata(
+        OPENAI_COMPATIBLE_PROVIDER_NAME,
+        request.messages.len(),
+    ));
+
+    let mut prepared = crate::Provider::prepare_turn(&provider, &request).expect("prepared turn");
+    assert!(
+        prepared
+            .wire
+            .as_ref()
+            .expect("prepared wire")
+            .reply_bindings
+            .iter()
+            .any(|binding| binding.text.shares_arena_with(&reply)),
+        "canonical reply must leave the wire DOM"
+    );
+    assert!(
+        prepared
+            .provider_view_storage_blobs
+            .iter()
+            .any(haider_protocol::cache::ProviderViewBlobV1::is_segmented),
+        "the provider-view CAS must retain an arena-backed segment"
+    );
+    let mut finalized = request.clone();
+    finalized
+        .cache_metadata
+        .as_mut()
+        .expect("cache metadata")
+        .header_epoch = prepared
+        .provider_view()
+        .expect("provider view")
+        .ledger()
+        .header_epoch
+        .clone();
+    let expected = serde_json::to_vec(
+        &provider
+            .request_payload(&finalized)
+            .expect("legacy final payload"),
+    )
+    .expect("legacy final bytes");
+    let wire = prepared.wire.take().expect("prepared wire");
+    assert!(
+        wire.reply_bindings
+            .iter()
+            .any(|binding| binding.text.shares_arena_with(&reply))
+    );
+    let actual = crate::serialize_prepared_json_body(wire).expect("segmented final bytes");
+    assert_eq!(actual, expected);
 }
 
 /// CM2d — the routing key identifies one account/model/header/fork cohort.
@@ -4602,7 +4668,7 @@ fn assistant_history_replays_as_output_text() {
         messages: vec![
             crate::Message::user_text("hi"),
             crate::Message::assistant(vec![crate::Block::Text {
-                text: "Hi! How can I help?".to_owned(),
+                text: "Hi! How can I help?".to_owned().into(),
             }]),
             crate::Message::user_text("say PONG"),
         ],

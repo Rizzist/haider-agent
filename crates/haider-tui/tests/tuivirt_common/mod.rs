@@ -94,7 +94,7 @@ pub fn push_agent(model: &mut AppModel, id: &str, text: &str) {
         EventPayload::Item(ItemEvent::Completed {
             item_id: ItemId::new(id),
             item: TurnItem::AgentMessage {
-                text: text.to_owned(),
+                text: text.to_owned().into(),
             },
         }),
     );

@@ -753,7 +753,7 @@ fn golden_additive_task_facts_and_unknown_kind_tolerance() {
         envelope_value["payload"] = raw.clone();
         let decoded: haider_protocol::envelope::RawEnvelope =
             serde_json::from_value(envelope_value).expect("raw envelope tolerates additive kind");
-        assert_eq!(decoded.payload, raw);
+        assert_eq!(decoded.payload.to_json_value(), raw);
     }
 }
 
@@ -793,7 +793,7 @@ fn golden_additive_hook_fired_fact_and_unknown_kind_tolerance() {
     envelope["payload"] = raw.clone();
     let decoded: haider_protocol::envelope::RawEnvelope =
         serde_json::from_value(envelope).expect("raw envelope tolerates additive kind");
-    assert_eq!(decoded.payload, raw);
+    assert_eq!(decoded.payload.to_json_value(), raw);
 }
 
 /// WIRE-GAPS hook additions stay satellite facts: the current writer may
@@ -854,7 +854,7 @@ fn golden_hook_menu_coordinate_and_trust_revision_are_additive() {
         raw_envelope["payload"] = raw.clone();
         let decoded: haider_protocol::envelope::RawEnvelope =
             serde_json::from_value(raw_envelope).expect("legacy raw envelope keeps hook fact");
-        assert_eq!(decoded.payload, raw);
+        assert_eq!(decoded.payload.to_json_value(), raw);
     }
 }
 
@@ -2078,7 +2078,7 @@ fn golden_convergence_graph_facts_and_old_decoder_tolerance() {
         value["payload"] = raw.clone();
         let decoded: haider_protocol::envelope::RawEnvelope =
             serde_json::from_value(value).expect("RawEnvelope tolerates the new fact");
-        assert_eq!(decoded.payload, raw);
+        assert_eq!(decoded.payload.to_json_value(), raw);
     }
 }
 

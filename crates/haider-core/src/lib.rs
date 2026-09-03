@@ -308,7 +308,13 @@ pub trait StoreHandle: Send + Sync {
         let actual = blobs
             .into_iter()
             .map(|blob| {
-                let computed = ProviderViewBlockRefV1::for_bytes(&blob.bytes);
+                let computed = blob.computed_block().map_err(|error| {
+                    HaiderError::new(
+                        haider_protocol::error::ErrorCode::InvalidArgument,
+                        format!("provider-view blob could not be hashed: {error}"),
+                        false,
+                    )
+                })?;
                 (computed == blob.block).then_some(computed).ok_or_else(|| {
                     HaiderError::new(
                         haider_protocol::error::ErrorCode::InvalidArgument,

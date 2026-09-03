@@ -349,7 +349,10 @@ fn note_throughput_observes_a_live_turn_and_settles_a_finished_one() {
             .throughput
             .observe(1_000 + 250 * step, turn, chars, None);
     }
-    assert_eq!(model.throughput_pill().unwrap().phase, ThroughputPhase::Live);
+    assert_eq!(
+        model.throughput_pill().unwrap().phase,
+        ThroughputPhase::Live
+    );
     model.handle(AppEvent::Envelope(Box::new(usage(700, 0))));
     model.handle(AppEvent::Envelope(Box::new(EventPayload::RunState(
         RunState::Done,
@@ -363,7 +366,10 @@ fn note_throughput_observes_a_live_turn_and_settles_a_finished_one() {
         Some(35),
         "700 provider-reported tokens over the 20s generation span"
     );
-    assert!(!settled.approx, "the provider's own figure is not an estimate");
+    assert!(
+        !settled.approx,
+        "the provider's own figure is not an estimate"
+    );
 }
 
 #[test]

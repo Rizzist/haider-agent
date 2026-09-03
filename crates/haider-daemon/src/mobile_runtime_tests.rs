@@ -63,7 +63,8 @@ fn memory_envelope(
             attachments: Vec::new(),
             mode: DeliveryMode::Steer,
         })
-        .expect("user message serializes"),
+        .expect("user message serializes")
+        .into(),
     }
 }
 
@@ -417,7 +418,7 @@ async fn mobile_dispatch_fence_rejects_inactive_without_backend() {
         .await
         .expect("inactive journal");
     assert!(!events.into_iter().any(|event| {
-        serde_json::from_value::<EventPayload>(event.payload).is_ok_and(|payload| {
+        event.payload.decode_event().is_ok_and(|payload| {
             matches!(
                 payload,
                 EventPayload::Effect(EffectPhase::Intent(EffectIntent {
@@ -484,7 +485,7 @@ async fn mobile_sms_read_fast_path_serializes_json_without_images() {
         .expect("active journal");
     let phases = events
         .into_iter()
-        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        .filter_map(|event| event.payload.decode_event().ok())
         .filter_map(|payload| match payload {
             EventPayload::Effect(phase) => Some(phase),
             _ => None,

@@ -334,7 +334,7 @@ impl WebWorld {
                     .expect("read journal");
                 if events.iter().any(|event| {
                     event.run_id.as_ref() == Some(&run_id)
-                        && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                        && event.payload.decode_event().is_ok_and(
                             |payload| {
                                 matches!(payload, EventPayload::RunState(state) if state == terminal)
                             },
@@ -356,7 +356,7 @@ impl WebWorld {
             .await
             .expect("read journal")
             .into_iter()
-            .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+            .filter_map(|event| event.payload.decode_event().ok())
             .collect()
     }
 }
@@ -965,7 +965,7 @@ async fn an_invalid_request_on_an_anthropic_turn_falls_back_to_the_local_fetch()
         .expect("fallback history");
     assert!(history.iter().any(|event| {
         matches!(
-            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            event.payload.decode_event(),
             Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
                 item: haider_protocol::item::TurnItem::Extension { kind, data, .. },
                 ..

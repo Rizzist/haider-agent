@@ -79,7 +79,7 @@ fn raw_value(seq: u64, agent: Option<&str>, payload: serde_json::Value) -> RawEn
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     }
 }
 

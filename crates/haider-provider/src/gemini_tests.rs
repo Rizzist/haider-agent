@@ -410,14 +410,14 @@ fn prepared_gemini_wire_bytes_match_legacy_final_render() {
         crate::Provider::prepare_turn_with_tools(&provider, &borrowed_request, &shared_tools)
             .expect("borrowed-tools prepared Gemini");
     assert_eq!(
-        serde_json::to_vec(&borrowed.wire.as_ref().expect("borrowed wire").payload)
+        crate::serialize_prepared_json_body_ref(borrowed.wire.as_ref().expect("borrowed wire"))
             .expect("borrowed Gemini bytes"),
-        serde_json::to_vec(&prepared.wire.as_ref().expect("prepared wire").payload)
+        crate::serialize_prepared_json_body_ref(prepared.wire.as_ref().expect("prepared wire"))
             .expect("prepared Gemini bytes"),
         "Arc-backed preparation must preserve exact Gemini wire bytes"
     );
     assert_eq!(
-        serde_json::to_vec(&prepared.wire.as_ref().expect("prepared wire").payload)
+        crate::serialize_prepared_json_body_ref(prepared.wire.as_ref().expect("prepared wire"))
             .expect("prepared Gemini bytes"),
         serde_json::to_vec(&legacy).expect("legacy Gemini bytes")
     );
@@ -452,7 +452,11 @@ fn prepared_gemini_wire_bytes_match_legacy_final_render() {
         .as_str()
         .expect("prepared Gemini attachment data");
     assert_eq!(prepared_data.as_ptr(), original_pointer);
-    assert_eq!(owned_payload, &legacy_owned);
+    assert_eq!(
+        crate::serialize_prepared_json_body_ref(owned.wire.as_ref().expect("owned wire"))
+            .expect("owned prepared Gemini bytes"),
+        serde_json::to_vec(&legacy_owned).expect("legacy owned Gemini bytes")
+    );
 }
 
 #[test]

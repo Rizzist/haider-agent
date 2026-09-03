@@ -1016,7 +1016,7 @@ struct DurableReplayDocument<'a> {
     provider_requests: u8,
     provider: &'a str,
     model: &'a str,
-    response: Option<String>,
+    response: Option<haider_protocol::reply::ReplyText>,
     events: &'a HeadlessRunEvents,
     integrity: DurableReplayIntegrity,
     equivalence: DurableReplayEquivalence,
@@ -1138,7 +1138,9 @@ fn write_durable_replay(
     output.flush()
 }
 
-fn replay_final_text(events: &HeadlessRunEvents) -> io::Result<Option<String>> {
+fn replay_final_text(
+    events: &HeadlessRunEvents,
+) -> io::Result<Option<haider_protocol::reply::ReplyText>> {
     let mut final_text = None;
     events.try_for_each(|envelope| {
         let payload = envelope.payload;
@@ -1147,7 +1149,7 @@ fn replay_final_text(events: &HeadlessRunEvents) -> io::Result<Option<String>> {
                 haider_protocol::item::TurnItem::AgentMessage { text }
                 | haider_protocol::item::TurnItem::IncompleteAgentMessage { text, .. },
             ..
-        })) = serde_json::from_value::<EventPayload>(payload)
+        })) = payload.decode_event()
         {
             final_text = Some(text);
         }
@@ -1408,8 +1410,7 @@ fn adapt_events_to(
             }
             HeadlessEvent::Envelope(envelope) => {
                 if output == RunOutput::Jsonl {
-                    serde_json::to_writer(&mut stdout, envelope.as_ref())
-                        .map_err(io::Error::other)?;
+                    haider_protocol::envelope::write_envelope_json(&mut stdout, envelope.as_ref())?;
                     stdout.write_all(b"\n")?;
                     stdout_dirty = true;
                     stdout_unflushed_envelopes = stdout_unflushed_envelopes.saturating_add(1);
@@ -1449,7 +1450,7 @@ fn adapt_events_to(
                     if let Some(error_code) = terminal.error_code {
                         payload.insert("error_code".into(), serde_json::Value::String(error_code));
                     }
-                    serde_json::to_writer(&mut stdout, &envelope).map_err(io::Error::other)?;
+                    haider_protocol::envelope::write_envelope_json(&mut stdout, &envelope)?;
                     stdout.write_all(b"\n")?;
                     stdout.flush()?;
                 }
@@ -1527,7 +1528,7 @@ pub(crate) fn write_final(
                 output.write_all(result.run_id.as_str().as_bytes())?;
                 output.write_all(b"\n")?;
             } else if let Some(response) = &result.response {
-                output.write_all(response.as_bytes())?;
+                response.write_to(&mut output)?;
                 output.write_all(b"\n")?;
             }
         }
@@ -1570,7 +1571,7 @@ struct RunJson<'a> {
     model: &'a str,
     attachments: RunJsonAttachments<'a>,
     outcome: HeadlessOutcome,
-    response: &'a Option<String>,
+    response: &'a Option<haider_protocol::reply::ReplyText>,
     events: &'a HeadlessRunEvents,
     usage: &'a Option<haider_protocol::provider::Usage>,
     budget_exhausted: &'a Option<haider_protocol::headless::RunBudgetExhaustedV1>,

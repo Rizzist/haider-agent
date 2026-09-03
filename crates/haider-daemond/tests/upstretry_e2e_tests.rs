@@ -510,7 +510,7 @@ async fn observe_terminal(client: &mut UdsClient, run_id: &RunId) -> TerminalObs
             if envelope.run_id.as_ref() != Some(run_id) {
                 continue;
             }
-            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+            let Ok(payload) = envelope.payload.decode_event() else {
                 continue;
             };
             match &payload {
@@ -576,7 +576,7 @@ async fn replay_run_events(
                 } => response = true,
                 WireFrame::AttachCaughtUp { .. } => caught_up = true,
                 WireFrame::Event { envelope, .. } if envelope.run_id.as_ref() == Some(run_id) => {
-                    if let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) {
+                    if let Ok(payload) = envelope.payload.decode_event() {
                         events.push(payload);
                     }
                 }

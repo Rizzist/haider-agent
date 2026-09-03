@@ -755,7 +755,7 @@ fn envelope(
             durable: true,
             prompt: PromptRender::Verbatim,
         },
-        payload,
+        payload: payload.into(),
     }
 }
 

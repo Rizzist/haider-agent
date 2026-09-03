@@ -427,7 +427,7 @@ async fn outstanding_verify_evidence_does_not_block_an_interactive_submit() {
     let events = store.read(&session_id, 0, 128).await.expect("history");
     assert!(events.iter().any(|event| {
         matches!(
-            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            event.payload.decode_event(),
             Ok(EventPayload::UserMessage { ref text, .. })
                 if text == "ordinary interactive followup"
         )
@@ -504,7 +504,7 @@ async fn recoverable_workflow_continuation_blocks_daemon_idle_ttl_retirement() {
         "workflow-idle-ttl-configured",
         RunState::Queued,
     );
-    configured.payload = HeadlessRunEventPayload::HeadlessRunConfigured(HeadlessRunSpecV1 {
+    *configured.payload = HeadlessRunEventPayload::HeadlessRunConfigured(HeadlessRunSpecV1 {
         cwd: "workflow-idle-ttl-workspace".into(),
         provider: "fake".into(),
         model: "workflow-idle-ttl-model".into(),
@@ -814,9 +814,7 @@ async fn branch_create_receipt_replays_before_attachment_and_generation_validati
         let (fork_node_id, fork_seq) = events
             .iter()
             .find_map(|event| {
-                let EventPayload::NodeCommitted(node) =
-                    serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
-                else {
+                let EventPayload::NodeCommitted(node) = event.payload.decode_event().ok()? else {
                     return None;
                 };
                 (event.run_id.as_ref() == Some(&run_id)).then_some((node.node, event.seq))
@@ -965,9 +963,7 @@ async fn concurrent_duplicate_fork_discards_the_losing_candidate_actor() {
     let (fork_node_id, fork_seq) = source_events
         .iter()
         .find_map(|event| {
-            let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
-            else {
+            let EventPayload::NodeCommitted(node) = event.payload.decode_event().ok()? else {
                 return None;
             };
             Some((node.node, event.seq))
@@ -1050,9 +1046,7 @@ async fn create_fork_ready_source(
     let (node_id, seq) = events
         .into_iter()
         .find_map(|event| {
-            let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(event.payload).ok()?
-            else {
+            let EventPayload::NodeCommitted(node) = event.payload.decode_event().ok()? else {
                 return None;
             };
             Some((node.node, event.seq))
@@ -1418,9 +1412,7 @@ async fn fork_resets_remembered_grants_but_keeps_creation_permission_policy() {
         .expect("read user node")
         .into_iter()
         .find_map(|event| {
-            let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(event.payload).ok()?
-            else {
+            let EventPayload::NodeCommitted(node) = event.payload.decode_event().ok()? else {
                 return None;
             };
             Some(node.node)
@@ -2223,7 +2215,7 @@ async fn fork_roster_publication_waits_for_actor_and_complete_pipe_projection() 
         .into_iter()
         .find_map(|envelope| {
             matches!(
-                serde_json::from_value::<EventPayload>(envelope.payload),
+                envelope.payload.decode_event(),
                 Ok(EventPayload::UserMessage { .. })
             )
             .then_some(envelope.seq)
@@ -2385,7 +2377,7 @@ async fn prompt_fork_rpc_publishes_response_draft_and_roster_provenance() {
         .into_iter()
         .find_map(|envelope| {
             matches!(
-                serde_json::from_value::<EventPayload>(envelope.payload),
+                envelope.payload.decode_event(),
                 Ok(EventPayload::UserMessage { .. })
             )
             .then_some(envelope.seq)
@@ -2851,7 +2843,7 @@ async fn queue_changes_publish_revisioned_attachment_deltas() {
                 .iter()
                 .filter(|frame| {
                     matches!(frame, WireFrame::Event { envelope, .. }
-                    if serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                    if envelope.payload.decode_event()
                         .is_ok_and(|payload| matches!(payload, EventPayload::QueueChanged(_))))
                 })
                 .count();
@@ -2869,8 +2861,7 @@ async fn queue_changes_publish_revisioned_attachment_deltas() {
         .iter()
         .filter_map(|frame| match frame {
             WireFrame::Event { envelope, .. } => {
-                let EventPayload::QueueChanged(delta) =
-                    serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
+                let EventPayload::QueueChanged(delta) = envelope.payload.decode_event().ok()?
                 else {
                     return None;
                 };
@@ -3467,7 +3458,7 @@ async fn metafork_rejects_range_beyond_copied_lineage() {
         .iter()
         .find(|event| {
             matches!(
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                event.payload.decode_event(),
                 Ok(EventPayload::UserMessage { ref text, .. }) if text == "bounded review event"
             )
         })
@@ -3476,9 +3467,7 @@ async fn metafork_rejects_range_beyond_copied_lineage() {
     let (fork_node_id, fork_seq) = source_events
         .iter()
         .find_map(|event| {
-            let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
-            else {
+            let EventPayload::NodeCommitted(node) = event.payload.decode_event().ok()? else {
                 return None;
             };
             (event.run_id.as_ref() == Some(&run_id)).then_some((node.node, event.seq))
@@ -3607,7 +3596,7 @@ async fn metafork_review_is_write_free_until_human_acceptance() {
         .iter()
         .find(|event| {
             matches!(
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                event.payload.decode_event(),
                 Ok(EventPayload::UserMessage { ref text, .. })
                     if text == "review this chocolate event"
             )
@@ -3617,9 +3606,7 @@ async fn metafork_review_is_write_free_until_human_acceptance() {
     let (fork_node_id, fork_seq) = source_events
         .iter()
         .find_map(|event| {
-            let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
-            else {
+            let EventPayload::NodeCommitted(node) = event.payload.decode_event().ok()? else {
                 return None;
             };
             (event.run_id.as_ref() == Some(&run_id)).then_some((node.node, event.seq))
@@ -4893,7 +4880,9 @@ fn run_state_envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(EventPayload::RunState(state)).expect("state serializes"),
+        payload: serde_json::to_value(EventPayload::RunState(state))
+            .expect("state serializes")
+            .into(),
     }
 }
 
@@ -4906,7 +4895,7 @@ fn run_payload_envelope(
 ) -> RawEnvelope {
     let mut envelope =
         run_state_envelope(session_id, run_id, generation, event_id, RunState::Queued);
-    envelope.payload = serde_json::to_value(payload).expect("payload serializes");
+    *envelope.payload = serde_json::to_value(payload).expect("payload serializes");
     envelope
 }
 
@@ -5055,7 +5044,7 @@ async fn cancelling_committed_before_worker_done_rejects_done() {
     let history = store.read(&session_id, 0, 16).await.expect("history");
     let states = history
         .into_iter()
-        .filter_map(|envelope| serde_json::from_value::<EventPayload>(envelope.payload).ok())
+        .filter_map(|envelope| envelope.payload.decode_event().ok())
         .filter_map(|payload| match payload {
             EventPayload::RunState(state) => Some(state),
             _ => None,
@@ -5202,7 +5191,7 @@ async fn worker_head_cas_tolerates_a_config_fact_delta() {
         RunState::Queued,
     );
     fact.run_id = None;
-    fact.payload = haider_protocol::session::ModelSelected {
+    *fact.payload = haider_protocol::session::ModelSelected {
         provider: "fake-b".into(),
         model: "model-b".into(),
     }
@@ -5305,7 +5294,7 @@ async fn worker_head_cas_tolerates_a_rename_fact_delta() {
         RunState::Queued,
     );
     fact.run_id = None;
-    fact.payload = haider_protocol::session::SessionConfigEventPayload::session_renamed_value(
+    *fact.payload = haider_protocol::session::SessionConfigEventPayload::session_renamed_value(
         Some("parser rewrite".into()),
     )
     .expect("fact serializes");
@@ -5395,7 +5384,7 @@ async fn worker_head_cas_tolerates_a_graph_fact_delta() {
         RunState::Queued,
     );
     graph_fact.run_id = None;
-    graph_fact.payload = serde_json::to_value(EventPayload::GraphPinned(
+    *graph_fact.payload = serde_json::to_value(EventPayload::GraphPinned(
         haider_protocol::graph::GraphPinned {
             graph_id: GraphId::new("graph-cas-instance"),
             template: SHIP_LOOP_TEMPLATE.into(),
@@ -5502,7 +5491,7 @@ async fn worker_head_cas_tolerates_an_effort_and_fast_fact_delta() {
         RunState::Queued,
     );
     effort_fact.run_id = None;
-    effort_fact.payload = haider_protocol::session::EffortSelected {
+    *effort_fact.payload = haider_protocol::session::EffortSelected {
         effort: Some("xhigh".into()),
     }
     .to_payload_value()
@@ -5515,7 +5504,7 @@ async fn worker_head_cas_tolerates_an_effort_and_fast_fact_delta() {
         RunState::Queued,
     );
     fast_fact.run_id = None;
-    fast_fact.payload = haider_protocol::session::FastModeSelected { enabled: true }
+    *fast_fact.payload = haider_protocol::session::FastModeSelected { enabled: true }
         .to_payload_value()
         .expect("fast fact serializes");
     let (advance_completed, advance_response) = oneshot::channel();
@@ -5621,7 +5610,9 @@ async fn accepted_commit_then_shutdown_before_handoff_is_swept_terminal() {
         .expect("history reads");
     assert!(history.iter().any(|envelope| {
         envelope.run_id.as_ref() == Some(&run_id)
-            && serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            && envelope
+                .payload
+                .decode_event()
                 .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Cancelled))
     }));
     hub.shutdown().await.expect("hub stops");
@@ -5702,14 +5693,12 @@ async fn direct_shell_cancellation_supervises_process_and_closes_every_lifecycle
                 .expect("history reads");
             if history.iter().any(|envelope| {
                 envelope.run_id.as_ref() == Some(&run_id)
-                    && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
-                        |payload| {
-                            matches!(
-                                payload,
-                                EventPayload::Effect(EffectPhase::Dispatched { .. })
-                            )
-                        },
-                    )
+                    && envelope.payload.decode_event().is_ok_and(|payload| {
+                        matches!(
+                            payload,
+                            EventPayload::Effect(EffectPhase::Dispatched { .. })
+                        )
+                    })
             }) {
                 break;
             }
@@ -5739,7 +5728,9 @@ async fn direct_shell_cancellation_supervises_process_and_closes_every_lifecycle
                 .expect("history reads");
             if history.iter().any(|envelope| {
                 envelope.run_id.as_ref() == Some(&run_id)
-                    && serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                    && envelope
+                        .payload
+                        .decode_event()
                         .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Cancelled))
             }) {
                 break history;
@@ -5752,9 +5743,7 @@ async fn direct_shell_cancellation_supervises_process_and_closes_every_lifecycle
     let payloads = history
         .iter()
         .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
-        .filter_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()
-        })
+        .filter_map(|envelope| envelope.payload.decode_event().ok())
         .collect::<Vec<_>>();
     let phases = payloads
         .iter()
@@ -5889,14 +5878,12 @@ async fn direct_shell_manager_drain_cancels_process_before_join() {
                 .expect("history reads");
             if history.iter().any(|envelope| {
                 envelope.run_id.as_ref() == Some(&run_id)
-                    && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
-                        |payload| {
-                            matches!(
-                                payload,
-                                EventPayload::Effect(EffectPhase::Dispatched { .. })
-                            )
-                        },
-                    )
+                    && envelope.payload.decode_event().is_ok_and(|payload| {
+                        matches!(
+                            payload,
+                            EventPayload::Effect(EffectPhase::Dispatched { .. })
+                        )
+                    })
             }) {
                 break;
             }
@@ -5917,9 +5904,7 @@ async fn direct_shell_manager_drain_cancels_process_before_join() {
     let payloads = history
         .iter()
         .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
-        .filter_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()
-        })
+        .filter_map(|envelope| envelope.payload.decode_event().ok())
         .collect::<Vec<_>>();
     let phases = payloads
         .iter()
@@ -6020,20 +6005,18 @@ async fn accepted_shell_without_handoff_drains_with_prompt_visible_completion() 
         .iter()
         .find(|envelope| {
             envelope.run_id.as_ref() == Some(&run_id)
-                && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
-                    |payload| {
-                        matches!(
-                            payload,
-                            EventPayload::Item(ItemEvent::Completed {
-                                item_id: ref candidate,
-                                item: TurnItem::CommandExecution {
-                                    status: ToolStatus::Cancelled,
-                                    ..
-                                },
-                            }) if candidate == &item_id
-                        )
-                    },
-                )
+                && envelope.payload.decode_event().is_ok_and(|payload| {
+                    matches!(
+                        payload,
+                        EventPayload::Item(ItemEvent::Completed {
+                            item_id: ref candidate,
+                            item: TurnItem::CommandExecution {
+                                status: ToolStatus::Cancelled,
+                                ..
+                            },
+                        }) if candidate == &item_id
+                    )
+                })
         })
         .expect("drain closes the command");
     assert_eq!(completed.render.prompt, PromptRender::Verbatim);
@@ -6088,20 +6071,18 @@ async fn shell_supervisor_exit_keeps_failed_completion_prompt_visible() {
         .iter()
         .find(|envelope| {
             envelope.run_id.as_ref() == Some(&run_id)
-                && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
-                    |payload| {
-                        matches!(
-                            payload,
-                            EventPayload::Item(ItemEvent::Completed {
-                                item_id: ref candidate,
-                                item: TurnItem::CommandExecution {
-                                    status: ToolStatus::Failed,
-                                    ..
-                                },
-                            }) if candidate == &item_id
-                        )
-                    },
-                )
+                && envelope.payload.decode_event().is_ok_and(|payload| {
+                    matches!(
+                        payload,
+                        EventPayload::Item(ItemEvent::Completed {
+                            item_id: ref candidate,
+                            item: TurnItem::CommandExecution {
+                                status: ToolStatus::Failed,
+                                ..
+                            },
+                        }) if candidate == &item_id
+                    )
+                })
         })
         .expect("failure closes the command");
     assert_eq!(completed.render.prompt, PromptRender::Verbatim);
@@ -6206,7 +6187,9 @@ async fn panic_exit_after_cancelling_closes_item_and_menu_before_cancelled() {
         .into_iter()
         .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
         .filter_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload)
+            envelope
+                .payload
+                .decode_event()
                 .ok()
                 .map(|payload| (envelope.seq, payload))
         })
@@ -6296,7 +6279,9 @@ async fn panic_exit_reconciles_dispatched_and_parks_effect_unknown() {
         .into_iter()
         .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
         .filter_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload)
+            envelope
+                .payload
+                .decode_event()
                 .ok()
                 .map(|payload| (envelope.seq, payload))
         })
@@ -6354,7 +6339,7 @@ fn envelope_weight_charges_every_large_owned_id_string() {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::Value::Null,
+        payload: serde_json::Value::Null.into(),
     };
     let owned_string_bytes = envelope
         .event_id
@@ -6755,9 +6740,7 @@ async fn recovery_terminalization_never_settles_idle_while_another_run_is_active
     let idle_envelopes = |history: &[RawEnvelope]| {
         history
             .iter()
-            .filter_map(|envelope| {
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()
-            })
+            .filter_map(|envelope| envelope.payload.decode_event().ok())
             .filter(|payload| {
                 matches!(
                     payload,
@@ -6770,11 +6753,9 @@ async fn recovery_terminalization_never_settles_idle_while_another_run_is_active
         history
             .iter()
             .filter(|envelope| envelope.run_id.as_ref() == Some(run))
-            .filter_map(|envelope| {
-                match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
-                    Ok(EventPayload::RunState(state)) => Some(state),
-                    _ => None,
-                }
+            .filter_map(|envelope| match envelope.payload.decode_event() {
+                Ok(EventPayload::RunState(state)) => Some(state),
+                _ => None,
             })
             .next_back()
     };

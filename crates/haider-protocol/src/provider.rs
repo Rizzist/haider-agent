@@ -3,6 +3,7 @@
 //! envelopes; capability documents make degradation explicit, never silent.
 
 use crate::ids::{AgentId, CredentialAlias, RunId};
+use crate::reply::ReplyText;
 use crate::tool::{AttachmentBlock, ImageBlockRef};
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +28,7 @@ pub struct WebSource {
 #[serde(tag = "block", rename_all = "snake_case")]
 pub enum Block {
     Text {
-        text: String,
+        text: ReplyText,
     },
     Reasoning {
         summary: String,

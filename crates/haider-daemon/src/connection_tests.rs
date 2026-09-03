@@ -865,6 +865,13 @@ fn assert_unadvertised_fleet_identity_is_byte_identical() {
                     bytes.extend_from_slice(frame.body());
                     bytes
                 }
+                OutboundBytes::Event(frame) => {
+                    let mut bytes = Vec::with_capacity(frame.framed_len());
+                    frame
+                        .write_to(&mut bytes)
+                        .expect("event frame reconstructs");
+                    bytes
+                }
             };
             assert_eq!(actual, expected);
         }
@@ -1374,7 +1381,7 @@ fn queued_byte_budget_covers_the_four_byte_prefix_at_the_exact_boundary() {
                 durable: true,
                 prompt: haider_protocol::envelope::PromptRender::Omit,
             },
-            payload: serde_json::json!({"type": "budget_boundary"}),
+            payload: serde_json::json!({"type": "budget_boundary"}).into(),
         },
     };
     let encoded =
@@ -2170,7 +2177,7 @@ async fn empty_fake_turn_retries_until_the_paired_connection_hits_read_idle() {
             } => accepted = true,
             WireFrame::Event { envelope, .. }
                 if serde_json::from_value::<haider_protocol::EventPayload>(
-                    envelope.payload.clone(),
+                    envelope.payload.clone().into(),
                 )
                 .is_ok_and(|payload| {
                     matches!(
@@ -2220,7 +2227,7 @@ async fn terminal_fake_turn_finishes_over_the_paired_connection() {
             } => accepted = true,
             WireFrame::Event { envelope, .. }
                 if serde_json::from_value::<haider_protocol::EventPayload>(
-                    envelope.payload.clone(),
+                    envelope.payload.clone().into(),
                 )
                 .is_ok_and(|payload| {
                     payload

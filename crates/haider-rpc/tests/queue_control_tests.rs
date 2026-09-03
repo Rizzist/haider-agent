@@ -60,7 +60,7 @@ fn queue_feature_and_revision_bearing_delta_are_golden() {
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload: serde_json::to_value(payload).expect("payload"),
+            payload: serde_json::to_value(payload).expect("payload").into(),
         },
     };
     let encoded = serde_json::to_vec(&frame).expect("encode event frame");

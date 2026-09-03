@@ -686,7 +686,7 @@ fn decision_firing_jumps_to_its_committed_menu() {
         Some((HookDecisionKind::Allow, true)),
     );
     let HookEventPayload::HookFired(mut payload) =
-        HookEventPayload::from_payload_value(fired.payload.clone()).expect("fired payload")
+        HookEventPayload::from_payload_value(fired.payload.clone().into()).expect("fired payload")
     else {
         panic!("expected hook fired")
     };

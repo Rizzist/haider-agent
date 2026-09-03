@@ -23,6 +23,7 @@ use haider_protocol::provider::{
     Block, CacheStatAvailability, CapabilityDoc, FeatureResolve, FinishReason, NormalizedUsage,
     ReasoningAccounting, StreamEvent, Usage, UsageSource, WebSource,
 };
+use haider_protocol::reply::ReplyText;
 use haider_protocol::tool::AttachmentBlock;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use serde::Deserialize;
@@ -836,12 +837,21 @@ impl OpenAiProvider {
         &self,
         request: &TurnRequest,
     ) -> Result<reqwest::Response, ProviderError> {
-        let mut payload = match crate::take_prepared_wire_payload() {
-            Some(prepared) => prepared.payload,
-            None => self.request_payload(request)?,
+        let mut prepared = match crate::take_prepared_wire_payload() {
+            Some(prepared) => prepared,
+            None => crate::PreparedWire {
+                payload: self.request_payload(request)?,
+                history_boundary: None,
+                reply_bindings: Vec::new(),
+            },
         };
-        refresh_openai_cache_routing(request, self.http.codex_responses_lite, &mut payload, None);
-        let body = crate::serialize_json_body(payload)?;
+        refresh_openai_cache_routing(
+            request,
+            self.http.codex_responses_lite,
+            &mut prepared.payload,
+            None,
+        );
+        let body = crate::serialize_prepared_json_body(prepared)?;
         let route_gating = crate::RouteGating::for_endpoint(&self.api_url);
         self.http
             .post_json_body(&self.api_url, body, route_gating)
@@ -915,12 +925,14 @@ impl Provider for OpenAiProvider {
             self.effort.as_deref(),
             self.web_search,
             boundary,
+            true,
         )
         .ok()?;
         let stable_wire_end = rendered.stable_wire_end;
         let previous_wire_end = rendered.previous_wire_end;
         let message_wire_ends = rendered.message_wire_ends;
         let mut full_payload = rendered.payload;
+        let reply_bindings = rendered.reply_bindings;
         let rendered_system = if self.http.codex_responses_lite {
             request.system_prompt.as_ref().and_then(|_| {
                 full_payload
@@ -952,6 +964,7 @@ impl Provider for OpenAiProvider {
                 history_wire_start,
                 stable_wire_end,
                 previous_wire_end,
+                &reply_bindings,
             )?;
         let mut provider_view = crate::cachemaxxing::prepared_serialized_provider_view(
             request,
@@ -973,10 +986,13 @@ impl Provider for OpenAiProvider {
                 self.http.codex_responses_lite && request.system_prompt.is_some(),
                 previous_history_block_len,
             )?;
-        if previous_immutable_history_digest.is_none() {
-            previous_immutable_history_digest = previous_wire_end.map(|end| {
-                crate::exact_optional_wire_digest(Some(&history[..end.min(history.len())]))
-            });
+        if previous_immutable_history_digest.is_none()
+            && let Some(end) = previous_wire_end
+        {
+            previous_immutable_history_digest = Some(crate::exact_json_digest_with_replies(
+                &Some(&history[..end.min(history.len())]),
+                &reply_bindings,
+            )?);
         }
         let header_epoch = provider_view.ledger().header_epoch.as_str();
         apply_openai_cache_controls(
@@ -998,6 +1014,7 @@ impl Provider for OpenAiProvider {
             wire: Some(crate::PreparedWire {
                 payload: full_payload,
                 history_boundary: None,
+                reply_bindings,
             }),
             turn_trace: None,
         })
@@ -1751,14 +1768,18 @@ impl OpenAiCompatibleProvider {
         &self,
         request: &TurnRequest,
     ) -> Result<reqwest::Request, ProviderError> {
-        let mut payload = match crate::take_prepared_wire_payload() {
-            Some(prepared) => prepared.payload,
-            None => self.request_payload(request)?,
+        let mut prepared = match crate::take_prepared_wire_payload() {
+            Some(prepared) => prepared,
+            None => crate::PreparedWire {
+                payload: self.request_payload(request)?,
+                history_boundary: None,
+                reply_bindings: Vec::new(),
+            },
         };
         if matches!(
             self.dialect,
             CompatibleDialect::Generic | CompatibleDialect::KimiOAuth
-        ) && let Some(object) = payload.as_object_mut()
+        ) && let Some(object) = prepared.payload.as_object_mut()
         {
             let key = request
                 .cache_metadata
@@ -1783,7 +1804,7 @@ impl OpenAiCompatibleProvider {
                 object.remove("prompt_cache_key");
             }
         }
-        let body = crate::serialize_json_body(payload)?;
+        let body = crate::serialize_prepared_json_body(prepared)?;
         let mut outbound = self
             .http
             .post_json_body_request(&self.chat_url, body)
@@ -1867,7 +1888,7 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.cacheable_history_end();
         self.http.validate_model(request).ok()?;
-        let (mut full_payload, stable_wire_end, previous_wire_end) =
+        let (mut full_payload, stable_wire_end, previous_wire_end, reply_bindings) =
             chat_request_json_with_boundary(
                 request,
                 tools,
@@ -1875,6 +1896,7 @@ impl Provider for OpenAiCompatibleProvider {
                 self.kimi_thinking.as_ref(),
                 self.kimi_reasoning_effort.as_deref(),
                 boundary,
+                true,
             )
             .ok()?;
         // Kimi's cohort key is a routing overlay, not prompt content. Remove
@@ -1901,6 +1923,7 @@ impl Provider for OpenAiCompatibleProvider {
                 history_wire_start,
                 stable_wire_end,
                 previous_wire_end,
+                &reply_bindings,
             )?;
         let mut provider_view = crate::cachemaxxing::prepared_serialized_provider_view(
             request,
@@ -1921,10 +1944,13 @@ impl Provider for OpenAiCompatibleProvider {
             request.system_prompt.is_some(),
             previous_history_block_len,
         )?;
-        if previous_immutable_history_digest.is_none() {
-            previous_immutable_history_digest = previous_wire_end.map(|end| {
-                crate::exact_optional_wire_digest(Some(&history[..end.min(history.len())]))
-            });
+        if previous_immutable_history_digest.is_none()
+            && let Some(end) = previous_wire_end
+        {
+            previous_immutable_history_digest = Some(crate::exact_json_digest_with_replies(
+                &Some(&history[..end.min(history.len())]),
+                &reply_bindings,
+            )?);
         }
         if !matches!(
             self.dialect,
@@ -1980,6 +2006,7 @@ impl Provider for OpenAiCompatibleProvider {
             wire: Some(crate::PreparedWire {
                 payload: full_payload,
                 history_boundary: None,
+                reply_bindings,
             }),
             turn_trace: None,
         })
@@ -4128,6 +4155,7 @@ struct ResponsesNeutralRender {
     stable_wire_end: usize,
     previous_wire_end: Option<usize>,
     message_wire_ends: Vec<usize>,
+    reply_bindings: Vec<crate::PreparedReplyBinding>,
 }
 
 fn responses_request_json_with_boundary(
@@ -4144,6 +4172,7 @@ fn responses_request_json_with_boundary(
         effort,
         hosted_web_search,
         stable_history_end,
+        false,
     )?;
     apply_openai_cache_controls(
         request,
@@ -4168,6 +4197,7 @@ fn responses_request_json_neutral_with_boundary(
     effort: Option<&str>,
     hosted_web_search: bool,
     stable_history_end: usize,
+    bind_large_replies: bool,
 ) -> Result<ResponsesNeutralRender, ProviderError> {
     let computer_kind = openai_computer_tool_kind(&request.model, codex_responses_lite);
     let computer_display = latest_computer_display_dimensions(request).unwrap_or((
@@ -4186,6 +4216,7 @@ fn responses_request_json_neutral_with_boundary(
         })
         .collect::<HashSet<_>>();
     let mut input = Vec::new();
+    let mut reply_bindings = Vec::new();
     // Current codex sends subscription instructions as the first developer
     // input item and leaves the top-level `instructions` parameter null. Keep
     // the API-key Responses shape unchanged.
@@ -4222,7 +4253,17 @@ fn responses_request_json_neutral_with_boundary(
                     } else {
                         "input_text"
                     };
-                    content.push(serde_json::json!({"type": content_type, "text": text}));
+                    let mut rendered = serde_json::Map::new();
+                    rendered.insert("type".into(), content_type.into());
+                    rendered.insert(
+                        "text".into(),
+                        if bind_large_replies {
+                            crate::reply_json_value(text, &mut reply_bindings)
+                        } else {
+                            serde_json::Value::String(text.to_owned_string())
+                        },
+                    );
+                    content.push(serde_json::Value::Object(rendered));
                 }
                 Block::Text { .. } => {
                     return Err(invalid_request(
@@ -4506,12 +4547,15 @@ fn responses_request_json_neutral_with_boundary(
     //     models).
     // The API-key Responses path keeps its original shape.
     let stable_wire_end = stable_wire_end.unwrap_or(input.len());
-    let mut payload = serde_json::json!({
-        "model": request.model,
-        "input": input,
-        "stream": true,
-        "store": false,
-    });
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "model".into(),
+        serde_json::Value::String(request.model.clone()),
+    );
+    payload.insert("input".into(), serde_json::Value::Array(input));
+    payload.insert("stream".into(), serde_json::Value::Bool(true));
+    payload.insert("store".into(), serde_json::Value::Bool(false));
+    let mut payload = serde_json::Value::Object(payload);
     let object = payload
         .as_object_mut()
         .ok_or_else(|| internal("OpenAI Responses request payload was not a JSON object"))?;
@@ -4566,6 +4610,7 @@ fn responses_request_json_neutral_with_boundary(
         stable_wire_end,
         previous_wire_end,
         message_wire_ends,
+        reply_bindings,
     })
 }
 
@@ -5147,11 +5192,14 @@ fn flush_response_message(
         MessageRole::User | MessageRole::Tool => "user",
         MessageRole::Assistant => "assistant",
     };
-    input.push(serde_json::json!({
-        "type": "message",
-        "role": role,
-        "content": std::mem::take(content),
-    }));
+    let mut message = serde_json::Map::new();
+    message.insert("type".into(), serde_json::Value::String("message".into()));
+    message.insert("role".into(), serde_json::Value::String(role.into()));
+    message.insert(
+        "content".into(),
+        serde_json::Value::Array(std::mem::take(content)),
+    );
+    input.push(serde_json::Value::Object(message));
 }
 
 fn chat_request_json(
@@ -5167,8 +5215,9 @@ fn chat_request_json(
         kimi_thinking,
         kimi_reasoning_effort,
         request.messages.len(),
+        false,
     )
-    .map(|(payload, _, _)| payload)
+    .map(|(payload, _, _, _)| payload)
 }
 
 fn chat_request_json_with_boundary(
@@ -5178,9 +5227,19 @@ fn chat_request_json_with_boundary(
     kimi_thinking: Option<&KimiThinkingConfig>,
     kimi_reasoning_effort: Option<&str>,
     stable_history_end: usize,
-) -> Result<(serde_json::Value, usize, Option<usize>), ProviderError> {
+    bind_large_replies: bool,
+) -> Result<
+    (
+        serde_json::Value,
+        usize,
+        Option<usize>,
+        Vec<crate::PreparedReplyBinding>,
+    ),
+    ProviderError,
+> {
     let attachments = attachment_index(request)?;
     let mut messages = Vec::new();
+    let mut reply_bindings = Vec::new();
     if let Some(system) = &request.system_prompt {
         messages.push(serde_json::json!({"role": "system", "content": system}));
     }
@@ -5195,11 +5254,26 @@ fn chat_request_json_with_boundary(
     for (message_index, message) in request.messages.iter().enumerate() {
         match message.role {
             MessageRole::Assistant => {
-                let mut text = String::new();
+                let mut text = None::<ReplyText>;
+                let mut joined_copy = None::<String>;
                 let mut tool_calls = Vec::new();
                 for block in &message.blocks {
                     match block {
-                        Block::Text { text: delta } => text.push_str(delta),
+                        Block::Text { text: delta } => {
+                            if let Some(copy) = joined_copy.as_mut() {
+                                delta.visit_strs(|part| copy.push_str(part));
+                            } else if let Some(previous) = text.take() {
+                                if let Some(joined) = previous.try_join(delta) {
+                                    text = Some(joined);
+                                } else {
+                                    let mut copy = previous.to_owned_string();
+                                    delta.visit_strs(|part| copy.push_str(part));
+                                    joined_copy = Some(copy);
+                                }
+                            } else {
+                                text = Some(delta.clone());
+                            }
+                        }
                         Block::ToolCall {
                             call_id,
                             name,
@@ -5233,10 +5307,21 @@ fn chat_request_json_with_boundary(
                         }
                     }
                 }
-                let mut wire = serde_json::json!({
-                    "role": "assistant",
-                    "content": (!text.is_empty()).then_some(text),
-                });
+                let mut wire = serde_json::Map::new();
+                wire.insert("role".into(), serde_json::Value::String("assistant".into()));
+                let content = if let Some(copy) = joined_copy {
+                    serde_json::Value::String(copy)
+                } else if let Some(text) = text {
+                    if bind_large_replies {
+                        crate::reply_json_value(&text, &mut reply_bindings)
+                    } else {
+                        serde_json::Value::String(text.to_owned_string())
+                    }
+                } else {
+                    serde_json::Value::Null
+                };
+                wire.insert("content".into(), content);
+                let mut wire = serde_json::Value::Object(wire);
                 if !tool_calls.is_empty() {
                     wire.as_object_mut()
                         .ok_or_else(|| internal("Chat assistant message was not an object"))?
@@ -5250,7 +5335,17 @@ fn chat_request_json_with_boundary(
                 for block in &message.blocks {
                     match block {
                         Block::Text { text } => {
-                            content.push(serde_json::json!({"type": "text", "text": text}));
+                            let mut block = serde_json::Map::new();
+                            block.insert("type".into(), "text".into());
+                            block.insert(
+                                "text".into(),
+                                if bind_large_replies {
+                                    crate::reply_json_value(text, &mut reply_bindings)
+                                } else {
+                                    serde_json::Value::String(text.to_owned_string())
+                                },
+                            );
+                            content.push(serde_json::Value::Object(block));
                         }
                         Block::Attachment(AttachmentBlock::Image { artifact, mime, .. }) => {
                             let data = resolved_attachment(&attachments, artifact.as_str())?;
@@ -5291,7 +5386,10 @@ fn chat_request_json_with_boundary(
                     }
                 }
                 if !content.is_empty() {
-                    messages.push(serde_json::json!({"role": "user", "content": content}));
+                    let mut wire = serde_json::Map::new();
+                    wire.insert("role".into(), serde_json::Value::String("user".into()));
+                    wire.insert("content".into(), serde_json::Value::Array(content));
+                    messages.push(serde_json::Value::Object(wire));
                 }
                 for (call_id, preview, images) in results {
                     messages.push(serde_json::json!({
@@ -5349,12 +5447,18 @@ fn chat_request_json_with_boundary(
         })
         .collect::<Vec<_>>();
     let stable_wire_end = stable_wire_end.unwrap_or(messages.len());
-    let mut payload = serde_json::json!({
-        "model": request.model,
-        "messages": messages,
-        "stream": true,
-        "stream_options": {"include_usage": true},
-    });
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "model".into(),
+        serde_json::Value::String(request.model.clone()),
+    );
+    payload.insert("messages".into(), serde_json::Value::Array(messages));
+    payload.insert("stream".into(), serde_json::Value::Bool(true));
+    payload.insert(
+        "stream_options".into(),
+        serde_json::json!({"include_usage": true}),
+    );
+    let mut payload = serde_json::Value::Object(payload);
     let object = payload
         .as_object_mut()
         .ok_or_else(|| internal("Chat request payload was not an object"))?;
@@ -5407,7 +5511,7 @@ fn chat_request_json_with_boundary(
     if !tools.is_empty() {
         object.insert("tools".into(), serde_json::Value::Array(tools));
     }
-    Ok((payload, stable_wire_end, previous_wire_end))
+    Ok((payload, stable_wire_end, previous_wire_end, reply_bindings))
 }
 
 /// OpenAI-compatible ordering law: the tool-role result is immediately

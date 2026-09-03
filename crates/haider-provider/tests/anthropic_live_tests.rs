@@ -114,7 +114,9 @@ async fn live_anthropic_second_turn_reads_cached_prompt_prefix() {
     );
 
     first_request.messages.extend([
-        Message::assistant(vec![Block::Text { text: first_reply }]),
+        Message::assistant(vec![Block::Text {
+            text: first_reply.into(),
+        }]),
         Message::user_text("Reply with exactly: cache-turn-two"),
     ]);
     let metadata = first_request

@@ -35,7 +35,7 @@ fn envelope(session_id: &SessionId, event_id: &str) -> RawEnvelope {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::json!({"type": "future_rpc_seed"}),
+        payload: serde_json::json!({"type": "future_rpc_seed"}).into(),
     }
 }
 
@@ -361,7 +361,8 @@ fn seed_with_payload(config: &DaemonConfig, session_id: &SessionId, count: usize
             event.payload = serde_json::json!({
                 "type": "future_rpc_seed",
                 "blob": "x".repeat(blob),
-            });
+            })
+            .into();
             event
         })
         .collect::<Vec<_>>();

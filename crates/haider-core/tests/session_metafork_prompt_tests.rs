@@ -75,7 +75,7 @@ async fn metafork_content_is_in_child_journal_but_not_child_prompt() {
         .iter()
         .find_map(|envelope| {
             let EventPayload::NodeCommitted(node) =
-                serde_json::from_value(envelope.payload.clone()).ok()?
+                serde_json::from_value(envelope.payload.clone().into()).ok()?
             else {
                 return None;
             };
@@ -103,7 +103,8 @@ async fn metafork_content_is_in_child_journal_but_not_child_prompt() {
                 prompt: PromptRender::Omit,
             },
             payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
-                .expect("done payload"),
+                .expect("done payload")
+                .into(),
         }])
         .await
         .expect("terminalize source");

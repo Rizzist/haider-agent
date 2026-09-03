@@ -1838,6 +1838,8 @@ name = "haider-protocol"
 version = "0.0.969"
 dependencies = [
  "blake3",
+ "bytes",
+ "rmp-serde",
  "serde",
  "serde_json",
 ]

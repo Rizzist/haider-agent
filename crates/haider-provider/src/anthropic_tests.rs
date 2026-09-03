@@ -444,14 +444,14 @@ fn prepared_anthropic_wire_bytes_match_legacy_final_render() {
         crate::Provider::prepare_turn_with_tools(&provider, &borrowed_request, &shared_tools)
             .expect("borrowed-tools prepared turn");
     assert_eq!(
-        serde_json::to_vec(&borrowed.wire.as_ref().expect("borrowed wire").payload)
+        crate::serialize_prepared_json_body_ref(borrowed.wire.as_ref().expect("borrowed wire"))
             .expect("borrowed bytes"),
-        serde_json::to_vec(&prepared.wire.as_ref().expect("prepared wire").payload)
+        crate::serialize_prepared_json_body_ref(prepared.wire.as_ref().expect("prepared wire"))
             .expect("prepared bytes"),
         "Arc-backed preparation must preserve exact Anthropic wire bytes"
     );
     assert_eq!(
-        serde_json::to_vec(&prepared.wire.as_ref().expect("prepared wire").payload)
+        crate::serialize_prepared_json_body_ref(prepared.wire.as_ref().expect("prepared wire"))
             .expect("prepared bytes"),
         serde_json::to_vec(&legacy).expect("legacy bytes")
     );
@@ -486,7 +486,11 @@ fn prepared_anthropic_wire_bytes_match_legacy_final_render() {
         .as_str()
         .expect("prepared attachment data");
     assert_eq!(prepared_data.as_ptr(), original_pointer);
-    assert_eq!(owned_payload, &legacy_owned);
+    assert_eq!(
+        crate::serialize_prepared_json_body_ref(owned.wire.as_ref().expect("owned wire"))
+            .expect("owned prepared bytes"),
+        serde_json::to_vec(&legacy_owned).expect("legacy owned bytes")
+    );
 
     let mut rejected_request = cache_control_request();
     let rejected_artifact = ArtifactRef::new("blake3:rejected-attachment-move");
@@ -794,24 +798,35 @@ fn cache_diagnostic_provider_prepare_added_cpu_cost_is_measured() {
 /// v0.0.962 M5 allocation proof: the thread-local counting allocator samples
 /// every live allocation made during preparation, including transient DOMs
 /// and serializer buffers. The 1 MiB text makes fixed overhead negligible;
-/// the bound permits one final DOM plus one exact CAS view.
+/// arena-backed CAS segments leave at most one transient rendered copy.
 #[test]
-fn single_render_prepare_peaks_at_two_prompt_sized_views() {
+fn single_render_prepare_peaks_at_one_transient_prompt_view() {
     let provider = payload_provider(true).with_prompt_caching_verified(true);
     let mut request = cache_control_request();
     request.messages[0] = Message::user_text("x".repeat(1024 * 1024));
     let (prepared, peak_bytes) = crate::measure_peak_test_allocation(|| {
         provider.prepare_turn(&request).expect("prepared turn")
     });
-    let wire_size = crate::exact_wire_size(&prepared.wire.as_ref().expect("prepared wire").payload)
-        .expect("wire size");
-    let allowed = usize::try_from(wire_size)
-        .unwrap_or(usize::MAX)
-        .saturating_mul(2)
-        .saturating_add(128 * 1024);
+    assert!(
+        prepared
+            .wire
+            .as_ref()
+            .expect("prepared wire")
+            .reply_bindings
+            .iter()
+            .any(|binding| binding.text.len() == 1024 * 1024),
+        "the one-megabyte prompt must remain arena-backed"
+    );
+    assert!(
+        prepared
+            .provider_view_storage_blobs
+            .iter()
+            .any(haider_protocol::cache::ProviderViewBlobV1::is_segmented)
+    );
+    let allowed = 1024 * 1024 + 256 * 1024;
     assert!(
         peak_bytes <= allowed,
-        "prepare peak {peak_bytes} exceeded two prompt views plus fixed overhead {allowed}"
+        "prepare peak {peak_bytes} exceeded one prompt view plus fixed overhead {allowed}"
     );
 }
 

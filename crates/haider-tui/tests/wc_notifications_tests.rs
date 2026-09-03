@@ -335,7 +335,8 @@ fn run_state_envelope(
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(haider_protocol::EventPayload::RunState(state))
-            .expect("payload serializes"),
+            .expect("payload serializes")
+            .into(),
     }
 }
 

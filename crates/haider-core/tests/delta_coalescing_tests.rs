@@ -48,7 +48,7 @@ async fn journal_for(script: Vec<FakeStep>, window: Duration) -> Vec<RawEnvelope
 }
 
 fn typed(envelope: &RawEnvelope) -> EventPayload {
-    serde_json::from_value(envelope.payload.clone()).expect("known payload")
+    serde_json::from_value(envelope.payload.clone().into()).expect("known payload")
 }
 
 /// Every journaled delta in seq order, tagged by variant.
@@ -57,8 +57,8 @@ fn delta_payloads(events: &[RawEnvelope]) -> Vec<(&'static str, String)> {
         .iter()
         .filter_map(|event| match typed(event) {
             EventPayload::Item(ItemEvent::Delta { delta, .. }) => Some(match delta {
-                ItemDelta::Text { text } => ("text", text),
-                ItemDelta::Reasoning { text } => ("reasoning", text),
+                ItemDelta::Text { text } => ("text", text.to_owned_string()),
+                ItemDelta::Reasoning { text } => ("reasoning", text.to_owned_string()),
                 ItemDelta::ToolArgs { fragment } => ("tool_args", fragment),
                 _ => ("other", String::new()),
             }),
@@ -74,7 +74,7 @@ fn completed_message(events: &[RawEnvelope]) -> String {
             EventPayload::Item(ItemEvent::Completed {
                 item: TurnItem::AgentMessage { text },
                 ..
-            }) => Some(text),
+            }) => Some(text.to_owned_string()),
             _ => None,
         })
         .expect("completed agent message")

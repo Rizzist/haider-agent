@@ -468,14 +468,14 @@ pub fn status_line(projection: &SessionProjection, window: u64) -> String {
 fn render_item(out: &mut String, block: &ItemBlock) {
     match &block.item {
         TurnItem::AgentMessage { text } => {
-            out.push_str(text);
+            text.visit_strs(|part| out.push_str(part));
             if block.streaming {
                 out.push('▮');
             }
             out.push('\n');
         }
         TurnItem::IncompleteAgentMessage { text, interruption } => {
-            out.push_str(text);
+            text.visit_strs(|part| out.push_str(part));
             out.push('\n');
             out.push_str("⚠ incomplete — stream interrupted (");
             out.push_str(interruption.subcode.as_str());
@@ -483,7 +483,7 @@ fn render_item(out: &mut String, block: &ItemBlock) {
         }
         TurnItem::Reasoning { summary } => {
             out.push_str("· ");
-            out.push_str(summary);
+            summary.visit_strs(|part| out.push_str(part));
             out.push('\n');
         }
         TurnItem::ToolCall { name, status, .. } => {

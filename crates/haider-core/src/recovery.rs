@@ -16,7 +16,7 @@ use crate::{SqliteStoreHandle, StoreHandle};
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{EffectOutcome, EffectPhase};
 use haider_protocol::envelope::{
-    EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
+    EventEnvelope, PromptRender, RawEnvelope, RawPayload, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{
@@ -155,7 +155,7 @@ async fn gather_effect_recovery_evidence<S: StoreHandle + ?Sized>(
             let seq = envelope.seq;
             let agent_id = envelope.agent_id.clone();
             let raw_pid = effect_dispatch_pid(&envelope.payload);
-            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+            let Ok(payload) = envelope.payload.decode_event() else {
                 continue;
             };
             match payload {
@@ -541,7 +541,7 @@ fn reduce_page(
         ) {
             continue;
         }
-        let payload: EventPayload = serde_json::from_value(envelope.payload).map_err(|error| {
+        let payload = envelope.payload.decode_event().map_err(|error| {
             HaiderError::new(
                 ErrorCode::StoreCorrupt,
                 format!(
@@ -592,7 +592,7 @@ fn recovery_envelope(
     event_id: EventId,
     payload: EventPayload,
 ) -> Result<RawEnvelope, HaiderError> {
-    let payload = serde_json::to_value(payload).map_err(|error| {
+    let payload = RawPayload::from_event(payload).map_err(|error| {
         HaiderError::new(
             ErrorCode::Internal,
             format!("recovery payload could not serialize: {error}"),
@@ -753,7 +753,7 @@ mod reducer_filter_tests {
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload,
+            payload: payload.into(),
         }
     }
 

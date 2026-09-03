@@ -123,7 +123,7 @@ fn config_fact(seq: u64, payload: &AgentTypeSelected) -> RawEnvelope {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: payload.to_payload_value().expect("fact payload"),
+        payload: payload.to_payload_value().expect("fact payload").into(),
     }
 }
 

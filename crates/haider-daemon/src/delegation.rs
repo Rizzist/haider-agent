@@ -31,7 +31,7 @@ use haider_protocol::agent::{
 };
 use haider_protocol::effect::EffectClass;
 use haider_protocol::envelope::{
-    EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
+    EventEnvelope, PromptRender, RawEnvelope, RawPayload, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::graph::{
@@ -47,6 +47,7 @@ use haider_protocol::ids::{
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::loom::{LoomGate, LoomWorkflow, parse_pipe};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuScope};
+use haider_protocol::reply::ReplyText;
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState, WaitReason};
 use haider_protocol::task::TaskEventPayload;
@@ -1263,9 +1264,7 @@ impl DelegationHandle {
                     continue;
                 }
                 let Ok(haider_protocol::EventPayload::MenuAnswered(answer)) =
-                    serde_json::from_value::<haider_protocol::EventPayload>(
-                        envelope.payload.clone(),
-                    )
+                    envelope.payload.decode_event()
                 else {
                     continue;
                 };
@@ -1795,7 +1794,7 @@ impl DelegationHandle {
                     continue;
                 };
                 if let Ok(haider_protocol::EventPayload::RunState(state)) =
-                    serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload)
+                    envelope.payload.decode_event()
                 {
                     states.insert(run_id, (state, envelope.seq));
                 }
@@ -1849,18 +1848,16 @@ impl DelegationHandle {
                 } else {
                     AgentMessageDelivery::DeliveredQueued
                 };
-                let text =
-                    match serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload)
-                    {
-                        Ok(haider_protocol::EventPayload::UserMessage { text, .. }) => text,
-                        _ => {
-                            return Err(HaiderError::new(
-                                ErrorCode::StoreCorrupt,
-                                "child message event is not a user message",
-                                false,
-                            ));
-                        }
-                    };
+                let text = match envelope.payload.decode_event() {
+                    Ok(haider_protocol::EventPayload::UserMessage { text, .. }) => text,
+                    _ => {
+                        return Err(HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            "child message event is not a user message",
+                            false,
+                        ));
+                    }
+                };
                 return Ok(Some(ChildMessageEvent {
                     run_id,
                     event_id: envelope.event_id,
@@ -2068,9 +2065,7 @@ impl DelegationHandle {
                 if envelope.run_id.as_ref() != Some(&record.child_run_id) {
                     continue;
                 }
-                let Ok(payload) = serde_json::from_value::<haider_protocol::EventPayload>(
-                    envelope.payload.clone(),
-                ) else {
+                let Ok(payload) = envelope.payload.decode_event() else {
                     if let Some(TaskEventPayload::TaskCompleted(completed)) =
                         TaskEventPayload::from_payload_value(&envelope.payload)
                         && let Some(revision) = completed
@@ -2098,7 +2093,7 @@ impl DelegationHandle {
                     haider_protocol::EventPayload::Item(ItemEvent::Completed {
                         item: TurnItem::AgentMessage { text },
                         ..
-                    }) if !text.trim().is_empty() => summary = Some(text),
+                    }) if !text.is_blank() => summary = Some(text),
                     haider_protocol::EventPayload::ProcessSignalRecorded(signal)
                         if signal.workspace_revision.is_some() =>
                     {
@@ -2127,7 +2122,7 @@ impl DelegationHandle {
         } else {
             None
         };
-        let (mut summary, verified, chip) = match state {
+        let (summary, verified, chip) = match state {
             RunState::Done => {
                 let verified = match workflow_graph.as_ref().map(|graph| graph.phase) {
                     Some(GraphPhase::Completed) => ReportVerification::Verified,
@@ -2135,28 +2130,38 @@ impl DelegationHandle {
                     _ => ReportVerification::Unverified,
                 };
                 (
-                    summary.unwrap_or_else(|| "subagent completed without a text report".into()),
+                    summary.map_or_else(
+                        || {
+                            ReportSummaryText::Owned(
+                                "subagent completed without a text report".into(),
+                            )
+                        },
+                        ReportSummaryText::Reply,
+                    ),
                     verified,
                     ChipState::Done,
                 )
             }
             RunState::Errored => (
-                failure.unwrap_or_else(|| "subagent failed without public failure detail".into()),
+                ReportSummaryText::Owned(
+                    failure
+                        .unwrap_or_else(|| "subagent failed without public failure detail".into()),
+                ),
                 ReportVerification::Red,
                 ChipState::Error,
             ),
             RunState::Cancelled => (
-                if self.stall_cancel_requested(record).await? {
+                ReportSummaryText::Owned(if self.stall_cancel_requested(record).await? {
                     STALL_REPORT_SUMMARY.into()
                 } else {
                     "subagent was cancelled before completing its report".into()
-                },
+                }),
                 ReportVerification::Red,
                 ChipState::Error,
             ),
             _ => unreachable!("terminal state match is exhaustive"),
         };
-        if record
+        let lockdown_prefix = if record
             .manifest
             .coordinates
             .as_ref()
@@ -2171,9 +2176,11 @@ impl DelegationHandle {
                 .and_then(|coordinates| coordinates.get("provider"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
-            summary = format!("[lockdown provider {provider}] {summary}");
-        }
-        let (summary, truncated) = bounded_summary(summary);
+            format!("[lockdown provider {provider}] ")
+        } else {
+            String::new()
+        };
+        let (summary, truncated) = bounded_report_summary(summary, &lockdown_prefix);
         Ok(Some(DeferredToolResult {
             report: ChildReport {
                 agent: record.agent_id.clone(),
@@ -2392,9 +2399,7 @@ impl DelegationHandle {
                     continue;
                 }
                 if let Ok(haider_protocol::EventPayload::AgentChipState { agent, chip }) =
-                    serde_json::from_value::<haider_protocol::EventPayload>(
-                        envelope.payload.clone(),
-                    )
+                    envelope.payload.decode_event()
                     && agent == record.agent_id
                 {
                     last_chip = Some(chip);
@@ -2402,7 +2407,7 @@ impl DelegationHandle {
                 if let Ok(haider_protocol::EventPayload::Item(ItemEvent::Completed {
                     item: TurnItem::Extension { kind, data },
                     ..
-                })) = serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload)
+                })) = envelope.payload.decode_event()
                     && kind == AGENT_GRAPH_ROLLUP_EXTENSION_KIND
                     && let Ok(rollup) = serde_json::from_value::<AgentGraphRollupV1>(data)
                     && rollup.agent == record.agent_id
@@ -2474,9 +2479,7 @@ impl DelegationHandle {
                     mirror.graph_envelopes.push(envelope.clone());
                     prune_graph_envelopes(&mut mirror.graph_envelopes);
                 }
-                let Ok(payload) = serde_json::from_value::<haider_protocol::EventPayload>(
-                    envelope.payload.clone(),
-                ) else {
+                let Ok(payload) = envelope.payload.decode_event() else {
                     continue;
                 };
                 let graph_boundary = graph_rollup_boundary(&payload);
@@ -2732,9 +2735,7 @@ impl DelegationHandle {
                 if envelope.run_id.as_ref() != Some(&record.child_run_id) {
                     continue;
                 }
-                let Ok(payload) =
-                    serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload)
-                else {
+                let Ok(payload) = envelope.payload.decode_event() else {
                     continue;
                 };
                 match payload {
@@ -3333,7 +3334,7 @@ pub(crate) fn chip_projection_envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     })
 }
 
@@ -3375,7 +3376,7 @@ fn terminal_mirror_handoff_envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     })
 }
 
@@ -3409,7 +3410,7 @@ pub(crate) fn metrics_projection_envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     })
 }
 
@@ -3482,7 +3483,7 @@ fn child_menu_projection_envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).map_err(internal_serialization)?,
+        payload: RawPayload::from_event(payload).map_err(internal_serialization)?,
     })
 }
 
@@ -3522,7 +3523,7 @@ pub(crate) fn graph_rollup_projection_envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     })
 }
 
@@ -3563,7 +3564,7 @@ pub(crate) fn child_prompt_projection_envelope(
             // into the parent's provider history.
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     })
 }
 
@@ -3603,7 +3604,7 @@ pub(crate) fn agent_messaged_envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     })
 }
 
@@ -3947,4 +3948,34 @@ fn bounded_summary(summary: String) -> (String, bool) {
         end -= 1;
     }
     (summary[..end].to_owned(), true)
+}
+
+enum ReportSummaryText {
+    Reply(ReplyText),
+    Owned(String),
+}
+
+fn bounded_report_summary(summary: ReportSummaryText, prefix: &str) -> (String, bool) {
+    let remaining = MAX_REPORT_BYTES.saturating_sub(prefix.len());
+    match summary {
+        ReportSummaryText::Reply(text) => {
+            let end = remaining.min(text.len());
+            let mut boundary = end;
+            let body = loop {
+                if let Some(body) = text.slice(0..boundary) {
+                    break body.to_owned_string();
+                }
+                if boundary == 0 {
+                    break String::new();
+                }
+                boundary -= 1;
+            };
+            let truncated = boundary < text.len() || prefix.len() > MAX_REPORT_BYTES;
+            let mut output = String::with_capacity(prefix.len().saturating_add(body.len()));
+            output.push_str(prefix);
+            output.push_str(&body);
+            (output, truncated)
+        }
+        ReportSummaryText::Owned(summary) => bounded_summary(format!("{prefix}{summary}")),
+    }
 }

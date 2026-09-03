@@ -88,13 +88,13 @@ fn envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::json!({"type": "future_test_event"}),
+        payload: serde_json::json!({"type": "future_test_event"}).into(),
     }
 }
 
 fn menu_opening(session_id: &SessionId, menu_id: &MenuId, worker_generation: u64) -> RawEnvelope {
     let mut envelope = envelope(session_id, "menu-opened", worker_generation);
-    envelope.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
+    *envelope.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
         id: menu_id.clone(),
         kind: MenuKind::Choice,
         title: "Choose".into(),
@@ -142,7 +142,7 @@ fn footprint_envelope(
         truth: ContextFootprintTruth::Estimated,
         accounting: None,
     };
-    envelope.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+    *envelope.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
         item_id: ItemId::new(format!("item-{event_id}")),
         item: footprint.extension_item().expect("footprint serializes"),
     }))
@@ -161,7 +161,7 @@ fn cache_rate_usage_envelope(
     let mut envelope = envelope(session_id, event_id, worker_generation);
     let run_id = RunId::new(run);
     envelope.run_id = Some(run_id.clone());
-    envelope.payload = serde_json::to_value(EventPayload::Usage(Usage {
+    *envelope.payload = serde_json::to_value(EventPayload::Usage(Usage {
         input: logical_input,
         output: 0,
         reasoning: 0,
@@ -671,7 +671,7 @@ fn pipe_event(
     payload: EventPayload,
 ) -> RawEnvelope {
     let mut event = envelope(session_id, event_id, worker_generation);
-    event.payload = serde_json::to_value(payload).expect("pipe payload serializes");
+    *event.payload = serde_json::to_value(payload).expect("pipe payload serializes");
     event
 }
 
@@ -862,10 +862,10 @@ async fn append_delta(
 
 fn delta_pipe_event(session_id: &SessionId, event_id: &str, worker_generation: u64) -> RawEnvelope {
     let mut delta = envelope(session_id, event_id, worker_generation);
-    delta.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Delta {
+    *delta.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Delta {
         item_id: ItemId::new("sealed-replay-item"),
         delta: ItemDelta::Text {
-            text: event_id.to_owned(),
+            text: event_id.to_owned().into(),
         },
     }))
     .expect("delta serializes");
@@ -1211,13 +1211,12 @@ async fn unknown_parked_command_origin_is_rejected_before_answer_commit() {
     create_and_attach_typed_session(&store, &connection, &sink, &session_id, "fake").await;
 
     let mut opening = menu_opening(&session_id, &menu_id, store.worker_generation());
-    let EventPayload::MenuOpened(mut menu) =
-        serde_json::from_value::<EventPayload>(opening.payload).expect("menu payload")
+    let EventPayload::MenuOpened(mut menu) = opening.payload.decode_event().expect("menu payload")
     else {
         panic!("opening helper must create a menu");
     };
     menu.origin = "command-door-v1:future-command-kind".into();
-    opening.payload = serde_json::to_value(EventPayload::MenuOpened(menu)).expect("menu encodes");
+    *opening.payload = serde_json::to_value(EventPayload::MenuOpened(menu)).expect("menu encodes");
     let mut opening = [opening];
     hub.append(&mut opening).await.expect("future menu opens");
     let request_seq = opening[0].seq;
@@ -1257,12 +1256,12 @@ async fn unknown_parked_command_origin_is_rejected_before_answer_commit() {
     let mut v2_opening = menu_opening(&session_id, &v2_menu_id, store.worker_generation());
     v2_opening.event_id = EventId::new("command-door-v2-opened");
     let EventPayload::MenuOpened(mut v2_menu) =
-        serde_json::from_value::<EventPayload>(v2_opening.payload).expect("menu payload")
+        v2_opening.payload.decode_event().expect("menu payload")
     else {
         panic!("opening helper must create a menu");
     };
     v2_menu.origin = "command-door-v2:rename".into();
-    v2_opening.payload =
+    *v2_opening.payload =
         serde_json::to_value(EventPayload::MenuOpened(v2_menu)).expect("menu encodes");
     let mut v2_opening = [v2_opening];
     hub.append(&mut v2_opening).await.expect("v2 menu opens");
@@ -1340,7 +1339,7 @@ async fn parked_command_uses_needs_input_and_executes_once_through_menu_answer()
         match sink.next().await {
             WireFrame::Event { envelope, .. }
                 if matches!(
-                    serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                    envelope.payload.decode_event(),
                     Ok(EventPayload::MenuOpened(_))
                 ) =>
             {
@@ -1700,7 +1699,7 @@ async fn command_cache_epoch_confirmation_parks_and_resumes_through_menu_answer(
         "command-door-cache-scope",
         store.worker_generation(),
     );
-    usage.payload = serde_json::to_value(EventPayload::Usage(Usage {
+    *usage.payload = serde_json::to_value(EventPayload::Usage(Usage {
         input: 10_000,
         output: 0,
         reasoning: 0,
@@ -2426,7 +2425,7 @@ async fn append_fleet_metrics(
         );
         event.run_id = Some(record.child_run_id.clone());
         event.agent_id = Some(record.agent_id.clone());
-        event.payload = payload;
+        *event.payload = payload;
         event
     };
     let started = scoped(
@@ -2540,7 +2539,7 @@ async fn a_stale_v4_file_rebuilds_with_the_reasoning_compat_flag_cleared() {
         EventPayload::Item(ItemEvent::Started {
             item_id: reasoning_id.clone(),
             item: TurnItem::Reasoning {
-                summary: String::new(),
+                summary: String::new().into(),
             },
         }),
     );
@@ -4055,7 +4054,7 @@ fn user_turn_envelope(
     if agent_scoped {
         envelope.agent_id = Some(AgentId::new("agent-under-test"));
     }
-    envelope.payload = serde_json::to_value(EventPayload::UserMessage {
+    *envelope.payload = serde_json::to_value(EventPayload::UserMessage {
         text: format!("turn {event_id}"),
         attachments: Vec::new(),
         mode: DeliveryMode::Queue,
@@ -4072,7 +4071,7 @@ fn model_selected_envelope(
     model: &str,
 ) -> RawEnvelope {
     let mut envelope = envelope(session_id, event_id, worker_generation);
-    envelope.payload = ModelSelected {
+    *envelope.payload = ModelSelected {
         provider: provider.into(),
         model: model.into(),
     }
@@ -4448,12 +4447,12 @@ async fn session_list_publishes_compact_agent_metrics_at_committed_head() {
     let mut started = envelope(&session_id, "metrics-started", generation);
     started.run_id = Some(run_id.clone());
     started.committed_at_ms = 100;
-    started.payload =
+    *started.payload =
         serde_json::to_value(EventPayload::RunState(RunState::Thinking)).expect("run state");
     let mut tool_started = envelope(&session_id, "metrics-tool-started", generation);
     tool_started.run_id = Some(run_id.clone());
     tool_started.committed_at_ms = 200;
-    tool_started.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Started {
+    *tool_started.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Started {
         item_id: ItemId::new("tool-item"),
         item: tool(haider_protocol::item::ToolStatus::InProgress),
     }))
@@ -4461,7 +4460,7 @@ async fn session_list_publishes_compact_agent_metrics_at_committed_head() {
     let mut tool_completed = envelope(&session_id, "metrics-tool-completed", generation);
     tool_completed.run_id = Some(run_id.clone());
     tool_completed.committed_at_ms = 300;
-    tool_completed.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+    *tool_completed.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
         item_id: ItemId::new("tool-item"),
         item: tool(haider_protocol::item::ToolStatus::Completed),
     }))
@@ -4469,7 +4468,7 @@ async fn session_list_publishes_compact_agent_metrics_at_committed_head() {
     let mut done = envelope(&session_id, "metrics-done", generation);
     done.run_id = Some(run_id);
     done.committed_at_ms = 400;
-    done.payload =
+    *done.payload =
         serde_json::to_value(EventPayload::RunState(RunState::Done)).expect("done state");
     hub.append(&mut [started, tool_started, tool_completed, done])
         .await
@@ -4660,7 +4659,7 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
     let mut permission_menu = menu_opening(&permission_session, &permission_menu_id, generation);
     permission_menu.event_id = EventId::new("permission-menu-opened");
     permission_menu.run_id = Some(RunId::new("permission-run"));
-    permission_menu.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
+    *permission_menu.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
         id: permission_menu_id.clone(),
         kind: MenuKind::Permission {
             effect_summary: "write src/lib.rs".into(),
@@ -4685,7 +4684,7 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
     .expect("permission menu serializes");
     let mut permission_state = envelope(&permission_session, "permission-state", generation);
     permission_state.run_id = Some(RunId::new("permission-run"));
-    permission_state.payload =
+    *permission_state.payload =
         serde_json::to_value(EventPayload::RunState(RunState::PermissionRequired {
             menu: permission_menu_id,
         }))
@@ -4695,7 +4694,7 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
     let mut input_menu = menu_opening(&input_session, &input_menu_id, generation);
     input_menu.event_id = EventId::new("input-menu-opened");
     input_menu.run_id = Some(RunId::new("input-run"));
-    input_menu.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
+    *input_menu.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
         id: input_menu_id.clone(),
         kind: MenuKind::Secret,
         title: "Credential required".into(),
@@ -4715,12 +4714,12 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
     .expect("input menu serializes");
     let mut input_state = envelope(&input_session, "input-state", generation);
     input_state.run_id = Some(RunId::new("input-run"));
-    input_state.payload = serde_json::to_value(EventPayload::RunState(RunState::InputRequired {
+    *input_state.payload = serde_json::to_value(EventPayload::RunState(RunState::InputRequired {
         menu: input_menu_id,
     }))
     .expect("input state serializes");
     let mut opaque_oauth = envelope(&input_session, "opaque-oauth", generation);
-    opaque_oauth.payload = serde_json::json!({
+    *opaque_oauth.payload = serde_json::json!({
         "type": "future_oauth_token_event",
         "access_token": OAUTH_SENTINEL,
         "refresh_token": VAULT_SENTINEL,
@@ -4728,7 +4727,7 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
 
     let branch_fact = |event_id: &str, branch_id: &str, name: &str, created_seq: u64| {
         let mut fact = envelope(&active_session, event_id, generation);
-        fact.payload = BranchCreated {
+        *fact.payload = BranchCreated {
             branch: BranchDescriptor {
                 branch_id: BranchId::new(branch_id),
                 name: name.into(),
@@ -4755,12 +4754,12 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
     let mut active_state = envelope(&active_session, "active-state", generation);
     active_state.branch_id = Some(BranchId::new("branch-executing"));
     active_state.run_id = Some(RunId::new("run-executing"));
-    active_state.payload = serde_json::to_value(EventPayload::RunState(RunState::Thinking))
+    *active_state.payload = serde_json::to_value(EventPayload::RunState(RunState::Thinking))
         .expect("active state serializes");
     let mut queued_state = envelope(&active_session, "queued-state", generation);
     queued_state.branch_id = Some(BranchId::new("branch-queued"));
     queued_state.run_id = Some(RunId::new("run-queued"));
-    queued_state.payload = serde_json::to_value(EventPayload::RunState(RunState::Queued))
+    *queued_state.payload = serde_json::to_value(EventPayload::RunState(RunState::Queued))
         .expect("queued state serializes");
 
     hub.append(&mut [permission_menu, permission_state])
@@ -4780,7 +4779,7 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
     let mut recovery_menu = menu_opening(&recovery_session, &recovery_menu_id, generation);
     recovery_menu.event_id = EventId::new("recovery-menu-opened");
     recovery_menu.run_id = Some(RunId::new("recovery-run"));
-    recovery_menu.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
+    *recovery_menu.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
         id: recovery_menu_id.clone(),
         kind: MenuKind::Recovery {
             effect: EffectId::new("effect-observe-recovery"),
@@ -4810,7 +4809,7 @@ async fn session_observe_distinguishes_parked_states_and_never_leaks_secret_mate
     .expect("recovery menu serializes");
     let mut recovery_state = envelope(&recovery_session, "recovery-state", generation);
     recovery_state.run_id = Some(RunId::new("recovery-run"));
-    recovery_state.payload =
+    *recovery_state.payload =
         serde_json::to_value(EventPayload::RunState(RunState::EffectOutcomeUnknown))
             .expect("recovery state serializes");
     hub.append(&mut [recovery_menu, recovery_state])
@@ -4987,7 +4986,7 @@ async fn metadata_only_observe_shares_authoritative_fields_and_roster_truth() {
     create_typed_session(&store, &session_id, "openai").await;
     let mut message = envelope(&session_id, "meta-user-message", generation);
     message.run_id = Some(RunId::new("meta-run"));
-    message.payload = serde_json::to_value(EventPayload::UserMessage {
+    *message.payload = serde_json::to_value(EventPayload::UserMessage {
         text: "compare the two observe doors".into(),
         attachments: Vec::new(),
         mode: DeliveryMode::Queue,
@@ -5180,11 +5179,11 @@ async fn descendant_stream_reconnects_per_child_without_gaps_or_duplicates() {
 
     let mut spawn = envelope(&root, "descendant-parent-spawn", generation);
     spawn.run_id = Some(record.parent_run_id.clone());
-    spawn.payload = serde_json::to_value(EventPayload::AgentSpawned(record.manifest.clone()))
+    *spawn.payload = serde_json::to_value(EventPayload::AgentSpawned(record.manifest.clone()))
         .expect("spawn fact");
     let mut spawn_item = envelope(&root, "descendant-parent-spawn-item", generation);
     spawn_item.run_id = Some(record.parent_run_id.clone());
-    spawn_item.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+    *spawn_item.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
         item_id: record.tool_item_id.clone(),
         item: TurnItem::ChildSpawn {
             agent: record.agent_id.clone(),
@@ -5201,7 +5200,7 @@ async fn descendant_stream_reconnects_per_child_without_gaps_or_duplicates() {
     let mut thinking = envelope(&child_session, "descendant-child-thinking", generation);
     thinking.run_id = Some(record.child_run_id.clone());
     thinking.agent_id = Some(record.agent_id.clone());
-    thinking.payload =
+    *thinking.payload =
         serde_json::to_value(EventPayload::RunState(RunState::Thinking)).expect("thinking state");
     hub.append(&mut [thinking])
         .await
@@ -5380,7 +5379,7 @@ async fn descendant_stream_reconnects_per_child_without_gaps_or_duplicates() {
     let mut done = envelope(&child_session, "descendant-child-done", generation);
     done.run_id = Some(record.child_run_id.clone());
     done.agent_id = Some(record.agent_id.clone());
-    done.payload =
+    *done.payload =
         serde_json::to_value(EventPayload::RunState(RunState::Done)).expect("done state");
     hub.append(&mut [done])
         .await
@@ -5428,11 +5427,11 @@ async fn descendant_stream_reconnects_per_child_without_gaps_or_duplicates() {
     };
     let mut report_fact = envelope(&root, "descendant-parent-result", generation);
     report_fact.run_id = Some(record.parent_run_id.clone());
-    report_fact.payload =
+    *report_fact.payload =
         serde_json::to_value(EventPayload::AgentReport(report.clone())).expect("report fact");
     let mut result_item = envelope(&root, "descendant-parent-result-item", generation);
     result_item.run_id = Some(record.parent_run_id.clone());
-    result_item.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+    *result_item.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
         item_id: ItemId::new("descendant-result-item"),
         item: TurnItem::ChildResult { report },
     }))
@@ -5806,7 +5805,7 @@ async fn session_fleet_reduces_nested_terminal_tree_and_rollup_with_view_capabil
 
     let mut root_terminal = envelope(&root, "fleet-root-terminal", generation);
     root_terminal.run_id = Some(RunId::new("fleet-root-run"));
-    root_terminal.payload =
+    *root_terminal.payload =
         serde_json::to_value(EventPayload::RunState(RunState::Done)).expect("root terminal");
     hub.append(&mut [root_terminal])
         .await
@@ -5941,7 +5940,7 @@ async fn session_fleet_caps_historical_response_at_512_nodes() {
     );
     parent_done.run_id = Some(parent.child_run_id.clone());
     parent_done.agent_id = Some(parent.agent_id.clone());
-    parent_done.payload =
+    *parent_done.payload =
         serde_json::to_value(EventPayload::RunState(RunState::Done)).expect("parent done state");
     hub.append(&mut [parent_done])
         .await
@@ -5982,7 +5981,7 @@ async fn session_fleet_caps_historical_response_at_512_nodes() {
         );
         done.run_id = Some(record.child_run_id.clone());
         done.agent_id = Some(record.agent_id.clone());
-        done.payload =
+        *done.payload =
             serde_json::to_value(EventPayload::RunState(RunState::Done)).expect("done state");
         hub.append(&mut [done]).await.expect("terminal child state");
         store
@@ -6461,17 +6460,13 @@ async fn n_way_menu_answer_race_has_one_streamed_winner_and_correlated_losers() 
             match sink.next().await {
                 WireFrame::Event { envelope, .. } => {
                     if envelope.seq == request_seq + 1 {
-                        assert!(
-                            serde_json::from_value::<EventPayload>(envelope.payload).is_ok_and(
-                                |payload| {
-                                    matches!(
-                                        payload,
-                                        EventPayload::MenuAnswered(ref answer)
-                                            if answer.menu == menu_id
-                                    )
-                                }
+                        assert!(envelope.payload.decode_event().is_ok_and(|payload| {
+                            matches!(
+                                payload,
+                                EventPayload::MenuAnswered(ref answer)
+                                    if answer.menu == menu_id
                             )
-                        );
+                        }));
                         saw_resolution_event = true;
                     }
                 }
@@ -6576,7 +6571,8 @@ async fn committed_menu_event_wakes_registered_harness_exactly_once() {
                 prompt: PromptRender::Omit,
             },
             payload: serde_json::to_value(EventPayload::RunState(RunState::Queued))
-                .expect("queued payload"),
+                .expect("queued payload")
+                .into(),
         },
         EventEnvelope {
             schema_version: SCHEMA_VERSION,
@@ -6602,7 +6598,8 @@ async fn committed_menu_event_wakes_registered_harness_exactly_once() {
                 attachments: Vec::new(),
                 mode: haider_protocol::DeliveryMode::Queue,
             })
-            .expect("user payload"),
+            .expect("user payload")
+            .into(),
         },
     ];
     hub.append(&mut accepted_prefix)
@@ -6647,7 +6644,9 @@ async fn committed_menu_event_wakes_registered_harness_exactly_once() {
     let request_seq = history
         .iter()
         .find_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            envelope
+                .payload
+                .decode_event()
                 .ok()
                 .and_then(|payload| match payload {
                     EventPayload::MenuOpened(opened) if opened.id == menu => Some(envelope.seq),
@@ -6712,14 +6711,18 @@ async fn committed_menu_event_wakes_registered_harness_exactly_once() {
         history
             .iter()
             .filter(|envelope| {
-                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                envelope
+                    .payload
+                    .decode_event()
                     .is_ok_and(|payload| matches!(payload, EventPayload::MenuAnswered(_)))
             })
             .count(),
         1
     );
     assert!(history.iter().any(|envelope| {
-        serde_json::from_value::<EventPayload>(envelope.payload.clone())
+        envelope
+            .payload
+            .decode_event()
             .is_ok_and(|payload| matches!(payload, EventPayload::ToolResult { .. }))
     }));
 
@@ -7068,7 +7071,7 @@ async fn attachment_after_menu_opened_learns_pending_menu_from_replay() {
     assert!(matches!(
         sink.next().await,
         WireFrame::Event { envelope, .. }
-            if serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+            if envelope.payload.decode_event().is_ok_and(
                 |payload| matches!(payload, EventPayload::MenuOpened(menu) if menu.id == menu_id)
             )
     ));
@@ -7509,7 +7512,7 @@ async fn catch_up_byte_budget_trips_long_before_the_frame_count_and_resumes_from
 
     for name in ["giant-1", "giant-2"] {
         let mut event = vec![envelope(&session_id, name, generation)];
-        event[0].payload = serde_json::json!({
+        *event[0].payload = serde_json::json!({
             "type": "future_test_event",
             "blob": "x".repeat(3_000),
         });
@@ -7638,7 +7641,7 @@ async fn commit_pressure_behind_a_stalled_outbox_laggs_and_detaches() {
             format!("pressure-{index}"),
             generation,
         )];
-        event[0].payload = serde_json::json!({
+        *event[0].payload = serde_json::json!({
             "type": "future_test_event",
             "blob": "x".repeat(400),
         });
@@ -7952,7 +7955,7 @@ async fn undelivered_attach_response_is_answered_with_a_correlated_error_not_lag
     // One oversized commit trips the hard catch-up byte bound while the
     // replay is parked on its admission ticket: lag-under-stall detaches.
     let mut event = vec![envelope(&session_id, "pressure", generation)];
-    event[0].payload = serde_json::json!({
+    *event[0].payload = serde_json::json!({
         "type": "future_test_event",
         "blob": "x".repeat(700),
     });
@@ -8045,7 +8048,7 @@ async fn graceful_drain_store_resumes_a_pending_lag_suffix() {
     // Oversized commit while the replay is gated: trips the hard byte bound,
     // sets REAL lag, and is never buffered.
     let mut oversized = vec![envelope(&session_id, "oversized", generation)];
-    oversized[0].payload = serde_json::json!({
+    *oversized[0].payload = serde_json::json!({
         "type": "future_test_event",
         "blob": "x".repeat(700),
     });
@@ -8142,7 +8145,7 @@ async fn final_suffix_store_read_failure_forces_the_shutdown_outcome() {
         HubObservation::BeforeEvent { seq: 2, .. }
     ));
     let mut oversized = vec![envelope(&session_id, "oversized", generation)];
-    oversized[0].payload = serde_json::json!({
+    *oversized[0].payload = serde_json::json!({
         "type": "future_test_event",
         "blob": "x".repeat(2_000),
     });
@@ -8232,7 +8235,7 @@ async fn oversized_envelope_takes_the_store_resume_path_exactly_once() {
     ));
 
     let mut giant = vec![envelope(&session_id, "giant", generation)];
-    giant[0].payload = serde_json::json!({
+    *giant[0].payload = serde_json::json!({
         "type": "future_test_event",
         "blob": "x".repeat(3_000),
     });
@@ -8548,7 +8551,7 @@ async fn combined_pressure_five_lanes_large_envelopes_and_live_commits_lag_no_re
                 format!("{session_id}-big-{seq}"),
                 generation,
             )];
-            event[0].payload = serde_json::json!({
+            *event[0].payload = serde_json::json!({
                 "type": "future_test_event",
                 "blob": "x".repeat(8 * 1024),
             });
@@ -8599,7 +8602,7 @@ async fn combined_pressure_five_lanes_large_envelopes_and_live_commits_lag_no_re
                         format!("{session_id}-live-{round}"),
                         generation,
                     )];
-                    event[0].payload = serde_json::json!({
+                    *event[0].payload = serde_json::json!({
                         "type": "future_test_event",
                         "blob": "y".repeat(8 * 1024),
                     });
@@ -8937,7 +8940,7 @@ async fn native_pipe_carries_only_sealed_reasoning_on_the_assistant_row() {
         EventPayload::Item(ItemEvent::Started {
             item_id: item_id.clone(),
             item: TurnItem::Reasoning {
-                summary: String::new(),
+                summary: String::new().into(),
             },
         }),
     );
@@ -9770,7 +9773,7 @@ async fn native_pipe_v3_header_rebuilds_to_current_with_generation_bump() {
         EventPayload::Item(ItemEvent::Started {
             item_id: reasoning_id.clone(),
             item: TurnItem::Reasoning {
-                summary: String::new(),
+                summary: String::new().into(),
             },
         }),
     );
@@ -9987,7 +9990,7 @@ async fn session_seen_rpc_and_activity_scalars_converge_on_the_roster() {
 
     // A committed assistant item IS meaningful activity.
     let mut item = envelope(&session, "attention-item-1", generation);
-    item.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+    *item.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
         item_id: ItemId::new("attention-item-1"),
         item: TurnItem::AgentMessage {
             text: "hello".into(),
@@ -10060,7 +10063,7 @@ async fn session_seen_rpc_and_activity_scalars_converge_on_the_roster() {
     );
     let usage = footprint_envelope(&session, "attention-usage", generation, 1_000);
     let mut bookkeeping = envelope(&session, "attention-bookkeeping", generation);
-    bookkeeping.payload = serde_json::json!({"type": "graph_telemetry_probe"});
+    *bookkeeping.payload = serde_json::json!({"type": "graph_telemetry_probe"});
     hub.append(&mut [bookkeeping])
         .await
         .expect("bookkeeping commits");
@@ -10074,7 +10077,7 @@ async fn session_seen_rpc_and_activity_scalars_converge_on_the_roster() {
 
     // New assistant activity AFTER seen: the unseen predicate flips back.
     let mut item = envelope(&session, "attention-item-2", generation);
-    item.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+    *item.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
         item_id: ItemId::new("attention-item-2"),
         item: TurnItem::AgentMessage {
             text: "again".into(),
@@ -10128,7 +10131,7 @@ async fn waiting_why_types_parked_states_with_menu_identity() {
         let menu_id = MenuId::new(menu_id);
         let mut opened = envelope(session, format!("{menu_id}-opened"), generation);
         opened.run_id = Some(RunId::new(format!("{menu_id}-run")));
-        opened.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
+        *opened.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
             id: menu_id.clone(),
             kind,
             title: "Attention park".into(),
@@ -10148,7 +10151,7 @@ async fn waiting_why_types_parked_states_with_menu_identity() {
         .expect("menu serializes");
         let mut parked = envelope(session, format!("{menu_id}-state"), generation);
         parked.run_id = Some(RunId::new(format!("{menu_id}-run")));
-        parked.payload =
+        *parked.payload =
             serde_json::to_value(EventPayload::RunState(state(menu_id))).expect("state");
         vec![opened, parked]
     };
@@ -10348,7 +10351,7 @@ async fn every_input_kind_is_answerable_headlessly_over_rpc() {
         let menu_id = MenuId::new(menu_id);
         let mut opened = envelope(&session, format!("parity-{seq_hint}-opened"), generation);
         opened.run_id = Some(RunId::new(format!("parity-{seq_hint}-run")));
-        opened.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
+        *opened.payload = serde_json::to_value(EventPayload::MenuOpened(Menu {
             id: menu_id.clone(),
             kind,
             title: format!("parity {seq_hint}"),

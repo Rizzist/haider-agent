@@ -378,7 +378,7 @@ impl SessionState {
                     }
                 }
                 if matches!(note, crate::branch::AdmittedNote::Content) {
-                    match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+                    match envelope.payload.decode_event() {
                         Ok(payload) => {
                             // Hidden direct-shell provenance annotates its
                             // linked visible command without painting a row.
@@ -819,7 +819,8 @@ pub fn route_workflow_graph_event(envelope: &RawEnvelope) -> bool {
 /// non-permission payload so the caller keeps trying decoders / counts unknown.
 pub fn route_permission_event(projection: &mut SessionProjection, envelope: &RawEnvelope) -> bool {
     use haider_protocol::permission::PermissionEventPayload;
-    let Ok(payload) = PermissionEventPayload::from_payload_value(envelope.payload.clone()) else {
+    let Ok(payload) = PermissionEventPayload::from_payload_value(envelope.payload.to_json_value())
+    else {
         return false;
     };
     match payload {

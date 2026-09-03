@@ -146,7 +146,8 @@ async fn terminalize_tool_run(
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
-            .expect("done payload"),
+            .expect("done payload")
+            .into(),
     }];
     hub.append(&mut terminal)
         .await
@@ -464,21 +465,19 @@ async fn background_dispatch_is_immediate_and_kill_is_brokered_end_to_end() {
     let envelopes = read_all(&store, &session_id).await;
     let kill_intent = envelopes
         .iter()
-        .find_map(|envelope| {
-            match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
-                Ok(EventPayload::Effect(EffectPhase::Intent(intent)))
-                    if intent.summary.starts_with("kill background task") =>
-                {
-                    Some(intent)
-                }
-                _ => None,
+        .find_map(|envelope| match envelope.payload.decode_event() {
+            Ok(EventPayload::Effect(EffectPhase::Intent(intent)))
+                if intent.summary.starts_with("kill background task") =>
+            {
+                Some(intent)
             }
+            _ => None,
         })
         .expect("kill effect intent journals");
     assert!(
         envelopes.iter().any(|envelope| {
             matches!(
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                envelope.payload.decode_event(),
                 Ok(EventPayload::Effect(EffectPhase::Outcome {
                     effect,
                     outcome: EffectOutcome::Ok,
@@ -537,7 +536,9 @@ async fn foreground_process_exec_is_unchanged_and_journals_no_task_facts() {
     let signals = envelopes
         .iter()
         .filter_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            envelope
+                .payload
+                .decode_event()
                 .ok()
                 .and_then(|payload| match payload {
                     EventPayload::ProcessSignalRecorded(signal) => Some(signal),
@@ -925,7 +926,7 @@ async fn active_run_completion_steers_mid_turn_with_exactly_one_durable_nudge() 
         .iter()
         .filter(|envelope| {
             matches!(
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                envelope.payload.decode_event(),
                 Ok(EventPayload::UserMessage { text, mode: DeliveryMode::Steer, .. })
                     if text.contains("[background task finished] steered")
             )
@@ -939,7 +940,7 @@ async fn active_run_completion_steers_mid_turn_with_exactly_one_durable_nudge() 
             let done = envelopes.iter().any(|envelope| {
                 envelope.run_id.as_ref() == Some(&live_run)
                     && matches!(
-                        serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                        envelope.payload.decode_event(),
                         Ok(EventPayload::RunState(RunState::Done))
                     )
             });

@@ -16,6 +16,7 @@ use crate::frame::BorrowedEventFrame;
 use crate::{AttachmentId, CodecError, RequestId, WIRE_PROTOCOL_VERSION, WireEncoding, WireFrame};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::ids::SessionId;
+use haider_protocol::reply::ReplyText;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -26,6 +27,35 @@ const PREFIX_LEN: usize = 4;
 pub struct ZeroizingEncodedFrame {
     prefix: [u8; PREFIX_LEN],
     body: Zeroizing<Vec<u8>>,
+}
+
+/// One EVENT frame whose large reply scalar remains a shared arena range.
+/// Only the small serializer-produced bookends are owned by the socket lane.
+pub struct ZeroizingEncodedEventFrame {
+    prefix: [u8; PREFIX_LEN],
+    body: EncodedEventBody,
+}
+
+enum EncodedEventBody {
+    Contiguous(Zeroizing<Vec<u8>>),
+    Reply {
+        head: Zeroizing<Vec<u8>>,
+        text: ReplyText,
+        tail: Zeroizing<Vec<u8>>,
+        encoding: WireEncoding,
+        encoded_text_len: usize,
+    },
+}
+
+/// Borrowed body pieces used by the daemon's bounded async writer.
+pub enum EncodedEventBodyRef<'a> {
+    Contiguous(&'a [u8]),
+    Reply {
+        head: &'a [u8],
+        text: &'a ReplyText,
+        tail: &'a [u8],
+        encoding: WireEncoding,
+    },
 }
 
 /// One `artifact.put` request encoded as small owned JSON/MessagePack
@@ -290,6 +320,68 @@ impl ZeroizingEncodedFrame {
     }
 }
 
+impl ZeroizingEncodedEventFrame {
+    pub fn framed_len(&self) -> usize {
+        PREFIX_LEN.saturating_add(self.body_len())
+    }
+
+    pub fn prefix(&self) -> &[u8; PREFIX_LEN] {
+        &self.prefix
+    }
+
+    pub fn body_parts(&self) -> EncodedEventBodyRef<'_> {
+        match &self.body {
+            EncodedEventBody::Contiguous(body) => EncodedEventBodyRef::Contiguous(body.as_slice()),
+            EncodedEventBody::Reply {
+                head,
+                text,
+                tail,
+                encoding,
+                ..
+            } => EncodedEventBodyRef::Reply {
+                head: head.as_slice(),
+                text,
+                tail: tail.as_slice(),
+                encoding: *encoding,
+            },
+        }
+    }
+
+    fn body_len(&self) -> usize {
+        match &self.body {
+            EncodedEventBody::Contiguous(body) => body.len(),
+            EncodedEventBody::Reply {
+                head,
+                tail,
+                encoded_text_len,
+                ..
+            } => head
+                .len()
+                .saturating_add(*encoded_text_len)
+                .saturating_add(tail.len()),
+        }
+    }
+
+    /// Compatibility/test sink that reconstructs the exact framed bytes
+    /// without changing the representation retained by the socket lane.
+    pub fn write_to(&self, writer: &mut impl Write) -> std::io::Result<()> {
+        writer.write_all(&self.prefix)?;
+        match self.body_parts() {
+            EncodedEventBodyRef::Contiguous(body) => writer.write_all(body),
+            EncodedEventBodyRef::Reply {
+                head,
+                text,
+                tail,
+                encoding,
+            } => {
+                writer.write_all(head)?;
+                write_reply_scalar(writer, text, encoding)?;
+                writer.write_all(tail)
+            }
+        }
+    }
+}
+
 /// Serializes one UDS frame: a four-byte big-endian prefix holding the exact
 /// JSON body length, followed by the body bytes. This legacy entry point is
 /// also used for the always-JSON handshake.
@@ -386,16 +478,186 @@ pub fn encode_event_zeroizing_parts_with(
     envelope: &RawEnvelope,
     frame_limit: usize,
     encoding: WireEncoding,
-) -> Result<ZeroizingEncodedFrame, CodecError> {
-    encode_zeroizing_parts_value(
-        &BorrowedEventFrame {
-            attachment_id,
-            session_id,
-            envelope,
+) -> Result<ZeroizingEncodedEventFrame, CodecError> {
+    let Some(text) = envelope.payload.reply_text() else {
+        let encoded = encode_zeroizing_parts_value(
+            &BorrowedEventFrame {
+                attachment_id,
+                session_id,
+                envelope,
+            },
+            frame_limit,
+            encoding,
+        )?;
+        return Ok(ZeroizingEncodedEventFrame {
+            prefix: encoded.prefix,
+            body: EncodedEventBody::Contiguous(encoded.body),
+        });
+    };
+
+    let (encoded, token) = (0_u32..1_024)
+        .find_map(|nonce| {
+            let marker = format!("__haider_rpc_reply_arena_{nonce:08x}_sentinel__");
+            let payload = envelope.payload.with_reply_placeholder(&marker)?;
+            let template = envelope.clone().map_payload(|_| payload);
+            let encoded = encode_body_value(
+                &BorrowedEventFrame {
+                    attachment_id,
+                    session_id,
+                    envelope: &template,
+                },
+                frame_limit,
+                encoding,
+            )
+            .ok()?;
+            let token = match encoding {
+                WireEncoding::Json => serde_json::to_vec(&marker).ok()?,
+                WireEncoding::MessagePack => rmp_serde::to_vec_named(&marker).ok()?,
+            };
+            (subslice_count(&encoded, &token) == 1).then_some((encoded, token))
+        })
+        .ok_or(CodecError::AllocationFailed { requested: 0 })?;
+    let offset = unique_subslice_offset(&encoded, &token).ok_or(CodecError::AllocationFailed {
+        requested: encoded.len(),
+    })?;
+    let encoded_text_len = reply_scalar_len(text, encoding)?;
+    let body_len = offset
+        .checked_add(encoded_text_len)
+        .and_then(|len| len.checked_add(encoded.len().saturating_sub(offset + token.len())))
+        .ok_or(CodecError::LengthPrefixOverflow {
+            body_len: usize::MAX,
+        })?;
+    if body_len > frame_limit {
+        return Err(CodecError::FrameLimitExceeded {
+            frame_limit,
+            announced_len: Some(body_len),
+        });
+    }
+    let body_len_u32 =
+        u32::try_from(body_len).map_err(|_| CodecError::LengthPrefixOverflow { body_len })?;
+    let mut head = encoded;
+    let tail = head.split_off(offset + token.len());
+    head.truncate(offset);
+    Ok(ZeroizingEncodedEventFrame {
+        prefix: body_len_u32.to_be_bytes(),
+        body: EncodedEventBody::Reply {
+            head: Zeroizing::new(head),
+            text: text.clone(),
+            tail: Zeroizing::new(tail),
+            encoding,
+            encoded_text_len,
         },
-        frame_limit,
-        encoding,
-    )
+    })
+}
+
+fn subslice_count(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+fn unique_subslice_offset(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    let mut offsets = haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == needle).then_some(offset));
+    let first = offsets.next()?;
+    offsets.next().is_none().then_some(first)
+}
+
+fn reply_scalar_len(text: &ReplyText, encoding: WireEncoding) -> Result<usize, CodecError> {
+    match encoding {
+        WireEncoding::Json => {
+            let mut length = 2_usize;
+            let mut error = None;
+            text.visit_strs(|segment| {
+                if error.is_some() {
+                    return;
+                }
+                let mut counter = CountingWriter {
+                    len: 0,
+                    frame_limit: usize::MAX,
+                    exceeded: false,
+                };
+                match serde_json::to_writer(&mut counter, segment) {
+                    Ok(()) => {
+                        length = length.saturating_add(counter.len.saturating_sub(2));
+                    }
+                    Err(cause) => error = Some(CodecError::Json(cause)),
+                }
+            });
+            error.map_or(Ok(length), Err)
+        }
+        WireEncoding::MessagePack => Ok(messagepack_string_header_len(text.len())
+            .checked_add(text.len())
+            .ok_or(CodecError::LengthPrefixOverflow {
+                body_len: usize::MAX,
+            })?),
+    }
+}
+
+fn messagepack_string_header_len(len: usize) -> usize {
+    if len < 32 {
+        1
+    } else if len <= u8::MAX as usize {
+        2
+    } else if len <= u16::MAX as usize {
+        3
+    } else {
+        5
+    }
+}
+
+fn write_reply_scalar(
+    writer: &mut impl Write,
+    text: &ReplyText,
+    encoding: WireEncoding,
+) -> std::io::Result<()> {
+    match encoding {
+        WireEncoding::Json => {
+            writer.write_all(b"\"")?;
+            let mut result = Ok(());
+            text.visit_strs(|segment| {
+                let mut start = 0;
+                while result.is_ok() && start < segment.len() {
+                    let mut end = start.saturating_add(16 * 1_024).min(segment.len());
+                    while end > start && !segment.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    match serde_json::to_vec(&segment[start..end]) {
+                        Ok(encoded) => {
+                            result = writer.write_all(&encoded[1..encoded.len() - 1]);
+                        }
+                        Err(error) => result = Err(std::io::Error::other(error)),
+                    }
+                    start = end;
+                }
+            });
+            result?;
+            writer.write_all(b"\"")
+        }
+        WireEncoding::MessagePack => {
+            let len = text.len();
+            if len < 32 {
+                writer.write_all(&[0xa0 | u8::try_from(len).expect("fixstr length")])?;
+            } else if let Ok(len) = u8::try_from(len) {
+                writer.write_all(&[0xd9, len])?;
+            } else if let Ok(len) = u16::try_from(len) {
+                writer.write_all(&[0xda])?;
+                writer.write_all(&len.to_be_bytes())?;
+            } else {
+                let len = u32::try_from(len)
+                    .map_err(|_| std::io::Error::other("MessagePack reply exceeds str32"))?;
+                writer.write_all(&[0xdb])?;
+                writer.write_all(&len.to_be_bytes())?;
+            }
+            text.write_to(writer)
+        }
+    }
 }
 
 fn encode_zeroizing_parts_value<T: Serialize + ?Sized>(

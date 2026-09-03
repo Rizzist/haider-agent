@@ -991,7 +991,7 @@ async fn published_sms_wakes_a_normal_durable_turn_through_default_sink() {
                 .await
                 .expect("read monitor wake journal");
             if events.into_iter().any(|event| {
-                serde_json::from_value::<EventPayload>(event.payload).is_ok_and(|payload| {
+                event.payload.decode_event().is_ok_and(|payload| {
                     matches!(
                         payload,
                         EventPayload::UserMessage { text, .. }
@@ -1034,9 +1034,7 @@ async fn named_branch_waiting_run_is_woken_as_a_subturn() {
     let (fork_node_id, fork_seq) = source_events
         .iter()
         .find_map(|event| {
-            let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
-            else {
+            let EventPayload::NodeCommitted(node) = event.payload.decode_event().ok()? else {
                 return None;
             };
             (event.run_id.as_ref() == Some(&world.run)).then_some((node.node, event.seq))
@@ -1139,7 +1137,7 @@ async fn named_branch_waiting_run_is_woken_as_a_subturn() {
         .expect("read named wake");
     assert!(events.into_iter().any(|event| {
         event.run_id.as_ref() == Some(&branch_run)
-            && serde_json::from_value::<EventPayload>(event.payload).is_ok_and(|payload| {
+            && event.payload.decode_event().is_ok_and(|payload| {
                 matches!(
                     payload,
                     EventPayload::UserMessage { text, mode, .. }

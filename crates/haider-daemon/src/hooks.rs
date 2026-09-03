@@ -29,7 +29,9 @@ use haider_core::{
     HookTrustChange, HookTrustCommand, MenuResolutionCommand, MenuResolutionOutcome, StoreHandle,
 };
 use haider_protocol::effect::{AuthorizationVerdict, EffectIntent, EffectPhase};
-use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION};
+use haider_protocol::envelope::{
+    PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, write_envelope_json,
+};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::headless::HeadlessRunEventPayload;
 use haider_protocol::hook::{
@@ -653,7 +655,7 @@ impl HookService {
                     durable: true,
                     prompt: PromptRender::Omit,
                 },
-                payload: payload.clone(),
+                payload: payload.clone().into(),
             }];
             if let Err(error) = self.inner.hub.append(&mut envelope).await
                 && error.code != ErrorCode::InvalidArgument
@@ -786,7 +788,7 @@ impl HookService {
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload,
+            payload: payload.into(),
         }];
         if let Err(error) = self.inner.hub.append(&mut envelope).await {
             tracing::warn!(target: "haider.hooks", ?error, "hook fact append failed");
@@ -835,7 +837,7 @@ impl HookService {
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload,
+            payload: payload.into(),
         }];
         if let Err(error) = self.inner.hub.append(&mut envelope).await {
             tracing::warn!(target: "haider.hooks", ?error, "lockdown refusal append failed");
@@ -1560,13 +1562,26 @@ fn advance_durable_cursor(state: &mut EngineState, envelope: &RawEnvelope) {
 }
 
 fn hook_envelope_digest(envelope: &RawEnvelope) -> String {
-    serde_json::to_vec(envelope)
-        .map_or_else(
-            |_| blake3::hash(b"haider-hook-snapshot-envelope-encode-error"),
-            |bytes| blake3::hash(&bytes),
-        )
-        .to_hex()
-        .to_string()
+    struct DigestWriter(blake3::Hasher);
+
+    impl Write for DigestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = DigestWriter(blake3::Hasher::new());
+    if write_envelope_json(&mut writer, envelope).is_err() {
+        return blake3::hash(b"haider-hook-snapshot-envelope-encode-error")
+            .to_hex()
+            .to_string();
+    }
+    writer.0.finalize().to_hex().to_string()
 }
 
 fn hook_boundary_event_id_digest(event_id: &EventId) -> String {
@@ -3277,9 +3292,15 @@ async fn prepare_hook_input(
     store: &haider_core::SqliteStoreHandle,
     envelope: &RawEnvelope,
 ) -> Result<Vec<u8>, String> {
-    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
-        return serde_json::to_vec(envelope)
-            .map_err(|error| format!("hook event JSON serialization failed: {error}"));
+    fn encode(envelope: &RawEnvelope) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        write_envelope_json(&mut bytes, envelope)
+            .map_err(|error| format!("hook event JSON serialization failed: {error}"))?;
+        Ok(bytes)
+    }
+
+    let Ok(payload) = envelope.payload.decode_event() else {
+        return encode(envelope);
     };
     let EventPayload::UserMessage {
         text,
@@ -3287,8 +3308,7 @@ async fn prepare_hook_input(
         mode,
     } = payload
     else {
-        return serde_json::to_vec(envelope)
-            .map_err(|error| format!("hook event JSON serialization failed: {error}"));
+        return encode(envelope);
     };
     let run = envelope.run_id.clone().ok_or_else(|| {
         "user_message hook input was skipped: committed fact has no run id".to_owned()

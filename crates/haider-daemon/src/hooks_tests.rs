@@ -407,7 +407,7 @@ fn raw_event(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("payload"),
+        payload: serde_json::to_value(payload).expect("payload").into(),
     }
 }
 
@@ -437,7 +437,7 @@ fn raw_hook_event(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: payload.to_payload_value().expect("hook payload"),
+        payload: payload.to_payload_value().expect("hook payload").into(),
     }
 }
 
@@ -1251,7 +1251,7 @@ async fn untrusted_hook_never_executes_and_notices_honestly() {
     let events = wait_for_with_timeout(&fixture, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT, |events| {
         events.iter().any(|event| {
             matches!(
-                HookEventPayload::from_payload_value(event.payload.clone()),
+                HookEventPayload::from_payload_value(event.payload.clone().into()),
                 Ok(HookEventPayload::HookNotice(ref notice))
                     if notice.reason == "hook is untrusted and was not executed"
             )
@@ -1261,7 +1261,7 @@ async fn untrusted_hook_never_executes_and_notices_honestly() {
     assert!(!marker.exists());
     assert!(events.iter().any(|event| {
         matches!(
-            HookEventPayload::from_payload_value(event.payload.clone()),
+            HookEventPayload::from_payload_value(event.payload.clone().into()),
             Ok(HookEventPayload::HookNotice(ref notice))
                 if notice.hook.as_deref() == Some("test_hook")
         )
@@ -1287,7 +1287,7 @@ async fn untrusted_notice_dedup_is_digest_sensitive() {
         wait_for_with_timeout(&fixture, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT, |events| {
             events.iter().any(|event| {
                 matches!(
-                    HookEventPayload::from_payload_value(event.payload.clone()),
+                    HookEventPayload::from_payload_value(event.payload.clone().into()),
                     Ok(HookEventPayload::HookNotice(_))
                 )
             })
@@ -1295,7 +1295,7 @@ async fn untrusted_notice_dedup_is_digest_sensitive() {
         .await;
     let first_digest = first_events
         .iter()
-        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone().into()).ok())
         .find_map(|payload| match payload {
             HookEventPayload::HookNotice(notice) => notice.digest,
             _ => None,
@@ -1321,7 +1321,9 @@ async fn untrusted_notice_dedup_is_digest_sensitive() {
     let events = wait_for_with_timeout(&fixture, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT, |events| {
         events
             .iter()
-            .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+            .filter_map(|event| {
+                HookEventPayload::from_payload_value(event.payload.clone().into()).ok()
+            })
             .filter(|payload| matches!(payload, HookEventPayload::HookNotice(_)))
             .count()
             >= 2
@@ -1329,7 +1331,7 @@ async fn untrusted_notice_dedup_is_digest_sensitive() {
     .await;
     let digests = events
         .iter()
-        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone().into()).ok())
         .filter_map(|payload| match payload {
             HookEventPayload::HookNotice(notice) => notice.digest,
             _ => None,
@@ -1405,7 +1407,7 @@ async fn hook_trust_revision_and_journal_fact_are_receipted_once() {
         .await
         .into_iter()
         .filter_map(|event| {
-            HookEventPayload::from_payload_value(event.payload.clone())
+            HookEventPayload::from_payload_value(event.payload.clone().into())
                 .ok()
                 .map(|payload| (event, payload))
         })
@@ -1437,7 +1439,7 @@ async fn hook_trust_revision_and_journal_fact_are_receipted_once() {
         .iter()
         .filter(|event| {
             matches!(
-                HookEventPayload::from_payload_value(event.payload.clone()),
+                HookEventPayload::from_payload_value(event.payload.clone().into()),
                 Ok(HookEventPayload::HookTrustChanged { revision: 1, .. })
             )
         })
@@ -1671,7 +1673,7 @@ async fn committed_user_message_hook_projection_is_surface_neutral() {
         exec_hook_observation_timeout(Duration::from_millis(USER_MESSAGE_CAPTURE_TIMEOUT_MS), 1),
         |events| {
             events.iter().any(|event| {
-                HookEventPayload::from_payload_value(event.payload.clone())
+                HookEventPayload::from_payload_value(event.payload.clone().into())
                     .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
             })
         },
@@ -1681,7 +1683,7 @@ async fn committed_user_message_hook_projection_is_surface_neutral() {
         headless_events
             .iter()
             .filter(|event| {
-                HookEventPayload::from_payload_value(event.payload.clone())
+                HookEventPayload::from_payload_value(event.payload.clone().into())
                     .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
             })
             .count(),
@@ -1702,7 +1704,7 @@ async fn committed_user_message_hook_projection_is_surface_neutral() {
         exec_hook_observation_timeout(Duration::from_millis(USER_MESSAGE_CAPTURE_TIMEOUT_MS), 1),
         |events| {
             events.iter().any(|event| {
-                HookEventPayload::from_payload_value(event.payload.clone())
+                HookEventPayload::from_payload_value(event.payload.clone().into())
                     .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
             })
         },
@@ -1712,7 +1714,7 @@ async fn committed_user_message_hook_projection_is_surface_neutral() {
         rpc_events
             .iter()
             .filter(|event| {
-                HookEventPayload::from_payload_value(event.payload.clone())
+                HookEventPayload::from_payload_value(event.payload.clone().into())
                     .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
             })
             .count(),
@@ -1724,7 +1726,7 @@ async fn committed_user_message_hook_projection_is_surface_neutral() {
         let fired = events
             .iter()
             .find_map(|event| {
-                match HookEventPayload::from_payload_value(event.payload.clone()).ok()? {
+                match HookEventPayload::from_payload_value(event.payload.clone().into()).ok()? {
                     HookEventPayload::HookFired(fired) => Some(fired),
                     _ => None,
                 }
@@ -2000,7 +2002,7 @@ async fn decision_hook_allow_uses_existing_menu_cas_and_allow_once_only() {
         |events| {
             events.iter().any(|event| {
                 matches!(
-                    serde_json::from_value::<EventPayload>(event.payload.clone()),
+                    event.payload.decode_event(),
                     Ok(EventPayload::MenuAnswered(_))
                 )
             })
@@ -2009,11 +2011,9 @@ async fn decision_hook_allow_uses_existing_menu_cas_and_allow_once_only() {
     .await;
     let answer = events
         .iter()
-        .find_map(|event| {
-            match serde_json::from_value::<EventPayload>(event.payload.clone()).ok()? {
-                EventPayload::MenuAnswered(answer) => Some(answer),
-                _ => None,
-            }
+        .find_map(|event| match event.payload.decode_event().ok()? {
+            EventPayload::MenuAnswered(answer) => Some(answer),
+            _ => None,
         })
         .expect("hook menu answer");
     assert_eq!(answer.option_key.as_deref(), Some("approve_once"));
@@ -2037,13 +2037,13 @@ async fn decision_deny_is_reject_once_and_malformed_output_falls_through() {
         |events| {
             for event in events {
                 if matches!(
-                    serde_json::from_value::<EventPayload>(event.payload.clone()),
+                    event.payload.decode_event(),
                     Ok(EventPayload::MenuAnswered(ref answer)) if answer.menu == menu_id
                 ) {
                     return true;
                 }
                 if matches!(
-                    HookEventPayload::from_payload_value(event.payload.clone()),
+                    HookEventPayload::from_payload_value(event.payload.clone().into()),
                     Ok(HookEventPayload::HookFired(ref fired))
                         if fired.kind == HookRuntimeKind::Decision
                             && fired.menu_id.as_ref() == Some(&menu_id)
@@ -2061,7 +2061,7 @@ async fn decision_deny_is_reject_once_and_malformed_output_falls_through() {
     let answer = events
         .iter()
         .find_map(
-            |event| match serde_json::from_value(event.payload.clone()).ok()? {
+            |event| match serde_json::from_value(event.payload.clone().into()).ok()? {
                 EventPayload::MenuAnswered(answer) => Some(answer),
                 _ => None,
             },
@@ -2082,7 +2082,7 @@ async fn decision_deny_is_reject_once_and_malformed_output_falls_through() {
         |events| {
             events.iter().any(|event| {
                 matches!(
-                    HookEventPayload::from_payload_value(event.payload.clone()),
+                    HookEventPayload::from_payload_value(event.payload.clone().into()),
                     Ok(HookEventPayload::HookFired(_))
                 )
             })
@@ -2091,7 +2091,7 @@ async fn decision_deny_is_reject_once_and_malformed_output_falls_through() {
     .await;
     assert!(!events.iter().any(|event| {
         matches!(
-            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            event.payload.decode_event(),
             Ok(EventPayload::MenuAnswered(_))
         )
     }));
@@ -2117,7 +2117,7 @@ async fn decision_hook_cannot_exceed_committed_ask_scope() {
         exec_hook_observation_timeout(Duration::from_millis(1_000), 1),
         |events| {
             events.iter().any(|event| {
-                HookEventPayload::from_payload_value(event.payload.clone())
+                HookEventPayload::from_payload_value(event.payload.clone().into())
                     .is_ok_and(|payload| matches!(payload, HookEventPayload::HookFired(_)))
             })
         },
@@ -2125,13 +2125,13 @@ async fn decision_hook_cannot_exceed_committed_ask_scope() {
     .await;
     assert!(!events.iter().any(|event| {
         matches!(
-            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            event.payload.decode_event(),
             Ok(EventPayload::MenuAnswered(_))
         )
     }));
     let fired = events
         .iter()
-        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone().into()).ok())
         .find_map(|payload| match payload {
             HookEventPayload::HookFired(fired) => Some(fired),
             _ => None,
@@ -2205,7 +2205,7 @@ async fn decision_timeout_falls_through_to_byte_identical_ask() {
         exec_hook_observation_timeout(Duration::from_millis(20), 1),
         |events| {
             events.iter().any(|event| {
-                HookEventPayload::from_payload_value(event.payload.clone()).is_ok_and(|payload| {
+                HookEventPayload::from_payload_value(event.payload.clone().into()).is_ok_and(|payload| {
                     matches!(payload, HookEventPayload::HookFired(ref fired) if fired.timed_out)
                 })
             })
@@ -2214,7 +2214,7 @@ async fn decision_timeout_falls_through_to_byte_identical_ask() {
     .await;
     assert!(!events.iter().any(|event| {
         matches!(
-            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            event.payload.decode_event(),
             Ok(EventPayload::MenuAnswered(_))
         )
     }));
@@ -2222,7 +2222,7 @@ async fn decision_timeout_falls_through_to_byte_identical_ask() {
         .iter()
         .find(|event| {
             matches!(
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                event.payload.decode_event(),
                 Ok(EventPayload::MenuOpened(_))
             )
         })
@@ -2338,7 +2338,7 @@ async fn lockdown_run_binding_suppresses_hooks_until_the_next_run() {
     assert!(!marker.exists());
     assert!(fixture.events().await.iter().any(|event| {
         matches!(
-            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            event.payload.decode_event(),
             Ok(EventPayload::LockdownRefused(refusal))
                 if refusal.provider == "fake" && refusal.tool == "hooks"
         )
@@ -2470,7 +2470,7 @@ async fn keyless_resolution_survives_management_mutation_before_hook_binding() {
     assert!(!marker.exists());
     assert!(fixture.events().await.iter().any(|event| {
         matches!(
-            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            event.payload.decode_event(),
             Ok(EventPayload::LockdownRefused(refusal))
                 if refusal.provider == "fake"
                     && refusal.tool == "hooks"
@@ -2918,7 +2918,7 @@ async fn digest_change_revokes_trust_before_fire() {
     let events = wait_for_with_timeout(&fixture, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT, |events| {
         events.iter().any(|event| {
             matches!(
-                HookEventPayload::from_payload_value(event.payload.clone()),
+                HookEventPayload::from_payload_value(event.payload.clone().into()),
                 Ok(HookEventPayload::HookNotice(ref notice))
                     if notice.reason.contains("untrusted")
             )
@@ -2928,7 +2928,7 @@ async fn digest_change_revokes_trust_before_fire() {
     assert!(!marker.exists());
     assert!(events.iter().any(|event| {
         matches!(
-            HookEventPayload::from_payload_value(event.payload.clone()),
+            HookEventPayload::from_payload_value(event.payload.clone().into()),
             Ok(HookEventPayload::HookNotice(_))
         )
     }));
@@ -3189,7 +3189,7 @@ async fn exec_output_is_bounded_and_overflow_is_in_cas() {
         |events| {
             events.iter().any(|event| {
                 matches!(
-                    HookEventPayload::from_payload_value(event.payload.clone()),
+                    HookEventPayload::from_payload_value(event.payload.clone().into()),
                     Ok(HookEventPayload::HookFired(ref fired))
                         if fired.observed_seq == event.seq.saturating_sub(1)
                 )
@@ -3199,7 +3199,7 @@ async fn exec_output_is_bounded_and_overflow_is_in_cas() {
     .await;
     let fired = events
         .iter()
-        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone().into()).ok())
         .find_map(|payload| match payload {
             HookEventPayload::HookFired(fired) if fired.hook == "test_hook" => Some(fired),
             _ => None,
@@ -3262,7 +3262,7 @@ async fn subscribe_restart_backoff_is_exponential_and_bounded() {
                 .iter()
                 .filter_map(|event| {
                     let HookEventPayload::HookSubscription(subscription) =
-                        HookEventPayload::from_payload_value(event.payload.clone()).ok()?
+                        HookEventPayload::from_payload_value(event.payload.clone().into()).ok()?
                     else {
                         return None;
                     };
@@ -3278,7 +3278,7 @@ async fn subscribe_restart_backoff_is_exponential_and_bounded() {
         .iter()
         .filter_map(|event| {
             let HookEventPayload::HookSubscription(subscription) =
-                HookEventPayload::from_payload_value(event.payload.clone()).ok()?
+                HookEventPayload::from_payload_value(event.payload.clone().into()).ok()?
             else {
                 return None;
             };
@@ -3617,7 +3617,7 @@ async fn fired_count(fixture: &EngineFixture) -> usize {
         .events()
         .await
         .iter()
-        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone().into()).ok())
         .filter(|payload| matches!(payload, HookEventPayload::HookFired(_)))
         .count()
 }
@@ -3627,7 +3627,7 @@ async fn successful_server_fire_count(fixture: &EngineFixture) -> usize {
         .events()
         .await
         .iter()
-        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone().into()).ok())
         .filter(|payload| {
             matches!(
                 payload,
@@ -3664,7 +3664,9 @@ async fn wait_for_server_fires(fixture: &EngineFixture, expected: usize) {
     wait_for_with_timeout(fixture, server_mode_observation_timeout(), |events| {
         events
             .iter()
-            .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+            .filter_map(|event| {
+                HookEventPayload::from_payload_value(event.payload.clone().into()).ok()
+            })
             .filter(|payload| matches!(payload, HookEventPayload::HookFired(_)))
             .count()
             >= expected

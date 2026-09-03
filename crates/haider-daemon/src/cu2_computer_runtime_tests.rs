@@ -336,7 +336,9 @@ fn grant_envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("grant payload serializes"),
+        payload: serde_json::to_value(payload)
+            .expect("grant payload serializes")
+            .into(),
     }
 }
 
@@ -454,7 +456,9 @@ async fn wait_for_run_state(
             let events = store.read(session_id, 0, 4096).await.expect("journal");
             if events.iter().any(|event| {
                 event.run_id.as_ref() == Some(run_id)
-                    && serde_json::from_value::<EventPayload>(event.payload.clone())
+                    && event
+                        .payload
+                        .decode_event()
                         .is_ok_and(|payload| payload == EventPayload::RunState(expected.clone()))
             }) {
                 break events;
@@ -487,18 +491,16 @@ async fn abandon_active_graph_and_wait_for_done(
             let events = store.read(session_id, 0, 4096).await.expect("journal");
             if let Some(opening) = events.into_iter().find(|event| {
                 event.run_id.as_ref() == Some(run_id)
-                    && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
-                        |payload| {
-                            matches!(
-                                payload,
-                                EventPayload::MenuOpened(ref menu)
-                                    if matches!(menu.kind, MenuKind::GraphAbandonConfirm { .. })
-                            )
-                        },
-                    )
+                    && event.payload.decode_event().is_ok_and(|payload| {
+                        matches!(
+                            payload,
+                            EventPayload::MenuOpened(ref menu)
+                                if matches!(menu.kind, MenuKind::GraphAbandonConfirm { .. })
+                        )
+                    })
             }) {
                 let EventPayload::MenuOpened(menu) =
-                    serde_json::from_value(opening.payload).expect("typed graph menu")
+                    serde_json::from_value(opening.payload.into()).expect("typed graph menu")
                 else {
                     unreachable!();
                 };
@@ -625,7 +627,7 @@ async fn explicit_intent_auto_grants_and_tcc_flip_retries_the_parked_action() {
     let mut observe_effect = None;
     let mut observe_authorized = false;
     for event in &events {
-        match PermissionEventPayload::from_payload_value(event.payload.clone()) {
+        match PermissionEventPayload::from_payload_value(event.payload.clone().into()) {
             Ok(PermissionEventPayload::PermissionGrantNeeded(event_payload)) => {
                 needed = Some((event.seq, event_payload));
                 continue;
@@ -636,7 +638,7 @@ async fn explicit_intent_auto_grants_and_tcc_flip_retries_the_parked_action() {
             }
             Err(_) => {}
         }
-        match serde_json::from_value::<EventPayload>(event.payload.clone()) {
+        match event.payload.decode_event() {
             Ok(EventPayload::ToolResult { call_id, result })
                 if call_id == "permission-screenshot" && !result.images.is_empty() =>
             {
@@ -685,7 +687,7 @@ async fn explicit_intent_auto_grants_and_tcc_flip_retries_the_parked_action() {
     assert!(!events.iter().any(|event| {
         event.seq < resolved_seq
             && matches!(
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                event.payload.decode_event(),
                 Ok(EventPayload::Effect(EffectPhase::Dispatched { .. }))
             )
     }));
@@ -777,30 +779,28 @@ async fn autonomous_os_permission_fails_typed_without_a_menu_or_dispatch() {
     assert_eq!(backend.attempts.load(Ordering::Acquire), 0);
     assert_eq!(backend.polls.load(Ordering::Acquire), 0);
     assert!(!events.iter().any(|event| matches!(
-        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        event.payload.decode_event(),
         Ok(EventPayload::RunState(RunState::PermissionRequired { .. }))
     )));
     assert!(!events.iter().any(|event| matches!(
-        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        event.payload.decode_event(),
         Ok(EventPayload::MenuOpened(ref menu))
             if menu.origin == super::COMPUTER_PERMISSION_MENU_ORIGIN
     )));
     assert!(!events.iter().any(|event| matches!(
-        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        event.payload.decode_event(),
         Ok(EventPayload::Effect(EffectPhase::Dispatched { .. }))
     )));
     let result = events
         .iter()
-        .find_map(
-            |event| match serde_json::from_value::<EventPayload>(event.payload.clone()) {
-                Ok(EventPayload::ToolResult { call_id, result })
-                    if call_id == "autonomous-permission-screenshot" =>
-                {
-                    Some(result)
-                }
-                _ => None,
-            },
-        )
+        .find_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::ToolResult { call_id, result })
+                if call_id == "autonomous-permission-screenshot" =>
+            {
+                Some(result)
+            }
+            _ => None,
+        })
         .expect("typed permission result");
     assert_eq!(result.status, ToolResultStatus::Rejected);
     assert!(result.preview.contains("permission_denied"));
@@ -891,34 +891,32 @@ async fn permission_poll_timeout_leaves_the_card_actionable_and_undispatched() {
     .await
     .expect("bounded fake poll finishes");
     assert!(events.iter().any(|event| matches!(
-        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        event.payload.decode_event(),
         Ok(EventPayload::RunState(RunState::PermissionRequired { .. }))
     )));
     assert!(events.iter().any(|event| matches!(
-        PermissionEventPayload::from_payload_value(event.payload.clone()),
+        PermissionEventPayload::from_payload_value(event.payload.clone().into()),
         Ok(PermissionEventPayload::PermissionGrantNeeded(_))
     )));
     assert!(!events.iter().any(|event| matches!(
-        PermissionEventPayload::from_payload_value(event.payload.clone()),
+        PermissionEventPayload::from_payload_value(event.payload.clone().into()),
         Ok(PermissionEventPayload::PermissionGrantResolved(_))
     )));
     assert!(!events.iter().any(|event| matches!(
-        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        event.payload.decode_event(),
         Ok(EventPayload::Effect(EffectPhase::Dispatched { .. }))
     )));
 
     let (request_seq, worker_generation, menu) = events
         .iter()
-        .find_map(
-            |event| match serde_json::from_value::<EventPayload>(event.payload.clone()) {
-                Ok(EventPayload::MenuOpened(menu))
-                    if menu.origin == super::COMPUTER_PERMISSION_MENU_ORIGIN =>
-                {
-                    Some((event.seq, event.worker_generation, menu))
-                }
-                _ => None,
-            },
-        )
+        .find_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::MenuOpened(menu))
+                if menu.origin == super::COMPUTER_PERMISSION_MENU_ORIGIN =>
+            {
+                Some((event.seq, event.worker_generation, menu))
+            }
+            _ => None,
+        })
         .expect("durable retry menu");
     backend.granted.store(true, Ordering::Release);
     hub.resolve_hook_menu(MenuResolutionCommand {
@@ -942,7 +940,7 @@ async fn permission_poll_timeout_leaves_the_card_actionable_and_undispatched() {
     let resumed = wait_for_run_state(&store, &session_id, &run_id, RunState::Done).await;
     assert_eq!(backend.attempts.load(Ordering::Acquire), 1);
     assert!(resumed.iter().any(|event| matches!(
-        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        event.payload.decode_event(),
         Ok(EventPayload::ToolResult { ref call_id, .. }) if call_id == "timeout-screenshot"
     )));
 
@@ -1025,7 +1023,7 @@ async fn screen_recording_flip_parks_then_fresh_daemon_resumes_the_exact_call() 
             let events = store.read(&session_id, 0, 4096).await.expect("journal");
             if events.iter().any(|event| {
                 matches!(
-                    PermissionEventPayload::from_payload_value(event.payload.clone()),
+                    PermissionEventPayload::from_payload_value(event.payload.clone().into()),
                     Ok(PermissionEventPayload::PermissionGrantNeeded(ref needed))
                         if needed.auto_restart_pending
                 )
@@ -1041,7 +1039,7 @@ async fn screen_recording_flip_parks_then_fresh_daemon_resumes_the_exact_call() 
     assert_eq!(first_backend.polls.load(Ordering::Acquire), 1);
     assert_eq!(first_backend.attempts.load(Ordering::Acquire), 0);
     assert!(!before_restart.iter().any(|event| matches!(
-        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        event.payload.decode_event(),
         Ok(EventPayload::Effect(EffectPhase::Dispatched { .. }))
     )));
 
@@ -1112,7 +1110,7 @@ async fn screen_recording_flip_parks_then_fresh_daemon_resumes_the_exact_call() 
     assert_eq!(fresh_backend.polls.load(Ordering::Acquire), 0);
     assert_eq!(fresh_backend.attempts.load(Ordering::Acquire), 1);
     assert!(events.iter().any(|event| matches!(
-        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        event.payload.decode_event(),
         Ok(EventPayload::ToolResult { ref call_id, .. }) if call_id == "restart-screenshot"
     )));
 
@@ -1243,7 +1241,7 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
     let (journal_json, image) = events
         .iter()
         .find_map(|event| {
-            let payload = serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?;
+            let payload = event.payload.decode_event().ok()?;
             match payload {
                 EventPayload::ToolResult { result, .. } if !result.images.is_empty() => {
                     Some((event.payload.to_string(), result.images[0].clone()))
@@ -1321,9 +1319,7 @@ async fn screenshot_reaches_provider_click_journals_control_and_viewport_is_post
     let mut inspect_effect = None;
     let mut phases = Vec::new();
     for event in &events {
-        if let Ok(EventPayload::Effect(phase)) =
-            serde_json::from_value::<EventPayload>(event.payload.clone())
-        {
+        if let Ok(EventPayload::Effect(phase)) = event.payload.decode_event() {
             if let EffectPhase::Intent(intent) = &phase
                 && intent.class == EffectClass::ScreenControl
                 && intent.summary == "computer left_click"
@@ -1465,8 +1461,7 @@ async fn turn_cancel_emergency_stops_backend_and_journals_computer_cancelled() {
     );
     let mut computer_effect = None;
     for event in &events {
-        if let Ok(EventPayload::Effect(EffectPhase::Intent(intent))) =
-            serde_json::from_value::<EventPayload>(event.payload.clone())
+        if let Ok(EventPayload::Effect(EffectPhase::Intent(intent))) = event.payload.decode_event()
             && intent.class == EffectClass::ScreenControl
             && intent.summary == "computer wait"
         {
@@ -1477,9 +1472,7 @@ async fn turn_cancel_emergency_stops_backend_and_journals_computer_cancelled() {
     let effect_phases = events
         .iter()
         .filter_map(|event| {
-            let EventPayload::Effect(phase) =
-                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
-            else {
+            let EventPayload::Effect(phase) = event.payload.decode_event().ok()? else {
                 return None;
             };
             match &phase {
@@ -1514,7 +1507,7 @@ async fn turn_cancel_emergency_stops_backend_and_journals_computer_cancelled() {
         .iter()
         .find_map(|event| {
             matches!(
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                event.payload.decode_event(),
                 Ok(EventPayload::Effect(EffectPhase::Outcome {
                     ref effect,
                     outcome: EffectOutcome::Cancelled,
@@ -1528,7 +1521,7 @@ async fn turn_cancel_emergency_stops_backend_and_journals_computer_cancelled() {
         .iter()
         .find_map(|event| {
             matches!(
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                event.payload.decode_event(),
                 Ok(EventPayload::Item(ItemEvent::Completed {
                     item: TurnItem::ToolCall {
                         ref call_id,

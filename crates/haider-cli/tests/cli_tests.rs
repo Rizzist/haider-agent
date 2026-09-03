@@ -876,7 +876,10 @@ fn run_jsonl_announces_acceptance_before_lf_framed_envelopes() {
             }) => Some(text),
             _ => None,
         });
-    assert_eq!(response.as_deref(), Some("fake response: hello"));
+    assert_eq!(
+        response.map(|text| text.to_owned_string()).as_deref(),
+        Some("fake response: hello")
+    );
 }
 
 #[test]
@@ -3231,7 +3234,7 @@ fn run_jsonl_replays_every_envelope_to_a_slow_pipe_consumer() {
     // dropped — the concatenated delta text and the completed item must
     // both carry all 500 fragments.
     let expected_text: String = (0..500).map(|index| index.to_string()).collect();
-    let delta_text: String = envelopes
+    let delta_text = envelopes
         .iter()
         .filter_map(|envelope| match typed(envelope) {
             Some(EventPayload::Item(ItemEvent::Delta {
@@ -3240,7 +3243,10 @@ fn run_jsonl_replays_every_envelope_to_a_slow_pipe_consumer() {
             })) => Some(text),
             _ => None,
         })
-        .collect();
+        .fold(String::new(), |mut output, text| {
+            text.visit_strs(|segment| output.push_str(segment));
+            output
+        });
     assert!(!delta_text.is_empty(), "streamed deltas must journal");
     assert_eq!(delta_text, expected_text);
     assert!(envelopes.iter().any(|envelope| matches!(
@@ -4114,7 +4120,7 @@ fn typed(envelope: &RawEnvelope) -> Option<EventPayload> {
         "payload frame lacks a string type tag: {}",
         envelope.payload
     );
-    serde_json::from_value(envelope.payload.clone()).ok()
+    serde_json::from_value(envelope.payload.clone().into()).ok()
 }
 
 #[test]

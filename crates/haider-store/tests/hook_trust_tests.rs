@@ -122,7 +122,7 @@ fn run_scoped_trust_is_atomic_with_turn_acceptance_and_omitted_by_default() {
     };
     let trust = envelopes
         .iter()
-        .find_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+        .find_map(|event| HookEventPayload::from_payload_value(event.payload.clone().into()).ok())
         .expect("atomic run trust fact");
     assert_eq!(trust, HookEventPayload::HookRunTrust { enabled: true });
     assert!(
@@ -162,11 +162,9 @@ fn run_scoped_trust_is_atomic_with_turn_acceptance_and_omitted_by_default() {
     let TurnAcceptOutcome::Committed { envelopes, .. } = ordinary else {
         panic!("ordinary acceptance commits");
     };
-    assert!(
-        envelopes
-            .iter()
-            .all(|event| { HookEventPayload::from_payload_value(event.payload.clone()).is_err() })
-    );
+    assert!(envelopes.iter().all(|event| {
+        HookEventPayload::from_payload_value(event.payload.clone().into()).is_err()
+    }));
 }
 
 fn turn_command(

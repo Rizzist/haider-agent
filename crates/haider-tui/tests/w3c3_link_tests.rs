@@ -183,7 +183,7 @@ fn envelope(session: &SessionId, seq: u64) -> RawEnvelope {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::json!({ "type": "noop", "seq": seq }),
+        payload: serde_json::json!({ "type": "noop", "seq": seq }).into(),
     }
 }
 

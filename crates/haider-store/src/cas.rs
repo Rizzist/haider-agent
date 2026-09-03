@@ -266,6 +266,114 @@ impl FileCas {
         self.put_bytes(bytes, haider_platform::SyncPolicy::Plain, true)
     }
 
+    /// Streams one already-addressed member of a provider-view durability
+    /// group. The bytes are re-hashed as they are written, so a segmented
+    /// source cannot publish under a stale or dishonest address.
+    pub(crate) fn put_batched_stream(
+        &self,
+        expected: &ArtifactRef,
+        write_source: impl FnOnce(&mut dyn Write) -> std::io::Result<()>,
+    ) -> StoreResult<ArtifactRef> {
+        struct HashingWriter<'a> {
+            file: &'a mut File,
+            hasher: blake3::Hasher,
+        }
+        impl Write for HashingWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.file.write_all(bytes)?;
+                self.hasher.update(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.file.flush()
+            }
+        }
+
+        let path = self.path_for(expected)?;
+        if self.verify_existing(expected, &path)? {
+            return Ok(expected.clone());
+        }
+        let parent = path.parent().ok_or_else(|| {
+            store_error(
+                ErrorCode::Internal,
+                format!("CAS object has no parent directory: {}", path.display()),
+                false,
+            )
+        })?;
+        fs::create_dir_all(parent).map_err(|error| io_error("create CAS shard", parent, error))?;
+        let (mut temporary_path, mut temporary) = create_temporary(parent)?;
+        let write_result = (|| {
+            let mut writer = HashingWriter {
+                file: &mut temporary,
+                hasher: blake3::Hasher::new(),
+            };
+            write_source(&mut writer).map_err(|error| {
+                io_error("persist temporary CAS object", temporary_path.path(), error)
+            })?;
+            writer.flush().map_err(|error| {
+                io_error("flush temporary CAS object", temporary_path.path(), error)
+            })?;
+            let actual = ArtifactRef::new(format!("blake3:{}", writer.hasher.finalize().to_hex()));
+            drop(writer);
+            if actual != *expected {
+                return Err(store_error(
+                    ErrorCode::InvalidArgument,
+                    "streamed CAS bytes do not match their provider-view content address",
+                    false,
+                ));
+            }
+            sync_file(
+                &temporary,
+                temporary_path.path(),
+                haider_platform::SyncPolicy::Plain,
+            )
+        })();
+        if let Err(error) = write_result {
+            drop(temporary);
+            cleanup_temporary(
+                &mut temporary_path,
+                parent,
+                haider_platform::SyncPolicy::Plain,
+            )?;
+            return Err(error);
+        }
+        drop(temporary);
+
+        match fs::hard_link(temporary_path.path(), &path) {
+            Ok(()) => {
+                cleanup_temporary(
+                    &mut temporary_path,
+                    parent,
+                    haider_platform::SyncPolicy::Plain,
+                )?;
+                Ok(expected.clone())
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                let winner_is_valid = self.verify_existing(expected, &path);
+                cleanup_temporary(
+                    &mut temporary_path,
+                    parent,
+                    haider_platform::SyncPolicy::Plain,
+                )?;
+                if winner_is_valid? {
+                    Ok(expected.clone())
+                } else {
+                    Err(corrupt_object(&path))
+                }
+            }
+            Err(error) => {
+                let publish_error = io_error("publish CAS object", &path, error);
+                cleanup_temporary(
+                    &mut temporary_path,
+                    parent,
+                    haider_platform::SyncPolicy::Plain,
+                )?;
+                Err(publish_error)
+            }
+        }
+    }
+
     /// Closes a durability group with the generic CAS contract's full device
     /// flush. Checkpoint preimages and other [`Cas::put_batch`] callers rely on
     /// persistence at return, not only ordering before a later index write.

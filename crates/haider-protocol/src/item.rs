@@ -10,6 +10,7 @@ use crate::agent::ChildReport;
 use crate::error::ErrorPresentation;
 use crate::history::TodoItem;
 use crate::ids::{AgentId, ArtifactRef, ItemId};
+use crate::reply::ReplyText;
 use serde::{Deserialize, Serialize};
 
 const fn is_false(value: &bool) -> bool {
@@ -75,18 +76,18 @@ impl UserCommandOriginV1 {
 #[serde(tag = "item", rename_all = "snake_case")]
 pub enum TurnItem {
     AgentMessage {
-        text: String,
+        text: ReplyText,
     },
     /// Assistant text whose provider stream ended after content committed.
     /// This variant is deliberately not replayed as completed assistant
     /// history; an explicit recovery action decides whether to prime a new
     /// turn from it or retry fresh.
     IncompleteAgentMessage {
-        text: String,
+        text: ReplyText,
         interruption: ErrorPresentation,
     },
     Reasoning {
-        summary: String,
+        summary: ReplyText,
     },
     ToolCall {
         call_id: String,
@@ -174,10 +175,10 @@ pub enum ItemEvent {
 #[serde(tag = "delta", rename_all = "snake_case")]
 pub enum ItemDelta {
     Text {
-        text: String,
+        text: ReplyText,
     },
     Reasoning {
-        text: String,
+        text: ReplyText,
     },
     ToolArgs {
         fragment: String,

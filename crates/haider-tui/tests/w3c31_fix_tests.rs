@@ -97,7 +97,8 @@ fn envelope(session: &SessionId, seq: u64) -> RawEnvelope {
             attachments: vec![],
             mode: haider_protocol::DeliveryMode::Steer,
         })
-        .expect("payload serializes"),
+        .expect("payload serializes")
+        .into(),
     }
 }
 

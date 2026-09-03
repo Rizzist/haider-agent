@@ -205,8 +205,7 @@ impl StoreHandle for MemoryStore {
                 descriptors.insert(created.branch.branch_id.clone(), created.branch);
                 continue;
             }
-            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
-            else {
+            let Ok(payload) = envelope.payload.decode_event() else {
                 continue;
             };
             match payload {

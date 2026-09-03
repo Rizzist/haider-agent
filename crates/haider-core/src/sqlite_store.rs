@@ -3112,7 +3112,8 @@ mod error_wave_tests {
                 prompt: haider_protocol::envelope::PromptRender::Omit,
             },
             payload: serde_json::to_value(haider_protocol::EventPayload::IdleDecayed)
-                .expect("payload"),
+                .expect("payload")
+                .into(),
         }];
         // Simulates the historical `let _ = append(...)` hole. Publication
         // must happen inside the shared store owner before the caller drops

@@ -22,7 +22,7 @@ fn raw_with_payload(payload: serde_json::Value) -> RawEnvelope {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     }
 }
 

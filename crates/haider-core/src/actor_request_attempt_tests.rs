@@ -71,7 +71,8 @@ impl StoreHandle for AppendRecordingStore {
         let batch = envelopes
             .iter()
             .map(|envelope| {
-                serde_json::from_value(envelope.payload.clone()).expect("recorded payload is typed")
+                serde_json::from_value(envelope.payload.clone().into())
+                    .expect("recorded payload is typed")
             })
             .collect::<Vec<_>>();
         let reject = self.reject_request_boundary
@@ -542,7 +543,8 @@ async fn rejected_request_boundary_publishes_neither_half_and_never_opens_provid
 
     let published = std::iter::from_fn(|| live_events.try_recv().ok()).collect::<Vec<_>>();
     assert!(!published.iter().any(|event| {
-        let Ok(payload) = serde_json::from_value::<EventPayload>(event.payload.clone()) else {
+        let Ok(payload) = serde_json::from_value::<EventPayload>(event.payload.clone().into())
+        else {
             return false;
         };
         matches!(&payload, EventPayload::RunState(RunState::Thinking))
@@ -562,7 +564,7 @@ async fn rejected_request_boundary_publishes_neither_half_and_never_opens_provid
     let journal = store.inner.events(&session_id).await;
     assert!(!journal.iter().any(|event| {
         matches!(
-            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            serde_json::from_value::<EventPayload>(event.payload.clone().into()),
             Ok(EventPayload::Item(ItemEvent::Started {
                 item: TurnItem::Extension { kind, .. },
                 ..
@@ -673,7 +675,7 @@ async fn provider_view_and_request_attempt_share_one_ordered_append() {
     let payloads = journal
         .iter()
         .map(|event| {
-            serde_json::from_value::<EventPayload>(event.payload.clone())
+            serde_json::from_value::<EventPayload>(event.payload.clone().into())
                 .expect("typed journal payload")
         })
         .collect::<Vec<_>>();
@@ -748,7 +750,9 @@ async fn no_boundary_post_stream_facts_share_one_ordered_append() {
             matches!(
                 window
                     .iter()
-                    .map(|event| serde_json::from_value::<EventPayload>(event.payload.clone()))
+                    .map(|event| serde_json::from_value::<EventPayload>(
+                        event.payload.clone().into()
+                    ))
                     .collect::<Result<Vec<_>, _>>()
                     .as_deref(),
                 Ok([

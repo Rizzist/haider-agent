@@ -3,7 +3,10 @@
 use crate::ids::SessionId;
 use crate::item::TurnItem;
 use crate::provider::CacheRequestDiagnosticV1;
+use crate::reply::ReplyText;
 use serde::{Deserialize, Serialize};
+use std::io;
+use std::io::Write as _;
 
 /// Current exact provider-view ledger encoding. Older/future encodings remain
 /// decodable for audit, but cannot authorize fork cache inheritance.
@@ -66,7 +69,22 @@ impl ProviderViewBlockRefV1 {
 #[derive(Debug)]
 pub struct ProviderViewBlobV1 {
     pub block: ProviderViewBlockRefV1,
-    pub bytes: Vec<u8>,
+    bytes: ProviderViewBlobBytesV1,
+}
+
+#[derive(Debug)]
+enum ProviderViewBlobBytesV1 {
+    Contiguous(Vec<u8>),
+    Segmented(Vec<ProviderViewBlobSegmentV1>),
+}
+
+/// One exact byte segment of a transient provider-view CAS object. Reply
+/// segments retain the canonical arena range and are JSON-escaped only while
+/// hashing or writing the object.
+#[derive(Debug)]
+pub enum ProviderViewBlobSegmentV1 {
+    Bytes(Vec<u8>),
+    JsonString(ReplyText),
 }
 
 impl ProviderViewBlobV1 {
@@ -74,9 +92,137 @@ impl ProviderViewBlobV1 {
     pub fn new(bytes: Vec<u8>) -> Self {
         Self {
             block: ProviderViewBlockRefV1::for_bytes(&bytes),
-            bytes,
+            bytes: ProviderViewBlobBytesV1::Contiguous(bytes),
         }
     }
+
+    /// Builds a content-addressed object without joining reply ranges into a
+    /// second string or byte vector.
+    pub fn segmented(segments: Vec<ProviderViewBlobSegmentV1>) -> io::Result<Self> {
+        let bytes = ProviderViewBlobBytesV1::Segmented(segments);
+        let block = block_for_provider_view_bytes(&bytes)?;
+        Ok(Self { block, bytes })
+    }
+
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        usize::try_from(self.block.byte_len).unwrap_or(usize::MAX)
+    }
+
+    #[must_use]
+    pub fn is_segmented(&self) -> bool {
+        matches!(self.bytes, ProviderViewBlobBytesV1::Segmented(_))
+    }
+
+    /// Recomputes the address from the retained representation. Store seams
+    /// use this before publication instead of trusting adapter metadata.
+    pub fn computed_block(&self) -> io::Result<ProviderViewBlockRefV1> {
+        block_for_provider_view_bytes(&self.bytes)
+    }
+
+    pub fn write_to(&self, writer: &mut (impl io::Write + ?Sized)) -> io::Result<()> {
+        match &self.bytes {
+            ProviderViewBlobBytesV1::Contiguous(bytes) => writer.write_all(bytes),
+            ProviderViewBlobBytesV1::Segmented(segments) => {
+                for segment in segments {
+                    match segment {
+                        ProviderViewBlobSegmentV1::Bytes(bytes) => writer.write_all(bytes)?,
+                        ProviderViewBlobSegmentV1::JsonString(text) => {
+                            write_json_reply_scalar(writer, text)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Feeds the exact block bytes into a sink in bounded windows. This is
+    /// used by provider prefix digests and never materializes a full reply.
+    pub fn visit_bytes(&self, mut visit: impl FnMut(&[u8])) -> io::Result<()> {
+        struct VisitorWriter<'a, F>(&'a mut F);
+        impl<F: FnMut(&[u8])> io::Write for VisitorWriter<'_, F> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                (self.0)(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        self.write_to(&mut VisitorWriter(&mut visit))
+    }
+}
+
+fn block_for_provider_view_bytes(
+    bytes: &ProviderViewBlobBytesV1,
+) -> io::Result<ProviderViewBlockRefV1> {
+    struct HashWriter {
+        hasher: blake3::Hasher,
+        len: u64,
+    }
+    impl io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.hasher.update(bytes);
+            self.len = self
+                .len
+                .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                .ok_or_else(|| io::Error::other("provider-view block length overflow"))?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = HashWriter {
+        hasher: blake3::Hasher::new(),
+        len: 0,
+    };
+    match bytes {
+        ProviderViewBlobBytesV1::Contiguous(bytes) => writer.write_all(bytes)?,
+        ProviderViewBlobBytesV1::Segmented(segments) => {
+            for segment in segments {
+                match segment {
+                    ProviderViewBlobSegmentV1::Bytes(bytes) => writer.write_all(bytes)?,
+                    ProviderViewBlobSegmentV1::JsonString(text) => {
+                        write_json_reply_scalar(&mut writer, text)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(ProviderViewBlockRefV1 {
+        content_hash: format!("blake3:{}", writer.hasher.finalize().to_hex()),
+        byte_len: writer.len,
+    })
+}
+
+fn write_json_reply_scalar(
+    writer: &mut (impl io::Write + ?Sized),
+    text: &ReplyText,
+) -> io::Result<()> {
+    const WINDOW_BYTES: usize = 16 * 1_024;
+    writer.write_all(b"\"")?;
+    let mut result = Ok(());
+    text.visit_strs(|segment| {
+        let mut start = 0;
+        while result.is_ok() && start < segment.len() {
+            let mut end = start.saturating_add(WINDOW_BYTES).min(segment.len());
+            while end > start && !segment.is_char_boundary(end) {
+                end -= 1;
+            }
+            match serde_json::to_vec(&segment[start..end]) {
+                Ok(encoded) => result = writer.write_all(&encoded[1..encoded.len() - 1]),
+                Err(error) => result = Err(io::Error::other(error)),
+            }
+            start = end;
+        }
+    });
+    result?;
+    writer.write_all(b"\"")
 }
 
 /// Durable lookup cursor for the SQLite/CAS request view.

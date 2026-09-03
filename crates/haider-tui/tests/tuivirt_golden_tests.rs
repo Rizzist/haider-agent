@@ -409,7 +409,7 @@ fn streaming_tail_frames() {
         EventPayload::Item(ItemEvent::Started {
             item_id: ItemId::new("stream-1"),
             item: TurnItem::AgentMessage {
-                text: String::new(),
+                text: String::new().into(),
             },
         }),
     );
@@ -418,7 +418,9 @@ fn streaming_tail_frames() {
         EventPayload::Item(ItemEvent::Delta {
             item_id: ItemId::new("stream-1"),
             delta: ItemDelta::Text {
-                text: "Streaming a partial reply with an **unterminated bold span".to_owned(),
+                text: "Streaming a partial reply with an **unterminated bold span"
+                    .to_owned()
+                    .into(),
             },
         }),
     );

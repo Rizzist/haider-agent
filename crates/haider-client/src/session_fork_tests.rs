@@ -67,7 +67,9 @@ fn envelope(seq: u64, agent: Option<&str>, payload: EventPayload) -> RawEnvelope
             durable: true,
             prompt: PromptRender::Verbatim,
         },
-        payload: serde_json::to_value(payload).expect("payload serializes"),
+        payload: serde_json::to_value(payload)
+            .expect("payload serializes")
+            .into(),
     }
 }
 

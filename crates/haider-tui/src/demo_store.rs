@@ -861,6 +861,10 @@ fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
             let output_tail = base64::engine::general_purpose::STANDARD
                 .decode(&output_tail_b64)
                 .unwrap_or_default();
+            let agent_line_starts = match &item {
+                TurnItem::AgentMessage { text } => crate::projection::index_agent_reply(text),
+                _ => Vec::new(),
+            };
             TranscriptEntry::Item(ItemBlock {
                 item_id,
                 item,
@@ -872,6 +876,7 @@ fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
                 output_decode_error,
                 tool_reason,
                 spoken,
+                agent_line_starts,
             })
         }
         EntryDto::Note { text } => TranscriptEntry::Note { text },

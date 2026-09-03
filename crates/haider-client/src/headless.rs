@@ -31,6 +31,7 @@ use haider_rpc::haider_protocol::ids::{ArtifactRef, MenuId, RunId, SessionId};
 use haider_rpc::haider_protocol::item::{ItemEvent, TurnItem};
 use haider_rpc::haider_protocol::menu::{DecisionKind, MenuKind};
 use haider_rpc::haider_protocol::provider::Usage;
+use haider_rpc::haider_protocol::reply::ReplyText;
 use haider_rpc::haider_protocol::session::{
     SessionInteractionModeV1, SessionPermissionOverridesV1,
 };
@@ -639,7 +640,7 @@ pub struct HeadlessRunResult {
     pub model: String,
     pub attachments: Vec<ArtifactRef>,
     pub outcome: HeadlessOutcome,
-    pub response: Option<String>,
+    pub response: Option<ReplyText>,
     pub usage: Option<Usage>,
     /// Lossless correlated journal stream. Event payloads are the shared
     /// client contract, including typed tool results and normalized cache
@@ -1559,7 +1560,7 @@ fn write_event_spool_record(
     envelope: &RawEnvelope,
     estimate: usize,
 ) -> std::io::Result<()> {
-    serde_json::to_writer(&mut spool.file, envelope).map_err(std::io::Error::other)?;
+    haider_rpc::haider_protocol::envelope::write_envelope_json(&mut spool.file, envelope)?;
     spool.file.write_all(b"\n")?;
     spool.len = spool.len.saturating_add(1);
     spool.unflushed_bytes = spool.unflushed_bytes.saturating_add(estimate);
@@ -1636,7 +1637,7 @@ struct HeadlessReducer {
     session_id: SessionId,
     run_id: Option<RunId>,
     last_applied: u64,
-    response: Option<String>,
+    response: Option<ReplyText>,
     usage: Option<Usage>,
     permission_denials: Vec<HeadlessPermissionDenial>,
     effect_summaries: BTreeMap<String, String>,
@@ -1786,7 +1787,7 @@ impl HeadlessReducer {
         let mut is_terminal_envelope = false;
         if correlated
             && reduce_core_payload
-            && let Ok(payload) = EventPayload::deserialize(&envelope.payload)
+            && let Ok(payload) = envelope.payload.decode_event()
         {
             match payload {
                 EventPayload::Item(ItemEvent::Completed {

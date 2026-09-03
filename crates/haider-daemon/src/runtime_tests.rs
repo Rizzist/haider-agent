@@ -66,7 +66,8 @@ async fn startup_recovery_run_failed_reaches_sidecar_without_later_append() {
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(EventPayload::RunState(RunState::Thinking))
-            .expect("running payload"),
+            .expect("running payload")
+            .into(),
     }];
     StoreHandle::append(&first, &mut interrupted)
         .await
@@ -94,7 +95,7 @@ async fn startup_recovery_run_failed_reaches_sidecar_without_later_append() {
         .iter()
         .find(|event| {
             matches!(
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                event.payload.decode_event(),
                 Ok(EventPayload::RunFailed { .. })
             )
         })
@@ -160,7 +161,8 @@ async fn shared_startup_hydration_is_page_bounded_across_sessions() {
                     prompt: PromptRender::Omit,
                 },
                 payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
-                    .expect("terminal payload"),
+                    .expect("terminal payload")
+                    .into(),
             })
             .collect::<Vec<_>>();
         StoreHandle::append(&store, &mut events)
@@ -356,7 +358,7 @@ async fn child_done_parent_wait_crash_recovers_the_same_logical_turn() {
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload: serde_json::to_value(payload).expect("payload"),
+            payload: serde_json::to_value(payload).expect("payload").into(),
         }
     }
 
@@ -565,9 +567,9 @@ async fn child_done_parent_wait_crash_recovers_the_same_logical_turn() {
         .await
         .expect("read recovered parent");
     assert!(matches!(
-        parent_tail.last().map(|event| {
-            serde_json::from_value::<EventPayload>(event.payload.clone()).expect("payload")
-        }),
+        parent_tail
+            .last()
+            .map(|event| { event.payload.decode_event().expect("payload") }),
         Some(EventPayload::RunState(RunState::Waiting {
             reason: WaitReason::LocalChild
         }))
@@ -821,7 +823,8 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
-            .expect("source done payload"),
+            .expect("source done payload")
+            .into(),
     }];
     StoreHandle::append(&first, &mut source_done)
         .await
@@ -832,9 +835,7 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
     let (fork_node, fork_seq) = source_events
         .iter()
         .find_map(|event| {
-            let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
-            else {
+            let EventPayload::NodeCommitted(node) = event.payload.decode_event().ok()? else {
                 return None;
             };
             (event.run_id.as_ref() == Some(&source_run)).then_some((node.node, event.seq))
@@ -888,7 +889,7 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
                 durable: true,
                 prompt,
             },
-            payload: serde_json::to_value(payload).expect("payload"),
+            payload: serde_json::to_value(payload).expect("payload").into(),
         }
     };
     let user = |text: &str| EventPayload::UserMessage {
@@ -965,13 +966,13 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
         envelope.run_id.as_ref() == Some(&cancelling_b)
             && envelope.branch_id.as_ref() == Some(&branch_b)
             && matches!(
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                envelope.payload.decode_event(),
                 Ok(EventPayload::RunState(RunState::Cancelled))
             )
     }));
     assert!(events.iter().all(|envelope| {
         !matches!(
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            envelope.payload.decode_event(),
             Ok(EventPayload::SessionState(
                 SessionState::ActiveRun | SessionState::Idle { .. }
             ))
@@ -1024,7 +1025,7 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
                         event.run_id.as_ref() == Some(run_id)
                             && event.branch_id.as_ref() == Some(branch_id)
                             && matches!(
-                                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                                event.payload.decode_event(),
                                 Ok(EventPayload::RunState(RunState::Done))
                             )
                     })
@@ -1050,7 +1051,7 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
                     event.seq,
                     event.run_id,
                     event.branch_id,
-                    serde_json::from_value::<EventPayload>(event.payload),
+                    event.payload.decode_event(),
                 )
             })
             .collect::<Vec<_>>();
@@ -1064,7 +1065,7 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
             event.run_id.as_ref() == Some(run_id)
                 && event.branch_id.as_ref() == Some(branch_id)
                 && matches!(
-                    serde_json::from_value::<EventPayload>(event.payload.clone()),
+                    event.payload.decode_event(),
                     Ok(EventPayload::Item(_) | EventPayload::NodeCommitted(_))
                 )
         }));
@@ -1194,7 +1195,7 @@ async fn failed_recovery_start_terminalizes_on_the_accepted_branch() {
                 durable: true,
                 prompt,
             },
-            payload: serde_json::to_value(payload).expect("payload"),
+            payload: serde_json::to_value(payload).expect("payload").into(),
         }
     };
     let mut source_done = [stamp(
@@ -1212,9 +1213,7 @@ async fn failed_recovery_start_terminalizes_on_the_accepted_branch() {
     let (fork_node, fork_seq) = source_events
         .iter()
         .find_map(|event| {
-            let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
-            else {
+            let EventPayload::NodeCommitted(node) = event.payload.decode_event().ok()? else {
                 return None;
             };
             (event.run_id.as_ref() == Some(&source_run)).then_some((node.node, event.seq))
@@ -1324,7 +1323,7 @@ async fn failed_recovery_start_terminalizes_on_the_accepted_branch() {
         let errored = events.iter().find_map(|envelope| {
             (envelope.run_id.as_ref() == Some(&run_id)
                 && matches!(
-                    serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                    envelope.payload.decode_event(),
                     Ok(EventPayload::RunState(RunState::Errored))
                 ))
             .then(|| envelope.branch_id.clone())

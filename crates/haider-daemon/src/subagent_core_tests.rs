@@ -438,7 +438,7 @@ fn delegation_parent_projection_is_pinned_to_the_spawn_branch() {
     assert_eq!(envelope.branch_id, Some(branch_id.clone()));
     assert_eq!(envelope.run_id, Some(record.parent_run_id.clone()));
     assert!(matches!(
-        serde_json::from_value::<EventPayload>(envelope.payload),
+        envelope.payload.decode_event(),
         Ok(EventPayload::AgentChipState { agent, chip: ChipState::Done })
             if agent == agent_id
     ));
@@ -570,7 +570,8 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(EventPayload::RunState(RunState::Thinking))
-            .expect("parent run start payload"),
+            .expect("parent run start payload")
+            .into(),
     }];
     hub.append(&mut parent_started)
         .await
@@ -623,9 +624,7 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         .iter()
         .filter(|event| event.run_id.as_ref() == Some(&records[0].child_run_id))
         .filter_map(|event| {
-            let EventPayload::UserMessage { text, .. } =
-                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
-            else {
+            let EventPayload::UserMessage { text, .. } = event.payload.decode_event().ok()? else {
                 return None;
             };
             Some((event, text))
@@ -673,7 +672,8 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
-            .expect("child terminal payload"),
+            .expect("child terminal payload")
+            .into(),
     }];
     hub.append(&mut terminal)
         .await
@@ -733,7 +733,7 @@ impl Provider for InspectingProvider {
                 cursor = page.last().map_or(cursor, |event| event.seq);
                 spawn_terminal |= page.into_iter().any(|event| {
                     observed.push(event.payload.clone());
-                    serde_json::from_value::<EventPayload>(event.payload).is_ok_and(|payload| {
+                    event.payload.decode_event().is_ok_and(|payload| {
                         matches!(
                             payload,
                             EventPayload::Effect(EffectPhase::Outcome {
@@ -1104,7 +1104,7 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
     let steered_runs = child_events
         .iter()
         .filter(|event| {
-            serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(|payload| {
+            event.payload.decode_event().is_ok_and(|payload| {
                 matches!(payload, EventPayload::UserMessage { text, .. } if text == message)
             })
         })
@@ -1610,7 +1610,8 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
-            .expect("fork done payload"),
+            .expect("fork done payload")
+            .into(),
     }];
     hub.append(&mut fork_done)
         .await
@@ -1622,9 +1623,7 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
     let (fork_node, fork_seq) = fork_events
         .iter()
         .find_map(|event| {
-            let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
-            else {
+            let EventPayload::NodeCommitted(node) = event.payload.decode_event().ok()? else {
                 return None;
             };
             (event.run_id.as_ref() == Some(&fork_run)).then_some((node.node, event.seq))
@@ -1690,9 +1689,9 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
                 .expect("read parent");
             if events.iter().any(|event| {
                 event.run_id.as_ref() == Some(&parent_run)
-                    && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
-                        |payload| matches!(payload, EventPayload::RunState(RunState::Done)),
-                    )
+                    && event.payload.decode_event().is_ok_and(|payload| {
+                        matches!(payload, EventPayload::RunState(RunState::Done))
+                    })
             }) {
                 break;
             }
@@ -1734,7 +1733,7 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
         .filter(|event| event.run_id.as_ref() == Some(&parent_run))
     {
         if matches!(
-            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            event.payload.decode_event(),
             Ok(EventPayload::SessionState(_))
         ) {
             assert_eq!(event.branch_id, None);
@@ -1744,7 +1743,7 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
     }
     let payloads = parent_events
         .iter()
-        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.clone()).ok())
+        .filter_map(|event| event.payload.decode_event().ok())
         .collect::<Vec<_>>();
     let waiting = payloads
         .iter()
@@ -1791,15 +1790,13 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
         .iter()
         .find(|event| {
             event.agent_id.as_ref() == Some(&spawned.agent)
-                && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
-                    |payload| {
-                        matches!(
-                            payload,
-                            EventPayload::UserMessage { text, .. }
-                                if text.contains("run the focused test suite")
-                        )
-                    },
-                )
+                && event.payload.decode_event().is_ok_and(|payload| {
+                    matches!(
+                        payload,
+                        EventPayload::UserMessage { text, .. }
+                            if text.contains("run the focused test suite")
+                    )
+                })
         })
         .expect("spawn prompt projected into child-scoped parent timeline");
     assert_eq!(projected_prompt.branch_id, Some(branch_a.clone()));
@@ -1972,7 +1969,8 @@ async fn terminalize_test_parent(
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
-            .expect("parent done payload"),
+            .expect("parent done payload")
+            .into(),
     }];
     hub.append(&mut terminal)
         .await
@@ -1988,7 +1986,7 @@ async fn wait_for_state(
         loop {
             let events = store.read(session_id, 0, 1024).await.expect("read run");
             if events.iter().any(|event| {
-                serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                event.payload.decode_event().is_ok_and(
                     |payload| matches!(payload, EventPayload::RunState(state) if expected(&state)),
                 )
             }) {
@@ -2006,7 +2004,7 @@ async fn wait_for_state(
         let states = events
             .iter()
             .filter_map(|event| {
-                let payload = serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?;
+                let payload = event.payload.decode_event().ok()?;
                 match payload {
                     EventPayload::RunState(state) => Some(format!("run:{state:?}")),
                     EventPayload::RunFailed { code, message, .. } => {
@@ -2035,7 +2033,9 @@ async fn wait_for_journal_event(
         loop {
             let events = store.read(session_id, 0, 1024).await.expect("read run");
             for event in events {
-                if serde_json::from_value::<EventPayload>(event.payload.clone())
+                if event
+                    .payload
+                    .decode_event()
                     .is_ok_and(|payload| expected(&payload))
                 {
                     return event;
@@ -2241,7 +2241,7 @@ fn typed_payloads(events: &[haider_protocol::envelope::RawEnvelope]) -> Vec<Even
         // Raw journals may contain additive payload kinds introduced after
         // this exhaustive core enum. Keep this helper scoped to the typed
         // W6 payloads it is named for instead of rejecting forward facts.
-        .filter_map(|event| serde_json::from_value(event.payload.clone()).ok())
+        .filter_map(|event| serde_json::from_value(event.payload.clone().into()).ok())
         .collect()
 }
 
@@ -2394,7 +2394,7 @@ async fn start_parked_child_with_wait_budgets(
     let permission_menu = events
         .iter()
         .find_map(|envelope| {
-            let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?;
+            let payload = envelope.payload.decode_event().ok()?;
             match payload {
                 EventPayload::MenuOpened(menu)
                     if matches!(menu.kind, haider_protocol::menu::MenuKind::Question) =>
@@ -2432,7 +2432,7 @@ async fn wait_for_parent_delegated_menu(
                 .expect("parent delegated menu journal");
             if let Some(opening) = events.iter().find_map(|envelope| {
                 let EventPayload::MenuOpened(menu) =
-                    serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
+                    envelope.payload.decode_event().ok()?
                 else {
                     return None;
                 };
@@ -2877,9 +2877,7 @@ async fn parent_user_answers_delegated_question_over_uds_and_child_continues() {
     let (parent_menu, parent_request_seq, parent_generation) = replayed
         .into_iter()
         .find_map(|envelope| {
-            let EventPayload::MenuOpened(menu) =
-                serde_json::from_value::<EventPayload>(envelope.payload).ok()?
-            else {
+            let EventPayload::MenuOpened(menu) = envelope.payload.decode_event().ok()? else {
                 return None;
             };
             (menu.id == parent_menu.id
@@ -3163,7 +3161,8 @@ async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(EventPayload::RunState(RunState::Cancelling))
-            .expect("parent cancelling payload"),
+            .expect("parent cancelling payload")
+            .into(),
     }];
     first_hub
         .append(&mut parent_cancelling)
@@ -3261,7 +3260,7 @@ async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
         .expect("completed handoff journal");
     assert!(child_events.iter().any(|event| {
         let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
-            serde_json::from_value::<EventPayload>(event.payload.clone())
+            event.payload.decode_event()
         else {
             return false;
         };
@@ -3329,12 +3328,12 @@ async fn unanswered_delegated_question_times_out_parent_and_reaps_child() {
                 .await
                 .expect("timed-out child journal");
             let cancelled = events.iter().position(|event| {
-                serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(|payload| {
+                event.payload.decode_event().is_ok_and(|payload| {
                     matches!(payload, EventPayload::RunState(RunState::Cancelled))
                 })
             });
             let idle = events.iter().position(|event| {
-                serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(|payload| {
+                event.payload.decode_event().is_ok_and(|payload| {
                     matches!(
                         payload,
                         EventPayload::SessionState(
@@ -3414,12 +3413,12 @@ async fn expired_cancellation_handoff_reaps_live_child_without_restart() {
                 .await
                 .expect("expired cancellation child journal");
             let cancelled = events.iter().position(|event| {
-                serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(|payload| {
+                event.payload.decode_event().is_ok_and(|payload| {
                     matches!(payload, EventPayload::RunState(RunState::Cancelled))
                 })
             });
             let idle = events.iter().position(|event| {
-                serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(|payload| {
+                event.payload.decode_event().is_ok_and(|payload| {
                     matches!(
                         payload,
                         EventPayload::SessionState(
@@ -3836,7 +3835,7 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
                 .await
                 .expect("child journal during grace evaluation");
             let cancelled = events.iter().any(|event| {
-                serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(|payload| {
+                event.payload.decode_event().is_ok_and(|payload| {
                     matches!(payload, EventPayload::RunState(RunState::Cancelled))
                 })
             });
@@ -3993,7 +3992,7 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
                 let mut completed = std::collections::HashSet::new();
                 for event in events {
                     let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
-                        serde_json::from_value::<EventPayload>(event.payload)
+                        event.payload.decode_event()
                     else {
                         continue;
                     };
@@ -4040,7 +4039,9 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
             let cancelled = events
                 .iter()
                 .filter_map(|event| {
-                    serde_json::from_value::<EventPayload>(event.payload.clone())
+                    event
+                        .payload
+                        .decode_event()
                         .is_ok_and(|payload| {
                             matches!(payload, EventPayload::RunState(RunState::Cancelled))
                         })
@@ -4050,7 +4051,9 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
             let idle = events
                 .iter()
                 .filter_map(|event| {
-                    serde_json::from_value::<EventPayload>(event.payload.clone())
+                    event
+                        .payload
+                        .decode_event()
                         .is_ok_and(|payload| {
                             matches!(
                                 payload,
@@ -4415,7 +4418,9 @@ async fn global_subagent_cap_is_a_typed_tool_rejection_and_parent_continues() {
         .expect("parent terminal journal");
     assert!(
         terminal_events.iter().any(|event| {
-            serde_json::from_value::<EventPayload>(event.payload.clone())
+            event
+                .payload
+                .decode_event()
                 .is_ok_and(|payload| matches!(payload, EventPayload::RunState(RunState::Done)))
         }),
         "parent must continue to Done after cap rejection: {terminal_events:#?}"
@@ -4440,7 +4445,7 @@ async fn global_subagent_cap_is_a_typed_tool_rejection_and_parent_continues() {
         .expect("parent journal");
     let presentation = events
         .into_iter()
-        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        .filter_map(|event| event.payload.decode_event().ok())
         .find_map(|payload| match payload {
             EventPayload::ToolResult { call_id, result } if call_id == "cap-513-rejected" => {
                 result.presentation

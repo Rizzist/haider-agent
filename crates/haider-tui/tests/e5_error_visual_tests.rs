@@ -65,7 +65,9 @@ fn raw(seq: u64, at_ms: u64, payload: &EventPayload) -> haider_protocol::envelop
             durable: true,
             prompt: haider_protocol::envelope::PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("payload serializes"),
+        payload: serde_json::to_value(payload)
+            .expect("payload serializes")
+            .into(),
     }
 }
 

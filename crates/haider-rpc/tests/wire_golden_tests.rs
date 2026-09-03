@@ -5202,7 +5202,7 @@ fn borrowed_event_encode_is_byte_identical_to_owned() {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::json!({"type": "idle_decayed"}),
+        payload: serde_json::json!({"type": "idle_decayed"}).into(),
     };
     let owned = WireFrame::Event {
         attachment_id: attachment.clone(),
@@ -5220,12 +5220,90 @@ fn borrowed_event_encode_is_byte_identical_to_owned() {
             encoding,
         )
         .expect("borrowed encode");
-        let mut borrowed_bytes = borrowed.prefix().to_vec();
-        borrowed_bytes.extend_from_slice(borrowed.body());
+        let mut borrowed_bytes = Vec::with_capacity(borrowed.framed_len());
+        borrowed
+            .write_to(&mut borrowed_bytes)
+            .expect("borrowed frame");
         assert_eq!(
             owned_bytes, borrowed_bytes,
             "borrowed EVENT encode must match owned bytes for {encoding:?}"
         );
+    }
+}
+
+/// Reply EVENT frames retain the arena range as the body middle while the
+/// announced length and reconstructed bytes remain identical to the legacy
+/// owned encoder in both wire encodings.
+#[test]
+fn segmented_reply_event_encode_is_byte_identical_to_owned() {
+    use haider_protocol::EventPayload;
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RawPayload, RenderTargets};
+    use haider_protocol::ids::{DeviceId, EventId, ItemId, SessionId};
+    use haider_protocol::item::{ItemDelta, ItemEvent};
+    use haider_protocol::reply::ReplyArenaWriter;
+    use haider_rpc::uds_codec::EncodedEventBodyRef;
+    use haider_rpc::{AttachmentId, WireEncoding};
+
+    let mut arena = ReplyArenaWriter::new();
+    let _ = arena.append("left \"quote\"\n".to_owned());
+    let _ = arena.append("مرز 😀 right".to_owned());
+    let reply = arena.seal();
+    let attachment = AttachmentId::new("att-reply");
+    let session = SessionId::new("s-reply");
+    let envelope = EventEnvelope {
+        schema_version: 1,
+        event_id: EventId::new("e-reply"),
+        seq: 9,
+        session_id: session.clone(),
+        branch_id: None,
+        run_id: None,
+        agent_id: None,
+        device_id: DeviceId::new("d-reply"),
+        authority_epoch: 0,
+        worker_generation: 1,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 42,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Verbatim,
+        },
+        payload: RawPayload::from_event(EventPayload::Item(ItemEvent::Delta {
+            item_id: ItemId::new("i-reply"),
+            delta: ItemDelta::Text {
+                text: reply.clone(),
+            },
+        }))
+        .expect("reply payload"),
+    };
+    let owned = WireFrame::Event {
+        attachment_id: attachment.clone(),
+        session_id: session.clone(),
+        envelope: envelope.clone(),
+    };
+
+    for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
+        let expected =
+            uds_codec::encode_with(&owned, TEST_FRAME_LIMIT, encoding).expect("owned encode");
+        let segmented = uds_codec::encode_event_zeroizing_parts_with(
+            &attachment,
+            &session,
+            &envelope,
+            TEST_FRAME_LIMIT,
+            encoding,
+        )
+        .expect("segmented encode");
+        match segmented.body_parts() {
+            EncodedEventBodyRef::Reply { text, .. } => {
+                assert!(text.shares_arena_with(&reply));
+            }
+            EncodedEventBodyRef::Contiguous(_) => panic!("reply was flattened"),
+        }
+        let mut actual = Vec::with_capacity(segmented.framed_len());
+        segmented.write_to(&mut actual).expect("segmented frame");
+        assert_eq!(actual.len(), segmented.framed_len());
+        assert_eq!(actual, expected, "reply frame differs for {encoding:?}");
     }
 }
 

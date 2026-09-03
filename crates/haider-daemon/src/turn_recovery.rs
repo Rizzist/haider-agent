@@ -60,7 +60,7 @@ use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase,
 };
 use haider_protocol::envelope::{
-    EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
+    EventEnvelope, PromptRender, RawEnvelope, RawPayload, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::graph::{GraphFinalizationDeferred, GraphPhase};
@@ -71,6 +71,7 @@ use haider_protocol::ids::{
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuCloseReason, MenuKind, effect_recovery_menu};
 use haider_protocol::provider::{PROVIDER_OPAQUE_EXTENSION_KIND, StreamEvent};
+use haider_protocol::reply::{ReplyArenaWriter, ReplyText};
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::state::{RunState, SessionState, WaitReason};
 use serde::{Deserialize, Serialize};
@@ -174,7 +175,7 @@ struct RunReduction {
     user_seq: Option<u64>,
     retry_source: Option<(RunId, RunId, u64, u64)>,
     open_items: HashMap<ItemId, OpenItem>,
-    incomplete_items: HashMap<ItemId, String>,
+    incomplete_items: HashMap<ItemId, ReplyText>,
     menu: Option<OpenMenu>,
     menu_answers: HashMap<MenuId, RawEnvelope>,
     tool_results: HashSet<String>,
@@ -211,12 +212,57 @@ struct RecoveredToolCall {
     completed: bool,
 }
 
-#[derive(Serialize, Deserialize)]
 struct OpenItem {
     item: TurnItem,
     started_seq: u64,
-    text: String,
+    text: ReplyArenaWriter,
     args: String,
+}
+
+impl Serialize for OpenItem {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Encoded<'a> {
+            item: &'a TurnItem,
+            started_seq: u64,
+            text: ReplyText,
+            args: &'a str,
+        }
+        Encoded {
+            item: &self.item,
+            started_seq: self.started_seq,
+            text: self.text.snapshot(),
+            args: &self.args,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for OpenItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Encoded {
+            item: TurnItem,
+            started_seq: u64,
+            text: String,
+            args: String,
+        }
+        let encoded = Encoded::deserialize(deserializer)?;
+        let mut text = ReplyArenaWriter::new();
+        let _ = text.append(encoded.text);
+        Ok(Self {
+            item: encoded.item,
+            started_seq: encoded.started_seq,
+            text,
+            args: encoded.args,
+        })
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1082,9 +1128,7 @@ async fn latest_run_state(
             {
                 continue;
             }
-            if let Ok(EventPayload::RunState(next)) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
-            {
+            if let Ok(EventPayload::RunState(next)) = envelope.payload.decode_event() {
                 state = Some(next);
             }
         }
@@ -1095,8 +1139,9 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
     let Some(run_id) = envelope.run_id.clone() else {
         return;
     };
-    let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok();
-    let retry_payload = RunRetryEventPayload::from_payload_value(envelope.payload.clone()).ok();
+    let payload = envelope.payload.decode_event().ok();
+    let retry_payload =
+        RunRetryEventPayload::from_payload_value(envelope.payload.to_json_value()).ok();
     let headless_payload = HeadlessRunEventPayload::from_payload_value(&envelope.payload);
     if payload.is_none() && retry_payload.is_none() && headless_payload.is_none() {
         return;
@@ -1214,7 +1259,7 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
                 OpenItem {
                     item,
                     started_seq: envelope.seq,
-                    text: String::new(),
+                    text: ReplyArenaWriter::new(),
                     args: String::new(),
                 },
             );
@@ -1230,16 +1275,10 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
             if let Some(open) = reduction.open_items.get_mut(&item_id) {
                 match &delta {
                     ItemDelta::Text { text } => {
-                        open.text.push_str(text);
-                        reduction
-                            .route_replay_events
-                            .push(StreamEvent::TextDelta { text: text.clone() });
+                        let _ = open.text.append_shared(text);
                     }
                     ItemDelta::Reasoning { text } => {
-                        open.text.push_str(text);
-                        reduction
-                            .route_replay_events
-                            .push(StreamEvent::ReasoningDelta { text: text.clone() });
+                        let _ = open.text.append_shared(text);
                     }
                     ItemDelta::ToolArgs { fragment } => open.args.push_str(fragment),
                     ItemDelta::CommandOutput { .. } => {}
@@ -1254,7 +1293,7 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
                 tool.args.push_str(&fragment);
             }
         }
-        EventPayload::Item(ItemEvent::Completed { item_id, item }) => {
+        EventPayload::Item(ItemEvent::Completed { item_id, mut item }) => {
             if provider_response_item(&item) {
                 reduction.latest_provider_response_seq = Some(envelope.seq);
             }
@@ -1297,6 +1336,9 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
                 {
                     reduction.route_replay_events.push(event);
                 }
+            }
+            if let Some(open) = reduction.open_items.get(&item_id) {
+                canonicalize_completed_reply(&mut item, open);
             }
             let item = match item {
                 TurnItem::IncompleteAgentMessage { text, .. } => {
@@ -1384,6 +1426,18 @@ fn provider_response_item(item: &TurnItem) -> bool {
     )
 }
 
+fn canonicalize_completed_reply(item: &mut TurnItem, open: &OpenItem) {
+    let canonical = open.text.snapshot();
+    let completed = match item {
+        TurnItem::AgentMessage { text } | TurnItem::IncompleteAgentMessage { text, .. } => text,
+        TurnItem::Reasoning { summary } => summary,
+        _ => return,
+    };
+    if *completed == canonical {
+        *completed = canonical;
+    }
+}
+
 fn pending_checkpoint(reduction: &RunReduction) -> Option<RequestInputCheckpoint> {
     let open_menu = reduction.menu.clone()?;
     reduction
@@ -1447,7 +1501,7 @@ fn pending_route_wait_checkpoint(reduction: &RunReduction) -> Option<RouteWaitCh
     for (item_id, open) in &reduction.open_items {
         let text = RouteWaitTextCheckpoint {
             item_id: item_id.clone(),
-            text: open.text.clone(),
+            text: open.text.snapshot(),
         };
         match &open.item {
             TurnItem::AgentMessage { .. } if checkpoint.message.is_none() => {
@@ -1760,8 +1814,12 @@ fn interrupted_terminal_payloads(
     open_items.sort_by_key(|(_, open)| open.started_seq);
     for (item_id, open) in open_items {
         let item = match open.item {
-            TurnItem::AgentMessage { .. } => TurnItem::AgentMessage { text: open.text },
-            TurnItem::Reasoning { .. } => TurnItem::Reasoning { summary: open.text },
+            TurnItem::AgentMessage { .. } => TurnItem::AgentMessage {
+                text: open.text.snapshot(),
+            },
+            TurnItem::Reasoning { .. } => TurnItem::Reasoning {
+                summary: open.text.snapshot(),
+            },
             TurnItem::ToolCall {
                 call_id,
                 name,
@@ -1883,7 +1941,7 @@ fn recovery_envelopes(
                     durable: true,
                     prompt: PromptRender::Omit,
                 },
-                payload: serde_json::to_value(payload).map_err(|error| {
+                payload: RawPayload::from_event(payload).map_err(|error| {
                     HaiderError::new(
                         ErrorCode::Internal,
                         format!("cannot serialize turn recovery payload: {error}"),

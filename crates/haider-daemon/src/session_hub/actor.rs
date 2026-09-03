@@ -194,13 +194,15 @@ fn effect_recovery_envelopes(
                 durable: true,
                 prompt: haider_protocol::envelope::PromptRender::Pruned,
             },
-            payload: serde_json::to_value(payload).map_err(|error| {
-                HaiderError::new(
-                    ErrorCode::Internal,
-                    format!("effect reconciliation payload could not serialize: {error}"),
-                    false,
-                )
-            })?,
+            payload: haider_protocol::envelope::RawPayload::from_event(payload).map_err(
+                |error| {
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        format!("effect reconciliation payload could not serialize: {error}"),
+                        false,
+                    )
+                },
+            )?,
         });
     }
     Ok(envelopes)
@@ -1758,7 +1760,7 @@ fn publish_graph_commit(
         && let Some(RunState::InputRequired { menu: waiting }) = harness.current_state()
     {
         for envelope in envelopes {
-            let closes_waiting = serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            let closes_waiting = envelope.payload.decode_event()
                 .is_ok_and(|payload| {
                     matches!(payload, EventPayload::MenuClosed { menu, .. } if menu == waiting)
                 });
@@ -1796,9 +1798,7 @@ async fn session_is_quiescent(
             let Some(run_id) = event.run_id else {
                 continue;
             };
-            if let Ok(EventPayload::RunState(state)) =
-                serde_json::from_value::<EventPayload>(event.payload)
-            {
+            if let Ok(EventPayload::RunState(state)) = event.payload.decode_event() {
                 states.insert(run_id, state);
             }
         }
@@ -1990,7 +1990,7 @@ mod discarded_result_tests {
                 durable: true,
                 prompt: haider_protocol::envelope::PromptRender::Omit,
             },
-            payload: serde_json::Value::Null,
+            payload: serde_json::Value::Null.into(),
         }
     }
 
@@ -2258,7 +2258,9 @@ mod error_wave3_tests {
                 durable: true,
                 prompt: haider_protocol::envelope::PromptRender::Pruned,
             },
-            payload: serde_json::to_value(EventPayload::IdleDecayed).expect("answer payload"),
+            payload: serde_json::to_value(EventPayload::IdleDecayed)
+                .expect("answer payload")
+                .into(),
         };
         settle_effect_recovery(
             &store,
@@ -2273,7 +2275,7 @@ mod error_wave3_tests {
         let events = store.read(&session_id, 0, 100).await.expect("read journal");
         assert!(events.iter().any(|event| {
             matches!(
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                event.payload.decode_event(),
                 Ok(EventPayload::RunFailed {
                     code: ErrorCode::EffectUnknownOutcome,
                     ..
@@ -2282,7 +2284,7 @@ mod error_wave3_tests {
         }));
         assert!(events.iter().any(|event| {
             matches!(
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                event.payload.decode_event(),
                 Ok(EventPayload::RunState(RunState::Errored))
             )
         }));

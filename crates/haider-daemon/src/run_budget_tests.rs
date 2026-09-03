@@ -599,7 +599,7 @@ fn a_durable_budget_cause_wins_when_stop_races_the_terminal_batch() {
         .read(&SessionId::new("budget-session"), 0, 16)
         .expect("read raced journal");
     assert!(journal.iter().any(|event| matches!(
-        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        event.payload.decode_event(),
         Ok(EventPayload::RunFailed {
             code: ErrorCode::BudgetExhausted,
             ..
@@ -608,7 +608,7 @@ fn a_durable_budget_cause_wins_when_stop_races_the_terminal_batch() {
     assert!(matches!(
         journal
             .last()
-            .and_then(|event| serde_json::from_value::<EventPayload>(event.payload.clone()).ok()),
+            .and_then(|event| event.payload.decode_event().ok()),
         Some(EventPayload::RunState(RunState::Errored))
     ));
 }
@@ -1033,7 +1033,7 @@ async fn run_provider_budget_case_inner(
             let events = store.read(&session_id, 0, 1024).await.expect("read run");
             if events.iter().any(|event| {
                 event.run_id.as_ref() == Some(&run_id)
-                    && serde_json::from_value::<EventPayload>(event.payload.clone())
+                    && event.payload.decode_event()
                         .is_ok_and(|payload| {
                             matches!(payload, EventPayload::RunState(state) if state.is_terminal())
                         })
@@ -1860,7 +1860,9 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
                 .iter()
                 .any(|event| {
                     event.run_id.as_ref() == Some(&parent_run)
-                        && serde_json::from_value::<EventPayload>(event.payload.clone())
+                        && event
+                            .payload
+                            .decode_event()
                             .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Done))
                 });
             if done {
@@ -1878,7 +1880,9 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
     assert!(
         initial_parent_events.iter().any(|event| {
             event.run_id.as_ref() == Some(&parent_run)
-                && serde_json::from_value::<EventPayload>(event.payload.clone())
+                && event
+                    .payload
+                    .decode_event()
                     .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Done))
         }),
         "initial capped delegation reaches Done; requests={}; payloads={:?}",
@@ -1955,7 +1959,7 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
                 .iter()
                 .any(|event| {
                     event.run_id.as_ref() == Some(&resumed_run)
-                        && serde_json::from_value::<EventPayload>(event.payload.clone())
+                        && event.payload.decode_event()
                             .is_ok_and(|payload| {
                                 matches!(payload, EventPayload::RunState(state) if state.is_terminal())
                             })
@@ -1975,17 +1979,15 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
     assert!(
         resumed_events.iter().any(|event| {
             event.run_id.as_ref() == Some(&resumed_run)
-                && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
-                    |payload| {
-                        matches!(
-                            payload,
-                            EventPayload::RunFailed {
-                                code: ErrorCode::BudgetExhausted,
-                                ..
-                            }
-                        )
-                    },
-                )
+                && event.payload.decode_event().is_ok_and(|payload| {
+                    matches!(
+                        payload,
+                        EventPayload::RunFailed {
+                            code: ErrorCode::BudgetExhausted,
+                            ..
+                        }
+                    )
+                })
         }),
         "recreated run must debit its durable root spend; requests={}; payloads={:?}",
         provider.requests().len(),
@@ -1997,7 +1999,9 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
     );
     assert!(resumed_events.iter().any(|event| {
         event.run_id.as_ref() == Some(&resumed_run)
-            && serde_json::from_value::<EventPayload>(event.payload.clone())
+            && event
+                .payload
+                .decode_event()
                 .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Errored))
     }));
     assert_eq!(
@@ -2165,7 +2169,9 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
                 .iter()
                 .filter(|event| event.run_id.as_ref() == Some(&run_id))
                 .find_map(|event| {
-                    serde_json::from_value::<EventPayload>(event.payload.clone())
+                    event
+                        .payload
+                        .decode_event()
                         .ok()
                         .and_then(|payload| match payload {
                             EventPayload::RunFailed {
@@ -2179,15 +2185,15 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
                 });
             let terminal = events.iter().any(|event| {
                 event.run_id.as_ref() == Some(&run_id)
-                    && serde_json::from_value::<EventPayload>(event.payload.clone())
+                    && event
+                        .payload
+                        .decode_event()
                         .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Errored))
             });
             if let Some(unexpected) = events
                 .iter()
                 .filter(|event| event.run_id.as_ref() == Some(&run_id))
-                .filter_map(|event| {
-                    serde_json::from_value::<EventPayload>(event.payload.clone()).ok()
-                })
+                .filter_map(|event| event.payload.decode_event().ok())
                 .find(|payload| {
                     matches!(
                         payload,
@@ -2227,16 +2233,14 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
             .iter()
             .any(|event| {
                 event.run_id.as_ref() == Some(&run_id)
-                    && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
-                        |payload| {
-                            matches!(
-                                payload,
-                                EventPayload::RunState(RunState::Waiting {
-                                    reason: haider_protocol::state::WaitReason::NetworkUnavailable
-                                })
-                            )
-                        },
-                    )
+                    && event.payload.decode_event().is_ok_and(|payload| {
+                        matches!(
+                            payload,
+                            EventPayload::RunState(RunState::Waiting {
+                                reason: haider_protocol::state::WaitReason::NetworkUnavailable
+                            })
+                        )
+                    })
             }),
         "a never-opening provider on a live route must not enter WaitingForRoute"
     );

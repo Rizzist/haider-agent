@@ -40,7 +40,9 @@ fn envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("payload serializes"),
+        payload: serde_json::to_value(payload)
+            .expect("payload serializes")
+            .into(),
     }
 }
 
@@ -214,7 +216,7 @@ fn n_way_race_commits_exactly_one_answer_and_returns_one_resolution_coordinate()
         history
             .iter()
             .filter(|envelope| {
-                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                     .is_ok_and(|payload| matches!(payload, EventPayload::MenuAnswered(_)))
             })
             .count(),

@@ -266,7 +266,8 @@ async fn drive_turns(
                 if event_session != session_id {
                     continue;
                 }
-                let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+                let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.into())
+                else {
                     continue;
                 };
                 match payload {

@@ -1222,7 +1222,7 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
     let mut usage_accounts = Vec::new();
     loop {
         if let WireFrame::Event { envelope, .. } = client.next().await {
-            match serde_json::from_value::<EventPayload>(envelope.payload) {
+            match serde_json::from_value::<EventPayload>(envelope.payload.into()) {
                 Ok(EventPayload::Usage(usage)) => {
                     usage_accounts.push(usage.account.clone());
                 }

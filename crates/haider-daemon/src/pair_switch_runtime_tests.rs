@@ -343,10 +343,9 @@ impl PairSwitchWorld {
             .await
             .expect("read journal")
         {
-            let (Some(run_id), Ok(EventPayload::RunState(state))) = (
-                event.run_id.clone(),
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
-            ) else {
+            let (Some(run_id), Ok(EventPayload::RunState(state))) =
+                (event.run_id.clone(), event.payload.decode_event())
+            else {
                 continue;
             };
             if let Some(slot) = latest.iter_mut().find(|(id, _)| id == &run_id) {
@@ -368,9 +367,9 @@ impl PairSwitchWorld {
                     .expect("read journal");
                 if events.iter().any(|event| {
                     event.run_id.as_ref() == Some(run_id)
-                        && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
-                            |payload| matches!(payload, EventPayload::RunState(RunState::Done)),
-                        )
+                        && event.payload.decode_event().is_ok_and(|payload| {
+                            matches!(payload, EventPayload::RunState(RunState::Done))
+                        })
                 }) {
                     break;
                 }
@@ -615,7 +614,7 @@ async fn pinned_loom_workflow_runs_its_next_turn_after_registry_edit() {
         .iter()
         .flat_map(|message| &message.blocks)
         .filter_map(|block| match block {
-            Block::Text { text } => Some(text.as_str()),
+            Block::Text { text } => Some(text.to_owned_string()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -712,7 +711,7 @@ async fn fallback_chain_switch_is_durable_visible_and_finishes_the_same_turn() {
     }));
     let completed_extensions = events.iter().filter_map(|event| {
         let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
-            serde_json::from_value::<EventPayload>(event.payload.clone())
+            event.payload.decode_event()
         else {
             return None;
         };
@@ -958,12 +957,10 @@ async fn spawn_after_pair_switch_inherits_the_new_pair() {
         .expect("read parent journal");
     let manifest = events
         .iter()
-        .find_map(
-            |event| match serde_json::from_value::<EventPayload>(event.payload.clone()) {
-                Ok(EventPayload::AgentSpawned(manifest)) => Some(manifest),
-                _ => None,
-            },
-        )
+        .find_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::AgentSpawned(manifest)) => Some(manifest),
+            _ => None,
+        })
         .expect("spawn manifest");
     assert_eq!(
         manifest.model_profile, "model-b",
@@ -1037,12 +1034,10 @@ async fn explicit_selector_spawns_the_child_cross_provider() {
         .expect("read parent journal");
     let manifest = events
         .iter()
-        .find_map(
-            |event| match serde_json::from_value::<EventPayload>(event.payload.clone()) {
-                Ok(EventPayload::AgentSpawned(manifest)) => Some(manifest),
-                _ => None,
-            },
-        )
+        .find_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::AgentSpawned(manifest)) => Some(manifest),
+            _ => None,
+        })
         .expect("spawn manifest");
     assert_eq!(manifest.model_profile, "model-b");
     let child_session = manifest
@@ -1400,7 +1395,7 @@ async fn submit_during_manual_compaction_queues_and_runs_after() {
         .iter()
         .filter(|event| {
             event.run_id.as_ref().is_some_and(|id| id != &queued_run)
-                && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+                && event.payload.decode_event().is_ok_and(
                     |payload| matches!(payload, EventPayload::RunState(state) if state.is_terminal()),
                 )
         })
@@ -1411,15 +1406,13 @@ async fn submit_during_manual_compaction_queues_and_runs_after() {
         .iter()
         .filter(|event| {
             event.run_id.as_ref() == Some(&queued_run)
-                && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
-                    |payload| {
-                        matches!(
-                            payload,
-                            EventPayload::RunState(state)
-                                if !matches!(state, RunState::Queued) && !state.is_terminal()
-                        )
-                    },
-                )
+                && event.payload.decode_event().is_ok_and(|payload| {
+                    matches!(
+                        payload,
+                        EventPayload::RunState(state)
+                            if !matches!(state, RunState::Queued) && !state.is_terminal()
+                    )
+                })
         })
         .map(|event| event.seq)
         .min()
@@ -1484,7 +1477,7 @@ async fn steer_during_manual_compaction_blocks_and_never_reaches_the_summarizer(
             .iter()
             .flat_map(|message| &message.blocks)
             .filter_map(|block| match block {
-                Block::Text { text } => Some(text.as_str()),
+                Block::Text { text } => Some(text.to_owned_string()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -1679,7 +1672,9 @@ async fn consumed_before_start_recovers_and_delivers_after_the_crash_boundary() 
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(EventPayload::RunState(state)).expect("state payload"),
+        payload: serde_json::to_value(EventPayload::RunState(state))
+            .expect("state payload")
+            .into(),
     };
     let mut thinking = [state_envelope(
         "queue-consume-crash-thinking",
@@ -1760,7 +1755,9 @@ async fn consumed_before_start_recovers_and_delivers_after_the_crash_boundary() 
             let events = store.read(&session_id, 0, 1024).await.expect("journal");
             if events.iter().any(|event| {
                 event.run_id.as_ref() == Some(&queued_run)
-                    && serde_json::from_value::<EventPayload>(event.payload.clone())
+                    && event
+                        .payload
+                        .decode_event()
                         .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Done))
             }) {
                 break;
@@ -1917,7 +1914,7 @@ async fn unavailable_spawn_selector_is_a_typed_continuable_rejection() {
         .expect("read parent journal");
     assert!(
         !events.iter().any(|event| matches!(
-            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            event.payload.decode_event(),
             Ok(EventPayload::AgentSpawned(_))
         )),
         "a refused selector must never create a child"
@@ -2174,12 +2171,10 @@ async fn spawned_child_inherits_parent_effort_and_fast() {
         .expect("read parent journal");
     let manifest = events
         .iter()
-        .find_map(
-            |event| match serde_json::from_value::<EventPayload>(event.payload.clone()) {
-                Ok(EventPayload::AgentSpawned(manifest)) => Some(manifest),
-                _ => None,
-            },
-        )
+        .find_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::AgentSpawned(manifest)) => Some(manifest),
+            _ => None,
+        })
         .expect("spawn manifest");
     let child_session = manifest
         .coordinates

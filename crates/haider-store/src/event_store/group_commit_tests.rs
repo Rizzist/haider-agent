@@ -28,7 +28,7 @@ fn envelope(session: &SessionId, event_id: impl Into<String>) -> RawEnvelope {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::json!({"type": "group_commit_test"}),
+        payload: serde_json::json!({"type": "group_commit_test"}).into(),
     }
 }
 

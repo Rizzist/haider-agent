@@ -63,7 +63,7 @@ async fn typed_payloads(store: &MemoryStore) -> Vec<(EventPayload, PromptRender)
         .await
         .iter()
         .filter_map(|event| {
-            serde_json::from_value::<EventPayload>(event.payload.clone())
+            serde_json::from_value::<EventPayload>(event.payload.clone().into())
                 .ok()
                 .map(|payload| (payload, event.render.prompt))
         })

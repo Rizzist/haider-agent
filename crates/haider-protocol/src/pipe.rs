@@ -6,10 +6,12 @@ use crate::history::NodeKind;
 use crate::ids::ArtifactRef;
 use crate::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use crate::peer::{PeerKind, PeerTrust};
+use crate::reply::ReplyText;
 use crate::state::{RunState, WaitReason};
 use crate::tool::{BoundedResult, ToolResultStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::io;
 
 /// Wire revision for immutable evidence carried between activation-graph
 /// stages. The bytes live in the shared CAS; journal facts carry only this
@@ -190,7 +192,7 @@ struct OpenReasoning {
 
 #[derive(Debug)]
 struct PendingReasoning {
-    summary: String,
+    summary: ReplyText,
     seq: u64,
 }
 
@@ -277,7 +279,7 @@ struct BufferedRow {
 enum ReasoningFact {
     Started { item_id: String },
     Delta { item_id: String },
-    Sealed { item_id: String, summary: String },
+    Sealed { item_id: String, summary: ReplyText },
 }
 
 impl TranscriptProjector {
@@ -590,7 +592,7 @@ fn reasoning_fact(envelope: &RawEnvelope) -> Option<ReasoningFact> {
     if !exact_reasoning_shape {
         return None;
     }
-    match serde_json::from_value::<EventPayload>(payload.clone()).ok()? {
+    match payload.decode_event().ok()? {
         EventPayload::Item(ItemEvent::Started {
             item_id,
             item: TurnItem::Reasoning { .. },
@@ -626,7 +628,7 @@ fn is_compaction_node(envelope: &RawEnvelope) -> bool {
         return false;
     }
     matches!(
-        serde_json::from_value::<EventPayload>(payload.clone()),
+        payload.decode_event(),
         Ok(EventPayload::NodeCommitted(crate::history::TreeNode {
             kind: NodeKind::Compaction { .. },
             ..
@@ -640,7 +642,7 @@ fn is_terminal_run_state(envelope: &RawEnvelope) -> bool {
         return false;
     }
     matches!(
-        serde_json::from_value::<EventPayload>(payload.clone()),
+        payload.decode_event(),
         Ok(EventPayload::RunState(
             RunState::Done | RunState::Errored | RunState::Cancelled
         ))
@@ -659,9 +661,7 @@ fn matching_result(envelope: &RawEnvelope) -> Option<(ToolJoinKey, BoundedResult
     {
         return None;
     }
-    let EventPayload::ToolResult { call_id, result } =
-        serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
-    else {
+    let EventPayload::ToolResult { call_id, result } = envelope.payload.decode_event().ok()? else {
         return None;
     };
     Some((
@@ -705,7 +705,7 @@ impl TranscriptJoiner {
             self.previous_tool_call = None;
             return None;
         }
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        let Ok(payload) = envelope.payload.decode_event() else {
             self.previous_tool_call = None;
             return None;
         };
@@ -846,11 +846,11 @@ pub fn result_preview(result: &BoundedResult) -> Option<String> {
 #[derive(Serialize)]
 struct TextRow {
     role: &'static str,
-    text: String,
+    text: ReplyText,
     /// Final `TurnItem::Reasoning.summary` for this assistant response. Pipe
     /// projection never serializes streaming reasoning deltas.
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<String>,
+    reasoning: Option<ReplyText>,
     at_ms: u64,
     seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -893,9 +893,9 @@ fn is_false(value: &bool) -> bool {
 #[derive(Serialize)]
 struct IncompleteRow {
     role: &'static str,
-    text: String,
+    text: ReplyText,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<String>,
+    reasoning: Option<ReplyText>,
     incomplete: bool,
     interruption: crate::error::ErrorPresentation,
     at_ms: u64,
@@ -996,6 +996,70 @@ enum SidecarRowKind {
 }
 
 impl SidecarRow {
+    /// Writes compact JSON while visiting reply ranges chunk-by-chunk.
+    pub fn write_json<W: io::Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
+        fn scalar<W: io::Write + ?Sized>(writer: &mut W, value: &impl Serialize) -> io::Result<()> {
+            serde_json::to_writer(writer, value).map_err(io::Error::other)
+        }
+
+        match &self.0 {
+            SidecarRowKind::Text(row) => {
+                writer.write_all(b"{\"role\":")?;
+                scalar(writer, &row.role)?;
+                writer.write_all(b",\"text\":")?;
+                row.text.write_json_string_to(writer)?;
+                if let Some(reasoning) = &row.reasoning {
+                    writer.write_all(b",\"reasoning\":")?;
+                    reasoning.write_json_string_to(writer)?;
+                }
+                writer.write_all(b",\"at_ms\":")?;
+                scalar(writer, &row.at_ms)?;
+                writer.write_all(b",\"seq\":")?;
+                scalar(writer, &row.seq)?;
+                if let Some(branch_id) = &row.branch_id {
+                    writer.write_all(b",\"branch_id\":")?;
+                    scalar(writer, branch_id)?;
+                }
+                writer.write_all(b",\"ordinal\":")?;
+                scalar(writer, &row.ordinal)?;
+                if row.compat {
+                    writer.write_all(b",\"compat\":true")?;
+                }
+                writer.write_all(b"}")
+            }
+            SidecarRowKind::Incomplete(row) => {
+                writer.write_all(b"{\"role\":")?;
+                scalar(writer, &row.role)?;
+                writer.write_all(b",\"text\":")?;
+                row.text.write_json_string_to(writer)?;
+                if let Some(reasoning) = &row.reasoning {
+                    writer.write_all(b",\"reasoning\":")?;
+                    reasoning.write_json_string_to(writer)?;
+                }
+                writer.write_all(b",\"incomplete\":true,\"interruption\":")?;
+                scalar(writer, &row.interruption)?;
+                writer.write_all(b",\"at_ms\":")?;
+                scalar(writer, &row.at_ms)?;
+                writer.write_all(b",\"seq\":")?;
+                scalar(writer, &row.seq)?;
+                if let Some(branch_id) = &row.branch_id {
+                    writer.write_all(b",\"branch_id\":")?;
+                    scalar(writer, branch_id)?;
+                }
+                writer.write_all(b",\"ordinal\":")?;
+                scalar(writer, &row.ordinal)?;
+                writer.write_all(b"}")
+            }
+            _ => serde_json::to_writer(writer, self).map_err(io::Error::other),
+        }
+    }
+
+    fn json_string(&self) -> Option<String> {
+        let mut encoded = Vec::new();
+        self.write_json(&mut encoded).ok()?;
+        String::from_utf8(encoded).ok()
+    }
+
     fn set_result(&mut self, result: &BoundedResult) {
         if let SidecarRowKind::Tool(row) = &mut self.0 {
             row.result_preview = result_preview(result);
@@ -1026,7 +1090,7 @@ impl SidecarRow {
     /// following the documented contract would drop 100% of the reasoning that
     /// release shipped. Making this a PRODUCER guarantee — rather than a caveat
     /// each client must remember — means it fails loudly instead of silently.
-    fn set_reasoning_summary(&mut self, summary: String) {
+    fn set_reasoning_summary(&mut self, summary: ReplyText) {
         let summary = (!summary.is_empty()).then_some(summary);
         let carries_reasoning = summary.is_some();
         match &mut self.0 {
@@ -1072,7 +1136,7 @@ impl SidecarRow {
                     "U  {} {} {}",
                     row.seq,
                     row.at_ms,
-                    escape_pipe_field(&row.text)
+                    escape_pipe_field(&row.text.to_owned_string())
                 )
             }
             SidecarRowKind::Text(row) => {
@@ -1080,7 +1144,7 @@ impl SidecarRow {
                     "A  {} {} {}",
                     row.seq,
                     row.at_ms,
-                    escape_pipe_field(&row.text)
+                    escape_pipe_field(&row.text.to_owned_string())
                 )
             }
             SidecarRowKind::PeerMessage(row) => format!(
@@ -1097,7 +1161,7 @@ impl SidecarRow {
                 "A! {} {} {} interrupted={}",
                 row.seq,
                 row.at_ms,
-                escape_pipe_field(&row.text),
+                escape_pipe_field(&row.text.to_owned_string()),
                 escape_pipe_field(&format!(
                     "{}: {}",
                     row.interruption.title, row.interruption.detail
@@ -1227,7 +1291,7 @@ struct SidecarProjection {
 /// the more expensive typed decode and payload clone.
 #[must_use]
 pub fn sidecar_row_line(envelope: &RawEnvelope) -> Option<String> {
-    serde_json::to_string(&sidecar_row(envelope)?).ok()
+    sidecar_row(envelope)?.json_string()
 }
 
 /// Stateful form of [`sidecar_row_line`] used by journal readers that can
@@ -1237,7 +1301,7 @@ pub fn sidecar_row_line_with(
     joiner: &mut TranscriptJoiner,
     envelope: &RawEnvelope,
 ) -> Option<String> {
-    serde_json::to_string(&sidecar_row_with(joiner, envelope)?).ok()
+    sidecar_row_with(joiner, envelope)?.json_string()
 }
 
 /// Build the structured form serialized by [`sidecar_row_line`].
@@ -1304,7 +1368,7 @@ fn sidecar_projection(
         return None;
     }
 
-    let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?;
+    let payload = envelope.payload.decode_event().ok()?;
     let seq = envelope.seq;
     let at_ms = envelope.committed_at_ms;
     let branch_id = envelope
@@ -1316,7 +1380,7 @@ fn sidecar_projection(
             NodeKind::UserTurn { text, .. } => Some(SidecarProjection {
                 row: SidecarRow(SidecarRowKind::Text(TextRow {
                     role: "user",
-                    text,
+                    text: text.into(),
                     reasoning: None,
                     at_ms,
                     seq,
@@ -1525,7 +1589,7 @@ mod tests {
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload: serde_json::to_value(payload).expect("serialize payload"),
+            payload: crate::envelope::RawPayload::from_event(payload).expect("serialize payload"),
         }
     }
 
@@ -1552,7 +1616,7 @@ mod tests {
                 EventPayload::Item(ItemEvent::Started {
                     item_id: ItemId::new(item_id),
                     item: TurnItem::Reasoning {
-                        summary: String::new(),
+                        summary: String::new().into(),
                     },
                 }),
             ),
@@ -1567,7 +1631,7 @@ mod tests {
                 EventPayload::Item(ItemEvent::Delta {
                     item_id: ItemId::new(item_id),
                     delta: ItemDelta::Reasoning {
-                        text: text.to_owned(),
+                        text: text.to_owned().into(),
                     },
                 }),
             ),
@@ -1582,7 +1646,7 @@ mod tests {
                 EventPayload::Item(ItemEvent::Completed {
                     item_id: ItemId::new(item_id),
                     item: TurnItem::Reasoning {
-                        summary: summary.to_owned(),
+                        summary: summary.to_owned().into(),
                     },
                 }),
             ),
@@ -1595,7 +1659,7 @@ mod tests {
             node(
                 seq,
                 NodeKind::AssistantCommit {
-                    text: text.to_owned(),
+                    text: text.to_owned().into(),
                     verdict: VerifyVerdict::Unverified,
                 },
             ),
@@ -1796,11 +1860,12 @@ mod tests {
         tagged_malformed.payload = serde_json::json!({
             "type": "tool_result",
             "call_id": 7,
-        });
+        })
+        .into();
         assert!(matching_result(&tagged_malformed).is_none());
 
         let mut untagged = envelope(9, EventPayload::IdleDecayed);
-        untagged.payload = serde_json::json!({"call_id": "call-peek"});
+        untagged.payload = serde_json::json!({"call_id": "call-peek"}).into();
         assert!(matching_result(&untagged).is_none());
 
         let foreign = envelope(10, EventPayload::IdleDecayed);

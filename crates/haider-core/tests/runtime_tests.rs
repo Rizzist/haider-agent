@@ -69,7 +69,7 @@ fn runtime(script: Vec<FakeStep>) -> (HarnessHandle, Arc<MemoryStore>, Arc<FakeP
 }
 
 fn typed(envelope: &RawEnvelope) -> EventPayload {
-    serde_json::from_value(envelope.payload.clone()).expect("known payload")
+    serde_json::from_value(envelope.payload.clone().into()).expect("known payload")
 }
 
 fn completed_extension(envelope: &RawEnvelope, expected_kind: &str) -> bool {
@@ -410,7 +410,8 @@ async fn m2c_end_turn_defers_once_then_waits_for_committed_abandonment() {
             value: None,
             via: AnswerVia::Rpc,
         }))
-        .expect("answer serializes"),
+        .expect("answer serializes")
+        .into(),
         ..history.last().expect("run history").clone()
     }];
     store
@@ -469,7 +470,7 @@ async fn full_turn_commits_exact_projected_sequence() {
     let events = store.events(&SessionId::new(SESSION)).await;
     let actual: Vec<_> = events
         .iter()
-        .map(|event| normalize(event.payload.clone()))
+        .map(|event| normalize(event.payload.clone().into()))
         .collect();
     let expected = vec![
         serde_json::json!({"type":"run_state","state":"queued"}),
@@ -791,14 +792,16 @@ async fn max_tokens_continues_in_the_same_logical_run() {
         .iter()
         .flat_map(|message| &message.blocks)
         .filter_map(|block| match block {
-            Block::Text { text } => Some(text.as_str()),
+            Block::Text { text } => Some(text.to_owned_string()),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert!(second_text.contains(&"partial answer"));
+    assert!(second_text.iter().any(|text| text == "partial answer"));
     assert!(
         second_text
-            .contains(&"Continue exactly where you stopped. Do not repeat completed content.")
+            .iter()
+            .any(|text| text
+                == "Continue exactly where you stopped. Do not repeat completed content.")
     );
     let events = store.events(&SessionId::new(SESSION)).await;
     assert_eq!(
@@ -1304,7 +1307,7 @@ async fn ineffective_compaction_promotes_to_a_larger_same_provider_model() {
     let window = used.saturating_mul(100).saturating_add(84) / 85;
     let mut continued_messages = messages.clone();
     continued_messages.push(Message::assistant(vec![Block::Text {
-        text: partial.clone(),
+        text: partial.clone().into(),
     }]));
     continued_messages.push(Message::user_text(
         "Continue exactly where you stopped. Do not repeat completed content.",
@@ -2045,7 +2048,7 @@ async fn max_tokens_continuation_rechecks_hard_fit_and_compacts_first() {
         history.clone(),
         current.clone(),
         Message::assistant(vec![Block::Text {
-            text: partial.clone(),
+            text: partial.clone().into(),
         }]),
         instruction.clone(),
     ];
@@ -2053,7 +2056,7 @@ async fn max_tokens_continuation_rechecks_hard_fit_and_compacts_first() {
         Message::user_text("s"),
         current.clone(),
         Message::assistant(vec![Block::Text {
-            text: partial.clone(),
+            text: partial.clone().into(),
         }]),
         instruction,
     ];
@@ -2067,7 +2070,7 @@ async fn max_tokens_continuation_rechecks_hard_fit_and_compacts_first() {
     bounded.context_compactor = Some(compactor.clone());
     let provider = Arc::new(FakeProvider::new(vec![
         FakeStep::EmitText {
-            text: partial.clone(),
+            text: partial.clone().into(),
         },
         FakeStep::Finish {
             reason: FinishReason::MaxTokens,
@@ -2110,7 +2113,7 @@ async fn proactive_compaction_can_repeat_after_continuation_growth() {
         Message::user_text("s"),
         current,
         Message::assistant(vec![Block::Text {
-            text: partial.clone(),
+            text: partial.clone().into(),
         }]),
         instruction,
     ];
@@ -2474,7 +2477,7 @@ async fn forged_generic_image_ref_fails_before_any_tool_result_is_journaled() {
             .iter()
             .all(|event| {
                 !matches!(
-                    serde_json::from_value::<EventPayload>(event.payload.clone()),
+                    serde_json::from_value::<EventPayload>(event.payload.clone().into()),
                     Ok(EventPayload::ToolResult { .. })
                 )
             })
@@ -2681,7 +2684,10 @@ async fn split_utf8_reassembles_in_completed_agent_message() {
         }) => Some(text),
         _ => None,
     });
-    assert_eq!(completed.as_deref(), Some("A🌍B"));
+    assert_eq!(
+        completed.map(|text| text.to_owned_string()).as_deref(),
+        Some("A🌍B")
+    );
 }
 
 #[tokio::test]
@@ -3181,7 +3187,7 @@ async fn network_break_after_tool_effect_replays_without_redispatch() {
             EventPayload::Item(ItemEvent::Completed {
                 item: TurnItem::AgentMessage { text },
                 ..
-            }) => Some(text.as_str()),
+            }) => Some(text.to_owned_string()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -5180,7 +5186,7 @@ impl StoreHandle for BatchRecordingStore {
         let batch = envelopes
             .iter()
             .map(|envelope| {
-                serde_json::from_value(envelope.payload.clone()).map_err(|error| {
+                serde_json::from_value(envelope.payload.clone().into()).map_err(|error| {
                     HaiderError::new(
                         ErrorCode::Internal,
                         format!("recorded payload did not decode: {error}"),
@@ -6181,12 +6187,15 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
         .iter()
         .flat_map(|message| &message.blocks)
         .filter_map(|block| match block {
-            Block::Text { text } => Some(text.as_str()),
+            Block::Text { text } => Some(text.to_owned_string()),
             _ => None,
         })
         .collect::<Vec<_>>();
     assert!(
-        !all_text.contains(&"Continue exactly where you stopped. Do not repeat completed content."),
+        !all_text
+            .iter()
+            .any(|text| text
+                == "Continue exactly where you stopped. Do not repeat completed content."),
         "pause_turn must NOT inject the MaxTokens continuation nudge"
     );
 
