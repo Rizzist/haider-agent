@@ -13,6 +13,8 @@ import ctypes
 import ctypes.util
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import time
 
@@ -22,6 +24,12 @@ PROC_PIDTASKINFO = 4
 MAX_PID_PATH = 4096
 SAMPLE_INTERVAL_NS = 1_000_000
 DISCOVERY_INTERVAL_NS = 5_000_000
+REGION_SNAPSHOT_REFRESH_NS = 10_000_000
+REGION_SNAPSHOT_HEADER = (
+    "address\tsize_bytes\tresident_bytes\tprivate_resident_bytes\t"
+    "shared_resident_bytes\tdirtied_bytes\tprotection\tmax_protection\t"
+    "user_tag\tshare_mode\toffset\tpath"
+)
 
 
 class ProcTaskInfo(ctypes.Structure):
@@ -207,6 +215,85 @@ def published_daemons(
     return labels
 
 
+def region_snapshot_metadata(
+    path: Path, expected_pid: int
+) -> tuple[dict[str, int] | None, str | None]:
+    """Parse metadata after validating every row of this PID's raw TSV."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        return None, f"cannot read output: {error}"
+    if len(lines) < 3:
+        return None, "output lacks metadata, header, or a region row"
+    metadata_fields = lines[0].split()
+    if not metadata_fields or metadata_fields[0] != "#":
+        return None, "metadata line does not start with #"
+    metadata: dict[str, int] = {}
+    try:
+        for field in metadata_fields[1:]:
+            key, value = field.split("=", 1)
+            if key in metadata:
+                return None, f"metadata repeats {key}"
+            metadata[key] = int(value)
+    except ValueError:
+        return None, "metadata contains a malformed or non-numeric field"
+    required = {
+        "pid",
+        "capture_wall_ns",
+        "rss_bytes",
+        "footprint_bytes",
+        "user_cpu_ns",
+        "system_cpu_ns",
+    }
+    if not required.issubset(metadata):
+        return None, "metadata lacks one or more required counters"
+    if metadata["pid"] != expected_pid:
+        return None, f"metadata does not name requested pid={expected_pid}"
+    if lines[1] != REGION_SNAPSHOT_HEADER:
+        return None, "TSV header does not match the region snapshot schema"
+    for index, line in enumerate(lines[2:], start=1):
+        fields = line.split("\t")
+        if len(fields) != 12:
+            return None, f"region row {index} does not have 12 TSV fields"
+        try:
+            int(fields[0], 16)
+            for value in fields[1:11]:
+                int(value)
+        except ValueError:
+            return None, f"region row {index} has a non-numeric counter"
+    return metadata, None
+
+
+def validate_region_snapshot(path: Path, expected_pid: int) -> str | None:
+    """Return an error string unless a helper emitted this PID's raw TSV."""
+    _, error = region_snapshot_metadata(path, expected_pid)
+    return error
+
+
+def capture_region_snapshot(tool: Path, pid: int, output: Path) -> str | None:
+    """Run and validate one bounded snapshot, returning an error on failure."""
+    try:
+        with output.open("wb") as snapshot:
+            completed = subprocess.run(
+                [str(tool), str(pid)],
+                stdout=snapshot,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                check=False,
+            )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        output.unlink(missing_ok=True)
+        return f"could not execute helper: {error}"
+    if completed.returncode != 0:
+        output.unlink(missing_ok=True)
+        message = completed.stderr.decode("utf-8", errors="replace").strip()
+        return f"helper status {completed.returncode}: {message}"
+    error = validate_region_snapshot(output, pid)
+    if error is not None:
+        output.unlink(missing_ok=True)
+    return error
+
+
 def sample(args: argparse.Namespace) -> int:
     if sys.platform != "darwin":
         print("m1-rss-sampler: proc_pidinfo is supported only on Darwin", file=sys.stderr)
@@ -217,6 +304,9 @@ def sample(args: argparse.Namespace) -> int:
     saw_root = False
     saw_sample = False
     saw_daemon = False
+    region_snapshot_rss = 0
+    region_snapshot_last_mono = 0
+    region_snapshot_error: str | None = None
     next_sample = time.monotonic_ns()
     next_discovery = next_sample
     sampler_started_wall_ns = time.time_ns()
@@ -254,6 +344,41 @@ def sample(args: argparse.Namespace) -> int:
                 saw_sample = True
                 saw_daemon = saw_daemon or label == "haiderd"
                 pending_lines.append(f"{wall_ns}\t{now_mono}\t{pid}\t{label}\t{rss}\n")
+                if (
+                    label == "haiderd"
+                    and args.region_snapshot_tool is not None
+                    and region_snapshot_error is None
+                    and rss >= args.region_snapshot_threshold_bytes
+                    and (
+                        region_snapshot_rss == 0
+                        or rss
+                        >= region_snapshot_rss
+                        + args.region_snapshot_min_growth_bytes
+                        or now_mono
+                        >= region_snapshot_last_mono + REGION_SNAPSHOT_REFRESH_NS
+                    )
+                ):
+                    assert args.region_snapshot_output is not None
+                    args.region_snapshot_output.parent.mkdir(parents=True, exist_ok=True)
+                    captured_snapshot = args.region_snapshot_output.with_name(
+                        f"{args.region_snapshot_output.stem}-{wall_ns}-{rss}"
+                        f"{args.region_snapshot_output.suffix}"
+                    )
+                    temporary_snapshot = captured_snapshot.with_suffix(".tmp")
+                    error = capture_region_snapshot(
+                        args.region_snapshot_tool, pid, temporary_snapshot
+                    )
+                    if error is None:
+                        temporary_snapshot.replace(captured_snapshot)
+                        shutil.copyfile(captured_snapshot, args.region_snapshot_output)
+                        region_snapshot_rss = rss
+                        region_snapshot_last_mono = now_mono
+                    else:
+                        region_snapshot_error = error
+                        print(
+                            f"m1-rss-sampler: region snapshot failed: {error}",
+                            file=sys.stderr,
+                        )
             if len(pending_lines) >= 32:
                 output.writelines(pending_lines)
                 pending_lines.clear()
@@ -276,10 +401,18 @@ def sample(args: argparse.Namespace) -> int:
     if args.require_daemon and not saw_daemon:
         print("m1-rss-sampler: daemon PID was never observed", file=sys.stderr)
         return 5
+    if region_snapshot_error is not None:
+        return 7
+    if args.region_snapshot_tool is not None and region_snapshot_rss == 0:
+        print(
+            "m1-rss-sampler: daemon never crossed the region snapshot threshold",
+            file=sys.stderr,
+        )
+        return 6
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
+def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--root-pid-file", required=True, type=Path)
@@ -287,13 +420,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pid", action="append", default=[], type=parse_named_pid)
     parser.add_argument("--daemon-pid-dir", action="append", default=[], type=Path)
     parser.add_argument("--require-daemon", action="store_true")
+    parser.add_argument("--region-snapshot-tool", type=Path)
+    parser.add_argument("--region-snapshot-output", type=Path)
+    parser.add_argument("--region-snapshot-threshold-bytes", type=int, default=0)
+    parser.add_argument("--region-snapshot-min-growth-bytes", type=int, default=1)
     parser.add_argument(
         "--label-all-descendants-as-daemon",
         action="store_true",
         help="self-test only: prove parent discovery without requiring a haiderd binary",
     )
-    return parser
+    args = parser.parse_args()
+    if (args.region_snapshot_tool is None) != (args.region_snapshot_output is None):
+        parser.error(
+            "--region-snapshot-tool and --region-snapshot-output must be supplied together"
+        )
+    if args.region_snapshot_threshold_bytes < 0:
+        parser.error("--region-snapshot-threshold-bytes must be non-negative")
+    if args.region_snapshot_min_growth_bytes < 1:
+        parser.error("--region-snapshot-min-growth-bytes must be positive")
+    return args
 
 
 if __name__ == "__main__":
-    raise SystemExit(sample(build_parser().parse_args()))
+    raise SystemExit(sample(parse_arguments()))

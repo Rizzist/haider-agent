@@ -98,3 +98,23 @@ Read against the final uncommitted tree before verification. “checked: none”
 - #94 fixed — every nested wait is a named product budget; arithmetic is in each check
 - #95 fixed — retained RPC links have a dedicated Ping/Pong reader and continuous request deadline
 - #96 fixed — turn-wall timing is accepted only for one same-PID/generation warm settled daemon, exactly 25 valid samples per shape, exact physical provider counts 1/2, one monotonic local `process_exec` effect per tool case, and start/mid/end one-minute load strictly below 4; overload or an unsettled harness rejects timing without rewriting correctness. The CI artefact retains raw samples, median/MAD, wall/CPU/peak RSS, request ledgers, and binary/daemon/proxy/harness hashes; the separate exact-cardinality trace-on companion retains correlated stage timestamps.
+
+## v0.0.970 codepagediet delta walk
+
+- #1-#18 checked: none — measurement tooling and documentation only; no affected product surface
+- #19 fixed — shell syntax, Python compilation, strict C compilation, focused region tests, and `git diff --check` cover the changed surface
+- #20-#40 checked: none — no affected product surface or Rust test-count change
+- #41 checked — M1 and turn-wall probes retain short hermetic temporary roots
+- #42-#43 checked: none — no affected installed-warmup or product surface
+- #44 checked — the unchanged warm and one-shot harnesses exercise the real UDS daemon path; `vmmap` denial does not weaken that probe
+- #45-#63 checked: none — no affected product surface
+- #64 checked — baseline `haiderd` is 52,341,120 bytes and the isolated PGO candidate is 45,373,872 bytes, both above 10 MiB
+- #65-#70 checked: none — no affected product surface
+- #71 checked — exact frozen client/daemon pairs are exercised end to end against the fake proxy and durable tool effect
+- #72 checked — native discovery remains intentionally disabled in the hermetic measurement environment
+- #73-#76 checked — throwaway HOME/profile/runtime ownership is retained; no fixed-byte product source window changed
+- #77 checked — no Rust unsafe delta; the bounded Darwin libproc helper passes `clang -Wall -Wextra -Werror`
+- #78-#93 checked: none — no affected product surface
+- #94 checked — no product deadline changed; the diagnostic helper has a bounded five-second subprocess timeout and fails closed
+- #95 checked: none — no new wait while a negotiated connection is open
+- #96 fixed — warm/one-shot authority still requires start/mid/end load below 3; M1 now additionally records and gates both pre-run and post-run load below 3
