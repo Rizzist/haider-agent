@@ -1469,6 +1469,7 @@ fn connection_context(
         pid_file_path: std::path::PathBuf::from("/tmp/haiderd.pid"),
         idle_ttl_ms: None,
         warm: false,
+        readiness: crate::lifecycle::ready_for_tests(),
     }
 }
 

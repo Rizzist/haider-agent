@@ -2021,6 +2021,14 @@ enum ActorCommand {
     Stop,
 }
 
+#[derive(Clone)]
+pub(crate) struct DaemonRuntimeView {
+    pub(crate) paths: (std::path::PathBuf, std::path::PathBuf),
+    pub(crate) idle_ttl_ms: Option<u64>,
+    pub(crate) warm: bool,
+    pub(crate) readiness: crate::Readiness,
+}
+
 /// One negotiated connection's authorization and attachment ownership.
 pub struct HubConnection {
     hub: SessionHub,
@@ -2035,6 +2043,7 @@ pub struct HubConnection {
     runtime_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     daemon_idle_ttl_ms: Option<u64>,
     daemon_warm: bool,
+    daemon_readiness: Option<crate::Readiness>,
     /// Connection-scoped staged secrets (R7): wiped on close/disconnect.
     stages: Mutex<crate::accounts::StagedSecrets>,
     /// At most one connection-scoped roster ticker. The task owns no
@@ -4394,7 +4403,7 @@ impl SessionHub {
         sink: Arc<dyn FrameSink>,
         transport: crate::accounts::ConnectionTransport,
     ) -> Result<HubConnection, SessionHubError> {
-        self.open_connection_with_runtime_paths(capabilities, sink, transport, None, None, false)
+        self.open_connection_with_runtime_paths(capabilities, sink, transport, None)
     }
 
     pub(crate) fn open_connection_with_runtime_paths(
@@ -4402,14 +4411,21 @@ impl SessionHub {
         capabilities: CapabilitySet,
         sink: Arc<dyn FrameSink>,
         transport: crate::accounts::ConnectionTransport,
-        runtime_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
-        daemon_idle_ttl_ms: Option<u64>,
-        daemon_warm: bool,
+        runtime: Option<DaemonRuntimeView>,
     ) -> Result<HubConnection, SessionHubError> {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(SessionHubError::Closed);
         }
         let connection_id = random_id("connection")?;
+        let (runtime_paths, daemon_idle_ttl_ms, daemon_warm, daemon_readiness) = match runtime {
+            Some(runtime) => (
+                Some(runtime.paths),
+                runtime.idle_ttl_ms,
+                runtime.warm,
+                Some(runtime.readiness),
+            ),
+            None => (None, None, false, None),
+        };
         let may_view_binding =
             capabilities.contains(&Capability::View) || capabilities.contains(&Capability::Control);
         // The state lock spans registration and baseline admission. A
@@ -4469,6 +4485,7 @@ impl SessionHub {
             runtime_paths,
             daemon_idle_ttl_ms,
             daemon_warm,
+            daemon_readiness,
             stages: Mutex::new(crate::accounts::StagedSecrets::default()),
             roster_watch: Mutex::new(None),
             accounts_watch: Mutex::new(None),

@@ -2487,6 +2487,7 @@ impl UdsControlClient {
             pid_file_path: PathBuf::from("/tmp/haiderd.pid"),
             idle_ttl_ms: None,
             warm: false,
+            readiness: crate::lifecycle::ready_for_tests(),
         };
         let (drain_sender, drain) = watch::channel(Option::<DrainNotice>::None);
         let serve_task = tokio::spawn(async move {

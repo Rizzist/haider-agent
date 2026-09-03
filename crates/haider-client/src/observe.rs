@@ -117,6 +117,11 @@ pub struct ObserveStatusSnapshot {
     /// The daemon's serving edge. For pre-feature daemons, a negotiated
     /// Ready Welcome is the compatible source of the same lifecycle fact.
     pub ready: bool,
+    /// Unix epoch milliseconds at the positive Ready edge.
+    pub ready_since: Option<u64>,
+    /// Whether the daemon provider registry/factories finished loading.
+    /// Providers themselves still connect per request.
+    pub providers_loaded: bool,
     /// Effective idle TTL; zero is one-shot and `None` is unbounded/unknown.
     pub idle_ttl_ms: Option<u64>,
     /// Whether pre-ready boot work remains resident for the first client.
@@ -271,6 +276,8 @@ impl ObserveClient {
                 socket_path,
                 pid_file_path,
                 ready,
+                ready_since,
+                providers_loaded,
                 idle_ttl_ms,
                 warm,
             } => Ok(ObserveStatusSnapshot {
@@ -281,6 +288,8 @@ impl ObserveClient {
                 daemon_pid,
                 socket_path,
                 pid_file_path,
+                ready_since,
+                providers_loaded,
                 idle_ttl_ms,
                 warm,
                 ready: if self

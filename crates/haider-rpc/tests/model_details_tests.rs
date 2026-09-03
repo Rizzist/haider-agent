@@ -46,6 +46,7 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
                 default_effort: None,
                 supported_speeds: Vec::new(),
                 supports_thinking_type: None,
+                supports_vision: None,
             },
             ModelDetailWire {
                 name: "frontier-b".to_owned(),
@@ -55,6 +56,7 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
                 default_effort: None,
                 supported_speeds: Vec::new(),
                 supports_thinking_type: None,
+                supports_vision: None,
             },
         ],
         inventory_fetched_at_ms: None,

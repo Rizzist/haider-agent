@@ -10,6 +10,7 @@
 //! - loser diagnostics             -> `already_running_error_carries_incumbent_diagnostics`
 //! - stale-PID-reuse               -> `stale_pid_reuse_is_diagnostic_only_and_does_not_block_start`
 //! - cold-start socket-missing     -> `cold_start_socket_missing_serves_handshake_ping_and_session_list`
+//! - positive readiness predicate -> `readiness_is_false_during_injected_pre_ready_pause_and_true_after`
 //! - failed-listener startup       -> `failed_listener_startup_publishes_failed_and_releases_profile_lock`
 //! - abrupt-death (kill -9)        -> `abrupt_death_kill_9_leaves_recoverable_socket_and_next_start_serves`
 //! - reconcile-before-ready        -> `reconcile_before_ready_marks_unknown_exactly_once_and_never_retries_effect`
@@ -379,6 +380,75 @@ async fn wait_for_state(
     })
     .await
     .expect("readiness state deadline")
+}
+
+/// MUTATION CHECK: hardcode the status bit, omit any readiness prerequisite,
+/// or publish Ready before the injected boundary. Expected failure: the
+/// pre-Ready snapshot becomes true or the post-Ready RPC loses its timestamp.
+#[tokio::test]
+async fn readiness_is_false_during_injected_pre_ready_pause_and_true_after() {
+    let root = test_root("readiness-predicate");
+    let mut config = test_config(&root, "readiness-predicate-profile");
+    config.inject_before_ready_delay = Some(Duration::from_millis(500));
+    let task = spawn(config.clone());
+    let readiness = task.readiness();
+    let pid_file = config.runtime_dir.join(haider_daemon::DAEMON_PID_FILE);
+
+    tokio::time::timeout(DEADLINE, async {
+        while !pid_file.exists() {
+            tokio::time::sleep(POLL_BACKOFF).await;
+        }
+    })
+    .await
+    .expect("daemon-owned PID publication before the injected Ready pause");
+
+    assert_eq!(readiness.current(), DaemonState::Recovering);
+    let before = readiness.snapshot();
+    assert!(!before.ready);
+    assert_eq!(before.ready_since_unix_ms, None);
+    assert!(
+        before.providers_loaded,
+        "provider registry must be loaded before the final hub-serving gate"
+    );
+
+    wait_for_state(readiness.clone(), |state| *state == DaemonState::Ready).await;
+    let after = readiness.snapshot();
+    assert!(after.ready);
+    assert!(
+        after
+            .ready_since_unix_ms
+            .is_some_and(|timestamp| timestamp > 0)
+    );
+    assert!(after.providers_loaded);
+
+    let mut client = handshake(&config.endpoint_path(), config.frame_limit).await;
+    client
+        .send(
+            &WireFrame::Request {
+                request_id: RequestId::new("positive-readiness"),
+                body: RequestBody::StatusSnapshot {},
+            },
+            config.frame_limit,
+        )
+        .await;
+    assert!(matches!(
+        client.receive_reply().await,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::StatusSnapshot {
+                ready: true,
+                ready_since: Some(timestamp),
+                providers_loaded: true,
+                ..
+            },
+        } if request_id.as_str() == "positive-readiness" && timestamp > 0
+    ));
+
+    task.shutdown_handle().request("test complete");
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
+    );
 }
 
 fn raw_event(

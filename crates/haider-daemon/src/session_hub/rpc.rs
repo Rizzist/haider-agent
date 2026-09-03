@@ -7283,6 +7283,7 @@ impl HubConnection {
                 runtime_paths: None,
                 daemon_idle_ttl_ms: self.daemon_idle_ttl_ms,
                 daemon_warm: self.daemon_warm,
+                daemon_readiness: self.daemon_readiness.clone(),
                 stages: Mutex::new(crate::accounts::StagedSecrets::default()),
                 roster_watch: Mutex::new(None),
                 accounts_watch: Mutex::new(None),
@@ -15647,6 +15648,10 @@ impl HubConnection {
         )
         .unwrap_or(u64::MAX);
         let runtime = self.runtime_paths.as_ref();
+        let readiness = self
+            .daemon_readiness
+            .as_ref()
+            .map(crate::Readiness::snapshot);
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::StatusSnapshot {
@@ -15660,10 +15665,9 @@ impl HubConnection {
                     .map(|(_, pid_file_path)| pid_file_path.display().to_string()),
                 idle_ttl_ms: self.daemon_idle_ttl_ms,
                 warm: self.daemon_warm,
-                // A request can reach this handler only after the runtime
-                // publishes Ready and starts the accept loop. The same edge
-                // drives DaemonReadyNotifier in runtime.rs.
-                ready: true,
+                ready: readiness.is_some_and(|snapshot| snapshot.ready),
+                ready_since: readiness.and_then(|snapshot| snapshot.ready_since_unix_ms),
+                providers_loaded: readiness.is_some_and(|snapshot| snapshot.providers_loaded),
             },
         })
     }

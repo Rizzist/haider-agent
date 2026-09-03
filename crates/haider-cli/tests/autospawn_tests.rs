@@ -693,6 +693,9 @@ fn repeated_run_invocations_default_to_one_warm_daemon_until_operator_stop() {
     assert_eq!(status["daemon"]["pid"], daemon_pid);
     assert_eq!(status["daemon"]["idle_ttl_ms"], 30_000);
     assert_eq!(status["daemon"]["warm"], true);
+    assert_eq!(status["daemon"]["ready"], true);
+    assert!(status["daemon"]["ready_since"].as_u64().is_some());
+    assert_eq!(status["daemon"]["providers_loaded"], true);
     assert!(
         process_exists(daemon_pid),
         "warm daemon must still be alive"
@@ -721,6 +724,206 @@ fn repeated_run_invocations_default_to_one_warm_daemon_until_operator_stop() {
         !profile.endpoint_path.exists(),
         "operator stop must remove the profile endpoint"
     );
+}
+
+// MUTATION CHECK: notify the launcher on Recovering, make `--ready` trust
+// process/PID existence, or let immediate clients give up after losing their
+// daemon-candidate race. Expected failure: the starter exits before the
+// delayed readiness edge or at least one of the N client turns fails.
+#[test]
+fn clients_immediately_after_daemon_pid_publication_all_wait_and_succeed() {
+    const CLIENTS: usize = 4;
+    const READY_DELAY_MS: u64 = 750;
+
+    ensure_haiderd_built();
+    let store = tempfile::tempdir().expect("store dir");
+    let profile = resolved_for(store.path());
+    let guard = DaemonGuard {
+        store: store.path().to_path_buf(),
+    };
+    let fake_steps = (0..CLIENTS)
+        .flat_map(|index| {
+            [
+                serde_json::json!({"step": "emit_text", "text": format!("ok-{index}")}),
+                serde_json::json!({"step": "finish", "reason": "end_turn"}),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let fake_script = serde_json::to_string(&fake_steps).expect("fake script JSON");
+
+    let mut starter = haider_command(store.path())
+        .arg("--ready")
+        .env("HAIDER_TEST_FAKE_PROVIDER", &fake_script)
+        .env("HAIDER_TEST_READY_DELAY_MS", READY_DELAY_MS.to_string())
+        .spawn()
+        .expect("spawn readiness launcher");
+
+    let pid_deadline = Instant::now() + CHILD_EXIT_TIMEOUT;
+    let daemon_pid = loop {
+        if let Some(pid) = guard.pid() {
+            break pid;
+        }
+        assert!(
+            Instant::now() < pid_deadline,
+            "daemon did not publish its early profile-lock PID"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        starter.try_wait().expect("poll --ready launcher").is_none(),
+        "--ready must not exit on PID publication before positive readiness"
+    );
+
+    let clients = (0..CLIENTS)
+        .map(|index| {
+            haider_command(store.path())
+                .args([
+                    "run",
+                    "--provider",
+                    "fake",
+                    "--json",
+                    "-p",
+                    &format!("immediate client {index}"),
+                ])
+                .env("HAIDER_TEST_FAKE_PROVIDER", &fake_script)
+                .spawn()
+                .unwrap_or_else(|error| panic!("spawn immediate client {index}: {error}"))
+        })
+        .collect::<Vec<_>>();
+    for (index, client) in clients.into_iter().enumerate() {
+        let output = wait_for_output(client, &format!("immediate client {index}"));
+        assert!(
+            output.status.success(),
+            "immediate client {index} failed: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let _: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("client {index} stdout is JSON: {error}"));
+    }
+
+    let starter = wait_for_output(starter, "positive-readiness launcher");
+    assert!(
+        starter.status.success(),
+        "--ready failed: status={} stdout={} stderr={}",
+        starter.status,
+        String::from_utf8_lossy(&starter.stdout),
+        String::from_utf8_lossy(&starter.stderr),
+    );
+    assert!(String::from_utf8_lossy(&starter.stdout).contains("daemon ready"));
+    assert_eq!(
+        guard.pid(),
+        Some(daemon_pid),
+        "one daemon must serve every client"
+    );
+
+    let status_output = output_with_timeout(
+        haider_command(store.path()).args(["status", "--json", "--no-spawn"]),
+        "post-race readiness status",
+    );
+    assert!(status_output.status.success());
+    let status: serde_json::Value =
+        serde_json::from_slice(&status_output.stdout).expect("status stdout is JSON");
+    assert_eq!(status["daemon"]["pid"], daemon_pid);
+    assert_eq!(status["daemon"]["ready"], true);
+    assert!(status["daemon"]["ready_since"].as_u64().is_some());
+    assert_eq!(status["daemon"]["providers_loaded"], true);
+
+    guard.terminate_and_wait(&profile.endpoint_path);
+}
+
+// MUTATION CHECK: notify the inherited startup pipe from Recovering instead
+// of the shared positive predicate. Expected failure: the first timeout sees
+// the early byte after the daemon-owned PID file appears.
+#[test]
+fn launcher_readiness_pipe_stays_silent_until_positive_predicate() {
+    const READY_DELAY_MS: u64 = 3_000;
+    const SILENCE_WINDOW: Duration = Duration::from_millis(200);
+
+    let haiderd = ensure_haiderd_built();
+    let store = tempfile::tempdir().expect("store dir");
+    let profile = resolved_for(store.path());
+    let guard = DaemonGuard {
+        store: store.path().to_path_buf(),
+    };
+    let log_path =
+        haider_platform::allocate_daemon_log_path(&profile.store_dir).expect("allocate daemon log");
+    let ready_delay = READY_DELAY_MS.to_string();
+    let machine_home = test_home(store.path());
+    let machine_home = machine_home.to_str().expect("UTF-8 machine-user home");
+    let spawned = haider_platform::spawn_daemon_with_readiness_and_environment(
+        haider_platform::DaemonSpawn {
+            binary: &haiderd,
+            profile_id: &profile.profile_id,
+            store_dir: &profile.store_dir,
+            runtime_dir: &profile.runtime_dir,
+            log_path: &log_path,
+        },
+        &[
+            (
+                "HAIDER_TEST_FAKE_PROVIDER",
+                r#"[{"step":"finish","reason":"end_turn"}]"#,
+            ),
+            ("HAIDER_TEST_READY_DELAY_MS", &ready_delay),
+            ("HAIDER_DISCOVERY_DISABLED", "1"),
+            ("HOME", machine_home),
+            ("USERPROFILE", machine_home),
+        ],
+    )
+    .expect("spawn daemon with a directly observable readiness pipe");
+    let haider_platform::SpawnedDaemon {
+        mut child,
+        readiness,
+    } = spawned;
+
+    let pid_file = profile.runtime_dir.join("haiderd.pid");
+    let pid_deadline = Instant::now() + CHILD_EXIT_TIMEOUT;
+    while !pid_file.exists() {
+        if let Some(status) = child.try_wait().expect("poll direct readiness daemon") {
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            panic!("daemon exited before PID-file publication: {status}; log={log}");
+        }
+        assert!(
+            Instant::now() < pid_deadline,
+            "daemon did not publish its PID file before the injected pause"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("readiness test runtime");
+    runtime.block_on(async {
+        let mut readiness = Box::pin(readiness.wait());
+        // The 200 ms observation is bounded by a 3,000 ms injected pause,
+        // leaving 2,800 ms of scheduler headroom after PID-file observation.
+        assert!(
+            tokio::time::timeout(SILENCE_WINDOW, &mut readiness)
+                .await
+                .is_err(),
+            "launcher readiness pipe fired before the positive predicate"
+        );
+        tokio::time::timeout(CHILD_EXIT_TIMEOUT, &mut readiness)
+            .await
+            .expect("positive readiness pipe deadline")
+            .expect("positive readiness pipe result");
+    });
+
+    let pid = guard.pid().expect("running daemon PID before cleanup");
+    let signal = Command::new("kill")
+        .arg(pid.to_string())
+        .status()
+        .expect("signal daemon after readiness assertion");
+    assert!(signal.success(), "signal daemon: {signal}");
+    let output = wait_for_output(child, "direct readiness daemon shutdown");
+    assert!(
+        output.status.success(),
+        "daemon shutdown: {}",
+        output.status
+    );
+    assert!(!profile.endpoint_path.exists());
 }
 
 // MUTATION CHECK: R8 concurrent-launch arbitration — the store lock elects

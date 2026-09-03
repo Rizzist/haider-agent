@@ -40,8 +40,8 @@ mod connection_duplex_tests;
 mod connection_tests;
 
 use crate::session_hub::{
-    AdmissionTicket, FrameSendError, FrameSink, HubConnection, PreparedFrame, SendAdmission,
-    SessionHub,
+    AdmissionTicket, DaemonRuntimeView, FrameSendError, FrameSink, HubConnection, PreparedFrame,
+    SendAdmission, SessionHub,
 };
 use crate::{DaemonError, ShutdownHandle};
 use haider_client::DAEMON_STOP_CLIENT_NAME;
@@ -1238,6 +1238,8 @@ pub(crate) struct ConnectionContext {
     pub(crate) idle_ttl_ms: Option<u64>,
     /// True only when pre-ready boot work remains resident for the first client.
     pub(crate) warm: bool,
+    /// Shared positive-readiness predicate used by status and the launcher.
+    pub(crate) readiness: crate::Readiness,
 }
 
 /// Runs one client connection to completion: UID gate, framed read loop,
@@ -1821,9 +1823,12 @@ async fn handle_frame(
                         granted.capabilities.clone(),
                         sink,
                         crate::accounts::ConnectionTransport::LocalSameUid,
-                        Some((context.endpoint_path.clone(), context.pid_file_path.clone())),
-                        context.idle_ttl_ms,
-                        context.warm,
+                        Some(DaemonRuntimeView {
+                            paths: (context.endpoint_path.clone(), context.pid_file_path.clone()),
+                            idle_ttl_ms: context.idle_ttl_ms,
+                            warm: context.warm,
+                            readiness: context.readiness.clone(),
+                        }),
                     )
                     .map_err(DaemonError::from)?,
             );
@@ -1992,8 +1997,8 @@ async fn handle_frame(
 
 /// Version/capability negotiation via haider-rpc, answered with a `Welcome`
 /// carrying instance id, daemon generation, frame limit, and the honest
-/// lifecycle phase (`Draining` once the drain broadcast fired, else `Ready` —
-/// connections are only accepted between those two states).
+/// lifecycle phase (`Draining` once the drain broadcast fired; otherwise the
+/// same positive readiness predicate used by status and the launcher).
 fn negotiate_hello(
     hello: Hello,
     context: &ConnectionContext,
@@ -2022,8 +2027,10 @@ fn negotiate_hello(
     };
     let lifecycle_phase = if drain.borrow().is_some() {
         LifecyclePhase::Draining
-    } else {
+    } else if context.readiness.snapshot().ready {
         LifecyclePhase::Ready
+    } else {
+        context.readiness.current().phase()
     };
     if lifecycle_phase == LifecyclePhase::Draining
         && hello.client_name == DAEMON_STOP_CLIENT_NAME

@@ -3301,6 +3301,16 @@ pub enum AppRequest {
     AttachRead {
         path: String,
     },
+    /// ⌃V / ⌘V / ⌃⇧V: read the OS CLIPBOARD (970 owner bug 2).
+    ///
+    /// Bracketed paste carries text and only text — no terminal delivers
+    /// image bytes through it — so a clipboard picture has to be fetched
+    /// from the OS on the keystroke. The read is SHELL-owned for exactly
+    /// the reason [`Self::AttachRead`] is: the reducer performs no IO. The
+    /// outcome re-enters through [`crate::runtime::clipboard_paste_effects`]
+    /// — a chip + upload, an image notice, or nothing at all when the
+    /// clipboard holds text (which the terminal's own paste already owns).
+    ClipboardRead,
     /// Upload one attachment's bytes into the daemon CAS (B4b) — the
     /// receipt-free `artifact.put` (content-addressed, naturally
     /// idempotent; deliberately NO command id and never outboxed).
@@ -4285,6 +4295,40 @@ impl std::fmt::Debug for ArtifactBytes {
 /// still in hand, instead of durably accepting a submit the daemon must
 /// bounce. The daemon stays the authority — these only pre-empt.
 pub const MAX_TURN_ATTACHMENTS: usize = 5;
+
+/// Why the composer refused (or could not obtain) an IMAGE — the ONE
+/// vocabulary shared by BOTH image entry points, `/attach <path>` and the
+/// ⌃V clipboard paste (970 owner bug 2), so the two can never word the same
+/// refusal differently.
+///
+/// It is a typed value rather than a string because the refusal is a fact
+/// about the SESSION (which model, which failure), and the tests assert the
+/// fact — not a sentence someone may reword later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageNotice {
+    /// The session's current pair DECLARES it does not accept images.
+    NoVision { model: String },
+    /// The clipboard held nothing an attachment could be made from.
+    ClipboardEmpty,
+    /// The clipboard could not be read at all (no clipboard server, a
+    /// locked Windows clipboard, an image we could not decode).
+    ClipboardUnreadable { note: String },
+}
+
+impl ImageNotice {
+    /// The rendered sentence. `NoVision` names the model AND both ways out,
+    /// because a bare refusal leaves the user guessing.
+    #[must_use]
+    pub fn text(&self) -> String {
+        match self {
+            Self::NoVision { model } => format!(
+                "{model} does not accept images — pick a vision model or /attach as text"
+            ),
+            Self::ClipboardEmpty => "nothing on the clipboard to paste".to_owned(),
+            Self::ClipboardUnreadable { note } => format!("clipboard — {note}"),
+        }
+    }
+}
 pub const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 
 /// Render a release version with exactly one conventional `v` prefix.
@@ -5011,6 +5055,14 @@ pub struct AppModel {
     /// One-line transient notice shown in the status bar until the next
     /// keystroke (honest stubs: "/tree lands with the daemon").
     pub flash: Option<String>,
+    /// A refused/failed IMAGE, shown as its own row INSIDE the composer
+    /// band until the next keystroke (970 owner bug 2). It rides the band
+    /// rather than the status bar because it answers something the user
+    /// just did to the DRAFT — and because the draft is deliberately kept,
+    /// the notice has to sit where the draft is. Same shared-predicate
+    /// discipline as the attachment chip row: `render::composer_height`
+    /// and `render::render_composer` both read THIS field.
+    pub composer_notice: Option<ImageNotice>,
     /// A production release newer than this process, discovered by the
     /// shell. Profile-wide and screen-independent: the quiet status-bar
     /// indicator persists until a later check proves the process current or
@@ -5343,6 +5395,7 @@ impl Default for AppModel {
             lockdown_provider: None,
             lockdown_boundary_known: false,
             flash: None,
+            composer_notice: None,
             update_available: None,
             profile_diagnostic: None,
             compatibility_diagnostic: None,
@@ -5603,6 +5656,55 @@ impl AppModel {
         self.requests.push(AppRequest::AttachRead {
             path: path.to_owned(),
         });
+        self.dirty = true;
+    }
+
+    /// ⌃V / ⌘V / ⌃⇧V — attach the OS clipboard's IMAGE (970 owner bug 2).
+    ///
+    /// This is `/attach` with a different source of bytes, so it holds
+    /// EXACTLY the same gates in the same order, and the bytes land through
+    /// the same seam ([`Self::begin_attachment_upload`]) wearing the same
+    /// chip. Two differences, both deliberate:
+    ///
+    /// * the read is issued blind. The reducer cannot know whether the
+    ///   clipboard holds an image, text or nothing without performing IO,
+    ///   so the vision gate is re-checked in the shell effect once the
+    ///   content is actually known — a picture is refused there, and TEXT
+    ///   never reaches the gate at all;
+    /// * a wrong-surface press is SILENT. ⌃V is a keystroke, not a typed
+    ///   command: flashing "session only" at someone who reflex-pasted on
+    ///   the launcher would be noise, where `/attach` was a deliberate ask
+    ///   that deserves an answer.
+    fn paste_clipboard_image(&mut self) {
+        if self.screen != Screen::Session {
+            return;
+        }
+        // Same live-mode law as `/attach`: attachments are daemon CAS
+        // truth, and the demo has no store to hold bytes.
+        if self.mode.fabricates_locally() {
+            self.flash =
+                Some("· paste — live only; attachments ride the daemon's store".to_owned());
+            self.dirty = true;
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_ARTIFACT_PUT_V1) {
+            self.flash = Some(self.stale_daemon_note("attachments"));
+            self.dirty = true;
+            return;
+        }
+        if self.composer.attachments().len() >= MAX_TURN_ATTACHMENTS {
+            self.flash = Some("· 5 attachments a turn — ⌫ at the start removes one".to_owned());
+            self.dirty = true;
+            return;
+        }
+        // The vision gate BEFORE the read, when the answer is already
+        // known: a pair that declares no vision never pays for a clipboard
+        // round trip. The draft is kept, untouched.
+        if let Some(notice) = self.image_refusal() {
+            self.set_composer_notice(notice);
+            return;
+        }
+        self.requests.push(AppRequest::ClipboardRead);
         self.dirty = true;
     }
 
@@ -6313,6 +6415,36 @@ impl AppModel {
             })
     }
 
+    /// Whether the session's CURRENT pair accepts image attachments, as the
+    /// DAEMON projects it (`ModelDetailWire::supports_vision`, itself a
+    /// projection of each adapter's `capabilities().vision`).
+    ///
+    /// `None` is "the daemon says nothing about this pair" — an older
+    /// daemon, or a catalog row from before the field existed. The client
+    /// holds no tables and must NOT invent the answer: it attaches and lets
+    /// the daemon refuse with its typed `vision_unsupported`. Only a
+    /// DECLARED `Some(false)` is a refusal this side may act on.
+    #[must_use]
+    pub fn pair_accepts_images(&self) -> Option<bool> {
+        self.current_pair_detail()
+            .and_then(|detail| detail.supports_vision)
+    }
+
+    /// The refusal to raise when this pair cannot take a picture, or `None`
+    /// when an image may proceed. The ONE gate both image entry points use.
+    #[must_use]
+    pub fn image_refusal(&self) -> Option<ImageNotice> {
+        (self.pair_accepts_images() == Some(false)).then(|| ImageNotice::NoVision {
+            model: self.identity.model_short.clone(),
+        })
+    }
+
+    /// Raise an image notice on the composer band, keeping the draft.
+    pub fn set_composer_notice(&mut self, notice: ImageNotice) {
+        self.composer_notice = Some(notice);
+        self.dirty = true;
+    }
+
     pub fn palette_items(&self) -> Vec<PaletteItem> {
         palette_items(
             self.composer.text().trim_start_matches('/'),
@@ -6379,6 +6511,11 @@ impl AppModel {
             AppEvent::Key(key) => {
                 self.dirty = true;
                 self.flash = None;
+                // The image notice is transient exactly like the flash: it
+                // answers ONE gesture, and the next keystroke is the user
+                // moving on. Cleared BEFORE dispatch so the very key that
+                // raises a new one (⌃V) still shows it.
+                self.composer_notice = None;
                 // The masked login card OWNS the keyboard while it is open
                 // (W3c3 M3): a key must never reach the composer, the
                 // palette, the input ring or a selection gate, because
@@ -7361,6 +7498,28 @@ impl AppModel {
                 KeyCode::Char('f') => self.tree_fork_selected(),
                 _ => {}
             }
+            return;
+        }
+
+        // 970 owner bug 2 — the PASTE-IMAGE chord, ahead of the plain ⌃
+        // block so it catches every spelling terminals actually send:
+        // ⌃V (passed through everywhere), ⌘V (macOS terminals speaking the
+        // kitty keyboard protocol, which report SUPER), and ⌃⇧V (the Linux
+        // terminal paste chord, when the emulator forwards it instead of
+        // answering it). A terminal that answers the chord ITSELF sends a
+        // bracketed paste instead — that is the TEXT path, and it is
+        // untouched by this arm.
+        //
+        // Loom keeps its own ⌃V (`/validate`), so it is excluded rather
+        // than shadowed.
+        if matches!(key.code, KeyCode::Char('v' | 'V'))
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+            && self.screen != Screen::Loom
+            && self.composer_owns_input()
+        {
+            self.paste_clipboard_image();
             return;
         }
 

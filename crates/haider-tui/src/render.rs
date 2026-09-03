@@ -4746,9 +4746,15 @@ fn render_session(
     // last and given up first.
     // The waiting line and the task band share one breathing row (they are
     // the same "live background work" block when both are present).
+    // 970 owner bug 1: the SubTree gets NO breathing row. The band already
+    // closes with its rule (`band_rule_h`), and `render_subagent` has always
+    // gone `❯ message …` → rule → `▾ subagents` with nothing between (TUI6
+    // item 6, the owner's own screenshot). The session surface kept a
+    // `lead_subtree` blank on top of that rule, so the same band read one
+    // row taller here than on the subagent screen — the extra empty line
+    // under the composer. Session parity: the rule is the separator.
     let want_lead = u16::from(waiting_height + tasks_height + graph_height > 0);
     let want_todos_lead = u16::from(todos_height > 0);
-    let want_subtree_lead = u16::from(subtree_height > 0);
     let breathe = |want: u16, budget: &mut u16| -> u16 {
         if want > 0 && *budget >= want {
             *budget -= want;
@@ -4759,7 +4765,6 @@ fn render_session(
     };
     let lead_waiting = breathe(want_lead, &mut budget);
     let lead_todos = breathe(want_todos_lead, &mut budget);
-    let lead_subtree = breathe(want_subtree_lead, &mut budget);
     let [
         header_area,
         header_rule,
@@ -4778,7 +4783,6 @@ fn render_session(
         rule_area,
         composer_area,
         band_rule_area,
-        _lead_subtree,
         subtree_area,
         _gap,
     ] = Layout::vertical([
@@ -4799,7 +4803,6 @@ fn render_session(
         Constraint::Length(input_rule_h),
         Constraint::Length(input_height),
         Constraint::Length(band_rule_h),
-        Constraint::Length(lead_subtree),
         Constraint::Length(subtree_height),
         Constraint::Length(gap),
     ])
@@ -10738,10 +10741,15 @@ fn composer_height(model: &AppModel, width: u16) -> u16 {
     // (`AppModel::talk_ghost_visible`), and CHROME by law: nothing here
     // touches the transcript projection.
     let ghost = u16::from(model.talk_ghost_visible());
+    // 970 owner bug 2: a refused/failed image claims ONE row at the top of
+    // the band — the same shared-predicate discipline as the chip row, so
+    // the geometry and the paint can never disagree.
+    let notice = u16::from(model.composer_notice.is_some());
     u16::try_from(rows)
         .unwrap_or(1)
         .saturating_add(chips)
         .saturating_add(ghost)
+        .saturating_add(notice)
 }
 
 /// The gold rule + composer rows on the input ground (sim InputBar,
@@ -10859,6 +10867,27 @@ fn render_composer(
     // row the layout granted). The text rows — and their click windows —
     // shift down by exactly the carved row.
     let mut row_area = row_area;
+    // 970 owner bug 2: the image notice is the TOPMOST row in the band —
+    // it answers a gesture the user just made, and the draft it preserves
+    // sits directly under it. Warn ink, one line, no hits.
+    if let Some(notice) = &model.composer_notice
+        && row_area.height > 1
+    {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(" ".repeat(COMPOSER_PAD)),
+                Span::styled("⚠ ", theme.warn_style()),
+                Span::styled(notice.text(), theme.warn_style()),
+            ]))
+            .style(theme.input_style()),
+            Rect {
+                height: 1,
+                ..row_area
+            },
+        );
+        row_area.y += 1;
+        row_area.height -= 1;
+    }
     // T2: the partial-transcript ghost row carves the VERY top of the
     // band (dim, replaced per partial, realized into the composer on
     // commit). Same shared predicate as `composer_height`; chrome only —
