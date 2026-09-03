@@ -542,3 +542,39 @@ PY
     run_once "$index" "$run_load"
     index=$((index + 1))
 done
+
+python3 - "$OUTPUT_ROOT" "$RUNS" <<'PY'
+import json
+from pathlib import Path
+import statistics
+import sys
+
+root = Path(sys.argv[1])
+expected = int(sys.argv[2])
+paths = sorted(root.glob("*-run*/summary.json"))
+if len(paths) != expected:
+    raise SystemExit(f"M1 aggregate found {len(paths)} summaries, expected {expected}")
+samples = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+
+def stats(key):
+    values = [int(sample[key]) for sample in samples]
+    median = statistics.median(values)
+    return {
+        "min": min(values),
+        "median": median,
+        "max": max(values),
+        "mad": statistics.median(abs(value - median) for value in values),
+    }
+
+aggregate = {
+    "runs": expected,
+    "R_cli_max_bytes": stats("R_cli_max_bytes"),
+    "R_max_bytes": stats("R_max_bytes"),
+    "sanity_growth_bytes": stats("sanity_growth_bytes"),
+    "samples": samples,
+}
+(root / "aggregate.json").write_text(
+    json.dumps(aggregate, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+print(json.dumps(aggregate, sort_keys=True))
+PY

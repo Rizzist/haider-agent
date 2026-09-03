@@ -17,24 +17,42 @@
 //! at header scale than a half-block DOWNSAMPLE of the image would.
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::widgets::StatefulWidget as _;
+use ratatui::layout::{Rect, Size};
+use ratatui::widgets::Widget as _;
 use ratatui_image::picker::{Picker, ProtocolType};
-use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::{Resize, StatefulImage};
+use ratatui_image::protocol::Protocol;
+use ratatui_image::{Image, Resize};
 
 /// The bundled wordmark: حيدر in Damascus Naskh, Desert-Dawn gold, transparent
 /// background so it composites over any terminal ground. Regenerate with
 /// `assets/gen-wordmark.swift` (CoreText, which shapes Arabic natively).
 const WORDMARK_PNG: &[u8] = include_bytes!("../assets/wordmark-haider.png");
+const WORDMARK_IMAGE_SIZE: Size = Size::new(24, 2);
 
 /// A terminal-graphics wordmark, ready to render into a reserved cell rect.
 ///
 /// Held behind a `RefCell` in `AppModel` because the render pass takes
-/// `&AppModel` while the protocol needs `&mut` to (re)encode on a size change.
+/// `&AppModel` while first-draw initialization and one-shot relief mutate it.
 pub struct Wordmark {
-    protocol: StatefulProtocol,
+    state: WordmarkState,
     kind: ProtocolType,
+}
+
+enum WordmarkState {
+    /// Capability detection is complete, but the PNG has not been decoded and
+    /// no terminal image buffer exists. Sessions which never actually draw
+    /// the mark stay in this cheap state for their entire lifetime.
+    Deferred(Picker),
+    /// One persistent fixed-size protocol owns the encoded terminal payload.
+    /// It contains no resizeable source, so constructing it once makes later
+    /// renders allocation-free by type.
+    Ready {
+        protocol: Protocol,
+        relief_pending: bool,
+    },
+    /// Decode is attempted once. A damaged embedded asset must not turn every
+    /// frame into another failed allocation attempt.
+    Failed,
 }
 
 impl std::fmt::Debug for Wordmark {
@@ -43,13 +61,15 @@ impl std::fmt::Debug for Wordmark {
         // derive(Debug) only needs a stable, cheap summary.
         f.debug_struct("Wordmark")
             .field("kind", &self.kind)
+            .field("state", &self.state_label())
             .finish_non_exhaustive()
     }
 }
 
 impl Wordmark {
-    /// Query the terminal for a graphics protocol and build the wordmark, or
-    /// `None` to fall back to `crate::mark`.
+    /// Query the terminal for a graphics protocol and defer building the
+    /// wordmark until a frame actually has a non-empty image rectangle, or
+    /// return `None` to fall back to `crate::mark`.
     ///
     /// Returns `None` when the terminal offers only half-blocks (the crafted
     /// art is cleaner there) or on any decode/query failure.
@@ -74,14 +94,18 @@ impl Wordmark {
         if !graphics_terminal_likely(&|name| std::env::var(name).ok()) {
             return None;
         }
-        let picker = Picker::from_query_stdio().ok()?;
+        Self::from_picker(Picker::from_query_stdio().ok()?)
+    }
+
+    /// Build deferred wordmark state from an already-configured picker.
+    /// Useful for embedders that perform capability detection themselves.
+    #[must_use]
+    pub fn from_picker(picker: Picker) -> Option<Self> {
         let kind = picker.protocol_type();
-        if matches!(kind, ProtocolType::Halfblocks) {
-            return None;
-        }
-        let image = image::load_from_memory(WORDMARK_PNG).ok()?;
-        let protocol = picker.new_resize_protocol(image);
-        Some(Self { protocol, kind })
+        (!matches!(kind, ProtocolType::Halfblocks)).then_some(Self {
+            state: WordmarkState::Deferred(picker),
+            kind,
+        })
     }
 
     /// The detected protocol (for diagnostics/tests).
@@ -90,16 +114,68 @@ impl Wordmark {
         self.kind
     }
 
-    /// Render the wordmark, fit + centered, into `area`. The caller must have
-    /// reserved `area` (drawn nothing there); the widget resizes+encodes to the
-    /// cell rect once and caches until the rect changes.
+    /// Whether the first real render has constructed the persistent protocol.
+    #[must_use]
+    pub fn is_initialized(&self) -> bool {
+        matches!(&self.state, WordmarkState::Ready { .. })
+    }
+
+    /// Decode the embedded PNG and create the persistent protocol at most
+    /// once. Render calls this itself; the outer renderer uses it before
+    /// clearing the half-block fallback cells.
+    pub(crate) fn prepare(&mut self) -> bool {
+        if matches!(&self.state, WordmarkState::Deferred(_)) {
+            let WordmarkState::Deferred(picker) =
+                std::mem::replace(&mut self.state, WordmarkState::Failed)
+            else {
+                unreachable!("wordmark state was checked immediately before replacement");
+            };
+            let Ok(image) = image::load_from_memory(WORDMARK_PNG) else {
+                return false;
+            };
+            let Ok(protocol) = picker.new_protocol(image, WORDMARK_IMAGE_SIZE, Resize::Fit(None))
+            else {
+                return false;
+            };
+            self.state = WordmarkState::Ready {
+                protocol,
+                relief_pending: true,
+            };
+        }
+        matches!(&self.state, WordmarkState::Ready { .. })
+    }
+
+    /// Render the already encoded 24x2 wordmark into `area`. The caller passes
+    /// the fixed geometry and must have reserved it (drawn nothing there).
     pub fn render_into(&mut self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        StatefulImage::<StatefulProtocol>::default()
-            .resize(Resize::Fit(None))
-            .render(area, buf, &mut self.protocol);
+        if !self.prepare() {
+            return;
+        }
+        let WordmarkState::Ready {
+            protocol,
+            relief_pending,
+        } = &mut self.state
+        else {
+            unreachable!("prepare accepted only ready wordmark state");
+        };
+        Image::new(protocol).render(area, buf);
+        if std::mem::take(relief_pending) {
+            // Sixel/Kitty/iTerm encoding uses several large temporary image
+            // buffers. They are all dead after the first render; ask Darwin's
+            // allocator to return free pages once, never once per frame.
+            let _ = haider_platform::allocator_pressure_relief();
+        }
+    }
+
+    fn state_label(&self) -> &'static str {
+        match &self.state {
+            WordmarkState::Deferred(_) => "deferred",
+            WordmarkState::Ready { .. } => "ready",
+            WordmarkState::Failed => "failed",
+        }
     }
 }
 

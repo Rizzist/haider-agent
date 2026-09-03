@@ -55,7 +55,6 @@ class ClientFootprintBudgetTests(unittest.TestCase):
                 "phys_footprint_bytes": footprint,
                 "cpu_total_us": footprint // 10,
                 "threads": 1,
-                "vmmap_exit": 0,
                 "load_before_read": 0.5,
             }
 
@@ -136,7 +135,83 @@ class ClientFootprintBudgetTests(unittest.TestCase):
         )
         self.assertIn("calibrate_surface run-post-command run 3794948", workflow)
         self.assertIn(
-            "calibrate_surface tui-demo-sixel tui-sixel 6110043", workflow
+            "calibrate_surface tui-demo-sixel tui-sixel 6344334", workflow
+        )
+
+    def test_registry_44_uses_proc_rusage_without_retrying_vmmap(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn('"/usr/bin/vmmap"', source)
+        self.assertNotIn("diagnostic-allow-missing-vmmap", source)
+        self.assertIn("proc_pid_rusage", source)
+
+    def test_tui_cpu_workload_is_exactly_twenty_turns(self):
+        required = [
+            "--haider",
+            "/tmp/haider",
+            "--surface",
+            "tui-demo-sixel",
+            "--output",
+            "/tmp/client-footprint",
+            "--budget-bytes",
+            "1000",
+        ]
+        args = client_footprint.parse_args(required + ["--tui-turns", "20"])
+        self.assertEqual(args.tui_turns, 20)
+        for invalid in ("1", "19", "21"):
+            with self.subTest(invalid=invalid), redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(SystemExit, "2"):
+                    client_footprint.parse_args(required + ["--tui-turns", invalid])
+
+        headless = list(required)
+        headless[3] = "status-post-command"
+        with redirect_stderr(io.StringIO()), self.assertRaisesRegex(SystemExit, "2"):
+            client_footprint.parse_args(headless + ["--tui-turns", "20"])
+
+    def test_cpu_ticks_are_converted_with_the_mach_timebase(self):
+        metrics = object.__new__(client_footprint.DarwinProcessMetrics)
+        metrics.timebase_numer = 125
+        metrics.timebase_denom = 3
+        self.assertEqual(metrics.ticks_to_ns(3), 125)
+
+    def test_cpu_read_is_load_gated_immediately_before_clock_read(self):
+        events = []
+        metrics = mock.Mock()
+        metrics.read.side_effect = lambda pid: events.append(("read", pid)) or {
+            "cpu_total_ns": 7
+        }
+        with mock.patch.object(
+            client_footprint,
+            "require_load_below",
+            side_effect=lambda limit, stage: events.append(("load", limit, stage)),
+        ):
+            sample = client_footprint.read_cpu_at_calibrated_load(
+                metrics, 42, 4.0, "before-test"
+            )
+        self.assertEqual(sample["cpu_total_ns"], 7)
+        self.assertEqual(
+            events,
+            [("load", 4.0, "before-test"), ("read", 42)],
+        )
+
+    def test_tui_turn_deadline_reuses_derived_headless_deadline(self):
+        self.assertEqual(
+            client_footprint.TUI_TURN_TIMEOUT_SECONDS,
+            client_footprint.HEADLESS_TERMINAL_DEADLINE_SECONDS,
+        )
+
+    def test_twenty_turn_cpu_summary_reports_median_and_mad(self):
+        samples = [
+            {
+                "phys_footprint_bytes": 1_000 + index,
+                "cpu_total_us": 100 + index,
+                "turn_20_cpu_ns": value,
+            }
+            for index, value in enumerate((100, 110, 120, 130, 500))
+        ]
+        summary = client_footprint.summarize("tui-demo-sixel", samples)
+        self.assertEqual(
+            summary["turn_20_cpu_ns"],
+            {"min": 100, "median": 120, "max": 500, "mad": 10.0},
         )
 
     def test_hermetic_env_removes_all_proxy_routes_and_pins_loopback_bypass(self):

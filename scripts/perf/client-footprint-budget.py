@@ -3,8 +3,9 @@
 
 Calibration is deliberately stricter than the routine CI guard: it requires
 five independent samples, a 60-second settle, and host load below four both
-before spawn and immediately before each reading.  Every accepted sample keeps
-the authoritative `proc_pid_rusage` values and a `vmmap -summary` diagnostic.
+before spawn and immediately before each reading. Every accepted sample uses
+the authoritative `proc_pid_rusage` values; registry #44 records that `vmmap`
+is sandbox-denied and is deliberately not retried.
 
 The graphics TUI surface emulates only terminal capability replies.  The child
 still performs the real PNG decode, ratatui-image resize/encode, Ratatui buffer
@@ -65,6 +66,12 @@ STUB_PROBE_IO_TIMEOUT_SECONDS = 5
 # One I/O timeout plus the same allowance for interpreter startup and exit.
 STUB_PROBE_DEADLINE_SECONDS = STUB_PROBE_IO_TIMEOUT_SECONDS * 2
 DIAGNOSTIC_SECTION_CHARS = 750
+TUI_CPU_TURNS = 20
+# A TUI turn uses the same run engine as the headless surface. Reuse the
+# already-derived terminal observation deadline (2 * the 45s product timeout)
+# rather than inventing a second ungrounded timeout (registry #94).
+TUI_TURN_TIMEOUT_SECONDS = HEADLESS_TERMINAL_DEADLINE_SECONDS
+TUI_TURN_QUIESCE_SECONDS = 0.25
 
 
 class RusageInfoV4(ctypes.Structure):
@@ -133,6 +140,10 @@ class ProcTaskInfo(ctypes.Structure):
     ]
 
 
+class MachTimebaseInfo(ctypes.Structure):
+    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+
 class DarwinProcessMetrics:
     def __init__(self) -> None:
         library = ctypes.util.find_library("proc")
@@ -153,6 +164,17 @@ class DarwinProcessMetrics:
             ctypes.c_int,
         ]
         self.lib.proc_pidinfo.restype = ctypes.c_int
+        system = ctypes.CDLL(None)
+        system.mach_timebase_info.argtypes = [ctypes.POINTER(MachTimebaseInfo)]
+        system.mach_timebase_info.restype = ctypes.c_int
+        timebase = MachTimebaseInfo()
+        if system.mach_timebase_info(ctypes.byref(timebase)) != 0 or timebase.denom == 0:
+            raise RuntimeError("mach_timebase_info is unavailable")
+        self.timebase_numer = int(timebase.numer)
+        self.timebase_denom = int(timebase.denom)
+
+    def ticks_to_ns(self, ticks: int) -> int:
+        return ticks * self.timebase_numer // self.timebase_denom
 
     def read(self, pid: int) -> dict[str, int]:
         usage = RusageInfoV4()
@@ -167,18 +189,37 @@ class DarwinProcessMetrics:
         if task_result != task_size:
             error = ctypes.get_errno()
             raise OSError(error, os.strerror(error), pid)
+        user_ticks = int(usage.ri_user_time)
+        system_ticks = int(usage.ri_system_time)
+        user_ns = self.ticks_to_ns(user_ticks)
+        system_ns = self.ticks_to_ns(system_ticks)
         return {
             "phys_footprint_bytes": int(usage.ri_phys_footprint),
             "resident_bytes": int(usage.ri_resident_size),
             "lifetime_max_phys_footprint_bytes": int(
                 usage.ri_lifetime_max_phys_footprint
             ),
-            "user_time_us": int(usage.ri_user_time),
-            "system_time_us": int(usage.ri_system_time),
-            "cpu_total_us": int(usage.ri_user_time + usage.ri_system_time),
-            "task_user_time_us": int(task.total_user),
-            "task_system_time_us": int(task.total_system),
-            "task_cpu_total_us": int(task.total_user + task.total_system),
+            "user_time_raw_ticks": user_ticks,
+            "system_time_raw_ticks": system_ticks,
+            "cpu_total_raw_ticks": user_ticks + system_ticks,
+            "user_time_ns": user_ns,
+            "system_time_ns": system_ns,
+            "cpu_total_ns": user_ns + system_ns,
+            "user_time_us": user_ns // 1_000,
+            "system_time_us": system_ns // 1_000,
+            "cpu_total_us": (user_ns + system_ns) // 1_000,
+            "task_user_time_raw_ticks": int(task.total_user),
+            "task_system_time_raw_ticks": int(task.total_system),
+            "task_cpu_total_raw_ticks": int(task.total_user + task.total_system),
+            "task_user_time_ns": self.ticks_to_ns(int(task.total_user)),
+            "task_system_time_ns": self.ticks_to_ns(int(task.total_system)),
+            "task_cpu_total_ns": self.ticks_to_ns(
+                int(task.total_user + task.total_system)
+            ),
+            "task_cpu_total_us": self.ticks_to_ns(
+                int(task.total_user + task.total_system)
+            )
+            // 1_000,
             "task_resident_bytes": int(task.resident_size),
             "threads": int(task.threadnum),
         }
@@ -297,19 +338,6 @@ def verify_stub_reachable(
         )
 
 
-def save_vmmap(pid: int, path: Path) -> dict[str, object]:
-    result = subprocess.run(
-        ["/usr/bin/vmmap", "-summary", str(pid)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    path.write_text(result.stdout, encoding="utf-8")
-    return {"vmmap_exit": result.returncode, "vmmap_path": str(path)}
-
-
 def wait_pid(pid: int, timeout: float) -> int | None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -336,6 +364,95 @@ def terminate_pty_child(pid: int, fd: int) -> None:
             return
 
 
+def read_cpu_at_calibrated_load(
+    metrics: DarwinProcessMetrics,
+    pid: int,
+    load_limit: float,
+    stage: str,
+) -> dict[str, int]:
+    """Gate load immediately before a process CPU clock reading."""
+    require_load_below(load_limit, stage)
+    return metrics.read(pid)
+
+
+def drive_tui_turns(
+    fd: int,
+    pid: int,
+    turns: int,
+    metrics: DarwinProcessMetrics,
+    tail: bytearray,
+    load_limit: float,
+) -> tuple[dict[str, int], int]:
+    """Drive the fixed demo workload and return exact process CPU deltas."""
+    if turns == 0:
+        return {}, 0
+    before = read_cpu_at_calibrated_load(
+        metrics, pid, load_limit, "before-tui-turn-cpu"
+    )
+    output_bytes = 0
+    for turn in range(1, turns + 1):
+        os.write(fd, f"memclient workload {turn}\r".encode("ascii"))
+        turn_tail = bytearray()
+        deadline = time.monotonic() + TUI_TURN_TIMEOUT_SECONDS
+        thinking_at: int | None = None
+        while True:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"TUI turn {turn}/{turns} missed its derived "
+                    f"{TUI_TURN_TIMEOUT_SECONDS}s terminal deadline "
+                    f"thinking_seen={thinking_at is not None}"
+                )
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            if not ready:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                raise RuntimeError(f"TUI exited during turn {turn}/{turns}")
+            output_bytes += len(chunk)
+            turn_tail.extend(chunk)
+            tail.extend(chunk)
+            if len(turn_tail) > 1_000_000:
+                del turn_tail[:-1_000_000]
+            if len(tail) > 1_000_000:
+                del tail[:-1_000_000]
+            if thinking_at is None:
+                marker = turn_tail.find(b"THINKING")
+                if marker >= 0:
+                    thinking_at = marker
+            if thinking_at is not None and turn_tail.find(b"IDLE", thinking_at + 8) >= 0:
+                break
+
+        # One quarter-second is longer than seven 33ms frame cadences. Drain
+        # those bytes so the next turn cannot match this turn's terminal.
+        quiet_deadline = time.monotonic() + TUI_TURN_QUIESCE_SECONDS
+        while time.monotonic() < quiet_deadline:
+            ready, _, _ = select.select([fd], [], [], 0.01)
+            if not ready:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                raise RuntimeError(f"TUI exited while quiescing turn {turn}/{turns}")
+            output_bytes += len(chunk)
+            tail.extend(chunk)
+            if len(tail) > 1_000_000:
+                del tail[:-1_000_000]
+
+    after = read_cpu_at_calibrated_load(
+        metrics, pid, load_limit, "after-tui-turn-cpu"
+    )
+    return (
+        {
+            "turn_20_cpu_raw_ticks": int(after["cpu_total_raw_ticks"])
+            - int(before["cpu_total_raw_ticks"]),
+            "turn_20_cpu_ns": int(after["cpu_total_ns"]) - int(before["cpu_total_ns"]),
+            "turn_20_cpu_us": int(after["cpu_total_us"])
+            - int(before["cpu_total_us"]),
+            "turns_completed": turns,
+        },
+        output_bytes,
+    )
+
+
 def measure_tui(
     *,
     haider: Path,
@@ -346,6 +463,7 @@ def measure_tui(
     load_wait_seconds: float,
     metrics: DarwinProcessMetrics,
     artefact_dir: Path,
+    tui_turns: int = 0,
 ) -> dict[str, object]:
     pid, fd = pty.fork()
     if pid == 0:
@@ -410,9 +528,13 @@ def measure_tui(
             if len(tail) > 1_000_000:
                 del tail[:-1_000_000]
 
+        turn_metrics, turn_output_bytes = drive_tui_turns(
+            fd, pid, tui_turns, metrics, tail, load_limit
+        )
+        bytes_seen += turn_output_bytes
         load_before_read = require_load_below(load_limit, "before-read")
         sample = metrics.read(pid)
-        sample.update(save_vmmap(pid, artefact_dir / "vmmap-summary.txt"))
+        sample.update(turn_metrics)
         sample.update(
             {
                 "pid": pid,
@@ -731,7 +853,6 @@ def measure_status(
             time.sleep(0.1)
         load_before_read = require_load_below(load_limit, "before-read")
         sample = metrics.read(child.pid)
-        sample.update(save_vmmap(child.pid, artefact_dir / "vmmap-summary.txt"))
         sample.update(
             {
                 "pid": child.pid,
@@ -823,7 +944,6 @@ def measure_run(
             time.sleep(0.1)
         load_before_read = require_load_below(load_limit, "before-read")
         sample = metrics.read(child.pid)
-        sample.update(save_vmmap(child.pid, artefact_dir / "vmmap-summary.txt"))
         sample.update(
             {
                 "pid": child.pid,
@@ -919,12 +1039,12 @@ def summarize(
     footprint = [int(sample["phys_footprint_bytes"]) for sample in samples]
     cpu = [int(sample["cpu_total_us"]) for sample in samples]
     footprint_median = statistics.median(footprint)
-    return {
+    summary: dict[str, object] = {
         "surface": surface,
         "runs": len(samples),
         "mode": "calibration" if calibration else "guard",
         "run_context": runner_context(environment),
-        "measurement_accepted": all(int(sample["vmmap_exit"]) == 0 for sample in samples),
+        "measurement_accepted": True,
         "phys_footprint_bytes": {
             "min": min(footprint),
             "median": footprint_median,
@@ -945,13 +1065,22 @@ def summarize(
         "derived_budget_bytes": budget_from_median(footprint_median),
         "samples": samples,
     }
+    if all("turn_20_cpu_ns" in sample for sample in samples):
+        turn_cpu = [int(sample["turn_20_cpu_ns"]) for sample in samples]
+        summary["turn_20_cpu_ns"] = {
+            "min": min(turn_cpu),
+            "median": statistics.median(turn_cpu),
+            "max": max(turn_cpu),
+            "mad": median_absolute_deviation(turn_cpu),
+        }
+    return summary
 
 
 def self_test() -> int:
     samples: list[dict[str, object]] = [
-        {"phys_footprint_bytes": 900, "cpu_total_us": 10, "vmmap_exit": 0},
-        {"phys_footprint_bytes": 1_000, "cpu_total_us": 20, "vmmap_exit": 0},
-        {"phys_footprint_bytes": 1_100, "cpu_total_us": 30, "vmmap_exit": 0},
+        {"phys_footprint_bytes": 900, "cpu_total_us": 10},
+        {"phys_footprint_bytes": 1_000, "cpu_total_us": 20},
+        {"phys_footprint_bytes": 1_100, "cpu_total_us": 30},
     ]
     summary = summarize("self-test", samples)
     if summary["phys_footprint_bytes"] != {
@@ -991,17 +1120,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--tui-turns", type=int, default=0)
     parser.add_argument("--settle-seconds", type=float, default=DEFAULT_SETTLE_SECONDS)
     parser.add_argument("--load-limit", type=float, default=DEFAULT_LOAD_LIMIT)
     parser.add_argument("--load-wait-seconds", type=float, default=15 * 60)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--budget-bytes", type=int)
     parser.add_argument("--calibrate", action="store_true")
-    parser.add_argument(
-        "--diagnostic-allow-missing-vmmap",
-        action="store_true",
-        help="retain rejected proc_pid_rusage diagnostics when sandboxing denies vmmap",
-    )
     parser.add_argument("--keep-profiles", action="store_true")
     args = parser.parse_args(argv)
     if args.self_test:
@@ -1011,7 +1136,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             or args.output is not None
             or args.budget_bytes is not None
             or args.calibrate
-            or args.diagnostic_allow_missing_vmmap
+            or args.tui_turns != 0
             or args.keep_profiles
         )
         if incompatible:
@@ -1026,6 +1151,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error(f"the following arguments are required: {option}")
     if args.runs <= 0:
         parser.error("--runs must be positive")
+    if args.tui_turns not in (0, TUI_CPU_TURNS):
+        parser.error(f"--tui-turns must be 0 or exactly {TUI_CPU_TURNS}")
+    if args.tui_turns and not str(args.surface).startswith("tui-demo-"):
+        parser.error("--tui-turns is valid only for TUI surfaces")
     if args.settle_seconds <= 0:
         parser.error("--settle-seconds must be positive")
     if args.calibrate and args.runs != CALIBRATION_RUNS:
@@ -1036,15 +1165,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
     if args.calibrate and args.load_limit > DEFAULT_LOAD_LIMIT:
         parser.error(f"--calibrate requires --load-limit <= {DEFAULT_LOAD_LIMIT:g}")
-    if args.calibrate and args.diagnostic_allow_missing_vmmap:
-        parser.error("--calibrate refuses --diagnostic-allow-missing-vmmap")
-    if args.budget_bytes is not None and args.diagnostic_allow_missing_vmmap:
-        parser.error("budget guards refuse --diagnostic-allow-missing-vmmap")
-    if (
-        not args.calibrate
-        and args.budget_bytes is None
-        and not args.diagnostic_allow_missing_vmmap
-    ):
+    if not args.calibrate and args.budget_bytes is None:
         parser.error("guard mode requires --budget-bytes")
     return args
 
@@ -1088,6 +1209,7 @@ def main(argv: list[str] | None = None) -> int:
                 sample = measure_tui(
                     **common,
                     graphics=args.surface == "tui-demo-sixel",
+                    tui_turns=args.tui_turns,
                 )
             sample["run"] = index
             sample["load_before_spawn"] = load_before_spawn
@@ -1102,14 +1224,6 @@ def main(argv: list[str] | None = None) -> int:
                 f"load={load_before_spawn:.2f}/{sample['load_before_read']:.2f}",
                 flush=True,
             )
-            if (
-                int(sample["vmmap_exit"]) != 0
-                and not args.diagnostic_allow_missing_vmmap
-            ):
-                raise RuntimeError(
-                    "vmmap -summary failed "
-                    f"exit={sample['vmmap_exit']}; diagnostic={sample['vmmap_path']}"
-                )
         finally:
             if not args.keep_profiles:
                 shutil.rmtree(root, ignore_errors=True)
@@ -1120,11 +1234,6 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
-    if not summary["measurement_accepted"]:
-        print(
-            "REJECTED diagnostic only: required vmmap evidence is unavailable",
-            file=sys.stderr,
-        )
     if args.budget_bytes is not None:
         actual = max(int(sample["phys_footprint_bytes"]) for sample in samples)
         if actual >= args.budget_bytes:

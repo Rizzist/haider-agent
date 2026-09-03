@@ -599,10 +599,11 @@ pub async fn run_demo(
     let mut seen_theme_commits = model.theme_commits;
     let mut active_title = model.window_title();
 
-    // Query the terminal for a graphics protocol and build the wordmark image
-    // NOW — after raw mode, before the input pump claims stdin — so the
-    // capability response is not eaten by the pump. Degrades to None (the
-    // half-block art) on a non-graphics or non-answering terminal; never hangs.
+    // Query the terminal for a graphics protocol NOW — after raw mode, before
+    // the input pump claims stdin — so the capability response is not eaten by
+    // the pump. Image decode/protocol allocation remains deferred until a real
+    // non-empty image rectangle is drawn. Degrades to None (the half-block art)
+    // on a non-graphics or non-answering terminal; never hangs.
     *model.wordmark.borrow_mut() = crate::wordmark::Wordmark::detect();
     // Pin the truecolor capability once (read by render for the Thinking
     // shimmer's fidelity); the default is true, so this only downgrades a
@@ -909,7 +910,17 @@ pub fn dispatch_input(
         // TUI6.3 fix 2: the paste is wrapped at RECEIPT — the zeroizing
         // buffer takes the same allocation, so our one owned copy wipes
         // on drop and Debug-prints redacted.
-        Event::Paste(text) => model.handle(AppEvent::Paste(crate::app::Pasted::new(text))),
+        Event::Paste(text) => {
+            const ALLOCATOR_RELIEF_MIN_BYTES: usize = 256 * 1024;
+            let transient_capacity = text.capacity();
+            model.handle(AppEvent::Paste(crate::app::Pasted::new(text)));
+            if transient_capacity >= ALLOCATOR_RELIEF_MIN_BYTES {
+                // The zeroizing receipt buffer is dead after `handle`; the
+                // draft owns any intended retained copy. Coalesce allocator
+                // relief to genuinely large pastes only.
+                let _ = haider_platform::allocator_pressure_relief();
+            }
+        }
         Event::Resize(cols, rows) => {
             // TUI6.1 fix 1 (reflow-before-input): the next frame's wrap
             // budget is a pure function of the NEW width, so apply it
@@ -2842,6 +2853,10 @@ fn present_frame(
     // W5g-7: hover survives a redraw only while the pointer still resolves
     // to it; this applies identically to cadence and semantic-edge frames.
     settle_hover_after_draw(model, hit_map, pointer);
+    // A terminal/catch-up frame must be observable before its duplicated
+    // transcript layout is released. This one-shot post-present seam avoids
+    // both retaining idle render copies and rebuilding them every idle frame.
+    let _ = model.finish_frame_memory_maintenance();
     Ok(())
 }
 

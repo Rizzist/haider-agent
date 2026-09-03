@@ -42,6 +42,14 @@ pub struct PromptEntry {
     pub seq: Option<u64>,
 }
 
+/// Prompt recall is convenience state, not the durable transcript. Keep a
+/// useful recent window while preventing replay of a long-lived session from
+/// duplicating tens of MiB of prompt text in the client.
+#[doc(hidden)]
+pub const PROMPT_RECALL_MAX_ENTRIES: usize = 128;
+#[doc(hidden)]
+pub const PROMPT_RECALL_MAX_BYTES: usize = 1024 * 1024;
+
 impl PromptEntry {
     /// A prompt rebuilt from a committed journal envelope.
     #[must_use]
@@ -57,6 +65,48 @@ impl PromptEntry {
     pub const fn local(text: String) -> Self {
         Self { text, seq: None }
     }
+}
+
+/// Insert one newest-first recall entry under both count and byte ceilings.
+/// An individually oversized prompt remains in the durable transcript but is
+/// not duplicated into the optional recall cache.
+pub(crate) fn push_prompt_recall(
+    history: &mut std::collections::VecDeque<PromptEntry>,
+    entry: PromptEntry,
+) {
+    if entry.text.capacity() > PROMPT_RECALL_MAX_BYTES {
+        return;
+    }
+    history.push_front(entry);
+    let mut bytes = history
+        .iter()
+        .map(|entry| entry.text.capacity())
+        .sum::<usize>();
+    while history.len() > PROMPT_RECALL_MAX_ENTRIES || bytes > PROMPT_RECALL_MAX_BYTES {
+        let Some(removed) = history.pop_back() else {
+            break;
+        };
+        bytes = bytes.saturating_sub(removed.text.capacity());
+    }
+}
+
+/// Right-size retained prompt buffers at an idle/catch-up boundary. Returns a
+/// conservative count of capacity bytes released so the caller can coalesce
+/// allocator pressure relief instead of invoking it for every small turn.
+pub(crate) fn shrink_prompt_recall(history: &mut std::collections::VecDeque<PromptEntry>) -> usize {
+    let entry_slack = history
+        .iter()
+        .map(|entry| entry.text.capacity().saturating_sub(entry.text.len()))
+        .sum::<usize>();
+    for entry in history.iter_mut() {
+        entry.text.shrink_to_fit();
+    }
+    let deque_slack = history
+        .capacity()
+        .saturating_sub(history.len())
+        .saturating_mul(std::mem::size_of::<PromptEntry>());
+    history.shrink_to_fit();
+    entry_slack.saturating_add(deque_slack)
 }
 
 /// One session, fully owned — the sim's `sessions[i]` (tui.js:497-579
@@ -395,8 +445,10 @@ impl SessionState {
                             if envelope.agent_id.is_none()
                                 && let EventPayload::UserMessage { text, .. } = &payload
                             {
-                                self.prompt_history
-                                    .push_front(PromptEntry::committed(text.clone(), envelope.seq));
+                                push_prompt_recall(
+                                    &mut self.prompt_history,
+                                    PromptEntry::committed(text.clone(), envelope.seq),
+                                );
                             }
                             if admission == Admission::Apply {
                                 self.route_admitted(

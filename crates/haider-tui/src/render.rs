@@ -21,6 +21,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
 const TRANSCRIPT_OVERSCAN_ROWS: u16 = 2;
+const TRANSCRIPT_CACHE_MAX_ENTRIES: usize = 128;
+const TRANSCRIPT_CACHE_MAX_BYTES: usize = 512 * 1024;
 
 /// Pure view cache for transcript entry formatting and wrapped geometry.
 /// The projection remains authoritative; this cache is discarded whenever
@@ -31,23 +33,37 @@ pub(crate) struct TranscriptLayoutCache {
     width: u16,
     theme: Option<ThemeKey>,
     revision: u64,
-    source_ptr: usize,
+    transcript_revision: u64,
     source_len: usize,
     phase: u8,
     entries: Vec<CachedTranscriptEntry>,
-    dynamic_entries: Vec<usize>,
-    entry_rows: Vec<u16>,
-    user_rows: Vec<(u16, usize)>,
+    geometry: Vec<TranscriptGeometry>,
     total_rows: u16,
+    retained_bytes: usize,
+    source_bytes: usize,
+    bounded: bool,
+    bounded_format_count: u64,
+    released_idle_revision: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CachedTranscriptEntry {
-    source: TranscriptEntry,
+    index: usize,
+    revision: u64,
     lines: Vec<Line<'static>>,
     row_start: u16,
     height: u16,
     dynamic: bool,
+    user: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TranscriptGeometry {
+    revision: u64,
+    source_bytes: usize,
+    row_start: u16,
+    height: u16,
+    user: bool,
 }
 
 impl TranscriptLayoutCache {
@@ -62,21 +78,55 @@ impl TranscriptLayoutCache {
         let layout_changed =
             !self.initialized || self.width != width || self.theme != Some(theme_key);
         let source = projection.entries();
-        let projection_changed = self.revision != projection.render_revision()
-            || self.source_ptr != source.as_ptr() as usize
+        let projection_changed =
+            self.revision != projection.render_revision() || self.source_len != source.len();
+        let transcript_changed = self.transcript_revision != projection.transcript_revision()
             || self.source_len != source.len();
         let phase_changed = self.phase != phase;
         if !layout_changed && !projection_changed && !phase_changed {
             return;
         }
 
+        // Oversized transcripts retain only compact geometry. Exact
+        // per-entry revisions mean a semantic event reformats only the row it
+        // changed; badge/usage events reformat none. Phase-only ticks cannot
+        // change wrapped height, and visible dynamic rows use the current
+        // phase in `virtualized_transcript_lines` below.
+        if self.bounded {
+            if layout_changed || transcript_changed {
+                self.reconcile_bounded_geometry(projection, theme, width, phase, layout_changed);
+            }
+            self.finish_reconcile(projection, theme_key, width, phase, source.len());
+            return;
+        }
+
+        if source.len() > TRANSCRIPT_CACHE_MAX_ENTRIES {
+            self.entries = Vec::new();
+            self.bounded = true;
+            self.reconcile_bounded_geometry(projection, theme, width, phase, true);
+            self.finish_reconcile(projection, theme_key, width, phase, source.len());
+            return;
+        }
+
         if !layout_changed && !projection_changed {
-            for &index in &self.dynamic_entries {
-                self.entries[index] =
-                    cache_transcript_entry(&projection.entries()[index], theme, width, phase);
+            for index in 0..self.entries.len() {
+                if self.entries[index].dynamic {
+                    let revision = projection
+                        .entry_revision(index)
+                        .expect("a cached transcript entry has a revision");
+                    self.entries[index] = cache_transcript_entry(
+                        index,
+                        &projection.entries()[index],
+                        revision,
+                        theme,
+                        width,
+                        phase,
+                    );
+                }
             }
             self.recompute_geometry();
             self.phase = phase;
+            self.enforce_bound(projection, theme, width, phase);
             return;
         }
 
@@ -84,14 +134,18 @@ impl TranscriptLayoutCache {
             self.entries.clear();
         }
         for (index, entry) in source.iter().enumerate() {
+            let revision = projection
+                .entry_revision(index)
+                .expect("every transcript entry has a revision");
             let refresh = layout_changed
                 || self
                     .entries
                     .get(index)
-                    .is_none_or(|cached| cached.source != *entry)
+                    .is_none_or(|cached| cached.revision != revision)
                 || (phase_changed && self.entries.get(index).is_some_and(|cached| cached.dynamic));
             if refresh {
-                let replacement = cache_transcript_entry(entry, theme, width, phase);
+                let replacement =
+                    cache_transcript_entry(index, entry, revision, theme, width, phase);
                 if let Some(cached) = self.entries.get_mut(index) {
                     *cached = replacement;
                 } else {
@@ -101,46 +155,250 @@ impl TranscriptLayoutCache {
         }
         self.entries.truncate(source.len());
         self.recompute_geometry();
+        self.source_bytes = source
+            .iter()
+            .map(transcript_source_heap_bytes)
+            .sum::<usize>();
+        self.enforce_bound(projection, theme, width, phase);
+        self.finish_reconcile(projection, theme_key, width, phase, source.len());
+    }
+
+    fn finish_reconcile(
+        &mut self,
+        projection: &SessionProjection,
+        theme_key: ThemeKey,
+        width: u16,
+        phase: u8,
+        source_len: usize,
+    ) {
         self.initialized = true;
         self.width = width;
         self.theme = Some(theme_key);
         self.revision = projection.render_revision();
-        self.source_ptr = source.as_ptr() as usize;
-        self.source_len = source.len();
+        self.transcript_revision = projection.transcript_revision();
+        self.source_len = source_len;
         self.phase = phase;
     }
 
     fn recompute_geometry(&mut self) {
-        self.entry_rows.clear();
-        self.user_rows.clear();
-        self.dynamic_entries.clear();
+        self.geometry.clear();
         let mut row = 0u16;
-        for (index, entry) in self.entries.iter_mut().enumerate() {
+        for entry in &mut self.entries {
             entry.row_start = row;
-            let anchor = if matches!(entry.source, TranscriptEntry::User { .. }) {
-                row.saturating_add(1)
-            } else {
-                row
-            };
-            self.entry_rows.push(anchor);
-            if matches!(entry.source, TranscriptEntry::User { .. }) {
-                self.user_rows.push((anchor, index));
-            }
-            if entry.dynamic {
-                self.dynamic_entries.push(index);
-            }
+            self.geometry.push(TranscriptGeometry {
+                revision: entry.revision,
+                source_bytes: 0,
+                row_start: entry.row_start,
+                height: entry.height,
+                user: entry.user,
+            });
             row = row.saturating_add(entry.height);
         }
         self.total_rows = row;
+        self.retained_bytes = retained_cache_bytes(&self.entries, &self.geometry);
+    }
+
+    fn enforce_bound(
+        &mut self,
+        projection: &SessionProjection,
+        theme: &Theme,
+        width: u16,
+        phase: u8,
+    ) {
+        if self.entries.len() <= TRANSCRIPT_CACHE_MAX_ENTRIES
+            && self.retained_bytes <= TRANSCRIPT_CACHE_MAX_BYTES
+        {
+            return;
+        }
+        self.entries = Vec::new();
+        self.bounded = true;
+        self.reconcile_bounded_geometry(projection, theme, width, phase, true);
+    }
+
+    fn reconcile_bounded_geometry(
+        &mut self,
+        projection: &SessionProjection,
+        theme: &Theme,
+        width: u16,
+        phase: u8,
+        layout_changed: bool,
+    ) {
+        let source = projection.entries();
+        if layout_changed {
+            self.geometry.clear();
+            self.entries = Vec::new();
+        }
+        self.geometry.truncate(source.len());
+        for (index, entry) in source.iter().enumerate() {
+            let revision = projection
+                .entry_revision(index)
+                .expect("every transcript entry has a revision");
+            let refresh = self
+                .geometry
+                .get(index)
+                .is_none_or(|geometry| geometry.revision != revision);
+            if !refresh {
+                continue;
+            }
+            let (lines, height, _dynamic) = formatted_transcript_entry(entry, theme, width, phase);
+            drop(lines);
+            self.bounded_format_count = self.bounded_format_count.saturating_add(1);
+            let replacement = TranscriptGeometry {
+                revision,
+                source_bytes: transcript_source_heap_bytes(entry),
+                row_start: 0,
+                height,
+                user: matches!(entry, TranscriptEntry::User { .. }),
+            };
+            if let Some(geometry) = self.geometry.get_mut(index) {
+                *geometry = replacement;
+            } else {
+                self.geometry.push(replacement);
+            }
+        }
+
+        self.source_bytes = 0;
+        let mut row = 0u16;
+        for geometry in &mut self.geometry {
+            geometry.row_start = row;
+            self.source_bytes = self.source_bytes.saturating_add(geometry.source_bytes);
+            row = row.saturating_add(geometry.height);
+        }
+        self.total_rows = row;
+        self.retained_bytes = retained_cache_bytes(&self.entries, &self.geometry);
+    }
+
+    fn bounded_entry_lines(
+        &mut self,
+        projection: &SessionProjection,
+        index: usize,
+        theme: &Theme,
+        width: u16,
+        phase: u8,
+    ) -> Vec<Line<'static>> {
+        let revision = projection
+            .entry_revision(index)
+            .expect("a visible transcript entry has a revision");
+        if let Some(position) = self.entries.iter().position(|cached| {
+            cached.index == index && cached.revision == revision && !cached.dynamic
+        }) {
+            let cached = self.entries.remove(position);
+            let lines = cached.lines.clone();
+            self.entries.push(cached);
+            return lines;
+        }
+
+        self.entries.retain(|cached| cached.index != index);
+        let cached = cache_transcript_entry(
+            index,
+            &projection.entries()[index],
+            revision,
+            theme,
+            width,
+            phase,
+        );
+        self.bounded_format_count = self.bounded_format_count.saturating_add(1);
+
+        // An individually huge visible row is moved directly into this
+        // frame, never cloned merely to violate the retained byte cap.
+        self.entries.push(cached);
+        self.retained_bytes = retained_cache_bytes(&self.entries, &self.geometry);
+        while (self.retained_bytes > TRANSCRIPT_CACHE_MAX_BYTES
+            || self.entries.len() > TRANSCRIPT_CACHE_MAX_ENTRIES)
+            && self.entries.len() > 1
+        {
+            self.entries.remove(0);
+            self.retained_bytes = retained_cache_bytes(&self.entries, &self.geometry);
+        }
+        if self.retained_bytes > TRANSCRIPT_CACHE_MAX_BYTES {
+            let cached = self.entries.pop().expect("the candidate was just pushed");
+            self.retained_bytes = retained_cache_bytes(&self.entries, &self.geometry);
+            return cached.lines;
+        }
+
+        self.entries
+            .last()
+            .expect("the retained candidate was just pushed")
+            .lines
+            .clone()
+    }
+
+    fn has_entries(&self) -> bool {
+        self.source_len != 0
+    }
+
+    /// Drop duplicated transcript content once after its terminal frame. A
+    /// later idle interaction may rebuild once; the revision latch prevents
+    /// repeated idle frames from recreating and dropping the same cache.
+    pub(crate) fn release_after_frame(&mut self, revision: u64) -> usize {
+        if self.released_idle_revision == Some(revision) {
+            return 0;
+        }
+        let released = self.retained_bytes;
+        let pressure_basis = released.max(self.source_bytes);
+        *self = Self {
+            released_idle_revision: Some(revision),
+            ..Self::default()
+        };
+        pressure_basis
+    }
+
+    pub(crate) fn retained_stats(&self) -> (usize, usize, bool) {
+        (self.entries.len(), self.retained_bytes, self.bounded)
+    }
+
+    pub(crate) const fn bounded_format_count(&self) -> u64 {
+        self.bounded_format_count
+    }
+
+    fn entry_row(&self, index: usize) -> Option<u16> {
+        self.geometry.get(index).map(|entry| {
+            if entry.user {
+                entry.row_start.saturating_add(1)
+            } else {
+                entry.row_start
+            }
+        })
+    }
+
+    fn prior_user_row(&self, scroll: u16) -> Option<(u16, usize)> {
+        self.geometry
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, entry)| {
+                let row = entry.row_start.saturating_add(1);
+                (entry.user && row < scroll).then_some((row, index))
+            })
     }
 }
 
 fn cache_transcript_entry(
+    index: usize,
     entry: &TranscriptEntry,
+    revision: u64,
     theme: &Theme,
     width: u16,
     phase: u8,
 ) -> CachedTranscriptEntry {
+    let (lines, height, dynamic) = formatted_transcript_entry(entry, theme, width, phase);
+    CachedTranscriptEntry {
+        index,
+        revision,
+        lines,
+        row_start: 0,
+        height,
+        dynamic,
+        user: matches!(entry, TranscriptEntry::User { .. }),
+    }
+}
+
+fn formatted_transcript_entry(
+    entry: &TranscriptEntry,
+    theme: &Theme,
+    width: u16,
+    phase: u8,
+) -> (Vec<Line<'static>>, u16, bool) {
     let mut lines = Vec::new();
     transcript_lines(&mut lines, entry, theme, width, phase);
     let lines = lines.into_iter().map(owned_line).collect::<Vec<_>>();
@@ -156,12 +414,159 @@ fn cache_transcript_entry(
             ..
         })
     );
-    CachedTranscriptEntry {
-        source: entry.clone(),
-        lines,
-        row_start: 0,
-        height,
-        dynamic,
+    (lines, height, dynamic)
+}
+
+fn retained_cache_bytes(
+    entries: &Vec<CachedTranscriptEntry>,
+    geometry: &Vec<TranscriptGeometry>,
+) -> usize {
+    let line_heaps = entries.iter().fold(0usize, |total, entry| {
+        total
+            .saturating_add(
+                entry
+                    .lines
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Line<'static>>()),
+            )
+            .saturating_add(entry.lines.iter().fold(0usize, |line_total, line| {
+                line_total
+                    .saturating_add(
+                        line.spans
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<Span<'static>>()),
+                    )
+                    .saturating_add(line.spans.iter().fold(0usize, |span_total, span| {
+                        span_total.saturating_add(match &span.content {
+                            std::borrow::Cow::Owned(text) => text.capacity(),
+                            std::borrow::Cow::Borrowed(_) => 0,
+                        })
+                    }))
+            }))
+    });
+    entries
+        .capacity()
+        .saturating_mul(std::mem::size_of::<CachedTranscriptEntry>())
+        .saturating_add(
+            geometry
+                .capacity()
+                .saturating_mul(std::mem::size_of::<TranscriptGeometry>()),
+        )
+        .saturating_add(line_heaps)
+}
+
+fn transcript_source_heap_bytes(entry: &TranscriptEntry) -> usize {
+    match entry {
+        TranscriptEntry::User { text, .. } | TranscriptEntry::Note { text } => text.capacity(),
+        TranscriptEntry::Peer {
+            msg_id,
+            sender,
+            sender_kind,
+            text,
+            ..
+        } => msg_id
+            .capacity()
+            .saturating_add(sender.capacity())
+            .saturating_add(sender_kind.capacity())
+            .saturating_add(text.capacity()),
+        TranscriptEntry::Item(block) => block
+            .item_id
+            .as_str()
+            .len()
+            .saturating_add(block.args_fragments.capacity())
+            .saturating_add(block.output_tail.capacity())
+            .saturating_add(block.tool_reason.as_ref().map_or(0, String::capacity))
+            .saturating_add(turn_item_source_heap_bytes(&block.item)),
+        TranscriptEntry::Refusal {
+            provider,
+            tool,
+            reason,
+        } => provider
+            .capacity()
+            .saturating_add(tool.capacity())
+            .saturating_add(reason.capacity()),
+        TranscriptEntry::Error { text, presentation } => {
+            text.capacity()
+                .saturating_add(presentation.as_ref().map_or(0, |card| {
+                    card.subcode
+                        .as_str()
+                        .len()
+                        .saturating_add(card.title.capacity())
+                        .saturating_add(card.detail.capacity())
+                        .saturating_add(
+                            card.provider_request_id
+                                .as_ref()
+                                .map_or(0, String::capacity),
+                        )
+                        .saturating_add(card.allowed_actions.capacity().saturating_mul(
+                            std::mem::size_of::<haider_protocol::error::ErrorAction>(),
+                        ))
+                }))
+        }
+        TranscriptEntry::Shell { cmd, out } => cmd.capacity().saturating_add(out.capacity()),
+    }
+}
+
+fn turn_item_source_heap_bytes(item: &TurnItem) -> usize {
+    match item {
+        TurnItem::AgentMessage { text }
+        | TurnItem::Reasoning { summary: text }
+        | TurnItem::Refusal { reason: text } => text.capacity(),
+        TurnItem::IncompleteAgentMessage { text, interruption } => text
+            .capacity()
+            .saturating_add(interruption.title.capacity())
+            .saturating_add(interruption.detail.capacity()),
+        TurnItem::ToolCall {
+            call_id,
+            name,
+            args,
+            ..
+        } => call_id
+            .capacity()
+            .saturating_add(name.capacity())
+            .saturating_add(json_source_heap_bytes(args)),
+        TurnItem::CommandExecution {
+            call_id, command, ..
+        } => call_id.capacity().saturating_add(command.capacity()),
+        TurnItem::FileChange { path, .. } => path.capacity(),
+        TurnItem::ChildSpawn { agent } => agent.as_str().len(),
+        TurnItem::ChildResult { report } => report
+            .agent
+            .as_str()
+            .len()
+            .saturating_add(report.summary.capacity()),
+        TurnItem::Plan { items } => items
+            .capacity()
+            .saturating_mul(std::mem::size_of::<haider_protocol::history::TodoItem>())
+            .saturating_add(items.iter().map(|item| item.text.capacity()).sum::<usize>()),
+        TurnItem::ContextCompaction {
+            summary_artifact, ..
+        } => summary_artifact.as_str().len(),
+        TurnItem::Extension { kind, data } => {
+            kind.capacity().saturating_add(json_source_heap_bytes(data))
+        }
+    }
+}
+
+fn json_source_heap_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 0,
+        serde_json::Value::String(text) => text.capacity(),
+        serde_json::Value::Array(values) => values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<serde_json::Value>())
+            .saturating_add(values.iter().map(json_source_heap_bytes).sum::<usize>()),
+        serde_json::Value::Object(values) => values
+            .len()
+            .saturating_mul(std::mem::size_of::<(String, serde_json::Value)>())
+            .saturating_add(
+                values
+                    .iter()
+                    .map(|(key, value)| {
+                        key.capacity().saturating_add(json_source_heap_bytes(value))
+                    })
+                    .sum::<usize>(),
+            ),
     }
 }
 
@@ -192,7 +597,10 @@ fn wrapped_lines_height(lines: &[Line<'_>], width: u16) -> u16 {
 /// Select only the contiguous transcript slice intersecting the viewport
 /// plus a two-row overscan. Returned scroll coordinates remain global.
 fn virtualized_transcript_lines(
-    cache: &TranscriptLayoutCache,
+    cache: &mut TranscriptLayoutCache,
+    projection: &SessionProjection,
+    theme: &Theme,
+    phase: u8,
     prefix: &[Line<'static>],
     suffix: &[Line<'static>],
     scroll: u16,
@@ -211,14 +619,14 @@ fn virtualized_transcript_lines(
     let prefix_visible = !prefix.is_empty() && wanted_start < prefix_rows;
     let suffix_visible = !suffix.is_empty() && wanted_end > suffix_base && wanted_start < total;
 
-    let first = cache.entries.partition_point(|entry| {
+    let first = cache.geometry.partition_point(|entry| {
         entries_base
             .saturating_add(entry.row_start)
             .saturating_add(entry.height)
             <= wanted_start
     });
     let mut end = first;
-    while let Some(entry) = cache.entries.get(end) {
+    while let Some(entry) = cache.geometry.get(end) {
         if entries_base.saturating_add(entry.row_start) >= wanted_end {
             break;
         }
@@ -227,7 +635,7 @@ fn virtualized_transcript_lines(
 
     let base = if prefix_visible {
         0
-    } else if let Some(entry) = cache.entries.get(first).filter(|_| first < end) {
+    } else if let Some(entry) = cache.geometry.get(first).filter(|_| first < end) {
         entries_base.saturating_add(entry.row_start)
     } else {
         suffix_base
@@ -236,8 +644,13 @@ fn virtualized_transcript_lines(
     if prefix_visible {
         lines.extend_from_slice(prefix);
     }
-    for entry in &cache.entries[first..end] {
-        lines.extend_from_slice(&entry.lines);
+    for index in first..end {
+        if cache.bounded {
+            let entry_lines = cache.bounded_entry_lines(projection, index, theme, width, phase);
+            lines.extend(entry_lines);
+        } else {
+            lines.extend_from_slice(&cache.entries[index].lines);
+        }
     }
     if suffix_visible {
         lines.extend_from_slice(suffix);
@@ -250,14 +663,15 @@ fn virtualized_transcript_lines(
 /// remains aligned after resizing and scroll-back.
 fn image_reveal_hits(
     cache: &TranscriptLayoutCache,
+    projection: &SessionProjection,
     prefix_rows: u16,
     scroll: u16,
     area: Rect,
     hits: &mut Vec<(Rect, Hit)>,
 ) {
     let viewport_end = scroll.saturating_add(area.height);
-    for entry in &cache.entries {
-        let TranscriptEntry::Item(block) = &entry.source else {
+    for (index, entry) in cache.geometry.iter().enumerate() {
+        let TranscriptEntry::Item(block) = &projection.entries()[index] else {
             continue;
         };
         let TurnItem::Extension { kind, data } = &block.item else {
@@ -851,6 +1265,9 @@ fn overlay_wordmark(
 /// Draw the graphics wordmark into `rect`, replacing whatever was drawn there.
 /// No-op when the terminal has no graphics protocol (`model.wordmark` is None).
 fn draw_wordmark_image(model: &AppModel, rect: Rect, frame: &mut Frame<'_>) {
+    const IMAGE_COLS: u16 = crate::mark::HEADER_COLS;
+    const IMAGE_ROWS: u16 = crate::mark::HEADER_ROWS;
+
     let mut slot = model.wordmark.borrow_mut();
     let Some(wordmark) = slot.as_mut() else {
         return;
@@ -858,10 +1275,26 @@ fn draw_wordmark_image(model: &AppModel, rect: Rect, frame: &mut Frame<'_>) {
     if rect.width == 0 || rect.height == 0 {
         return;
     }
+    if !wordmark.prepare() {
+        return;
+    }
+    // Keep one encoded geometry for the whole session. The large launcher
+    // slot centers the same 24x2 protocol used by session headers, so moving
+    // between screens never asks ratatui-image to resize/re-encode it.
+    let image_rect = Rect {
+        x: rect
+            .x
+            .saturating_add(rect.width.saturating_sub(IMAGE_COLS) / 2),
+        y: rect
+            .y
+            .saturating_add(rect.height.saturating_sub(IMAGE_ROWS) / 2),
+        width: rect.width.min(IMAGE_COLS),
+        height: rect.height.min(IMAGE_ROWS),
+    };
     // Wipe the cells first (the half-block art the caller drew), then draw the
     // image over them so no block ink bleeds around the aspect-fitted wordmark.
     frame.render_widget(ratatui::widgets::Clear, rect);
-    wordmark.render_into(rect, frame.buffer_mut());
+    wordmark.render_into(image_rect, frame.buffer_mut());
 }
 
 fn render_launcher(
@@ -4540,7 +4973,7 @@ fn render_session(
     // output and the composer band. The breathing row rides the STREAM
     // (the pad row died with S2 item 4), so at the bottom-anchored tail
     // it separates output from the band and it scrolls with history.
-    if !transcript_cache.entries.is_empty() || !tail.is_empty() {
+    if transcript_cache.has_entries() || !tail.is_empty() {
         tail.push(Line::default());
     }
     let total = transcript_cache
@@ -4568,7 +5001,7 @@ fn render_session(
     {
         match model.projection.entry_of_node(&jump.node) {
             Some(entry) => {
-                let row = transcript_cache.entry_rows.get(entry).copied().unwrap_or(0);
+                let row = transcript_cache.entry_row(entry).unwrap_or(0);
                 // A near-tail target cannot be top-aligned without fake
                 // padding: clamp honestly and let it sit where the real
                 // rows put it.
@@ -4586,7 +5019,10 @@ fn render_session(
     let scroll_back = model.scroll_back.get();
     let scroll = max_scroll - scroll_back;
     let (visible_lines, visible_base, visible_total) = virtualized_transcript_lines(
-        &transcript_cache,
+        &mut transcript_cache,
+        &model.projection,
+        theme,
+        model.anim_phase,
         &[],
         &tail,
         scroll,
@@ -4620,7 +5056,14 @@ fn render_session(
             paragraph.scroll((scroll.saturating_sub(visible_base), 0)),
             transcript_area,
         );
-        image_reveal_hits(&transcript_cache, 0, scroll, transcript_area, hits);
+        image_reveal_hits(
+            &transcript_cache,
+            &model.projection,
+            0,
+            scroll,
+            transcript_area,
+            hits,
+        );
     }
     // Sticky origin line (sim StickyLine, tui.js:3345-3349 / 4597-4623):
     // while scrolled into history, pin the user prompt that produced the
@@ -4642,16 +5085,12 @@ fn render_session(
         && transcript_area.height > 0
         && !model.sticky_suppressed.get()
     {
-        let sticky = transcript_cache
-            .user_rows
-            .iter()
-            .rev()
-            .find(|(row, _)| *row < scroll);
+        let sticky = transcript_cache.prior_user_row(scroll);
         if let Some((row, entry_index)) = sticky
             && let Some(TranscriptEntry::User { text, .. }) =
-                model.projection.entries().get(*entry_index)
+                model.projection.entries().get(entry_index)
         {
-            let jump = max_scroll.saturating_sub(*row);
+            let jump = max_scroll.saturating_sub(row);
             let sticky_rect = Rect {
                 x: transcript_area.x,
                 y: transcript_area.y,
@@ -8849,7 +9288,7 @@ fn render_subagent(
     }
     // S2 item 5, session parity: one blank line between the chip
     // transcript's tail and the band.
-    if !prefix.is_empty() || !transcript_cache.entries.is_empty() || !tail.is_empty() {
+    if !prefix.is_empty() || transcript_cache.has_entries() || !tail.is_empty() {
         tail.push(Line::default());
     }
     let total = wrapped_lines_height(&prefix, transcript_area.width)
@@ -8864,7 +9303,10 @@ fn render_subagent(
         .set(model.scroll_back.get().min(max_scroll));
     let scroll = max_scroll - model.scroll_back.get();
     let (visible_lines, visible_base, visible_total) = virtualized_transcript_lines(
-        &transcript_cache,
+        &mut transcript_cache,
+        &chip.transcript,
+        theme,
+        model.anim_phase,
         &prefix,
         &tail,
         scroll,
@@ -8880,6 +9322,7 @@ fn render_subagent(
     );
     image_reveal_hits(
         &transcript_cache,
+        &chip.transcript,
         wrapped_lines_height(&prefix, transcript_area.width),
         scroll,
         transcript_area,

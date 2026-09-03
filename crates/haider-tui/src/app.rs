@@ -4617,6 +4617,11 @@ pub struct AppModel {
     pub sanctum_tier: SanctumTier,
     pub projection: SessionProjection,
     pub(crate) transcript_layout: std::cell::RefCell<crate::render::TranscriptLayoutCache>,
+    /// One-shot post-frame cache maintenance requested by a terminal run or
+    /// completed attach replay. The terminal frame renders first; only then
+    /// may duplicated view state be released.
+    client_memory_settle_pending: bool,
+    client_memory_settle_pressure_bytes: usize,
     /// Durable-journal prompt recall for the attached session, newest first.
     /// Identical redo prompts are distinct entries by design. Each entry
     /// carries the committed sequence a fork cut needs, or `None` when it
@@ -5180,6 +5185,8 @@ impl Default for AppModel {
             sanctum_tier: SanctumTier::default(),
             projection: SessionProjection::new(),
             transcript_layout: std::cell::RefCell::new(Default::default()),
+            client_memory_settle_pending: false,
+            client_memory_settle_pressure_bytes: 0,
             prompt_history: std::collections::VecDeque::new(),
             cache_usage: crate::cache_usage::SessionUsageFold::default(),
             pending_cache_change: None,
@@ -8231,8 +8238,100 @@ impl AppModel {
     }
 
     fn record_prompt(&mut self, entry: crate::session::PromptEntry) {
-        self.prompt_history.push_front(entry);
+        crate::session::push_prompt_recall(&mut self.prompt_history, entry);
         self.close_backtrack();
+    }
+
+    /// Request one post-frame memory maintenance pass. Attach catch-up uses
+    /// this boundary because all replay allocations are dead, while terminal
+    /// run-state handling requests it for the first fully settled frame.
+    pub fn request_client_memory_settle(&mut self) {
+        self.client_memory_settle_pending = true;
+    }
+
+    /// Request settlement and include transient work that is no longer
+    /// retained (for example raw envelopes decoded during attach replay).
+    pub fn request_client_memory_settle_after(&mut self, transient_bytes: usize) {
+        self.client_memory_settle_pending = true;
+        self.client_memory_settle_pressure_bytes = self
+            .client_memory_settle_pressure_bytes
+            .saturating_add(transient_bytes);
+        // `CaughtUp` may arrive after the last replay event was already
+        // painted. Re-arm one frame so post-frame maintenance cannot remain
+        // stranded on an otherwise clean idle model.
+        self.dirty = true;
+    }
+
+    /// Release duplicated view caches after the frame that made settlement
+    /// visible. Returns a conservative pressure basis: released cache
+    /// capacity or the completed transcript-format workload, whichever was
+    /// larger.
+    #[doc(hidden)]
+    pub fn finish_frame_memory_maintenance(&mut self) -> usize {
+        const ALLOCATOR_RELIEF_MIN_BYTES: usize = 256 * 1024;
+
+        if !std::mem::take(&mut self.client_memory_settle_pending) {
+            return 0;
+        }
+        fn release_chips(chips: &mut [ChipModel]) -> usize {
+            chips.iter_mut().fold(0usize, |released, chip| {
+                let display_active = matches!(
+                    chip.display_state(),
+                    ChipDisplayState::Thinking
+                        | ChipDisplayState::Streaming
+                        | ChipDisplayState::Running
+                        | ChipDisplayState::Tool
+                        | ChipDisplayState::InputRequired
+                );
+                let own_release = if chip.transcript.settled() && !display_active {
+                    chip.transcript_layout
+                        .get_mut()
+                        .release_after_frame(chip.transcript.render_revision())
+                } else {
+                    0
+                };
+                released
+                    .saturating_add(own_release)
+                    .saturating_add(release_chips(&mut chip.children))
+            })
+        }
+
+        let mut released = std::mem::take(&mut self.client_memory_settle_pressure_bytes);
+        if self.projection.settled() {
+            released = released.saturating_add(
+                self.transcript_layout
+                    .get_mut()
+                    .release_after_frame(self.projection.render_revision()),
+            );
+        }
+        released = released.saturating_add(crate::session::shrink_prompt_recall(
+            &mut self.prompt_history,
+        ));
+        released = released.saturating_add(release_chips(&mut self.chips));
+        for session in &mut self.sessions {
+            released = released.saturating_add(crate::session::shrink_prompt_recall(
+                &mut session.prompt_history,
+            ));
+            released = released.saturating_add(release_chips(&mut session.chips));
+        }
+        if released >= ALLOCATOR_RELIEF_MIN_BYTES {
+            let _ = haider_platform::allocator_pressure_relief();
+        }
+        released
+    }
+
+    /// Retained main-transcript cache diagnostics for memory-bound tests.
+    #[doc(hidden)]
+    pub fn transcript_cache_stats(&self) -> (usize, usize, bool) {
+        self.transcript_layout.borrow().retained_stats()
+    }
+
+    /// Number of rows formatted to maintain oversized-transcript geometry.
+    /// Exposed only for the regression test that prevents O(history)
+    /// reformatting on each semantic event.
+    #[doc(hidden)]
+    pub fn transcript_cache_bounded_format_count(&self) -> u64 {
+        self.transcript_layout.borrow().bounded_format_count()
     }
 
     fn rapid_backtrack_escape(&self, now: std::time::Instant) -> bool {
@@ -14388,6 +14487,9 @@ impl AppModel {
                     && let Ok(EventPayload::RunState(state)) =
                         serde_json::from_value::<EventPayload>(envelope.payload.clone())
                 {
+                    if state.is_terminal() {
+                        self.request_client_memory_settle();
+                    }
                     let title = self
                         .sessions
                         .iter()
@@ -14990,6 +15092,7 @@ impl AppModel {
             if state.is_terminal() {
                 self.turn_active = false;
                 self.auto_resuming = false;
+                self.request_client_memory_settle();
                 // The `♪ speaking` tag ends where the TURN ends. A trailing
                 // `Voice(false)` beat could not: a branch parked on a menu
                 // never reaches its own tail, so later ordinary rows kept

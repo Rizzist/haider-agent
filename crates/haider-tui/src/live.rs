@@ -2004,6 +2004,10 @@ pub struct LiveDriver {
     /// attachment ids are rejected").
     attachments: HashMap<SessionId, AttachmentId>,
     routes: HashMap<AttachmentId, SessionId>,
+    /// Approximate heap volume decoded between `Attached` and `CaughtUp`.
+    /// The map exists only for attachments still replaying; the caught-up
+    /// boundary coalesces one allocator-relief decision from this total.
+    replay_transient_bytes: HashMap<AttachmentId, usize>,
     /// Working set in LRU order: front is coldest, back is most recently
     /// used. Bounded by [`ATTACHMENT_CAP`].
     lru: Vec<SessionId>,
@@ -2263,6 +2267,29 @@ pub fn session_output_cap(context_window: u64) -> u64 {
     SESSION_OUTPUT_CAP.min(context_window.max(1))
 }
 
+fn json_transient_heap_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 0,
+        serde_json::Value::String(text) => text.capacity(),
+        serde_json::Value::Array(values) => values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<serde_json::Value>())
+            .saturating_add(values.iter().map(json_transient_heap_bytes).sum::<usize>()),
+        serde_json::Value::Object(values) => values
+            .len()
+            .saturating_mul(std::mem::size_of::<(String, serde_json::Value)>())
+            .saturating_add(
+                values
+                    .iter()
+                    .map(|(key, value)| {
+                        key.capacity()
+                            .saturating_add(json_transient_heap_bytes(value))
+                    })
+                    .sum::<usize>(),
+            ),
+    }
+}
+
 impl LiveDriver {
     /// A driver for one client instance. `instance` must be unique per
     /// process (the client instance id serves).
@@ -2273,6 +2300,7 @@ impl LiveDriver {
             input_mirror: InputMirrorState::default(),
             attachments: HashMap::new(),
             routes: HashMap::new(),
+            replay_transient_bytes: HashMap::new(),
             lru: Vec::new(),
             cold: HashMap::new(),
             attaching: HashMap::new(),
@@ -2620,6 +2648,7 @@ impl LiveDriver {
     }
 
     fn drop_attachment(&mut self, attachment: &AttachmentId) {
+        self.replay_transient_bytes.remove(attachment);
         if let Some(session) = self.routes.remove(attachment) {
             self.attachments.remove(&session);
             self.lru.retain(|held| held != &session);
@@ -3055,6 +3084,7 @@ impl LiveDriver {
                     queue_read.push(LiveCommand::ShellList);
                 }
                 self.generations.insert(session.clone(), worker_generation);
+                self.replay_transient_bytes.insert(attachment.clone(), 0);
                 self.routes.insert(attachment.clone(), session.clone());
                 self.attachments.insert(session.clone(), attachment);
                 self.touch(&session);
@@ -4356,6 +4386,8 @@ impl LiveDriver {
                 // and our reducer, and the LAST ones leave no trace of
                 // their own absence. Reattach from what we really applied.
                 if cursor_of(model, &session).unwrap_or(0) >= high_water_seq {
+                    let replay_bytes = self.replay_transient_bytes.remove(&attachment).unwrap_or(0);
+                    model.request_client_memory_settle_after(replay_bytes);
                     return Vec::new();
                 }
                 self.drop_attachment(&attachment);
@@ -4978,6 +5010,7 @@ impl LiveDriver {
                 // session.
                 self.attachments.clear();
                 self.routes.clear();
+                self.replay_transient_bytes.clear();
                 // The login's staged secret died with the socket: staging is
                 // connection-scoped and deliberately non-durable, so nothing
                 // can retry it and no response will ever arrive. A card left
@@ -5481,6 +5514,10 @@ impl LiveDriver {
         };
         if routed != session || &envelope.session_id != session {
             return Vec::new();
+        }
+        if let Some(replay_bytes) = self.replay_transient_bytes.get_mut(attachment) {
+            *replay_bytes =
+                replay_bytes.saturating_add(json_transient_heap_bytes(&envelope.payload));
         }
         self.touch(session);
         // Driver-side bookkeeping happens ONLY for envelopes the reducer

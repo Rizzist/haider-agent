@@ -154,7 +154,7 @@ jobs:
           # Runner evidence and provisional gaps are documented in cfbcal.md.
           calibrate_surface status-post-command status 2938637
           calibrate_surface run-post-command run 3794948
-          calibrate_surface tui-demo-sixel tui-sixel 6110043
+          calibrate_surface tui-demo-sixel tui-sixel 6344334
           if (( failures != 0 )); then
             echo "$failures client-footprint surface(s) failed; available calibration evidence was retained" >&2
             exit 1

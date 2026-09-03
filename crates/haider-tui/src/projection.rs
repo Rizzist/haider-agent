@@ -253,6 +253,11 @@ pub struct SessionProjection {
     /// remains the authority; render caches only use this to avoid comparing
     /// an unchanged transcript on every animation frame.
     render_revision: u64,
+    /// Exact per-entry invalidation tokens for the transcript layout cache.
+    /// A global render revision also changes for badges, menus, and meters;
+    /// using it for every row would reformat all history on each such event.
+    entry_revision_clock: u64,
+    entry_revisions: Vec<u64>,
     last_seq: Option<u64>,
     harness: Option<HarnessStatus>,
     run: Option<RunState>,
@@ -343,11 +348,13 @@ impl SessionProjection {
         &mut self,
         origin: &haider_protocol::item::UserCommandOriginV1,
     ) -> bool {
-        let Some(block) = self.entries.iter_mut().find_map(|entry| match entry {
-            TranscriptEntry::Item(block) if block.item_id == origin.command_item_id => Some(block),
-            _ => None,
+        let Some(index) = self.entries.iter().position(|entry| {
+            matches!(entry, TranscriptEntry::Item(block) if block.item_id == origin.command_item_id)
         }) else {
             return false;
+        };
+        let TranscriptEntry::Item(block) = &mut self.entries[index] else {
+            unreachable!("the matching entry is an item")
         };
         if !matches!(
             &block.item,
@@ -359,6 +366,7 @@ impl SessionProjection {
         block.user_command = true;
         if changed {
             self.render_revision = self.render_revision.wrapping_add(1);
+            self.touch_entry(index);
         }
         true
     }
@@ -385,13 +393,34 @@ impl SessionProjection {
         usage: Option<Usage>,
         interrupted: bool,
     ) -> Self {
+        let entry_revisions = vec![1; entries.len()];
         Self {
             entries,
+            entry_revision_clock: 1,
+            entry_revisions,
             menu,
             todos,
             usage,
             interrupted,
             ..Self::default()
+        }
+    }
+
+    fn next_entry_revision(&mut self) -> u64 {
+        self.entry_revision_clock = self.entry_revision_clock.wrapping_add(1).max(1);
+        self.entry_revision_clock
+    }
+
+    fn push_entry(&mut self, entry: TranscriptEntry) {
+        let revision = self.next_entry_revision();
+        self.entries.push(entry);
+        self.entry_revisions.push(revision);
+    }
+
+    fn touch_entry(&mut self, index: usize) {
+        let revision = self.next_entry_revision();
+        if let Some(slot) = self.entry_revisions.get_mut(index) {
+            *slot = revision;
         }
     }
 
@@ -538,7 +567,7 @@ impl SessionProjection {
                 // serves no public reason.
                 if matches!(run, RunState::Errored) && !self.run_failure_reported {
                     self.run_failure_reported = true;
-                    self.entries.push(TranscriptEntry::Error {
+                    self.push_entry(TranscriptEntry::Error {
                         text: "errored — the daemon reported no public reason".to_owned(),
                         presentation: None,
                     });
@@ -560,7 +589,7 @@ impl SessionProjection {
             EventPayload::UserMessage {
                 text, attachments, ..
             } => {
-                self.entries.push(TranscriptEntry::User {
+                self.push_entry(TranscriptEntry::User {
                     text: text.clone(),
                     attachments: attachments.len(),
                     voice: false,
@@ -589,7 +618,7 @@ impl SessionProjection {
                 ..
             } => {
                 self.run_failure_reported = true;
-                self.entries.push(TranscriptEntry::Error {
+                self.push_entry(TranscriptEntry::Error {
                     text: presentation.as_ref().map_or_else(
                         || format!("{} — {message}", code.as_str()),
                         format_error_presentation,
@@ -598,7 +627,7 @@ impl SessionProjection {
                 });
             }
             EventPayload::ClientDiagnostic { code, message, .. } => {
-                self.entries.push(TranscriptEntry::Error {
+                self.push_entry(TranscriptEntry::Error {
                     text: format!("{code} — {message}"),
                     presentation: Some(haider_protocol::error::ErrorPresentation::new(
                         code,
@@ -644,13 +673,13 @@ impl SessionProjection {
                         }
                     }
                     EffectOutcome::CancelledEscalated { note } => {
-                        self.entries.push(TranscriptEntry::Error {
+                        self.push_entry(TranscriptEntry::Error {
                             text: format!("effect cancel escalated — {note}"),
                             presentation: None,
                         });
                     }
                     EffectOutcome::Unknown => {
-                        self.entries.push(TranscriptEntry::Error {
+                        self.push_entry(TranscriptEntry::Error {
                             text: "effect outcome unknown — crash window; reconcile via the recovery menu"
                                 .to_owned(),
                             presentation: None,
@@ -664,7 +693,7 @@ impl SessionProjection {
                 let new_errors = report.new_errors.len();
                 match &report.verdict {
                     VerifyVerdict::ErroredWithReport => {
-                        self.entries.push(TranscriptEntry::Error {
+                        self.push_entry(TranscriptEntry::Error {
                             text: format!(
                                 "verify errored — cycle cap exhausted · {new_errors} new error(s)"
                             ),
@@ -672,19 +701,19 @@ impl SessionProjection {
                         });
                     }
                     VerifyVerdict::FailedEnv { item } => {
-                        self.entries.push(TranscriptEntry::Error {
+                        self.push_entry(TranscriptEntry::Error {
                             text: format!("verify failed-env — {item}"),
                             presentation: None,
                         });
                     }
                     VerifyVerdict::Incomplete { reason } => {
-                        self.entries.push(TranscriptEntry::Error {
+                        self.push_entry(TranscriptEntry::Error {
                             text: format!("verify incomplete — {reason}"),
                             presentation: None,
                         });
                     }
                     VerifyVerdict::AcknowledgedRed => {
-                        self.entries.push(TranscriptEntry::Error {
+                        self.push_entry(TranscriptEntry::Error {
                             text: format!(
                                 "verify acknowledged-red — {new_errors} new error(s) cited out of scope"
                             ),
@@ -710,7 +739,7 @@ impl SessionProjection {
                 ));
             }
             EventPayload::LockdownRefused(refusal) => {
-                self.entries.push(TranscriptEntry::Refusal {
+                self.push_entry(TranscriptEntry::Refusal {
                     provider: refusal.provider.clone(),
                     tool: refusal.tool.clone(),
                     reason: refusal.reason.clone(),
@@ -876,36 +905,42 @@ impl SessionProjection {
     }
 
     fn effect_failure_is_inline(&mut self, owners: &[EffectToolOwner], error: &str) -> bool {
-        self.entries.iter_mut().any(|entry| {
+        for index in 0..self.entries.len() {
+            let entry = &mut self.entries[index];
             let TranscriptEntry::Item(block) = entry else {
-                return false;
+                continue;
             };
             let TurnItem::ToolCall {
                 call_id, status, ..
             } = &block.item
             else {
-                return false;
+                continue;
             };
             if !owners
                 .iter()
                 .any(|owner| owner.item_id == block.item_id && owner.call_id == *call_id)
                 || !tool_status_carries_effect_failure(*status)
             {
-                return false;
+                continue;
             }
             if let Some(reason) = &block.tool_reason {
-                return reason.contains(&bounded_effect_error(error));
+                if reason.contains(&bounded_effect_error(error)) {
+                    return true;
+                }
+                continue;
             }
             if block.streaming {
-                return false;
+                continue;
             }
             block.tool_reason = Some(bounded_effect_error(error));
-            true
-        })
+            self.touch_entry(index);
+            return true;
+        }
+        false
     }
 
     fn push_effect_failure(&mut self, error: &str) {
-        self.entries.push(TranscriptEntry::Error {
+        self.push_entry(TranscriptEntry::Error {
             text: format!("effect failed — {error}"),
             presentation: None,
         });
@@ -1020,22 +1055,18 @@ impl SessionProjection {
                 // The row failed carrying no reason of its own: the
                 // first-settling candidate law lets it adopt the oldest
                 // candidate's error.
-                inline = self
-                    .entries
-                    .iter_mut()
-                    .rev()
-                    .find_map(|entry| match entry {
-                        TranscriptEntry::Item(block) if block.item_id == *item_id => {
-                            if block.tool_reason.is_none() {
-                                block.tool_reason = Some(bounded_effect_error(&failure.error));
-                                Some(true)
-                            } else {
-                                Some(false)
-                            }
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or(false);
+                if let Some(entry_index) = self.entries.iter().rposition(
+                    |entry| matches!(entry, TranscriptEntry::Item(block) if block.item_id == *item_id),
+                ) {
+                    let TranscriptEntry::Item(block) = &mut self.entries[entry_index] else {
+                        unreachable!("the matching entry is an item")
+                    };
+                    if block.tool_reason.is_none() {
+                        block.tool_reason = Some(bounded_effect_error(&failure.error));
+                        self.touch_entry(entry_index);
+                        inline = true;
+                    }
+                }
             }
             if !inline {
                 self.push_effect_failure(&failure.error);
@@ -1047,22 +1078,22 @@ impl SessionProjection {
 
     fn apply_tool_result(&mut self, call_id: &str, result: &haider_protocol::tool::BoundedResult) {
         let reason = bounded_tool_reason(result);
-        let item_id = self.entries.iter_mut().rev().find_map(|entry| match entry {
-            TranscriptEntry::Item(block) => match &mut block.item {
-                TurnItem::ToolCall {
-                    call_id: known,
-                    status,
-                    ..
-                } if known == call_id => {
-                    *status = result.status.item_status();
-                    block.tool_reason = reason.clone();
-                    Some(block.item_id.clone())
-                }
-                _ => None,
-            },
-            _ => None,
+        let item_index = self.entries.iter().rposition(|entry| {
+            matches!(entry, TranscriptEntry::Item(ItemBlock { item: TurnItem::ToolCall { call_id: known, .. }, .. }) if known == call_id)
+        });
+        let item_id = item_index.map(|index| {
+            let TranscriptEntry::Item(block) = &mut self.entries[index] else {
+                unreachable!("the matching entry is an item")
+            };
+            let TurnItem::ToolCall { status, .. } = &mut block.item else {
+                unreachable!("the matching item is a tool call")
+            };
+            *status = result.status.item_status();
+            block.tool_reason = reason;
+            block.item_id.clone()
         });
         if let Some(item_id) = item_id {
+            self.touch_entry(item_index.expect("a matched item has an index"));
             self.settle_effect_failures_for_result(&item_id, call_id, result);
         } else {
             self.pending_tool_results
@@ -1076,7 +1107,7 @@ impl SessionProjection {
     /// silent IDLE. Local display truth only: nothing durable claims it.
     pub fn record_local_error(&mut self, text: String) {
         self.render_revision = self.render_revision.wrapping_add(1);
-        self.entries.push(TranscriptEntry::Error {
+        self.push_entry(TranscriptEntry::Error {
             text,
             presentation: None,
         });
@@ -1092,7 +1123,7 @@ impl SessionProjection {
         presentation: haider_protocol::error::ErrorPresentation,
     ) {
         self.render_revision = self.render_revision.wrapping_add(1);
-        self.entries.push(TranscriptEntry::Error {
+        self.push_entry(TranscriptEntry::Error {
             text: format_error_presentation(&presentation),
             presentation: Some(presentation),
         });
@@ -1181,7 +1212,7 @@ impl SessionProjection {
                     .is_some_and(|panel| panel.pinned && panel.item_id == *item_id);
                 if self.finished_items.contains(item_id)
                     || plan_active
-                    || self.open_block_mut(item_id).is_some()
+                    || self.open_block_index(item_id).is_some()
                 {
                     self.duplicate_items += 1;
                     return;
@@ -1193,13 +1224,12 @@ impl SessionProjection {
                         pinned: true,
                     });
                 } else {
-                    self.entries
-                        .push(TranscriptEntry::Item(ItemBlock::new_spoken(
-                            item_id.clone(),
-                            item.clone(),
-                            true,
-                            self.voice_live,
-                        )));
+                    self.push_entry(TranscriptEntry::Item(ItemBlock::new_spoken(
+                        item_id.clone(),
+                        item.clone(),
+                        true,
+                        self.voice_live,
+                    )));
                 }
             }
             ItemEvent::Delta { item_id, delta } => self.apply_delta(item_id, delta),
@@ -1219,7 +1249,7 @@ impl SessionProjection {
                         // The completed plan unpins INTO the transcript and
                         // the id closes — later duplicates are no-ops.
                         self.finished_items.insert(item_id.clone());
-                        self.entries.push(TranscriptEntry::Item(ItemBlock::new(
+                        self.push_entry(TranscriptEntry::Item(ItemBlock::new(
                             item_id.clone(),
                             item.clone(),
                             false,
@@ -1227,7 +1257,10 @@ impl SessionProjection {
                     }
                 } else {
                     self.finished_items.insert(item_id.clone());
-                    if let Some(block) = self.open_block_mut(item_id) {
+                    if let Some(index) = self.open_block_index(item_id) {
+                        let TranscriptEntry::Item(block) = &mut self.entries[index] else {
+                            unreachable!("an open block index is an item")
+                        };
                         // Replace semantics: the final item is authoritative.
                         block.item = item.clone();
                         block.streaming = false;
@@ -1235,16 +1268,16 @@ impl SessionProjection {
                         // fragment accumulation is a duplicate — release it
                         // (efficiency rider #3).
                         block.args_fragments = String::new();
+                        self.touch_entry(index);
                     } else {
                         // Attach-mid-stream tolerance: a Completed we never
                         // saw start still lands as a finished block.
-                        self.entries
-                            .push(TranscriptEntry::Item(ItemBlock::new_spoken(
-                                item_id.clone(),
-                                item.clone(),
-                                false,
-                                self.voice_live,
-                            )));
+                        self.push_entry(TranscriptEntry::Item(ItemBlock::new_spoken(
+                            item_id.clone(),
+                            item.clone(),
+                            false,
+                            self.voice_live,
+                        )));
                     }
                 }
                 if let TurnItem::ToolCall {
@@ -1270,27 +1303,34 @@ impl SessionProjection {
         // 2026-08-15). Command OUTPUT is tool-execution data, not generation,
         // and stays excluded.
         let mut output_chars = 0u64;
+        let mut entry_changed = false;
+        let Some(index) = self.open_block_index(item_id) else {
+            self.orphan_deltas += 1;
+            return;
+        };
         {
-            let Some(block) = self.open_block_mut(item_id) else {
-                self.orphan_deltas += 1;
-                return;
+            let TranscriptEntry::Item(block) = &mut self.entries[index] else {
+                unreachable!("an open block index is an item")
             };
             match delta {
                 ItemDelta::Text { text } => {
                     if let TurnItem::AgentMessage { text: body } = &mut block.item {
                         body.push_str(text);
                         output_chars = text.chars().count() as u64;
+                        entry_changed = true;
                     }
                 }
                 ItemDelta::Reasoning { text } => {
                     if let TurnItem::Reasoning { summary } = &mut block.item {
                         summary.push_str(text);
                         output_chars = text.chars().count() as u64;
+                        entry_changed = true;
                     }
                 }
                 ItemDelta::ToolArgs { fragment } => {
                     block.args_fragments.push_str(fragment);
                     output_chars = fragment.chars().count() as u64;
+                    entry_changed = true;
                 }
                 ItemDelta::CommandOutput { chunk_b64, .. } => {
                     match base64::engine::general_purpose::STANDARD.decode(chunk_b64) {
@@ -1310,23 +1350,27 @@ impl SessionProjection {
                                 block.output_truncated = true;
                             }
                             block.output_tail.extend_from_slice(incoming);
+                            entry_changed = true;
                         }
-                        Err(_) => block.output_decode_error = true,
+                        Err(_) => {
+                            block.output_decode_error = true;
+                            entry_changed = true;
+                        }
                     }
                 }
             }
+        }
+        if entry_changed {
+            self.touch_entry(index);
         }
         self.streamed_output_chars = self.streamed_output_chars.saturating_add(output_chars);
     }
 
     /// The most recent still-streaming block for `item_id` (deltas always
     /// target the open block; searching from the back keeps this O(open)).
-    fn open_block_mut(&mut self, item_id: &ItemId) -> Option<&mut ItemBlock> {
-        self.entries.iter_mut().rev().find_map(|entry| match entry {
-            TranscriptEntry::Item(block) if block.streaming && &block.item_id == item_id => {
-                Some(block)
-            }
-            _ => None,
+    fn open_block_index(&self, item_id: &ItemId) -> Option<usize> {
+        self.entries.iter().rposition(|entry| {
+            matches!(entry, TranscriptEntry::Item(block) if block.streaming && &block.item_id == item_id)
         })
     }
 
@@ -1423,7 +1467,10 @@ impl SessionProjection {
         if self.turn_epoch == 0 || self.usage_turn != Some(self.turn_epoch) {
             return None;
         }
-        self.usage.as_ref().map(|usage| usage.output).filter(|output| *output > 0)
+        self.usage
+            .as_ref()
+            .map(|usage| usage.output)
+            .filter(|output| *output > 0)
     }
 
     /// M4: the visible retry view — `(attempt, max, delay_ms)` while the run
@@ -1455,7 +1502,7 @@ impl SessionProjection {
     /// interrupt, mid-turn input echoes. Never sourced from envelopes.
     pub fn push_note(&mut self, text: String) {
         self.render_revision = self.render_revision.wrapping_add(1);
-        self.entries.push(TranscriptEntry::Note { text });
+        self.push_entry(TranscriptEntry::Note { text });
     }
 
     /// Append one peer-message block from daemon event truth.
@@ -1470,7 +1517,7 @@ impl SessionProjection {
             return;
         }
         self.render_revision = self.render_revision.wrapping_add(1);
-        self.entries.push(TranscriptEntry::Peer {
+        self.push_entry(TranscriptEntry::Peer {
             msg_id,
             sender,
             sender_kind,
@@ -1481,11 +1528,12 @@ impl SessionProjection {
 
     /// Attach an optional delivery receipt to an existing peer block.
     pub fn set_peer_receipt(&mut self, msg_id: &str, receipt: PeerDelivery) {
-        let Some(entry) = self.entries.iter_mut().rev().find(|entry| {
+        let Some(index) = self.entries.iter().rposition(|entry| {
             matches!(entry, TranscriptEntry::Peer { msg_id: existing, .. } if existing == msg_id)
         }) else {
             return;
         };
+        let entry = &mut self.entries[index];
         if let TranscriptEntry::Peer {
             receipt: current, ..
         } = entry
@@ -1493,6 +1541,7 @@ impl SessionProjection {
         {
             *current = Some(receipt);
             self.render_revision = self.render_revision.wrapping_add(1);
+            self.touch_entry(index);
         }
     }
 
@@ -1506,7 +1555,7 @@ impl SessionProjection {
     /// Demo-local like notes — the protocol has no voice surface yet.
     pub fn push_user_voice(&mut self, text: String) {
         self.render_revision = self.render_revision.wrapping_add(1);
-        self.entries.push(TranscriptEntry::User {
+        self.push_entry(TranscriptEntry::User {
             text,
             attachments: 0,
             voice: true,
@@ -1521,7 +1570,7 @@ impl SessionProjection {
     /// see [`crate::session::chip_apply`].
     pub fn push_user_from_main(&mut self, text: String, attachments: usize) {
         self.render_revision = self.render_revision.wrapping_add(1);
-        self.entries.push(TranscriptEntry::User {
+        self.push_entry(TranscriptEntry::User {
             text,
             attachments,
             voice: false,
@@ -1567,7 +1616,7 @@ impl SessionProjection {
 
     pub fn push_shell(&mut self, cmd: String, out: String) {
         self.render_revision = self.render_revision.wrapping_add(1);
-        self.entries.push(TranscriptEntry::Shell { cmd, out });
+        self.push_entry(TranscriptEntry::Shell { cmd, out });
     }
 
     /// Toggle the voice-turn tag for blocks started from now on.
@@ -1840,6 +1889,21 @@ impl SessionProjection {
     #[must_use]
     pub fn entries(&self) -> &[TranscriptEntry] {
         &self.entries
+    }
+
+    /// Exact invalidation token for one transcript entry. View caches use
+    /// this instead of the projection-wide revision, which also changes for
+    /// non-transcript state such as badges and usage meters.
+    #[must_use]
+    pub fn entry_revision(&self, index: usize) -> Option<u64> {
+        self.entry_revisions.get(index).copied()
+    }
+
+    /// Monotone transcript-only revision. Unlike `render_revision`, this does
+    /// not change for badges, menus, usage, or animation state.
+    #[must_use]
+    pub const fn transcript_revision(&self) -> u64 {
+        self.entry_revision_clock
     }
 
     /// CU-2 safety signal: is the model mid-flight on a `computer` action
