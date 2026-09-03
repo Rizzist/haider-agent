@@ -334,6 +334,54 @@ fn provider_catalog_declares_the_pdf_capability_split() {
 }
 
 #[test]
+fn provider_catalog_declares_the_vision_capability_split() {
+    // 970 owner bug 2: the composer refuses a pasted image client-side on a
+    // pair that declares no vision, so this table has to keep agreeing with
+    // the adapters' own `capabilities().vision`. The documented list lives
+    // on `vision_capability`; this pins it.
+    for provider in BUILTIN_PROVIDER_NAMES {
+        let expected = if matches!(
+            provider,
+            "anthropic"
+                | "anthropic-oauth"
+                | "bedrock"
+                | "vertex"
+                | "openai"
+                | "openai-oauth"
+                | "gemini"
+                | "grok-oauth"
+        ) {
+            FeatureResolve::Native
+        } else {
+            FeatureResolve::Unsupported
+        };
+        assert_eq!(
+            haider_provider::vision_capability(provider, None),
+            expected,
+            "vision capability drifted for {provider}"
+        );
+    }
+    assert_eq!(
+        haider_provider::vision_capability("custom-profile", None),
+        FeatureResolve::Unsupported,
+        "an unknown/custom provider is conservative: the generic OpenAI \
+         schema carries no vision fact to infer from"
+    );
+    // A provider's OWN per-model declaration always wins over the family
+    // default, in BOTH directions (Kimi publishes `supports_image_in`).
+    assert_eq!(
+        haider_provider::vision_capability("kimi-oauth", Some(true)),
+        FeatureResolve::Native,
+        "a model that declares vision gets it even in an Unsupported family"
+    );
+    assert_eq!(
+        haider_provider::vision_capability("openai", Some(false)),
+        FeatureResolve::Unsupported,
+        "a model that declares NO vision is refused even in a Native family"
+    );
+}
+
+#[test]
 fn native_pdf_enforces_anthropics_complete_request_size_limit() {
     let provider = provider("claude-sonnet-5");
     let artifact = ArtifactRef::new("blake3:oversized-native-pdf");

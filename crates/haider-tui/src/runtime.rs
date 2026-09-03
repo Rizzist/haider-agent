@@ -1875,6 +1875,7 @@ impl DemoDriver {
             // refuse honestly upstream in demo mode — attachments are
             // daemon-CAS truth, and the read itself is shell-owned.
             | AppRequest::AttachRead { .. }
+            | AppRequest::ClipboardRead
             | AppRequest::AttachUpload { .. }
             // W10b live-only mutations: the demo reducer removes locally.
             | AppRequest::AccountRemove { .. }
@@ -2932,6 +2933,14 @@ pub fn attach_read_effects(model: &mut AppModel, path: &str) {
     let loaded = haider_client::load_attachment(std::path::Path::new(path));
     match loaded {
         Ok(haider_client::HeadlessAttachment::Image(image)) => {
+            // 970 owner bug 2: the vision gate belongs HERE for `/attach`,
+            // not in the command — a path alone does not say whether the
+            // file is a picture, and only an IMAGE is refused. Same typed
+            // notice the ⌃V paste raises, so the two cannot drift.
+            if let Some(notice) = model.image_refusal() {
+                model.set_composer_notice(notice);
+                return;
+            }
             let name = std::path::Path::new(path).file_name().map_or_else(
                 || path.to_owned(),
                 |name| name.to_string_lossy().into_owned(),
@@ -2982,6 +2991,53 @@ pub fn attach_read_effects(model: &mut AppModel, path: &str) {
             }
             model.flash = Some(format!("· /attach — {note}"));
             model.dirty = true;
+        }
+    }
+}
+
+/// ⌃V / ⌘V / ⌃⇧V: turn the OS clipboard into an attachment (970 owner
+/// bug 2). The shell half of [`crate::app::AppRequest::ClipboardRead`] —
+/// the read is IO, so it lives out here, and the `source` is a parameter so
+/// the tests drive the SAME wiring with a fake clipboard.
+///
+/// The four outcomes, all of them non-fatal:
+/// * an IMAGE — re-checked against the session's vision capability (the
+///   reducer issued the read before knowing what was on the clipboard),
+///   then chipped and uploaded through the very seam `/attach` uses;
+/// * TEXT — nothing happens. The terminal's own bracketed paste already
+///   owns text, and inserting it here would double the draft on every
+///   terminal that forwards the chord as well as answering it;
+/// * EMPTY, or an unreadable clipboard — a notice on the band, never a
+///   crash and never a silent no-op.
+pub fn clipboard_paste_effects(
+    model: &mut AppModel,
+    source: &dyn crate::clipboard::ClipboardSource,
+) {
+    match source.read() {
+        Ok(crate::clipboard::ClipboardContent::Image(image)) => {
+            if let Some(notice) = model.image_refusal() {
+                model.set_composer_notice(notice);
+                return;
+            }
+            let kib = image.png.len().div_ceil(1024);
+            let label = format!("clipboard {}×{} · {kib} KB", image.width, image.height);
+            model.begin_attachment_upload(
+                image.png,
+                crate::composer::PendingKind::Image {
+                    mime: "image/png".to_owned(),
+                },
+                label,
+            );
+        }
+        // The bracketed-paste path owns text; ⌃V adds nothing to it.
+        Ok(crate::clipboard::ClipboardContent::Text) => {}
+        Ok(crate::clipboard::ClipboardContent::Empty) => {
+            model.set_composer_notice(crate::app::ImageNotice::ClipboardEmpty);
+        }
+        Err(error) => {
+            model.set_composer_notice(crate::app::ImageNotice::ClipboardUnreadable {
+                note: error.0,
+            });
         }
     }
 }
@@ -3089,6 +3145,9 @@ pub enum ShellRequest {
     /// The outcome re-enters through [`attach_read_effects`]: an honest
     /// flash, or a chip + upload request on the model.
     AttachRead(String),
+    /// Read the OS clipboard for a pasted IMAGE (970 owner bug 2). The
+    /// outcome re-enters through [`clipboard_paste_effects`].
+    ClipboardRead,
     /// T2: one talk effect for the stt supervisor (mic capture, engines,
     /// model downloads, config IO — all TUI-process, none wire). Outcomes
     /// re-enter as [`crate::talk::TalkEvent`]s on the talk channel.
@@ -3451,6 +3510,7 @@ pub fn live_pass(
             AppRequest::OpenUrl { url } => shell.push(ShellRequest::OpenUrl(url)),
             AppRequest::RevealPath { path } => shell.push(ShellRequest::RevealPath(path)),
             AppRequest::AttachRead { path } => shell.push(ShellRequest::AttachRead(path)),
+            AppRequest::ClipboardRead => shell.push(ShellRequest::ClipboardRead),
             AppRequest::TalkShell(command) => shell.push(ShellRequest::Talk(command)),
             AppRequest::Quit => shell.push(ShellRequest::Quit),
             request => commands.extend(driver.handle_request(model, request)),
@@ -3834,6 +3894,9 @@ pub async fn run_live(
                     }
                 }
                 ShellRequest::AttachRead(path) => attach_read_effects(&mut model, &path),
+                ShellRequest::ClipboardRead => {
+                    clipboard_paste_effects(&mut model, &crate::clipboard::OsClipboard);
+                }
                 ShellRequest::Talk(command) => talk_runtime.execute(command),
                 ShellRequest::Quit => model.should_quit = true,
             }

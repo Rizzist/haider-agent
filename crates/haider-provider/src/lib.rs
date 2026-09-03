@@ -1092,6 +1092,65 @@ pub fn pdf_document_capability(provider: &str) -> FeatureResolve {
     }
 }
 
+/// Provider-catalog declaration for IMAGE attachments, so a CLIENT can refuse
+/// a picture BEFORE it costs a turn (970 owner bug 2: Ctrl+V paste-image).
+///
+/// This mirrors, per provider name, the `vision` field each adapter already
+/// returns from [`Provider::capabilities`] — the fact the daemon enforces at
+/// turn time (`worker.rs`, `ErrorCode::VisionUnsupported`). It is a
+/// PROJECTION of that truth into the sync catalog path, exactly the way
+/// [`pdf_document_capability`] projects `pdf_documents`: the catalog summary
+/// is built without a live adapter, so the fact has to be nameable from the
+/// provider id alone.
+///
+/// `model_declares` is the provider's OWN per-model declaration
+/// ([`DiscoveredModelExtensions::supports_vision`]) and always wins when the
+/// catalog carries one — today only Kimi (from its `supports_image_in` key)
+/// and Grok publish it.
+///
+/// THE DOCUMENTED LIST, each entry traceable to the adapter that serves it:
+///
+/// | provider id | `vision` | adapter site |
+/// |---|---|---|
+/// | `anthropic`, `anthropic-oauth`, `bedrock`, `vertex` | `Native` | `anthropic.rs` `capabilities` |
+/// | `openai`, `openai-oauth` | `Native` | `openai.rs` `native_capabilities` |
+/// | `gemini` | `Native` | `gemini.rs` `capabilities` |
+/// | `grok-oauth` | `Native` | `openai.rs` `grok_capabilities_from_model` |
+/// | `kimi-oauth` | per-model | `openai.rs` `kimi_capabilities_from_model` |
+/// | `openai-compatible`, `deepseek`, `haider-code`, `xai`, custom profiles | `Unsupported` | `openai.rs` `compatible_capabilities` |
+///
+/// The last row is the conservative default and it is deliberate, not a gap:
+/// `compatible_capabilities` refuses to infer features from a
+/// vendor-controlled model id, so the daemon WILL reject an image on those
+/// providers. Saying so in the catalog turns a wasted turn into an immediate,
+/// honest notice. A provider id this function has never heard of lands there
+/// too.
+#[must_use]
+pub fn vision_capability(provider: &str, model_declares: Option<bool>) -> FeatureResolve {
+    if let Some(declared) = model_declares {
+        return if declared {
+            FeatureResolve::Native
+        } else {
+            FeatureResolve::Unsupported
+        };
+    }
+    if matches!(
+        provider,
+        ANTHROPIC_PROVIDER_NAME
+            | ANTHROPIC_OAUTH_PROVIDER_NAME
+            | BEDROCK_PROVIDER_NAME
+            | VERTEX_PROVIDER_NAME
+            | OPENAI_PROVIDER_NAME
+            | OPENAI_OAUTH_PROVIDER_NAME
+            | GEMINI_PROVIDER_NAME
+            | GROK_OAUTH_PROVIDER_NAME
+    ) {
+        FeatureResolve::Native
+    } else {
+        FeatureResolve::Unsupported
+    }
+}
+
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-provider";
 

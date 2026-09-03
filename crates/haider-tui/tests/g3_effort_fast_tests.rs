@@ -49,6 +49,7 @@ fn tuned_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
             default_effort: Some("high".into()),
             supported_speeds: vec!["fast".into()],
             supports_thinking_type: None,
+            supports_vision: None,
         },
         ModelDetailWire {
             name: "claude-sonnet-5".into(),
@@ -60,6 +61,7 @@ fn tuned_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
             default_effort: Some("high".into()),
             supported_speeds: Vec::new(),
             supports_thinking_type: None,
+            supports_vision: None,
         },
     ];
     summaries

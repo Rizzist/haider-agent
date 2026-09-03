@@ -1103,6 +1103,19 @@ fn model_detail_wire(provider: &str, model: DiscoveredModel) -> ModelDetailWire 
             .extensions
             .as_ref()
             .map(|extensions| extensions.supports_thinking_type),
+        // 970 owner bug 2: project the adapters' own `vision` fact into the
+        // catalog row so the composer can refuse a pasted image BEFORE it
+        // costs a turn. The provider's per-model declaration wins; the
+        // documented per-family list fills the rest.
+        supports_vision: Some(
+            haider_provider::vision_capability(
+                provider,
+                model
+                    .extensions
+                    .as_ref()
+                    .map(|extensions| extensions.supports_vision),
+            ) != haider_protocol::provider::FeatureResolve::Unsupported,
+        ),
     }
 }
 

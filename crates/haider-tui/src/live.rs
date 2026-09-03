@@ -6834,6 +6834,7 @@ impl LiveDriver {
             | AppRequest::CheckForUpdate
             | AppRequest::RunUpdate
             | AppRequest::AttachRead { .. }
+            | AppRequest::ClipboardRead
             | AppRequest::TalkShell(_)
             | AppRequest::Quit => Vec::new(),
             // DEMO-ONLY VOCABULARY. The reducer refuses every one of these

@@ -13,6 +13,7 @@ haider-rpc = { path = "../haider-rpc" }
 haider-client = { path = "../haider-client" }
 haider-stt = { path = "../haider-stt" }
 zeroize.workspace = true
+arboard.workspace = true
 base64.workspace = true
 ratatui.workspace = true
 serde.workspace = true
