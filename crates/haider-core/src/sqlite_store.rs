@@ -34,11 +34,11 @@ use haider_store::{
     QueueConsumeCommand, QueueConsumeOutcome, QueuePromoteCommand, QueuePromoteOutcome,
     QueuePromotePreview, QueueRemoveCommand, QueueRemoveOutcome, QueueSnapshot, RunRetryCommand,
     RunRetryOutcome, SessionCreateCommand, SessionCreateOutcome, SessionForkCommand,
-    SessionForkOutcome, SessionProjectionCheckpoint, SessionPromptForkCommand,
-    SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
-    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
-    TurnCancelOutcome, TypedAgentInstallCas,
+    SessionForkOutcome, SessionProjectionCheckpoint, SessionPromptForkCommand, SessionRecencyKey,
+    SessionRecencyRow, SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand,
+    SessionSeenOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
+    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
+    TurnCancelCommand, TurnCancelOutcome, TypedAgentInstallCas,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
@@ -283,6 +283,30 @@ impl SqliteStoreHandle {
     pub async fn session_ids(&self) -> Result<Vec<SessionId>, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(Store::session_ids)).await
+    }
+
+    /// Returns one durable most-recent-first page using the store's indexed
+    /// head lookup. Summary hydration happens only for these bounded rows.
+    pub async fn session_recency_page(
+        &self,
+        after: Option<SessionRecencyKey>,
+        limit: usize,
+    ) -> Result<Vec<SessionRecencyRow>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.session_recency_page(after.as_ref(), limit))
+        })
+        .await
+    }
+
+    /// Returns durable recency for an already-selected bounded id page in one
+    /// blocking-store operation.
+    pub async fn session_recencies(
+        &self,
+        session_ids: Vec<SessionId>,
+    ) -> Result<Vec<SessionRecencyRow>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.session_recencies(&session_ids))).await
     }
 
     /// Counts durable sessions without allocating their identifiers.

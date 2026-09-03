@@ -308,6 +308,7 @@ is §4.1.
 | `session_agent_type_select_v1` | `session.select_agent_type`, summary `agent_type` |
 | `session_config_v1` | coherent headless read/write session provider/model/effort/fast configuration through existing fields and selection methods |
 | `session_lineage_v1` | summary `kind` and `parent_session_id` |
+| `session_list_recency_v1` | additive `session.list.order=recency_desc`; durable `(last_activity_ms DESC, session_id ASC)` cursor ordering |
 | `session_list_watch_v1` | `session.list_watch`, `SessionRosterDelta` |
 | `command_door_v1` | `command.list`, `command.invoke` |
 | `input_mirror_v1` | `session.surface_publish/watch`, input portion, `session.input_inject`, `SessionInputInjected` |
@@ -1031,7 +1032,7 @@ empty collection wins over an older fallback.
 | `run_state` | old daemon; current producers populate it |
 | `run_id` | no active run or old daemon; never render a stop action; read with `run_state` from the same summary |
 | `seen_at_ms` | no acknowledgement has ever committed |
-| `last_activity_ms` | no user-relevant committed activity — the session has **no position in an activity ordering**; see 9.2.1 |
+| `last_activity_ms` | old daemon; 0.0.970+ list/watch producers populate durable roster recency for cold and live rows; see 9.2.1 |
 | `waiting_why` | no legacy three-kind park reason; superseded by `needs_input` |
 | `needs_input` | nothing currently requires human input; if present without all answer coordinates it is badgeable but not answerable |
 | `metadata` | legacy/untyped row or old daemon; do not infer configuration |
@@ -1054,29 +1055,29 @@ empty collection wins over an older fallback.
 
 #### 9.2.1 Ordering sessions by activity
 
-`last_activity_ms` **is** the activity coordinate. It is the field to sort by
-when a surface shows "latest", "recent", or "most active". Naming a field is not
-the same as saying what it is for, and this document previously named it twice —
-once under `session_seen_v1`, once in the table above — without ever stating this.
+From 0.0.970, `last_activity_ms` **is durable roster recency**. The daemon
+computes it as:
 
-Do not confuse it with its neighbours. `seen_at_ms` is an acknowledgement
-coordinate, not an activity one; `updated_at` reflects row maintenance, which
-advances for reasons a user never caused.
+```text
+max(indexed journal-head committed_at_ms, seen_at_ms, created_at_ms)
+```
 
-**When `last_activity_ms` is absent, the session has no position in an activity
-ordering, and no other timestamp may take its place.** In particular, creation
-time answers a different question — *when was this made* rather than *when did
-something happen* — so ordering a never-active session by its creation ranks it
-as though being created were activity. That value is not zero, which makes it
-worse than an obvious sentinel: a rail ordered this way still *looks* ordered,
-and nothing about it appears broken.
+This is an owner-approved semantic correction from the earlier
+"user-relevant activity only" definition. It gives every current cold session
+a restart-safe position without asking clients to combine optional timestamps
+or replay a journal. The value returned in a `recency_desc` summary is exactly
+the value represented by that page's opaque cursor.
 
-Render such sessions as unordered — a separate group, or a position that is
-visibly not an activity rank. Do not interleave them with ranked rows.
+Surfaces sort top-level sessions by needs-input/unseen tier, then this value
+descending, then `metadata.created_at_ms` descending. A title is display data
+and must never be an ordering key. `seen_at_ms` remains the shared
+acknowledgement coordinate for the unseen predicate even though it also
+participates in durable recency; `updated_at` remains unrelated row-maintenance
+time.
 
-This is §1.1 applied to ordering: the prohibition on substituting a calculated
-value covers substituting a *different published* value just as much as an
-invented one. The plausibility of the substitute is what makes it dangerous.
+An absent `last_activity_ms` now means only an older daemon. Such clients may
+retain their historical compatibility fallback, but must switch to the
+published value once `session_list_recency_v1` is advertised.
 
 A client's OWN rows, which the harness has never seen, are outside this rule.
 A client may order those by whatever coordinate it defines, because no harness
@@ -1121,6 +1122,7 @@ or metadata-only digest.
 | Request field | Omitted / `None` meaning |
 |---|---|
 | `session.list.cursor` | first page; a returned cursor is opaque and passed verbatim |
+| `session.list.order` | original `id_asc` behavior; send `recency_desc` only when `session_list_recency_v1` is advertised |
 | create `permission_overrides` | daemon defaults |
 | create `cache_policy` | daemon/default policy |
 | create `interaction_mode` | the source-defined `interactive` enum value. A client may send `"autonomous"` only when `autonomous_interaction_v1` is advertised |

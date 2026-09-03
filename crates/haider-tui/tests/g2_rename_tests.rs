@@ -1,6 +1,6 @@
 //! G2 — session rename in the TUI: `/rename` rides the receipted
 //! `session.rename` wire (the header moves only on the daemon's NORMALIZED
-//! reply), launcher rows and `/sessions` hydrate their names from the
+//! reply), launcher rows and the `/sessions` browser hydrate their names from the
 //! additive `SessionSummary.title`, and every refusal is an honest notice.
 #![allow(clippy::expect_used)]
 
@@ -177,10 +177,10 @@ fn rename_refusals_are_honest_notices_with_no_command() {
     assert_eq!(model.flash.as_deref(), Some("· /rename — session only"));
 }
 
-// ---- law 3 (LB5): the wire title names launcher rows and /sessions -----
+// ---- law 3 (LB5): the wire title names launcher and browser rows -------
 
 /// LAW (LB5): a `session.list` summary's additive `title` hydrates the
-/// roster row's NAME — the launcher row and `/sessions` render the wire
+/// roster row's NAME — the launcher row and `/sessions` browser render the wire
 /// title — while an absent title (older daemon) hydrates nothing, and a
 /// summary for the ATTACHED session updates the live header instead of the
 /// neutral checked-out slot.
@@ -189,7 +189,7 @@ fn rename_refusals_are_honest_notices_with_no_command() {
 /// Expected RUNTIME failure: the row keeps its nameless "session" fallback
 /// below.
 #[test]
-fn session_list_title_hydrates_launcher_rows_and_sessions_listing() {
+fn session_list_title_hydrates_launcher_rows_and_sessions_browser() {
     use haider_tui::live::LiveReply;
 
     // A background (unattached) row takes the wire title.
@@ -212,16 +212,10 @@ fn session_list_title_hydrates_launcher_rows_and_sessions_listing() {
         .expect("listed row");
     assert_eq!(entry.name.as_deref(), Some("Parser rewrite"));
 
-    // /sessions renders the same name (the listing reads `entry.name`).
+    // /sessions opens the full browser and renders that same hydrated name.
     run_slash(&mut model, "/sessions");
-    let (_, listing) = model
-        .launcher_shellout
-        .clone()
-        .expect("launcher shellout listing");
-    assert!(
-        listing.contains("Parser rewrite"),
-        "/sessions names the row: {listing}"
-    );
+    assert_eq!(model.screen, Screen::Sessions);
+    assert_eq!(model.session_browser_rows()[0].title, "Parser rewrite");
 
     // An absent title hydrates NOTHING (older daemon tolerance).
     driver.apply(

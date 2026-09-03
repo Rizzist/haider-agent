@@ -162,6 +162,7 @@ pub fn transcript() -> Vec<WireFrame> {
             body: RequestBody::SessionList {
                 cursor: Some("cursor-after-session-0".into()),
                 limit: 50,
+                order: Default::default(),
             },
         },
         WireFrame::Request {
@@ -1811,6 +1812,7 @@ pub fn transcript() -> Vec<WireFrame> {
             body: RequestBody::SessionList {
                 cursor: None,
                 limit: 64,
+                order: Default::default(),
             },
         },
         WireFrame::Response {

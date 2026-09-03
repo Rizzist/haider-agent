@@ -199,6 +199,7 @@ async fn list_title(
         RequestBody::SessionList {
             cursor: None,
             limit: 50,
+            order: Default::default(),
         },
     )
     .await;

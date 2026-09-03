@@ -1081,6 +1081,23 @@ pub struct SessionRenameCommand {
     pub device_id: DeviceId,
 }
 
+/// Stable ordering key for one durable session-list row.
+///
+/// Recency is the greatest of the session's creation time, shared seen time,
+/// and committed timestamp of its indexed journal head. The session id makes
+/// pagination total when clocks repeat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecencyKey {
+    pub last_activity_ms: u64,
+    pub session_id: SessionId,
+}
+
+/// One lightweight row selected before the daemon builds full summaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecencyRow {
+    pub key: SessionRecencyKey,
+}
+
 /// Stable response stored in the committed `session.rename` receipt.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RenamedSession {
@@ -4189,6 +4206,121 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(map_sqlite_error)?;
         Ok(ids.into_iter().map(SessionId::new).collect())
+    }
+
+    /// Selects one most-recent-first page without scanning journal bodies.
+    ///
+    /// The correlated head lookup is satisfied by the `(session_id, seq)`
+    /// primary-key index in reverse order. Thus this performs one indexed
+    /// head probe per session row and never reads the event log to determine
+    /// recency. `after` is the exact final `(recency, id)` key from the prior
+    /// page, making equal-millisecond pagination stable.
+    pub fn session_recency_page(
+        &self,
+        after: Option<&SessionRecencyKey>,
+        limit: usize,
+    ) -> StoreResult<Vec<SessionRecencyRow>> {
+        let connection = self.connection()?;
+        let limit = i64::try_from(limit).map_err(|_| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                "session list limit is outside the supported range",
+                false,
+            )
+        })?;
+        let after_ms = after
+            .map(|key| to_sqlite_integer(key.last_activity_ms))
+            .transpose()?;
+        let after_id = after.map(|key| key.session_id.as_str());
+        let mut statement = connection
+            .prepare_cached(
+                "WITH roster AS (
+                     SELECT s.id,
+                            max(
+                                s.created_at_ms,
+                                coalesce(s.seen_at_ms, 0),
+                                coalesce(head.committed_at_ms, 0)
+                            ) AS last_activity_ms
+                       FROM sessions AS s
+                       LEFT JOIN events AS head
+                         ON head.rowid = (
+                             SELECT rowid
+                               FROM events
+                              WHERE session_id = s.id
+                              ORDER BY seq DESC
+                              LIMIT 1
+                         )
+                 )
+                 SELECT id, last_activity_ms
+                   FROM roster
+                  WHERE ?1 IS NULL
+                     OR last_activity_ms < ?1
+                     OR (last_activity_ms = ?1 AND id > ?2)
+                  ORDER BY last_activity_ms DESC, id ASC
+                  LIMIT ?3",
+            )
+            .map_err(map_sqlite_error)?;
+        statement
+            .query_map(params![after_ms, after_id, limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(map_sqlite_error)?
+            .map(|row| {
+                let (session_id, last_activity_ms) = row.map_err(map_sqlite_error)?;
+                let last_activity_ms = u64::try_from(last_activity_ms)
+                    .map_err(|_| corrupt("session recency timestamp is negative"))?;
+                Ok(SessionRecencyRow {
+                    key: SessionRecencyKey {
+                        last_activity_ms,
+                        session_id: SessionId::new(session_id),
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// Reads durable recency for an already-selected set of session ids.
+    ///
+    /// This keeps legacy id-ordered list pages compatible while giving every
+    /// summary the same durable activity field. The prepared statement does
+    /// one primary-key session lookup and one reverse `(session_id, seq)` head
+    /// probe per requested row; event payloads are never read.
+    pub fn session_recencies(
+        &self,
+        session_ids: &[SessionId],
+    ) -> StoreResult<Vec<SessionRecencyRow>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT max(
+                            s.created_at_ms,
+                            coalesce(s.seen_at_ms, 0),
+                            coalesce((
+                                SELECT committed_at_ms
+                                  FROM events
+                                 WHERE session_id = s.id
+                                 ORDER BY seq DESC
+                                 LIMIT 1
+                            ), 0)
+                        ) AS last_activity_ms
+                   FROM sessions AS s
+                  WHERE s.id = ?1",
+            )
+            .map_err(map_sqlite_error)?;
+        let mut rows = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            let last_activity_ms = statement
+                .query_row(params![session_id.as_str()], |row| row.get::<_, i64>(0))
+                .map_err(map_sqlite_error)?;
+            rows.push(SessionRecencyRow {
+                key: SessionRecencyKey {
+                    last_activity_ms: u64::try_from(last_activity_ms)
+                        .map_err(|_| corrupt("session recency timestamp is negative"))?,
+                    session_id: session_id.clone(),
+                },
+            });
+        }
+        Ok(rows)
     }
 
     /// Counts durable sessions without materializing their identifiers.

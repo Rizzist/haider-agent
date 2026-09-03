@@ -78,6 +78,7 @@ async fn uds_session_lifecycle_lists_reads_attaches_replays_and_detaches() {
                 body: RequestBody::SessionList {
                     cursor: None,
                     limit: 10,
+                    order: Default::default(),
                 },
             },
             config.frame_limit,

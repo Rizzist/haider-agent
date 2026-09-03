@@ -171,6 +171,7 @@ fn list_body() -> RequestBody {
     RequestBody::SessionList {
         cursor: None,
         limit: 1,
+        order: Default::default(),
     }
 }
 

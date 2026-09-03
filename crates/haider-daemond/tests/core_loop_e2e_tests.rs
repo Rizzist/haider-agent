@@ -4282,6 +4282,7 @@ async fn attachment_written_by_the_first_daemon_is_projected_by_the_next_daemon(
         RequestBody::SessionList {
             cursor: None,
             limit: 10,
+            order: Default::default(),
         },
     )
     .await;

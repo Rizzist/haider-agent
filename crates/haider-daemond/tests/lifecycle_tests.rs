@@ -463,6 +463,7 @@ async fn cold_start_socket_missing_serves_handshake_ping_and_session_list() {
                 body: RequestBody::SessionList {
                     cursor: None,
                     limit: 10,
+                    order: Default::default(),
                 },
             },
             config.frame_limit,
