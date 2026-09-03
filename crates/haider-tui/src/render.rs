@@ -11021,28 +11021,50 @@ fn talk_ghost_line(model: &AppModel, theme: &Theme, width: u16) -> Line<'static>
 /// faint slot — theme tokens only (the mechanical no-raw-color law covers
 /// this seam like every other).
 fn talk_wave_spans(model: &AppModel, theme: &Theme) -> Vec<Span<'static>> {
-    // Prefer real captured amplitude; when the ring carries no signal (a
-    // capture path that never fed levels, or true silence), show the
-    // synthesized listening sweep so the state animates instead of sitting
-    // as a dead flat line (owner: "have the animation for audio working").
-    let real_peak = model.talk.wave.levels().into_iter().fold(0.0_f32, f32::max);
-    let cells = if real_peak >= crate::talk::LISTENING_SIGNAL_MIN {
-        model.talk.wave.cells()
-    } else {
-        crate::talk::listening_pulse_cells(model.clock_ms)
+    // 970 owner requirement 2 — REAL amplitude wins whenever a mic is
+    // feeding us. The old test compared the ring's peak against
+    // `LISTENING_SIGNAL_MIN` and fell back to the synthesized sweep
+    // whenever it dipped, so every pause between words snapped the bars
+    // from live audio to a canned animation that only advanced on the
+    // 600 ms phase tick — which is exactly the "frozen/late" the owner
+    // saw. Once fed, the ring IS the display: a quiet passage draws
+    // quiet, and the bars track the voice at the capture cadence.
+    //
+    // The synthesized sweep now means one honest thing: no capture path
+    // has fed a level at all, so the row animates rather than sitting as
+    // a dead flat line while the engine opens the mic.
+    let plain = model.talk.wave_plain;
+    let style_for = |hot: bool| {
+        if hot {
+            theme.gold_style()
+        } else {
+            theme.faint_style()
+        }
     };
-    cells
-        .into_iter()
-        .map(|cell| {
-            let glyph = crate::talk::wave_glyph(cell, model.talk.wave_plain);
-            let style = if cell.hot {
-                theme.gold_style()
-            } else {
-                theme.faint_style()
-            };
-            Span::styled(glyph.to_string(), style)
-        })
-        .collect()
+    // Allocation: ONE `Vec<Span>` of `WAVE_WIDTH` borrowed `&'static str`
+    // symbols. No per-cell `String`, no intermediate cell buffer — this
+    // runs on every listening frame (up to 30/s).
+    let mut spans = Vec::with_capacity(crate::talk::WAVE_WIDTH);
+    if model.talk.wave.fed() {
+        spans.extend(model.talk.wave.cells_iter().map(|cell| {
+            Span::styled(
+                crate::talk::wave_glyph_str(cell, plain),
+                style_for(cell.hot),
+            )
+        }));
+    } else {
+        spans.extend(
+            crate::talk::listening_pulse_cells(model.clock_ms)
+                .into_iter()
+                .map(|cell| {
+                    Span::styled(
+                        crate::talk::wave_glyph_str(cell, plain),
+                        style_for(cell.hot),
+                    )
+                }),
+        );
+    }
+    spans
 }
 
 /// T2 — the `/talk` setup card's band lines. Handed STATES, never the
@@ -11392,7 +11414,17 @@ fn composer_lines<'a>(
     // chrome, pulsing (tui.js:5484-5489, 1.1s); otherwise frame chrome,
     // gold on hover.
     let (talk_chrome, talk_ink) = if model.listening {
-        let live = theme.pulse_ink(theme.maroon, model.anim_phase);
+        // 970 owner requirement 2: the `◉ listening…` indicator blinks at
+        // its OWN steady ~1 Hz, decoupled from the audio frames. The
+        // shared `anim_phase` counter is a 600 ms COUNTER (a 1.2 s cycle
+        // that drifts with whatever else armed the tick), so the blink
+        // reads the wall clock directly instead — a burst of envelopes or
+        // a silent mic leaves the cadence identical.
+        let live = if crate::talk::listening_blink_on(model.clock_ms) {
+            theme.pulse_ink(theme.maroon, 0)
+        } else {
+            theme.pulse_ink(theme.maroon, 1)
+        };
         (live, live)
     } else if model.hovered == Some(Hit::TalkChip) {
         (theme.gold_style(), theme.gold_style())
