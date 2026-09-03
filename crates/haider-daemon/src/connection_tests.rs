@@ -354,8 +354,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        108,
-        "the additive workspace recovery feature extends the prior 107-feature set"
+        109,
+        "durable session-list recency extends the prior 108-feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -412,8 +412,9 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_SESSION_ATTACH_SEALED_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_CONFIG_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_CREATE_ADMISSION_V1.to_owned(),
-            haider_rpc::FEATURE_WIRE_MSGPACK_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_LIST_RECENCY_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_LIST_WATCH_V1.to_owned(),
+            haider_rpc::FEATURE_WIRE_MSGPACK_V1.to_owned(),
             FEATURE_PROVIDER_CONFIGURE_V1.to_owned(),
             FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
             haider_rpc::FEATURE_PROVIDER_LOCKDOWN_V1.to_owned(),
@@ -1857,6 +1858,7 @@ async fn msgpack_switches_after_json_welcome_on_paired_uds() {
             haider_rpc::RequestBody::SessionList {
                 cursor: None,
                 limit: 10,
+                order: Default::default(),
             },
         )
         .await;

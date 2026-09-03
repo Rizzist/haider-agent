@@ -2275,6 +2275,7 @@ async fn fork_roster_publication_waits_for_actor_and_complete_pipe_projection() 
             RequestBody::SessionList {
                 cursor: None,
                 limit: 100,
+                order: Default::default(),
             },
         )
         .await
@@ -2309,6 +2310,7 @@ async fn fork_roster_publication_waits_for_actor_and_complete_pipe_projection() 
             RequestBody::SessionList {
                 cursor: None,
                 limit: 100,
+                order: Default::default(),
             },
         )
         .await
@@ -2548,6 +2550,7 @@ async fn prompt_fork_rpc_publishes_response_draft_and_roster_provenance() {
             RequestBody::SessionList {
                 cursor: None,
                 limit: 100,
+                order: Default::default(),
             },
         )
         .await

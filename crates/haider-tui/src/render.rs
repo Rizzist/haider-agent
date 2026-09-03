@@ -1511,7 +1511,15 @@ fn render_launcher(
     // TUI4c: rows derive from the LIVE session map — seeds and user
     // sessions alike; a busy background session shows its liveness HERE
     // (gold pulsing-dot semantics), never in the global badge (item 12).
-    let running = model.sessions.iter().filter(|s| s.busy()).count();
+    let launcher_session_ids = model.launcher_session_ids();
+    let running = model
+        .sessions
+        .iter()
+        .filter(|session| {
+            model.session_kinds.get(&session.id) != Some(&haider_rpc::SessionKindWire::Subagent)
+        })
+        .filter(|session| session.busy())
+        .count();
     // TUI4d item 14 — every row of the block leads with ONE rail cell so
     // the sim's `.rail` sliver has a home (tui.js:4370-4394: absolute in
     // the row's left padding, transparent unless running). Idle rows and
@@ -1535,7 +1543,14 @@ fn render_launcher(
     // three in demo, the reachable digit span live (see
     // `AppModel::launcher_rows`). Render stays source-agnostic: it asks.
     let mut recent: Vec<(Vec<Span<'_>>, Option<Hit>)> = vec![(rhead, None)];
-    for entry in model.sessions.iter().take(model.launcher_rows()) {
+    for session_id in launcher_session_ids.iter().take(model.launcher_rows()) {
+        let Some(entry) = model
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+        else {
+            continue;
+        };
         // Sim row anatomy (tui.js:3252-3277): rail · dot (ok; gold
         // PULSING when running, tui.js:4392-4394) · name BRIGHT bold ·
         // `▸ head hon` DIM (.hd) · meta DIM ellipsized. No digit prefix
@@ -1650,7 +1665,7 @@ fn render_launcher(
             fmt_tok(tokens),
             entry.model_short,
             entry.device,
-            entry.ago
+            model.session_display_age(&entry.id, &entry.ago)
         );
         // Sim `.meta`: ellipsized into the column, never clipped.
         let meta_budget = area_cap.saturating_sub(Line::from(spans.clone()).width());
@@ -5885,11 +5900,22 @@ fn render_sessions(
                 theme.maroon_style(),
             ),
         ]),
-        Line::raw(""),
+        Line::styled(
+            if model.session_browser_query.is_empty() {
+                "  search: type title / dir / model / id".to_owned()
+            } else {
+                format!("  search: {}▏  ·  esc clears", model.session_browser_query)
+            },
+            theme.dim_style(),
+        ),
     ];
     if rows.is_empty() {
         lines.push(Line::styled(
-            "  no sessions yet — start one from the launcher",
+            if model.session_browser_query.is_empty() {
+                "  no sessions yet — start one from the launcher"
+            } else {
+                "  no sessions match"
+            },
             theme.dim_style(),
         ));
     }

@@ -2212,6 +2212,7 @@ fn welcome_features() -> BTreeSet<String> {
         haider_rpc::FEATURE_INPUT_MIRROR_ATTACHMENTS_V1.to_owned(),
         haider_rpc::FEATURE_INPUT_MIRROR_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_ATTACH_SEALED_V1.to_owned(),
+        haider_rpc::FEATURE_SESSION_LIST_RECENCY_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_LIST_WATCH_V1.to_owned(),
         haider_rpc::FEATURE_WIRE_MSGPACK_V1.to_owned(),
         FEATURE_EXPORT_SEQ_V1.to_owned(),

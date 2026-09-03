@@ -13,7 +13,7 @@
 use haider_protocol::ids::SessionId;
 use haider_protocol::state::RunState;
 use haider_protocol::{DeliveryMode, EventPayload};
-use haider_tui::app::{AppModel, AppRequest, Hit, RuntimeMode};
+use haider_tui::app::{AppModel, AppRequest, Hit, RuntimeMode, Screen};
 use haider_tui::browser::open_url_command_with_env;
 use haider_tui::identity::UiGeneration;
 use haider_tui::live::LiveDriver;
@@ -193,22 +193,21 @@ fn the_launcher_paints_an_errored_row_honestly() {
     );
 }
 
-/// `/sessions` speaks the same third word.
+/// `/sessions` opens the full browser and never presents an errored row as
+/// running. The richer error label remains on the four-row launcher.
 #[test]
-fn the_sessions_listing_names_the_errored_state() {
+fn the_sessions_browser_never_names_an_errored_row_running() {
     let mut model = launcher_model();
     model.mode = RuntimeMode::Live;
     model.sessions.clear();
     model.sessions.push(errored_session());
     run_slash(&mut model, "/sessions");
-    let (_, listing) = model.launcher_shellout.clone().expect("launcher shellout");
+    assert_eq!(model.screen, Screen::Sessions);
+    assert!(!model.session_browser_rows()[0].busy);
+    let browser = draw_rows(&model).join("\n");
     assert!(
-        listing.contains("errored"),
-        "the listing must name the state: {listing:?}"
-    );
-    assert!(
-        !listing.contains("running"),
-        "and must not claim it runs: {listing:?}"
+        !browser.contains("running"),
+        "the full browser must not claim it runs: {browser:?}"
     );
 }
 
