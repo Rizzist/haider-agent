@@ -1220,6 +1220,16 @@ pub struct ModelDetailWire {
     /// vs top-level reasoning_effort) without a client-side table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_thinking_type: Option<bool>,
+    /// Whether this pair accepts IMAGE attachments.
+    ///
+    /// Daemon truth, projected from `haider_provider::vision_capability`
+    /// (which mirrors each adapter's own `capabilities().vision` — the fact
+    /// the daemon enforces at turn time as `vision_unsupported`). Clients
+    /// hold no tables: `Some(false)` is a DECLARED refusal a client may act
+    /// on before spending a turn; `None` is an older daemon that projects
+    /// nothing, and a client must then attach and let the daemon answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
 }
 
 /// One provider's read-only management projection.

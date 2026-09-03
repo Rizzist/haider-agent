@@ -850,6 +850,10 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
         .next()
         .expect("summary");
     assert_eq!(summary.models, vec!["frontier-a", "frontier-b"]);
+    // 970: `supports_vision` stays ABSENT here. This profile is a CUSTOM
+    // OpenAI-compatible provider, whose model slugs are user-controlled, so
+    // the catalog declares nothing rather than turning the adapter's "we
+    // cannot infer this" into a refusal the client would enforce.
     assert_eq!(
         summary.model_details,
         vec![
@@ -861,6 +865,7 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
                 default_effort: None,
                 supported_speeds: Vec::new(),
                 supports_thinking_type: None,
+                supports_vision: None,
             },
             ModelDetailWire {
                 name: "frontier-b".to_owned(),
@@ -870,6 +875,7 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
                 default_effort: None,
                 supported_speeds: Vec::new(),
                 supports_thinking_type: None,
+                supports_vision: None,
             },
         ]
     );

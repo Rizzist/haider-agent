@@ -59,6 +59,7 @@ fn provider_summary(
                 default_effort: None,
                 supported_speeds: Vec::new(),
                 supports_thinking_type: None,
+                supports_vision: None,
             })
             .collect(),
         inventory_fetched_at_ms: None,

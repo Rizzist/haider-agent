@@ -456,3 +456,55 @@ fn scrolled_history_with_sticky_and_jump_chip_frames() {
         model.scroll_back.set(0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// 970 owner bugs — the band's anatomy, pinned at the three sizes.
+// ---------------------------------------------------------------------------
+
+/// One running subagent, so the `▾ subagents` panel is on screen and the
+/// band's closing anatomy is actually observable.
+fn with_subagents(model: &mut AppModel) {
+    model.chips = vec![haider_tui::app::ChipModel::from_seed(
+        haider_tui::script::ChipSeed {
+            agent: "t1-docs".to_owned(),
+            parent: None,
+            ros: None,
+            callsign: "Husayn".to_owned(),
+            hon: "(r)",
+            full: "Husayn ibn Ali".to_owned(),
+            name: "docs".to_owned(),
+            model: "fable-5".to_owned(),
+            device: "macbook".to_owned(),
+            state: haider_tui::script::ChipDisplayState::Running,
+            tokens: 100,
+            prefill: Vec::new(),
+        },
+    )];
+}
+
+#[test]
+fn band_closes_straight_into_the_subagents_panel_frames() {
+    // 970 owner bug 1. The band used to reach `▾ subagents` through its
+    // closing rule AND a `lead_subtree` breathing blank; the blank is gone,
+    // so these frames show `❯ message haider …` / rule / `▾ subagents` on
+    // three consecutive rows — the anatomy `render_subagent` always had.
+    let mut model = session_model();
+    push_user(&mut model, "spin up a docs pass");
+    push_agent(&mut model, "band-1", "Delegating to a subagent now.");
+    with_subagents(&mut model);
+    pin("band_with_subagents", &model);
+}
+
+#[test]
+fn composer_image_notice_frames() {
+    // 970 owner bug 2. A pair that DECLARES no vision refuses a pasted
+    // image and says so on its own row inside the band, directly above the
+    // draft it deliberately kept.
+    let mut model = session_model();
+    push_agent(&mut model, "notice-1", "Ready when you are.");
+    model.composer.set_text("what is in this screenshot?".to_owned());
+    model.composer_notice = Some(haider_tui::app::ImageNotice::NoVision {
+        model: "deepseek-v4".to_owned(),
+    });
+    pin("composer_image_notice", &model);
+}
