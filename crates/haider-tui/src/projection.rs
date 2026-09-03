@@ -121,10 +121,16 @@ pub struct ItemBlock {
     /// The block was produced during a voice turn — the agent header tags
     /// ` · ♪ speaking` (sim tui.js:3895-3897; demo-local voice surface).
     pub spoken: bool,
+    /// Byte starts for logical lines in a large agent message. Built once
+    /// while ingesting raw text so viewport layout can seek directly to a
+    /// small line window without rescanning the whole message each frame.
+    /// Empty for other item kinds and small messages.
+    pub(crate) agent_line_starts: Vec<u32>,
 }
 
 impl ItemBlock {
     fn new(item_id: ItemId, item: TurnItem, streaming: bool) -> Self {
+        let agent_line_starts = index_agent_lines(&item);
         Self {
             item_id,
             item,
@@ -136,6 +142,7 @@ impl ItemBlock {
             output_decode_error: false,
             tool_reason: None,
             spoken: false,
+            agent_line_starts,
         }
     }
 
@@ -151,6 +158,31 @@ impl ItemBlock {
     #[must_use]
     pub fn output_text(&self) -> std::borrow::Cow<'_, str> {
         String::from_utf8_lossy(&self.output_tail)
+    }
+}
+
+const LARGE_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
+
+pub(crate) fn index_agent_text(text: &str) -> Vec<u32> {
+    if text.len() <= LARGE_AGENT_MESSAGE_BYTES || text.len() > u32::MAX as usize {
+        return Vec::new();
+    }
+    let logical_lines = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let mut starts = Vec::with_capacity(logical_lines);
+    starts.push(0);
+    starts.extend(
+        text.bytes()
+            .enumerate()
+            .filter(|(_, byte)| *byte == b'\n')
+            .map(|(index, _)| u32::try_from(index + 1).unwrap_or(u32::MAX)),
+    );
+    starts
+}
+
+fn index_agent_lines(item: &TurnItem) -> Vec<u32> {
+    match item {
+        TurnItem::AgentMessage { text } => index_agent_text(text),
+        _ => Vec::new(),
     }
 }
 
@@ -253,6 +285,11 @@ pub struct SessionProjection {
     /// remains the authority; render caches only use this to avoid comparing
     /// an unchanged transcript on every animation frame.
     render_revision: u64,
+    /// Bumped only when an existing transcript entry changes in place.
+    /// Appends deliberately leave this alone, allowing the viewport cache to
+    /// preserve measured prefix corrections without mistaking an edit+append
+    /// batch for a pure append.
+    entry_mutation_revision: u64,
     last_seq: Option<u64>,
     harness: Option<HarnessStatus>,
     run: Option<RunState>,
@@ -263,6 +300,14 @@ pub struct SessionProjection {
     run_failure_reported: bool,
     interrupted: bool,
     entries: Vec<TranscriptEntry>,
+    /// Entry ordinals for user prompts. This is raw-transcript metadata,
+    /// maintained at ingest beside `entries`, so sticky-origin lookup never
+    /// scans an arbitrarily large transcript on the frame path.
+    user_entries: Vec<usize>,
+    /// Live `computer` items that can move the owner's screen. The sacred
+    /// control banner reads this ingest-time index in O(1); it must never
+    /// scan transcript history on the frame path.
+    screen_control_items: std::collections::HashSet<ItemId>,
     /// Item ids whose lifecycle has closed — a re-delivered `Completed` (or a
     /// stale `Started`) for one of these is idempotently ignored (replace
     /// semantics: one item, one block, ever).
@@ -334,6 +379,26 @@ pub struct SessionProjection {
     duplicate_items: u64,
 }
 
+fn is_screen_control_item(item: &TurnItem) -> bool {
+    let TurnItem::ToolCall {
+        name, status, args, ..
+    } = item
+    else {
+        return false;
+    };
+    name == "computer"
+        && matches!(
+            status,
+            haider_protocol::item::ToolStatus::InProgress
+                | haider_protocol::item::ToolStatus::Pending
+        )
+        // Observation (screenshot / cursor_position) is not control.
+        && !matches!(
+            args.get("action").and_then(|value| value.as_str()),
+            Some("screenshot") | Some("cursor_position") | None
+        )
+}
+
 impl SessionProjection {
     /// Apply hidden provenance to an already-visible command block. The
     /// marker is committed after the started item, so no pending side table
@@ -359,6 +424,7 @@ impl SessionProjection {
         block.user_command = true;
         if changed {
             self.render_revision = self.render_revision.wrapping_add(1);
+            self.entry_mutation_revision = self.entry_mutation_revision.wrapping_add(1);
         }
         true
     }
@@ -385,8 +451,26 @@ impl SessionProjection {
         usage: Option<Usage>,
         interrupted: bool,
     ) -> Self {
+        let user_entries = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                matches!(entry, TranscriptEntry::User { .. }).then_some(index)
+            })
+            .collect();
+        let screen_control_items = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Item(block) if is_screen_control_item(&block.item) => {
+                    Some(block.item_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
         Self {
             entries,
+            user_entries,
+            screen_control_items,
             menu,
             todos,
             usage,
@@ -560,6 +644,7 @@ impl SessionProjection {
             EventPayload::UserMessage {
                 text, attachments, ..
             } => {
+                self.user_entries.push(self.entries.len());
                 self.entries.push(TranscriptEntry::User {
                     text: text.clone(),
                     attachments: attachments.len(),
@@ -876,7 +961,8 @@ impl SessionProjection {
     }
 
     fn effect_failure_is_inline(&mut self, owners: &[EffectToolOwner], error: &str) -> bool {
-        self.entries.iter_mut().any(|entry| {
+        let mut mutated = false;
+        let inline = self.entries.iter_mut().any(|entry| {
             let TranscriptEntry::Item(block) = entry else {
                 return false;
             };
@@ -900,8 +986,13 @@ impl SessionProjection {
                 return false;
             }
             block.tool_reason = Some(bounded_effect_error(error));
+            mutated = true;
             true
-        })
+        });
+        if mutated {
+            self.entry_mutation_revision = self.entry_mutation_revision.wrapping_add(1);
+        }
+        inline
     }
 
     fn push_effect_failure(&mut self, error: &str) {
@@ -1036,6 +1127,9 @@ impl SessionProjection {
                         _ => None,
                     })
                     .unwrap_or(false);
+                if inline {
+                    self.entry_mutation_revision = self.entry_mutation_revision.wrapping_add(1);
+                }
             }
             if !inline {
                 self.push_effect_failure(&failure.error);
@@ -1047,7 +1141,7 @@ impl SessionProjection {
 
     fn apply_tool_result(&mut self, call_id: &str, result: &haider_protocol::tool::BoundedResult) {
         let reason = bounded_tool_reason(result);
-        let item_id = self.entries.iter_mut().rev().find_map(|entry| match entry {
+        let item = self.entries.iter_mut().rev().find_map(|entry| match entry {
             TranscriptEntry::Item(block) => match &mut block.item {
                 TurnItem::ToolCall {
                     call_id: known,
@@ -1056,13 +1150,19 @@ impl SessionProjection {
                 } if known == call_id => {
                     *status = result.status.item_status();
                     block.tool_reason = reason.clone();
-                    Some(block.item_id.clone())
+                    Some((block.item_id.clone(), is_screen_control_item(&block.item)))
                 }
                 _ => None,
             },
             _ => None,
         });
-        if let Some(item_id) = item_id {
+        if let Some((item_id, screen_control_active)) = item {
+            self.entry_mutation_revision = self.entry_mutation_revision.wrapping_add(1);
+            if screen_control_active {
+                self.screen_control_items.insert(item_id.clone());
+            } else {
+                self.screen_control_items.remove(&item_id);
+            }
             self.settle_effect_failures_for_result(&item_id, call_id, result);
         } else {
             self.pending_tool_results
@@ -1193,6 +1293,9 @@ impl SessionProjection {
                         pinned: true,
                     });
                 } else {
+                    if is_screen_control_item(item) {
+                        self.screen_control_items.insert(item_id.clone());
+                    }
                     self.entries
                         .push(TranscriptEntry::Item(ItemBlock::new_spoken(
                             item_id.clone(),
@@ -1226,15 +1329,22 @@ impl SessionProjection {
                         )));
                     }
                 } else {
+                    if is_screen_control_item(item) {
+                        self.screen_control_items.insert(item_id.clone());
+                    } else {
+                        self.screen_control_items.remove(item_id);
+                    }
                     self.finished_items.insert(item_id.clone());
-                    if let Some(block) = self.open_block_mut(item_id) {
+                    let replaced = if let Some(block) = self.open_block_mut(item_id) {
                         // Replace semantics: the final item is authoritative.
+                        block.agent_line_starts = index_agent_lines(item);
                         block.item = item.clone();
                         block.streaming = false;
                         // The completed item carries the parsed args; the raw
                         // fragment accumulation is a duplicate — release it
                         // (efficiency rider #3).
                         block.args_fragments = String::new();
+                        true
                     } else {
                         // Attach-mid-stream tolerance: a Completed we never
                         // saw start still lands as a finished block.
@@ -1245,6 +1355,10 @@ impl SessionProjection {
                                 false,
                                 self.voice_live,
                             )));
+                        false
+                    };
+                    if replaced {
+                        self.entry_mutation_revision = self.entry_mutation_revision.wrapping_add(1);
                     }
                 }
                 if let TurnItem::ToolCall {
@@ -1270,6 +1384,7 @@ impl SessionProjection {
         // 2026-08-15). Command OUTPUT is tool-execution data, not generation,
         // and stays excluded.
         let mut output_chars = 0u64;
+        let mut mutated = false;
         {
             let Some(block) = self.open_block_mut(item_id) else {
                 self.orphan_deltas += 1;
@@ -1278,21 +1393,40 @@ impl SessionProjection {
             match delta {
                 ItemDelta::Text { text } => {
                     if let TurnItem::AgentMessage { text: body } = &mut block.item {
+                        let old_len = body.len();
                         body.push_str(text);
+                        if block.agent_line_starts.is_empty() {
+                            block.agent_line_starts = index_agent_text(body);
+                        } else if body.len() <= u32::MAX as usize {
+                            block.agent_line_starts.extend(
+                                text.bytes()
+                                    .enumerate()
+                                    .filter(|(_, byte)| *byte == b'\n')
+                                    .map(|(index, _)| {
+                                        u32::try_from(old_len + index + 1).unwrap_or(u32::MAX)
+                                    }),
+                            );
+                        } else {
+                            block.agent_line_starts.clear();
+                        }
                         output_chars = text.chars().count() as u64;
+                        mutated = true;
                     }
                 }
                 ItemDelta::Reasoning { text } => {
                     if let TurnItem::Reasoning { summary } = &mut block.item {
                         summary.push_str(text);
                         output_chars = text.chars().count() as u64;
+                        mutated = true;
                     }
                 }
                 ItemDelta::ToolArgs { fragment } => {
                     block.args_fragments.push_str(fragment);
                     output_chars = fragment.chars().count() as u64;
+                    mutated = true;
                 }
                 ItemDelta::CommandOutput { chunk_b64, .. } => {
+                    mutated = true;
                     match base64::engine::general_purpose::STANDARD.decode(chunk_b64) {
                         Ok(bytes) => {
                             // Bound BEFORE appending so the tail's capacity never
@@ -1315,6 +1449,9 @@ impl SessionProjection {
                     }
                 }
             }
+        }
+        if mutated {
+            self.entry_mutation_revision = self.entry_mutation_revision.wrapping_add(1);
         }
         self.streamed_output_chars = self.streamed_output_chars.saturating_add(output_chars);
     }
@@ -1493,6 +1630,7 @@ impl SessionProjection {
         {
             *current = Some(receipt);
             self.render_revision = self.render_revision.wrapping_add(1);
+            self.entry_mutation_revision = self.entry_mutation_revision.wrapping_add(1);
         }
     }
 
@@ -1506,6 +1644,7 @@ impl SessionProjection {
     /// Demo-local like notes — the protocol has no voice surface yet.
     pub fn push_user_voice(&mut self, text: String) {
         self.render_revision = self.render_revision.wrapping_add(1);
+        self.user_entries.push(self.entries.len());
         self.entries.push(TranscriptEntry::User {
             text,
             attachments: 0,
@@ -1521,6 +1660,7 @@ impl SessionProjection {
     /// see [`crate::session::chip_apply`].
     pub fn push_user_from_main(&mut self, text: String, attachments: usize) {
         self.render_revision = self.render_revision.wrapping_add(1);
+        self.user_entries.push(self.entries.len());
         self.entries.push(TranscriptEntry::User {
             text,
             attachments,
@@ -1849,31 +1989,7 @@ impl SessionProjection {
     /// session is driving their real machine.
     #[must_use]
     pub fn screen_control_active(&self) -> bool {
-        self.entries.iter().any(|entry| {
-            let TranscriptEntry::Item(block) = entry else {
-                return false;
-            };
-            let TurnItem::ToolCall {
-                name, status, args, ..
-            } = &block.item
-            else {
-                return false;
-            };
-            if name != "computer"
-                || !matches!(
-                    status,
-                    haider_protocol::item::ToolStatus::InProgress
-                        | haider_protocol::item::ToolStatus::Pending
-                )
-            {
-                return false;
-            }
-            // Observation (screenshot / cursor_position) is not control.
-            !matches!(
-                args.get("action").and_then(|v| v.as_str()),
-                Some("screenshot") | Some("cursor_position") | None
-            )
-        })
+        !self.screen_control_items.is_empty()
     }
 
     /// View-cache invalidation token; no semantic state is derived from it.
@@ -1882,17 +1998,25 @@ impl SessionProjection {
         self.render_revision
     }
 
+    /// Existing-entry mutation epoch used by the bounded render cache.
+    #[must_use]
+    pub(crate) const fn entry_mutation_revision(&self) -> u64 {
+        self.entry_mutation_revision
+    }
+
+    /// Raw prompt-entry ordinals, in transcript order. Rendering uses this
+    /// compact ingest-time index for O(log U) sticky-origin lookup (`U` is
+    /// the number of user prompts), never an O(N) frame-path scan.
+    #[must_use]
+    pub(crate) fn user_entries(&self) -> &[usize] {
+        &self.user_entries
+    }
+
     /// User prompt rows — the launcher row's turn count (sim tui.js:3248:
     /// `entries.filter((e) => e.kind === "user").length`).
     #[must_use]
     pub fn user_row_count(&self) -> u32 {
-        u32::try_from(
-            self.entries
-                .iter()
-                .filter(|entry| matches!(entry, TranscriptEntry::User { .. }))
-                .count(),
-        )
-        .unwrap_or(u32::MAX)
+        u32::try_from(self.user_entries.len()).unwrap_or(u32::MAX)
     }
 
     #[must_use]

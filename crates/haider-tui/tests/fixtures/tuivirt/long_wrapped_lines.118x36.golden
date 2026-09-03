@@ -1,0 +1,73 @@
+# tuivirt golden · long_wrapped_lines · 118x36
+00|[ ← main ]     ▄▄  ██   ▄▄  ▀▀▀▀▀██▄  haider v<VERSION> · ~/dev/enterprise-suite            [ ◉ voice · whisper→openai ]|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×6; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×5; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×3; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/BOLD×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×9; Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×25; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×12; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×24; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2
+01|            ▄▄█▀  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀  session ▸   · branch main · test-lion-box                                       |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×12; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×4; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×4; Rgb(229, 122, 74)/Rgb(217, 181, 68)/BOLD×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(229, 122, 74)/Rgb(217, 181, 68)/BOLD×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×7; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×30; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×39
+02|──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×118
+03|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+04| ■ haider                                                                                                             |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×109
+05| ▏ clause 0 of a single very long logical line, clause 1 of a single very long logical line, clause 2 of a single very|
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+06| ▏  long logical line, clause 3 of a single very long logical line, clause 4 of a single very long logical line,      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+07| ▏ clause 5 of a single very long logical line, clause 6 of a single very long logical line, clause 7 of a single very|
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+08| ▏  long logical line, clause 8 of a single very long logical line, clause 9 of a single very long logical line,      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+09| ▏ clause 10 of a single very long logical line, clause 11 of a single very long logical line, clause 12 of a single  |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+10| ▏ very long logical line, clause 13 of a single very long logical line, clause 14 of a single very long logical line,|
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+11| ▏  clause 15 of a single very long logical line, clause 16 of a single very long logical line, clause 17 of a single |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+12| ▏ very long logical line, clause 18 of a single very long logical line, clause 19 of a single very long logical line,|
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+13| ▏  clause 20 of a single very long logical line, clause 21 of a single very long logical line, clause 22 of a single |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+14| ▏ very long logical line, clause 23 of a single very long logical line, clause 24 of a single very long logical line,|
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+15| ▏  clause 25 of a single very long logical line, clause 26 of a single very long logical line, clause 27 of a single |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+16| ▏ very long logical line, clause 28 of a single very long logical line, clause 29 of a single very long logical line,|
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+17| ▏  clause 30 of a single very long logical line, clause 31 of a single very long logical line, clause 32 of a single |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+18| ▏ very long logical line, clause 33 of a single very long logical line, clause 34 of a single very long logical line,|
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+19| ▏  clause 35 of a single very long logical line, clause 36 of a single very long logical line, clause 37 of a single |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+20| ▏ very long logical line, clause 38 of a single very long logical line, clause 39 of a single very long logical line,|
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+21| ▏  end.                                                                                                              |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+22| ▏                                                                                                                    |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+23| ▏ https://example.invalid/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/seg|
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+24| ▏ ment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segmen|
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+25| ▏ t/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/s|
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+26| ▏ egment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segm|
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+27| ▏ ent/segment/segment/segment/segment/segment//end                                                                   |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+28| ▏                                                                                                                    |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+29| ▏ short tail line                                                                                                    |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×115
+30|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+31|─────────────────────────────────────────────────────────────────────────────────────────────────────────── fable-5 ──|
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×107; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×9; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×2
+32|  ❯   message haider — ⏎ send · ⇧⏎ newline · / commands · paste images/text                               [ ◉ talk ]  |
+   ~ Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×2; Rgb(217, 181, 68)/Rgb(26, 26, 26)/BOLD×2; Rgb(15, 15, 15)/Rgb(217, 181, 68)/NONE×1; Rgb(139, 148, 158)/Rgb(26, 26, 26)/NONE×70; Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×31; Rgb(68, 68, 68)/Rgb(26, 26, 26)/NONE×2; Rgb(217, 181, 68)/Rgb(26, 26, 26)/NONE×6; Rgb(68, 68, 68)/Rgb(26, 26, 26)/NONE×2; Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×2
+33|──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×118
+34|                                                                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118
+35| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k  · main                                                                      |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×76

@@ -1,0 +1,49 @@
+# tuivirt golden · input_required_menu · 80x24
+00|[ ← main ]     ▄▄  ██   ▄▄  ▀▀▀▀▀██▄  haider v<VERSION> · ~/dev/enterprise-suite  |
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×6; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×5; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×3; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/BOLD×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×9; Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×25; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2
+01|            ▄▄█▀  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀  session ▸   · branch main · test-lion-box |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×12; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×4; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×4; Rgb(229, 122, 74)/Rgb(217, 181, 68)/BOLD×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(229, 122, 74)/Rgb(217, 181, 68)/BOLD×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×7; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×30; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1
+02|────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×80
+03|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+04| ❯ migrate the store                                                            |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×17; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×60
+05|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+06| ■ haider                                                                       |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×71
+07| ▏ I need a decision before continuing.                                         |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(39, 35, 21)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×77
+08|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+09|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+10|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+11|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+12|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+13|────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×80
+14| ? Which migration strategy should the agent take?                              |
+   ~ Rgb(255, 183, 87)/Rgb(39, 35, 21)/NONE×50; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×30
+15| The event store has two candidate schemas.                                     |
+   ~ Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×1; Rgb(139, 148, 158)/Rgb(39, 35, 21)/NONE×42; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×37
+16| Pick one — the agent is blocked until you answer.                              |
+   ~ Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×1; Rgb(139, 148, 158)/Rgb(39, 35, 21)/NONE×49; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×30
+17| ❯ 1. Rewrite in place (fast, riskier)                                          |
+   ~ Rgb(58, 58, 58)/Rgb(39, 39, 39)/NONE×1; Rgb(217, 181, 68)/Rgb(39, 39, 39)/NONE×2; Rgb(242, 242, 242)/Rgb(39, 39, 39)/NONE×77
+18|   2. Shadow table + backfill                                                   |
+   ~ Rgb(58, 58, 58)/Rgb(39, 35, 21)/NONE×1; Rgb(217, 181, 68)/Rgb(39, 35, 21)/NONE×2; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×77
+19|   3. Option 2                                                                  |
+   ~ Rgb(58, 58, 58)/Rgb(39, 35, 21)/NONE×1; Rgb(217, 181, 68)/Rgb(39, 35, 21)/NONE×2; Rgb(212, 212, 212)/Rgb(39, 35, 21)/NONE×77
+20| ↑↓ select · ⏎ confirm · 1-3 quick · menu tuivirt-question-1 · menu.answer("tuiv|
+   ~ Rgb(58, 58, 58)/Rgb(39, 35, 21)/NONE×80
+21|────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×80
+22|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+23| [ ? INPUT_REQUIRED ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k  · main                    |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×20; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×26

@@ -1,0 +1,101 @@
+# tuivirt golden · tool_call_boxes · 160x50
+00|[ ← main ]     ▄▄  ██   ▄▄  ▀▀▀▀▀██▄  haider v<VERSION> · ~/dev/enterprise-suite                                                      [ ◉ voice · whisper→openai ]|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×6; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×5; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×3; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/BOLD×6; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×9; Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×25; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×54; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×24; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2
+01|            ▄▄█▀  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀  session ▸   · branch main · test-lion-box                                                                                 |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×12; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×4; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×4; Rgb(229, 122, 74)/Rgb(217, 181, 68)/BOLD×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×2; Rgb(229, 122, 74)/Rgb(217, 181, 68)/BOLD×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/BOLD×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×7; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×4; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×30; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×81
+02|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×160
+03|    output line 0218 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+04|    output line 0219 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+05|    output line 0220 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+06|    output line 0221 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+07|    output line 0222 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+08|    output line 0223 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+09|    output line 0224 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+10|    output line 0225 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+11|    output line 0226 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+12|    output line 0227 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+13|    output line 0228 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+14|    output line 0229 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+15|    output line 0230 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+16|    output line 0231 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+17|    output line 0232 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+18|    output line 0233 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+19|    output line 0234 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+20|    output line 0235 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+21|    output line 0236 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+22|    output line 0237 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+23|    output line 0238 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+24|    output line 0239 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+25|    output line 0240 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+26|    output line 0241 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+27|    output line 0242 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+28|    output line 0243 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+29|    output line 0244 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+30|    output line 0245 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+31|    output line 0246 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+32|    output line 0247 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+33|    output line 0248 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+34|    output line 0249 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+35|    output line 0250 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+36|    output line 0251 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+37|    output line 0252 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+38|    output line 0253 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+39|    output line 0254 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+40|    output line 0255 — bounded tail probe                                                                                                                       |
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×41; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×119
+41|    ⋯ output above is a bounded tail — earlier output truncated                                                                                                 |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×63; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×97
+42|  $ git status --short ✓ · exit 0                                                                                                                               |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×4; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×18; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×11; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×127
+43|  ✓ fs_edit crates/haider-store/src/event_store.rs +4 −1                                                                                                        |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(134, 196, 147)/Rgb(15, 15, 15)/NONE×2; Rgb(229, 122, 74)/Rgb(15, 15, 15)/NONE×7; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×45; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×104
+44|                                                                                                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
+45|───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── fable-5 ──|
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×149; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×9; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×2
+46|  ❯   message haider — ⏎ send · ⇧⏎ newline · / commands · paste images/text                                                                         [ ◉ talk ]  |
+   ~ Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×2; Rgb(217, 181, 68)/Rgb(26, 26, 26)/BOLD×2; Rgb(15, 15, 15)/Rgb(217, 181, 68)/NONE×1; Rgb(139, 148, 158)/Rgb(26, 26, 26)/NONE×70; Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×73; Rgb(68, 68, 68)/Rgb(26, 26, 26)/NONE×2; Rgb(217, 181, 68)/Rgb(26, 26, 26)/NONE×6; Rgb(68, 68, 68)/Rgb(26, 26, 26)/NONE×2; Rgb(242, 242, 242)/Rgb(26, 26, 26)/NONE×2
+47|────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────|
+   ~ Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×160
+48|                                                                                                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×160
+49| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k  · main                                                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×118

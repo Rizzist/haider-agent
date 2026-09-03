@@ -2,9 +2,8 @@
 //!
 //! The earlier W3c3 probe established the trigger for cached entry layout and
 //! viewport-only selection. The speed-optimization wave implements it, so this
-//! probe now protects the shipped property: after the cold cache fill, a 10k
-//! transcript must remain inside the live 33 ms frame budget and must not
-//! scale linearly with history length.
+//! legacy probe protects the 10k compatibility point. Ledger row 17 now runs
+//! `tuivirt_shape_bench_tests` across 10k/50k/200k, including first frames.
 //!
 //! Timing is noisy on a shared machine, so the enforced timing assertions
 //! are deliberately coarse (order-of-magnitude regression guards, not a
@@ -96,7 +95,7 @@ fn p95_frame(model: &AppModel, samples: usize) -> Duration {
 /// Measures the first draw of a newly constructed 10k-row model. Model and
 /// terminal construction stay outside the interval, matching the original
 /// cold-cache measurement.
-fn cold_10k_frame() -> Duration {
+fn first_10k_frame() -> Duration {
     let model = replayed(10_000);
     let backend = TestBackend::new(118, 36);
     let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -170,13 +169,13 @@ fn cached_viewport_render_stays_bounded_through_10k_rows() {
         );
     }
 
-    // The render/cache-fill loop is unchanged from origin/main. Measure three
-    // genuinely fresh caches and take the best sample so a scheduler preempt
-    // cannot masquerade as per-row work. A real regression slows all three.
-    let _allocator_and_page_cache_prefill = cold_10k_frame();
-    let cold_samples = [cold_10k_frame(), cold_10k_frame(), cold_10k_frame()];
-    let first = minimum_duration(&cold_samples);
-    println!("render cold-frame @ 10000 rows = {cold_samples:?}; min={first:?}");
+    // First-frame compatibility point. The cache is sparse now: a fresh draw
+    // lays out the tail viewport, never a history-sized cold fill. Take the
+    // best of three so scheduler preemption cannot masquerade as row work.
+    let _allocator_and_page_cache_prefill = first_10k_frame();
+    let first_samples = [first_10k_frame(), first_10k_frame(), first_10k_frame()];
+    let first = minimum_duration(&first_samples);
+    println!("render first-frame @ 10000 rows = {first_samples:?}; min={first:?}");
     // MUTATION CHECK: selecting max instead of min is caught without relying
     // on host timing; this also pins the intended outlier policy.
     assert_eq!(
@@ -189,8 +188,8 @@ fn cached_viewport_render_stays_bounded_through_10k_rows() {
     );
     if !cfg!(debug_assertions) {
         assert!(
-            first < Duration::from_millis(250),
-            "even a cold 10k-row cache fill must stay under 250ms: {first:?}"
+            first < FRAME_BUDGET,
+            "first 10k-row viewport frame must fit the 33ms budget: {first:?}"
         );
     }
 }
