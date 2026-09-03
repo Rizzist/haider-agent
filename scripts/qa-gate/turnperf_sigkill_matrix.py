@@ -180,18 +180,6 @@ def _replay(profile: ThrowawayProfile, run_id: str) -> dict[str, Any]:
     return document
 
 
-def _normalize_live(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    normalized: list[dict[str, Any]] = []
-    for event in events:
-        value = json.loads(json.dumps(event))
-        payload = value.get("payload")
-        if isinstance(payload, dict):
-            payload.pop("terminal_kind", None)
-            payload.pop("error_code", None)
-        normalized.append(value)
-    return normalized
-
-
 def _typed_terminals(events: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     return [
         event
@@ -220,7 +208,15 @@ def _validate_recovered_jsonl(stdout: str, shape: str) -> dict[str, Any]:
         raise ProofError(f"{shape} recovered JSONL has no envelopes")
     sequences = [event.get("seq") for event in events]
     if any(isinstance(value, bool) or not isinstance(value, int) for value in sequences):
-        raise ProofError(f"{shape} recovered JSONL has a non-integer sequence")
+        invalid = [
+            event
+            for event in events
+            if isinstance(event.get("seq"), bool)
+            or not isinstance(event.get("seq"), int)
+        ]
+        raise ProofError(
+            f"{shape} recovered JSONL has a non-integer sequence records={invalid!r}"
+        )
     if len(set(sequences)) != len(sequences):
         raise ProofError(f"{shape} recovered JSONL has duplicate sequences={sequences!r}")
     first = accepted.get("head_seq")
@@ -609,7 +605,7 @@ def _run_kill_case(
         if ledger_after_replay != ledger_before_replay:
             raise ProofError("durable replay mutated the external provider ledger")
         live_events = sorted(parsed["run_events"], key=lambda event: event["seq"])
-        if _normalize_live(live_events) != source_events:
+        if live_events != source_events:
             raise ProofError(
                 f"recovered live prefix+suffix parity failed live={len(live_events)} "
                 f"source={len(source_events)}"
@@ -619,11 +615,20 @@ def _run_kill_case(
             for value in pre_kill
             if value.get("event") != "accepted" and value.get("run_id") == parsed["run_id"]
         ]
-        if _normalize_live(pre_kill_events) != source_events[: len(pre_kill_events)]:
+        if pre_kill_events != source_events[: len(pre_kill_events)]:
             raise ProofError("committed pre-kill live prefix differs from replay prefix")
         terminals = _typed_terminals(live_events)
         if len(terminals) != 1:
             raise ProofError(f"typed terminal count expected=1 actual={len(terminals)}")
+        terminal_error_code = terminals[0]["payload"].get("error_code")
+        if recovery_action.get("outcome") == "probed_then_abandoned" and (
+            terminals[0]["payload"].get("terminal_kind") != "failure"
+            or terminal_error_code != "input_required"
+        ):
+            raise ProofError(
+                "effect recovery changed the established blocking terminal "
+                f"payload={terminals[0]['payload']!r}"
+            )
         _assert_event_identity(source_events)
         tool_results = sum(
             isinstance(event.get("payload"), Mapping)
@@ -655,6 +660,7 @@ def _run_kill_case(
             "pre_kill_events": len(pre_kill_events),
             "replay_events": len(source_events),
             "terminal_kind": terminal_kind,
+            "terminal_error_code": terminal_error_code,
             "settled_state": settled_state,
             "effect_recovery": recovery_action,
             "tool_effects": effects,

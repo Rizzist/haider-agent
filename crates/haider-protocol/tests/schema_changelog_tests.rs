@@ -3,6 +3,7 @@
 use haider_protocol::EventPayload;
 use haider_protocol::headless::HeadlessRunEventPayload;
 use haider_protocol::item::TurnItem;
+use haider_protocol::session::SessionConfigEventPayload;
 use std::fs;
 use std::path::Path;
 
@@ -116,6 +117,28 @@ headless_kinds! {
     HeadlessRunEventPayload::RunDeadlineExceeded(_) => "run_deadline_exceeded",
 }
 
+macro_rules! session_config_kinds {
+    ($($pattern:pat => $kind:literal),+ $(,)?) => {
+        const SESSION_CONFIG_KINDS: &[&str] = &[$($kind),+];
+
+        #[allow(dead_code)]
+        fn session_config_kind(payload: &SessionConfigEventPayload) -> &'static str {
+            match payload {
+                $($pattern => $kind),+
+            }
+        }
+    };
+}
+
+session_config_kinds! {
+    SessionConfigEventPayload::ModelSelected(_) => "model_selected",
+    SessionConfigEventPayload::SessionRenamed { .. } => "session_renamed",
+    SessionConfigEventPayload::SessionSeen { .. } => "session_seen",
+    SessionConfigEventPayload::EffortSelected(_) => "effort_selected",
+    SessionConfigEventPayload::FastModeSelected(_) => "fast_mode_selected",
+    SessionConfigEventPayload::AgentTypeSelected(_) => "agent_type_selected",
+}
+
 fn terminal_kinds() -> Vec<String> {
     let source = include_str!("../../haider-client/src/headless.rs");
     let enum_body = source
@@ -172,5 +195,6 @@ fn every_current_automation_kind_is_pinned_in_the_schema_changelog() {
     assert_documented(&changelog, "payload", PAYLOAD_KINDS);
     assert_documented(&changelog, "item", ITEM_KINDS);
     assert_documented(&changelog, "headless", HEADLESS_KINDS);
+    assert_documented(&changelog, "session_config", SESSION_CONFIG_KINDS);
     assert_documented(&changelog, "terminal", terminal_kinds());
 }

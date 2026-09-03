@@ -64,6 +64,15 @@ baseline at tag lines 72-135):
 - `item:child_spawn`, `item:child_result`, `item:plan`,
   `item:context_compaction`, `item:extension`, `item:refusal`
 
+Supplemental session-configuration kinds (the additive
+`SessionConfigEventPayload` union) are
+`session_config:model_selected`, `session_config:session_renamed`,
+`session_config:session_seen`, `session_config:effort_selected`,
+`session_config:fast_mode_selected`, and
+`session_config:agent_type_selected`. They remain separate from the closed
+core `EventPayload` union so older typed consumers can preserve them through
+the raw-envelope path.
+
 The five automation terminal kinds did not yet exist at this baseline.
 
 ### v0.0.965 — additive kinds
@@ -174,3 +183,55 @@ surfaces.
   terminal rules are unchanged. This is a behavioral correction to the
   existing carrier, not an additive field or kind; the normative automation
   wording is in `docs/jsonl-run-contract-v1.md` under “Tool-call identity.”
+
+### v0.0.970 — retained terminal projection and replay law
+
+- Additive durable terminal fields: the terminal `payload:run_state` now
+  retains `terminal_kind` in the journal. Failure, budget, timeout, and
+  provider-error terminals also retain `error_code`; success and ordinary
+  cancellation terminals omit it. The values use
+  the terminal vocabulary introduced in v0.0.967 and extended in v0.0.968.
+  This changes no live JSONL shape: those fields were already emitted there.
+  It makes session replay and `haider run --replay` serve the same retained
+  terminal envelope instead of reconstructing a smaller payload. Readers of
+  pre-v0.0.970 journals may add the missing fields with the documented
+  deterministic classifier, but must not rewrite the retained journal row.
+- Replay preservation rule: a durable event shape is additive-only and every
+  addition must be announced in this ledger. Every field inside a
+  `RawEnvelope`, including its payload, is durable and must survive replay
+  with identical JSON encoding for the same retained row. There are no
+  declared non-durable fields inside `RawEnvelope`, so live/replay event-byte
+  comparisons normalize nothing. Acceptance announcements and replay-document
+  metadata are separate protocol objects and are outside that comparison.
+- Derived-field boundary: an ephemeral or presentation-only derived field
+  never sits inside a durable payload. If a classifier is part of the durable
+  event contract, as `terminal_kind` now is, the writer stamps it before
+  commit and the journal retains it; subsequent live and replay surfaces
+  serialize that retained value. Other derived values belong outside the
+  `RawEnvelope` on both paths.
+
+The following payload kinds were present in the AHRB v0.0.969 capture but had
+not all been called out together in this ledger. Their schema status is:
+
+- `payload:session_state` — core `EventPayload` baseline kind from v0.0.964;
+  its value is the typed session lifecycle state.
+- `payload:usage` — core `EventPayload` baseline kind from v0.0.964; it carries
+  the correlated typed token/cache usage record and is independent of the
+  terminal classifier.
+- `payload:effect` — core `EventPayload` baseline kind from v0.0.964; it
+  carries the typed effect phase and must remain in the durable tool trace.
+- `payload:node_committed` — core `EventPayload` baseline kind from v0.0.964;
+  it carries the committed history `TreeNode`.
+- `headless:headless_run_configured` — supplemental durable headless kind
+  already present at the v0.0.964 baseline. It carries the fully resolved
+  `HeadlessRunSpecV1` and is prompt-omitted replay metadata.
+- `payload:session_renamed` — supplemental `SessionConfigEventPayload` kind,
+  introduced before the v0.0.964 baseline. It carries optional `title`; an
+  omitted title records that the title was cleared.
+- `payload:process_signal_recorded` — core `EventPayload` baseline kind from
+  v0.0.964; it carries the typed workflow/process-signal evidence fact.
+- `payload:node_renamed` — observed by AHRB as an additive raw kind, but this
+  repository's v0.0.969/v0.0.970 protocol sources and tag history contain no
+  typed producer or decoder for it. No field schema is therefore claimed
+  here. Forward readers must preserve its complete opaque JSON payload and
+  must not reject, drop, or reinterpret it while replaying the envelope.

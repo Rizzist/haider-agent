@@ -1,5 +1,6 @@
 //! Manual `haider run` parser and daemon-backed output adapter.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -11,15 +12,18 @@ use haider_client::{
     ConnectError, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL, EnsureError,
     EnsureOptions, HeadlessEvent, HeadlessEventMode, HeadlessFailureCode, HeadlessInterrupt,
     HeadlessOutcome, HeadlessRunError, HeadlessRunEvents, HeadlessRunRequest, HeadlessRunResult,
-    HeadlessRunStatus, HeadlessSessionConfig, ProfileEnv, autospawn_daemon_lifetime,
-    headless_run_events, headless_run_status, load_attachment, resolve_profile,
-    run_headless_with_session_config_event_mode_and_interrupts, stop_headless_run,
+    HeadlessRunStatus, HeadlessSessionConfig, HeadlessTerminalKind, ProfileEnv,
+    autospawn_daemon_lifetime, headless_run_events, headless_run_status, load_attachment,
+    resolve_profile, run_headless_with_session_config_event_mode_and_interrupts, stop_headless_run,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorCode;
-use haider_protocol::headless::RunBudgetV1;
+use haider_protocol::headless::{HeadlessRunEventPayload, RunBudgetV1, durable_run_terminal_v1};
 use haider_protocol::ids::RunId;
+#[cfg(test)]
+use haider_protocol::menu::Menu;
+use haider_protocol::menu::{DecisionKind, MenuKind};
 use haider_protocol::session::SessionPermissionOverridesV1;
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -1065,6 +1069,11 @@ fn write_durable_replay(
             "terminal replay source omitted terminal_seq",
         )
     })?;
+    // Current journals retain these fields on the terminal envelope. The
+    // owned branch is only a compatibility upcast for pre-v0.0.970 rows; the
+    // ordinary path serializes the journal-backed ledger directly.
+    let legacy_projection = replay_legacy_terminal_projection(&status.run_id, events)?;
+    let events = legacy_projection.as_ref().unwrap_or(events);
     let mut first_seq = None;
     let mut last_seq = None;
     let mut previous_seq = None;
@@ -1079,7 +1088,7 @@ fn write_durable_replay(
         previous_seq = Some(envelope.seq);
         last_seq = Some(envelope.seq);
         run_id_stable &= envelope.run_id.as_ref() == Some(&status.run_id);
-        if is_terminal_run_state(&envelope) {
+        if is_typed_terminal_run_state(&envelope) {
             terminal_sequences.push(envelope.seq);
         }
         Ok(())
@@ -1136,6 +1145,247 @@ fn write_durable_replay(
     serde_json::to_writer(&mut output, &document).map_err(io::Error::other)?;
     output.write_all(b"\n")?;
     output.flush()
+}
+
+fn replay_legacy_terminal_projection(
+    run_id: &RunId,
+    events: &HeadlessRunEvents,
+) -> io::Result<Option<HeadlessRunEvents>> {
+    let mut budget_exhausted = false;
+    let mut deadline_exceeded = false;
+    let mut request_deadline_unix_ms = None;
+    let mut cancellation_intent_at_ms = None;
+    let mut adjacent_failure = None::<(u64, ErrorCode)>;
+    let mut blocking_error_code = None;
+    let mut pending_permission_rejects = HashMap::<String, (String, u32)>::new();
+    let mut missing_projection = None::<(u64, &'static str, Option<&'static str>)>;
+
+    events.try_for_each(|envelope| {
+        match envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("headless_run_configured") => {
+                if let Some(HeadlessRunEventPayload::HeadlessRunConfigured(configured)) =
+                    HeadlessRunEventPayload::from_payload_value(&envelope.payload)
+                {
+                    request_deadline_unix_ms = configured.request_deadline_unix_ms;
+                }
+                adjacent_failure = None;
+            }
+            Some("run_budget_exhausted") => {
+                budget_exhausted = true;
+                adjacent_failure = None;
+            }
+            Some("run_deadline_exceeded") => {
+                if blocking_error_code.is_none() && cancellation_intent_at_ms.is_none() {
+                    deadline_exceeded = true;
+                }
+                adjacent_failure = None;
+            }
+            Some("run_failed") => {
+                adjacent_failure = match serde_json::from_value::<EventPayload>(envelope.payload) {
+                    Ok(EventPayload::RunFailed { code, .. }) => Some((envelope.seq, code)),
+                    _ => None,
+                };
+            }
+            Some("menu_opened") => {
+                if !deadline_exceeded
+                    && cancellation_intent_at_ms.is_none()
+                    && blocking_error_code.is_none()
+                    && let Ok(EventPayload::MenuOpened(menu)) =
+                        serde_json::from_value::<EventPayload>(envelope.payload)
+                {
+                    if let MenuKind::Permission { .. } = menu.kind {
+                        let reject_once = menu
+                            .options
+                            .iter()
+                            .enumerate()
+                            .find(|(_, option)| option.decision == Some(DecisionKind::RejectOnce))
+                            .and_then(|(index, option)| {
+                                u32::try_from(index)
+                                    .ok()
+                                    .map(|index| (option.key.clone(), index))
+                            });
+                        if let Some(reject_once) = reject_once {
+                            pending_permission_rejects
+                                .insert(menu.id.as_str().to_owned(), reject_once);
+                        } else {
+                            blocking_error_code.get_or_insert("permission_reject_unavailable");
+                        }
+                    } else if menu.blocking {
+                        blocking_error_code.get_or_insert("input_required");
+                    }
+                }
+                adjacent_failure = None;
+            }
+            Some("menu_answered") => {
+                if let Ok(EventPayload::MenuAnswered(answer)) =
+                    serde_json::from_value::<EventPayload>(envelope.payload)
+                    && let Some((option_key, option_index)) =
+                        pending_permission_rejects.remove(answer.menu.as_str())
+                    && !deadline_exceeded
+                    && cancellation_intent_at_ms.is_none()
+                    && blocking_error_code.is_none()
+                    && (answer.option_key.as_deref() != Some(option_key.as_str())
+                        || answer.option_index != option_index)
+                {
+                    blocking_error_code.get_or_insert("permission_resolution_conflict");
+                }
+                adjacent_failure = None;
+            }
+            Some("menu_closed") => {
+                if let Ok(EventPayload::MenuClosed { menu, .. }) =
+                    serde_json::from_value::<EventPayload>(envelope.payload)
+                    && pending_permission_rejects.remove(menu.as_str()).is_some()
+                    && !deadline_exceeded
+                    && cancellation_intent_at_ms.is_none()
+                    && blocking_error_code.is_none()
+                {
+                    blocking_error_code.get_or_insert("permission_resolution_conflict");
+                }
+                adjacent_failure = None;
+            }
+            Some("run_state") => {
+                let state = serde_json::from_value::<EventPayload>(envelope.payload.clone());
+                let Ok(EventPayload::RunState(state)) = state else {
+                    adjacent_failure = None;
+                    return Ok(());
+                };
+                match state {
+                    haider_protocol::state::RunState::Cancelling => {
+                        cancellation_intent_at_ms.get_or_insert(envelope.committed_at_ms);
+                    }
+                    haider_protocol::state::RunState::InputRequired { .. }
+                        if !deadline_exceeded
+                            && cancellation_intent_at_ms.is_none()
+                            && blocking_error_code.is_none() =>
+                    {
+                        blocking_error_code.get_or_insert("input_required");
+                    }
+                    haider_protocol::state::RunState::EffectOutcomeUnknown
+                        if !deadline_exceeded
+                            && cancellation_intent_at_ms.is_none()
+                            && blocking_error_code.is_none() =>
+                    {
+                        blocking_error_code.get_or_insert("effect_outcome_unknown");
+                    }
+                    _ => {}
+                }
+                let failure_code = adjacent_failure.take().and_then(|(failure_seq, code)| {
+                    failure_seq
+                        .checked_add(1)
+                        .is_some_and(|expected| expected == envelope.seq)
+                        .then_some(code)
+                });
+                let Some(terminal) = durable_run_terminal_v1(
+                    state,
+                    failure_code,
+                    budget_exhausted,
+                    deadline_exceeded
+                        || (blocking_error_code.is_none()
+                            && request_deadline_unix_ms.is_some_and(|deadline| {
+                                cancellation_intent_at_ms.is_some_and(|intent| intent >= deadline)
+                            })),
+                    blocking_error_code,
+                ) else {
+                    return Ok(());
+                };
+                let error_code = terminal.error_code;
+                let mut payload = envelope.payload;
+                if retain_or_project_terminal_fields(
+                    &mut payload,
+                    terminal.terminal_kind,
+                    error_code,
+                )? {
+                    missing_projection = Some((envelope.seq, terminal.terminal_kind, error_code));
+                }
+            }
+            _ => adjacent_failure = None,
+        }
+        Ok(())
+    })?;
+
+    let Some((terminal_seq, terminal_kind, error_code)) = missing_projection else {
+        return Ok(None);
+    };
+    let mut projected = Vec::with_capacity(events.len());
+    events.try_for_each(|mut envelope| {
+        if envelope.seq == terminal_seq {
+            retain_or_project_terminal_fields(&mut envelope.payload, terminal_kind, error_code)?;
+        }
+        projected.push(envelope);
+        Ok(())
+    })?;
+    HeadlessRunEvents::from_envelopes(run_id.clone(), projected)
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
+/// Returns true when an old payload needed an additive compatibility upcast.
+/// Retained fields are journal source-of-truth data and are never rebuilt.
+/// The shared classifier only fills fields absent from a pre-v0.0.970 row.
+fn retain_or_project_terminal_fields(
+    payload: &mut serde_json::Value,
+    terminal_kind: &str,
+    error_code: Option<&str>,
+) -> io::Result<bool> {
+    let payload = payload.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "terminal envelope payload is not an object",
+        )
+    })?;
+    match payload.get("terminal_kind") {
+        Some(serde_json::Value::String(_)) => {
+            return match payload.get("error_code") {
+                None | Some(serde_json::Value::String(_)) => Ok(false),
+                Some(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "retained error_code is not a string",
+                )),
+            };
+        }
+        Some(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "retained terminal_kind is not a string",
+            ));
+        }
+        None => {
+            payload.insert(
+                "terminal_kind".into(),
+                serde_json::Value::String(terminal_kind.into()),
+            );
+        }
+    }
+    let projected = true;
+    match (payload.get("error_code"), error_code) {
+        (Some(value), _) if value.is_string() => {}
+        (None, Some(code)) => {
+            payload.insert("error_code".into(), serde_json::Value::String(code.into()));
+        }
+        (None, None) => {}
+        (Some(_), _) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "retained error_code is not a string",
+            ));
+        }
+    }
+    Ok(projected)
+}
+
+fn terminal_kind_name(kind: HeadlessTerminalKind) -> &'static str {
+    match kind {
+        HeadlessTerminalKind::Success => "success",
+        HeadlessTerminalKind::Failure => "failure",
+        HeadlessTerminalKind::Budget => "budget",
+        HeadlessTerminalKind::Cancellation => "cancellation",
+        HeadlessTerminalKind::Timeout => "timeout",
+        HeadlessTerminalKind::ProviderError => "provider_error",
+    }
 }
 
 fn replay_final_text(events: &HeadlessRunEvents) -> io::Result<Option<String>> {
@@ -1436,19 +1686,11 @@ fn adapt_events_to(
                 }
                 if output == RunOutput::Jsonl {
                     let mut envelope = *terminal.envelope;
-                    let payload = envelope.payload.as_object_mut().ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "terminal envelope payload is not an object",
-                        )
-                    })?;
-                    payload.insert(
-                        "terminal_kind".into(),
-                        serde_json::to_value(terminal.kind).map_err(io::Error::other)?,
-                    );
-                    if let Some(error_code) = terminal.error_code {
-                        payload.insert("error_code".into(), serde_json::Value::String(error_code));
-                    }
+                    retain_or_project_terminal_fields(
+                        &mut envelope.payload,
+                        terminal_kind_name(terminal.kind),
+                        terminal.error_code.as_deref(),
+                    )?;
                     serde_json::to_writer(&mut stdout, &envelope).map_err(io::Error::other)?;
                     stdout.write_all(b"\n")?;
                     stdout.flush()?;
@@ -1514,6 +1756,61 @@ fn is_terminal_run_state(envelope: &RawEnvelope) -> bool {
                 .and_then(serde_json::Value::as_str),
             Some("done" | "errored" | "cancelled")
         )
+}
+
+fn is_typed_terminal_run_state(envelope: &RawEnvelope) -> bool {
+    if !is_terminal_run_state(envelope) {
+        return false;
+    }
+    let Some(kind_name) = envelope
+        .payload
+        .get("terminal_kind")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let kind = serde_json::from_value::<HeadlessTerminalKind>(serde_json::Value::String(
+        kind_name.to_owned(),
+    ));
+    let error_code = envelope.payload.get("error_code");
+    let error_value_is_typed = error_code.is_none_or(serde_json::Value::is_string);
+    let Ok(kind) = kind else {
+        // Terminal-kind additions are forward-compatible. The raw journal
+        // value remains authoritative as long as its optional error field is
+        // still structurally typed.
+        return error_value_is_typed;
+    };
+    let state = envelope
+        .payload
+        .get("state")
+        .and_then(serde_json::Value::as_str);
+    let state_matches = matches!(
+        (state, kind),
+        (Some("done"), HeadlessTerminalKind::Success)
+            | (
+                Some("cancelled"),
+                HeadlessTerminalKind::Failure
+                    | HeadlessTerminalKind::Cancellation
+                    | HeadlessTerminalKind::Timeout
+            )
+            | (
+                Some("errored"),
+                HeadlessTerminalKind::Failure
+                    | HeadlessTerminalKind::Budget
+                    | HeadlessTerminalKind::Timeout
+                    | HeadlessTerminalKind::ProviderError
+            )
+    );
+    let error_shape_matches = match kind {
+        HeadlessTerminalKind::Success | HeadlessTerminalKind::Cancellation => error_code.is_none(),
+        HeadlessTerminalKind::Failure
+        | HeadlessTerminalKind::Budget
+        | HeadlessTerminalKind::Timeout
+        | HeadlessTerminalKind::ProviderError => {
+            error_code.is_some_and(serde_json::Value::is_string)
+        }
+    };
+    state_matches && error_shape_matches
 }
 
 pub(crate) fn write_final(
@@ -1872,6 +2169,273 @@ mod tests {
             execution_permission_overrides(Some(pinned), true, true, true),
             pinned
         );
+    }
+
+    fn legacy_replay_envelope(seq: u64, payload: serde_json::Value) -> RawEnvelope {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "event_id": format!("event-legacy-{seq}"),
+            "seq": seq,
+            "session_id": "session-legacy",
+            "run_id": "run-legacy",
+            "device_id": "device-legacy",
+            "authority_epoch": 1,
+            "worker_generation": 1,
+            "committed_at_ms": seq,
+            "render": {"ui": true, "durable": true, "prompt": "omit"},
+            "payload": payload,
+        }))
+        .expect("legacy raw envelope")
+    }
+
+    /// Pre-v0.0.970 journals lack the additive terminal projection. Replay
+    /// upcasts those rows without mutating the journal and covers the three
+    /// terminal states independently of the current-writer retention pin.
+    #[test]
+    fn legacy_replay_projects_success_failure_and_cancellation_terminals() {
+        let cases = [
+            (
+                vec![legacy_replay_envelope(
+                    1,
+                    serde_json::json!({"type":"run_state","state":"done"}),
+                )],
+                "success",
+                None,
+            ),
+            (
+                vec![
+                    legacy_replay_envelope(
+                        1,
+                        serde_json::json!({
+                            "type":"run_failed",
+                            "code":"internal",
+                            "message":"legacy failure",
+                            "retryable":false
+                        }),
+                    ),
+                    legacy_replay_envelope(
+                        2,
+                        serde_json::json!({"type":"run_state","state":"errored"}),
+                    ),
+                ],
+                "failure",
+                Some("internal"),
+            ),
+            (
+                vec![legacy_replay_envelope(
+                    1,
+                    serde_json::json!({"type":"run_state","state":"cancelled"}),
+                )],
+                "cancellation",
+                None,
+            ),
+        ];
+
+        for (envelopes, terminal_kind, error_code) in cases {
+            let run_id = RunId::new("run-legacy");
+            let events = HeadlessRunEvents::from_envelopes(run_id.clone(), envelopes)
+                .expect("legacy fixture ledger");
+            let projected = replay_legacy_terminal_projection(&run_id, &events)
+                .expect("legacy projection")
+                .expect("legacy terminal needs projection");
+            let mut terminal = None;
+            projected
+                .try_for_each(|envelope| {
+                    if is_terminal_run_state(&envelope) {
+                        terminal = Some(envelope.payload);
+                    }
+                    Ok(())
+                })
+                .expect("read projected ledger");
+            let terminal = terminal.expect("projected terminal");
+            assert_eq!(terminal["terminal_kind"], terminal_kind);
+            assert_eq!(
+                terminal
+                    .get("error_code")
+                    .and_then(serde_json::Value::as_str),
+                error_code
+            );
+        }
+    }
+
+    /// MUTATION CHECK: treat adjacency in the run-filtered vector as global
+    /// journal adjacency. A skipped shared-session row must prevent a stale
+    /// `RunFailed` from determining the terminal classifier.
+    #[test]
+    fn legacy_replay_requires_global_sequence_adjacency_for_run_failure() {
+        let run_id = RunId::new("run-legacy");
+        let events = HeadlessRunEvents::from_envelopes(
+            run_id.clone(),
+            vec![
+                legacy_replay_envelope(
+                    1,
+                    serde_json::json!({
+                        "type":"run_failed",
+                        "code":"provider_error",
+                        "message":"not adjacent",
+                        "retryable":false
+                    }),
+                ),
+                legacy_replay_envelope(
+                    3,
+                    serde_json::json!({"type":"run_state","state":"errored"}),
+                ),
+            ],
+        )
+        .expect("gapped legacy ledger");
+        let projected = replay_legacy_terminal_projection(&run_id, &events)
+            .expect("legacy projection")
+            .expect("missing legacy fields");
+        let mut terminal = None;
+        projected
+            .try_for_each(|envelope| {
+                if is_terminal_run_state(&envelope) {
+                    terminal = Some(envelope.payload);
+                }
+                Ok(())
+            })
+            .expect("projected ledger");
+        let terminal = terminal.expect("terminal");
+        assert_eq!(terminal["terminal_kind"], "failure");
+        assert_eq!(terminal["error_code"], "internal");
+    }
+
+    /// MUTATION CHECK: run today's compatibility classifier over an already
+    /// retained future terminal kind. Additive journal data must be served
+    /// unchanged, including the absence of fields unknown to today's reader.
+    #[test]
+    fn legacy_replay_preserves_unknown_retained_terminal_without_synthesis() {
+        let run_id = RunId::new("run-legacy");
+        let terminal = legacy_replay_envelope(
+            1,
+            serde_json::json!({
+                "type":"run_state",
+                "state":"errored",
+                "terminal_kind":"future_terminal"
+            }),
+        );
+        let events = HeadlessRunEvents::from_envelopes(run_id.clone(), vec![terminal.clone()])
+            .expect("future terminal ledger");
+        assert!(
+            replay_legacy_terminal_projection(&run_id, &events)
+                .expect("compatibility scan")
+                .is_none()
+        );
+        assert!(is_typed_terminal_run_state(&terminal));
+        assert!(terminal.payload.get("error_code").is_none());
+    }
+
+    /// MUTATION CHECK: reclassify a known retained fork-boundary cancellation
+    /// from preceding blocking facts. Once typed terminal fields are retained,
+    /// the journal—not today's compatibility classifier—is authoritative.
+    #[test]
+    fn replay_preserves_known_retained_terminal_without_reclassification() {
+        let run_id = RunId::new("run-legacy");
+        let menu = Menu {
+            id: haider_protocol::ids::MenuId::new("question"),
+            kind: MenuKind::Question,
+            title: "Need input".into(),
+            body: Vec::new(),
+            options: Vec::new(),
+            blocking: true,
+            scope: haider_protocol::menu::MenuScope::Session,
+            origin: "test".into(),
+            ttl_ms: None,
+            timeout_option: None,
+        };
+        let terminal = legacy_replay_envelope(
+            2,
+            serde_json::json!({
+                "type":"run_state",
+                "state":"cancelled",
+                "terminal_kind":"cancellation"
+            }),
+        );
+        let events = HeadlessRunEvents::from_envelopes(
+            run_id.clone(),
+            vec![
+                legacy_replay_envelope(
+                    1,
+                    serde_json::to_value(EventPayload::MenuOpened(menu)).expect("menu"),
+                ),
+                terminal.clone(),
+            ],
+        )
+        .expect("retained terminal ledger");
+
+        assert!(
+            replay_legacy_terminal_projection(&run_id, &events)
+                .expect("compatibility scan")
+                .is_none()
+        );
+        assert!(is_typed_terminal_run_state(&terminal));
+        assert_eq!(terminal.payload["terminal_kind"], "cancellation");
+        assert!(terminal.payload.get("error_code").is_none());
+    }
+
+    /// MUTATION CHECK: let the later effect state replace an earlier blocking
+    /// menu, or map the resulting Cancelled state to ordinary cancellation.
+    #[test]
+    fn legacy_replay_preserves_first_blocker_on_cancelled_terminal() {
+        let run_id = RunId::new("run-legacy");
+        let menu = Menu {
+            id: haider_protocol::ids::MenuId::new("question"),
+            kind: MenuKind::Question,
+            title: "Need input".into(),
+            body: Vec::new(),
+            options: Vec::new(),
+            blocking: true,
+            scope: haider_protocol::menu::MenuScope::Session,
+            origin: "test".into(),
+            ttl_ms: None,
+            timeout_option: None,
+        };
+        let events = HeadlessRunEvents::from_envelopes(
+            run_id.clone(),
+            vec![
+                legacy_replay_envelope(
+                    1,
+                    serde_json::to_value(EventPayload::MenuOpened(menu)).expect("menu"),
+                ),
+                legacy_replay_envelope(
+                    2,
+                    serde_json::to_value(EventPayload::RunState(
+                        haider_protocol::state::RunState::EffectOutcomeUnknown,
+                    ))
+                    .expect("effect state"),
+                ),
+                legacy_replay_envelope(
+                    3,
+                    serde_json::to_value(EventPayload::RunState(
+                        haider_protocol::state::RunState::Cancelling,
+                    ))
+                    .expect("cancelling"),
+                ),
+                legacy_replay_envelope(
+                    4,
+                    serde_json::to_value(EventPayload::RunState(
+                        haider_protocol::state::RunState::Cancelled,
+                    ))
+                    .expect("cancelled"),
+                ),
+            ],
+        )
+        .expect("blocked legacy ledger");
+        let projected = replay_legacy_terminal_projection(&run_id, &events)
+            .expect("legacy projection")
+            .expect("missing legacy fields");
+        let mut terminal = None;
+        projected
+            .try_for_each(|envelope| {
+                if is_terminal_run_state(&envelope) {
+                    terminal = Some(envelope.payload);
+                }
+                Ok(())
+            })
+            .expect("projected ledger");
+        let terminal = terminal.expect("terminal");
+        assert_eq!(terminal["terminal_kind"], "failure");
+        assert_eq!(terminal["error_code"], "input_required");
     }
 
     /// MUTATION CHECK: buffering the accepted event behind an envelope makes

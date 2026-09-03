@@ -514,10 +514,11 @@ payload schema, but their wrappers are not byte-identical:
 - the socket wraps an unmodified `RawEnvelope` in `WireFrame::Event` with
   `attachment_id` and `session_id`, and uses `AttachCaughtUp` as its barrier;
 - JSONL starts with one non-envelope acceptance object, then emits envelopes
-  directly; on the one terminal envelope only, the adapter adds
-  `payload.terminal_kind` and optional `payload.error_code` while preserving
-  the same `seq` (`docs/jsonl-run-contract-v1.md:7-22`, `:78-102`;
-  `crates/haider-cli/src/run.rs:1322-1389`).
+  directly. The journal writer retains `payload.terminal_kind` and optional
+  `payload.error_code` on the one terminal envelope, so live JSONL and replay
+  serialize that same envelope without changing its `seq`
+  (`docs/jsonl-run-contract-v1.md:7-22`, `:87-107`;
+  `crates/haider-cli/src/run.rs`).
 
 ## 8. Delegation without a spawn RPC
 

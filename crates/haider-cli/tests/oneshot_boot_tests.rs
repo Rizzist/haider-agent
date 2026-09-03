@@ -434,19 +434,6 @@ fn envelope_value(envelope: &RawEnvelope) -> serde_json::Value {
     serde_json::to_value(envelope).expect("serialize envelope")
 }
 
-/// Removes the JSONL-only additive terminal fields so a stream envelope can
-/// be compared with the durable journal envelope it came from.
-fn strip_jsonl_terminal_fields(mut value: serde_json::Value) -> serde_json::Value {
-    if let Some(payload) = value
-        .get_mut("payload")
-        .and_then(|payload| payload.as_object_mut())
-    {
-        payload.remove("terminal_kind");
-        payload.remove("error_code");
-    }
-    value
-}
-
 /// Normalizes volatile identity/time/digest fields so one fixed fake script
 /// yields one stable golden. Everything else (sequence, payload kinds,
 /// ordering, states, texts, usage numbers, render flags) is compared exactly.
@@ -610,7 +597,7 @@ fn one_shot_run_state_is_visible_to_a_later_persistent_daemon() {
     );
     for (streamed, replayed) in streamed.iter().zip(&replayed) {
         assert_eq!(
-            strip_jsonl_terminal_fields(envelope_value(streamed)),
+            envelope_value(streamed),
             envelope_value(replayed),
             "seq {} must replay identically",
             streamed.seq
