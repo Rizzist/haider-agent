@@ -103,8 +103,10 @@ jobs:
   client-footprint:
     name: client footprint (settled macOS release)
     # Registry #80: typed run terminality is distinct from aggregate session
-    # settlement. Advisory until this job passes once on CI; see
-    # docs/testing/v0.0.969/cfbgate.md.
+    # settlement. TODO(2026-09-02): after three consecutive green runs of this
+    # job on main, land a follow-up that removes continue-on-error and records
+    # those run IDs in docs/testing/v0.0.970/cfbcal.md. Tag/reusable runs do not
+    # count toward the three-run registry note.
     continue-on-error: true
     runs-on: macos-15
     steps:
@@ -128,27 +130,39 @@ jobs:
         run: |
           cargo build --release -p haider-cli -p haider-daemond --locked
           test "$(stat -f %z target/release/haiderd)" -gt 10485760
-      - name: enforce settled client footprint budgets
+      - name: calibrate and enforce settled client footprint budgets (N=5)
         run: |
           mkdir -p "$RUNNER_TEMP/client-footprint"
-          python3 scripts/perf/client-footprint-budget.py \
-            --haider target/release/haider \
-            --surface status-post-command \
-            --output "$RUNNER_TEMP/client-footprint/status" \
-            --budget-bytes 2703783
-          python3 scripts/perf/client-footprint-budget.py \
-            --haider target/release/haider \
-            --surface run-post-command \
-            --output "$RUNNER_TEMP/client-footprint/run" \
-            --budget-bytes 3406683
-          python3 scripts/perf/client-footprint-budget.py \
-            --haider target/release/haider \
-            --surface tui-demo-sixel \
-            --output "$RUNNER_TEMP/client-footprint/tui-sixel" \
-            --budget-bytes 6110043
+          failures=0
+          calibrate_surface() {
+            local surface="$1"
+            local output="$2"
+            local budget="$3"
+            if ! python3 scripts/perf/client-footprint-budget.py \
+              --haider target/release/haider \
+              --surface "$surface" \
+              --output "$RUNNER_TEMP/client-footprint/$output" \
+              --calibrate \
+              --runs 5 \
+              --budget-bytes "$budget"
+            then
+              failures=$((failures + 1))
+            fi
+          }
+
+          # Runner evidence and provisional gaps are documented in cfbcal.md.
+          calibrate_surface status-post-command status 2938637
+          calibrate_surface run-post-command run 3794948
+          calibrate_surface tui-demo-sixel tui-sixel 6110043
+          if (( failures != 0 )); then
+            echo "$failures client-footprint surface(s) failed; available calibration evidence was retained" >&2
+            exit 1
+          fi
       - name: upload footprint evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: client-footprint-${{ runner.os }}-${{ runner.arch }}
+          name: client-footprint-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/client-footprint
+          if-no-files-found: error
+          retention-days: 90
