@@ -98,8 +98,9 @@ readers.
 ## Exactly one typed terminal
 
 An attached run ends with exactly one terminal envelope. It is still the
-ordinary durable `payload.type == "run_state"` envelope, augmented on the
-JSONL surface with `payload.terminal_kind`:
+ordinary durable `payload.type == "run_state"` envelope. The journal retains
+its additive `payload.terminal_kind`, and live JSONL and replay serialize that
+same retained envelope:
 
 | `terminal_kind` | Meaning |
 | --- | --- |
@@ -117,6 +118,12 @@ not create a parallel timeout-reason taxonomy: `provider_timeout` is a
 `provider_error` terminal, `budget_exhausted` is a `budget` terminal, and
 `timeout` means the caller's run deadline.
 
+Every field inside this terminal `RawEnvelope` is durable. Replay must preserve
+the complete envelope and payload byte-for-byte; it may not reconstruct a
+smaller terminal from `state`. A compatibility reader may deterministically
+add terminal fields omitted by a pre-v0.0.970 journal row, but it does not
+rewrite that retained row. Presentation-only derived fields stay outside the
+durable payload on both live and replay paths.
 `workspace_unavailable` is never mapped to `provider_error`; a plain degraded
 chat still ends with `success`, while a workspace-required direct operation
 uses the ordinary non-provider `failure` terminal.

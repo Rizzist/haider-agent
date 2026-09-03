@@ -66,7 +66,7 @@ use haider_protocol::graph::{
     workflow_evidence_ledger_digest, workflow_input_ledger_digest,
     workspace_mutation_subject_digest,
 };
-use haider_protocol::headless::HeadlessRunEventPayload;
+use haider_protocol::headless::{HeadlessRunEventPayload, durable_run_terminal_v1};
 use haider_protocol::history::{COMPACTION_INTENT_EXTENSION_KIND, NodeKind, TodoItem, TreeNode};
 use haider_protocol::hook::HookEventPayload;
 use haider_protocol::ids::{
@@ -80,7 +80,7 @@ use haider_protocol::loom::{
     LoomRegistrySnapshotEntry, LoomRevisionConflict, LoomRevisionExpectation, LoomWorkflow,
     compile_pipe, parse_pipe,
 };
-use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason, MenuKind};
+use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuCloseReason, MenuKind};
 use haider_protocol::peer::PeerMessage;
 use haider_protocol::permission::PermissionEventPayload;
 use haider_protocol::pipe::{InstructEvidenceRef, TranscriptProjector};
@@ -19270,6 +19270,7 @@ fn append_transaction_envelopes(
     envelopes: &mut [RawEnvelope],
 ) -> StoreResult<()> {
     ensure_run_head_projection(transaction, session_id)?;
+    stamp_headless_terminal_payloads(transaction, session_id, committed_at_ms, envelopes)?;
     let latest: i64 = transaction
         .query_row(
             "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1",
@@ -20522,6 +20523,7 @@ fn append_envelopes_in_transaction(
             run_head_metadata.run_count,
         )?;
     }
+    stamp_headless_terminal_payloads(transaction, &session, committed_at_ms, envelopes)?;
     let latest: i64 = transaction
         .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1")
         .and_then(|mut statement| statement.query_row([session.as_str()], |row| row.get(0)))
@@ -21054,25 +21056,149 @@ fn budget_terminal_runs(
         .collect()
 }
 
+#[derive(Debug, Clone, Default)]
+struct DurableHeadlessRunFacts {
+    configured: bool,
+    budget_exhausted: bool,
+    deadline_exceeded: bool,
+    request_deadline_unix_ms: Option<u64>,
+    cancellation_intent_at_ms: Option<u64>,
+    blocking_error_code: Option<&'static str>,
+    pending_permission_rejects: HashMap<MenuId, (String, u32)>,
+}
+
+fn record_headless_menu(facts: &mut DurableHeadlessRunFacts, menu: &Menu) {
+    if !facts.configured
+        || facts.deadline_exceeded
+        || facts.cancellation_intent_at_ms.is_some()
+        || facts.blocking_error_code.is_some()
+    {
+        return;
+    }
+    if let MenuKind::Permission { .. } = menu.kind {
+        let reject_once = menu
+            .options
+            .iter()
+            .enumerate()
+            .find(|(_, option)| option.decision == Some(DecisionKind::RejectOnce))
+            .and_then(|(index, option)| {
+                u32::try_from(index)
+                    .ok()
+                    .map(|index| (option.key.clone(), index))
+            });
+        if let Some(reject_once) = reject_once {
+            facts
+                .pending_permission_rejects
+                .insert(menu.id.clone(), reject_once);
+        } else {
+            facts
+                .blocking_error_code
+                .get_or_insert("permission_reject_unavailable");
+        }
+    } else if menu.blocking {
+        facts.blocking_error_code.get_or_insert("input_required");
+    }
+}
+
+fn record_headless_menu_answer(facts: &mut DurableHeadlessRunFacts, answer: &MenuAnswer) {
+    let Some((option_key, option_index)) = facts.pending_permission_rejects.remove(&answer.menu)
+    else {
+        return;
+    };
+    if !facts.deadline_exceeded
+        && facts.cancellation_intent_at_ms.is_none()
+        && facts.blocking_error_code.is_none()
+        && (answer.option_key.as_deref() != Some(option_key.as_str())
+            || answer.option_index != option_index)
+    {
+        facts
+            .blocking_error_code
+            .get_or_insert("permission_resolution_conflict");
+    }
+}
+
+fn record_headless_menu_closed(facts: &mut DurableHeadlessRunFacts, menu: &MenuId) {
+    if facts.pending_permission_rejects.remove(menu).is_some()
+        && !facts.deadline_exceeded
+        && facts.cancellation_intent_at_ms.is_none()
+        && facts.blocking_error_code.is_none()
+    {
+        facts
+            .blocking_error_code
+            .get_or_insert("permission_resolution_conflict");
+    }
+}
+
+fn record_headless_run_state(
+    facts: &mut DurableHeadlessRunFacts,
+    state: &RunState,
+    committed_at_ms: u64,
+) {
+    if !facts.configured {
+        return;
+    }
+    match state {
+        RunState::Cancelling => {
+            facts
+                .cancellation_intent_at_ms
+                .get_or_insert(committed_at_ms);
+        }
+        RunState::InputRequired { .. }
+            if !facts.deadline_exceeded
+                && facts.cancellation_intent_at_ms.is_none()
+                && facts.blocking_error_code.is_none() =>
+        {
+            facts.blocking_error_code.get_or_insert("input_required");
+        }
+        RunState::EffectOutcomeUnknown
+            if !facts.deadline_exceeded
+                && facts.cancellation_intent_at_ms.is_none()
+                && facts.blocking_error_code.is_none() =>
+        {
+            facts
+                .blocking_error_code
+                .get_or_insert("effect_outcome_unknown");
+        }
+        _ => {}
+    }
+}
+
+fn headless_deadline_won(facts: &DurableHeadlessRunFacts) -> bool {
+    facts.deadline_exceeded
+        || (facts.blocking_error_code.is_none()
+            && facts.request_deadline_unix_ms.is_some_and(|deadline| {
+                facts
+                    .cancellation_intent_at_ms
+                    .is_some_and(|intent| intent >= deadline)
+            }))
+}
+
 fn durable_headless_run_facts(
     transaction: &Connection,
     session_id: &SessionId,
     run_id: &RunId,
-) -> StoreResult<(bool, bool)> {
+) -> StoreResult<DurableHeadlessRunFacts> {
     let mut statement = transaction
         .prepare_cached(
             "SELECT seq, envelope_json, event_id, committed_at_ms
              FROM events
              WHERE session_id = ?1
-               AND payload_kind IN ('headless_run_configured', 'run_budget_exhausted')
+               AND payload_kind IN (
+                   'headless_run_configured',
+                   'run_budget_exhausted',
+                   'run_deadline_exceeded',
+                   'run_state',
+                   'menu_opened',
+                   'menu_answered',
+                   'menu_closed'
+               )
              ORDER BY seq ASC",
         )
         .map_err(map_sqlite_error)?;
     let mut rows = statement
         .query([session_id.as_str()])
         .map_err(map_sqlite_error)?;
-    let mut configured = false;
-    let mut budget_exhausted = false;
+    let mut facts = DurableHeadlessRunFacts::default();
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
         let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
@@ -21089,23 +21215,234 @@ fn durable_headless_run_facts(
             stored_committed_at_ms,
             &envelope,
         )?;
-        if envelope.run_id.as_ref() != Some(run_id) || !envelope.render.durable {
+        if !envelope.render.durable {
             continue;
         }
+        if envelope.run_id.as_ref() != Some(run_id) {
+            continue;
+        }
+        // The headless reducer consumes only exact-run-correlated menus, so
+        // durable reconstruction applies the identical correlation fence.
+        match decode_payload::<EventPayload>(&envelope.payload) {
+            Ok(EventPayload::MenuOpened(menu)) => record_headless_menu(&mut facts, &menu),
+            Ok(EventPayload::MenuAnswered(answer)) => {
+                record_headless_menu_answer(&mut facts, &answer);
+            }
+            Ok(EventPayload::MenuClosed { menu, .. }) => {
+                record_headless_menu_closed(&mut facts, &menu);
+            }
+            _ => {}
+        }
         match HeadlessRunEventPayload::from_payload_value(&envelope.payload) {
-            Some(HeadlessRunEventPayload::HeadlessRunConfigured(_)) => configured = true,
-            Some(HeadlessRunEventPayload::RunBudgetExhausted(_)) if configured => {
-                budget_exhausted = true;
+            Some(HeadlessRunEventPayload::HeadlessRunConfigured(configured_run)) => {
+                facts.configured = true;
+                facts.request_deadline_unix_ms = configured_run.request_deadline_unix_ms;
+            }
+            Some(HeadlessRunEventPayload::RunBudgetExhausted(_)) if facts.configured => {
+                facts.budget_exhausted = true;
             }
             Some(HeadlessRunEventPayload::RunBudgetExhausted(_)) => {}
+            Some(HeadlessRunEventPayload::RunDeadlineExceeded(_))
+                if facts.configured
+                    && facts.blocking_error_code.is_none()
+                    && facts.cancellation_intent_at_ms.is_none() =>
+            {
+                facts.deadline_exceeded = true;
+            }
             Some(HeadlessRunEventPayload::RunDeadlineExceeded(_)) => {}
             None => {}
         }
-        if configured && budget_exhausted {
-            break;
+        if let Ok(EventPayload::RunState(state)) = decode_payload::<EventPayload>(&envelope.payload)
+        {
+            record_headless_run_state(&mut facts, &state, envelope.committed_at_ms);
         }
     }
-    Ok((configured, budget_exhausted))
+    Ok(facts)
+}
+
+/// Stamps the automation discriminator into the journal record itself. Live
+/// subscribers and replay readers then receive the same retained envelope by
+/// construction instead of independently rebuilding its durable payload.
+fn stamp_headless_terminal_payloads(
+    transaction: &Connection,
+    session_id: &SessionId,
+    committed_at_ms: u64,
+    envelopes: &mut [RawEnvelope],
+) -> StoreResult<()> {
+    let terminal_run_ids = envelopes
+        .iter()
+        .filter_map(|envelope| {
+            let run_id = envelope.run_id.clone()?;
+            matches!(
+                decode_payload::<EventPayload>(&envelope.payload),
+                Ok(EventPayload::RunState(state)) if state.is_terminal()
+            )
+            .then_some(run_id)
+        })
+        .collect::<HashSet<_>>();
+    if terminal_run_ids.is_empty() {
+        return Ok(());
+    }
+    let mut facts = terminal_run_ids
+        .into_iter()
+        .map(|run_id| {
+            durable_headless_run_facts(transaction, session_id, &run_id)
+                .map(|run_facts| (run_id, run_facts))
+        })
+        .collect::<StoreResult<HashMap<_, _>>>()?;
+    let mut adjacent_failure = latest_adjacent_run_failure(transaction, session_id)?;
+
+    for envelope in envelopes {
+        // Adjacency is global sequence adjacency, not merely adjacency among
+        // events carrying the same run id.
+        let preceding_failure = adjacent_failure.take();
+        let Some(run_id) = envelope.run_id.clone() else {
+            continue;
+        };
+        let Some(run_facts) = facts.get_mut(&run_id) else {
+            continue;
+        };
+        match decode_payload::<EventPayload>(&envelope.payload) {
+            Ok(EventPayload::MenuOpened(menu)) => record_headless_menu(run_facts, &menu),
+            Ok(EventPayload::MenuAnswered(answer)) => {
+                record_headless_menu_answer(run_facts, &answer);
+            }
+            Ok(EventPayload::MenuClosed { menu, .. }) => {
+                record_headless_menu_closed(run_facts, &menu);
+            }
+            _ => {}
+        }
+        let payload_kind = envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str);
+        match payload_kind {
+            Some("headless_run_configured")
+                if matches!(
+                    HeadlessRunEventPayload::from_payload_value(&envelope.payload),
+                    Some(HeadlessRunEventPayload::HeadlessRunConfigured(_))
+                ) =>
+            {
+                if let Some(HeadlessRunEventPayload::HeadlessRunConfigured(configured)) =
+                    HeadlessRunEventPayload::from_payload_value(&envelope.payload)
+                {
+                    run_facts.request_deadline_unix_ms = configured.request_deadline_unix_ms;
+                }
+                run_facts.configured = true;
+            }
+            Some("run_budget_exhausted")
+                if matches!(
+                    HeadlessRunEventPayload::from_payload_value(&envelope.payload),
+                    Some(HeadlessRunEventPayload::RunBudgetExhausted(_))
+                ) =>
+            {
+                run_facts.budget_exhausted |= run_facts.configured;
+            }
+            Some("run_deadline_exceeded")
+                if matches!(
+                    HeadlessRunEventPayload::from_payload_value(&envelope.payload),
+                    Some(HeadlessRunEventPayload::RunDeadlineExceeded(_))
+                ) && run_facts.configured
+                    && run_facts.blocking_error_code.is_none()
+                    && run_facts.cancellation_intent_at_ms.is_none() =>
+            {
+                run_facts.deadline_exceeded = true;
+            }
+            Some("run_failed") => {
+                if let Ok(EventPayload::RunFailed { code, .. }) =
+                    decode_payload::<EventPayload>(&envelope.payload)
+                {
+                    adjacent_failure = Some((run_id, code));
+                }
+            }
+            Some("run_state") if run_facts.configured => {
+                let Ok(EventPayload::RunState(state)) =
+                    decode_payload::<EventPayload>(&envelope.payload)
+                else {
+                    continue;
+                };
+                record_headless_run_state(run_facts, &state, committed_at_ms);
+                let Some(terminal) = durable_run_terminal_v1(
+                    state,
+                    preceding_failure.and_then(|(failure_run_id, code)| {
+                        (failure_run_id == run_id).then_some(code)
+                    }),
+                    run_facts.budget_exhausted,
+                    headless_deadline_won(run_facts),
+                    run_facts.blocking_error_code,
+                ) else {
+                    continue;
+                };
+                let payload = envelope.payload.as_object_mut().ok_or_else(|| {
+                    store_error(
+                        ErrorCode::InvalidArgument,
+                        "headless terminal payload is not an object",
+                        false,
+                    )
+                })?;
+                payload.insert(
+                    "terminal_kind".into(),
+                    serde_json::Value::String(terminal.terminal_kind.into()),
+                );
+                match terminal.error_code {
+                    Some(code) => {
+                        payload.insert("error_code".into(), serde_json::Value::String(code.into()));
+                    }
+                    None => {
+                        payload.remove("error_code");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn latest_adjacent_run_failure(
+    transaction: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<Option<(RunId, ErrorCode)>> {
+    let row = transaction
+        .query_row(
+            "SELECT seq, envelope_json, event_id, committed_at_ms
+             FROM events
+             WHERE session_id = ?1
+             ORDER BY seq DESC LIMIT 1",
+            [session_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    decode_envelope_column(row, 1),
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    let Some((stored_seq, envelope, stored_event_id, stored_committed_at_ms)) = row else {
+        return Ok(None);
+    };
+    let envelope = envelope.map_err(|error| {
+        corrupt(format!(
+            "invalid terminal-adjacent envelope for session {session_id}, seq {stored_seq}: {error}"
+        ))
+    })?;
+    validate_stored_envelope(
+        session_id,
+        stored_seq,
+        &stored_event_id,
+        stored_committed_at_ms,
+        &envelope,
+    )?;
+    let Some(run_id) = envelope.run_id else {
+        return Ok(None);
+    };
+    match decode_payload::<EventPayload>(&envelope.payload) {
+        Ok(EventPayload::RunFailed { code, .. }) => Ok(Some((run_id, code))),
+        _ => Ok(None),
+    }
 }
 
 fn validate_worker_run_transitions(
@@ -21239,7 +21576,7 @@ fn validate_worker_run_transitions(
             ));
         }
         if supplemental_run_budget
-            && !durable_headless_run_facts(transaction, session_id, run_id)?.0
+            && !durable_headless_run_facts(transaction, session_id, run_id)?.configured
         {
             return Err(store_error(
                 ErrorCode::InvalidArgument,
@@ -21310,9 +21647,8 @@ fn validate_worker_run_transitions(
                 && next == RunState::Errored
                 && budget_terminal_runs.contains(run_id)
             {
-                let (configured, budget_exhausted) =
-                    durable_headless_run_facts(transaction, session_id, run_id)?;
-                configured && budget_exhausted
+                let facts = durable_headless_run_facts(transaction, session_id, run_id)?;
+                facts.configured && facts.budget_exhausted
             } else {
                 false
             };
@@ -22747,6 +23083,17 @@ fn append_fork_boundary_closures(
     // Run activity is reduced per agent lane. A terminal observation in one
     // lane says nothing about another lane that happens to share the run id.
     let mut run_states = HashMap::<(RunId, Option<AgentId>), RunState>::new();
+    let headless_runs = envelopes
+        .iter()
+        .filter_map(|envelope| {
+            matches!(
+                HeadlessRunEventPayload::from_payload_value(&envelope.payload),
+                Some(HeadlessRunEventPayload::HeadlessRunConfigured(_))
+            )
+            .then(|| envelope.run_id.clone())
+            .flatten()
+        })
+        .collect::<HashSet<_>>();
     for envelope in envelopes.iter() {
         if let Some(run_id) = envelope.run_id.clone()
             && let Ok(EventPayload::RunState(state)) =
@@ -22763,6 +23110,29 @@ fn append_fork_boundary_closures(
             .map_err(|_| corrupt("forked journal is too large"))?
             .checked_add(1)
             .ok_or_else(|| corrupt("forked journal sequence space is exhausted"))?;
+        let mut payload = serde_json::to_value(EventPayload::RunState(RunState::Cancelled))
+            .map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot serialize fork run boundary: {error}"),
+                    false,
+                )
+            })?;
+        if headless_runs.contains(&run_id) {
+            payload
+                .as_object_mut()
+                .ok_or_else(|| {
+                    store_error(
+                        ErrorCode::Internal,
+                        "typed fork run-state payload is not an object",
+                        false,
+                    )
+                })?
+                .insert(
+                    "terminal_kind".into(),
+                    serde_json::Value::String("cancellation".into()),
+                );
+        }
         let envelope = EventEnvelope {
             schema_version: SCHEMA_VERSION,
             event_id: fork_run_boundary_event_id(session_id, &run_id, agent_id.as_ref()),
@@ -22782,15 +23152,7 @@ fn append_fork_boundary_closures(
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload: serde_json::to_value(EventPayload::RunState(RunState::Cancelled)).map_err(
-                |error| {
-                    store_error(
-                        ErrorCode::InvalidArgument,
-                        format!("cannot serialize fork run boundary: {error}"),
-                        false,
-                    )
-                },
-            )?,
+            payload,
         };
         envelopes.push(envelope);
     }
