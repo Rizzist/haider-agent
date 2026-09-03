@@ -297,6 +297,8 @@ fn observe_json_schemas_are_goldened_and_secret_free() {
             socket_path: "/tmp/haider-runtime/profile-a/h.sock".into(),
             pid_file_path: Some("/tmp/haider-runtime/profile-a/haiderd.pid".into()),
             ready: true,
+            ready_since: Some(1_753_500_000_000),
+            providers_loaded: true,
             idle_ttl_ms: Some(30_000),
             warm: true,
         },

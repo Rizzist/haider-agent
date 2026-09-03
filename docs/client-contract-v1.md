@@ -314,6 +314,8 @@ is §4.1.
 | `input_mirror_attachments_v1` | input-surface `attachments` |
 | `status_segment_v1` | status portion of surface publish/watch/delta |
 | `status_segment_structured_v1` | status `state` and `detail` |
+| `status_snapshot_v1` | `status.snapshot` scalar snapshot |
+| `status_runtime_v1` | daemon PID/paths, positive readiness/timestamp, provider-registry-loaded, idle TTL, and warm status fields |
 | `transcription_v1` | `transcription.secret_get` and `transcription.secret_set` |
 | `usage_report_v1` | `usage.report` |
 | `usage_history_v1` | `usage.history_day`, `usage.history_range` |
@@ -400,6 +402,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 
 | Need | Method / frame | Success response | Delivery | Authority |
 |---|---|---|---|---|
+| Daemon runtime/readiness | `status.snapshot` | `StatusSnapshot` | non-subscribing snapshot | daemon lifecycle's positive readiness predicate and daemon-owned runtime paths |
 | Session roster | `session.list` | `SessionList` | paginated snapshot | sealed-journal daemon projection `SessionSummary` |
 | Roster changes | `session.list_watch` | `SessionListWatch`, then `SessionRosterDelta` | watch: complete initial changed/new baseline followed by coalesced deltas | same summary producer as `session.list` |
 | Exact event range | `session.read` | `SessionRead` / `SessionReadResult` | non-subscribing snapshot | raw committed envelopes |
@@ -3381,6 +3384,21 @@ error styling. See `docs/provider-lockdown-v1.md` for the normative envelope,
 quota, toggle-boundary, and subagent rules.
 
 ## 21. Additive changelog
+
+### 2026-09-03 — v0.0.970 positive daemon readiness
+
+- `status.snapshot` adds optional/default-compatible `ready_since` and
+  `providers_loaded`, projected by `haider status --json` as
+  `daemon.ready_since` and `daemon.providers_loaded`.
+- `ready` is true only while the store is open, startup recovery has completed,
+  provider descriptors/factories are loaded, the session hub can accept turns,
+  and the lifecycle is `Ready`. `ready_since` is Unix epoch milliseconds at
+  that edge and is absent for old/non-ready responses. PID, PID-file, lock-owner,
+  and socket existence are never substitutes.
+- `providers_loaded` is registry/factory readiness only. It MUST NOT be rendered
+  as provider connectivity or authentication; providers connect per request.
+  `haider --ready` and the spawn readiness channel use the same predicate.
+  Idle TTL and warm-retention semantics are unchanged.
 
 ### 2026-09-01 — v0.0.969 warm-by-default
 

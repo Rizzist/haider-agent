@@ -52,6 +52,8 @@ mod telemetry;
 /// exits 64 rather than degrading), and it announces itself loudly on
 /// stderr AND in its log so the profile's daemon.log names the condition.
 const FAKE_PROVIDER_ENV: &str = "HAIDER_TEST_FAKE_PROVIDER";
+const READY_DELAY_ENV: &str = "HAIDER_TEST_READY_DELAY_MS";
+const MAX_TEST_READY_DELAY_MS: u64 = 10_000;
 const EX_SOFTWARE: u8 = 70;
 // This mitigation makes Tokio workers match the deliberately large daemon
 // entry stack and raises the depth at which accidental recursion overflows.
@@ -372,6 +374,23 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedArgs, String> 
     // credentials into a throwaway profile.
     if std::env::var_os("HAIDER_DISCOVERY_DISABLED").is_some_and(|value| value != "0") {
         config.discovery_disabled = true;
+    }
+    if let Some(value) = std::env::var_os(READY_DELAY_ENV) {
+        if std::env::var_os(FAKE_PROVIDER_ENV).is_none() {
+            return Err(format!("{READY_DELAY_ENV} requires {FAKE_PROVIDER_ENV}"));
+        }
+        let value = value
+            .into_string()
+            .map_err(|_| format!("{READY_DELAY_ENV} must be valid UTF-8"))?;
+        let millis = value
+            .parse::<u64>()
+            .map_err(|_| format!("{READY_DELAY_ENV} requires a positive integer"))?;
+        if millis == 0 || millis > MAX_TEST_READY_DELAY_MS {
+            return Err(format!(
+                "{READY_DELAY_ENV} must be between 1 and {MAX_TEST_READY_DELAY_MS}"
+            ));
+        }
+        config.inject_before_ready_delay = Some(Duration::from_millis(millis));
     }
     let readiness = readiness
         .map(|token| haider_platform::DaemonReadyNotifier::from_spawn_token(&token))

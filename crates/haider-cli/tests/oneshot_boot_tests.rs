@@ -1275,6 +1275,8 @@ fn fresh_profile_status_is_typed_without_a_daemon_and_reports_the_build_version_
     assert_eq!(status["schema"], "haider.observe.v1");
     assert_eq!(status["daemon"]["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(status["daemon"]["ready"], true);
+    assert!(status["daemon"]["ready_since"].as_u64().is_some());
+    assert_eq!(status["daemon"]["providers_loaded"], true);
     assert_eq!(status["daemon"]["generation"], 1);
     assert_eq!(status["session_count"], 0);
     assert_eq!(

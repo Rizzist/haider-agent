@@ -118,3 +118,31 @@ Read against the final uncommitted tree before verification. “checked: none”
 - #94 checked — no product deadline changed; the diagnostic helper has a bounded five-second subprocess timeout and fails closed
 - #95 checked: none — no new wait while a negotiated connection is open
 - #96 fixed — warm/one-shot authority still requires start/mid/end load below 3; M1 now additionally records and gates both pre-run and post-run load below 3
+
+## v0.0.970 daemonready delta walk
+
+- #1-#18 checked: none — no affected packaging, dependency, or harness surface
+- #19 fixed — every changed Rust file is rustfmt-clean and `git diff --check` is clean; the repository-wide formatter still names only three pre-existing unrelated files
+- #20 fixed — four readiness regressions raise the reviewed Rust baseline from 4,437 to 4,441
+- #21-#28 checked: none — no affected surface
+- #29 fixed — status keeps the serving PID/path fields diagnostic and makes the positive readiness predicate authoritative; neither `lock.owner`, the daemon PID file, nor socket existence is treated as Ready
+- #30-#32 checked: none — no affected surface
+- #33 fixed — the additive `ready_since` and `providers_loaded` fields have old/new decoder coverage and exact JSON fixtures
+- #34-#40 checked: none — no affected surface
+- #41 fixed — in-process and subprocess tests retain short isolated store/runtime roots
+- #42 fixed — subprocess coverage prebuilds the sibling `haider`/`haiderd` binaries before the daemon-heavy tests
+- #43 checked: none — no affected surface
+- #44 fixed — the slowed-init predicate and N-client race execute over the real UDS daemon path
+- #45-#63 checked: none — no affected surface
+- #64 checked — the final gate inspects the built `haiderd`; a binary at or below 10 MiB remains a stop condition
+- #65-#70 checked: none — no affected surface
+- #71 fixed — the exact `haider --ready`, spawn notification, `status --json`, and immediate-turn subprocess path is exercised end to end
+- #72 fixed — the readiness delay environment seam is accepted only with the explicit fake-provider test seam; native discovery stays disabled
+- #73 checked — no fixed-byte source window changed
+- #74 fixed — every subprocess uses a throwaway HOME/profile and never reads host credentials
+- #75-#76 checked: none — no affected surface
+- #77 checked — no unsafe code was added; the standalone guard's existing four-test mismatch is confined to untouched `haider-tui` (`git diff --quiet -- crates/haider-tui` passes)
+- #78-#93 checked: none — no affected surface
+- #94 fixed — the test-only delay is capped at 10,000 ms and every process/poll wait retains an existing named deadline
+- #95 checked — status remains a one-shot RPC and adds no wait while a negotiated connection is retained
+- #96 checked — no TTL, warm-retention, or turn-performance policy changed

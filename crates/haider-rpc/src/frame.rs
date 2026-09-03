@@ -4229,11 +4229,19 @@ pub enum ResponseBody {
         /// has one. Older daemons omit it rather than publishing a guess.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pid_file_path: Option<String>,
-        /// True exactly on the lifecycle edge which also releases the
-        /// launcher readiness notification. Missing on an older response is
-        /// false and is disambiguated by feature negotiation.
+        /// True only after store open, recovery, provider-registry loading,
+        /// and the session-hub turn path are complete. The same predicate
+        /// releases the launcher readiness notification.
         #[serde(default)]
         ready: bool,
+        /// Unix epoch milliseconds at the positive Ready edge. Missing on an
+        /// older response or while not ready is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ready_since: Option<u64>,
+        /// Registry/factory loading is complete. This does not claim any
+        /// provider is connected; providers connect per request.
+        #[serde(default, skip_serializing_if = "is_false")]
+        providers_loaded: bool,
         /// Effective launcher-owned idle TTL. Zero is the explicit one-shot
         /// policy; absence identifies an unbounded or older daemon.
         #[serde(default, skip_serializing_if = "Option::is_none")]

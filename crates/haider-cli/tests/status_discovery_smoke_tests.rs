@@ -231,6 +231,13 @@ fn built_status_json_honors_private_xdg_with_enabled_discovery() {
     assert_eq!(document["daemon"]["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(document["daemon"]["ready"], true);
     assert!(
+        document["daemon"]["ready_since"]
+            .as_u64()
+            .is_some_and(|timestamp| timestamp > 0),
+        "status did not expose the positive Ready timestamp: {document}"
+    );
+    assert_eq!(document["daemon"]["providers_loaded"], true);
+    assert!(
         document["daemon"]["pid"]
             .as_u64()
             .is_some_and(|pid| pid > 0),

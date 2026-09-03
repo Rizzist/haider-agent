@@ -89,6 +89,11 @@ pub struct DaemonConfig {
     /// per-daemon config avoids process-global state in real-socket tests.
     #[doc(hidden)]
     pub inject_worker_manager_shutdown_error: bool,
+    /// Deterministic pause immediately before the positive Ready edge.
+    /// Production constructors leave this unset; readiness regression tests
+    /// use it to observe the early-PID/pre-Ready interval without guessing.
+    #[doc(hidden)]
+    pub inject_before_ready_delay: Option<Duration>,
 }
 
 impl DaemonConfig {
@@ -117,6 +122,7 @@ impl DaemonConfig {
             idle_ttl: None,
             lockdown_root_override: None,
             inject_worker_manager_shutdown_error: false,
+            inject_before_ready_delay: None,
         }
     }
 
