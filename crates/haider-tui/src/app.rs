@@ -3957,7 +3957,7 @@ pub enum Hit {
     /// The sticky origin line — carries the scroll-back that puts the
     /// producing prompt's first row at the viewport top (sim jumpToSticky:
     /// stay AT the prompt, tui.js:2637-2645).
-    StickyJump(u16),
+    StickyJump(u64),
     /// 954 owner item: the bottom jump band — click returns the transcript
     /// to follow (scroll-back 0); the unseen counter clears through the
     /// watermark the next FOLLOWING frame stamps.
@@ -4996,12 +4996,12 @@ pub struct AppModel {
     /// applies reconcile-then-apply (review r5 P2-2): fold to the
     /// ≤1-frame-stale [`Self::scroll_max`], then apply the notch clamped
     /// to it — bursts bank no debt; the frame's reconcile is the backstop.
-    pub scroll_back: std::cell::Cell<u16>,
+    pub scroll_back: std::cell::Cell<u64>,
     /// Max scroll-back of the LAST rendered frame — written by the
     /// renderer; wheel notches and sticky jumps clamp against it
     /// (reconcile-then-apply, review r5 P2-2). Starts at 0 (review r2
     /// P2-6).
-    pub scroll_max: std::cell::Cell<u16>,
+    pub scroll_max: std::cell::Cell<u64>,
     /// Entry-count watermark for the bottom jump band's "new" counter —
     /// renderer-written (the same frame-feedback `Cell` discipline):
     /// every FOLLOWING frame (scroll-back 0) stamps the transcript entry

@@ -8,11 +8,11 @@ has to keep them green; they pin OBSERVABLE OUTPUT (the `TestBackend`
 cell grid — text and style —, the hit map, `scroll_back`/`scroll_max`)
 and never reach into the cache.
 
-Run (all four files, debug build, ~15 s):
+Run (all four files; the release profile enforces timing):
 
 ```text
 RUST_MIN_STACK=8388608 HAIDER_DISCOVERY_DISABLED=1 HAIDER_TEST_DEVICE_NAME=test-mac \
-cargo test -p haider-tui --test tuivirt_golden_tests --test tuivirt_scroll_tests \
+cargo test --release -p haider-tui --test tuivirt_golden_tests --test tuivirt_scroll_tests \
   --test tuivirt_shape_bench_tests --test tuivirt_memory_tests
 ```
 
@@ -31,10 +31,10 @@ Files:
 | file | role |
 | --- | --- |
 | `crates/haider-tui/tests/tuivirt_common/mod.rs` | shared scaffold: empty LIVE session (`session_model`), the bench-shaped `replayed(N)`, `draw` → `Snapshot` (cells + display rows + hits + transcript rect), the golden dump/check, `assert_same_frame` |
-| `crates/haider-tui/tests/tuivirt_golden_tests.rs` | 13 golden-frame tests, 40 fixtures (13 scenarios × 3 sizes + `megabyte_reply_top.118x36`) under `tests/fixtures/tuivirt/` |
+| `crates/haider-tui/tests/tuivirt_golden_tests.rs` | 13 unchanged golden-frame tests, 40 fixtures (13 scenarios × 3 sizes + `megabyte_reply_top.118x36`), plus the extreme-logical-line cap pin |
 | `crates/haider-tui/tests/tuivirt_scroll_tests.rs` | 7 scroll-model / cache-invariant pins on 10k-row replays |
-| `crates/haider-tui/tests/tuivirt_shape_bench_tests.rs` | the ledger-row-17 replacement shape gate (`#[ignore]`d — cannot pass today) + its always-on arithmetic pin |
-| `crates/haider-tui/tests/tuivirt_memory_tests.rs` | in-process render-side retention pin (`#[ignore]`d — cannot pass today) + its always-on allocator pin |
+| `crates/haider-tui/tests/tuivirt_shape_bench_tests.rs` | always-on ledger-row-17 replacement shape gate + its arithmetic mutation pin |
+| `crates/haider-tui/tests/tuivirt_memory_tests.rs` | always-on render-side retention, extreme-entry window, and allocator-accounting pins |
 
 Golden format: per frame row, `NN|display row|` (wide-glyph continuation
 cells dropped so CJK reads naturally) followed by `~ fg/bg/modifier×count`
@@ -92,33 +92,32 @@ geometry`; they are not duplicated here.
 
 | behaviour | test | status |
 | --- | --- | --- |
-| First frame ≤ 33 ms and cached p95 (following AND mid-scroll) ≤ 33 ms at 10k / 50k / 200k rows, both flat within 20 % (+1 ms slack) from 10k to 200k, `--release` only (debug prints SKIP) | `first_frame_and_cached_p95_are_flat_from_10k_to_200k_rows` | `#[ignore]` — CANNOT PASS TODAY: the shipped cache fills O(N) on the first frame (`w3c3_render_bench_tests` pins the current law as `< 250 ms` cold @ 10k). The implementation lane deletes the `#[ignore]` line; nothing else changes. Run: `cargo test --release -p haider-tui --test tuivirt_shape_bench_tests -- --ignored --nocapture` |
+| First frame ≤ 33 ms and cached p95 (following AND mid-scroll) ≤ 33 ms at 10k / 50k / 200k rows, both flat within 20 % (+1 ms sub-millisecond jitter allowance) from 10k to 200k, `--release` only; the same test proves the real tail opens first and row 0 remains reachable beyond 65,535 rows | `first_frame_and_cached_p95_are_flat_from_10k_to_200k_rows` | always on; run `cargo test --release -p haider-tui --test tuivirt_shape_bench_tests -- --nocapture` |
 | The gate's own arithmetic (1.2× + 1 ms flatness ceiling, percentile pick) | `shape_gate_arithmetic_is_pinned` | always on, green |
 
-The existing row-17 bench (`w3c3_render_bench_tests::cached_viewport_
-render_stays_bounded_through_10k_rows`) stays in place — its bounds are
-upper bounds and remain true after the re-architecture.
+The old row-17 cold-fill law is gone. Its legacy test now checks the same
+33 ms first-frame frame budget at 10k; the workflow ledger invokes the
+three-size shape gate above.
 
 ### Memory pin (`tuivirt_memory_tests.rs`)
 
 | behaviour | test | status |
 | --- | --- | --- |
-| Render-side retention after the first frame (layout cache + frame buffers, measured by a counting global allocator) for a 50k-row session ≤ 1.5× a 1k-row session | `render_side_retention_is_flat_from_1k_to_50k_rows` | `#[ignore]` — CANNOT PASS TODAY. Measured 2026-09-02 (debug): 1k rows model 537 KiB / render 1224 KiB; 50k rows model 29 399 KiB / render 66 384 KiB (54×). Run: `cargo test -p haider-tui --test tuivirt_memory_tests -- --ignored --nocapture` |
+| Render-side retention after the first frame (layout cache + frame buffers, measured by a thread-scoped counting allocator) for a 50k-row session ≤ 1.5× a 1k-row session | `render_side_retention_is_flat_from_1k_to_50k_rows` | always on; measured 2026-09-02: 1k model = 562 KiB / render = 6 KiB; 50k model = 30,935 KiB / render = 6 KiB |
+| A 1 MiB raw assistant entry retains at most 256 KiB of formatted layout | `megabyte_entry_retains_only_a_viewport_window` | always on; measured 28 KiB |
 | The allocator bookkeeping balances alloc/free | `counting_allocator_balances_alloc_and_free` | always on, green |
 
 The raw transcript (`model` bytes above) is O(N) by construction and is
 reported, not gated.
 
-## Not yet pinned / needs a hook
+The client footprint script also accepts `--tui-replay-rows N` for the TUI
+surfaces. It seeds one raw multiline transcript item before the first frame,
+allowing settled process-footprint comparisons at 1k and 50k visual rows. Its
+first-frame detector observes the actual bottom-row paint rather than requiring
+the old renderer's arbitrary 16 KiB of terminal output.
 
-* **Client RSS at 50k rows (process level).** `scripts/perf/client-footprint-budget.py`
-  has `tui-demo-no-graphics` / `tui-demo-sixel` surfaces that spawn
-  `haider tui --demo`; the demo transcript is fixed-size, so there is no
-  long-transcript surface. Hook needed: a replay surface (e.g. a fixture
-  session store the TUI attaches to, or a `HAIDER_DEMO_REPLAY_ROWS=N`
-  seam in the demo script) so the script can measure a 1k-row vs 50k-row
-  settled RSS with its usual `proc_pid_rusage` samples. Until then the
-  in-process allocator pin above is the memory gate.
+## Remaining adjacent coverage
+
 * **Keyboard paging.** PageUp/PageDown/Home/End are not bound in the
   session transcript today (Home/End are composer keys); "page" scrolling
   exists only as wheel notches (3 rows) and drag autoscroll (1 row), which
@@ -127,16 +126,13 @@ reported, not gated.
 * **Transcript search.** There is no transcript text search in the TUI
   (the only searches are the `/` palette and the model picker); nothing to
   pin.
-* **Row estimates at 200k+ rows vs the `u16` scroll space.** 200k
-  replayed rows exceed 65 535 wrapped rows; today's coordinates saturate
-  (ledger row 17 calls it a separate compatibility seam). The shape gate
-  measures 200k but no pin states what the user sees past saturation.
 * **Phase-dynamic rows across many phases.** Running tool rows are pinned
   at `anim_phase = 0` only; the pulse ink per phase is not golden'd.
 * **Subagent (chip) transcripts, the plan document surface and image
   rows** render through the same cache but are not golden'd here (existing
   coverage: `s3_subagent_timeline_tests`, `plan_surface_tests`,
   `image_created_tui_tests`).
-* **Release-build timing evidence for the shape gate** was not captured in
-  this lane (no `--release` build in the time box); the row-17 bench's
-  ~250 ms cold @ 10k is the reference.
+* **Release-build timing evidence for the shape gate** is captured in
+  `tuivirt.md`: first frame = 0.223 / 0.257 / 0.252 ms and worst cached p95 =
+  0.144 ms at 10k / 50k / 200k rows. The row-17 bench's ~255 ms cold @ 10k is
+  the pre-lane reference.

@@ -24,9 +24,7 @@ use haider_tui::mock::demo_script;
 use haider_tui::projection::OUTPUT_TAIL_MAX;
 
 mod tuivirt_common;
-use tuivirt_common::{
-    SIZES, apply, check_golden, draw, push_agent, push_user, session_model,
-};
+use tuivirt_common::{SIZES, apply, check_golden, draw, push_agent, push_user, session_model};
 
 /// Pin one model at every size.
 fn pin(name: &str, model: &AppModel) {
@@ -186,7 +184,10 @@ fn tool_call_boxes_collapsed_and_expanded_frames() {
     );
     apply(
         &mut model,
-        output_delta("t-exec", b"test boundary::seq_zero ... ok\ntest result: ok. 1 passed\n"),
+        output_delta(
+            "t-exec",
+            b"test boundary::seq_zero ... ok\ntest result: ok. 1 passed\n",
+        ),
     );
     apply(
         &mut model,
@@ -295,6 +296,18 @@ fn long_wrapped_lines_frames() {
 }
 
 #[test]
+fn extreme_logical_line_is_capped_with_raw_export_expander() {
+    let mut model = session_model();
+    push_agent(&mut model, "extreme-line", &"x".repeat(1 << 20));
+    let frame = draw(&model, 118, 36);
+    assert!(frame.contains("extreme line truncated"));
+    assert!(
+        frame.contains("/export expands"),
+        "a pathological logical line exposes the raw-text expander cue"
+    );
+}
+
+#[test]
 fn cjk_emoji_combining_frames() {
     let mut model = session_model();
     push_user(
@@ -332,7 +345,10 @@ fn megabyte_reply_frames() {
     // the bench size: the far end of a huge entry must render exactly.
     pin("megabyte_reply_tail", &model);
     let frame = draw(&model, 118, 36);
-    assert!(model.scroll_max.get() > 0, "a 1 MiB reply overflows the viewport");
+    assert!(
+        model.scroll_max.get() > 0,
+        "a 1 MiB reply overflows the viewport"
+    );
     let _ = frame;
     model.scroll_back.set(model.scroll_max.get());
     let top = draw(&model, 118, 36);
@@ -347,7 +363,10 @@ fn input_required_menu_frames() {
     let menu = question_menu(3);
     let id = menu.id.clone();
     apply(&mut model, EventPayload::MenuOpened(menu));
-    apply(&mut model, EventPayload::RunState(RunState::InputRequired { menu: id }));
+    apply(
+        &mut model,
+        EventPayload::RunState(RunState::InputRequired { menu: id }),
+    );
     pin("input_required_menu", &model);
 }
 
@@ -361,7 +380,10 @@ fn input_required_ask_frames() {
     let menu = question_menu(0);
     let id = menu.id.clone();
     apply(&mut model, EventPayload::MenuOpened(menu));
-    apply(&mut model, EventPayload::RunState(RunState::InputRequired { menu: id }));
+    apply(
+        &mut model,
+        EventPayload::RunState(RunState::InputRequired { menu: id }),
+    );
     pin("input_required_ask", &model);
 }
 
@@ -407,7 +429,10 @@ fn streaming_tail_frames() {
 fn scrolled_history_with_sticky_and_jump_chip_frames() {
     let mut model = session_model();
     for turn in 0..12 {
-        push_user(&mut model, &format!("prompt {turn} — please continue the work"));
+        push_user(
+            &mut model,
+            &format!("prompt {turn} — please continue the work"),
+        );
         for n in 0..4 {
             push_agent(
                 &mut model,

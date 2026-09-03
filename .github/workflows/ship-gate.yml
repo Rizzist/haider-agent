@@ -56,12 +56,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos-ship-render-release-profile
-      # Ledger row 17 enforces calibrated upper bounds only. The
-      # minimum_duration assertion selects min-vs-max samples; it is not a
-      # lower performance floor. Calibrating a no-op/implausibly-fast guard is
-      # an explicit 966 task. This job deliberately stays --release.
-      - name: render benchmark (release — ledger row 17 upper bounds)
-        run: cargo test --release -p haider-tui --test w3c3_render_bench_tests --locked
+      # Ledger row 17 is a shape gate: first and cached frames fit 33 ms at
+      # 10k/50k/200k, with the curve flat in N. This job deliberately stays
+      # --release; debug builds announce a timing SKIP.
+      - name: virtual transcript shape (release — ledger row 17)
+        run: cargo test --release -p haider-tui --test tuivirt_shape_bench_tests --locked -- --nocapture
 
   daemon-footprint:
     name: daemon footprint budget (release profile)

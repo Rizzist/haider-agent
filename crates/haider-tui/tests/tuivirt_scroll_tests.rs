@@ -53,7 +53,7 @@ const SMALL: (u16, u16) = (80, 24);
 
 /// A fresh model at `scroll_back`, with the watermark a following frame
 /// would have stamped (so the jump chip reads the same as the warm path).
-fn fresh_at(rows: usize, scroll_back: u16) -> AppModel {
+fn fresh_at(rows: usize, scroll_back: u64) -> AppModel {
     let model = replayed(rows);
     model.bottom_watermark.set(model.projection.entries().len());
     model.scroll_back.set(scroll_back);
@@ -66,7 +66,10 @@ fn assert_shifted_down(what: &str, before: &Snapshot, after: &Snapshot, shift: u
     let old = before.transcript_interior();
     let new = after.transcript_interior();
     assert_eq!(old.len(), new.len(), "{what}: interior height");
-    assert!(old.len() > shift + 4, "{what}: interior too small to compare");
+    assert!(
+        old.len() > shift + 4,
+        "{what}: interior too small to compare"
+    );
     for i in 0..old.len() - shift {
         assert_eq!(
             new[i + shift],
@@ -86,9 +89,9 @@ fn exercise_step(
     model: &mut AppModel,
     (width, height): (u16, u16),
     what: &str,
-    start: u16,
-    max: u16,
-    shift: u16,
+    start: u64,
+    max: u64,
+    shift: u64,
     step: fn(&mut AppModel, bool),
 ) {
     model.scroll_back.set(start);
@@ -100,20 +103,34 @@ fn exercise_step(
     let expected_up = start.saturating_add(shift).min(max);
     assert_eq!(model.scroll_back.get(), expected_up, "{what}: up offset");
     if expected_up > start {
-        assert_shifted_down(&format!("{what} up"), &before, &up, usize::from(shift));
+        assert_shifted_down(
+            &format!("{what} up"),
+            &before,
+            &up,
+            usize::try_from(shift).expect("test shift fits usize"),
+        );
     } else {
         assert_same_frame(&format!("{what} up clamps at the top"), &before, &up);
     }
     step(model, false);
     let down = draw(model, width, height);
     let expected_down = expected_up.saturating_sub(shift);
-    assert_eq!(model.scroll_back.get(), expected_down, "{what}: down offset");
+    assert_eq!(
+        model.scroll_back.get(),
+        expected_down,
+        "{what}: down offset"
+    );
     if expected_down == start {
         assert_same_frame(&format!("{what} round trip"), &before, &down);
     } else {
         // Clamped at the top: the down step is a real move, and the
         // top frame is the down frame shifted down by `shift`.
-        assert_shifted_down(&format!("{what} down from the top"), &down, &up, usize::from(shift));
+        assert_shifted_down(
+            &format!("{what} down from the top"),
+            &down,
+            &up,
+            usize::try_from(shift).expect("test shift fits usize"),
+        );
         step(model, true);
         let top_again = draw(model, width, height);
         assert_same_frame(&format!("{what} back to the top"), &up, &top_again);
@@ -124,7 +141,11 @@ fn exercise_step(
         let tail = draw(model, width, height);
         step(model, false);
         let still = draw(model, width, height);
-        assert_eq!(model.scroll_back.get(), 0, "{what}: down clamps at the tail");
+        assert_eq!(
+            model.scroll_back.get(),
+            0,
+            "{what}: down clamps at the tail"
+        );
         assert_same_frame(&format!("{what} down clamps at the tail"), &tail, &still);
     }
 }
@@ -136,11 +157,30 @@ fn wheel_and_drag_steps_from_bottom_middle_and_top_of_10k_rows() {
         let mut model = replayed(10_000);
         let _ = draw(&model, width, height);
         let max = model.scroll_max.get();
-        assert!(max > 1_000, "10k rows overflow {width}x{height} deeply: {max}");
-        for (label, start) in [("bottom", 0u16), ("middle", max / 2), ("top", max)] {
+        assert!(
+            max > 1_000,
+            "10k rows overflow {width}x{height} deeply: {max}"
+        );
+        for (label, start) in [("bottom", 0u64), ("middle", max / 2), ("top", max)] {
             let what = format!("{label} @ {width}x{height}");
-            exercise_step(&mut model, size, &format!("wheel {what}"), start, max, 3, AppModel::handle_wheel);
-            exercise_step(&mut model, size, &format!("drag {what}"), start, max, 1, AppModel::drag_autoscroll);
+            exercise_step(
+                &mut model,
+                size,
+                &format!("wheel {what}"),
+                start,
+                max,
+                3,
+                AppModel::handle_wheel,
+            );
+            exercise_step(
+                &mut model,
+                size,
+                &format!("drag {what}"),
+                start,
+                max,
+                1,
+                AppModel::drag_autoscroll,
+            );
         }
         // Anchoring semantics: the bottom shows the last row above the one
         // trailing blank; the top shows the first row on the first content
@@ -175,9 +215,18 @@ fn wheel_and_drag_steps_from_bottom_middle_and_top_of_10k_rows() {
 /// row, the ` ■ haider` speaker header, then the first entry's text row.
 fn assert_top_of_history(frame: &Snapshot, what: &str) {
     let rows = frame.transcript_rows();
-    assert!(rows[0].trim().is_empty(), "{what}: line 0 is the block's breathing row: {rows:?}");
-    assert!(rows[1].contains("■ haider"), "{what}: line 1 is the speaker header: {rows:?}");
-    assert!(rows[2].contains("row 0 —"), "{what}: line 2 is the first entry's text: {rows:?}");
+    assert!(
+        rows[0].trim().is_empty(),
+        "{what}: line 0 is the block's breathing row: {rows:?}"
+    );
+    assert!(
+        rows[1].contains("■ haider"),
+        "{what}: line 1 is the speaker header: {rows:?}"
+    );
+    assert!(
+        rows[2].contains("row 0 —"),
+        "{what}: line 2 is the first entry's text: {rows:?}"
+    );
 }
 
 #[test]
@@ -186,12 +235,16 @@ fn a_scroll_position_renders_identically_warm_and_cold() {
         let warm = replayed(rows);
         let _ = draw(&warm, width, height);
         let max = warm.scroll_max.get();
-        for position in [1u16, max / 2, max.saturating_sub(1), max] {
+        for position in [1u64, max / 2, max.saturating_sub(1), max] {
             warm.scroll_back.set(position);
             let via_scroll = draw(&warm, width, height);
             let fresh = fresh_at(rows, position);
             let cold = draw(&fresh, width, height);
-            assert_eq!(fresh.scroll_max.get(), max, "same ceiling @ {width}x{height}");
+            assert_eq!(
+                fresh.scroll_max.get(),
+                max,
+                "same ceiling @ {width}x{height}"
+            );
             assert_same_frame(
                 &format!("scroll_back={position} @ {width}x{height}"),
                 &via_scroll,
@@ -209,13 +262,20 @@ fn follow_mode_and_jump_to_bottom_behave_as_today() {
     assert!(!following.has_hit(|hit| matches!(hit, Hit::JumpToBottom)));
     // At the bottom: new rows land at the tail, the offset stays 0.
     for n in 0..5 {
-        push_agent(&mut model, &format!("late-{n}"), &format!("late row {n} arrived while following"));
+        push_agent(
+            &mut model,
+            &format!("late-{n}"),
+            &format!("late row {n} arrived while following"),
+        );
     }
     let tail = draw(&model, width, height);
     assert_eq!(model.scroll_back.get(), 0);
     let rows = tail.transcript_rows();
     assert!(
-        rows.iter().rev().take(3).any(|row| row.contains("late row 4")),
+        rows.iter()
+            .rev()
+            .take(3)
+            .any(|row| row.contains("late row 4")),
         "the newest row is at the tail: {rows:?}"
     );
     assert!(!tail.has_hit(|hit| matches!(hit, Hit::JumpToBottom)));
@@ -230,17 +290,33 @@ fn follow_mode_and_jump_to_bottom_behave_as_today() {
     assert!(!before.contains("new · Jump to bottom"));
     let max_before = model.scroll_max.get();
     for n in 0..3 {
-        push_agent(&mut model, &format!("unseen-{n}"), &format!("unseen row {n} arrived while scrolled"));
+        push_agent(
+            &mut model,
+            &format!("unseen-{n}"),
+            &format!("unseen row {n} arrived while scrolled"),
+        );
     }
     let after = draw(&model, width, height);
-    assert_eq!(model.scroll_back.get(), scrolled, "the bottom offset is untouched");
-    let appended = usize::from(model.scroll_max.get() - max_before);
-    assert!(appended > 0 && appended < 12, "three short rows appended: {appended}");
+    assert_eq!(
+        model.scroll_back.get(),
+        scrolled,
+        "the bottom offset is untouched"
+    );
+    let appended = usize::try_from(model.scroll_max.get() - max_before)
+        .expect("appended test height fits usize");
+    assert!(
+        appended > 0 && appended < 12,
+        "three short rows appended: {appended}"
+    );
     assert!(after.contains("3 new · Jump to bottom ↓"), "unseen count");
     let old = before.transcript_interior();
     let new = after.transcript_interior();
     for i in 0..old.len() - appended {
-        assert_eq!(new[i], old[i + appended], "interior row {i} slid up by {appended}");
+        assert_eq!(
+            new[i],
+            old[i + appended],
+            "interior row {i} slid up by {appended}"
+        );
     }
     // Jump to bottom: the exact following frame, chip gone.
     model.handle_hit(Hit::JumpToBottom);
@@ -250,13 +326,25 @@ fn follow_mode_and_jump_to_bottom_behave_as_today() {
     let fresh = fresh_at(2_000, 0);
     let mut fresh = fresh;
     for n in 0..5 {
-        push_agent(&mut fresh, &format!("late-{n}"), &format!("late row {n} arrived while following"));
+        push_agent(
+            &mut fresh,
+            &format!("late-{n}"),
+            &format!("late row {n} arrived while following"),
+        );
     }
     for n in 0..3 {
-        push_agent(&mut fresh, &format!("unseen-{n}"), &format!("unseen row {n} arrived while scrolled"));
+        push_agent(
+            &mut fresh,
+            &format!("unseen-{n}"),
+            &format!("unseen row {n} arrived while scrolled"),
+        );
     }
     let fresh_frame = draw(&fresh, width, height);
-    assert_same_frame("jump-to-bottom == fresh following frame", &jumped, &fresh_frame);
+    assert_same_frame(
+        "jump-to-bottom == fresh following frame",
+        &jumped,
+        &fresh_frame,
+    );
     // Scrolling back again with nothing new: a bare chip.
     model.handle_wheel(true);
     let again = draw(&model, width, height);
@@ -278,9 +366,17 @@ fn resize_rewraps_like_a_fresh_render_and_keeps_the_tail_and_top_anchored() {
     // Narrow: the cached re-wrap equals a fresh render at the new width.
     model.handle_resize();
     let narrow = draw(&model, 100, 36);
-    assert_eq!(model.scroll_back.get(), offset, "narrowing grows the range; no clamp");
+    assert_eq!(
+        model.scroll_back.get(),
+        offset,
+        "narrowing grows the range; no clamp"
+    );
     let fresh = fresh_at(rows, offset);
-    assert_same_frame("resized 118→100 == fresh @100", &narrow, &draw(&fresh, 100, 36));
+    assert_same_frame(
+        "resized 118→100 == fresh @100",
+        &narrow,
+        &draw(&fresh, 100, 36),
+    );
     // Back to 118: the exact earlier frame.
     model.handle_resize();
     let back = draw(&model, 118, 36);
@@ -292,7 +388,10 @@ fn resize_rewraps_like_a_fresh_render_and_keeps_the_tail_and_top_anchored() {
         let frame = draw(&model, width, height);
         let rows = frame.transcript_rows();
         assert!(
-            rows.iter().rev().take(4).any(|row| row.contains("row 2999")),
+            rows.iter()
+                .rev()
+                .take(4)
+                .any(|row| row.contains("row 2999")),
             "tail anchored after resize to {width}x{height}: {rows:?}"
         );
         assert_eq!(model.scroll_back.get(), 0);
@@ -304,10 +403,18 @@ fn resize_rewraps_like_a_fresh_render_and_keeps_the_tail_and_top_anchored() {
     assert_top_of_history(&top_118, "top @ 118x36");
     model.handle_resize();
     let top_160 = draw(&model, 160, 50);
-    assert_eq!(model.scroll_back.get(), model.scroll_max.get(), "clamped to the new top");
+    assert_eq!(
+        model.scroll_back.get(),
+        model.scroll_max.get(),
+        "clamped to the new top"
+    );
     assert_top_of_history(&top_160, "widened to 160x50");
-    let fresh = fresh_at(rows, u16::MAX);
-    assert_same_frame("widened top == fresh top @160", &top_160, &draw(&fresh, 160, 50));
+    let fresh = fresh_at(rows, u64::MAX);
+    assert_same_frame(
+        "widened top == fresh top @160",
+        &top_160,
+        &draw(&fresh, 160, 50),
+    );
 }
 
 #[test]
@@ -337,8 +444,30 @@ fn edits_appends_and_completions_never_render_stale_rows() {
             }),
         );
         let frame = draw(&model, width, height);
-        assert!(frame.contains(visible), "the delta shows in the very next frame: {visible:?}");
+        assert!(
+            frame.contains(visible),
+            "the delta shows in the very next frame: {visible:?}"
+        );
     }
+    // A reducer batch can mutate a cached row and append a different row
+    // before the renderer observes either event. Length growth alone must
+    // not classify that batch as a pure append and preserve stale text.
+    apply(
+        &mut model,
+        EventPayload::Item(ItemEvent::Delta {
+            item_id: item.clone(),
+            delta: ItemDelta::Text {
+                text: " batched".to_owned(),
+            },
+        }),
+    );
+    push_agent(&mut model, "batch-append", "appended before the next frame");
+    let batched = draw(&model, width, height);
+    assert!(
+        batched.contains("alpha beta batched"),
+        "an edit immediately followed by an append cannot retain stale layout"
+    );
+    assert!(batched.contains("appended before the next frame"));
     apply(
         &mut model,
         EventPayload::Item(ItemEvent::Completed {
@@ -349,7 +478,10 @@ fn edits_appends_and_completions_never_render_stale_rows() {
         }),
     );
     let frame = draw(&model, width, height);
-    assert!(frame.contains("alpha beta gamma (final)"), "completion replaces the streamed text");
+    assert!(
+        frame.contains("alpha beta gamma (final)"),
+        "completion replaces the streamed text"
+    );
     // A tool row flips its glyph the frame after its status flips.
     let call = ItemId::new("tool-1");
     let tool = |status: ToolStatus| TurnItem::ToolCall {
@@ -366,8 +498,14 @@ fn edits_appends_and_completions_never_render_stale_rows() {
         }),
     );
     let running = draw(&model, width, height);
-    let row = running.row_containing("web_fetch").expect("the running tool row");
-    assert!(!running.rows[row].contains('✓'), "not done yet: {:?}", running.rows[row]);
+    let row = running
+        .row_containing("web_fetch")
+        .expect("the running tool row");
+    assert!(
+        !running.rows[row].contains('✓'),
+        "not done yet: {:?}",
+        running.rows[row]
+    );
     apply(
         &mut model,
         EventPayload::Item(ItemEvent::Completed {
@@ -376,8 +514,14 @@ fn edits_appends_and_completions_never_render_stale_rows() {
         }),
     );
     let done = draw(&model, width, height);
-    let row = done.row_containing("web_fetch").expect("the completed tool row");
-    assert!(done.rows[row].contains('✓'), "completed glyph: {:?}", done.rows[row]);
+    let row = done
+        .row_containing("web_fetch")
+        .expect("the completed tool row");
+    assert!(
+        done.rows[row].contains('✓'),
+        "completed glyph: {:?}",
+        done.rows[row]
+    );
     // A duplicate completion of an EARLIER item id is a no-op frame today
     // (the projection keeps the first commit); pinned so the re-architecture
     // cannot turn a replayed duplicate into a phantom row.
@@ -400,6 +544,7 @@ fn edits_appends_and_completions_never_render_stale_rows() {
     push_user(&mut fresh, "stream something");
     apply(&mut fresh, EventPayload::RunState(RunState::Streaming));
     push_agent(&mut fresh, "stream-1", "alpha beta gamma (final)");
+    push_agent(&mut fresh, "batch-append", "appended before the next frame");
     apply(
         &mut fresh,
         EventPayload::Item(ItemEvent::Completed {
@@ -408,7 +553,11 @@ fn edits_appends_and_completions_never_render_stale_rows() {
         }),
     );
     apply(&mut fresh, EventPayload::RunState(RunState::Done));
-    assert_same_frame("edited history == fresh history", &settled, &draw(&fresh, width, height));
+    assert_same_frame(
+        "edited history == fresh history",
+        &settled,
+        &draw(&fresh, width, height),
+    );
 }
 
 #[test]
@@ -427,7 +576,11 @@ fn theme_switch_rerenders_from_the_cache_like_a_fresh_render() {
     let fresh = fresh_at(500, offset);
     let mut fresh = fresh;
     fresh.theme = ThemeKey::Light;
-    assert_same_frame("light via switch == fresh light", &light, &draw(&fresh, width, height));
+    assert_same_frame(
+        "light via switch == fresh light",
+        &light,
+        &draw(&fresh, width, height),
+    );
     model.theme = ThemeKey::Dark;
     let back = draw(&model, width, height);
     assert_same_frame("theme round trip", &dark, &back);
@@ -438,9 +591,16 @@ fn sticky_jump_lands_the_producing_prompt_on_the_transcripts_top_row() {
     for (width, height) in [BENCH, SMALL] {
         let mut model = session_model();
         for turn in 0..30 {
-            push_user(&mut model, &format!("prompt {turn} — please continue the work"));
+            push_user(
+                &mut model,
+                &format!("prompt {turn} — please continue the work"),
+            );
             for n in 0..100 {
-                push_agent(&mut model, &format!("j-{turn}-{n}"), &agent_row(turn * 100 + n));
+                push_agent(
+                    &mut model,
+                    &format!("j-{turn}-{n}"),
+                    &agent_row(turn * 100 + n),
+                );
             }
         }
         let _ = draw(&model, width, height);
@@ -451,7 +611,10 @@ fn sticky_jump_lands_the_producing_prompt_on_the_transcripts_top_row() {
         let (rect, hit) = scrolled
             .find_hit(|hit| matches!(hit, Hit::StickyJump(_)))
             .expect("the sticky band offers a jump");
-        assert_eq!(rect.y, scrolled.transcript.y, "the band is the transcript's top row");
+        assert_eq!(
+            rect.y, scrolled.transcript.y,
+            "the band is the transcript's top row"
+        );
         let band = scrolled.rows[usize::from(rect.y)].clone();
         let prompt = band
             .find("❯ prompt ")
@@ -471,9 +634,16 @@ fn sticky_jump_lands_the_producing_prompt_on_the_transcripts_top_row() {
         // The landed frame is a pure function of the offset the jump chose.
         let mut fresh = session_model();
         for turn in 0..30 {
-            push_user(&mut fresh, &format!("prompt {turn} — please continue the work"));
+            push_user(
+                &mut fresh,
+                &format!("prompt {turn} — please continue the work"),
+            );
             for n in 0..100 {
-                push_agent(&mut fresh, &format!("j-{turn}-{n}"), &agent_row(turn * 100 + n));
+                push_agent(
+                    &mut fresh,
+                    &format!("j-{turn}-{n}"),
+                    &agent_row(turn * 100 + n),
+                );
             }
         }
         fresh.bottom_watermark.set(fresh.projection.entries().len());

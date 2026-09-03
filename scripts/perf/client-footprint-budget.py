@@ -63,6 +63,8 @@ STUB_PROBE_IO_TIMEOUT_SECONDS = 5
 # One I/O timeout plus the same allowance for interpreter startup and exit.
 STUB_PROBE_DEADLINE_SECONDS = STUB_PROBE_IO_TIMEOUT_SECONDS * 2
 DIAGNOSTIC_SECTION_CHARS = 750
+TUI_ROWS = 36
+TUI_COLS = 118
 
 
 class RusageInfoV4(ctypes.Structure):
@@ -353,7 +355,11 @@ def measure_tui(
             os.environ["TERM_PROGRAM"] = "rio"
         os.execve(str(haider), [str(haider), "tui", "--demo"], os.environ)
 
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 36, 118, 0, 0))
+    fcntl.ioctl(
+        fd,
+        termios.TIOCSWINSZ,
+        struct.pack("HHHH", TUI_ROWS, TUI_COLS, 0, 0),
+    )
     os.kill(pid, signal.SIGWINCH)
 
     response_sent = False
@@ -363,6 +369,7 @@ def measure_tui(
     tail = bytearray()
     settle_start: float | None = None
     startup_deadline = time.monotonic() + 30.0
+    bottom_row = f"\x1b[{TUI_ROWS};1H".encode()
     try:
         while settle_start is None:
             if time.monotonic() >= startup_deadline:
@@ -386,7 +393,11 @@ def measure_tui(
             if graphics and query_seen and not response_sent:
                 os.write(fd, SIXEL_RESPONSE)
                 response_sent = True
-            if not graphics and alt_screen_seen and bytes_seen >= 16_384:
+            # A virtualized first frame can be materially smaller than the
+            # old 16 KiB byte-count heuristic. The cursor move that paints
+            # column 1 of the fixed bottom row proves the complete 118x36
+            # frame reached the PTY without coupling startup to output size.
+            if not graphics and alt_screen_seen and bottom_row in tail:
                 settle_start = time.monotonic()
             # icy_sixel begins its real payload with a DCS (`ESC P`).  Wait
             # for that marker rather than guessing encoded byte size: the
@@ -958,6 +969,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--load-wait-seconds", type=float, default=15 * 60)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--budget-bytes", type=int)
+    parser.add_argument(
+        "--tui-replay-rows",
+        type=int,
+        default=0,
+        help="demo-only long transcript: one raw assistant message with N visual rows",
+    )
     parser.add_argument("--calibrate", action="store_true")
     parser.add_argument(
         "--diagnostic-allow-missing-vmmap",
@@ -972,6 +989,7 @@ def parse_args() -> argparse.Namespace:
             or args.surface is not None
             or args.output is not None
             or args.budget_bytes is not None
+            or args.tui_replay_rows != 0
             or args.calibrate
             or args.diagnostic_allow_missing_vmmap
             or args.keep_profiles
@@ -988,6 +1006,10 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"the following arguments are required: {option}")
     if args.runs <= 0:
         parser.error("--runs must be positive")
+    if args.tui_replay_rows < 0:
+        parser.error("--tui-replay-rows must be non-negative")
+    if args.tui_replay_rows > 0 and not str(args.surface).startswith("tui-demo-"):
+        parser.error("--tui-replay-rows requires a tui-demo surface")
     if args.settle_seconds <= 0:
         parser.error("--settle-seconds must be positive")
     if args.calibrate and args.runs < CALIBRATION_RUNS:
@@ -1034,6 +1056,8 @@ def main() -> int:
         artefact_dir = args.output / f"run-{index}"
         artefact_dir.mkdir(parents=True, exist_ok=True)
         env = hermetic_env(root)
+        if args.tui_replay_rows > 0:
+            env["HAIDER_TUI_FOOTPRINT_ROWS"] = str(args.tui_replay_rows)
         try:
             common = {
                 "haider": haider,
@@ -1054,6 +1078,7 @@ def main() -> int:
                     graphics=args.surface == "tui-demo-sixel",
                 )
             sample["run"] = index
+            sample["tui_replay_rows"] = args.tui_replay_rows
             sample["load_before_spawn"] = load_before_spawn
             samples.append(sample)
             (artefact_dir / "sample.json").write_text(

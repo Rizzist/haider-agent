@@ -238,10 +238,7 @@ impl Snapshot {
             let encoded = runs
                 .iter()
                 .map(|(style, count)| {
-                    format!(
-                        "{:?}/{:?}/{:?}×{count}",
-                        style.fg, style.bg, style.modifier
-                    )
+                    format!("{:?}/{:?}/{:?}×{count}", style.fg, style.bg, style.modifier)
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
@@ -281,7 +278,10 @@ pub fn check_golden(name: &str, frame: &Snapshot) {
             .find(|(_, (want, got))| want != got);
         let detail = match mismatch {
             Some((line, (want, got))) => {
-                format!("first difference at golden line {}:\n  want: {want}\n  got:  {got}", line + 1)
+                format!(
+                    "first difference at golden line {}:\n  want: {want}\n  got:  {got}",
+                    line + 1
+                )
             }
             None => format!(
                 "line counts differ: want {} got {}",

@@ -11,16 +11,11 @@
 //! discipline): a debug build prints a loud SKIP and asserts nothing.
 //!
 //! ```text
-//! cargo test --release -p haider-tui --test tuivirt_shape_bench_tests -- --ignored --nocapture
+//! cargo test --release -p haider-tui --test tuivirt_shape_bench_tests -- --nocapture
 //! ```
 //!
-//! IGNORED TODAY, deliberately: the shipped cache fills O(N) on the first
-//! frame (~250 ms @ 10k in release, `cached_viewport_render_stays_bounded_
-//! through_10k_rows` pins < 250 ms as the CURRENT law), so the ≤ 33 ms
-//! first frame cannot pass on this tree. The implementation lane removes
-//! the `#[ignore]` when the viewport-only layout lands; nothing else in
-//! this file needs to change. The existing row-17 bench stays green
-//! alongside it (its bounds are upper bounds).
+//! This is ship-gate ledger row 17. It is always enabled; debug builds print
+//! a loud timing SKIP, while the release profile enforces the shape.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use haider_tui::app::AppModel;
@@ -54,6 +49,18 @@ fn one_frame(model: &AppModel, terminal: &mut Terminal<TestBackend>) -> Duration
     start.elapsed()
 }
 
+fn frame_text(terminal: &Terminal<TestBackend>) -> String {
+    let buffer = terminal.backend().buffer();
+    let mut text = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            text.push_str(buffer[(x, y)].symbol());
+        }
+        text.push('\n');
+    }
+    text
+}
+
 fn percentile(mut timings: Vec<Duration>, percentile: usize) -> Duration {
     timings.sort_unstable();
     timings[(timings.len() * percentile / 100).min(timings.len() - 1)]
@@ -71,6 +78,11 @@ fn measure(rows: usize) -> Shape {
     let model = replayed(rows);
     let mut terminal = Terminal::new(TestBackend::new(118, 36)).expect("test terminal");
     let first = one_frame(&model, &mut terminal);
+    let first_frame_text = frame_text(&terminal);
+    assert!(
+        first_frame_text.contains(&format!("row {}", rows - 1)),
+        "the first frame must open on the real visible tail at {rows} rows"
+    );
     let follow: Vec<Duration> = (0..samples())
         .map(|_| one_frame(&model, &mut terminal))
         .collect();
@@ -78,6 +90,12 @@ fn measure(rows: usize) -> Shape {
     let middle: Vec<Duration> = (0..samples())
         .map(|_| one_frame(&model, &mut terminal))
         .collect();
+    model.scroll_back.set(model.scroll_max.get());
+    let _ = one_frame(&model, &mut terminal);
+    assert!(
+        frame_text(&terminal).contains("row 0 —"),
+        "the full {rows}-row coordinate space must remain navigable past u16::MAX"
+    );
     Shape {
         rows,
         first,
@@ -95,7 +113,6 @@ fn flat(what: &str, small: Duration, large: Duration) {
 }
 
 #[test]
-#[ignore = "target shape of the tuivirt re-architecture: today's first frame is an O(N) cache fill (~250 ms @ 10k release); un-ignore when viewport-only layout lands"]
 fn first_frame_and_cached_p95_are_flat_from_10k_to_200k_rows() {
     // Warm the allocator/terminal once so the first sample is not the
     // benchmark.
@@ -141,11 +158,27 @@ fn first_frame_and_cached_p95_are_flat_from_10k_to_200k_rows() {
 /// ceiling is 1.2× + 1 ms, and the percentile picks the right sample.
 #[test]
 fn shape_gate_arithmetic_is_pinned() {
-    flat("exactly flat", Duration::from_millis(10), Duration::from_millis(10));
-    flat("within 20 %", Duration::from_millis(10), Duration::from_millis(12));
-    flat("slack covers jitter", Duration::from_micros(500), Duration::from_micros(1500));
+    flat(
+        "exactly flat",
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    );
+    flat(
+        "within 20 %",
+        Duration::from_millis(10),
+        Duration::from_millis(12),
+    );
+    flat(
+        "slack covers jitter",
+        Duration::from_micros(500),
+        Duration::from_micros(1500),
+    );
     let result = std::panic::catch_unwind(|| {
-        flat("too steep", Duration::from_millis(10), Duration::from_millis(14));
+        flat(
+            "too steep",
+            Duration::from_millis(10),
+            Duration::from_millis(14),
+        );
     });
     assert!(result.is_err(), "a 40 % rise must fail the flatness gate");
     let timings = (1..=100u64).map(Duration::from_millis).collect::<Vec<_>>();
