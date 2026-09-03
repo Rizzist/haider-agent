@@ -1271,7 +1271,7 @@ fn draw_wordmark_image(model: &AppModel, rect: Rect, frame: &mut Frame<'_>) {
     let Some(wordmark) = slot.as_mut() else {
         return;
     };
-    if rect.width == 0 || rect.height == 0 {
+    if !wordmark.prepare(rect) {
         return;
     }
     // Wipe the cells first (the half-block art the caller drew), then draw the

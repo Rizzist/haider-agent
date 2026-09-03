@@ -6496,7 +6496,7 @@ impl AppModel {
                     // A bare payload carries no envelope: this path is the
                     // demo/mock twin, whose prompts have no durable
                     // sequence. Recording one would fabricate a fork cut.
-                    self.record_prompt(crate::session::PromptEntry::local(text.clone()));
+                    self.record_prompt(text, None);
                 }
                 self.handle_envelope(&payload);
             }
@@ -8256,8 +8256,8 @@ impl AppModel {
         }
     }
 
-    fn record_prompt(&mut self, entry: crate::session::PromptEntry) {
-        self.prompt_history.push_front(entry);
+    fn record_prompt(&mut self, text: &str, seq: Option<u64>) {
+        crate::session::record_prompt_recall(&mut self.prompt_history, text, seq);
         self.close_backtrack();
     }
 
@@ -14501,10 +14501,7 @@ impl AppModel {
                             if envelope.agent_id.is_none()
                                 && let EventPayload::UserMessage { text, .. } = &payload
                             {
-                                self.record_prompt(crate::session::PromptEntry::committed(
-                                    text.clone(),
-                                    envelope.seq,
-                                ));
+                                self.record_prompt(text, Some(envelope.seq));
                             }
                             if admission == Admission::Apply {
                                 self.route_admitted(

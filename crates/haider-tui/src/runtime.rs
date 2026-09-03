@@ -600,10 +600,10 @@ pub async fn run_demo(
     let mut seen_theme_commits = model.theme_commits;
     let mut active_title = model.window_title();
 
-    // Query the terminal for a graphics protocol and build the wordmark image
-    // NOW — after raw mode, before the input pump claims stdin — so the
-    // capability response is not eaten by the pump. Degrades to None (the
-    // half-block art) on a non-graphics or non-answering terminal; never hangs.
+    // Query the terminal for a graphics protocol NOW — after raw mode, before
+    // the input pump claims stdin — so the capability response is not eaten by
+    // the pump. Image decode/encoding stays deferred until the first visible
+    // wordmark draw. A non-graphics/non-answering terminal degrades to None.
     *model.wordmark.borrow_mut() = crate::wordmark::Wordmark::detect();
     // Pin the truecolor capability once (read by render for the Thinking
     // shimmer's fidelity); the default is true, so this only downgrades a
@@ -3585,7 +3585,8 @@ pub async fn run_live(
     let mut active_title = model.window_title();
 
     // Graphics wordmark query — after raw mode, before the input pump (see the
-    // run_demo note); None on non-graphics terminals falls back to `crate::mark`.
+    // run_demo note). Decode/encoding stays deferred until first visible draw;
+    // None on non-graphics terminals falls back to `crate::mark`.
     *model.wordmark.borrow_mut() = crate::wordmark::Wordmark::detect();
     // Truecolor capability (see run_demo) — pinned once for render's shimmer.
     model.truecolor = truecolor_capable(&|name| std::env::var(name).ok());

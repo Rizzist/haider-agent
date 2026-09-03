@@ -42,6 +42,14 @@ pub struct PromptEntry {
     pub seq: Option<u64>,
 }
 
+/// Prompt recall is convenience state, not the durable transcript. Keep a
+/// useful recent window while preventing replay of a long-lived session from
+/// duplicating unbounded prompt text in the client.
+#[doc(hidden)]
+pub const PROMPT_RECALL_MAX_ENTRIES: usize = 128;
+#[doc(hidden)]
+pub const PROMPT_RECALL_MAX_BYTES: usize = 1024 * 1024;
+
 impl PromptEntry {
     /// A prompt rebuilt from a committed journal envelope.
     #[must_use]
@@ -56,6 +64,37 @@ impl PromptEntry {
     #[must_use]
     pub const fn local(text: String) -> Self {
         Self { text, seq: None }
+    }
+}
+
+/// Copy one prompt into newest-first recall state under count and byte caps.
+/// An individually oversized prompt remains available in the authoritative
+/// transcript but is never duplicated into this optional convenience cache.
+pub(crate) fn record_prompt_recall(
+    history: &mut std::collections::VecDeque<PromptEntry>,
+    text: &str,
+    seq: Option<u64>,
+) {
+    if text.len() > PROMPT_RECALL_MAX_BYTES {
+        return;
+    }
+    let entry = PromptEntry {
+        text: text.to_owned(),
+        seq,
+    };
+    if entry.text.capacity() > PROMPT_RECALL_MAX_BYTES {
+        return;
+    }
+    history.push_front(entry);
+    let mut bytes = history
+        .iter()
+        .map(|entry| entry.text.capacity())
+        .sum::<usize>();
+    while history.len() > PROMPT_RECALL_MAX_ENTRIES || bytes > PROMPT_RECALL_MAX_BYTES {
+        let Some(removed) = history.pop_back() else {
+            break;
+        };
+        bytes = bytes.saturating_sub(removed.text.capacity());
     }
 }
 
@@ -395,8 +434,11 @@ impl SessionState {
                             if envelope.agent_id.is_none()
                                 && let EventPayload::UserMessage { text, .. } = &payload
                             {
-                                self.prompt_history
-                                    .push_front(PromptEntry::committed(text.clone(), envelope.seq));
+                                record_prompt_recall(
+                                    &mut self.prompt_history,
+                                    text,
+                                    Some(envelope.seq),
+                                );
                             }
                             if admission == Admission::Apply {
                                 self.route_admitted(
