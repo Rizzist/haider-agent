@@ -4863,27 +4863,22 @@ fn render_session(
         && throughput_area.height > 0
     {
         let streaming = model.projection.is_streaming();
-        let tilde = if readout.approx { "~" } else { "" };
         let (spark_ink, rate_ink) = if streaming {
             (theme.gold_style(), theme.bright_style())
         } else {
             (theme.dim_style(), theme.dim_style())
         };
-        // Fixed-width readout, left-anchored above the composer (owner
-        // 2026-08-21): 24 bar columns then a 5-char rate field, so the row
-        // never shifts as digits (or the ~ marker) come and go.
-        let rate_width = 5_usize.saturating_sub(tilde.len());
-        let mut spans = vec![
+        // tpsfix (owner 2026-09-03): a SMALL fixed-width strip, left-anchored
+        // above the composer — `PILL_WIDTH` cells (6 bar columns + a 4-cell
+        // rate field + ` tps`), about a quarter of the old ~40-column row. It
+        // does NOT scale with the terminal, so nothing downstream of it moves
+        // on a resize, and `· μN` is gone: at turn end it duplicated the
+        // headline number (it survives on the verbose `--plain` row).
+        let spans = vec![
             Span::raw(" "),
             Span::styled(readout.spark.clone(), spark_ink),
-            Span::styled(
-                format!(" {tilde}{:>rate_width$} tps", readout.tps),
-                rate_ink,
-            ),
+            Span::styled(readout.rate_field(), rate_ink),
         ];
-        if let Some(mean) = readout.mean {
-            spans.push(Span::styled(format!(" · μ{mean}"), theme.dim_style()));
-        }
         frame.render_widget(Paragraph::new(Line::from(spans)), throughput_area);
     }
 
