@@ -1276,9 +1276,15 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
                 match &delta {
                     ItemDelta::Text { text } => {
                         let _ = open.text.append_shared(text);
+                        reduction
+                            .route_replay_events
+                            .push(StreamEvent::TextDelta { text: text.clone() });
                     }
                     ItemDelta::Reasoning { text } => {
                         let _ = open.text.append_shared(text);
+                        reduction
+                            .route_replay_events
+                            .push(StreamEvent::ReasoningDelta { text: text.clone() });
                     }
                     ItemDelta::ToolArgs { fragment } => open.args.push_str(fragment),
                     ItemDelta::CommandOutput { .. } => {}

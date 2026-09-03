@@ -510,7 +510,7 @@ impl std::error::Error for DaemonSpawnError {
 /// Spawns the sibling daemon with its fixed argv/stdout/stderr contract and
 /// the platform's detach + inheritance hygiene.
 pub fn spawn_daemon(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
-    spawn_daemon_with_stderr(spec, false, None, None, None, None)
+    spawn_daemon_with_stderr(spec, false, None, None, None, None, &[])
 }
 
 /// Test/diagnostic variant of [`spawn_daemon`] that gives a real daemon an
@@ -521,20 +521,38 @@ pub fn spawn_daemon_with_machine_user_home(
     spec: DaemonSpawn<'_>,
     machine_user_home: &Path,
 ) -> Result<Child, DaemonSpawnError> {
-    spawn_daemon_with_stderr(spec, false, None, None, None, Some(machine_user_home))
+    spawn_daemon_with_stderr(spec, false, None, None, None, Some(machine_user_home), &[])
 }
 
 /// Spawns a daemon with a private one-shot readiness notification.
 pub fn spawn_daemon_with_readiness(
     spec: DaemonSpawn<'_>,
 ) -> Result<SpawnedDaemon, DaemonSpawnError> {
+    spawn_daemon_with_readiness_and_environment(spec, &[])
+}
+
+/// Test/diagnostic variant of [`spawn_daemon_with_readiness`] with explicit
+/// child-only environment additions. Production launchers use the ordinary
+/// entry point and cannot inject these values accidentally.
+#[doc(hidden)]
+pub fn spawn_daemon_with_readiness_and_environment(
+    spec: DaemonSpawn<'_>,
+    environment: &[(&str, &str)],
+) -> Result<SpawnedDaemon, DaemonSpawnError> {
     let prepared = prepare_readiness().map_err(DaemonSpawnError::Readiness)?;
     let token = prepared.token().to_owned();
     let coordinate = prepared
         .child_coordinate()
         .map_err(DaemonSpawnError::Readiness)?;
-    let child =
-        spawn_daemon_with_stderr(spec, false, Some((&token, coordinate)), None, None, None)?;
+    let child = spawn_daemon_with_stderr(
+        spec,
+        false,
+        Some((&token, coordinate)),
+        None,
+        None,
+        None,
+        environment,
+    )?;
     Ok(SpawnedDaemon {
         child,
         readiness: prepared.into_receiver(),
@@ -577,6 +595,7 @@ fn spawn_daemon_with_readiness_and_liveness_inner(
         Some((&liveness_token, liveness_coordinate)),
         idle_ttl,
         None,
+        &[],
     )?;
     Ok((
         SpawnedDaemon {
@@ -595,7 +614,7 @@ fn spawn_daemon_with_readiness_and_liveness_inner(
 /// cannot block on a full pipe.
 #[doc(hidden)]
 pub fn spawn_daemon_with_piped_stderr(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
-    spawn_daemon_with_stderr(spec, true, None, None, None, None)
+    spawn_daemon_with_stderr(spec, true, None, None, None, None, &[])
 }
 
 fn spawn_daemon_with_stderr(
@@ -605,6 +624,7 @@ fn spawn_daemon_with_stderr(
     liveness: Option<(&str, LivenessChildCoordinate)>,
     idle_ttl: Option<Duration>,
     machine_user_home: Option<&Path>,
+    environment: &[(&str, &str)],
 ) -> Result<Child, DaemonSpawnError> {
     // The daemon creates this directory only after it owns the profile lock.
     // Merely naming it here keeps a launcher killed before `exec` from
@@ -636,6 +656,7 @@ fn spawn_daemon_with_stderr(
         .stdout(Stdio::from(log))
         .stderr(stderr);
     command.env(DAEMON_LOG_PATH_ENV, spec.log_path);
+    command.envs(environment.iter().copied());
     // The one-shot wall harness traces launcher-owned boundaries only. Never
     // leak that client diagnostic switch into the daemon's startup surface.
     command.env_remove("HAIDER_CLIENT_LIFECYCLE_TRACE");

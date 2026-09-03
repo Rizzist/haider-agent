@@ -101,7 +101,10 @@ fn branch_created(session: &SessionId, seq: u64, branch: &str, name: &str) -> Ra
         },
     };
     let mut envelope = raw(session, seq, &EventPayload::IdleDecayed);
-    envelope.payload = created.to_payload_value().expect("branch fact serializes");
+    envelope.payload = created
+        .to_payload_value()
+        .expect("branch fact serializes")
+        .into();
     envelope
 }
 

@@ -12,7 +12,8 @@ use crate::EventPayload;
 use crate::history::NodeKind;
 use crate::ids::{AgentId, BranchId, DeviceId, EventId, RunId, SessionId};
 use crate::item::{ItemDelta, ItemEvent, TurnItem};
-use crate::reply::ReplyText;
+use crate::provider::ProviderOpaqueData;
+use crate::reply::{ReplyArenaWriter, ReplyText};
 use serde::de::DeserializeOwned;
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -91,21 +92,23 @@ pub struct ReplyPayload {
     path: ReplyPath,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ReplyPath {
     ItemText,
     ItemSummary,
     DeltaText,
     NodeText,
+    ProviderOpaque(String),
 }
 
 impl ReplyPath {
-    const fn components(self) -> &'static [&'static str] {
+    fn components(&self) -> &'static [&'static str] {
         match self {
             Self::ItemText => &["item", "text"],
             Self::ItemSummary => &["item", "summary"],
             Self::DeltaText => &["delta", "text"],
             Self::NodeText => &["kind", "text"],
+            Self::ProviderOpaque(_) => &[],
         }
     }
 }
@@ -128,12 +131,35 @@ impl RawPayload {
         })
     }
 
+    /// Promotes the one arena-backed field of a provider-native continuation
+    /// event after its small JSON template has been serialized.
+    pub fn bind_provider_opaque_reply(&mut self, text: ReplyText) -> bool {
+        let Self::Json(value) = self else {
+            return false;
+        };
+        let marker = unique_raw_reply_marker(value);
+        let Some(slot) = provider_opaque_reply_slot_mut(value) else {
+            return false;
+        };
+        *slot = Value::String(marker.clone());
+        let skeleton = std::mem::take(value);
+        *self = Self::Reply(ReplyPayload {
+            skeleton,
+            text,
+            path: ReplyPath::ProviderOpaque(marker),
+        });
+        true
+    }
+
     /// Decodes the known payload union. Reply leaves remain shared arena
     /// handles rather than becoming owned `String`s.
     pub fn decode_event(&self) -> Result<EventPayload, serde_json::Error> {
         match self {
             Self::Json(value) => serde_json::from_value(value.clone()),
             Self::Reply(reply) => {
+                if matches!(reply.path, ReplyPath::ProviderOpaque(_)) {
+                    return serde_json::from_value(self.to_json_value());
+                }
                 let mut payload = serde_json::from_value::<EventPayload>(reply.skeleton.clone())?;
                 let Some((text, path)) = reply_leaf_mut(&mut payload) else {
                     return serde_json::from_value(Value::Null);
@@ -160,7 +186,13 @@ impl RawPayload {
             Self::Json(value) => value.clone(),
             Self::Reply(reply) => {
                 let mut value = reply.skeleton.clone();
-                if let Some(slot) = value_at_path_mut(&mut value, reply.path.components()) {
+                if let ReplyPath::ProviderOpaque(marker) = &reply.path {
+                    replace_value_string_marker(
+                        &mut value,
+                        marker,
+                        Value::String(reply.text.to_owned_string()),
+                    );
+                } else if let Some(slot) = value_at_path_mut(&mut value, reply.path.components()) {
                     *slot = Value::String(reply.text.to_owned_string());
                 }
                 value
@@ -196,9 +228,47 @@ impl RawPayload {
             return None;
         };
         let mut skeleton = reply.skeleton.clone();
-        *value_at_path_mut(&mut skeleton, reply.path.components())? =
-            Value::String(marker.to_owned());
+        if let ReplyPath::ProviderOpaque(bound_marker) = &reply.path {
+            if !replace_value_string_marker(
+                &mut skeleton,
+                bound_marker,
+                Value::String(marker.to_owned()),
+            ) {
+                return None;
+            }
+        } else {
+            *value_at_path_mut(&mut skeleton, reply.path.components())? =
+                Value::String(marker.to_owned());
+        }
         Some(Self::Json(skeleton))
+    }
+
+    /// Reads a durable provider-native continuation without materializing its
+    /// arena-backed text field.
+    #[must_use]
+    pub fn provider_opaque_data(&self) -> Option<(String, ProviderOpaqueData)> {
+        let value = self.deref();
+        if value.get("event").and_then(Value::as_str) != Some("completed") {
+            return None;
+        }
+        let item = value.get("item")?;
+        if item.get("item").and_then(Value::as_str) != Some("extension")
+            || item.get("kind").and_then(Value::as_str) != Some("provider_opaque")
+        {
+            return None;
+        }
+        let wrapper = item.get("data")?.as_object()?;
+        let provider = wrapper.get("provider")?.as_str()?.to_owned();
+        let data = wrapper.get("data")?.clone();
+        match self {
+            Self::Reply(ReplyPayload {
+                path: ReplyPath::ProviderOpaque(marker),
+                text,
+                ..
+            }) => ProviderOpaqueData::with_reply(data, marker.clone(), text.clone())
+                .map(|data| (provider, data)),
+            _ => Some((provider, data.into())),
+        }
     }
 
     #[must_use]
@@ -223,12 +293,10 @@ fn reply_leaf_mut(payload: &mut EventPayload) -> Option<(&mut ReplyText, ReplyPa
             TurnItem::Reasoning { summary } => Some((summary, ReplyPath::ItemSummary)),
             _ => None,
         },
-        EventPayload::Item(ItemEvent::Delta { delta, .. }) => match delta {
-            ItemDelta::Text { text } | ItemDelta::Reasoning { text } => {
-                Some((text, ReplyPath::DeltaText))
-            }
-            _ => None,
-        },
+        EventPayload::Item(ItemEvent::Delta {
+            delta: ItemDelta::Text { text } | ItemDelta::Reasoning { text },
+            ..
+        }) => Some((text, ReplyPath::DeltaText)),
         EventPayload::NodeCommitted(node) => match &mut node.kind {
             NodeKind::AssistantCommit { text, .. } => Some((text, ReplyPath::NodeText)),
             _ => None,
@@ -242,6 +310,73 @@ fn value_at_path_mut<'a>(value: &'a mut Value, path: &[&str]) -> Option<&'a mut 
         return Some(value);
     };
     value_at_path_mut(value.get_mut(*head)?, tail)
+}
+
+fn provider_opaque_reply_slot_mut(value: &mut Value) -> Option<&mut Value> {
+    let item = value.get_mut("item")?;
+    if item.get("item").and_then(Value::as_str) != Some("extension")
+        || item.get("kind").and_then(Value::as_str) != Some("provider_opaque")
+    {
+        return None;
+    }
+    let wrapper = item.get_mut("data")?.as_object_mut()?;
+    let provider = wrapper.get("provider")?.as_str()?.to_owned();
+    let data = wrapper.get_mut("data")?;
+    match provider.as_str() {
+        "anthropic" => match data.get("type").and_then(Value::as_str) {
+            Some("thinking") => data.get_mut("thinking"),
+            Some("text") => data.get_mut("text"),
+            _ => None,
+        },
+        "gemini" => data.get_mut("part")?.get_mut("text"),
+        "openai" if data.get("type").and_then(Value::as_str) == Some("reasoning") => data
+            .get_mut("summary")?
+            .as_array_mut()?
+            .first_mut()?
+            .get_mut("text"),
+        _ => None,
+    }
+}
+
+fn unique_raw_reply_marker(value: &Value) -> String {
+    for nonce in 0_u32..1_024 {
+        let marker = format!("__haider_provider_opaque_reply_{nonce:08x}__");
+        if count_value_string_marker(value, &marker) == 0 {
+            return marker;
+        }
+    }
+    unreachable!("bounded provider-opaque marker namespace exhausted")
+}
+
+fn count_value_string_marker(value: &Value, marker: &str) -> usize {
+    match value {
+        Value::String(text) => usize::from(text == marker),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| count_value_string_marker(value, marker))
+            .sum(),
+        Value::Object(fields) => fields
+            .values()
+            .map(|value| count_value_string_marker(value, marker))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn replace_value_string_marker(value: &mut Value, marker: &str, replacement: Value) -> bool {
+    match value {
+        Value::String(text) if text == marker => {
+            *value = replacement;
+            true
+        }
+        Value::Array(values) => values
+            .iter_mut()
+            .any(|value| replace_value_string_marker(value, marker, replacement.clone())),
+        Value::Object(fields) => fields
+            .values_mut()
+            .any(|value| replace_value_string_marker(value, marker, replacement.clone())),
+        _ => false,
+    }
 }
 
 fn reply_path(value: &Value) -> Option<ReplyPath> {
@@ -280,6 +415,20 @@ fn reply_path(value: &Value) -> Option<ReplyPath> {
 }
 
 fn promote_value(mut value: Value) -> RawPayload {
+    let marker = unique_raw_reply_marker(&value);
+    if let Some(slot) = provider_opaque_reply_slot_mut(&mut value)
+        && let Value::String(text) = std::mem::take(slot)
+    {
+        *slot = Value::String(marker.clone());
+        let mut writer = ReplyArenaWriter::new().with_standard_provider_json_views();
+        let text = writer.append(text);
+        drop(writer.seal());
+        return RawPayload::Reply(ReplyPayload {
+            skeleton: value,
+            text,
+            path: ReplyPath::ProviderOpaque(marker),
+        });
+    }
     let Some(path) = reply_path(&value) else {
         return RawPayload::Json(value);
     };
@@ -359,12 +508,20 @@ impl Serialize for RawPayload {
     {
         match self {
             Self::Json(value) => value.serialize(serializer),
-            Self::Reply(reply) => PatchedValue {
-                value: &reply.skeleton,
-                path: reply.path.components(),
-                text: &reply.text,
-            }
-            .serialize(serializer),
+            Self::Reply(reply) => match &reply.path {
+                ReplyPath::ProviderOpaque(marker) => PatchedMarkerValue {
+                    value: &reply.skeleton,
+                    marker,
+                    text: &reply.text,
+                }
+                .serialize(serializer),
+                _ => PatchedValue {
+                    value: &reply.skeleton,
+                    path: reply.path.components(),
+                    text: &reply.text,
+                }
+                .serialize(serializer),
+            },
         }
     }
 }
@@ -383,6 +540,49 @@ struct PatchedValue<'a> {
     value: &'a Value,
     path: &'a [&'a str],
     text: &'a ReplyText,
+}
+
+struct PatchedMarkerValue<'a> {
+    value: &'a Value,
+    marker: &'a str,
+    text: &'a ReplyText,
+}
+
+impl Serialize for PatchedMarkerValue<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self.value {
+            Value::String(value) if value == self.marker => self.text.serialize(serializer),
+            Value::Object(fields) => {
+                let mut map = serializer.serialize_map(Some(fields.len()))?;
+                for (key, value) in fields {
+                    map.serialize_entry(
+                        key,
+                        &Self {
+                            value,
+                            marker: self.marker,
+                            text: self.text,
+                        },
+                    )?;
+                }
+                map.end()
+            }
+            Value::Array(values) => {
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    sequence.serialize_element(&Self {
+                        value,
+                        marker: self.marker,
+                        text: self.text,
+                    })?;
+                }
+                sequence.end()
+            }
+            other => other.serialize(serializer),
+        }
+    }
 }
 
 impl Serialize for PatchedValue<'_> {
@@ -491,18 +691,18 @@ fn encoded_reply_template(
     envelope: &RawEnvelope,
     encoding: TemplateEncoding,
 ) -> io::Result<(Vec<u8>, Vec<u8>)> {
-    let RawPayload::Reply(reply) = &envelope.payload else {
+    let RawPayload::Reply(_) = &envelope.payload else {
         return Err(io::Error::other(
             "reply template requested for JSON payload",
         ));
     };
     for nonce in 0_u32..1_024 {
         let marker = format!("__haider_reply_arena_{nonce:08x}_sentinel__");
-        let mut skeleton = reply.skeleton.clone();
-        let slot = value_at_path_mut(&mut skeleton, reply.path.components())
+        let payload = envelope
+            .payload
+            .with_reply_placeholder(&marker)
             .ok_or_else(|| io::Error::other("reply payload path disappeared"))?;
-        *slot = Value::String(marker.clone());
-        let template = envelope.clone().map_payload(|_| RawPayload::Json(skeleton));
+        let template = envelope.clone().map_payload(|_| payload);
         let (encoded, token) = match encoding {
             TemplateEncoding::Json => (
                 serde_json::to_vec(&template).map_err(io::Error::other)?,
@@ -578,7 +778,7 @@ fn write_json_string_contents(writer: &mut impl io::Write, text: &ReplyText) -> 
 
 fn write_messagepack_string_len(writer: &mut impl io::Write, len: usize) -> io::Result<()> {
     if len < 32 {
-        writer.write_all(&[0xa0 | u8::try_from(len).expect("fixstr length")])
+        writer.write_all(&[0xa0 | len as u8])
     } else if let Ok(len) = u8::try_from(len) {
         writer.write_all(&[0xd9, len])
     } else if let Ok(len) = u16::try_from(len) {
@@ -703,6 +903,7 @@ impl<P> EventEnvelope<P> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::error::ErrorPresentation;
@@ -861,6 +1062,76 @@ mod tests {
                 "MessagePack replay path {path}"
             );
         }
+    }
+
+    #[test]
+    fn provider_opaque_reply_range_round_trips_without_a_second_text_owner() {
+        let thinking = reply_text(&["left \"quote\"\\\n", "مرز ", "😀 right\u{0007}"]);
+        let item_id = ItemId::new("thinking-1");
+        let event = EventPayload::Item(ItemEvent::Completed {
+            item_id,
+            item: TurnItem::Extension {
+                kind: crate::provider::PROVIDER_OPAQUE_EXTENSION_KIND.into(),
+                data: serde_json::json!({
+                    "provider": "anthropic",
+                    "data": {
+                        "type": "thinking",
+                        "thinking": "__native_reply_placeholder__",
+                        "signature": "provider-opaque-signature"
+                    }
+                }),
+            },
+        });
+        let mut envelope = reply_envelope(event);
+        assert!(
+            envelope
+                .payload
+                .bind_provider_opaque_reply(thinking.clone())
+        );
+        assert!(
+            envelope
+                .payload
+                .reply_text()
+                .is_some_and(|text| text.shares_arena_with(&thinking))
+        );
+        let (provider, data) = envelope
+            .payload
+            .provider_opaque_data()
+            .expect("arena-backed provider-native data");
+        assert_eq!(provider, "anthropic");
+        assert!(
+            data.reply_text()
+                .is_some_and(|text| text.shares_arena_with(&thinking))
+        );
+        assert_eq!(data["signature"], "provider-opaque-signature");
+
+        let materialized = envelope
+            .clone()
+            .map_payload(|payload| payload.to_json_value());
+        let expected_json = serde_json::to_vec(&materialized).expect("legacy JSON");
+        let mut actual_json = Vec::new();
+        write_envelope_json(&mut actual_json, &envelope).expect("chunked JSON");
+        assert_eq!(actual_json, expected_json);
+        let replayed_json: RawEnvelope =
+            serde_json::from_slice(&actual_json).expect("provider-opaque JSON replay");
+        assert!(replayed_json.payload.provider_opaque_data().is_some());
+        assert_eq!(
+            replayed_json.payload.to_json_value(),
+            envelope.payload.to_json_value()
+        );
+
+        let expected_messagepack =
+            rmp_serde::to_vec_named(&materialized).expect("legacy MessagePack");
+        let mut actual_messagepack = Vec::new();
+        write_envelope_messagepack(&mut actual_messagepack, &envelope)
+            .expect("chunked MessagePack");
+        assert_eq!(actual_messagepack, expected_messagepack);
+        let replayed_messagepack: RawEnvelope =
+            rmp_serde::from_slice(&actual_messagepack).expect("provider-opaque MessagePack replay");
+        assert_eq!(
+            replayed_messagepack.payload.to_json_value(),
+            envelope.payload.to_json_value()
+        );
     }
 
     #[test]

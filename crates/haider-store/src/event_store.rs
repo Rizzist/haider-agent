@@ -67,7 +67,7 @@ use haider_protocol::graph::{
     workflow_evidence_ledger_digest, workflow_input_ledger_digest,
     workspace_mutation_subject_digest,
 };
-use haider_protocol::headless::HeadlessRunEventPayload;
+use haider_protocol::headless::{HeadlessRunEventPayload, durable_run_terminal_v1};
 use haider_protocol::history::{COMPACTION_INTENT_EXTENSION_KIND, NodeKind, TodoItem, TreeNode};
 use haider_protocol::hook::HookEventPayload;
 use haider_protocol::ids::{
@@ -83,7 +83,7 @@ use haider_protocol::loom::{
     LoomRegistrySnapshotEntry, LoomRevisionConflict, LoomRevisionExpectation, LoomWorkflow,
     compile_pipe, parse_pipe,
 };
-use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason, MenuKind};
+use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuCloseReason, MenuKind};
 use haider_protocol::peer::PeerMessage;
 use haider_protocol::permission::PermissionEventPayload;
 use haider_protocol::pipe::{InstructEvidenceRef, TranscriptProjector};
@@ -109,6 +109,7 @@ use haider_protocol::typed_agent::{
     TypedAgentInstallJob, TypedAgentInstallProgress, TypedAgentInstallState,
     TypedAgentInstallTerminalStateV1, TypedAgentRequiredCli,
 };
+use haider_protocol::workspace::WorkspaceEventPayload;
 use haider_protocol::{DeliveryMode, EventPayload};
 use rusqlite::{
     Connection, Error as SqliteError, ErrorCode as SqliteErrorCode, OptionalExtension, Transaction,
@@ -238,7 +239,12 @@ pub struct CommittedSeqRange {
 pub struct PendingHookDispatchMetadata {
     pub session_id: SessionId,
     pub seq: u64,
+    pub run_id: Option<RunId>,
     pub payload_kind: Option<String>,
+    /// A durable turn-start availability fact exists for this exact run.
+    /// Hook recovery uses this indexed bit to suppress earlier outbox rows
+    /// from the same run without decoding them or re-probing the workspace.
+    pub workspace_unavailable: bool,
 }
 
 /// One payload-kind-filtered reducer page plus the committed journal head
@@ -1106,6 +1112,40 @@ pub enum SessionRenameOutcome {
     /// journaled, or updated. Only the internal auto-title path can see
     /// this — an explicit rename never sets the guard.
     Skipped,
+}
+
+/// Secret-free coordinates for one atomic session workspace replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionWorkspaceSetCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    /// Canonical absolute path validated and opened by the daemon.
+    pub path: String,
+    pub event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Stable response stored in the committed `session.workspace.set` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SelectedWorkspace {
+    pub session_id: SessionId,
+    pub path: String,
+    pub selected_seq: u64,
+    pub worker_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionWorkspaceSetOutcome {
+    Committed {
+        selected: SelectedWorkspace,
+        envelope: Box<RawEnvelope>,
+    },
+    IdempotentReplay {
+        selected: SelectedWorkspace,
+    },
 }
 
 /// Secret-free coordinates for one atomic durable attention acknowledgement.
@@ -2510,7 +2550,7 @@ impl Store {
             timeline_key: USAGE_CHECKPOINT_TIMELINE.to_owned(),
             through_seq,
             boundary_event_id,
-            payload: payload.into(),
+            payload,
         })
     }
 
@@ -4257,7 +4297,7 @@ impl Store {
             timeline_key: timeline_key.to_owned(),
             through_seq,
             boundary_event_id: EventId::new(boundary_event_id),
-            payload: payload.into(),
+            payload,
         }))
     }
 
@@ -8025,7 +8065,7 @@ impl Store {
             },
             payload,
         };
-        insert_encoded_event(&transaction, &envelope)?;
+        insert_encoded_event(transaction, &envelope)?;
         enqueue_hook_dispatch(transaction, &envelope)?;
         transaction
             .execute(
@@ -9180,6 +9220,26 @@ impl Store {
         )
     }
 
+    /// Looks up a committed `session.workspace.set` response before path,
+    /// session, generation, or metadata validation (response-loss replay).
+    pub fn session_workspace_set_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<SelectedWorkspace>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "session.workspace.set",
+            request_digest,
+            request_json,
+            "session-workspace-set",
+        )
+    }
+
     /// Returns the durable attention acknowledgement for a session. `None`
     /// is a real never-seen value, distinct from an absent legacy summary.
     pub fn session_seen_at(&self, session_id: &SessionId) -> StoreResult<Option<u64>> {
@@ -9465,6 +9525,156 @@ impl Store {
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(SessionRenameOutcome::Committed {
             renamed,
+            envelope: Box::new(envelopes.remove(0)),
+        })
+    }
+
+    /// Atomically commits a canonical session workspace, its additive audit
+    /// fact, and the replayable command receipt.
+    pub fn set_session_workspace(
+        &self,
+        command: &SessionWorkspaceSetCommand,
+    ) -> StoreResult<SessionWorkspaceSetOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        if command.path.is_empty() || !std::path::Path::new(&command.path).is_absolute() {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "session workspace must be an absolute canonical path",
+                false,
+            ));
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(selected) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            "session.workspace.set",
+            &command.request_digest,
+            &command.request_json,
+            "session-workspace-set",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(SessionWorkspaceSetOutcome::IdempotentReplay { selected });
+        }
+        require_typed_session(&transaction, &command.session_id)?;
+        let metadata_json: String = transaction
+            .query_row(
+                "SELECT meta_json FROM sessions WHERE id = ?1",
+                [command.session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        let Some(mut metadata) = decode_session_metadata(&command.session_id, &metadata_json)?
+        else {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "legacy session has no live-worker metadata",
+                false,
+            ));
+        };
+        let previous_path = metadata.cwd.clone();
+        metadata.cwd.clone_from(&command.path);
+        let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize session metadata: {error}"),
+                false,
+            )
+        })?;
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "session.workspace.set",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
+        let updated_rows = transaction
+            .execute(
+                "UPDATE sessions SET meta_json = ?2 WHERE id = ?1",
+                params![command.session_id.as_str(), updated_metadata],
+            )
+            .map_err(map_sqlite_error)?;
+        if updated_rows != 1 {
+            return Err(corrupt("session row disappeared during workspace set"));
+        }
+        let payload = haider_protocol::workspace::WorkspaceEventPayload::WorkspaceSelected(
+            haider_protocol::workspace::WorkspaceSelected {
+                path: command.path.clone(),
+                previous_path: Some(previous_path),
+            },
+        )
+        .to_payload_value()
+        .map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize workspace-selected payload: {error}"),
+                false,
+            )
+        })?;
+        let mut envelopes = vec![unstamped_raw_command_envelope(
+            command.event_id.clone(),
+            &command.session_id,
+            None,
+            None,
+            command.device_id.clone(),
+            self.worker_generation,
+            payload,
+            PromptRender::Omit,
+        )?];
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let selected = SelectedWorkspace {
+            session_id: command.session_id.clone(),
+            path: command.path.clone(),
+            selected_seq: envelopes[0].seq,
+            worker_generation: self.worker_generation,
+        };
+        // Workspace identity is an execution boundary for hooks. Rows from
+        // before this selection must never be rediscovered against the new
+        // metadata root if the asynchronous hook drain loses the race.
+        transaction
+            .execute(
+                "DELETE FROM hook_dispatch_outbox
+                 WHERE session_id = ?1 AND seq < ?2",
+                params![
+                    command.session_id.as_str(),
+                    to_sqlite_integer(selected.selected_seq)?
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        transaction
+            .execute(
+                "DELETE FROM workspace_unavailable_runs WHERE session_id = ?1",
+                [command.session_id.as_str()],
+            )
+            .map_err(map_sqlite_error)?;
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            None,
+            Some(selected.selected_seq),
+            &selected,
+            now,
+            "session-workspace-set",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(SessionWorkspaceSetOutcome::Committed {
+            selected,
             envelope: Box::new(envelopes.remove(0)),
         })
     }
@@ -11739,8 +11949,8 @@ impl Store {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut statement = connection
             .prepare_cached(
-                "SELECT e.session_id, e.seq, e.payload_kind,
-                        length(e.envelope_json)
+                "SELECT e.session_id, e.seq, o.run_id, e.payload_kind,
+                        length(e.envelope_json), o.workspace_unavailable
                  FROM hook_dispatch_outbox AS o
                  JOIN events AS e
                    ON e.session_id = o.session_id AND e.seq = o.seq
@@ -11757,8 +11967,10 @@ impl Store {
         while let Some(row) = rows.next().map_err(map_sqlite_error)? {
             let session_id = row.get::<_, String>(0).map_err(map_sqlite_error)?;
             let seq = row.get::<_, i64>(1).map_err(map_sqlite_error)?;
-            let payload_kind = row.get::<_, Option<String>>(2).map_err(map_sqlite_error)?;
-            let encoded_len = row.get::<_, i64>(3).map_err(map_sqlite_error)?;
+            let run_id = row.get::<_, Option<String>>(2).map_err(map_sqlite_error)?;
+            let payload_kind = row.get::<_, Option<String>>(3).map_err(map_sqlite_error)?;
+            let encoded_len = row.get::<_, i64>(4).map_err(map_sqlite_error)?;
+            let workspace_unavailable = row.get::<_, bool>(5).map_err(map_sqlite_error)?;
             let seq = u64::try_from(seq)
                 .map_err(|_| corrupt("hook outbox contains a negative event sequence"))?;
             let encoded_len = usize::try_from(encoded_len)
@@ -11770,7 +11982,9 @@ impl Store {
             metadata.push(PendingHookDispatchMetadata {
                 session_id: SessionId::new(session_id),
                 seq,
+                run_id: run_id.map(RunId::new),
                 payload_kind,
+                workspace_unavailable,
             });
             if encoded_bytes >= byte_budget {
                 break;
@@ -19036,6 +19250,7 @@ fn append_transaction_envelopes(
     envelopes: &mut [RawEnvelope],
 ) -> StoreResult<()> {
     ensure_run_head_projection(transaction, session_id)?;
+    stamp_headless_terminal_payloads(transaction, session_id, committed_at_ms, envelopes)?;
     let latest: i64 = transaction
         .query_row(
             "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1",
@@ -19711,12 +19926,54 @@ fn enqueue_hook_dispatch(transaction: &Connection, envelope: &RawEnvelope) -> St
     {
         return Ok(());
     }
+    let workspace_unavailable = matches!(
+        haider_protocol::workspace::WorkspaceEventPayload::from_payload_value(&envelope.payload),
+        Some(haider_protocol::workspace::WorkspaceEventPayload::WorkspaceUnavailable(_))
+    );
+    if workspace_unavailable {
+        let run_id = envelope.run_id.as_ref().ok_or_else(|| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                "workspace-unavailable hook boundary has no run id",
+                false,
+            )
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO workspace_unavailable_runs(session_id, run_id, notice_seq)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id, run_id) DO UPDATE SET notice_seq = excluded.notice_seq",
+                params![
+                    envelope.session_id.as_str(),
+                    run_id.as_str(),
+                    to_sqlite_integer(envelope.seq)?
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        transaction
+            .execute(
+                "UPDATE hook_dispatch_outbox
+                 SET workspace_unavailable = 1
+                 WHERE session_id = ?1 AND run_id = ?2",
+                params![envelope.session_id.as_str(), run_id.as_str()],
+            )
+            .map_err(map_sqlite_error)?;
+    }
     transaction
         .execute(
-            "INSERT INTO hook_dispatch_outbox(session_id, seq) VALUES (?1, ?2)",
+            "INSERT INTO hook_dispatch_outbox(
+                 session_id, seq, run_id, workspace_unavailable
+             ) VALUES (
+                 ?1, ?2, ?3,
+                 EXISTS(
+                     SELECT 1 FROM workspace_unavailable_runs
+                     WHERE session_id = ?1 AND run_id = ?3
+                 )
+             )",
             params![
                 envelope.session_id.as_str(),
-                to_sqlite_integer(envelope.seq)?
+                to_sqlite_integer(envelope.seq)?,
+                envelope.run_id.as_ref().map(RunId::as_str),
             ],
         )
         .map_err(map_sqlite_error)?;
@@ -20223,6 +20480,7 @@ fn append_envelopes_in_transaction(
             run_head_metadata.run_count,
         )?;
     }
+    stamp_headless_terminal_payloads(transaction, &session, committed_at_ms, envelopes)?;
     let latest: i64 = transaction
         .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1")
         .and_then(|mut statement| statement.query_row([session.as_str()], |row| row.get(0)))
@@ -20733,25 +20991,149 @@ fn budget_terminal_runs(
         .collect()
 }
 
+#[derive(Debug, Clone, Default)]
+struct DurableHeadlessRunFacts {
+    configured: bool,
+    budget_exhausted: bool,
+    deadline_exceeded: bool,
+    request_deadline_unix_ms: Option<u64>,
+    cancellation_intent_at_ms: Option<u64>,
+    blocking_error_code: Option<&'static str>,
+    pending_permission_rejects: HashMap<MenuId, (String, u32)>,
+}
+
+fn record_headless_menu(facts: &mut DurableHeadlessRunFacts, menu: &Menu) {
+    if !facts.configured
+        || facts.deadline_exceeded
+        || facts.cancellation_intent_at_ms.is_some()
+        || facts.blocking_error_code.is_some()
+    {
+        return;
+    }
+    if let MenuKind::Permission { .. } = menu.kind {
+        let reject_once = menu
+            .options
+            .iter()
+            .enumerate()
+            .find(|(_, option)| option.decision == Some(DecisionKind::RejectOnce))
+            .and_then(|(index, option)| {
+                u32::try_from(index)
+                    .ok()
+                    .map(|index| (option.key.clone(), index))
+            });
+        if let Some(reject_once) = reject_once {
+            facts
+                .pending_permission_rejects
+                .insert(menu.id.clone(), reject_once);
+        } else {
+            facts
+                .blocking_error_code
+                .get_or_insert("permission_reject_unavailable");
+        }
+    } else if menu.blocking {
+        facts.blocking_error_code.get_or_insert("input_required");
+    }
+}
+
+fn record_headless_menu_answer(facts: &mut DurableHeadlessRunFacts, answer: &MenuAnswer) {
+    let Some((option_key, option_index)) = facts.pending_permission_rejects.remove(&answer.menu)
+    else {
+        return;
+    };
+    if !facts.deadline_exceeded
+        && facts.cancellation_intent_at_ms.is_none()
+        && facts.blocking_error_code.is_none()
+        && (answer.option_key.as_deref() != Some(option_key.as_str())
+            || answer.option_index != option_index)
+    {
+        facts
+            .blocking_error_code
+            .get_or_insert("permission_resolution_conflict");
+    }
+}
+
+fn record_headless_menu_closed(facts: &mut DurableHeadlessRunFacts, menu: &MenuId) {
+    if facts.pending_permission_rejects.remove(menu).is_some()
+        && !facts.deadline_exceeded
+        && facts.cancellation_intent_at_ms.is_none()
+        && facts.blocking_error_code.is_none()
+    {
+        facts
+            .blocking_error_code
+            .get_or_insert("permission_resolution_conflict");
+    }
+}
+
+fn record_headless_run_state(
+    facts: &mut DurableHeadlessRunFacts,
+    state: &RunState,
+    committed_at_ms: u64,
+) {
+    if !facts.configured {
+        return;
+    }
+    match state {
+        RunState::Cancelling => {
+            facts
+                .cancellation_intent_at_ms
+                .get_or_insert(committed_at_ms);
+        }
+        RunState::InputRequired { .. }
+            if !facts.deadline_exceeded
+                && facts.cancellation_intent_at_ms.is_none()
+                && facts.blocking_error_code.is_none() =>
+        {
+            facts.blocking_error_code.get_or_insert("input_required");
+        }
+        RunState::EffectOutcomeUnknown
+            if !facts.deadline_exceeded
+                && facts.cancellation_intent_at_ms.is_none()
+                && facts.blocking_error_code.is_none() =>
+        {
+            facts
+                .blocking_error_code
+                .get_or_insert("effect_outcome_unknown");
+        }
+        _ => {}
+    }
+}
+
+fn headless_deadline_won(facts: &DurableHeadlessRunFacts) -> bool {
+    facts.deadline_exceeded
+        || (facts.blocking_error_code.is_none()
+            && facts.request_deadline_unix_ms.is_some_and(|deadline| {
+                facts
+                    .cancellation_intent_at_ms
+                    .is_some_and(|intent| intent >= deadline)
+            }))
+}
+
 fn durable_headless_run_facts(
     transaction: &Connection,
     session_id: &SessionId,
     run_id: &RunId,
-) -> StoreResult<(bool, bool)> {
+) -> StoreResult<DurableHeadlessRunFacts> {
     let mut statement = transaction
         .prepare_cached(
             "SELECT seq, envelope_json, event_id, committed_at_ms
              FROM events
              WHERE session_id = ?1
-               AND payload_kind IN ('headless_run_configured', 'run_budget_exhausted')
+               AND payload_kind IN (
+                   'headless_run_configured',
+                   'run_budget_exhausted',
+                   'run_deadline_exceeded',
+                   'run_state',
+                   'menu_opened',
+                   'menu_answered',
+                   'menu_closed'
+               )
              ORDER BY seq ASC",
         )
         .map_err(map_sqlite_error)?;
     let mut rows = statement
         .query([session_id.as_str()])
         .map_err(map_sqlite_error)?;
-    let mut configured = false;
-    let mut budget_exhausted = false;
+    let mut facts = DurableHeadlessRunFacts::default();
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
         let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
@@ -20768,23 +21150,234 @@ fn durable_headless_run_facts(
             stored_committed_at_ms,
             &envelope,
         )?;
-        if envelope.run_id.as_ref() != Some(run_id) || !envelope.render.durable {
+        if !envelope.render.durable {
             continue;
         }
+        if envelope.run_id.as_ref() != Some(run_id) {
+            continue;
+        }
+        // The headless reducer consumes only exact-run-correlated menus, so
+        // durable reconstruction applies the identical correlation fence.
+        match decode_payload::<EventPayload>(&envelope.payload) {
+            Ok(EventPayload::MenuOpened(menu)) => record_headless_menu(&mut facts, &menu),
+            Ok(EventPayload::MenuAnswered(answer)) => {
+                record_headless_menu_answer(&mut facts, &answer);
+            }
+            Ok(EventPayload::MenuClosed { menu, .. }) => {
+                record_headless_menu_closed(&mut facts, &menu);
+            }
+            _ => {}
+        }
         match HeadlessRunEventPayload::from_payload_value(&envelope.payload) {
-            Some(HeadlessRunEventPayload::HeadlessRunConfigured(_)) => configured = true,
-            Some(HeadlessRunEventPayload::RunBudgetExhausted(_)) if configured => {
-                budget_exhausted = true;
+            Some(HeadlessRunEventPayload::HeadlessRunConfigured(configured_run)) => {
+                facts.configured = true;
+                facts.request_deadline_unix_ms = configured_run.request_deadline_unix_ms;
+            }
+            Some(HeadlessRunEventPayload::RunBudgetExhausted(_)) if facts.configured => {
+                facts.budget_exhausted = true;
             }
             Some(HeadlessRunEventPayload::RunBudgetExhausted(_)) => {}
+            Some(HeadlessRunEventPayload::RunDeadlineExceeded(_))
+                if facts.configured
+                    && facts.blocking_error_code.is_none()
+                    && facts.cancellation_intent_at_ms.is_none() =>
+            {
+                facts.deadline_exceeded = true;
+            }
             Some(HeadlessRunEventPayload::RunDeadlineExceeded(_)) => {}
             None => {}
         }
-        if configured && budget_exhausted {
-            break;
+        if let Ok(EventPayload::RunState(state)) = decode_payload::<EventPayload>(&envelope.payload)
+        {
+            record_headless_run_state(&mut facts, &state, envelope.committed_at_ms);
         }
     }
-    Ok((configured, budget_exhausted))
+    Ok(facts)
+}
+
+/// Stamps the automation discriminator into the journal record itself. Live
+/// subscribers and replay readers then receive the same retained envelope by
+/// construction instead of independently rebuilding its durable payload.
+fn stamp_headless_terminal_payloads(
+    transaction: &Connection,
+    session_id: &SessionId,
+    committed_at_ms: u64,
+    envelopes: &mut [RawEnvelope],
+) -> StoreResult<()> {
+    let terminal_run_ids = envelopes
+        .iter()
+        .filter_map(|envelope| {
+            let run_id = envelope.run_id.clone()?;
+            matches!(
+                decode_payload::<EventPayload>(&envelope.payload),
+                Ok(EventPayload::RunState(state)) if state.is_terminal()
+            )
+            .then_some(run_id)
+        })
+        .collect::<HashSet<_>>();
+    if terminal_run_ids.is_empty() {
+        return Ok(());
+    }
+    let mut facts = terminal_run_ids
+        .into_iter()
+        .map(|run_id| {
+            durable_headless_run_facts(transaction, session_id, &run_id)
+                .map(|run_facts| (run_id, run_facts))
+        })
+        .collect::<StoreResult<HashMap<_, _>>>()?;
+    let mut adjacent_failure = latest_adjacent_run_failure(transaction, session_id)?;
+
+    for envelope in envelopes {
+        // Adjacency is global sequence adjacency, not merely adjacency among
+        // events carrying the same run id.
+        let preceding_failure = adjacent_failure.take();
+        let Some(run_id) = envelope.run_id.clone() else {
+            continue;
+        };
+        let Some(run_facts) = facts.get_mut(&run_id) else {
+            continue;
+        };
+        match decode_payload::<EventPayload>(&envelope.payload) {
+            Ok(EventPayload::MenuOpened(menu)) => record_headless_menu(run_facts, &menu),
+            Ok(EventPayload::MenuAnswered(answer)) => {
+                record_headless_menu_answer(run_facts, &answer);
+            }
+            Ok(EventPayload::MenuClosed { menu, .. }) => {
+                record_headless_menu_closed(run_facts, &menu);
+            }
+            _ => {}
+        }
+        let payload_kind = envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str);
+        match payload_kind {
+            Some("headless_run_configured")
+                if matches!(
+                    HeadlessRunEventPayload::from_payload_value(&envelope.payload),
+                    Some(HeadlessRunEventPayload::HeadlessRunConfigured(_))
+                ) =>
+            {
+                if let Some(HeadlessRunEventPayload::HeadlessRunConfigured(configured)) =
+                    HeadlessRunEventPayload::from_payload_value(&envelope.payload)
+                {
+                    run_facts.request_deadline_unix_ms = configured.request_deadline_unix_ms;
+                }
+                run_facts.configured = true;
+            }
+            Some("run_budget_exhausted")
+                if matches!(
+                    HeadlessRunEventPayload::from_payload_value(&envelope.payload),
+                    Some(HeadlessRunEventPayload::RunBudgetExhausted(_))
+                ) =>
+            {
+                run_facts.budget_exhausted |= run_facts.configured;
+            }
+            Some("run_deadline_exceeded")
+                if matches!(
+                    HeadlessRunEventPayload::from_payload_value(&envelope.payload),
+                    Some(HeadlessRunEventPayload::RunDeadlineExceeded(_))
+                ) && run_facts.configured
+                    && run_facts.blocking_error_code.is_none()
+                    && run_facts.cancellation_intent_at_ms.is_none() =>
+            {
+                run_facts.deadline_exceeded = true;
+            }
+            Some("run_failed") => {
+                if let Ok(EventPayload::RunFailed { code, .. }) =
+                    decode_payload::<EventPayload>(&envelope.payload)
+                {
+                    adjacent_failure = Some((run_id, code));
+                }
+            }
+            Some("run_state") if run_facts.configured => {
+                let Ok(EventPayload::RunState(state)) =
+                    decode_payload::<EventPayload>(&envelope.payload)
+                else {
+                    continue;
+                };
+                record_headless_run_state(run_facts, &state, committed_at_ms);
+                let Some(terminal) = durable_run_terminal_v1(
+                    state,
+                    preceding_failure.and_then(|(failure_run_id, code)| {
+                        (failure_run_id == run_id).then_some(code)
+                    }),
+                    run_facts.budget_exhausted,
+                    headless_deadline_won(run_facts),
+                    run_facts.blocking_error_code,
+                ) else {
+                    continue;
+                };
+                let payload = envelope.payload.as_object_mut().ok_or_else(|| {
+                    store_error(
+                        ErrorCode::InvalidArgument,
+                        "headless terminal payload is not an object",
+                        false,
+                    )
+                })?;
+                payload.insert(
+                    "terminal_kind".into(),
+                    serde_json::Value::String(terminal.terminal_kind.into()),
+                );
+                match terminal.error_code {
+                    Some(code) => {
+                        payload.insert("error_code".into(), serde_json::Value::String(code.into()));
+                    }
+                    None => {
+                        payload.remove("error_code");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn latest_adjacent_run_failure(
+    transaction: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<Option<(RunId, ErrorCode)>> {
+    let row = transaction
+        .query_row(
+            "SELECT seq, envelope_json, event_id, committed_at_ms
+             FROM events
+             WHERE session_id = ?1
+             ORDER BY seq DESC LIMIT 1",
+            [session_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    decode_envelope_column(row, 1),
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    let Some((stored_seq, envelope, stored_event_id, stored_committed_at_ms)) = row else {
+        return Ok(None);
+    };
+    let envelope = envelope.map_err(|error| {
+        corrupt(format!(
+            "invalid terminal-adjacent envelope for session {session_id}, seq {stored_seq}: {error}"
+        ))
+    })?;
+    validate_stored_envelope(
+        session_id,
+        stored_seq,
+        &stored_event_id,
+        stored_committed_at_ms,
+        &envelope,
+    )?;
+    let Some(run_id) = envelope.run_id else {
+        return Ok(None);
+    };
+    match decode_payload::<EventPayload>(&envelope.payload) {
+        Ok(EventPayload::RunFailed { code, .. }) => Ok(Some((run_id, code))),
+        _ => Ok(None),
+    }
 }
 
 fn validate_worker_run_transitions(
@@ -20869,6 +21462,11 @@ fn validate_worker_run_transitions(
             .and_then(serde_json::Value::as_str);
         let supplemental_project_instructions = kind == Some("project_instructions_loaded")
             && decode_payload::<ProjectInstructionsEventPayload>(&envelope.payload).is_ok();
+        let supplemental_workspace_unavailable = kind == Some("workspace_unavailable")
+            && matches!(
+                decode_payload::<WorkspaceEventPayload>(&envelope.payload),
+                Ok(WorkspaceEventPayload::WorkspaceUnavailable(_))
+            );
         let supplemental_computer_permission =
             matches!(
                 kind,
@@ -20886,6 +21484,7 @@ fn validate_worker_run_transitions(
             );
         let Some(run_id) = envelope.run_id.as_ref() else {
             if supplemental_project_instructions
+                || supplemental_workspace_unavailable
                 || supplemental_computer_permission
                 || supplemental_run_budget
                 || supplemental_run_deadline
@@ -20899,6 +21498,7 @@ fn validate_worker_run_transitions(
             continue;
         };
         if (supplemental_project_instructions
+            || supplemental_workspace_unavailable
             || supplemental_computer_permission
             || supplemental_run_budget
             || supplemental_run_deadline)
@@ -20911,7 +21511,7 @@ fn validate_worker_run_transitions(
             ));
         }
         if supplemental_run_budget
-            && !durable_headless_run_facts(transaction, session_id, run_id)?.0
+            && !durable_headless_run_facts(transaction, session_id, run_id)?.configured
         {
             return Err(store_error(
                 ErrorCode::InvalidArgument,
@@ -20923,6 +21523,7 @@ fn validate_worker_run_transitions(
             Ok(payload) => Some(payload),
             Err(_)
                 if supplemental_project_instructions
+                    || supplemental_workspace_unavailable
                     || supplemental_computer_permission
                     || supplemental_run_budget =>
             {
@@ -20981,9 +21582,8 @@ fn validate_worker_run_transitions(
                 && next == RunState::Errored
                 && budget_terminal_runs.contains(run_id)
             {
-                let (configured, budget_exhausted) =
-                    durable_headless_run_facts(transaction, session_id, run_id)?;
-                configured && budget_exhausted
+                let facts = durable_headless_run_facts(transaction, session_id, run_id)?;
+                facts.configured && facts.budget_exhausted
             } else {
                 false
             };
@@ -22405,6 +23005,17 @@ fn append_fork_boundary_closures(
     // Run activity is reduced per agent lane. A terminal observation in one
     // lane says nothing about another lane that happens to share the run id.
     let mut run_states = HashMap::<(RunId, Option<AgentId>), RunState>::new();
+    let headless_runs = envelopes
+        .iter()
+        .filter_map(|envelope| {
+            matches!(
+                HeadlessRunEventPayload::from_payload_value(&envelope.payload),
+                Some(HeadlessRunEventPayload::HeadlessRunConfigured(_))
+            )
+            .then(|| envelope.run_id.clone())
+            .flatten()
+        })
+        .collect::<HashSet<_>>();
     for envelope in envelopes.iter() {
         if let Some(run_id) = envelope.run_id.clone()
             && let Ok(EventPayload::RunState(state)) =
@@ -22421,6 +23032,29 @@ fn append_fork_boundary_closures(
             .map_err(|_| corrupt("forked journal is too large"))?
             .checked_add(1)
             .ok_or_else(|| corrupt("forked journal sequence space is exhausted"))?;
+        let mut payload = RawPayload::from_event(EventPayload::RunState(RunState::Cancelled))
+            .map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot serialize fork run boundary: {error}"),
+                    false,
+                )
+            })?;
+        if headless_runs.contains(&run_id) {
+            payload
+                .as_object_mut()
+                .ok_or_else(|| {
+                    store_error(
+                        ErrorCode::Internal,
+                        "typed fork run-state payload is not an object",
+                        false,
+                    )
+                })?
+                .insert(
+                    "terminal_kind".into(),
+                    serde_json::Value::String("cancellation".into()),
+                );
+        }
         let envelope = EventEnvelope {
             schema_version: SCHEMA_VERSION,
             event_id: fork_run_boundary_event_id(session_id, &run_id, agent_id.as_ref()),
@@ -22440,15 +23074,7 @@ fn append_fork_boundary_closures(
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload: RawPayload::from_event(EventPayload::RunState(RunState::Cancelled)).map_err(
-                |error| {
-                    store_error(
-                        ErrorCode::InvalidArgument,
-                        format!("cannot serialize fork run boundary: {error}"),
-                        false,
-                    )
-                },
-            )?,
+            payload,
         };
         envelopes.push(envelope);
     }
@@ -23319,6 +23945,14 @@ fn canonicalize_reply_page(envelopes: &mut [RawEnvelope]) {
         Some((scope.clone(), lane, text.len(), text.arena_digest()?))
     }
 
+    fn writer_for(lane: u8) -> ReplyArenaWriter {
+        if lane == 0 {
+            ReplyArenaWriter::new().with_standard_provider_json_views()
+        } else {
+            ReplyArenaWriter::new()
+        }
+    }
+
     let mut active = HashMap::<ActiveKey, (u8, ReplyArenaWriter)>::new();
     let mut completed = HashMap::<CompletedKey, ReplyText>::new();
     for envelope in envelopes {
@@ -23335,7 +23969,7 @@ fn canonicalize_reply_page(envelopes: &mut [RawEnvelope]) {
                 let Some((lane, text)) = lane(&item) else {
                     continue;
                 };
-                let mut writer = ReplyArenaWriter::new();
+                let mut writer = writer_for(lane);
                 let range = writer.append_shared(text);
                 active.insert((scope, item_id), (lane, writer));
                 Some(range)
@@ -23348,7 +23982,7 @@ fn canonicalize_reply_page(envelopes: &mut [RawEnvelope]) {
                 };
                 let (_, writer) = active
                     .entry((scope, item_id))
-                    .or_insert_with(|| (inferred_lane, ReplyArenaWriter::new()));
+                    .or_insert_with(|| (inferred_lane, writer_for(inferred_lane)));
                 Some(writer.append_shared(text))
             }
             EventPayload::Item(ItemEvent::Completed { item_id, item }) => {
@@ -25630,7 +26264,7 @@ mod run_head_projection_tests {
 
     /// MUTATION CHECK: remove one projected run from `expected` or change its
     /// state. Expected runtime failure on both passes: exact equality proves
-    /// v23's run-head backfill remains untouched through v27 and reopen.
+    /// v23's run-head backfill remains untouched through v28 and reopen.
     #[test]
     fn store_open_migrates_and_backfills_a_v22_journal_idempotently() {
         let root = tempfile::tempdir().expect("profile");
@@ -25646,7 +26280,10 @@ mod run_head_projection_tests {
         }
         let raw = Connection::open(&database_path).expect("open raw v22 fixture");
         raw.execute_batch(
-            "DROP TABLE checkpoints;
+            "DROP TABLE workspace_unavailable_runs;
+             ALTER TABLE hook_dispatch_outbox DROP COLUMN workspace_unavailable;
+             ALTER TABLE hook_dispatch_outbox DROP COLUMN run_id;
+             DROP TABLE checkpoints;
              DROP TABLE loom_registry_events;
              DROP TABLE loom_agent_type_revisions;
              ALTER TABLE loom_agent_types DROP COLUMN archived;
@@ -25670,7 +26307,7 @@ mod run_head_projection_tests {
 
         for pass in 0..2 {
             let store = Store::open(root.path()).expect("migrate v22 store");
-            assert_eq!(store.schema_version().expect("schema version"), 27);
+            assert_eq!(store.schema_version().expect("schema version"), 28);
             let connection = store.connection().expect("migrated journal connection");
             assert_eq!(
                 load_projected_run_heads(&connection, &SessionId::new("run-head-session"))

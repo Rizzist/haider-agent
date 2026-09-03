@@ -4,9 +4,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::provider::{
-    Block, CacheStatAvailability, FinishReason, NormalizedUsage, ReasoningAccounting, StreamEvent,
-    Usage, UsageSource, WebSource,
+    Block, CacheStatAvailability, FinishReason, NormalizedUsage, ProviderOpaqueData,
+    ReasoningAccounting, StreamEvent, Usage, UsageSource, WebSource,
 };
+use haider_protocol::reply::ReplyArenaWriter;
 use haider_protocol::tool::AttachmentBlock;
 use serde::Deserialize;
 
@@ -41,6 +42,15 @@ pub(crate) enum AnthropicSystemShape {
     OAuthClaudeCode,
 }
 
+struct RequestJsonOptions<'a> {
+    system_shape: AnthropicSystemShape,
+    effort: Option<&'a str>,
+    fast: bool,
+    web_tools: bool,
+    cache_ttl: Option<crate::AnthropicCacheTtl>,
+    bind_large_replies: bool,
+}
+
 pub(crate) fn request_json(
     request: &TurnRequest,
     tools: &[crate::ToolDefinition],
@@ -53,12 +63,14 @@ pub(crate) fn request_json(
     request_json_inner(
         request,
         tools,
-        system_shape,
-        effort,
-        fast,
-        web_tools,
-        cache_ttl,
-        false,
+        RequestJsonOptions {
+            system_shape,
+            effort,
+            fast,
+            web_tools,
+            cache_ttl,
+            bind_large_replies: false,
+        },
     )
     .map(|(payload, _)| payload)
 }
@@ -75,25 +87,30 @@ pub(crate) fn request_json_with_reply_bindings(
     request_json_inner(
         request,
         tools,
-        system_shape,
-        effort,
-        fast,
-        web_tools,
-        cache_ttl,
-        true,
+        RequestJsonOptions {
+            system_shape,
+            effort,
+            fast,
+            web_tools,
+            cache_ttl,
+            bind_large_replies: true,
+        },
     )
 }
 
 fn request_json_inner(
     request: &TurnRequest,
     tools: &[crate::ToolDefinition],
-    system_shape: AnthropicSystemShape,
-    effort: Option<&str>,
-    fast: bool,
-    web_tools: bool,
-    cache_ttl: Option<crate::AnthropicCacheTtl>,
-    bind_large_replies: bool,
+    options: RequestJsonOptions<'_>,
 ) -> Result<(serde_json::Value, Vec<crate::PreparedReplyBinding>), ProviderError> {
+    let RequestJsonOptions {
+        system_shape,
+        effort,
+        fast,
+        web_tools,
+        cache_ttl,
+        bind_large_replies,
+    } = options;
     let attachments = attachment_index(request)?;
     let mut reply_bindings = Vec::new();
     let native_computer = crate::anthropic::anthropic_computer_tool_version(&request.model)
@@ -634,14 +651,19 @@ fn message_content(
     reply_bindings: &mut Vec<crate::PreparedReplyBinding>,
 ) -> Result<Vec<serde_json::Value>, ProviderError> {
     let mut content = Vec::with_capacity(blocks.len());
+    let mut normalized_text = Vec::<haider_protocol::reply::ReplyText>::new();
     for block in blocks {
         if role == MessageRole::Assistant
             && let Block::ProviderOpaque { provider, data } = block
             && provider == crate::ANTHROPIC_PROVIDER_NAME
             && data.get("type").and_then(serde_json::Value::as_str) == Some("text")
         {
-            consume_normalized_text_for_signed_block(&mut content, data)?;
-            content.push(data.clone());
+            consume_normalized_text_for_signed_block(&mut content, &mut normalized_text, data)?;
+            content.push(crate::provider_opaque_json_value(
+                data,
+                bind_large_replies,
+                reply_bindings,
+            )?);
             continue;
         }
         content.push(content_block(
@@ -652,6 +674,11 @@ fn message_content(
             bind_large_replies,
             reply_bindings,
         )?);
+        if role == MessageRole::Assistant
+            && let Block::Text { text } = block
+        {
+            normalized_text.push(text.clone());
+        }
     }
     Ok(content)
 }
@@ -664,8 +691,45 @@ fn message_content(
 /// the capture disagrees with normalized history and is refused.
 fn consume_normalized_text_for_signed_block(
     content: &mut Vec<serde_json::Value>,
-    data: &serde_json::Value,
+    normalized_text: &mut Vec<haider_protocol::reply::ReplyText>,
+    data: &ProviderOpaqueData,
 ) -> Result<(), ProviderError> {
+    if let Some(expected) = data.reply_text() {
+        let mut consumed = None::<haider_protocol::reply::ReplyText>;
+        while consumed.as_ref() != Some(expected) {
+            let piece = normalized_text.pop().ok_or_else(|| {
+                invalid_request("Anthropic citation-signed text disagrees with normalized history")
+            })?;
+            let candidate = match consumed.take() {
+                None => piece,
+                Some(suffix) => piece.try_join(&suffix).ok_or_else(|| {
+                    invalid_request(
+                        "Anthropic citation-signed text does not share canonical reply storage",
+                    )
+                })?,
+            };
+            if candidate.len() > expected.len()
+                || !candidate
+                    .segments()
+                    .iter()
+                    .flat_map(|segment| segment.iter())
+                    .copied()
+                    .eq(expected
+                        .segments()
+                        .iter()
+                        .flat_map(|segment| segment.iter())
+                        .copied()
+                        .skip(expected.len().saturating_sub(candidate.len())))
+            {
+                return Err(invalid_request(
+                    "Anthropic citation-signed text disagrees with normalized history",
+                ));
+            }
+            content.pop();
+            consumed = Some(candidate);
+        }
+        return Ok(());
+    }
     let expected = data
         .get("text")
         .and_then(serde_json::Value::as_str)
@@ -844,7 +908,7 @@ fn content_block(
             "skill attachment `{name}` was not resolved by the prompt compiler"
         ))),
         Block::ProviderOpaque { provider, data } if provider == "anthropic" && data.is_object() => {
-            Ok(data.clone())
+            crate::provider_opaque_json_value(data, bind_large_replies, reply_bindings)
         }
         Block::ProviderOpaque { provider, .. } if provider == "anthropic" => Err(invalid_request(
             "Anthropic provider-opaque content block must be a JSON object",
@@ -1090,11 +1154,14 @@ impl StreamState {
                 }
                 let (block, item) = match content_block {
                     WireContentBlock::Text { text } => {
-                        let item = (!text.is_empty())
-                            .then(|| StreamEvent::TextDelta { text: text.clone() });
+                        let mut writer =
+                            ReplyArenaWriter::new().with_standard_provider_json_views();
+                        let item = (!text.is_empty()).then(|| StreamEvent::TextDelta {
+                            text: writer.append(text),
+                        });
                         (
                             OpenBlock::Text {
-                                text,
+                                text: writer,
                                 citations: Vec::new(),
                             },
                             item,
@@ -1164,13 +1231,20 @@ impl StreamState {
                     // signature for verbatim tool-loop replay. Display law is
                     // unchanged — only DELTAS are emitted as ReasoningDelta;
                     // the start content merely seeds the replay accumulator.
-                    WireContentBlock::Thinking { thinking } => (
-                        OpenBlock::Thinking {
-                            thinking,
-                            signature: String::new(),
-                        },
-                        None,
-                    ),
+                    WireContentBlock::Thinking { thinking } => {
+                        let mut writer =
+                            ReplyArenaWriter::new().with_standard_provider_json_views();
+                        if !thinking.is_empty() {
+                            let _ = writer.append(thinking);
+                        }
+                        (
+                            OpenBlock::Thinking {
+                                thinking: writer,
+                                signature: String::new(),
+                            },
+                            None,
+                        )
+                    }
                     WireContentBlock::RedactedThinking { data } => {
                         (OpenBlock::Redacted { data }, None)
                     }
@@ -1191,8 +1265,9 @@ impl StreamState {
                 })?;
                 match (block, delta) {
                     (OpenBlock::Text { text: accum, .. }, WireDelta::Text { text }) => {
-                        accum.push_str(&text);
-                        Ok(vec![StreamEvent::TextDelta { text }])
+                        Ok(vec![StreamEvent::TextDelta {
+                            text: accum.append(text),
+                        }])
                     }
                     // W-B: citation fragments accumulate on their text block
                     // for verbatim replay; they are not display deltas.
@@ -1236,10 +1311,9 @@ impl StreamState {
                     (
                         OpenBlock::Thinking { thinking, .. },
                         WireDelta::Thinking { thinking: delta },
-                    ) => {
-                        thinking.push_str(&delta);
-                        Ok(vec![StreamEvent::ReasoningDelta { text: delta }])
-                    }
+                    ) => Ok(vec![StreamEvent::ReasoningDelta {
+                        text: thinking.append(delta),
+                    }]),
                     // signature_delta fragments ACCUMULATE (LT1): the block's
                     // replayable signature is their concatenation.
                     (
@@ -1317,7 +1391,7 @@ impl StreamState {
                         Ok(vec![
                             StreamEvent::ProviderOpaque {
                                 provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
-                                data: serde_json::Value::Object(raw),
+                                data: serde_json::Value::Object(raw).into(),
                             },
                             StreamEvent::ServerToolUse {
                                 call_id: id,
@@ -1350,7 +1424,7 @@ impl StreamState {
                         Ok(vec![
                             StreamEvent::ProviderOpaque {
                                 provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
-                                data: serde_json::Value::Object(raw),
+                                data: serde_json::Value::Object(raw).into(),
                             },
                             StreamEvent::ServerToolResult {
                                 call_id: tool_use_id,
@@ -1368,17 +1442,28 @@ impl StreamState {
                     Some(OpenBlock::Thinking {
                         thinking,
                         signature,
-                    }) => Ok((!signature.is_empty())
-                        .then(|| StreamEvent::ProviderOpaque {
-                            provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
-                            data: serde_json::json!({
+                    }) => {
+                        let thinking = thinking.seal();
+                        if signature.is_empty() {
+                            return Ok(Vec::new());
+                        }
+                        let data = ProviderOpaqueData::with_reply(
+                            serde_json::json!({
                                 "type": "thinking",
-                                "thinking": thinking,
+                                "thinking": "__haider_anthropic_thinking_reply__",
                                 "signature": signature,
                             }),
-                        })
-                        .into_iter()
-                        .collect()),
+                            "__haider_anthropic_thinking_reply__",
+                            thinking,
+                        )
+                        .ok_or_else(|| {
+                            malformed("Anthropic thinking template lost its reply marker")
+                        })?;
+                        Ok(vec![StreamEvent::ProviderOpaque {
+                            provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
+                            data,
+                        }])
+                    }
                     // redacted_thinking replays as-is; the classic bug this
                     // pins against is filtering `type == "thinking"` and
                     // dropping these (a live 400).
@@ -1388,7 +1473,8 @@ impl StreamState {
                             data: serde_json::json!({
                                 "type": "redacted_thinking",
                                 "data": data,
-                            }),
+                            })
+                            .into(),
                         })
                         .into_iter()
                         .collect()),
@@ -1398,17 +1484,26 @@ impl StreamState {
                     // cites surface for display. A plain text block captures
                     // nothing — today's behavior.
                     Some(OpenBlock::Text { text, citations }) => {
+                        let text = text.seal();
                         if citations.is_empty() {
                             return Ok(Vec::new());
                         }
                         let sources = citation_sources(&citations);
-                        let mut events = vec![StreamEvent::ProviderOpaque {
-                            provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
-                            data: serde_json::json!({
+                        let data = ProviderOpaqueData::with_reply(
+                            serde_json::json!({
                                 "type": "text",
-                                "text": text,
+                                "text": "__haider_anthropic_text_reply__",
                                 "citations": citations,
                             }),
+                            "__haider_anthropic_text_reply__",
+                            text,
+                        )
+                        .ok_or_else(|| {
+                            malformed("Anthropic citation template lost its reply marker")
+                        })?;
+                        let mut events = vec![StreamEvent::ProviderOpaque {
+                            provider: crate::ANTHROPIC_PROVIDER_NAME.into(),
+                            data,
                         }];
                         if !sources.is_empty() {
                             events.push(StreamEvent::WebSources { sources });
@@ -1604,7 +1699,7 @@ enum OpenBlock {
     /// Text accumulates its characters and any citation fragments (W-B): a
     /// citation-carrying block must replay verbatim, encrypted_index and all.
     Text {
-        text: String,
+        text: ReplyArenaWriter,
         citations: Vec<serde_json::Value>,
     },
     Tool {
@@ -1630,7 +1725,7 @@ enum OpenBlock {
     },
     /// Thinking accumulates text + signature for verbatim replay (G3/LT1).
     Thinking {
-        thinking: String,
+        thinking: ReplyArenaWriter,
         signature: String,
     },
     /// redacted_thinking carries its encrypted payload from the start event.

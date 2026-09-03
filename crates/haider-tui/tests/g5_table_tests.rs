@@ -501,7 +501,7 @@ fn feed_message(model: &mut AppModel, chunks: &[&str], complete: bool) {
         &EventPayload::Item(ItemEvent::Started {
             item_id: item.clone(),
             item: TurnItem::AgentMessage {
-                text: String::new(),
+                text: String::new().into(),
             },
         }),
     ));
@@ -512,7 +512,7 @@ fn feed_message(model: &mut AppModel, chunks: &[&str], complete: bool) {
             &EventPayload::Item(ItemEvent::Delta {
                 item_id: item.clone(),
                 delta: ItemDelta::Text {
-                    text: (*chunk).to_owned(),
+                    text: (*chunk).to_owned().into(),
                 },
             }),
         ));
@@ -524,7 +524,7 @@ fn feed_message(model: &mut AppModel, chunks: &[&str], complete: bool) {
             &EventPayload::Item(ItemEvent::Completed {
                 item_id: item,
                 item: TurnItem::AgentMessage {
-                    text: chunks.concat(),
+                    text: chunks.concat().into(),
                 },
             }),
         ));

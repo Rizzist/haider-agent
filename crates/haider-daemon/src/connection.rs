@@ -40,8 +40,8 @@ mod connection_duplex_tests;
 mod connection_tests;
 
 use crate::session_hub::{
-    AdmissionTicket, FrameSendError, FrameSink, HubConnection, PreparedFrame, SendAdmission,
-    SessionHub,
+    AdmissionTicket, DaemonRuntimeView, FrameSendError, FrameSink, HubConnection, PreparedFrame,
+    SendAdmission, SessionHub,
 };
 use crate::{DaemonError, ShutdownHandle};
 use haider_client::DAEMON_STOP_CLIENT_NAME;
@@ -1246,6 +1246,8 @@ pub(crate) struct ConnectionContext {
     pub(crate) idle_ttl_ms: Option<u64>,
     /// True only when pre-ready boot work remains resident for the first client.
     pub(crate) warm: bool,
+    /// Shared positive-readiness predicate used by status and the launcher.
+    pub(crate) readiness: crate::Readiness,
 }
 
 /// Runs one client connection to completion: UID gate, framed read loop,
@@ -1809,7 +1811,7 @@ where
             writer.write_all(b"\"").await?;
             for segment in text.segments() {
                 let segment = std::str::from_utf8(&segment)
-                    .expect("reply arena segments originate from UTF-8 strings");
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
                 let mut start = 0;
                 while start < segment.len() {
                     let mut end = start.saturating_add(16 * 1_024).min(segment.len());
@@ -1827,9 +1829,7 @@ where
         haider_rpc::WireEncoding::MessagePack => {
             let len = text.len();
             if len < 32 {
-                writer
-                    .write_all(&[0xa0 | u8::try_from(len).expect("fixstr length")])
-                    .await?;
+                writer.write_all(&[0xa0 | len as u8]).await?;
             } else if let Ok(len) = u8::try_from(len) {
                 writer.write_all(&[0xd9, len]).await?;
             } else if let Ok(len) = u16::try_from(len) {
@@ -1898,9 +1898,12 @@ async fn handle_frame(
                         granted.capabilities.clone(),
                         sink,
                         crate::accounts::ConnectionTransport::LocalSameUid,
-                        Some((context.endpoint_path.clone(), context.pid_file_path.clone())),
-                        context.idle_ttl_ms,
-                        context.warm,
+                        Some(DaemonRuntimeView {
+                            paths: (context.endpoint_path.clone(), context.pid_file_path.clone()),
+                            idle_ttl_ms: context.idle_ttl_ms,
+                            warm: context.warm,
+                            readiness: context.readiness.clone(),
+                        }),
                     )
                     .map_err(DaemonError::from)?,
             );
@@ -2069,8 +2072,8 @@ async fn handle_frame(
 
 /// Version/capability negotiation via haider-rpc, answered with a `Welcome`
 /// carrying instance id, daemon generation, frame limit, and the honest
-/// lifecycle phase (`Draining` once the drain broadcast fired, else `Ready` —
-/// connections are only accepted between those two states).
+/// lifecycle phase (`Draining` once the drain broadcast fired; otherwise the
+/// same positive readiness predicate used by status and the launcher).
 fn negotiate_hello(
     hello: Hello,
     context: &ConnectionContext,
@@ -2099,8 +2102,10 @@ fn negotiate_hello(
     };
     let lifecycle_phase = if drain.borrow().is_some() {
         LifecyclePhase::Draining
-    } else {
+    } else if context.readiness.snapshot().ready {
         LifecyclePhase::Ready
+    } else {
+        context.readiness.current().phase()
     };
     if lifecycle_phase == LifecyclePhase::Draining
         && hello.client_name == DAEMON_STOP_CLIENT_NAME
@@ -2307,6 +2312,7 @@ fn welcome_features() -> BTreeSet<String> {
         haider_rpc::FEATURE_SESSION_CREATE_ADMISSION_V1.to_owned(),
         FEATURE_SESSION_MUTATION_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_RENAME_V1.to_owned(),
+        haider_rpc::FEATURE_SESSION_WORKSPACE_SET_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_SEEN_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_NEEDS_INPUT_V1.to_owned(),
         haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1.to_owned(),

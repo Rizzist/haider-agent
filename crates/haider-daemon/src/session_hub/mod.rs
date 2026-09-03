@@ -126,17 +126,18 @@ use haider_core::{
     PromptHistoryCache, ProviderViewAppendOutcome, ProviderViewAppendRequest, QueueConsumeCommand,
     QueueConsumeOutcome, QueuePromoteCommand, QueuePromoteOutcome, QueueRemoveCommand,
     QueueRemoveOutcome, QueueSnapshot, RenamedSession, RunRetryCommand, RunRetryOutcome,
-    SeenSession, SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel,
+    SeenSession, SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel, SelectedWorkspace,
     SessionCreateCommand, SessionCreateOutcome, SessionForkCommand, SessionForkOutcome,
     SessionMetaforkCommit, SessionProjectionCheckpoint, SessionPromptForkCommand,
     SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
     SessionSelectAgentTypeCommand, SessionSelectAgentTypeOutcome, SessionSelectEffortCommand,
     SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
-    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, SwitchedGraph, TurnAcceptCommand,
-    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
-    TurnCancellationStatus, TurnTraceContext, envelopes_contain_terminal, register_turn_trace,
-    turn_trace_for_envelopes, turn_trace_ordinal, unregister_turn_trace_for_envelopes,
+    SessionSelectModelCommand, SessionSelectModelOutcome, SessionWorkspaceSetCommand,
+    SessionWorkspaceSetOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
+    StoreHandle, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
+    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus, TurnTraceContext,
+    envelopes_contain_terminal, register_turn_trace, turn_trace_for_envelopes, turn_trace_ordinal,
+    unregister_turn_trace_for_envelopes,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::agent::AgentManifest;
@@ -1858,6 +1859,10 @@ enum ActorCommand {
         command: SessionRenameCommand,
         completed: oneshot::Sender<Result<SessionRenameOutcome, HaiderError>>,
     },
+    SetWorkspace {
+        command: SessionWorkspaceSetCommand,
+        completed: oneshot::Sender<Result<SessionWorkspaceSetOutcome, HaiderError>>,
+    },
     Seen {
         command: SessionSeenCommand,
         completed: oneshot::Sender<Result<SessionSeenOutcome, HaiderError>>,
@@ -2016,6 +2021,14 @@ enum ActorCommand {
     Stop,
 }
 
+#[derive(Clone)]
+pub(crate) struct DaemonRuntimeView {
+    pub(crate) paths: (std::path::PathBuf, std::path::PathBuf),
+    pub(crate) idle_ttl_ms: Option<u64>,
+    pub(crate) warm: bool,
+    pub(crate) readiness: crate::Readiness,
+}
+
 /// One negotiated connection's authorization and attachment ownership.
 pub struct HubConnection {
     hub: SessionHub,
@@ -2030,6 +2043,7 @@ pub struct HubConnection {
     runtime_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     daemon_idle_ttl_ms: Option<u64>,
     daemon_warm: bool,
+    daemon_readiness: Option<crate::Readiness>,
     /// Connection-scoped staged secrets (R7): wiped on close/disconnect.
     stages: Mutex<crate::accounts::StagedSecrets>,
     /// At most one connection-scoped roster ticker. The task owns no
@@ -4389,7 +4403,7 @@ impl SessionHub {
         sink: Arc<dyn FrameSink>,
         transport: crate::accounts::ConnectionTransport,
     ) -> Result<HubConnection, SessionHubError> {
-        self.open_connection_with_runtime_paths(capabilities, sink, transport, None, None, false)
+        self.open_connection_with_runtime_paths(capabilities, sink, transport, None)
     }
 
     pub(crate) fn open_connection_with_runtime_paths(
@@ -4397,14 +4411,21 @@ impl SessionHub {
         capabilities: CapabilitySet,
         sink: Arc<dyn FrameSink>,
         transport: crate::accounts::ConnectionTransport,
-        runtime_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
-        daemon_idle_ttl_ms: Option<u64>,
-        daemon_warm: bool,
+        runtime: Option<DaemonRuntimeView>,
     ) -> Result<HubConnection, SessionHubError> {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(SessionHubError::Closed);
         }
         let connection_id = random_id("connection")?;
+        let (runtime_paths, daemon_idle_ttl_ms, daemon_warm, daemon_readiness) = match runtime {
+            Some(runtime) => (
+                Some(runtime.paths),
+                runtime.idle_ttl_ms,
+                runtime.warm,
+                Some(runtime.readiness),
+            ),
+            None => (None, None, false, None),
+        };
         let may_view_binding =
             capabilities.contains(&Capability::View) || capabilities.contains(&Capability::Control);
         // The state lock spans registration and baseline admission. A
@@ -4464,6 +4485,7 @@ impl SessionHub {
             runtime_paths,
             daemon_idle_ttl_ms,
             daemon_warm,
+            daemon_readiness,
             stages: Mutex::new(crate::accounts::StagedSecrets::default()),
             roster_watch: Mutex::new(None),
             accounts_watch: Mutex::new(None),
@@ -5025,6 +5047,40 @@ impl SessionHub {
         actor
             .commands
             .send(ActorCommand::Rename { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn session_workspace_set_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<SelectedWorkspace>, SessionHubError> {
+        self.inner
+            .store
+            .session_workspace_set_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn set_session_workspace(
+        &self,
+        command: SessionWorkspaceSetCommand,
+    ) -> Result<SessionWorkspaceSetOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::SetWorkspace { command, completed })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result

@@ -267,21 +267,26 @@ impl FileCas {
     }
 
     /// Streams one already-addressed member of a provider-view durability
-    /// group. The bytes are re-hashed as they are written, so a segmented
-    /// source cannot publish under a stale or dishonest address.
+    /// group. The adapter supplies the incrementally finalized address; this
+    /// seam verifies the exact byte length while writing and never re-hashes
+    /// the completed reply.
     pub(crate) fn put_batched_stream(
         &self,
         expected: &ArtifactRef,
+        expected_len: u64,
         write_source: impl FnOnce(&mut dyn Write) -> std::io::Result<()>,
     ) -> StoreResult<ArtifactRef> {
-        struct HashingWriter<'a> {
+        struct CountingWriter<'a> {
             file: &'a mut File,
-            hasher: blake3::Hasher,
+            byte_len: u64,
         }
-        impl Write for HashingWriter<'_> {
+        impl Write for CountingWriter<'_> {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 self.file.write_all(bytes)?;
-                self.hasher.update(bytes);
+                self.byte_len = self
+                    .byte_len
+                    .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                    .ok_or_else(|| std::io::Error::other("streamed CAS byte length overflow"))?;
                 Ok(bytes.len())
             }
 
@@ -304,22 +309,23 @@ impl FileCas {
         fs::create_dir_all(parent).map_err(|error| io_error("create CAS shard", parent, error))?;
         let (mut temporary_path, mut temporary) = create_temporary(parent)?;
         let write_result = (|| {
-            let mut writer = HashingWriter {
-                file: &mut temporary,
-                hasher: blake3::Hasher::new(),
+            let actual_len = {
+                let mut writer = CountingWriter {
+                    file: &mut temporary,
+                    byte_len: 0,
+                };
+                write_source(&mut writer).map_err(|error| {
+                    io_error("persist temporary CAS object", temporary_path.path(), error)
+                })?;
+                writer.flush().map_err(|error| {
+                    io_error("flush temporary CAS object", temporary_path.path(), error)
+                })?;
+                writer.byte_len
             };
-            write_source(&mut writer).map_err(|error| {
-                io_error("persist temporary CAS object", temporary_path.path(), error)
-            })?;
-            writer.flush().map_err(|error| {
-                io_error("flush temporary CAS object", temporary_path.path(), error)
-            })?;
-            let actual = ArtifactRef::new(format!("blake3:{}", writer.hasher.finalize().to_hex()));
-            drop(writer);
-            if actual != *expected {
+            if actual_len != expected_len {
                 return Err(store_error(
                     ErrorCode::InvalidArgument,
-                    "streamed CAS bytes do not match their provider-view content address",
+                    "streamed CAS bytes do not match their provider-view byte length",
                     false,
                 ));
             }

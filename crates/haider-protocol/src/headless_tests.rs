@@ -1,6 +1,10 @@
 #![allow(clippy::expect_used)]
 
-use super::{RunBudgetDecisionReasonV1, RunBudgetDecisionV1, RunBudgetExhaustedV1};
+use super::{
+    RunBudgetDecisionReasonV1, RunBudgetDecisionV1, RunBudgetExhaustedV1, durable_run_terminal_v1,
+};
+use crate::error::ErrorCode;
+use crate::state::RunState;
 
 /// MUTATION CHECK: make the additive decision field required. Stored
 /// pre-decision budget events must remain readable after this extension.
@@ -64,4 +68,45 @@ fn budget_decision_preserves_unknown_pricing_without_guessing() {
     assert!(summary.contains("cap 10"));
     assert!(summary.contains("fake"));
     assert!(summary.contains("unpriced-model"));
+}
+
+/// MUTATION CHECK: classify a cancellation triggered by durable blocking input
+/// as ordinary cancellation, or let a later generic failure replace the first
+/// blocking cause. The retained live terminal would change shape.
+#[test]
+fn durable_terminal_classifier_preserves_blocked_cancellation_and_cause_precedence() {
+    assert!(durable_run_terminal_v1(RunState::Thinking, None, false, false, None).is_none());
+    assert_eq!(
+        durable_run_terminal_v1(
+            RunState::Cancelled,
+            None,
+            false,
+            false,
+            Some("input_required")
+        ),
+        Some(super::DurableRunTerminalV1 {
+            terminal_kind: "failure",
+            error_code: Some("input_required"),
+        })
+    );
+    assert_eq!(
+        durable_run_terminal_v1(
+            RunState::Errored,
+            Some(ErrorCode::Internal),
+            false,
+            false,
+            Some("effect_outcome_unknown")
+        ),
+        Some(super::DurableRunTerminalV1 {
+            terminal_kind: "failure",
+            error_code: Some("effect_outcome_unknown"),
+        })
+    );
+    assert_eq!(
+        durable_run_terminal_v1(RunState::Cancelled, None, false, true, None),
+        Some(super::DurableRunTerminalV1 {
+            terminal_kind: "timeout",
+            error_code: Some("timeout"),
+        })
+    );
 }

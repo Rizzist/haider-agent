@@ -4651,6 +4651,42 @@ impl HubConnection {
                 self.session_rename(request_id, command_id, session_id, worker_generation, title)
                     .await
             }
+            RequestBody::SessionWorkspaceSet {
+                command_id,
+                session_id,
+                worker_generation,
+                path,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "workspace selection requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.session_workspace_set(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    path,
+                )
+                .await
+            }
             RequestBody::SessionSeen {
                 command_id,
                 session_id,
@@ -7275,6 +7311,7 @@ impl HubConnection {
                 runtime_paths: None,
                 daemon_idle_ttl_ms: self.daemon_idle_ttl_ms,
                 daemon_warm: self.daemon_warm,
+                daemon_readiness: self.daemon_readiness.clone(),
                 stages: Mutex::new(crate::accounts::StagedSecrets::default()),
                 roster_watch: Mutex::new(None),
                 accounts_watch: Mutex::new(None),
@@ -11187,6 +11224,133 @@ impl HubConnection {
                 title: renamed.title,
                 renamed_seq: renamed.renamed_seq,
                 worker_generation: renamed.worker_generation,
+            },
+        })
+    }
+
+    /// Receipt-backed workspace replacement. Receipt replay deliberately
+    /// precedes filesystem validation so a committed response remains
+    /// recoverable even if the selected path later disappears.
+    async fn session_workspace_set(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        path: String,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "workspace selection needs a command id",
+                false,
+                None,
+            );
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+            "path": &path,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!("cannot encode workspace-set coordinates: {error}"))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        match self
+            .hub
+            .session_workspace_set_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(selected)) => return self.respond_workspace_selected(request_id, selected),
+            Ok(None) => {}
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+
+        if worker_generation != self.hub.inner.store.worker_generation() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_STALE_GENERATION,
+                "workspace selection worker generation is stale",
+                false,
+                None,
+            );
+        }
+        // A workspace is an effect-authority boundary. Serialize this idle
+        // check and commit against turn admission so no old-root broker can
+        // outlive the workspace-selected fact.
+        let _workspace_selection = self.hub.lock_workflow_selection(&session_id).await;
+        match self.hub.session_has_nonterminal_runs(&session_id).await {
+            Ok(false) => {}
+            Ok(true) => {
+                return self.respond_error(
+                    request_id,
+                    haider_rpc::ERROR_CODE_BUSY,
+                    "workspace selection requires an idle session; retry after the active turn completes",
+                    true,
+                    None,
+                );
+            }
+            Err(error) => return self.respond_turn_error(request_id, error),
+        }
+
+        let validated = match validate_workspace(path).await {
+            Ok(validated) => validated,
+            Err(message) => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    &message,
+                    false,
+                    None,
+                );
+            }
+        };
+        let ValidatedWorkspace {
+            canonical: path,
+            descriptor: workspace_descriptor,
+        } = validated;
+        let command = SessionWorkspaceSetCommand {
+            command_id: command_id.0,
+            request_digest,
+            request_json,
+            session_id,
+            worker_generation,
+            path,
+            event_id: EventId::new(random_id("workspace-selected")?),
+            device_id: self.hub.inner.device_id.clone(),
+        };
+        let selected = match self.hub.set_session_workspace(command).await {
+            Ok(SessionWorkspaceSetOutcome::Committed { selected, .. })
+            | Ok(SessionWorkspaceSetOutcome::IdempotentReplay { selected }) => selected,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        // Keep the exact validated directory identity alive across the
+        // actor/store commit. The stored path is still re-probed at attach and
+        // turn start; this handle preserves the validated object for the
+        // selection transaction rather than claiming to pin its pathname.
+        drop(workspace_descriptor);
+        self.respond_workspace_selected(request_id, selected)
+    }
+
+    fn respond_workspace_selected(
+        &self,
+        request_id: RequestId,
+        selected: SelectedWorkspace,
+    ) -> Result<(), SessionHubError> {
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionWorkspaceSet {
+                session_id: selected.session_id,
+                path: selected.path,
+                selected_seq: selected.selected_seq,
+                worker_generation: selected.worker_generation,
             },
         })
     }
@@ -15468,6 +15632,10 @@ impl HubConnection {
         )
         .unwrap_or(u64::MAX);
         let runtime = self.runtime_paths.as_ref();
+        let readiness = self
+            .daemon_readiness
+            .as_ref()
+            .map(crate::Readiness::snapshot);
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::StatusSnapshot {
@@ -15481,10 +15649,9 @@ impl HubConnection {
                     .map(|(_, pid_file_path)| pid_file_path.display().to_string()),
                 idle_ttl_ms: self.daemon_idle_ttl_ms,
                 warm: self.daemon_warm,
-                // A request can reach this handler only after the runtime
-                // publishes Ready and starts the accept loop. The same edge
-                // drives DaemonReadyNotifier in runtime.rs.
-                ready: true,
+                ready: readiness.is_some_and(|snapshot| snapshot.ready),
+                ready_since: readiness.and_then(|snapshot| snapshot.ready_since_unix_ms),
+                providers_loaded: readiness.is_some_and(|snapshot| snapshot.providers_loaded),
             },
         })
     }
@@ -16581,6 +16748,24 @@ impl HubConnection {
         };
         let attachment_id = registration.attachment_id.clone();
         let attach_state = registration.attach_state.clone();
+        let workspace_unavailable = self
+            .hub
+            .inner
+            .store
+            .session_metadata(&attach_state.session_id)
+            .await?
+            .and_then(|metadata| {
+                crate::workspace::unavailable(std::path::Path::new(&metadata.cwd))
+            });
+        if let Some(unavailable) = workspace_unavailable {
+            tracing::info!(
+                target: "haider.workspace",
+                session_id = %attach_state.session_id,
+                path = %unavailable.path,
+                reason = unavailable.reason.as_str(),
+                "attached session has an unavailable stored workspace"
+            );
+        }
         // Close-vs-registration sweep (P2-4): `close` sets `closed` BEFORE
         // it snapshots the owners map, so a registration that landed after
         // that snapshot always observes `closed` here and detaches itself;

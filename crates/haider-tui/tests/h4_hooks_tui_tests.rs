@@ -104,7 +104,7 @@ fn raw(seq: u64, run: Option<&str>, ui: bool, payload: serde_json::Value) -> Raw
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     }
 }
 
@@ -693,7 +693,8 @@ fn decision_firing_jumps_to_its_committed_menu() {
     payload.menu_id = Some(menu.id.clone());
     fired.payload = HookEventPayload::HookFired(payload)
         .to_payload_value()
-        .expect("linked fired payload");
+        .expect("linked fired payload")
+        .into();
     assert_eq!(
         model.route_raw(&fired),
         haider_tui::projection::RawOutcome::Applied

@@ -32,11 +32,13 @@ pub(crate) mod session_config;
 pub(crate) mod session_item;
 pub(crate) mod session_recover;
 pub(crate) mod session_seen;
+pub(crate) mod session_workspace;
 pub(crate) mod shell_registry;
 pub(crate) mod ssh;
 pub(crate) mod update;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const EX_UNAVAILABLE: u8 = 69;
 const EX_SOFTWARE: u8 = 70;
 const EX_IOERR: u8 = 74;
 const FOOTPRINT_HOLD_ENV: &str = "HAIDER_CLIENT_FOOTPRINT_HOLD_MS";
@@ -405,6 +407,14 @@ async fn dispatch(args: &[String]) -> ExitCode {
         {
             session_seen::session_seen_command(session_id, rest).await
         }
+        [command, subcommand, rest @ ..] if command == "session" && subcommand == "workspace" => {
+            session_workspace::session_workspace_command(None, rest).await
+        }
+        [command, session_id, subcommand, rest @ ..]
+            if command == "session" && subcommand == "workspace" =>
+        {
+            session_workspace::session_workspace_command(Some(session_id), rest).await
+        }
         [command, session_id, subcommand, seq, rest @ ..]
             if command == "session" && subcommand == "item" =>
         {
@@ -475,6 +485,7 @@ async fn dispatch(args: &[String]) -> ExitCode {
                  session <id> [--json|--watch] [--no-spawn], \
                  session <id> config [--json] [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>], \
                  session <id> seen, session <id> recover [--json] [--probe|--mark-done|--retry|--abandon], \
+                 session workspace set <path>, session <id> workspace set <path>, \
                  session <id> item <seq> --json [--masked] [--no-spawn], \
                  account list [--json], account import <codex|claude-code> [--confirm], account refresh <alias>, account remove <alias> --confirm, \
                  account add <alias> --base-url <url> [--api-key <key>|--api-key-env <VAR>|--api-key-stdin|--no-auth] [--api-family openai|anthropic] [--response-open-timeout <dur>] [--chunk-idle-timeout <dur>] [--semantic-progress-timeout <dur>] [--json], \
@@ -645,7 +656,17 @@ async fn front_door_with_options(mode: FrontDoor, options: BareTuiOptions) -> Ex
             return ExitCode::from(EX_SOFTWARE);
         }
     };
-    match haider_client::ensure_daemon(&profile, haider_client::EnsureOptions::default()).await {
+    let interactive = mode == FrontDoor::Tui && std::io::IsTerminal::is_terminal(&io::stdout());
+    let mut ensure_options = haider_client::EnsureOptions::default();
+    if !interactive {
+        ensure_options
+            .required_features
+            .insert(haider_rpc::FEATURE_STATUS_SNAPSHOT_V1.to_owned());
+        ensure_options
+            .required_features
+            .insert(haider_rpc::FEATURE_STATUS_RUNTIME_V1.to_owned());
+    }
+    match haider_client::ensure_daemon(&profile, ensure_options).await {
         Ok(ensured) => {
             let how = match (ensured.spawned, ensured.race_lost) {
                 (false, _) => "already running".to_owned(),
@@ -656,9 +677,32 @@ async fn front_door_with_options(mode: FrontDoor, options: BareTuiOptions) -> Ex
                     haider_client::RACE_LOSER_EXIT_CODE
                 ),
             };
-            let interactive =
-                mode == FrontDoor::Tui && std::io::IsTerminal::is_terminal(&io::stdout());
             if !interactive {
+                let positive_readiness = match ensured
+                    .client
+                    .request(haider_rpc::RequestBody::StatusSnapshot {})
+                    .await
+                {
+                    Ok(haider_rpc::ResponseBody::StatusSnapshot {
+                        ready: true,
+                        ready_since: Some(_),
+                        providers_loaded: true,
+                        ..
+                    }) => true,
+                    Ok(haider_rpc::ResponseBody::StatusSnapshot { .. }) => false,
+                    Ok(_) => false,
+                    Err(error) => {
+                        eprintln!("haider: daemon readiness status failed: {error}");
+                        false
+                    }
+                };
+                if !positive_readiness {
+                    eprintln!(
+                        "haider: daemon did not report positive readiness (store, recovery, provider registry, and session hub)"
+                    );
+                    let _ = ensured.client.close();
+                    return ExitCode::from(EX_UNAVAILABLE);
+                }
                 println!(
                     "haider {VERSION} — daemon ready ({how}): profile {} at {} \
                      (daemon v{}, generation {})",

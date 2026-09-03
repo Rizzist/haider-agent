@@ -30,6 +30,9 @@ use haider_protocol::ids::{ArtifactRef, DeviceId, EffectId, EventId, MenuId, Run
 use haider_protocol::menu::{AnswerVia, DecisionKind, Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::state::RunState;
 use haider_protocol::tool::AttachmentBlock;
+use haider_protocol::workspace::{
+    WorkspaceEventPayload, WorkspaceUnavailable, WorkspaceUnavailableReason,
+};
 use haider_rpc::{
     CommandId, HookTrustStateWire, ModelInventoryAuthorityWire, ProviderApiFamilyWire,
     ProviderAvailabilityWire, ProviderSummaryWire, ProviderTrustWire,
@@ -1062,6 +1065,104 @@ async fn wait_for_hook_outbox_drain(store: &SqliteStoreHandle, timeout: Duration
     })
     .await
     .expect("hook outbox drain deadline");
+}
+
+/// MUTATION CHECK: remove either the worker's synchronous run pin or the
+/// metadata-only durable run fence. Expected runtime failure: recreating the
+/// same path rediscovers the hook document or writes the marker for a turn
+/// whose workspace availability was already snapshotted as unavailable.
+#[tokio::test]
+async fn unavailable_turn_pin_survives_same_path_restoration_without_hook_discovery_or_fire() {
+    let marker_dir = tempfile::tempdir().expect("marker directory");
+    let marker = marker_dir.path().join("workspace-hook-fired");
+    let command = write_command("forbidden", &marker);
+    let fixture = EngineFixture::start(&command, 1_000, false, "exec").await;
+    wait_for_hook_outbox_drain(&fixture.store, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT).await;
+    let baseline_discoveries = fixture.service.discovery_stamp_count();
+
+    std::fs::remove_dir_all(&fixture.workspace).expect("delete stored workspace root");
+    assert!(crate::workspace::unavailable(&fixture.workspace).is_some());
+    fixture
+        .service
+        .pin_workspace_unavailable(&fixture.session_id, &fixture.run_id);
+    std::fs::create_dir(&fixture.workspace).expect("restore exact workspace path");
+    write_hook(
+        &fixture.workspace,
+        "test_hook",
+        "run_started",
+        &command,
+        1_000,
+        false,
+        "exec",
+    );
+
+    let mut live_trigger = [raw_event(
+        &fixture.session_id,
+        &fixture.run_id,
+        fixture.store.worker_generation(),
+        "workspace-live-fenced",
+        EventPayload::RunState(RunState::Thinking),
+    )];
+    fixture
+        .hub
+        .append(&mut live_trigger)
+        .await
+        .expect("commit live-fenced trigger");
+    wait_for_hook_outbox_drain(&fixture.store, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT).await;
+    assert!(!marker.exists(), "the restored-path hook must not execute");
+    assert_eq!(
+        fixture.service.discovery_stamp_count(),
+        baseline_discoveries,
+        "a pinned unavailable turn must not enter hook discovery"
+    );
+
+    // Simulate loss of the live pin across restart. A later durable notice in
+    // the same atomic append fences the earlier trigger through indexed
+    // outbox metadata, without depending on delivery order or path state.
+    fixture
+        .service
+        .clear_workspace_unavailable(&fixture.session_id, Some(&fixture.run_id));
+    let mut unavailable = raw_event(
+        &fixture.session_id,
+        &fixture.run_id,
+        fixture.store.worker_generation(),
+        "workspace-durable-fence",
+        EventPayload::RunState(RunState::Thinking),
+    );
+    unavailable.payload = WorkspaceEventPayload::WorkspaceUnavailable(WorkspaceUnavailable {
+        path: fixture.workspace.display().to_string(),
+        reason: WorkspaceUnavailableReason::Missing,
+        detail: "stored workspace root is unavailable: no such file or directory".into(),
+    })
+    .to_payload_value()
+    .expect("workspace unavailable payload")
+    .into();
+    let mut durable_batch = [
+        raw_event(
+            &fixture.session_id,
+            &fixture.run_id,
+            fixture.store.worker_generation(),
+            "workspace-durable-fenced-trigger",
+            EventPayload::RunState(RunState::Thinking),
+        ),
+        unavailable,
+    ];
+    fixture
+        .hub
+        .append(&mut durable_batch)
+        .await
+        .expect("commit durable workspace fence");
+    wait_for_hook_outbox_drain(&fixture.store, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT).await;
+    assert!(
+        !marker.exists(),
+        "the durable restored-path hook must not execute"
+    );
+    assert_eq!(
+        fixture.service.discovery_stamp_count(),
+        baseline_discoveries,
+        "durable recovery must suppress earlier same-run rows before discovery"
+    );
+    fixture.close().await;
 }
 
 /// MUTATION CHECK: persist on every committed batch, omit a dirty terminal or

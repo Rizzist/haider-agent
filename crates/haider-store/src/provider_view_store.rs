@@ -117,14 +117,9 @@ impl ProviderViewStore {
             .collect::<HashSet<_>>();
         let mut missing = expected.clone();
         for blob in &blobs {
-            let actual = blob.computed_block().map_err(|error| {
-                invalid(format!("provider-view blob could not be hashed: {error}"))
-            })?;
-            if actual != blob.block
-                || (!missing.remove(&blob.block) && !expected.contains(&blob.block))
-            {
+            if !missing.remove(&blob.block) && !expected.contains(&blob.block) {
                 return Err(invalid(
-                    "provider-view blob does not match the ledger content address",
+                    "provider-view blob is not referenced by the ledger",
                 ));
             }
         }
@@ -138,9 +133,11 @@ impl ProviderViewStore {
         for blob in blobs {
             if persisted.insert(blob.block.clone()) {
                 let expected = ArtifactRef::new(blob.block.content_hash.clone());
-                let stored = self
-                    .cas
-                    .put_batched_stream(&expected, |writer| blob.write_to(writer))?;
+                let stored =
+                    self.cas
+                        .put_batched_stream(&expected, blob.block.byte_len, |writer| {
+                            blob.write_to(writer)
+                        })?;
                 if stored.as_str() != blob.block.content_hash {
                     return Err(corrupt(
                         "provider-view CAS returned a different content address",

@@ -21,8 +21,9 @@ use haider_protocol::computer::{ComputerAction, ScreenPoint, ScrollDirection};
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::provider::{
     Block, CacheStatAvailability, CapabilityDoc, FeatureResolve, FinishReason, NormalizedUsage,
-    ReasoningAccounting, StreamEvent, Usage, UsageSource, WebSource,
+    ProviderOpaqueData, ReasoningAccounting, StreamEvent, Usage, UsageSource, WebSource,
 };
+use haider_protocol::reply::ReplyArenaWriter;
 use haider_protocol::reply::ReplyText;
 use haider_protocol::tool::AttachmentBlock;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
@@ -2512,6 +2513,8 @@ struct ResponsesDecoder {
     pending_tool_events: Vec<StreamEvent>,
     saw_tool: bool,
     saw_refusal: bool,
+    text: Option<ReplyArenaWriter>,
+    reasoning: Option<ReplyArenaWriter>,
     terminal: bool,
 }
 
@@ -2532,6 +2535,8 @@ impl ResponsesDecoder {
             pending_tool_events: Vec::new(),
             saw_tool: false,
             saw_refusal: false,
+            text: Some(ReplyArenaWriter::new().with_standard_provider_json_views()),
+            reasoning: Some(ReplyArenaWriter::new().with_standard_provider_json_views()),
             terminal: false,
         }
     }
@@ -2591,7 +2596,7 @@ impl ResponsesDecoder {
         if frame.data == "[DONE]" {
             return Ok(Vec::new());
         }
-        let value: serde_json::Value = match serde_json::from_str(&frame.data) {
+        let mut value: serde_json::Value = match serde_json::from_str(&frame.data) {
             Ok(value) => value,
             Err(_) if matches!(frame.event.as_deref(), Some("response.failed" | "error")) => {
                 return Err(openai_stream_error_prose(&frame.data));
@@ -2622,12 +2627,24 @@ impl ResponsesDecoder {
             )));
         }
         match event_type {
-            "response.output_text.delta" => Ok(vec![StreamEvent::TextDelta {
-                text: required_string(&value, "delta", event_type)?,
-            }]),
+            "response.output_text.delta" => {
+                let text = required_string(&value, "delta", event_type)?;
+                Ok(vec![StreamEvent::TextDelta {
+                    text: self
+                        .text
+                        .as_mut()
+                        .ok_or_else(|| malformed("OpenAI text arena is already sealed"))?
+                        .append(text),
+                }])
+            }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                let text = required_string(&value, "delta", event_type)?;
                 Ok(vec![StreamEvent::ReasoningDelta {
-                    text: required_string(&value, "delta", event_type)?,
+                    text: self
+                        .reasoning
+                        .as_mut()
+                        .ok_or_else(|| malformed("OpenAI reasoning arena is already sealed"))?
+                        .append(text),
                 }])
             }
             "response.refusal.delta" => {
@@ -2639,7 +2656,7 @@ impl ResponsesDecoder {
             "response.output_item.added" => self.output_item_added(&value),
             "response.function_call_arguments.delta" => self.function_arguments_delta(&value),
             "response.function_call_arguments.done" => self.function_arguments_done(&value),
-            "response.output_item.done" => self.output_item_done(&value),
+            "response.output_item.done" => self.output_item_done(&mut value),
             "response.completed" => self.response_terminal(&value, false),
             "response.incomplete" => self.response_terminal(&value, true),
             "response.failed" | "error" => Err(openai_stream_error(&value)),
@@ -2736,18 +2753,78 @@ impl ResponsesDecoder {
 
     fn output_item_done(
         &mut self,
-        value: &serde_json::Value,
+        value: &mut serde_json::Value,
     ) -> Result<Vec<StreamEvent>, ProviderError> {
+        if value
+            .get("item")
+            .and_then(|item| item.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("reasoning")
+        {
+            let mut item = value
+                .get_mut("item")
+                .map(std::mem::take)
+                .and_then(|item| match item {
+                    serde_json::Value::Object(item) => Some(item),
+                    _ => None,
+                })
+                .ok_or_else(|| malformed("OpenAI reasoning item is not an object"))?;
+            let summary_text = item
+                .get_mut("summary")
+                .and_then(serde_json::Value::as_array_mut)
+                .and_then(|summary| summary.first_mut())
+                .and_then(serde_json::Value::as_object_mut)
+                .and_then(|summary| summary.remove("text"))
+                .and_then(|text| match text {
+                    serde_json::Value::String(text) => Some(text),
+                    _ => None,
+                });
+            let mut events = Vec::new();
+            let data = if let Some(summary_text) = summary_text {
+                let writer = self
+                    .reasoning
+                    .as_mut()
+                    .ok_or_else(|| malformed("OpenAI reasoning arena is already sealed"))?;
+                let existing = writer.snapshot();
+                let text = if existing.is_empty() {
+                    writer.append(summary_text)
+                } else {
+                    if existing != summary_text {
+                        return Err(malformed(
+                            "OpenAI completed reasoning summary disagrees with streamed deltas",
+                        ));
+                    }
+                    existing
+                };
+                let summary = item
+                    .get_mut("summary")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .and_then(|summary| summary.first_mut())
+                    .and_then(serde_json::Value::as_object_mut)
+                    .ok_or_else(|| malformed("OpenAI reasoning summary shape changed"))?;
+                summary.insert(
+                    "text".into(),
+                    serde_json::Value::String("__haider_openai_reasoning_summary_reply__".into()),
+                );
+                ProviderOpaqueData::with_reply(
+                    serde_json::Value::Object(item),
+                    "__haider_openai_reasoning_summary_reply__",
+                    text,
+                )
+                .ok_or_else(|| malformed("OpenAI reasoning template lost its reply marker"))?
+            } else {
+                serde_json::Value::Object(item).into()
+            };
+            events.push(StreamEvent::ProviderOpaque {
+                provider: OPENAI_PROVIDER_NAME.into(),
+                data,
+            });
+            return Ok(events);
+        }
         let Some(item) = value.get("item").and_then(serde_json::Value::as_object) else {
             return Ok(Vec::new());
         };
         match item.get("type").and_then(serde_json::Value::as_str) {
-            Some("reasoning") => {
-                return Ok(vec![StreamEvent::ProviderOpaque {
-                    provider: OPENAI_PROVIDER_NAME.into(),
-                    data: serde_json::Value::Object(item.clone()),
-                }]);
-            }
             // W-B: a HOSTED web_search_call is provider-executed — it never
             // enters the local dispatch loop. The finished item is captured
             // verbatim (the reasoning-item channel) so follow-up requests
@@ -2857,6 +2934,12 @@ impl ResponsesDecoder {
         } else {
             FinishReason::EndTurn
         };
+        if let Some(writer) = self.text.take() {
+            drop(writer.seal());
+        }
+        if let Some(writer) = self.reasoning.take() {
+            drop(writer.seal());
+        }
         events.push(StreamEvent::Finish { reason });
         Ok(events)
     }
@@ -2900,7 +2983,7 @@ fn native_computer_call_events(
 
     let mut events = vec![StreamEvent::ProviderOpaque {
         provider: OPENAI_PROVIDER_NAME.into(),
-        data: serde_json::Value::Object(item.clone()),
+        data: serde_json::Value::Object(item.clone()).into(),
     }];
     for (index, action) in actions.into_iter().enumerate() {
         let action_call_id = native_computer_action_call_id(&call_id, index);
@@ -3199,7 +3282,7 @@ fn hosted_web_search_call_events(
     vec![
         StreamEvent::ProviderOpaque {
             provider: OPENAI_PROVIDER_NAME.into(),
-            data: serde_json::Value::Object(item.clone()),
+            data: serde_json::Value::Object(item.clone()).into(),
         },
         StreamEvent::ServerToolUse {
             call_id: call_id.clone(),
@@ -3352,6 +3435,8 @@ struct ChatDecoder {
     open_calls: BTreeMap<usize, ChatFunctionCall>,
     pending_tool_events: Vec<StreamEvent>,
     finish_reason: Option<FinishReason>,
+    text: Option<ReplyArenaWriter>,
+    reasoning: Option<ReplyArenaWriter>,
     terminal: bool,
 }
 
@@ -3376,6 +3461,8 @@ impl ChatDecoder {
             open_calls: BTreeMap::new(),
             pending_tool_events: Vec::new(),
             finish_reason: None,
+            text: Some(ReplyArenaWriter::new().with_standard_provider_json_views()),
+            reasoning: Some(ReplyArenaWriter::new()),
             terminal: false,
         }
     }
@@ -3473,7 +3560,13 @@ impl ChatDecoder {
             if let Some(text) = delta.get("content").and_then(serde_json::Value::as_str)
                 && !text.is_empty()
             {
-                events.push(StreamEvent::TextDelta { text: text.into() });
+                events.push(StreamEvent::TextDelta {
+                    text: self
+                        .text
+                        .as_mut()
+                        .ok_or_else(|| malformed("OpenAI-compatible text arena is already sealed"))?
+                        .append(text.to_owned()),
+                });
             }
             if let Some(text) = delta
                 .get("reasoning_content")
@@ -3481,7 +3574,15 @@ impl ChatDecoder {
                 .and_then(serde_json::Value::as_str)
                 && !text.is_empty()
             {
-                events.push(StreamEvent::ReasoningDelta { text: text.into() });
+                events.push(StreamEvent::ReasoningDelta {
+                    text: self
+                        .reasoning
+                        .as_mut()
+                        .ok_or_else(|| {
+                            malformed("OpenAI-compatible reasoning arena is already sealed")
+                        })?
+                        .append(text.to_owned()),
+                });
             }
             if let Some(refusal) = delta.get("refusal").and_then(serde_json::Value::as_str)
                 && !refusal.is_empty()
@@ -3561,7 +3662,7 @@ impl ChatDecoder {
                 synthesized_id,
             });
         }
-        let call = self.open_calls.get(&index).ok_or_else(|| {
+        let call = self.open_calls.get_mut(&index).ok_or_else(|| {
             malformed(format!(
                 "OpenAI-compatible tool index {index} disappeared after start"
             ))
@@ -3621,6 +3722,12 @@ impl ChatDecoder {
             self.pending_tool_events.clear();
             Vec::new()
         };
+        if let Some(writer) = self.text.take() {
+            drop(writer.seal());
+        }
+        if let Some(writer) = self.reasoning.take() {
+            drop(writer.seal());
+        }
         events.push(StreamEvent::Finish { reason });
         events
     }
@@ -4478,7 +4585,11 @@ fn responses_request_json_neutral_with_boundary(
                     if provider == OPENAI_PROVIDER_NAME && data.is_object() =>
                 {
                     flush_response_message(&mut input, message.role, &mut content);
-                    input.push(data.clone());
+                    input.push(crate::provider_opaque_json_value(
+                        data,
+                        bind_large_replies,
+                        &mut reply_bindings,
+                    )?);
                 }
                 Block::ProviderOpaque { provider, .. } if provider == OPENAI_PROVIDER_NAME => {
                     return Err(invalid_request(
@@ -5255,20 +5366,22 @@ fn chat_request_json_with_boundary(
         match message.role {
             MessageRole::Assistant => {
                 let mut text = None::<ReplyText>;
-                let mut joined_copy = None::<String>;
+                let mut joined_ranges = None::<ReplyArenaWriter>;
                 let mut tool_calls = Vec::new();
                 for block in &message.blocks {
                     match block {
                         Block::Text { text: delta } => {
-                            if let Some(copy) = joined_copy.as_mut() {
-                                delta.visit_strs(|part| copy.push_str(part));
+                            if let Some(writer) = joined_ranges.as_mut() {
+                                let _ = writer.append_shared(delta);
                             } else if let Some(previous) = text.take() {
                                 if let Some(joined) = previous.try_join(delta) {
                                     text = Some(joined);
                                 } else {
-                                    let mut copy = previous.to_owned_string();
-                                    delta.visit_strs(|part| copy.push_str(part));
-                                    joined_copy = Some(copy);
+                                    let mut writer =
+                                        ReplyArenaWriter::new().with_standard_provider_json_views();
+                                    let _ = writer.append_shared(&previous);
+                                    let _ = writer.append_shared(delta);
+                                    joined_ranges = Some(writer);
                                 }
                             } else {
                                 text = Some(delta.clone());
@@ -5293,7 +5406,11 @@ fn chat_request_json_with_boundary(
                         Block::ProviderOpaque { provider, data }
                             if provider == OPENAI_COMPATIBLE_PROVIDER_NAME && data.is_object() =>
                         {
-                            messages.push(data.clone());
+                            messages.push(crate::provider_opaque_json_value(
+                                data,
+                                bind_large_replies,
+                                &mut reply_bindings,
+                            )?);
                         }
                         Block::Reasoning { .. } => {
                             return Err(invalid_request(
@@ -5309,9 +5426,8 @@ fn chat_request_json_with_boundary(
                 }
                 let mut wire = serde_json::Map::new();
                 wire.insert("role".into(), serde_json::Value::String("assistant".into()));
-                let content = if let Some(copy) = joined_copy {
-                    serde_json::Value::String(copy)
-                } else if let Some(text) = text {
+                let text = joined_ranges.map(ReplyArenaWriter::seal).or(text);
+                let content = if let Some(text) = text {
                     if bind_large_replies {
                         crate::reply_json_value(&text, &mut reply_bindings)
                     } else {
@@ -5371,7 +5487,11 @@ fn chat_request_json_with_boundary(
                         Block::ProviderOpaque { provider, data }
                             if provider == OPENAI_COMPATIBLE_PROVIDER_NAME && data.is_object() =>
                         {
-                            messages.push(data.clone());
+                            messages.push(crate::provider_opaque_json_value(
+                                data,
+                                bind_large_replies,
+                                &mut reply_bindings,
+                            )?);
                         }
                         Block::Reasoning { .. } => {
                             return Err(invalid_request(

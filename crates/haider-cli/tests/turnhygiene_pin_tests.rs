@@ -827,14 +827,7 @@ fn replay_of_a_tool_call_turn_equals_the_live_run_scoped_jsonl() {
     let expected = envelopes
         .iter()
         .filter(|envelope| envelope["run_id"].as_str() == Some(run_id.as_str()))
-        .map(|envelope| {
-            let mut envelope = envelope.clone();
-            if let Some(payload) = envelope["payload"].as_object_mut() {
-                payload.remove("terminal_kind");
-                payload.remove("error_code");
-            }
-            envelope
-        })
+        .cloned()
         .collect::<Vec<_>>();
     assert!(
         expected.len() > 30,

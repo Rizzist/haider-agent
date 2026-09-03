@@ -44,6 +44,7 @@ use haider_protocol::provider::{
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::{AttachmentBlock, ToolPermissionDefault};
+use haider_protocol::workspace::WorkspaceEventPayload;
 use haider_provider::{
     FakeInputKind, FakeInputOption, FakeProvider, FakeStep, Provider, ProviderError,
     ProviderStream, ToolDefinition, TurnRequest,
@@ -3060,6 +3061,284 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
             .expect("created payload"),
         EventPayload::SessionState(SessionState::Created)
     );
+
+    task.shutdown_handle().request("test complete");
+    task.join().await.expect("daemon joins");
+}
+
+/// A stored root is a capability, not a prerequisite for conversation. The
+/// daemon rechecks it at attach/turn boundaries without canonicalizing, emits
+/// one typed fact, and still completes the provider turn. The same test pins
+/// receipt-first re-root replay after the newly selected directory vanishes.
+#[tokio::test]
+async fn vanished_workspace_degrades_plain_turn_and_workspace_set_replays() {
+    let root = test_root("wsroot-vanished-");
+    let workspace = root.path().join("workspace");
+    let recovery = root.path().join("recovery");
+    let other = root.path().join("other");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&recovery).expect("recovery workspace");
+    fs::create_dir(&other).expect("alternate workspace");
+    let config = DaemonConfig::new(
+        "workspace-vanished",
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
+    let (dependencies, fake) = fake_dependencies(vec![
+        FakeStep::EmitText {
+            text: "first".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitText {
+            text: "still here".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::Delay { ms: 250 },
+        FakeStep::EmitText {
+            text: "recovered".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let task = ready_with_dependencies(&config, dependencies).await;
+    let mut client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "workspace-test",
+        "workspace-client",
+        ClientKind::Headless,
+    )
+    .await;
+    let (session_id, generation) = create_and_attach(&mut client, &config, &workspace).await;
+
+    send_request(
+        &mut client,
+        &config,
+        "first-submit",
+        submit_body(
+            "first-command",
+            session_id.clone(),
+            generation,
+            "first turn",
+        ),
+    )
+    .await;
+    let (first_run, _) = next_submit_response(&mut client).await;
+    let first = events_until_terminal(&mut client, &first_run).await;
+    assert!(matches!(
+        first.last(),
+        Some((_, EventPayload::RunState(RunState::Done)))
+    ));
+    let first_head = first
+        .last()
+        .map(|(seq, _)| *seq)
+        .expect("terminal event has a sequence");
+
+    fs::remove_dir(&workspace).expect("delete stored workspace between turns");
+    let mut attach_client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "workspace-attach-test",
+        "workspace-attach-client",
+        ClientKind::Headless,
+    )
+    .await;
+    send_request(
+        &mut attach_client,
+        &config,
+        "attach-after-delete",
+        RequestBody::SessionAttach {
+            session_id: session_id.clone(),
+            after_seq: first_head,
+            mode: AttachMode::Control,
+            sealed_replay: false,
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_response(&mut attach_client).await,
+        WireFrame::Response {
+            body: ResponseBody::SessionAttach { .. },
+            ..
+        }
+    ));
+    drop(attach_client);
+    send_request(
+        &mut client,
+        &config,
+        "second-submit",
+        submit_body(
+            "second-command",
+            session_id.clone(),
+            generation,
+            "plain chat still works",
+        ),
+    )
+    .await;
+    let (second_run, _) = next_submit_response(&mut client).await;
+    let mut notices = Vec::new();
+    let mut core = Vec::new();
+    loop {
+        let WireFrame::Event { envelope, .. } = client.next().await else {
+            continue;
+        };
+        if envelope.run_id.as_ref() != Some(&second_run) {
+            continue;
+        }
+        if let Some(workspace) = WorkspaceEventPayload::from_payload_value(&envelope.payload) {
+            notices.push((envelope.clone(), workspace));
+            continue;
+        }
+        assert_ne!(
+            envelope
+                .payload
+                .get("type")
+                .and_then(serde_json::Value::as_str),
+            Some("project_instructions_loaded"),
+            "unavailable workspace must not journal an empty instruction transition"
+        );
+        let payload = serde_json::from_value::<EventPayload>(envelope.payload.into())
+            .expect("non-workspace turn event remains core typed");
+        let done = payload == EventPayload::RunState(RunState::Done);
+        core.push(payload);
+        if done {
+            break;
+        }
+    }
+    assert_eq!(notices.len(), 1, "exactly one workspace notice per turn");
+    let (notice_envelope, WorkspaceEventPayload::WorkspaceUnavailable(unavailable)) = &notices[0]
+    else {
+        panic!("expected workspace_unavailable fact")
+    };
+    assert_eq!(unavailable.path, workspace.to_string_lossy());
+    assert_eq!(unavailable.reason.as_str(), "missing");
+    assert!(notice_envelope.render.ui && notice_envelope.render.durable);
+    assert_eq!(notice_envelope.render.prompt, PromptRender::Omit);
+    assert!(core.iter().all(|payload| !matches!(
+        payload,
+        EventPayload::RunFailed {
+            code: ErrorCode::ProviderError,
+            ..
+        }
+    )));
+    assert!(
+        core.iter()
+            .all(|payload| !matches!(payload, EventPayload::Effect(_))),
+        "a degraded plain turn must not create workspace effect receipts"
+    );
+    assert!(matches!(
+        core.last(),
+        Some(EventPayload::RunState(RunState::Done))
+    ));
+    assert_eq!(fake.requests().len(), 2, "degraded turn reaches provider");
+
+    let set = RequestBody::SessionWorkspaceSet {
+        command_id: CommandId::new("workspace-set-command"),
+        session_id: session_id.clone(),
+        worker_generation: generation,
+        path: recovery.to_string_lossy().into_owned(),
+    };
+    send_request(&mut client, &config, "workspace-set", set.clone()).await;
+    let first_receipt = next_response(&mut client).await;
+    assert!(matches!(
+        first_receipt,
+        WireFrame::Response {
+            body: ResponseBody::SessionWorkspaceSet { ref path, .. },
+            ..
+        } if path == &recovery.to_string_lossy()
+    ));
+    let selected_seq = match &first_receipt {
+        WireFrame::Response {
+            body: ResponseBody::SessionWorkspaceSet { selected_seq, .. },
+            ..
+        } => *selected_seq,
+        _ => unreachable!("workspace receipt shape asserted above"),
+    };
+    let mut mutation_client = UdsClient::connect_control(
+        &config.endpoint_path(),
+        config.frame_limit,
+        "workspace-mutation-test",
+        "workspace-mutation-client",
+        ClientKind::Headless,
+    )
+    .await;
+    send_request(
+        &mut mutation_client,
+        &config,
+        "attach-for-busy-set",
+        RequestBody::SessionAttach {
+            session_id: session_id.clone(),
+            after_seq: selected_seq,
+            mode: AttachMode::Control,
+            sealed_replay: false,
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_response(&mut mutation_client).await,
+        WireFrame::Response {
+            body: ResponseBody::SessionAttach { .. },
+            ..
+        }
+    ));
+
+    send_request(
+        &mut client,
+        &config,
+        "recovered-submit",
+        submit_body(
+            "recovered-command",
+            session_id.clone(),
+            generation,
+            "workspace is back",
+        ),
+    )
+    .await;
+    let (recovered_run, _) = next_submit_response(&mut client).await;
+    send_request(
+        &mut mutation_client,
+        &config,
+        "workspace-set-while-active",
+        RequestBody::SessionWorkspaceSet {
+            command_id: CommandId::new("workspace-set-active-command"),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            path: other.to_string_lossy().into_owned(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_response(&mut mutation_client).await,
+        WireFrame::Response {
+            body: ResponseBody::Error { ref code, .. },
+            ..
+        } if code == ERROR_CODE_BUSY
+    ));
+    drop(mutation_client);
+    let recovered_events = events_until_terminal(&mut client, &recovered_run).await;
+    assert!(matches!(
+        recovered_events.last(),
+        Some((_, EventPayload::RunState(RunState::Done)))
+    ));
+    assert_eq!(
+        fake.requests().len(),
+        3,
+        "a turn after re-root uses the selected workspace"
+    );
+
+    fs::remove_dir(&recovery).expect("remove selected root after commit");
+    send_request(&mut client, &config, "workspace-replay", set).await;
+    let replayed = next_response(&mut client).await;
+    let response_body = |frame: WireFrame| match frame {
+        WireFrame::Response { body, .. } => body,
+        other => panic!("expected response, got {other:?}"),
+    };
+    assert_eq!(response_body(first_receipt), response_body(replayed));
 
     task.shutdown_handle().request("test complete");
     task.join().await.expect("daemon joins");

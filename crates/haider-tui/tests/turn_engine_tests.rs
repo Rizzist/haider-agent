@@ -48,7 +48,7 @@ fn agent_texts(beats: &[Beat]) -> Vec<String> {
             EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
                 item: haider_protocol::item::TurnItem::AgentMessage { text },
                 ..
-            }) => Some(text.clone()),
+            }) => Some(text.to_owned_string()),
             _ => None,
         })
         .collect()
@@ -721,7 +721,9 @@ async fn generic_turn_plays_end_to_end_with_the_delayed_title_note() {
         .iter()
         .filter_map(|entry| match entry {
             TranscriptEntry::Item(block) => match &block.item {
-                haider_protocol::item::TurnItem::AgentMessage { text } => Some(text.clone()),
+                haider_protocol::item::TurnItem::AgentMessage { text } => {
+                    Some(text.to_owned_string())
+                }
                 _ => None,
             },
             _ => None,

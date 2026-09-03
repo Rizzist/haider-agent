@@ -664,7 +664,7 @@ fn cm2g_anthropic_api_key_system_text_and_signed_opaque_are_unchanged() {
     });
     request.messages[2].blocks.push(Block::ProviderOpaque {
         provider: "anthropic".into(),
-        data: signed.clone(),
+        data: signed.clone().into(),
     });
     let annotated = provider
         .request_payload(&request)

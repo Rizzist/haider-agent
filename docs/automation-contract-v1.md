@@ -430,11 +430,25 @@ receipt are the lifecycle evidence (`docs/client-contract-v1.md:420-440`).
 ```
 
 ```json body.response
-{"method":"status.snapshot","session_count":365,"adoption_available":[{"source":"codex","email":"person@example.invalid"}],"daemon_pid":4242,"socket_path":"/tmp/haider-golden/h.sock","pid_file_path":"/tmp/haider-golden/haiderd.pid","ready":true}
+{"method":"status.snapshot","session_count":365,"adoption_available":[{"source":"codex","email":"person@example.invalid"}],"daemon_pid":4242,"socket_path":"/tmp/haider-golden/h.sock","pid_file_path":"/tmp/haider-golden/haiderd.pid","ready":true,"ready_since":1753500000000,"providers_loaded":true}
 ```
 
-Sources: `client_contract_methods_v1.json:389-392`; types
-`crates/haider-rpc/src/frame.rs:3095-3099`, `:4176-4202`.
+Sources: `client_contract_methods_v1.json:397-398`; types
+`crates/haider-rpc/src/frame.rs:3107-3111`, `:4196-4242`.
+
+With `status_runtime_v1`, `ready` is the daemon's positive serving predicate,
+not a PID-exists shortcut: the store is open, startup recovery is complete,
+the provider registry/factories are loaded, the session hub can accept turns,
+and the lifecycle is still `Ready`. `ready_since` is the Unix epoch timestamp
+in milliseconds at that positive edge. Its absence means an older response or
+a non-ready predicate; automation MUST NOT synthesize it from process start,
+the profile-lock owner record, the daemon PID file, or socket existence.
+
+`providers_loaded: true` means only that provider descriptors and factories
+were registered. It does not mean an upstream provider is connected or
+authenticated: provider connections are established per request. `haider
+--ready` and the launcher readiness channel use this same predicate. The
+v0.0.969 idle-TTL and warm-retention meanings are unchanged.
 
 `haider sessions wait-ready --json` is a separate CLI document,
 `haider.sessions.ready.v1`, not another RPC. It combines daemon readiness,
@@ -514,10 +528,11 @@ payload schema, but their wrappers are not byte-identical:
 - the socket wraps an unmodified `RawEnvelope` in `WireFrame::Event` with
   `attachment_id` and `session_id`, and uses `AttachCaughtUp` as its barrier;
 - JSONL starts with one non-envelope acceptance object, then emits envelopes
-  directly; on the one terminal envelope only, the adapter adds
-  `payload.terminal_kind` and optional `payload.error_code` while preserving
-  the same `seq` (`docs/jsonl-run-contract-v1.md:7-22`, `:78-102`;
-  `crates/haider-cli/src/run.rs:1322-1389`).
+  directly. The journal writer retains `payload.terminal_kind` and optional
+  `payload.error_code` on the one terminal envelope, so live JSONL and replay
+  serialize that same envelope without changing its `seq`
+  (`docs/jsonl-run-contract-v1.md:7-22`, `:87-107`;
+  `crates/haider-cli/src/run.rs`).
 
 ## 8. Delegation without a spawn RPC
 
@@ -576,6 +591,19 @@ remains a CLI status field, not `ResponseBody::StatusSnapshot`. The visible
 meaning is at `crates/haider-client/src/profile.rs:187-200` on that branch.
 
 ## Additive changelog
+
+### 2026-09-03 — v0.0.970
+
+- Added default-compatible `ready_since` and `providers_loaded` fields to
+  `status.snapshot`, projected as `daemon.ready_since` and
+  `daemon.providers_loaded` by `haider status --json`.
+- Defined `daemon.ready` as one positive predicate covering store open,
+  completed startup recovery, loaded provider registry/factories, an
+  accepting session hub, and the live `Ready` lifecycle phase. PID and socket
+  publication are not readiness evidence.
+- Aligned `haider --ready` and the spawn readiness channel with that predicate.
+  No idle-TTL or warm-retention behavior changed, and provider-registry loading
+  does not claim a provider connection.
 
 ### 2026-09-01 — v0.0.969
 

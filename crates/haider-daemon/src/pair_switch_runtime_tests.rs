@@ -2296,11 +2296,11 @@ fn opaque_tag_table_and_strip_are_exact() {
 
     let anthropic_fact = Block::ProviderOpaque {
         provider: "anthropic".into(),
-        data: serde_json::json!({"type": "thinking"}),
+        data: serde_json::json!({"type": "thinking"}).into(),
     };
     let openai_fact = Block::ProviderOpaque {
         provider: "openai".into(),
-        data: serde_json::json!({"type": "reasoning"}),
+        data: serde_json::json!({"type": "reasoning"}).into(),
     };
     let mut messages = vec![
         haider_provider::Message::user_text("hello"),
@@ -2340,14 +2340,14 @@ fn cache_boundaries_remap_across_foreign_opaque_removal() {
 
     let kept = Block::ProviderOpaque {
         provider: "anthropic".into(),
-        data: serde_json::json!({"type": "thinking", "signature": "exact"}),
+        data: serde_json::json!({"type": "thinking", "signature": "exact"}).into(),
     };
     let mut projection = CompiledPromptProjection {
         messages: vec![
             haider_provider::Message::user_text("summary"),
             haider_provider::Message::assistant(vec![Block::ProviderOpaque {
                 provider: "openai".into(),
-                data: serde_json::json!({"type": "reasoning", "encrypted": "exact"}),
+                data: serde_json::json!({"type": "reasoning", "encrypted": "exact"}).into(),
             }]),
             haider_provider::Message::assistant(vec![
                 kept.clone(),

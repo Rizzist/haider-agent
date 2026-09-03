@@ -903,7 +903,11 @@ fn run_json_is_one_stable_typed_stream_summary() {
     }));
     assert_eq!(
         events.last().map(|event| &event["payload"]),
-        Some(&serde_json::json!({"type":"run_state","state":"done"}))
+        Some(&serde_json::json!({
+            "type":"run_state",
+            "state":"done",
+            "terminal_kind":"success"
+        }))
     );
 }
 
@@ -1300,6 +1304,192 @@ fn replay_is_a_read_only_exact_durable_projection() {
     assert_eq!(status["session_count"], 1);
 }
 
+fn jsonl_raw_run_envelope_lines(output: &[u8], run_id: &RunId) -> Vec<Vec<u8>> {
+    output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .skip(1)
+        .filter(|line| {
+            serde_json::from_slice::<RawEnvelope>(line)
+                .expect("live RawEnvelope line")
+                .run_id
+                .as_ref()
+                == Some(run_id)
+        })
+        // Selection parses only the run id. Comparison retains the original
+        // bytes and never serializes the envelope again.
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// Extracts the literal object slices from the replay document's `events`
+/// array. Parsing and reserializing here would hide ordering/encoding drift,
+/// which is exactly what this byte-parity pin is intended to catch.
+fn replay_raw_event_elements(output: &[u8]) -> Vec<Vec<u8>> {
+    let marker = b"\"events\":[";
+    let marker_offset = output
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("replay document events array");
+    let mut cursor = marker_offset + marker.len();
+    let mut events = Vec::new();
+    while output.get(cursor) != Some(&b']') {
+        let start = cursor;
+        let mut depth = 0_usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        loop {
+            let byte = *output.get(cursor).expect("complete replay event object");
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match byte {
+                    b'"' => in_string = true,
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth = depth.checked_sub(1).expect("balanced replay JSON");
+                        if depth == 0 {
+                            cursor += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            cursor += 1;
+        }
+        events.push(output[start..cursor].to_vec());
+        match output.get(cursor) {
+            Some(b',') => cursor += 1,
+            Some(b']') => {}
+            other => panic!("unexpected replay array delimiter: {other:?}"),
+        }
+    }
+    events
+}
+
+fn assert_jsonl_replay_raw_parity(source: &HaiderCommand, live: &std::process::Output) {
+    let live_events = parse_jsonl(&live.stdout);
+    let run_id = live_events
+        .iter()
+        .find_map(|envelope| envelope.run_id.as_ref())
+        .expect("live run id");
+    let mut replay = Command::new(env!("CARGO_BIN_EXE_haider"));
+    configure_test_home(&mut replay, &source.profile);
+    replay
+        .args(["run", "--replay", run_id.as_str()])
+        .env("HAIDER_PROFILE_DIR", &source.profile)
+        .env("HAIDER_DISCOVERY_DISABLED", "1")
+        // A replay must not touch this deliberately unusable provider script.
+        .env(
+            "HAIDER_TEST_FAKE_PROVIDER",
+            r#"[{"step":"malformed_frame"}]"#,
+        )
+        .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0");
+    let replay = output_with_boot_retry(&mut replay);
+    assert!(
+        replay.status.success(),
+        "replay stderr: {}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let replay_document: serde_json::Value =
+        serde_json::from_slice(&replay.stdout).expect("replay document");
+    assert_eq!(replay_document["provider_requests"], 0);
+
+    // The run contract declares no non-durable fields inside RawEnvelope, so
+    // this comparison intentionally performs zero normalization: ids, cursor,
+    // timestamps, render flags, payload fields, key order, and encoding all
+    // remain byte-for-byte identical for the same retained journal rows.
+    assert_eq!(
+        replay_raw_event_elements(&replay.stdout),
+        jsonl_raw_run_envelope_lines(&live.stdout, run_id)
+    );
+}
+
+/// Pins literal live/replay parity for every durable run-correlated row in
+/// both ordinary text and tool turns, plus errored/cancelled variants.
+#[test]
+fn live_jsonl_and_durable_replay_are_byte_identical_for_text_tool_error_and_cancel() {
+    let cases = [
+        (
+            "text",
+            r#"[{"step":"emit_text","text":"byte exact"},{"step":"finish","reason":"end_turn"}]"#,
+            0,
+            "done",
+            "success",
+            None,
+        ),
+        (
+            "tool",
+            r#"[
+                {"step":"emit_tool_call","call_id":"read-1","name":"fs_read","args":{"path":"missing.txt"}},
+                {"step":"finish","reason":"tool_use"},
+                {"step":"expect_tool_result","call_id":"read-1"},
+                {"step":"emit_text","text":"tool completed"},
+                {"step":"finish","reason":"end_turn"}
+            ]"#,
+            0,
+            "done",
+            "success",
+            None,
+        ),
+        (
+            "error",
+            r#"[{"step":"malformed_frame"}]"#,
+            i32::from(EX_PROVIDER),
+            "errored",
+            "provider_error",
+            Some("provider_error"),
+        ),
+        (
+            "cancel",
+            r#"[{"step":"finish","reason":"cancelled"}]"#,
+            i32::from(EX_CANCELLED),
+            "cancelled",
+            "cancellation",
+            None,
+        ),
+    ];
+
+    for (label, script, expected_exit, state, terminal_kind, error_code) in cases {
+        let mut source = haider();
+        source
+            .args(["run", "--provider", "fake", "--jsonl", label])
+            .env("HAIDER_TEST_FAKE_PROVIDER", script)
+            .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0");
+        let live = output_with_boot_retry(&mut source);
+        assert_eq!(
+            live.status.code(),
+            Some(expected_exit),
+            "{label} stderr: {}; stdout: {}",
+            String::from_utf8_lossy(&live.stderr),
+            String::from_utf8_lossy(&live.stdout)
+        );
+        let envelopes = parse_jsonl(&live.stdout);
+        let terminal = envelopes.last().expect("live terminal envelope");
+        assert_eq!(terminal.payload["state"], state, "case {label}");
+        assert_eq!(
+            terminal.payload["terminal_kind"], terminal_kind,
+            "case {label}"
+        );
+        assert_eq!(
+            terminal
+                .payload
+                .get("error_code")
+                .and_then(|value| value.as_str()),
+            error_code,
+            "case {label}"
+        );
+        assert_jsonl_replay_raw_parity(&source, &live);
+    }
+}
+
 #[test]
 fn replay_is_sealed_at_terminal_before_late_same_run_task_facts() {
     let script = serde_json::json!([
@@ -1410,7 +1600,11 @@ fn replay_is_sealed_at_terminal_before_late_same_run_task_facts() {
             .as_array()
             .and_then(|events| events.last())
             .map(|event| &event["payload"]),
-        Some(&serde_json::json!({"type": "run_state", "state": "done"}))
+        Some(&serde_json::json!({
+            "type": "run_state",
+            "state": "done",
+            "terminal_kind": "success"
+        }))
     );
 }
 
@@ -2298,6 +2492,7 @@ fn anthropic_missing_credential_exits_65_without_network_access() {
     assert!(envelopes.iter().any(|envelope| {
         envelope.payload["type"] == "run_failed" && envelope.payload["code"] == "credential_missing"
     }));
+    assert_jsonl_replay_raw_parity(&command, &out);
 }
 
 #[test]
@@ -2638,6 +2833,7 @@ fn run_jsonl_timeout_has_one_distinct_timeout_terminal() {
     assert_eq!(terminals.len(), 1);
     assert_eq!(terminals[0].payload["terminal_kind"], "timeout");
     assert_eq!(terminals[0].payload["error_code"], "timeout");
+    assert_jsonl_replay_raw_parity(&run, &out);
 }
 
 /// MUTATION CHECK: classify budget exhaustion as a generic failure, or emit

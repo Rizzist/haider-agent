@@ -75,17 +75,18 @@ pub use haider_store::{
     QueueRemoveCommand, QueueRemoveOutcome, QueueSnapshot, RecordedGraphEvidence,
     RecordedProcessSignal, ReducerPage, RenamedSession, RunRetryCommand, RunRetryOutcome,
     SUBAGENT_LIVE_LIMIT, SeenSession, SelectedAgentType, SelectedEffort, SelectedFast,
-    SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionForkCommand,
-    SessionForkOutcome, SessionMetaforkCommit, SessionProjectionCheckpoint,
+    SelectedModel, SelectedWorkspace, SessionCreateCommand, SessionCreateOutcome,
+    SessionForkCommand, SessionForkOutcome, SessionMetaforkCommit, SessionProjectionCheckpoint,
     SessionPromptForkCommand, SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand,
     SessionSeenOutcome, SessionSelectAgentTypeCommand, SessionSelectAgentTypeOutcome,
     SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
     SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
-    ShellExecAcceptCommand, ShellExecAcceptOutcome, SwitchedGraph, TurnAcceptCommand,
-    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
-    TurnCancellationStatus, TypedAgentInstallCancelResult, TypedAgentInstallCas,
-    TypedAgentInstallItemCas, TypedAgentInstallRetryResult, TypedAgentInstallSnapshot,
-    TypedAgentInstallWatchPage, TypedAgentInstallWatchResult,
+    SessionWorkspaceSetCommand, SessionWorkspaceSetOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome,
+    TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
+    TypedAgentInstallCancelResult, TypedAgentInstallCas, TypedAgentInstallItemCas,
+    TypedAgentInstallRetryResult, TypedAgentInstallSnapshot, TypedAgentInstallWatchPage,
+    TypedAgentInstallWatchResult,
 };
 pub use prompt_history::{
     ArtifactReader, CompiledPromptProjection, PromptCompactionPlanRequest, PromptHistoryCache,
@@ -307,23 +308,8 @@ pub trait StoreHandle: Send + Sync {
             .collect::<HashSet<_>>();
         let actual = blobs
             .into_iter()
-            .map(|blob| {
-                let computed = blob.computed_block().map_err(|error| {
-                    HaiderError::new(
-                        haider_protocol::error::ErrorCode::InvalidArgument,
-                        format!("provider-view blob could not be hashed: {error}"),
-                        false,
-                    )
-                })?;
-                (computed == blob.block).then_some(computed).ok_or_else(|| {
-                    HaiderError::new(
-                        haider_protocol::error::ErrorCode::InvalidArgument,
-                        "provider-view blob does not match its content address",
-                        false,
-                    )
-                })
-            })
-            .collect::<Result<HashSet<_>, _>>()?;
+            .map(|blob| blob.block)
+            .collect::<HashSet<_>>();
         if actual != expected {
             return Err(HaiderError::new(
                 haider_protocol::error::ErrorCode::InvalidArgument,

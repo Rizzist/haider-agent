@@ -48,6 +48,9 @@ use haider_protocol::tool::{
     ToolPermissionDefault, ToolResultData, ToolResultStatus, ToolTruncationReason,
 };
 use haider_protocol::verify::{Diagnostic, GateReport, Severity, VerifyVerdict};
+use haider_protocol::workspace::{
+    WorkspaceEventPayload, WorkspaceSelected, WorkspaceUnavailable, WorkspaceUnavailableReason,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::PathBuf;
 
@@ -433,6 +436,31 @@ fn golden_project_instructions_loaded_fact() {
     assert_eq!(
         ProjectInstructionsLoaded::from_payload_value(&value),
         Some(fact)
+    );
+}
+
+#[test]
+fn golden_workspace_event_facts() {
+    let unavailable = WorkspaceEventPayload::WorkspaceUnavailable(WorkspaceUnavailable {
+        path: "/private/tmp/vanished/scratchpad".into(),
+        reason: WorkspaceUnavailableReason::Missing,
+        detail: "No such file or directory (os error 2)".into(),
+    });
+    additive_golden("workspace_unavailable", &unavailable);
+    assert!(
+        serde_json::from_value::<EventPayload>(
+            unavailable
+                .to_payload_value()
+                .expect("serialize workspace fact")
+        )
+        .is_err()
+    );
+    additive_golden(
+        "workspace_selected",
+        &WorkspaceEventPayload::WorkspaceSelected(WorkspaceSelected {
+            path: "/workspace/recovered".into(),
+            previous_path: Some("/workspace/vanished".into()),
+        }),
     );
 }
 

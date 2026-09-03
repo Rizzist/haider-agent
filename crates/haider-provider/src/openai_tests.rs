@@ -1664,7 +1664,7 @@ fn native_computer_call_decodes_preview_and_ga_batches_to_singular_actions() {
     );
     assert!(preview_events.contains(&Ok(StreamEvent::ProviderOpaque {
         provider: OPENAI_PROVIDER_NAME.into(),
-        data: preview_item,
+        data: preview_item.into(),
     })));
     assert_eq!(
         preview_events.last(),
@@ -1842,7 +1842,7 @@ fn native_computer_followup(model: &str, call: serde_json::Value) -> TurnRequest
     let artifact = ArtifactRef::new(format!("blake3:{provider_call_id}"));
     let mut assistant_blocks = vec![Block::ProviderOpaque {
         provider: OPENAI_PROVIDER_NAME.into(),
-        data: call,
+        data: call.into(),
     }];
     for index in 0..action_count {
         assistant_blocks.push(Block::ToolCall {
@@ -2389,18 +2389,44 @@ fn prepared_openai_and_compatible_wire_bytes_match_legacy_final_render() {
 
 #[test]
 fn large_compatible_reply_uses_segmented_cas_and_exact_final_wire() {
-    use haider_protocol::reply::ReplyArenaWriter;
-
     let provider = compatible_provider_with_resolver(
         b"compatible-segmented-reply-key",
         "https://compatible-segmented.example",
         Arc::new(StubDnsResolver::new(std::iter::empty::<Vec<SocketAddr>>())),
     );
-    let mut arena = ReplyArenaWriter::new();
-    let _ = arena.append("left \"quote\"\n".to_owned());
-    let _ = arena.append("x".repeat(96 * 1024));
-    let _ = arena.append("مرز 😀 right".to_owned());
-    let reply = arena.seal();
+    let parts = [
+        "left \"quote\"\n".to_owned(),
+        "x".repeat(96 * 1024),
+        "مرز 😀 right".to_owned(),
+    ];
+    let mut sse = Vec::new();
+    for part in &parts {
+        sse.extend_from_slice(b"data: ");
+        serde_json::to_writer(
+            &mut sse,
+            &serde_json::json!({
+                "choices": [{"index": 0, "delta": {"content": part}, "finish_reason": null}]
+            }),
+        )
+        .expect("chat delta serializes");
+        sse.extend_from_slice(b"\n\n");
+    }
+    sse.extend_from_slice(
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+    );
+    let mut reply = None::<haider_protocol::reply::ReplyText>;
+    for event in replay_openai_chat_sse(&sse) {
+        if let Ok(StreamEvent::TextDelta { text }) = event {
+            reply = Some(match reply {
+                None => text,
+                Some(previous) => previous
+                    .try_join(&text)
+                    .expect("decoder deltas share one contiguous reply arena"),
+            });
+        }
+    }
+    let reply = reply.expect("decoded compatible reply");
+    assert_eq!(reply, parts.concat());
     let mut request = probe_request("audit-model");
     request.messages.push(Message::assistant(vec![Block::Text {
         text: reply.clone(),
@@ -2428,6 +2454,18 @@ fn large_compatible_reply_uses_segmented_cas_and_exact_final_wire() {
             .iter()
             .any(haider_protocol::cache::ProviderViewBlobV1::is_segmented),
         "the provider-view CAS must retain an arena-backed segment"
+    );
+    let incrementally_hashed = prepared
+        .provider_view_storage_blobs
+        .iter()
+        .find(|blob| blob.is_incrementally_hashed())
+        .expect("decoder-fed reply must retain its per-delta provider-view hash");
+    assert_eq!(
+        incrementally_hashed
+            .computed_block()
+            .expect("legacy whole-view hash oracle"),
+        incrementally_hashed.block,
+        "per-delta and legacy complete canonical bytes must address the same CAS key"
     );
     let mut finalized = request.clone();
     finalized
@@ -3279,7 +3317,7 @@ fn cm2g_openai_cache_keys_do_not_change_model_visible_content() {
             Message::assistant(vec![
                 Block::ProviderOpaque {
                     provider: OPENAI_PROVIDER_NAME.into(),
-                    data: opaque,
+                    data: opaque.into(),
                 },
                 Block::ToolCall {
                     call_id: "call-1".into(),

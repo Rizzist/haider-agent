@@ -56,7 +56,8 @@ fn segmented_reply_blob_hashes_persists_and_reads_exact_legacy_json() {
     let store = Store::open(root.path()).expect("store");
     let session_id = SessionId::new("provider-view-segmented-reply");
     create_session(&store, &session_id);
-    let mut arena = ReplyArenaWriter::new();
+    let mut arena = ReplyArenaWriter::new()
+        .with_incremental_json_view(br#"{"content":"#, br#","role":"assistant"}"#);
     let _ = arena.append("left \"quote\"\n".to_owned());
     let _ = arena.append("مرز 😀 right".to_owned());
     let reply = arena.seal();
@@ -67,6 +68,7 @@ fn segmented_reply_blob_hashes_persists_and_reads_exact_legacy_json() {
     ])
     .expect("segmented provider-view blob");
     assert!(history.is_segmented());
+    assert!(history.is_incrementally_hashed());
     let expected = serde_json::to_vec(&serde_json::json!({
         "role": "assistant",
         "content": "left \"quote\"\nمرز 😀 right",

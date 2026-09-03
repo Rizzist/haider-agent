@@ -69,7 +69,10 @@ fn branch_created(seq: u64, branch: &str, name: &str) -> RawEnvelope {
         },
     };
     let mut envelope = raw(seq, &EventPayload::IdleDecayed);
-    envelope.payload = created.to_payload_value().expect("branch fact serializes");
+    envelope.payload = created
+        .to_payload_value()
+        .expect("branch fact serializes")
+        .into();
     envelope
 }
 
@@ -341,7 +344,8 @@ fn slash_branch_new_issues_exact_captured_coordinates() {
             },
         },
     ))
-    .expect("serializes");
+    .expect("serializes")
+    .into();
     node.branch_id = Some(bid("b-exp"));
     assert_eq!(model.route_raw(&node), RawOutcome::Applied);
     submit(&mut model, "/branch new");

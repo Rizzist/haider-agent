@@ -204,7 +204,9 @@ async fn run_live_cache_turn(
     let mut saw_finish = false;
     while let Some(item) = stream.recv().await {
         match item.expect("live cache stream item") {
-            StreamEvent::TextDelta { text: delta } => text.push_str(&delta),
+            StreamEvent::TextDelta { text: delta } => {
+                delta.visit_strs(|segment| text.push_str(segment));
+            }
             StreamEvent::UsageUpdate(update) => usage = Some(update),
             StreamEvent::Finish { .. } => {
                 saw_finish = true;

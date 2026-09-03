@@ -4,8 +4,10 @@
 //! therefore consumes the same typed journal as every other surface instead
 //! of maintaining a second output-only schema.
 
+use crate::error::ErrorCode;
 use crate::ids::RunId;
 use crate::session::SessionPermissionOverridesV1;
+use crate::state::RunState;
 use serde::{Deserialize, Serialize};
 
 fn permissions_are_empty(value: &SessionPermissionOverridesV1) -> bool {
@@ -168,6 +170,84 @@ impl RunBudgetExhaustedV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunDeadlineExceededV1 {
     pub deadline_unix_ms: u64,
+}
+
+/// Additive fields carried by the one durable terminal `run_state` envelope.
+///
+/// This projection is shared by journal writers and compatibility readers so
+/// a terminal has one stable payload shape on live and replay surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableRunTerminalV1 {
+    pub terminal_kind: &'static str,
+    pub error_code: Option<&'static str>,
+}
+
+/// Classifies the durable terminal payload from facts in the same run.
+///
+/// Deadline and first blocking facts take precedence over the generic
+/// `RunFailed` code because they are the durable cause records for those
+/// terminal kinds. Callers pass mutually exclusive deadline/blocking facts by
+/// preserving the first durable cause.
+#[must_use]
+pub fn durable_run_terminal_v1(
+    state: RunState,
+    failure_code: Option<ErrorCode>,
+    budget_exhausted: bool,
+    deadline_exceeded: bool,
+    blocking_error_code: Option<&'static str>,
+) -> Option<DurableRunTerminalV1> {
+    match state {
+        RunState::Cancelled | RunState::Errored if deadline_exceeded => {
+            Some(DurableRunTerminalV1 {
+                terminal_kind: "timeout",
+                error_code: Some("timeout"),
+            })
+        }
+        RunState::Done => Some(DurableRunTerminalV1 {
+            terminal_kind: "success",
+            error_code: None,
+        }),
+        RunState::Cancelled | RunState::Errored if blocking_error_code.is_some() => {
+            Some(DurableRunTerminalV1 {
+                terminal_kind: "failure",
+                error_code: blocking_error_code,
+            })
+        }
+        RunState::Cancelled => Some(DurableRunTerminalV1 {
+            terminal_kind: "cancellation",
+            error_code: None,
+        }),
+        RunState::Errored
+            if budget_exhausted || matches!(failure_code, Some(ErrorCode::BudgetExhausted)) =>
+        {
+            Some(DurableRunTerminalV1 {
+                terminal_kind: "budget",
+                error_code: Some("budget_exhausted"),
+            })
+        }
+        RunState::Errored
+            if matches!(
+                failure_code,
+                Some(ErrorCode::ProviderError | ErrorCode::ProviderTimeout)
+            ) =>
+        {
+            Some(DurableRunTerminalV1 {
+                terminal_kind: "provider_error",
+                error_code: match failure_code {
+                    Some(code) => Some(code.as_str()),
+                    None => None,
+                },
+            })
+        }
+        RunState::Errored => Some(DurableRunTerminalV1 {
+            terminal_kind: "failure",
+            error_code: match failure_code {
+                Some(code) => Some(code.as_str()),
+                None => Some("internal"),
+            },
+        }),
+        _ => None,
+    }
 }
 
 /// Semantic comparison between a source run and its re-execution.

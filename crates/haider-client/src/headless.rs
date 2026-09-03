@@ -4619,7 +4619,7 @@ fn finalize(
     provider: String,
     model: String,
     attachments: Vec<ArtifactRef>,
-    forced: Option<ForcedOutcome>,
+    mut forced: Option<ForcedOutcome>,
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
     let HeadlessReducer {
         session_id,
@@ -4635,6 +4635,23 @@ fn finalize(
         mut output,
         ..
     } = reducer;
+    let retained_terminal_kind = terminal_envelope
+        .as_ref()
+        .and_then(|envelope| envelope.payload.get("terminal_kind"))
+        .and_then(|kind| serde_json::from_value::<HeadlessTerminalKind>(kind.clone()).ok());
+    if let (Some(forced_outcome), Some(retained_kind)) = (forced.as_ref(), retained_terminal_kind) {
+        let forced_kind = match forced_outcome {
+            ForcedOutcome::Timeout => HeadlessTerminalKind::Timeout,
+            ForcedOutcome::Interrupted => HeadlessTerminalKind::Cancellation,
+            ForcedOutcome::Blocked(_) => HeadlessTerminalKind::Failure,
+        };
+        if forced_kind != retained_kind {
+            // Once a current daemon has committed the terminal classifier,
+            // that durable row wins races with a local deadline/interrupt.
+            // Legacy peers omit the field and retain the historical fallback.
+            forced = None;
+        }
+    }
     let (outcome, failure, terminal_seq) = match forced {
         Some(ForcedOutcome::Timeout) => (
             HeadlessOutcome::Timeout,

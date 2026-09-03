@@ -1702,6 +1702,8 @@ async fn status_snapshot_counts_sessions_without_listing_summaries() {
                         socket_path,
                         pid_file_path,
                         ready,
+                        ready_since,
+                        providers_loaded,
                         idle_ttl_ms,
                         warm,
                     },
@@ -1714,6 +1716,8 @@ async fn status_snapshot_counts_sessions_without_listing_summaries() {
                 socket_path.clone(),
                 pid_file_path.clone(),
                 *ready,
+                *ready_since,
+                *providers_loaded,
                 *idle_ttl_ms,
                 *warm,
             )),
@@ -1730,7 +1734,9 @@ async fn status_snapshot_counts_sessions_without_listing_summaries() {
             Some(std::process::id()),
             None,
             None,
-            true,
+            false,
+            None,
+            false,
             None,
             false
         )

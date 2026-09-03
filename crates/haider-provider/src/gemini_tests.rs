@@ -666,7 +666,7 @@ async fn cm2g_gemini_cached_prefix_preserves_signed_parts_byte_exact() {
         Message::assistant(vec![
             Block::ProviderOpaque {
                 provider: GEMINI_PROVIDER_NAME.into(),
-                data: signed.clone(),
+                data: signed.clone().into(),
             },
             Block::ToolCall {
                 call_id: "gemini-call-0000000000000000".into(),

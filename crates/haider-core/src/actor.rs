@@ -2846,6 +2846,7 @@ impl HarnessActor {
                 message = Some(TextAccumulator::from_shared(
                     checkpoint.item_id.clone(),
                     &checkpoint.text,
+                    true,
                 ));
                 replay.message_applied = Some(checkpoint.text.clone());
             }
@@ -2853,6 +2854,7 @@ impl HarnessActor {
                 reasoning = Some(TextAccumulator::from_shared(
                     checkpoint.item_id.clone(),
                     &checkpoint.text,
+                    false,
                 ));
                 replay.reasoning_applied = Some(checkpoint.text.clone());
             }
@@ -2879,16 +2881,15 @@ impl HarnessActor {
                     }
                 }
             }
-            let mut replay_messages = ReplyArenaWriter::new();
+            let mut replay_messages = ReplyArenaWriter::new().with_standard_provider_json_views();
             let mut replay_reasoning = ReplyArenaWriter::new();
             for event in &mut checkpoint.structured_events {
                 match event {
                     StreamEvent::TextDelta { text } => {
-                        route_message_ranges
-                            .push_back(replay_messages.append(std::mem::take(text)));
+                        route_message_ranges.push_back(replay_messages.append_shared(text));
                     }
                     StreamEvent::ReasoningDelta { text } => {
-                        let _ = replay_reasoning.append(std::mem::take(text));
+                        let _ = replay_reasoning.append_shared(text);
                     }
                     StreamEvent::RefusalDelta { text } => {
                         replay.refusal_applied.push_str(text);
@@ -2976,7 +2977,7 @@ impl HarnessActor {
             {
                 Ok(ErrorAction::ContinuePartial) => {
                     messages.push(Message::assistant(vec![Block::Text {
-                        text: checkpoint.text.into(),
+                        text: checkpoint.text,
                     }]));
                     messages.push(Message::user_text(
                         "The previous response was interrupted. Continue exactly where it stopped without repeating any completed text.",
@@ -3220,7 +3221,7 @@ impl HarnessActor {
                 match event {
                     StreamEvent::TextDelta { .. } if route_has_message_events => {
                         if let Some(text) = route_message_ranges.pop_front() {
-                            assistant_blocks.push(Block::Text { text });
+                            append_assistant_text_block(&mut assistant_blocks, text);
                         }
                     }
                     StreamEvent::ProviderOpaque { provider, data } => {
@@ -4985,7 +4986,7 @@ impl HarnessActor {
                                 .await
                             {
                                 Ok(range) => {
-                                    assistant_blocks.push(Block::Text { text: range });
+                                    append_assistant_text_block(&mut assistant_blocks, range);
                                     replay.message_applied =
                                         message.as_ref().map(TextAccumulator::snapshot);
                                     Ok(None)
@@ -6248,7 +6249,7 @@ impl HarnessActor {
         &mut self,
         run_id: &RunId,
         accumulator: &mut Option<TextAccumulator>,
-        text: String,
+        text: ReplyText,
         reasoning: bool,
     ) -> Result<ReplyText, DriveError> {
         let open = match accumulator.take() {
@@ -6279,16 +6280,17 @@ impl HarnessActor {
                 )
                 .await
                 .map_err(DriveError::Store)?;
-                TextAccumulator::new(item_id)
+                TextAccumulator::new(item_id, !reasoning)
             }
         };
 
         let active = accumulator.insert(open);
-        let text = active.append(text);
+        let appended = active.append_shared(&text);
+        let accumulated = active.snapshot();
         let delta = if reasoning {
-            ItemDelta::Reasoning { text: text.clone() }
+            ItemDelta::Reasoning { text: appended }
         } else {
-            ItemDelta::Text { text: text.clone() }
+            ItemDelta::Text { text: appended }
         };
         self.commit_item(
             run_id,
@@ -6299,7 +6301,7 @@ impl HarnessActor {
         )
         .await
         .map_err(DriveError::Store)?;
-        Ok(text)
+        Ok(accumulated)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9555,7 +9557,7 @@ impl HarnessActor {
             kind: PROVIDER_OPAQUE_EXTENSION_KIND.into(),
             data: serde_json::json!({
                 "provider": provider,
-                "data": data,
+                "data": data.template(),
             }),
         };
         let render = hidden_prompt_verbatim_render();
@@ -9568,8 +9570,8 @@ impl HarnessActor {
                 verdict: VerifyVerdict::NotApplicable,
             },
         };
-        let envelopes = [
-            self.uncommitted_envelope(
+        let mut started = self
+            .uncommitted_envelope(
                 run_id,
                 EventPayload::Item(ItemEvent::Started {
                     item_id: item_id.clone(),
@@ -9577,13 +9579,25 @@ impl HarnessActor {
                 }),
                 render,
             )
-            .map_err(DriveError::Store)?,
-            self.uncommitted_envelope(
+            .map_err(DriveError::Store)?;
+        let mut completed = self
+            .uncommitted_envelope(
                 run_id,
                 EventPayload::Item(ItemEvent::Completed { item_id, item }),
                 render,
             )
-            .map_err(DriveError::Store)?,
+            .map_err(DriveError::Store)?;
+        if let Some(text) = data.reply_text()
+            && (!started.payload.bind_provider_opaque_reply(text.clone())
+                || !completed.payload.bind_provider_opaque_reply(text.clone()))
+        {
+            return Err(DriveError::Provider(provider_protocol_error(
+                "provider-opaque reply template has no recognized native text field",
+            )));
+        }
+        let envelopes = [
+            started,
+            completed,
             self.uncommitted_envelope(
                 run_id,
                 EventPayload::NodeCommitted(node.clone()),
@@ -10379,14 +10393,27 @@ fn poll_provider_stream_now(stream: &mut ProviderStream) -> Option<Option<Provid
 
 fn merge_contiguous_item_delta(existing: &mut ItemDelta, incoming: &ItemDelta) -> bool {
     match (existing, incoming) {
-        (ItemDelta::Text { text: accumulated }, ItemDelta::Text { text })
-        | (ItemDelta::Reasoning { text: accumulated }, ItemDelta::Reasoning { text }) => {
+        (ItemDelta::Text { text: accumulated }, ItemDelta::Text { text }) => {
             if let Some(joined) = accumulated.try_join(text) {
                 *accumulated = joined;
-                true
             } else {
-                false
+                let mut writer = ReplyArenaWriter::new().with_standard_provider_json_views();
+                let _ = writer.append_shared(accumulated);
+                let _ = writer.append_shared(text);
+                *accumulated = writer.seal();
             }
+            true
+        }
+        (ItemDelta::Reasoning { text: accumulated }, ItemDelta::Reasoning { text }) => {
+            if let Some(joined) = accumulated.try_join(text) {
+                *accumulated = joined;
+            } else {
+                let mut writer = ReplyArenaWriter::new();
+                let _ = writer.append_shared(accumulated);
+                let _ = writer.append_shared(text);
+                *accumulated = writer.seal();
+            }
+            true
         }
         (
             ItemDelta::ToolArgs {
@@ -10446,42 +10473,89 @@ struct ProviderRetryContext<'a> {
 #[derive(Debug)]
 struct TextAccumulator {
     item_id: ItemId,
+    provider_text: bool,
     writer: Option<ReplyArenaWriter>,
+    external: Option<ReplyText>,
     sealed: Option<ReplyText>,
 }
 
+/// Keeps one logical assistant text block while the provider grows it through
+/// multiple deltas. Both the prefix replacement and adjacent-range cases are
+/// metadata-only operations over the shared reply arena.
+fn append_assistant_text_block(blocks: &mut Vec<Block>, text: ReplyText) {
+    if let Some(Block::Text { text: previous }) = blocks.last_mut() {
+        let previous_range = previous.byte_range();
+        let text_range = text.byte_range();
+        if previous.shares_arena_with(&text)
+            && previous_range.start == text_range.start
+            && previous.is_prefix_of(&text)
+        {
+            *previous = text;
+            return;
+        }
+        if let Some(joined) = previous.try_join(&text) {
+            *previous = joined;
+            return;
+        }
+    }
+    blocks.push(Block::Text { text });
+}
+
 impl TextAccumulator {
-    fn new(item_id: ItemId) -> Self {
+    fn new(item_id: ItemId, provider_text: bool) -> Self {
         Self {
             item_id,
-            writer: Some(ReplyArenaWriter::new()),
+            provider_text,
+            writer: None,
+            external: None,
             sealed: None,
         }
     }
 
-    fn from_shared(item_id: ItemId, text: &ReplyText) -> Self {
-        let mut accumulator = Self::new(item_id);
-        let _ = accumulator
-            .writer
-            .as_mut()
-            .expect("new text accumulator owns append authority")
-            .append_shared(text);
-        accumulator
+    fn from_shared(item_id: ItemId, text: &ReplyText, provider_text: bool) -> Self {
+        Self {
+            item_id,
+            provider_text,
+            writer: None,
+            external: Some(text.clone()),
+            sealed: None,
+        }
     }
 
-    fn append(&mut self, text: String) -> ReplyText {
-        self.writer
-            .as_mut()
-            .expect("sealed reply accumulator cannot accept another delta")
-            .append(text)
+    fn append_shared(&mut self, text: &ReplyText) -> ReplyText {
+        assert!(
+            self.sealed.is_none(),
+            "sealed reply accumulator cannot accept another delta"
+        );
+        if let Some(writer) = self.writer.as_mut() {
+            return writer.append_shared(text);
+        }
+        if let Some(previous) = self.external.take() {
+            if let Some(joined) = previous.try_join(text) {
+                self.external = Some(joined);
+                return text.clone();
+            }
+            let mut writer = if self.provider_text {
+                ReplyArenaWriter::new().with_standard_provider_json_views()
+            } else {
+                ReplyArenaWriter::new()
+            };
+            let _ = writer.append_shared(&previous);
+            let appended = writer.append_shared(text);
+            self.writer = Some(writer);
+            return appended;
+        }
+        self.external = Some(text.clone());
+        text.clone()
     }
 
     fn snapshot(&self) -> ReplyText {
         self.sealed.clone().unwrap_or_else(|| {
-            self.writer
-                .as_ref()
-                .expect("text accumulator has a writer or sealed handle")
-                .snapshot()
+            self.external.clone().unwrap_or_else(|| {
+                self.writer
+                    .as_ref()
+                    .map_or_else(ReplyText::default, ReplyArenaWriter::snapshot)
+            })
         })
     }
 
@@ -10489,11 +10563,11 @@ impl TextAccumulator {
         if let Some(text) = &self.sealed {
             return text.clone();
         }
-        let text = self
-            .writer
-            .take()
-            .expect("unsealed text accumulator owns append authority")
-            .seal();
+        let text = self.external.take().unwrap_or_else(|| {
+            self.writer
+                .take()
+                .map_or_else(ReplyText::default, ReplyArenaWriter::seal)
+        });
         self.sealed = Some(text.clone());
         text
     }
@@ -10541,11 +10615,11 @@ impl ReplayPrefix {
         self.structured_expected = normalized_structured_replay(&self.structured_applied);
     }
 
-    fn filter_message(&mut self, text: String) -> String {
+    fn filter_message(&mut self, text: ReplyText) -> ReplyText {
         strip_replayed_reply_prefix(&mut self.message, text)
     }
 
-    fn filter_reasoning(&mut self, text: String) -> String {
+    fn filter_reasoning(&mut self, text: ReplyText) -> ReplyText {
         strip_replayed_reply_prefix(&mut self.reasoning, text)
     }
 
@@ -10754,7 +10828,7 @@ fn strip_replayed_prefix(expected: &mut String, text: String) -> String {
 /// Removes the exact prefix already accepted into the canonical reply arena.
 /// The expected side is only a shrinking range handle; the incoming provider
 /// delta is returned in its original allocation after an in-place drain.
-fn strip_replayed_reply_prefix(expected: &mut Option<ReplyText>, mut text: String) -> String {
+fn strip_replayed_reply_prefix(expected: &mut Option<ReplyText>, text: ReplyText) -> ReplyText {
     let Some(current) = expected.take() else {
         return text;
     };
@@ -10766,44 +10840,41 @@ fn strip_replayed_reply_prefix(expected: &mut Option<ReplyText>, mut text: Strin
         return text;
     }
 
-    let mut incoming = text.char_indices();
-    let mut expected_bytes = 0_usize;
-    let mut incoming_bytes = 0_usize;
-    let mut stopped = false;
-    let mut mismatch = false;
-    current.visit_strs(|segment| {
-        if stopped {
-            return;
+    let mut expected_bytes = current
+        .segments()
+        .into_iter()
+        .flat_map(IntoIterator::into_iter);
+    let mut incoming_bytes = text
+        .segments()
+        .into_iter()
+        .flat_map(IntoIterator::into_iter);
+    let mut common = 0_usize;
+    loop {
+        match (expected_bytes.next(), incoming_bytes.next()) {
+            (Some(left), Some(right)) if left == right => common = common.saturating_add(1),
+            _ => break,
         }
-        for expected_character in segment.chars() {
-            match incoming.next() {
-                Some((index, actual_character)) if actual_character == expected_character => {
-                    expected_bytes = expected_bytes.saturating_add(expected_character.len_utf8());
-                    incoming_bytes = index.saturating_add(actual_character.len_utf8());
-                }
-                Some((index, _)) => {
-                    incoming_bytes = index;
-                    mismatch = true;
-                    stopped = true;
-                    break;
-                }
-                None => {
-                    stopped = true;
-                    break;
-                }
-            }
-        }
-    });
+    }
+    while common > 0 && text.slice(0..common).is_none() {
+        common -= 1;
+    }
 
-    if mismatch {
-        text.drain(..incoming_bytes);
+    if common < current.len().min(text.len()) {
+        expected.take();
+        if let Some(suffix) = text.slice(common..text.len()) {
+            return suffix;
+        }
+        debug_assert!(false, "common reply prefix must end at a UTF-8 boundary");
         return text;
     }
-    if expected_bytes < current.len() {
-        *expected = current.slice(expected_bytes..current.len());
-        return String::new();
+    if common < current.len() {
+        *expected = current.slice(common..current.len());
+        return ReplyText::default();
     }
-    text.drain(..incoming_bytes);
+    if let Some(suffix) = text.slice(common..text.len()) {
+        return suffix;
+    }
+    debug_assert!(false, "complete replay prefix must end at a UTF-8 boundary");
     text
 }
 

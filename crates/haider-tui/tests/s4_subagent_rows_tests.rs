@@ -110,7 +110,7 @@ fn raw_metrics(seq: u64, at_ms: u64, snapshot: &AgentMetricsSnapshot) -> RawEnve
         at_ms,
         &EventPayload::RunState(haider_protocol::state::RunState::Thinking),
     );
-    envelope.payload = snapshot.to_payload_value().expect("metrics payload");
+    envelope.payload = snapshot.to_payload_value().expect("metrics payload").into();
     envelope
 }
 

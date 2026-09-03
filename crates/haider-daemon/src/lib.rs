@@ -129,6 +129,7 @@ mod usage_report;
 mod wb_web_runtime_tests;
 mod web_search;
 mod worker;
+mod workspace;
 
 #[cfg(test)]
 mod project_instructions_tests;
@@ -145,7 +146,8 @@ pub use error::{DaemonError, IncumbentDiagnostics};
 pub use gcloud::{GcloudAccessTokenSource, GcloudCli};
 pub use haider_tools::MonitorSourceKind;
 pub use lifecycle::{
-    DaemonState, Readiness, ShutdownDisposition, ShutdownHandle, ShutdownOutcome, ShutdownReason,
+    DaemonReadinessSnapshot, DaemonState, Readiness, ShutdownDisposition, ShutdownHandle,
+    ShutdownOutcome, ShutdownReason,
 };
 pub use monitor::{
     MAX_MONITORS_PER_SESSION, MAX_PENDING_MONITOR_REPORTS_PER_SESSION, MONITOR_COALESCE_WINDOW,

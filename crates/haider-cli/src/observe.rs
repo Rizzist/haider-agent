@@ -86,6 +86,8 @@ pub(crate) struct DaemonView {
     pub socket_path: String,
     pub pid_file_path: Option<String>,
     pub ready: bool,
+    pub ready_since: Option<u64>,
+    pub providers_loaded: bool,
     pub idle_ttl_ms: Option<u64>,
     pub warm: bool,
 }
@@ -126,6 +128,8 @@ struct StatusDaemonWire<'a> {
     pid_file_path: Option<&'a str>,
     pipe_dir: String,
     ready: bool,
+    ready_since: Option<u64>,
+    providers_loaded: bool,
     idle_ttl_ms: Option<u64>,
     warm: bool,
     socket_path: &'a str,
@@ -255,6 +259,8 @@ impl ObserveJson for StatusDocument {
                 "socket_path": self.daemon.socket_path,
                 "pid_file_path": self.daemon.pid_file_path,
                 "ready": self.daemon.ready,
+                "ready_since": self.daemon.ready_since,
+                "providers_loaded": self.daemon.providers_loaded,
                 "idle_ttl_ms": self.daemon.idle_ttl_ms,
                 "warm": self.daemon.warm,
                 "pipe_dir": std::path::Path::new(&self.profile_path)
@@ -606,6 +612,8 @@ JSON filesystem paths are canonical absolute paths; daemon.socket_path is a Wind
             socket_path,
             pid_file_path,
             ready: snapshot.ready,
+            ready_since: snapshot.ready_since,
+            providers_loaded: snapshot.providers_loaded,
             idle_ttl_ms: snapshot.idle_ttl_ms,
             warm: snapshot.warm,
         },
@@ -1196,6 +1204,8 @@ fn write_status_document(document: &StatusDocument) -> ExitCode {
             socket_path: &document.daemon.socket_path,
             pid_file_path: document.daemon.pid_file_path.as_deref(),
             ready: document.daemon.ready,
+            ready_since: document.daemon.ready_since,
+            providers_loaded: document.daemon.providers_loaded,
             idle_ttl_ms: document.daemon.idle_ttl_ms,
             warm: document.daemon.warm,
             pipe_dir: std::path::Path::new(&document.profile_path)
@@ -1263,7 +1273,7 @@ fn write_status_human(document: &StatusDocument) -> ExitCode {
         |version| format!("available ({version})"),
     );
     let mut text = format!(
-        "daemon {} (generation {}, pid {}, ready {})\nsocket: {}\npid file: {}\nupdate: {update}\naccount: {account}\nsessions: {}\nwaiting for route: {}\nprofile: {}\nruntime: {}\nfeatures: {}\n",
+        "daemon {} (generation {}, pid {}, ready {}, ready since {}, providers loaded {})\nsocket: {}\npid file: {}\nupdate: {update}\naccount: {account}\nsessions: {}\nwaiting for route: {}\nprofile: {}\nruntime: {}\nfeatures: {}\n",
         document.daemon.version,
         document.daemon.generation,
         document
@@ -1271,6 +1281,11 @@ fn write_status_human(document: &StatusDocument) -> ExitCode {
             .pid
             .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
         document.daemon.ready,
+        document
+            .daemon
+            .ready_since
+            .map_or_else(|| "unknown".to_owned(), |timestamp| timestamp.to_string()),
+        document.daemon.providers_loaded,
         document.daemon.socket_path,
         document
             .daemon

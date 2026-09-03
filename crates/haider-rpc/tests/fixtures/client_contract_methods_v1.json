@@ -188,6 +188,12 @@
       "response": {"method":"session.seen","session_id":"session-1","seen_at_ms":1753500000000,"seen_seq":21,"worker_generation":3}
     },
     {
+      "request_method": "session.workspace.set",
+      "response_method": "session.workspace.set",
+      "request": {"method":"session.workspace.set","command_id":"command-workspace-set","session_id":"session-1","worker_generation":3,"path":"/workspace/recovered"},
+      "response": {"method":"session.workspace.set","session_id":"session-1","path":"/workspace/recovered","selected_seq":22,"worker_generation":3}
+    },
+    {
       "request_method": "session.select_agent_type",
       "response_method": "session.select_agent_type",
       "request": {"method":"session.select_agent_type","command_id":"command-agent-type","session_id":"session-1","worker_generation":3,"agent_type":"reviewer"},
@@ -389,7 +395,7 @@
       "request_method": "status.snapshot",
       "response_method": "status.snapshot",
       "request": {"method":"status.snapshot"},
-      "response": {"method":"status.snapshot","session_count":365,"adoption_available":[{"source":"codex","email":"person@example.invalid"}],"daemon_pid":4242,"socket_path":"/tmp/haider-golden/h.sock","pid_file_path":"/tmp/haider-golden/haiderd.pid","ready":true}
+      "response": {"method":"status.snapshot","session_count":365,"adoption_available":[{"source":"codex","email":"person@example.invalid"}],"daemon_pid":4242,"socket_path":"/tmp/haider-golden/h.sock","pid_file_path":"/tmp/haider-golden/haiderd.pid","ready":true,"ready_since":1753500000000,"providers_loaded":true}
     }
   ]
 }

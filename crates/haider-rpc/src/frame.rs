@@ -409,6 +409,9 @@ pub const FEATURE_SESSION_MODEL_SELECT_V1: &str = "session_model_select_v1";
 /// `session_renamed` config fact is journaled atomically with the receipt,
 /// and `session.list` summaries carry the title.
 pub const FEATURE_SESSION_RENAME_V1: &str = "session_rename_v1";
+/// Daemon implements receipt-backed replacement of a session's canonical
+/// workspace root (`session.workspace.set`).
+pub const FEATURE_SESSION_WORKSPACE_SET_V1: &str = "session_workspace_set_v1";
 /// Daemon implements the durable, shared per-session attention acknowledgement
 /// (`session.seen`) and attention fields on session summaries.
 pub const FEATURE_SESSION_SEEN_V1: &str = "session_seen_v1";
@@ -1217,6 +1220,16 @@ pub struct ModelDetailWire {
     /// vs top-level reasoning_effort) without a client-side table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_thinking_type: Option<bool>,
+    /// Whether this pair accepts IMAGE attachments.
+    ///
+    /// Daemon truth, projected from `haider_provider::vision_capability`
+    /// (which mirrors each adapter's own `capabilities().vision` — the fact
+    /// the daemon enforces at turn time as `vision_unsupported`). Clients
+    /// hold no tables: `Some(false)` is a DECLARED refusal a client may act
+    /// on before spending a turn; `None` is an older daemon that projects
+    /// nothing, and a client must then attach and let the daemon answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
 }
 
 /// One provider's read-only management projection.
@@ -3504,6 +3517,14 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
     },
+    /// Replace this session's stored workspace with a freshly validated root.
+    #[serde(rename = "session.workspace.set")]
+    SessionWorkspaceSet {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        path: String,
+    },
     /// Receipted durable acknowledgement that one surface has viewed this
     /// session. The daemon advances the timestamp monotonically and replays
     /// the original receipt for a repeated command id.
@@ -4208,11 +4229,19 @@ pub enum ResponseBody {
         /// has one. Older daemons omit it rather than publishing a guess.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pid_file_path: Option<String>,
-        /// True exactly on the lifecycle edge which also releases the
-        /// launcher readiness notification. Missing on an older response is
-        /// false and is disambiguated by feature negotiation.
+        /// True only after store open, recovery, provider-registry loading,
+        /// and the session-hub turn path are complete. The same predicate
+        /// releases the launcher readiness notification.
         #[serde(default)]
         ready: bool,
+        /// Unix epoch milliseconds at the positive Ready edge. Missing on an
+        /// older response or while not ready is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ready_since: Option<u64>,
+        /// Registry/factory loading is complete. This does not claim any
+        /// provider is connected; providers connect per request.
+        #[serde(default, skip_serializing_if = "is_false")]
+        providers_loaded: bool,
         /// Effective launcher-owned idle TTL. Zero is the explicit one-shot
         /// policy; absence identifies an unbounded or older daemon.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4562,6 +4591,14 @@ pub enum ResponseBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
         renamed_seq: u64,
+        worker_generation: u64,
+    },
+    /// Durable coordinates of a committed workspace selection.
+    #[serde(rename = "session.workspace.set")]
+    SessionWorkspaceSet {
+        session_id: SessionId,
+        path: String,
+        selected_seq: u64,
         worker_generation: u64,
     },
     /// Durable coordinates of a committed attention acknowledgement. A

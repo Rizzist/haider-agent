@@ -594,7 +594,7 @@ fn agent_body_wraps_by_cells_with_rail_on_every_row() {
         ItemEvent::Completed {
             item_id: ItemId::new("wide-msg"),
             item: TurnItem::AgentMessage {
-                text: body.to_owned(),
+                text: body.to_owned().into(),
             },
         },
     ))));

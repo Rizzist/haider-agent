@@ -147,7 +147,7 @@ pub(crate) async fn draft_from_prose(
                         false,
                     ));
                 }
-                output.push_str(&text);
+                text.visit_strs(|segment| output.push_str(segment));
             }
             StreamEvent::RefusalDelta { .. } => {
                 return Err(HaiderError::new(

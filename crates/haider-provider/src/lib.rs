@@ -1230,6 +1230,78 @@ pub fn pdf_document_capability(provider: &str) -> FeatureResolve {
     }
 }
 
+/// Provider-catalog declaration for IMAGE attachments, so a CLIENT can refuse
+/// a picture BEFORE it costs a turn (970 owner bug 2: Ctrl+V paste-image).
+///
+/// This mirrors, per provider name, the `vision` field each adapter already
+/// returns from [`Provider::capabilities`] — the fact the daemon enforces at
+/// turn time (`worker.rs`, `ErrorCode::VisionUnsupported`). It is a
+/// PROJECTION of that truth into the sync catalog path, exactly the way
+/// [`pdf_document_capability`] projects `pdf_documents`: the catalog summary
+/// is built without a live adapter, so the fact has to be nameable from the
+/// provider id alone.
+///
+/// `None` is the honest "UNDECLARED" and it is not the same as a refusal: a
+/// client must attach and let the daemon answer. Only `Some(Unsupported)`
+/// authorizes a client-side refusal.
+///
+/// `model_declares` is the provider's OWN per-model declaration
+/// ([`DiscoveredModelExtensions::supports_vision`]) and always wins when the
+/// catalog carries one — today only Kimi (from its `supports_image_in` key)
+/// and Grok publish it.
+///
+/// THE DOCUMENTED LIST, each entry traceable to the adapter that serves it:
+///
+/// | provider id | answer | adapter site |
+/// |---|---|---|
+/// | `anthropic`, `anthropic-oauth`, `bedrock`, `vertex` | `Native` | `anthropic.rs` `capabilities` |
+/// | `openai`, `openai-oauth` | `Native` | `openai.rs` `native_capabilities` |
+/// | `gemini` | `Native` | `gemini.rs` `capabilities` |
+/// | `grok-oauth` | `Native` | `openai.rs` `grok_capabilities_from_model` |
+/// | `kimi-oauth` | per-model, else UNDECLARED | `openai.rs` `kimi_capabilities_from_model` |
+/// | `deepseek` | `Unsupported` | text-only catalog (`DEEPSEEK_SEED_MODELS`) |
+/// | `openai-compatible`, `haider-code`, `xai`, custom profiles | UNDECLARED | `openai.rs` `compatible_capabilities` |
+///
+/// WHY THE LAST ROW IS UNDECLARED RATHER THAN `Unsupported`. Those families
+/// serve models whose SLUGS ARE USER-CONTROLLED — an arbitrary endpoint, the
+/// first-party gateway's rotating catalog, xAI's own vision-capable Grok
+/// builds. `compatible_capabilities` answers `Unsupported` because it refuses
+/// to INFER a feature from a vendor-controlled identifier, which is a
+/// statement about the adapter's knowledge, not about the model. Projecting
+/// it as a declared `false` would turn "we do not know" into "you may not",
+/// and a client would then refuse images that actually work. Undeclared keeps
+/// the daemon the authority.
+///
+/// `deepseek` stays declared-unsupported because it is the one family here
+/// whose inventory is a fixed, first-party, genuinely text-only seed list.
+#[must_use]
+pub fn vision_capability(provider: &str, model_declares: Option<bool>) -> Option<FeatureResolve> {
+    if let Some(declared) = model_declares {
+        return Some(if declared {
+            FeatureResolve::Native
+        } else {
+            FeatureResolve::Unsupported
+        });
+    }
+    if matches!(
+        provider,
+        ANTHROPIC_PROVIDER_NAME
+            | ANTHROPIC_OAUTH_PROVIDER_NAME
+            | BEDROCK_PROVIDER_NAME
+            | VERTEX_PROVIDER_NAME
+            | OPENAI_PROVIDER_NAME
+            | OPENAI_OAUTH_PROVIDER_NAME
+            | GEMINI_PROVIDER_NAME
+            | GROK_OAUTH_PROVIDER_NAME
+    ) {
+        return Some(FeatureResolve::Native);
+    }
+    if provider == DEEPSEEK_PROVIDER_NAME {
+        return Some(FeatureResolve::Unsupported);
+    }
+    None
+}
+
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-provider";
 
@@ -2002,6 +2074,51 @@ pub(crate) fn reply_json_value(
         text: text.clone(),
     });
     serde_json::Value::String(marker)
+}
+
+/// Projects provider-native continuation JSON into the prepared-wire marker
+/// table without materializing an arena-backed text field.
+pub(crate) fn provider_opaque_json_value(
+    data: &haider_protocol::provider::ProviderOpaqueData,
+    bind_large_replies: bool,
+    bindings: &mut Vec<PreparedReplyBinding>,
+) -> Result<serde_json::Value, ProviderError> {
+    if !bind_large_replies {
+        return Ok(data.to_json_value());
+    }
+    let Some((marker, text)) = data.reply_binding() else {
+        return Ok(data.to_json_value());
+    };
+    let mut template = data.template().clone();
+    let replacement = reply_json_value(text, bindings);
+    if replace_provider_opaque_marker(&mut template, marker, replacement) {
+        Ok(template)
+    } else {
+        Err(ProviderError::new(
+            ProviderErrorKind::Internal,
+            "provider-opaque reply marker disappeared before wire preparation",
+        ))
+    }
+}
+
+fn replace_provider_opaque_marker(
+    value: &mut serde_json::Value,
+    marker: &str,
+    replacement: serde_json::Value,
+) -> bool {
+    match value {
+        serde_json::Value::String(text) if text == marker => {
+            *value = replacement;
+            true
+        }
+        serde_json::Value::Array(values) => values
+            .iter_mut()
+            .any(|value| replace_provider_opaque_marker(value, marker, replacement.clone())),
+        serde_json::Value::Object(fields) => fields
+            .values_mut()
+            .any(|value| replace_provider_opaque_marker(value, marker, replacement.clone())),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3127,7 +3244,7 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                 }
             }
             FakeStep::EmitReasoning { text } => {
-                if !send_event(&sender, StreamEvent::ReasoningDelta { text }).await {
+                if !send_event(&sender, StreamEvent::ReasoningDelta { text: text.into() }).await {
                     return;
                 }
             }
@@ -3137,7 +3254,15 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                 }
             }
             FakeStep::EmitProviderOpaque { provider, data } => {
-                if !send_event(&sender, StreamEvent::ProviderOpaque { provider, data }).await {
+                if !send_event(
+                    &sender,
+                    StreamEvent::ProviderOpaque {
+                        provider,
+                        data: data.into(),
+                    },
+                )
+                .await
+                {
                     return;
                 }
             }
@@ -3379,7 +3504,7 @@ async fn emit_bytes(
     match utf8.push(bytes) {
         Ok(parts) => {
             for text in parts {
-                if !send_event(sender, StreamEvent::TextDelta { text }).await {
+                if !send_event(sender, StreamEvent::TextDelta { text: text.into() }).await {
                     return false;
                 }
             }

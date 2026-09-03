@@ -137,6 +137,7 @@ use haider_protocol::tool::{
     ToolInventoryEntry, ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
     ToolResultStatus,
 };
+use haider_protocol::workspace::{WorkspaceEventPayload, WorkspaceUnavailable};
 use haider_protocol::{DeliveryMode, EventPayload};
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, DEEPSEEK_PROVIDER_NAME, Message,
@@ -1599,7 +1600,9 @@ impl ContextCompactor for DaemonContextCompactor {
             };
             match item {
                 StreamEvent::NetworkUnavailable | StreamEvent::NetworkRestored => {}
-                StreamEvent::TextDelta { text } => summary.push_str(&text),
+                StreamEvent::TextDelta { text } => {
+                    text.visit_strs(|segment| summary.push_str(segment));
+                }
                 StreamEvent::ReasoningDelta { .. } => {}
                 StreamEvent::UsageUpdate(mut usage) => {
                     let mut scope = self.usage_scope.clone();
@@ -6260,10 +6263,16 @@ async fn perform_manual_compaction(
         .provider_factory
         .reconcile_cache_scope(lease.session_id(), &resolved.provider_name)
         .await;
+    let workspace_unavailable = crate::workspace::unavailable(Path::new(&metadata.cwd));
+    if workspace_unavailable.is_some()
+        && let Some(hooks) = lease.hub().hooks().map_err(hub_error)?
+    {
+        hooks.pin_workspace_unavailable(lease.session_id(), &boundary_run_id);
+    }
     // Project instruction discovery walks ancestor directories. Lockdown
     // reads are workspace-scoped, so the daemon must not inject that implicit
     // out-of-workspace read into a restricted provider prompt.
-    let instructions = if lockdown.is_some() {
+    let instructions = if lockdown.is_some() || workspace_unavailable.is_some() {
         None
     } else {
         project_instructions::load(&metadata.cwd).await
@@ -6271,9 +6280,13 @@ async fn perform_manual_compaction(
     let instruction_entries = instructions
         .as_ref()
         .map_or_else(Vec::new, LoadedProjectInstructions::prompt_entries);
-    let handoff_dir = delegation
-        .handoff_dir_for_child_session(lease.session_id(), &metadata.cwd)
-        .await?;
+    let handoff_dir = if workspace_unavailable.is_none() {
+        delegation
+            .handoff_dir_for_child_session(lease.session_id(), &metadata.cwd)
+            .await?
+    } else {
+        None
+    };
     let mobile_use_active = durable_session_tool_state(lease, lease.session_id())
         .await?
         .mobile_use_active;
@@ -6294,11 +6307,19 @@ async fn perform_manual_compaction(
         post_compaction_tools.as_ref(),
         &post_compaction_grant_scope,
     );
-    let post_compaction_volatile_tail = SystemPromptBuilder::session_context_with_handoff(
+    let mut post_compaction_volatile_tail = SystemPromptBuilder::session_context_with_handoff(
         metadata,
         &instruction_entries,
         handoff_dir.as_deref(),
     );
+    if let Some(unavailable) = workspace_unavailable.as_ref() {
+        post_compaction_volatile_tail.push_str("\n\n[WORKSPACE UNAVAILABLE]\n");
+        post_compaction_volatile_tail.push_str(&format!(
+            "The stored workspace root `{}` is unavailable ({}). Workspace-scoped context is disabled.",
+            unavailable.path,
+            unavailable.reason.as_str()
+        ));
+    }
     let auth_scope = credential_surface_name(resolved.provider.credential_surface()).to_owned();
     let usage_account = resolved
         .account_alias
@@ -6558,6 +6579,18 @@ async fn perform_shell_exec(
             false,
         ));
     }
+    if let Some(unavailable) = crate::workspace::unavailable(Path::new(&metadata.cwd)) {
+        return fail_shell_exec(
+            lease,
+            device_id,
+            &event_ids,
+            &run_id,
+            pending.branch_id.as_ref(),
+            pending.agent_id.as_ref(),
+            crate::workspace::error(&unavailable),
+        )
+        .await;
+    }
     if *drain_wakes.borrow() {
         begin_shell_cancellation(
             lease,
@@ -6626,6 +6659,9 @@ async fn perform_shell_exec(
         intent_digests: HashMap::new(),
         pending_breadcrumbs: HashMap::new(),
     };
+    // Direct-shell setup also canonicalizes its optional per-command cwd;
+    // retain the broker's matching canonical identity here. Ordinary chat
+    // turn setup uses `new_canonical` after the shared cheap root probe.
     let mut broker = match EffectBroker::new(
         Box::new(journal),
         &metadata.cwd,
@@ -6634,6 +6670,13 @@ async fn perform_shell_exec(
     ) {
         Ok(broker) => broker,
         Err(error) => {
+            let unavailable = crate::workspace::unavailable(Path::new(&metadata.cwd)).unwrap_or(
+                WorkspaceUnavailable {
+                    path: metadata.cwd.clone(),
+                    reason: haider_protocol::workspace::WorkspaceUnavailableReason::NotReadable,
+                    detail: error.to_string(),
+                },
+            );
             return fail_shell_exec(
                 lease,
                 device_id,
@@ -6641,7 +6684,7 @@ async fn perform_shell_exec(
                 &run_id,
                 pending.branch_id.as_ref(),
                 pending.agent_id.as_ref(),
-                tool_error(error),
+                crate::workspace::error(&unavailable),
             )
             .await;
         }
@@ -7298,6 +7341,18 @@ async fn start_turn(
         });
     }
     let metadata = &pinned_metadata;
+    // Creation and explicit re-rooting already establish canonical identity.
+    // Turn startup performs only a cheap availability/open check: a vanished
+    // root degrades workspace capabilities but must not abort plain chat.
+    let mut workspace_unavailable = crate::workspace::unavailable(Path::new(&metadata.cwd));
+    if workspace_unavailable.is_some()
+        && let Some(hooks) = lease.hub().hooks().map_err(hub_error)?
+    {
+        // This is intentionally synchronous and immediately adjacent to the
+        // probe. A same-path restoration after the snapshot cannot race hook
+        // discovery or execution back on for this logical run.
+        hooks.pin_workspace_unavailable(lease.session_id(), &accepted.run_id);
+    }
     // W-B (decision 8): the session's web-capability degrades ride into
     // pair resolution (native declarations) AND the tool pack below — ONE
     // per-turn derivation from the resolved pair.
@@ -7605,12 +7660,16 @@ async fn start_turn(
         .await;
     // G1 (L5): a delegation-owned session is a child — its tool pack below
     // excludes the root-only planning surface.
-    let handoff_dir = delegation
-        .handoff_dir_for_child_session(lease.session_id(), &metadata.cwd)
-        .await?;
+    let handoff_dir = if workspace_unavailable.is_none() {
+        delegation
+            .handoff_dir_for_child_session(lease.session_id(), &metadata.cwd)
+            .await?
+    } else {
+        None
+    };
     // See the manual-compaction path above: ancestor instruction discovery
     // is an implicit filesystem read and is therefore disabled in lockdown.
-    let instructions = if lockdown.is_some() {
+    let instructions = if lockdown.is_some() || workspace_unavailable.is_some() {
         None
     } else {
         project_instructions::load(&metadata.cwd).await
@@ -7633,17 +7692,31 @@ async fn start_turn(
         },
     )
     .await?;
-    journal_project_instructions_if_changed(
-        lease,
-        device_id,
-        &accepted.run_id,
-        accepted.branch_id.as_ref(),
-        agent_id.as_ref(),
-        &event_ids,
-        instructions.as_ref(),
-        &mut setup_reduction,
-    )
-    .await?;
+    if let Some(unavailable) = workspace_unavailable.as_ref() {
+        journal_workspace_unavailable_once(
+            lease,
+            device_id,
+            &accepted.run_id,
+            accepted.branch_id.as_ref(),
+            agent_id.as_ref(),
+            &event_ids,
+            unavailable,
+            &mut setup_reduction,
+        )
+        .await?;
+    } else {
+        journal_project_instructions_if_changed(
+            lease,
+            device_id,
+            &accepted.run_id,
+            accepted.branch_id.as_ref(),
+            agent_id.as_ref(),
+            &event_ids,
+            instructions.as_ref(),
+            &mut setup_reduction,
+        )
+        .await?;
+    }
     let prewarm = (std::env::var_os("HAIDER_PROVIDER_PREWARM").as_deref()
         == Some(std::ffi::OsStr::new("1")))
     .then(|| {
@@ -7752,14 +7825,52 @@ async fn start_turn(
         .collect();
         (!parts.is_empty()).then(|| parts.join("\n"))
     };
-    let instruction_entries = instructions
-        .as_ref()
-        .map_or_else(Vec::new, LoadedProjectInstructions::prompt_entries);
+    // Workspace-scoped setup above contains several unrelated awaits. Sample
+    // again immediately before broker construction; a root deleted in that
+    // interval must still switch the turn to its rootless dispatcher instead
+    // of terminalizing it from the constructor.
+    if workspace_unavailable.is_none()
+        && let Some(unavailable) = crate::workspace::unavailable(Path::new(&metadata.cwd))
+    {
+        if let Some(hooks) = lease.hub().hooks().map_err(hub_error)? {
+            hooks.pin_workspace_unavailable(lease.session_id(), &accepted.run_id);
+        }
+        journal_workspace_unavailable_once(
+            lease,
+            device_id,
+            &accepted.run_id,
+            accepted.branch_id.as_ref(),
+            agent_id.as_ref(),
+            &event_ids,
+            &unavailable,
+            &mut setup_reduction,
+        )
+        .await?;
+        workspace_unavailable = Some(unavailable);
+    }
+    let instruction_entries = if workspace_unavailable.is_some() {
+        Vec::new()
+    } else {
+        instructions
+            .as_ref()
+            .map_or_else(Vec::new, LoadedProjectInstructions::prompt_entries)
+    };
     let mut session_context = SystemPromptBuilder::session_context_with_handoff(
         metadata,
         &instruction_entries,
-        handoff_dir.as_deref(),
+        workspace_unavailable
+            .is_none()
+            .then_some(handoff_dir.as_deref())
+            .flatten(),
     );
+    if let Some(unavailable) = workspace_unavailable.as_ref() {
+        session_context.push_str("\n\n[WORKSPACE UNAVAILABLE]\n");
+        session_context.push_str(&format!(
+            "The stored workspace root `{}` is unavailable ({}). Continue as plain chat. Workspace instructions, hooks, receipts, and cwd-dependent tools are disabled for this turn.",
+            unavailable.path,
+            unavailable.reason.as_str()
+        ));
+    }
     if loom_workflow
         .as_ref()
         .is_some_and(|workflow| workflow.meta.iter().any(|meta| meta.agent_type.is_some()))
@@ -7776,36 +7887,87 @@ async fn start_turn(
         mobile_use_active,
     } = setup_reduction.durable_tool_state();
     let effect_dispatched = Arc::new(AtomicBool::new(false));
-    let dispatcher = dependencies
-        .tool_factory
-        .create_with_turn_snapshot(
-            WorkerToolContext {
-                metadata: metadata.clone(),
-                store: lease.clone(),
-                run_id: accepted.run_id.clone(),
-                run_deadline: provider_deadline,
-                branch_id: accepted.branch_id.clone(),
-                device_id: device_id.clone(),
-                event_ids: Arc::clone(&event_ids),
-                delegation,
-                tasks: crate::tasks::TaskFacade::new(lease.hub().clone()),
-                agent_id: agent_id.clone(),
-                session_context_tail: session_context.clone(),
-                grant: delegation_grant.clone(),
-                mobile_use_active,
-                cli_scope,
-                typed_workflow_execution,
-                loom_provider_fenced,
-                web_search: dependencies.web_search.clone(),
-                diagnostics: dependencies.diagnostics.clone(),
-                lockdown: lockdown.clone(),
-            },
-            durable_grants,
-            durable_bindings,
-            durable_freshness,
-            Arc::clone(&effect_dispatched),
-        )
-        .await?;
+    let dispatcher = if let Some(unavailable) = workspace_unavailable.clone() {
+        Some(Arc::new(WorkspaceUnavailableToolDispatcher { unavailable }) as Arc<dyn ToolDispatcher>)
+    } else {
+        let broker = dependencies
+            .tool_factory
+            .create_with_turn_snapshot(
+                WorkerToolContext {
+                    metadata: metadata.clone(),
+                    store: lease.clone(),
+                    run_id: accepted.run_id.clone(),
+                    run_deadline: provider_deadline,
+                    branch_id: accepted.branch_id.clone(),
+                    device_id: device_id.clone(),
+                    event_ids: Arc::clone(&event_ids),
+                    delegation,
+                    tasks: crate::tasks::TaskFacade::new(lease.hub().clone()),
+                    agent_id: agent_id.clone(),
+                    session_context_tail: session_context.clone(),
+                    grant: delegation_grant.clone(),
+                    mobile_use_active,
+                    cli_scope,
+                    typed_workflow_execution,
+                    loom_provider_fenced,
+                    web_search: dependencies.web_search.clone(),
+                    diagnostics: dependencies.diagnostics.clone(),
+                    lockdown: lockdown.clone(),
+                },
+                durable_grants,
+                durable_bindings,
+                durable_freshness,
+                Arc::clone(&effect_dispatched),
+            )
+            .await;
+        match broker {
+            Ok(dispatcher) => dispatcher,
+            Err(error) if error.code == ErrorCode::WorkspaceUnavailable => {
+                // The root can disappear in the tiny interval between the
+                // second cheap probe and the broker's directory open. Convert
+                // that constructor race into the same rootless turn snapshot.
+                let unavailable = crate::workspace::unavailable(Path::new(&metadata.cwd))
+                    .unwrap_or(WorkspaceUnavailable {
+                        path: metadata.cwd.clone(),
+                        reason: haider_protocol::workspace::WorkspaceUnavailableReason::NotReadable,
+                        detail: error.message,
+                    });
+                if let Some(hooks) = lease.hub().hooks().map_err(hub_error)? {
+                    hooks.pin_workspace_unavailable(lease.session_id(), &accepted.run_id);
+                }
+                journal_workspace_unavailable_once(
+                    lease,
+                    device_id,
+                    &accepted.run_id,
+                    accepted.branch_id.as_ref(),
+                    agent_id.as_ref(),
+                    &event_ids,
+                    &unavailable,
+                    &mut setup_reduction,
+                )
+                .await?;
+                session_context =
+                    SystemPromptBuilder::session_context_with_handoff(metadata, &[], None);
+                session_context.push_str("\n\n[WORKSPACE UNAVAILABLE]\n");
+                session_context.push_str(&format!(
+                    "The stored workspace root `{}` is unavailable ({}). Continue as plain chat. Workspace instructions, hooks, receipts, and cwd-dependent tools are disabled for this turn.",
+                    unavailable.path,
+                    unavailable.reason.as_str()
+                ));
+                if loom_workflow.as_ref().is_some_and(|workflow| {
+                    workflow.meta.iter().any(|meta| meta.agent_type.is_some())
+                }) {
+                    session_context.push_str("\n\n[DAEMON-BOUND TYPED WORKFLOW EXECUTOR]\n");
+                    session_context.push_str(
+                        "The daemon selects and capability-scopes each typed node. The current volatile typed-executor binding is authoritative; stop using a prior specialist role whenever that binding changes.",
+                    );
+                }
+                Some(Arc::new(WorkspaceUnavailableToolDispatcher { unavailable })
+                    as Arc<dyn ToolDispatcher>)
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let mut config = HarnessConfig::for_session(
         lease.session_id().clone(),
         device_id.clone(),
@@ -8269,6 +8431,8 @@ fn stamp_usage_lane_dimensions(
 
 const TURN_SETUP_REDUCTION_PAYLOAD_KINDS: &[&str] = &[
     "project_instructions_loaded",
+    "workspace_unavailable",
+    "workspace_selected",
     "effect",
     "menu_opened",
     "menu_answered",
@@ -8439,6 +8603,7 @@ struct TurnSetupReduction {
     selector: TurnSetupReductionSelector,
     latest_instruction_fact: Option<ProjectInstructionsLoaded>,
     same_run_instruction_fact: Option<ProjectInstructionsLoaded>,
+    same_run_workspace_unavailable: bool,
     instruction_facts: HashMap<(Option<RunId>, Option<BranchId>), SequencedInstructionFact>,
     durable_tools: DurableToolStateReduction,
     latest_main_usage_scope: Option<UsageScope>,
@@ -8461,6 +8626,7 @@ impl TurnSetupReduction {
             selector,
             latest_instruction_fact: None,
             same_run_instruction_fact: None,
+            same_run_workspace_unavailable: false,
             instruction_facts: HashMap::new(),
             durable_tools: DurableToolStateReduction::default(),
             latest_main_usage_scope: None,
@@ -8490,6 +8656,28 @@ impl TurnSetupReduction {
             .payload
             .get("type")
             .and_then(serde_json::Value::as_str);
+        if matches!(
+            payload_kind,
+            Some("workspace_unavailable" | "workspace_selected")
+        ) {
+            match WorkspaceEventPayload::from_payload_value(&envelope.payload) {
+                Some(WorkspaceEventPayload::WorkspaceUnavailable(_))
+                    if envelope.run_id.as_ref() == Some(&self.selector.run_id) =>
+                {
+                    self.same_run_workspace_unavailable = true;
+                }
+                Some(WorkspaceEventPayload::WorkspaceSelected(_)) => {
+                    // Re-rooting changes the identity behind every path.
+                    // Historical instruction facts, permission grants, and
+                    // freshness receipts cannot authorize the new root.
+                    self.instruction_facts.clear();
+                    self.refresh_instruction_facts();
+                    self.durable_tools.reset_at_workspace_selection();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
         if payload_kind == Some("project_instructions_loaded") {
             if let Some(fact) = ProjectInstructionsLoaded::from_payload_value(&envelope.payload) {
                 self.observe_instruction_fact(
@@ -10839,6 +11027,58 @@ async fn append_shell_payloads(
     if publishes_terminal {
         trace_windows_process_publish("Terminal", run_id);
     }
+    Ok(())
+}
+
+/// Emits the one durable/UI availability notice owned by this logical run.
+/// Recovery may re-enter setup after the append, so the setup reduction is
+/// the exactly-once fence rather than process memory.
+#[allow(clippy::too_many_arguments)]
+async fn journal_workspace_unavailable_once(
+    store: &HubStoreHandle,
+    device_id: &DeviceId,
+    run_id: &RunId,
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
+    event_ids: &EventIdGenerator,
+    unavailable: &WorkspaceUnavailable,
+    reduction: &mut TurnSetupReduction,
+) -> Result<(), HaiderError> {
+    if reduction.same_run_workspace_unavailable {
+        return Ok(());
+    }
+    let payload = WorkspaceEventPayload::WorkspaceUnavailable(unavailable.clone())
+        .to_payload_value()
+        .map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("cannot serialize workspace-unavailable fact: {error}"),
+                false,
+            )
+        })?;
+    let mut envelopes = [RawEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: event_ids.next(),
+        seq: 0,
+        session_id: store.session_id().clone(),
+        branch_id: branch_id.cloned(),
+        run_id: Some(run_id.clone()),
+        agent_id: agent_id.cloned(),
+        device_id: device_id.clone(),
+        authority_epoch: 0,
+        worker_generation: store.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: payload.into(),
+    }];
+    StoreHandle::append(store, &mut envelopes).await?;
+    reduction.same_run_workspace_unavailable = true;
     Ok(())
 }
 
@@ -13734,6 +13974,64 @@ pub(crate) fn provider_derived_request_state(
     }
 }
 
+/// Turn-local dispatcher used when the stored root failed its cheap
+/// availability check. Actor-owned conversational tools remain usable;
+/// anything routed through the workspace broker receives a completed typed
+/// refusal and therefore cannot create effects or workspace receipts.
+struct WorkspaceUnavailableToolDispatcher {
+    unavailable: WorkspaceUnavailable,
+}
+
+#[async_trait]
+impl ToolDispatcher for WorkspaceUnavailableToolDispatcher {
+    async fn execute(
+        &self,
+        _run_id: &RunId,
+        _item_id: &ItemId,
+        _call_id: &str,
+        name: &str,
+        _args: serde_json::Value,
+        _cancel: &CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        let reason = bounded_failure_reason(&format!(
+            "workspace unavailable: {}: {}; re-root the session before using `{name}`",
+            self.unavailable.path,
+            self.unavailable.reason.as_str()
+        ));
+        Ok(ToolDispatchResult::Completed(BoundedResult {
+            preview: serde_json::json!({
+                "status": "rejected",
+                "error": {
+                    "kind": ErrorCode::WorkspaceUnavailable.as_str(),
+                    "path": self.unavailable.path,
+                    "reason": self.unavailable.reason,
+                    "detail": self.unavailable.detail,
+                    "tool": name,
+                }
+            })
+            .to_string(),
+            truncated: false,
+            data: None,
+            artifact: None,
+            images: Vec::new(),
+            cursor: None,
+            status: ToolResultStatus::Rejected,
+            reason: Some(reason),
+            presentation: Some(ErrorPresentation::new(
+                ErrorCode::WorkspaceUnavailable.as_subcode(),
+                "Workspace unavailable",
+                format!(
+                    "The stored workspace root `{}` cannot be used ({}). Re-root this session to enable workspace tools.",
+                    self.unavailable.path,
+                    self.unavailable.reason.as_str()
+                ),
+                ErrorScope::Tool,
+                [ErrorAction::None],
+            )),
+        }))
+    }
+}
+
 #[async_trait]
 impl TurnToolFactory for BrokerToolFactory {
     fn definitions(&self) -> Vec<ToolDefinition> {
@@ -13914,13 +14212,21 @@ async fn create_broker_tool_dispatcher(
     let session_id = context.store.session_id().clone();
     let active_tool_name = Arc::new(StdMutex::new(None));
     let journal = HubJournalSink::new(&context, Arc::clone(&active_tool_name), effect_dispatched);
-    let mut broker = EffectBroker::new(
+    let mut broker = EffectBroker::new_canonical(
         Box::new(journal),
         &context.metadata.cwd,
         context.store.session_id().clone(),
         context.store.worker_generation(),
     )
-    .map_err(tool_error)?;
+    .map_err(|error| {
+        let unavailable = crate::workspace::unavailable(Path::new(&context.metadata.cwd))
+            .unwrap_or(WorkspaceUnavailable {
+                path: context.metadata.cwd.clone(),
+                reason: haider_protocol::workspace::WorkspaceUnavailableReason::NotReadable,
+                detail: error.to_string(),
+            });
+        crate::workspace::error(&unavailable)
+    })?;
     broker
         .restore_freshness(durable_freshness.into_values())
         .map_err(tool_error)?;
@@ -18425,6 +18731,11 @@ impl DurableToolStateReduction {
         self.bindings.clear();
         self.explicit_computer_intent = false;
         self.mobile_use_active = false;
+    }
+
+    fn reset_at_workspace_selection(&mut self) {
+        self.reset_at_session_fork();
+        self.freshness.clear();
     }
 
     fn observe(&mut self, agent_id: Option<&AgentId>, payload: &EventPayload) {

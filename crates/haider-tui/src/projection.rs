@@ -27,6 +27,7 @@ use haider_protocol::menu::Menu;
 use haider_protocol::peer::{PeerDelivery, PeerKind};
 use haider_protocol::provider::Usage;
 use haider_protocol::state::{HarnessStatus, ReadinessCheck, RunState, VerifyStep, WaitReason};
+use haider_protocol::workspace::{WorkspaceEventPayload, WorkspaceUnavailable};
 use std::fmt::Write as _;
 
 /// Command output kept per block for display — the FULL output lives in the
@@ -206,7 +207,6 @@ pub(crate) fn index_agent_reply(text: &haider_protocol::reply::ReplyText) -> Vec
     });
     starts
 }
-
 /// A hidden direct-user-shell provenance marker. Unknown, malformed, and
 /// non-item extensions are not display authority.
 #[must_use]
@@ -339,11 +339,16 @@ pub struct SessionProjection {
     /// state with no reported reason synthesizes one — a turn must never
     /// end in a silent ✗.
     run_failure_reported: bool,
+    workspace_unavailable: Option<WorkspaceUnavailable>,
     interrupted: bool,
     entries: Vec<TranscriptEntry>,
-    /// Entry ordinals for user prompts, maintained at ingest.
+    /// Entry ordinals for user prompts. This is raw-transcript metadata,
+    /// maintained at ingest beside `entries`, so sticky-origin lookup never
+    /// scans an arbitrarily large transcript on the frame path.
     user_entries: Vec<usize>,
-    /// Live computer items that can move the owner's screen.
+    /// Live `computer` items that can move the owner's screen. The sacred
+    /// control banner reads this ingest-time index in O(1); it must never
+    /// scan transcript history on the frame path.
     screen_control_items: std::collections::HashSet<ItemId>,
     /// Unique append authorities for live assistant/reasoning rows. Completed
     /// transcript items retain only their shared reply range.
@@ -381,6 +386,15 @@ pub struct SessionProjection {
     /// delta), reset at each new turn's start; approximate tokens are derived
     /// as `chars / 4`.
     streamed_output_chars: u64,
+    /// tpsfix (v0.0.970): a monotone TURN counter, bumped on every genuine turn
+    /// opening (idle/none → non-terminal). It is the identity the throughput
+    /// estimator resets on, and the gate that stops a usage frame committed by
+    /// an EARLIER turn from being read as this turn's total — the root cause of
+    /// the `0 tps` → `5000 tps` flap, because `Usage::output` is cumulative
+    /// within a run and the projection keeps the last frame after the run ends.
+    turn_epoch: u64,
+    /// The turn epoch at which the retained `usage` frame was committed.
+    usage_turn: Option<u64>,
     /// Latest durable context-occupancy snapshot (W7b), consumed from the
     /// journal's `context_footprint_v1` extension items — never a
     /// transcript row (one arrives per provider round).
@@ -562,6 +576,10 @@ impl SessionProjection {
     /// Decode one admitted payload into this projection; an undecodable kind
     /// is counted, never fatal (forward-compat law).
     pub fn apply_payload_json(&mut self, payload: &serde_json::Value) {
+        if let Some(payload) = WorkspaceEventPayload::from_payload_value(payload) {
+            self.apply_workspace_event(&payload);
+            return;
+        }
         match serde_json::from_value::<EventPayload>(payload.clone()) {
             Ok(payload) => self.apply(&payload),
             Err(_) => self.unknown_payloads += 1,
@@ -572,6 +590,29 @@ impl SessionProjection {
     /// the router's hook when IT owns the decode.
     pub fn count_unknown_payload(&mut self) {
         self.unknown_payloads += 1;
+    }
+
+    pub fn apply_workspace_event(&mut self, payload: &WorkspaceEventPayload) {
+        match payload {
+            WorkspaceEventPayload::WorkspaceUnavailable(unavailable) => {
+                self.workspace_unavailable = Some(unavailable.clone());
+                self.push_note(format!(
+                    "⚠ workspace unavailable — {} · {} ({})",
+                    unavailable.path,
+                    unavailable.reason.as_str(),
+                    unavailable.detail
+                ));
+            }
+            WorkspaceEventPayload::WorkspaceSelected(selected) => {
+                self.workspace_unavailable = None;
+                self.push_note(format!("⇄ workspace → {}", selected.path));
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn workspace_unavailable(&self) -> Option<&WorkspaceUnavailable> {
+        self.workspace_unavailable.as_ref()
     }
 
     /// Record which scope opened a menu (report R11 cut 2).
@@ -636,6 +677,13 @@ impl SessionProjection {
                 let was_idle = self.run.as_ref().is_none_or(RunState::is_terminal);
                 if was_idle && !run.is_terminal() {
                     self.streamed_output_chars = 0;
+                    // Availability is re-probed by the daemon for every new
+                    // turn. Drop a prior run's notice at the opening edge; if
+                    // the root is still unavailable, this run's durable fact
+                    // immediately reinstates it.
+                    self.workspace_unavailable = None;
+                    // tpsfix: the same opening starts a new throughput turn.
+                    self.turn_epoch = self.turn_epoch.saturating_add(1);
                 }
                 if matches!(run, RunState::Cancelled) {
                     self.interrupted = true;
@@ -689,7 +737,11 @@ impl SessionProjection {
             ),
             EventPayload::Item(event) => self.apply_item(event),
             EventPayload::ToolResult { call_id, result } => self.apply_tool_result(call_id, result),
-            EventPayload::Usage(usage) => self.usage = Some(usage.clone()),
+            EventPayload::Usage(usage) => {
+                self.usage = Some(usage.clone());
+                // tpsfix: stamp the frame with the turn that produced it.
+                self.usage_turn = Some(self.turn_epoch);
+            }
             // The failed run's PUBLIC reason joins the transcript (W5g-6):
             // the envelope always carried it; only the badge ever showed.
             EventPayload::RunFailed {
@@ -986,6 +1038,7 @@ impl SessionProjection {
     }
 
     fn effect_failure_is_inline(&mut self, owners: &[EffectToolOwner], error: &str) -> bool {
+        let mut mutated = false;
         let inline = self.entries.iter_mut().any(|entry| {
             let TranscriptEntry::Item(block) = entry else {
                 return false;
@@ -1010,9 +1063,12 @@ impl SessionProjection {
                 return false;
             }
             block.tool_reason = Some(bounded_effect_error(error));
+            mutated = true;
             true
         });
-        self.entry_mutation_revision = self.entry_mutation_revision.wrapping_add(1);
+        if mutated {
+            self.entry_mutation_revision = self.entry_mutation_revision.wrapping_add(1);
+        }
         inline
     }
 
@@ -1370,7 +1426,7 @@ impl SessionProjection {
                         self.screen_control_items.remove(item_id);
                     }
                     self.finished_items.insert(item_id.clone());
-                    if let Some(block) = self.open_block_mut(item_id) {
+                    let replaced = if let Some(block) = self.open_block_mut(item_id) {
                         // Replace semantics: the final item is authoritative.
                         block.agent_line_starts = index_agent_lines(&completed_item);
                         block.item = completed_item;
@@ -1379,6 +1435,7 @@ impl SessionProjection {
                         // fragment accumulation is a duplicate — release it
                         // (efficiency rider #3).
                         block.args_fragments = String::new();
+                        true
                     } else {
                         // Attach-mid-stream tolerance: a Completed we never
                         // saw start still lands as a finished block.
@@ -1389,6 +1446,10 @@ impl SessionProjection {
                                 false,
                                 self.voice_live,
                             )));
+                        false
+                    };
+                    if replaced {
+                        self.entry_mutation_revision = self.entry_mutation_revision.wrapping_add(1);
                     }
                     self.reply_writers.remove(item_id);
                 }
@@ -1425,6 +1486,7 @@ impl SessionProjection {
             }
             _ => None,
         };
+        let mut mutated = false;
         {
             let Some(block) = self.open_block_mut(item_id) else {
                 self.orphan_deltas += 1;
@@ -1450,6 +1512,7 @@ impl SessionProjection {
                                 );
                             }
                         }
+                        mutated = true;
                     }
                 }
                 ItemDelta::Reasoning { text } => {
@@ -1459,13 +1522,16 @@ impl SessionProjection {
                         } else {
                             *summary = text.clone();
                         }
+                        mutated = true;
                     }
                 }
                 ItemDelta::ToolArgs { fragment } => {
                     block.args_fragments.push_str(fragment);
                     output_chars = fragment.chars().count() as u64;
+                    mutated = true;
                 }
                 ItemDelta::CommandOutput { chunk_b64, .. } => {
+                    mutated = true;
                     match base64::engine::general_purpose::STANDARD.decode(chunk_b64) {
                         Ok(bytes) => {
                             // Bound BEFORE appending so the tail's capacity never
@@ -1489,7 +1555,9 @@ impl SessionProjection {
                 }
             }
         }
-        self.entry_mutation_revision = self.entry_mutation_revision.wrapping_add(1);
+        if mutated {
+            self.entry_mutation_revision = self.entry_mutation_revision.wrapping_add(1);
+        }
         self.streamed_output_chars = self.streamed_output_chars.saturating_add(output_chars);
     }
 
@@ -1562,6 +1630,45 @@ impl SessionProjection {
     #[must_use]
     pub const fn streamed_output_tokens_approx(&self) -> u64 {
         self.streamed_output_chars / 4
+    }
+
+    /// tpsfix: this turn's cumulative GENERATED characters — assistant text,
+    /// reasoning, and tool-call arguments. The smooth signal the throughput
+    /// estimator differentiates (provider usage arrives as a step function and
+    /// is used only to calibrate the ratio).
+    #[must_use]
+    pub const fn streamed_output_chars(&self) -> u64 {
+        self.streamed_output_chars
+    }
+
+    /// tpsfix: the monotone turn counter — see [`Self::turn_epoch`]'s field.
+    #[must_use]
+    pub const fn turn_epoch(&self) -> u64 {
+        self.turn_epoch
+    }
+
+    /// tpsfix: true while a turn is live (a non-terminal run state). Broader
+    /// than [`Self::is_streaming`] on purpose: a turn parked on a tool, a
+    /// permission menu or provider backoff has NOT ended, and settling its
+    /// throughput early would publish a final figure mid-turn.
+    #[must_use]
+    pub fn turn_live(&self) -> bool {
+        self.run.as_ref().is_some_and(|run| !run.is_terminal())
+    }
+
+    /// tpsfix: the provider's EXACT output-token total for the CURRENT turn, or
+    /// `None` when the retained usage frame belongs to an earlier turn (or none
+    /// exists). `Usage::output` already includes reasoning tokens on every
+    /// provider the harness speaks, so `Usage::reasoning` is never added to it.
+    #[must_use]
+    pub fn turn_output_tokens_exact(&self) -> Option<u64> {
+        if self.turn_epoch == 0 || self.usage_turn != Some(self.turn_epoch) {
+            return None;
+        }
+        self.usage
+            .as_ref()
+            .map(|usage| usage.output)
+            .filter(|output| *output > 0)
     }
 
     /// M4: the visible retry view — `(attempt, max, delay_ms)` while the run

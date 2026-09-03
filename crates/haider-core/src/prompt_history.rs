@@ -1411,6 +1411,14 @@ fn canonicalize_reply_envelope(
         Some((scope.clone(), lane, text.len(), text.arena_digest()?))
     }
 
+    fn writer_for(lane: u8) -> ReplyArenaWriter {
+        if lane == 0 {
+            ReplyArenaWriter::new().with_standard_provider_json_views()
+        } else {
+            ReplyArenaWriter::new()
+        }
+    }
+
     let scope = (
         envelope.run_id.clone(),
         envelope.branch_id.clone(),
@@ -1424,7 +1432,7 @@ fn canonicalize_reply_envelope(
             let Some((item_lane, text)) = lane(&item) else {
                 return;
             };
-            let mut writer = ReplyArenaWriter::new();
+            let mut writer = writer_for(item_lane);
             let range = writer.append_shared(text);
             active_reply_arenas.insert((scope, item_id), (item_lane, writer));
             Some(range)
@@ -1437,7 +1445,7 @@ fn canonicalize_reply_envelope(
             };
             let (_, writer) = active_reply_arenas
                 .entry((scope, item_id))
-                .or_insert_with(|| (inferred_lane, ReplyArenaWriter::new()));
+                .or_insert_with(|| (inferred_lane, writer_for(inferred_lane)));
             Some(writer.append_shared(text))
         }
         EventPayload::Item(ItemEvent::Completed { item_id, item }) => {
@@ -4280,6 +4288,16 @@ fn render_journal_with_facts(
         if !ordinary_visible {
             continue;
         }
+        if envelope.render.prompt != PromptRender::Omit
+            && !is_current
+            && let Some((provider, data)) = envelope.payload.provider_opaque_data()
+        {
+            messages.push(Message::assistant(vec![Block::ProviderOpaque {
+                provider,
+                data,
+            }]));
+            continue;
+        }
         let Ok(payload) = envelope.payload.decode_event() else {
             continue;
         };
@@ -4563,7 +4581,10 @@ fn provider_opaque_extension(data: serde_json::Value) -> Option<Block> {
     let object = data.as_object()?;
     let provider = object.get("provider")?.as_str()?.to_owned();
     let data = object.get("data")?.clone();
-    Some(Block::ProviderOpaque { provider, data })
+    Some(Block::ProviderOpaque {
+        provider,
+        data: data.into(),
+    })
 }
 
 fn corrupt(message: impl Into<String>) -> HaiderError {
@@ -4653,9 +4674,10 @@ fn serialized_body_bytes(messages: &[Message]) -> usize {
                             },
                         ),
                         Block::Attachment(attachment) => attachment_bytes(attachment),
-                        Block::ProviderOpaque { provider, data } => {
-                            provider.len().saturating_add(json_bytes(data))
-                        }
+                        Block::ProviderOpaque { provider, data } => provider
+                            .len()
+                            .saturating_add(json_bytes(data.template()))
+                            .saturating_add(data.reply_text().map_or(0, ReplyText::len)),
                     })
                 },
             )

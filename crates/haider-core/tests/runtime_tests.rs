@@ -2070,7 +2070,7 @@ async fn max_tokens_continuation_rechecks_hard_fit_and_compacts_first() {
     bounded.context_compactor = Some(compactor.clone());
     let provider = Arc::new(FakeProvider::new(vec![
         FakeStep::EmitText {
-            text: partial.clone().into(),
+            text: partial.clone(),
         },
         FakeStep::Finish {
             reason: FinishReason::MaxTokens,
@@ -3297,7 +3297,7 @@ async fn recovered_route_wait_rebuilds_completed_and_open_text_in_event_order() 
                     haider_protocol::provider::StreamEvent::TextDelta { text: "A".into() },
                     haider_protocol::provider::StreamEvent::ProviderOpaque {
                         provider: "fake".into(),
-                        data: serde_json::json!({"state":"between"}),
+                        data: serde_json::json!({"state":"between"}).into(),
                     },
                     haider_protocol::provider::StreamEvent::TextDelta { text: "B".into() },
                 ],
@@ -6177,7 +6177,7 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
             },
             Block::ProviderOpaque {
                 provider: "anthropic".into(),
-                data: server_use,
+                data: server_use.into(),
             },
         ],
         "the paused assistant message replays verbatim, opaque facts included"

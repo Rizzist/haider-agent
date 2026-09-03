@@ -29,6 +29,11 @@ rust-version = "1.95"
 
 [workspace.dependencies]
 async-trait = "0.1"
+# Clipboard READ (970 owner bug 2). `default-features = false` drops the
+# `wayland-data-control` backend on purpose: it links libwayland, which no
+# CI target is provisioned for. macOS/Windows/X11 are covered natively and
+# Wayland falls back to the `wl-paste` tool (see `haider-tui::clipboard`).
+arboard = { version = "3.6", default-features = false, features = ["image-data"] }
 base64 = "0.22"
 blake3 = "1"
 cpal = "0.15"

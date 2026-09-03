@@ -643,7 +643,7 @@ fn write_reply_scalar(
         WireEncoding::MessagePack => {
             let len = text.len();
             if len < 32 {
-                writer.write_all(&[0xa0 | u8::try_from(len).expect("fixstr length")])?;
+                writer.write_all(&[0xa0 | len as u8])?;
             } else if let Ok(len) = u8::try_from(len) {
                 writer.write_all(&[0xd9, len])?;
             } else if let Ok(len) = u16::try_from(len) {

@@ -10,8 +10,10 @@ use haider_accounts::SecretHandle;
 use haider_protocol::ids::{ArtifactRef, CredentialAlias};
 use haider_protocol::provider::{
     Block, CacheStatAvailability, CapabilityDoc, FeatureResolve, FinishReason, NormalizedUsage,
-    ReasoningAccounting, StreamEvent, Usage, UsageSource, WebSource,
+    ProviderOpaqueData, ReasoningAccounting, StreamEvent, Usage, UsageSource, WebSource,
 };
+use haider_protocol::reply::ReplyArenaWriter;
+use haider_protocol::reply::ReplyText;
 use haider_protocol::tool::AttachmentBlock;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use serde::ser::{SerializeMap, SerializeSeq};
@@ -1161,7 +1163,7 @@ fn gemini_request_json_with_boundary_inner(
     let mut reply_bindings = Vec::new();
     let (tool_names, opaque_calls) = tool_call_index(request)?;
     let mut contents = Vec::<serde_json::Value>::new();
-    let mut pending_signed_text = VecDeque::<String>::new();
+    let mut pending_signed_text = VecDeque::<ReplyText>::new();
     let stable_history_end = stable_history_end.min(request.messages.len());
     let mut history_boundary =
         (stable_history_end == 0).then_some(crate::PreparedHistoryBoundary {
@@ -1196,7 +1198,7 @@ fn gemini_request_json_with_boundary_inner(
                     if message.role == MessageRole::Assistant
                         && let Some(expected) = pending_signed_text.front()
                     {
-                        if text != expected.as_str() {
+                        if text != expected {
                             return Err(invalid_request(
                                 "Gemini signed text part disagrees with normalized history",
                             ));
@@ -1326,10 +1328,30 @@ fn gemini_request_json_with_boundary_inner(
                         && message.role == MessageRole::Assistant =>
                 {
                     match parse_gemini_opaque(data)? {
-                        OpaqueReplay::FunctionCall { part, .. }
-                        | OpaqueReplay::Thought { part } => parts.push(part),
-                        OpaqueReplay::Text { text, part } => {
-                            parts.push(part);
+                        OpaqueReplay::FunctionCall { part, .. } => parts.push(part),
+                        OpaqueReplay::Thought => {
+                            let data = crate::provider_opaque_json_value(
+                                data,
+                                bind_large_replies,
+                                &mut reply_bindings,
+                            )?;
+                            parts.push(data.get("part").cloned().ok_or_else(|| {
+                                invalid_request(
+                                    "Gemini provider-opaque continuation has no native part",
+                                )
+                            })?);
+                        }
+                        OpaqueReplay::Text { text } => {
+                            let rendered = crate::provider_opaque_json_value(
+                                data,
+                                bind_large_replies,
+                                &mut reply_bindings,
+                            )?;
+                            parts.push(rendered.get("part").cloned().ok_or_else(|| {
+                                invalid_request(
+                                    "Gemini provider-opaque continuation has no native part",
+                                )
+                            })?);
                             if !text.is_empty() {
                                 pending_signed_text.push_back(text);
                             }
@@ -1739,15 +1761,12 @@ enum OpaqueReplay {
         part: serde_json::Value,
     },
     Text {
-        text: String,
-        part: serde_json::Value,
+        text: ReplyText,
     },
-    Thought {
-        part: serde_json::Value,
-    },
+    Thought,
 }
 
-fn parse_gemini_opaque(data: &serde_json::Value) -> Result<OpaqueReplay, ProviderError> {
+fn parse_gemini_opaque(data: &ProviderOpaqueData) -> Result<OpaqueReplay, ProviderError> {
     let object = data.as_object().ok_or_else(|| {
         invalid_request("Gemini provider-opaque continuation must be a JSON object")
     })?;
@@ -1799,21 +1818,23 @@ fn parse_gemini_opaque(data: &serde_json::Value) -> Result<OpaqueReplay, Provide
             part,
         });
     }
-    if let Some(text) = part_object.get("text").and_then(serde_json::Value::as_str) {
+    if let Some(text) = data.reply_text().cloned().or_else(|| {
+        part_object
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(ReplyText::from)
+    }) {
         if part_object
             .get("thought")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
         {
-            Ok(OpaqueReplay::Thought { part })
+            Ok(OpaqueReplay::Thought)
         } else {
-            Ok(OpaqueReplay::Text {
-                text: text.to_owned(),
-                part,
-            })
+            Ok(OpaqueReplay::Text { text })
         }
     } else {
-        Ok(OpaqueReplay::Thought { part })
+        Ok(OpaqueReplay::Thought)
     }
 }
 
@@ -2003,6 +2024,8 @@ pub(crate) struct GeminiDecoder {
     framer: SseFramer,
     account: Option<CredentialAlias>,
     next_call_index: u64,
+    text: Option<ReplyArenaWriter>,
+    reasoning: Option<ReplyArenaWriter>,
     saw_tool: bool,
     saw_refusal: bool,
     terminal: bool,
@@ -2019,6 +2042,8 @@ impl GeminiDecoder {
             framer: SseFramer::default(),
             account,
             next_call_index,
+            text: Some(ReplyArenaWriter::new().with_standard_provider_json_views()),
+            reasoning: Some(ReplyArenaWriter::new()),
             saw_tool: false,
             saw_refusal: false,
             terminal: false,
@@ -2077,7 +2102,7 @@ impl GeminiDecoder {
     }
 
     fn dispatch(&mut self, frame: SseFrame) -> Result<Vec<StreamEvent>, ProviderError> {
-        let value: serde_json::Value = serde_json::from_str(&frame.data)
+        let mut value: serde_json::Value = serde_json::from_str(&frame.data)
             .map_err(|error| malformed(format!("Gemini SSE data is not valid JSON: {error}")))?;
         if value
             .get("promptFeedback")
@@ -2087,6 +2112,7 @@ impl GeminiDecoder {
             .is_some()
         {
             self.saw_refusal = true;
+            self.seal_reply_arenas();
             return Ok(vec![
                 safety_refusal_delta(),
                 StreamEvent::Finish {
@@ -2096,14 +2122,14 @@ impl GeminiDecoder {
         }
 
         let mut events = Vec::new();
-        if let Some(candidate) = value
-            .get("candidates")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|candidates| candidates.first())
-            && let Some(parts) = candidate
-                .get("content")
-                .and_then(|content| content.get("parts"))
-                .and_then(serde_json::Value::as_array)
+        if let Some(parts) = value
+            .get_mut("candidates")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|candidates| candidates.first_mut())
+            .and_then(|candidate| candidate.get_mut("content"))
+            .and_then(|content| content.get_mut("parts"))
+            .and_then(serde_json::Value::as_array_mut)
+            .map(std::mem::take)
         {
             for part in parts {
                 events.extend(self.part_events(part)?);
@@ -2163,19 +2189,23 @@ impl GeminiDecoder {
                     )));
                 }
             };
+            self.seal_reply_arenas();
             events.push(StreamEvent::Finish { reason: finish });
         }
         Ok(events)
     }
 
-    fn part_events(&mut self, part: &serde_json::Value) -> Result<Vec<StreamEvent>, ProviderError> {
+    fn part_events(
+        &mut self,
+        mut part: serde_json::Value,
+    ) -> Result<Vec<StreamEvent>, ProviderError> {
         let object = part
-            .as_object()
+            .as_object_mut()
             .ok_or_else(|| malformed("Gemini response part is not a JSON object"))?;
-        let signature = object
+        let signed = object
             .get("thoughtSignature")
             .and_then(serde_json::Value::as_str)
-            .filter(|signature| !signature.is_empty());
+            .is_some_and(|signature| !signature.is_empty());
         if let Some(function) = object
             .get("functionCall")
             .and_then(serde_json::Value::as_object)
@@ -2184,7 +2214,8 @@ impl GeminiDecoder {
                 .get("name")
                 .and_then(serde_json::Value::as_str)
                 .filter(|name| !name.is_empty())
-                .ok_or_else(|| malformed("Gemini function call has no name"))?;
+                .ok_or_else(|| malformed("Gemini function call has no name"))?
+                .to_owned();
             let args = function
                 .get("args")
                 .cloned()
@@ -2196,19 +2227,20 @@ impl GeminiDecoder {
             self.next_call_index = self.next_call_index.saturating_add(1);
             self.saw_tool = true;
             let mut events = Vec::new();
-            if signature.is_some() {
+            if signed {
                 events.push(StreamEvent::ProviderOpaque {
                     provider: GEMINI_PROVIDER_NAME.into(),
                     data: serde_json::json!({
                         "kind": OPAQUE_KIND,
                         "call_id": call_id,
                         "part": part,
-                    }),
+                    })
+                    .into(),
                 });
             }
             events.push(StreamEvent::ToolCallStart {
                 call_id: call_id.clone(),
-                name: name.to_owned(),
+                name,
             });
             events.push(StreamEvent::ToolCallArgsDelta {
                 call_id: call_id.clone(),
@@ -2221,34 +2253,89 @@ impl GeminiDecoder {
             events.push(StreamEvent::ToolCallEnd { call_id });
             return Ok(events);
         }
-        if let Some(text) = object.get("text").and_then(serde_json::Value::as_str) {
+        if let Some(serde_json::Value::String(text)) = object.remove("text") {
+            let thought = object
+                .get("thought")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let text = if signed {
+                object.insert(
+                    "text".into(),
+                    serde_json::Value::String("__haider_gemini_signed_reply__".into()),
+                );
+                let rendered = serde_json::to_vec(&serde_json::json!({
+                    "parts": [&part],
+                    "role": "model",
+                }))
+                .map_err(|error| {
+                    malformed(format!(
+                        "Gemini provider-view template could not be encoded: {error}"
+                    ))
+                })?;
+                let token = br#""__haider_gemini_signed_reply__""#;
+                let offset = rendered
+                    .windows(token.len())
+                    .position(|window| window == token)
+                    .ok_or_else(|| {
+                        malformed("Gemini reply marker is absent from provider-view template")
+                    })?;
+                let mut writer = ReplyArenaWriter::new().with_incremental_json_view(
+                    &rendered[..offset],
+                    &rendered[offset.saturating_add(token.len())..],
+                );
+                let text = writer.append(text);
+                drop(writer.seal());
+                text
+            } else if thought {
+                self.reasoning
+                    .as_mut()
+                    .ok_or_else(|| malformed("Gemini reasoning arena is already sealed"))?
+                    .append(text)
+            } else {
+                self.text
+                    .as_mut()
+                    .ok_or_else(|| malformed("Gemini text arena is already sealed"))?
+                    .append(text)
+            };
             let mut events = Vec::new();
-            if signature.is_some() {
+            if signed {
                 events.push(StreamEvent::ProviderOpaque {
                     provider: GEMINI_PROVIDER_NAME.into(),
-                    data: serde_json::json!({"kind": OPAQUE_KIND, "part": part}),
+                    data: ProviderOpaqueData::with_reply(
+                        serde_json::json!({"kind": OPAQUE_KIND, "part": part}),
+                        "__haider_gemini_signed_reply__",
+                        text.clone(),
+                    )
+                    .ok_or_else(|| {
+                        malformed("Gemini signed part template lost its reply marker")
+                    })?,
                 });
             }
             if !text.is_empty() {
-                if object
-                    .get("thought")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    events.push(StreamEvent::ReasoningDelta { text: text.into() });
+                if thought {
+                    events.push(StreamEvent::ReasoningDelta { text });
                 } else {
-                    events.push(StreamEvent::TextDelta { text: text.into() });
+                    events.push(StreamEvent::TextDelta { text });
                 }
             }
             return Ok(events);
         }
-        if signature.is_some() {
+        if signed {
             return Ok(vec![StreamEvent::ProviderOpaque {
                 provider: GEMINI_PROVIDER_NAME.into(),
-                data: serde_json::json!({"kind": OPAQUE_KIND, "part": part}),
+                data: serde_json::json!({"kind": OPAQUE_KIND, "part": part}).into(),
             }]);
         }
         Ok(Vec::new())
+    }
+
+    fn seal_reply_arenas(&mut self) {
+        if let Some(writer) = self.text.take() {
+            drop(writer.seal());
+        }
+        if let Some(writer) = self.reasoning.take() {
+            drop(writer.seal());
+        }
     }
 
     /// Decodes one candidate's grounding facts (W-B): executed search

@@ -304,6 +304,8 @@ async fn one_shot_status_is_exactly_one_scalar_rpc() {
                         .to_string(),
                 ),
                 ready: true,
+                ready_since: Some(1_753_500_000_000),
+                providers_loaded: true,
                 idle_ttl_ms: Some(30_000),
                 warm: true,
             },
@@ -324,6 +326,8 @@ async fn one_shot_status_is_exactly_one_scalar_rpc() {
     assert_eq!(status.waiting_for_route_count, 2);
     assert!(status.active_account.is_none());
     assert_eq!(status.daemon_pid, Some(42));
+    assert_eq!(status.ready_since, Some(1_753_500_000_000));
+    assert!(status.providers_loaded);
     assert_eq!(status.idle_ttl_ms, Some(30_000));
     assert!(status.warm);
     assert_eq!(

@@ -119,7 +119,7 @@ fn branch_created(
         },
     };
     let mut envelope = raw(seq, &EventPayload::IdleDecayed);
-    envelope.payload = created.to_payload_value().expect("fact serializes");
+    envelope.payload = created.to_payload_value().expect("fact serializes").into();
     envelope
 }
 

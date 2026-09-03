@@ -70,6 +70,7 @@ impl ProviderViewBlockRefV1 {
 pub struct ProviderViewBlobV1 {
     pub block: ProviderViewBlockRefV1,
     bytes: ProviderViewBlobBytesV1,
+    incrementally_hashed: bool,
 }
 
 #[derive(Debug)]
@@ -93,15 +94,38 @@ impl ProviderViewBlobV1 {
         Self {
             block: ProviderViewBlockRefV1::for_bytes(&bytes),
             bytes: ProviderViewBlobBytesV1::Contiguous(bytes),
+            incrementally_hashed: false,
         }
     }
 
     /// Builds a content-addressed object without joining reply ranges into a
-    /// second string or byte vector.
+    /// second string or byte vector. A streamed reply must carry an
+    /// incremental digest seeded before its first delta; ordinary prompt
+    /// scalars without a delta-time hash retain the legacy bounded writer.
     pub fn segmented(segments: Vec<ProviderViewBlobSegmentV1>) -> io::Result<Self> {
         let bytes = ProviderViewBlobBytesV1::Segmented(segments);
-        let block = block_for_provider_view_bytes(&bytes)?;
-        Ok(Self { block, bytes })
+        let incremental = incremental_block_for_provider_view_bytes(&bytes);
+        let requires_incremental = match &bytes {
+            ProviderViewBlobBytesV1::Segmented(segments) => segments.iter().any(|segment| {
+                matches!(segment, ProviderViewBlobSegmentV1::JsonString(text) if text.has_incremental_json_views())
+            }),
+            ProviderViewBlobBytesV1::Contiguous(_) => false,
+        };
+        if requires_incremental && incremental.is_none() {
+            return Err(io::Error::other(
+                "streamed reply provider view lacks one exact incremental digest candidate",
+            ));
+        }
+        let incrementally_hashed = incremental.is_some();
+        let block = match incremental {
+            Some(block) => block,
+            None => block_for_provider_view_bytes(&bytes)?,
+        };
+        Ok(Self {
+            block,
+            bytes,
+            incrementally_hashed,
+        })
     }
 
     #[must_use]
@@ -114,8 +138,15 @@ impl ProviderViewBlobV1 {
         matches!(self.bytes, ProviderViewBlobBytesV1::Segmented(_))
     }
 
-    /// Recomputes the address from the retained representation. Store seams
-    /// use this before publication instead of trusting adapter metadata.
+    #[must_use]
+    pub fn is_incrementally_hashed(&self) -> bool {
+        self.incrementally_hashed
+    }
+
+    /// Recomputes the address from the retained representation as a test and
+    /// diagnostic oracle. Publication trusts the producer's incremental
+    /// address and validates only the streamed byte count, avoiding a second
+    /// full pass over the canonical reply.
     pub fn computed_block(&self) -> io::Result<ProviderViewBlockRefV1> {
         block_for_provider_view_bytes(&self.bytes)
     }
@@ -153,6 +184,46 @@ impl ProviderViewBlobV1 {
         }
         self.write_to(&mut VisitorWriter(&mut visit))
     }
+}
+
+fn incremental_block_for_provider_view_bytes(
+    bytes: &ProviderViewBlobBytesV1,
+) -> Option<ProviderViewBlockRefV1> {
+    let ProviderViewBlobBytesV1::Segmented(segments) = bytes else {
+        return None;
+    };
+    let reply_index = segments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, segment)| {
+            matches!(segment, ProviderViewBlobSegmentV1::JsonString(_)).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let [reply_index] = reply_index.as_slice() else {
+        return None;
+    };
+    let ProviderViewBlobSegmentV1::JsonString(text) = &segments[*reply_index] else {
+        return None;
+    };
+    let mut prefix = Vec::new();
+    for segment in &segments[..*reply_index] {
+        let ProviderViewBlobSegmentV1::Bytes(bytes) = segment else {
+            return None;
+        };
+        prefix.extend_from_slice(bytes);
+    }
+    let mut suffix = Vec::new();
+    for segment in &segments[reply_index.saturating_add(1)..] {
+        let ProviderViewBlobSegmentV1::Bytes(bytes) = segment else {
+            return None;
+        };
+        suffix.extend_from_slice(bytes);
+    }
+    let (digest, byte_len) = text.incremental_json_view(&prefix, &suffix)?;
+    Some(ProviderViewBlockRefV1 {
+        content_hash: format!("blake3:{}", digest.to_hex()),
+        byte_len,
+    })
 }
 
 fn block_for_provider_view_bytes(
@@ -518,5 +589,58 @@ impl CacheEpochTransitionV1 {
             label.push_str(" · plan");
         }
         label
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod incremental_provider_view_tests {
+    use super::{ProviderViewBlobSegmentV1, ProviderViewBlobV1, ProviderViewBlockRefV1};
+    use crate::reply::ReplyArenaWriter;
+
+    #[test]
+    fn per_delta_json_hash_matches_the_legacy_complete_canonical_bytes() {
+        let prefix = br#"{"content":[{"text":"#;
+        let suffix = br#","type":"output_text"}],"role":"assistant","type":"message"}"#;
+        let tail = "\"quote\"\\\nمرز 😀";
+        let mut writer =
+            ReplyArenaWriter::new().with_incremental_json_view(prefix, b"deferred suffix");
+        let _ = writer.append("left ".to_owned());
+        let _ = writer.append(tail.to_owned());
+        let text = writer.seal();
+        let blob = ProviderViewBlobV1::segmented(vec![
+            ProviderViewBlobSegmentV1::Bytes(prefix.to_vec()),
+            ProviderViewBlobSegmentV1::JsonString(text),
+            ProviderViewBlobSegmentV1::Bytes(suffix.to_vec()),
+        ])
+        .expect("segmented provider view");
+
+        let legacy = serde_json::to_vec(&serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": format!("left {tail}")}],
+        }))
+        .expect("legacy complete JSON");
+        assert!(blob.is_incrementally_hashed());
+        assert_eq!(blob.block, ProviderViewBlockRefV1::for_bytes(&legacy));
+        assert_eq!(
+            blob.computed_block().expect("legacy complete hash"),
+            blob.block
+        );
+    }
+
+    #[test]
+    fn streamed_reply_with_an_unseeded_prefix_cannot_fall_back_to_a_full_pass() {
+        let mut writer = ReplyArenaWriter::new().with_standard_provider_json_views();
+        let _ = writer.append("streamed native reply".to_owned());
+        let text = writer.seal();
+        let error = ProviderViewBlobV1::segmented(vec![
+            ProviderViewBlobSegmentV1::Bytes(br#"{"signature":"late","thinking":"#.to_vec()),
+            ProviderViewBlobSegmentV1::JsonString(text),
+            ProviderViewBlobSegmentV1::Bytes(br#","type":"thinking"}"#.to_vec()),
+        ])
+        .expect_err("an unseeded streamed shape must fail closed");
+
+        assert!(error.to_string().contains("incremental digest candidate"));
     }
 }

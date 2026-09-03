@@ -24,6 +24,21 @@ struct ReplyArenaInner {
     chunks: RwLock<Vec<ReplyChunk>>,
     len: AtomicUsize,
     digest: OnceLock<blake3::Hash>,
+    provider_views: OnceLock<Vec<IncrementalJsonViewDigest>>,
+}
+
+#[derive(Debug)]
+struct IncrementalJsonViewDigest {
+    prefix: Vec<u8>,
+    hasher_before_suffix: blake3::Hasher,
+    byte_len_before_suffix: u64,
+}
+
+#[derive(Debug)]
+struct IncrementalJsonViewHasher {
+    prefix: Vec<u8>,
+    hasher: blake3::Hasher,
+    byte_len: u64,
 }
 
 /// Shared storage retained by reply-range handles.
@@ -92,6 +107,7 @@ pub struct ReplyArenaWriter {
     arena: ReplyArena,
     hasher: blake3::Hasher,
     sealed: bool,
+    provider_views: Vec<IncrementalJsonViewHasher>,
 }
 
 impl Default for ReplyArenaWriter {
@@ -107,7 +123,51 @@ impl ReplyArenaWriter {
             arena: ReplyArena::default(),
             hasher: blake3::Hasher::new(),
             sealed: false,
+            provider_views: Vec::new(),
         }
+    }
+
+    /// Starts the exact provider-view block hash before the first reply
+    /// delta. `prefix` ends immediately before the JSON string scalar. The
+    /// final `suffix` argument documents the expected simple shape; the
+    /// sealed hash state can also accept a structurally richer suffix chosen
+    /// by the provider view once tool/native fields are known.
+    #[must_use]
+    pub fn with_incremental_json_view(mut self, prefix: &[u8], _suffix: &[u8]) -> Self {
+        self.add_incremental_json_view_prefix(prefix);
+        self
+    }
+
+    /// Seeds the three canonical assistant-message prefixes used by durable
+    /// replay. This lets journal deltas rebuild a provider-neutral arena once
+    /// while retaining exact candidate hash states for Anthropic/OpenAI,
+    /// Chat-compatible, and Gemini views.
+    #[must_use]
+    pub fn with_standard_provider_json_views(mut self) -> Self {
+        for prefix in [
+            br#"{"content":[{"text":"#.as_slice(),
+            br#"{"content":"#.as_slice(),
+            br#"{"parts":[{"text":"#.as_slice(),
+        ] {
+            self.add_incremental_json_view_prefix(prefix);
+        }
+        self
+    }
+
+    fn add_incremental_json_view_prefix(&mut self, prefix: &[u8]) {
+        if self.provider_views.iter().any(|view| view.prefix == prefix) {
+            return;
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(prefix);
+        hasher.update(b"\"");
+        self.provider_views.push(IncrementalJsonViewHasher {
+            prefix: prefix.to_vec(),
+            hasher,
+            byte_len: u64::try_from(prefix.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        });
     }
 
     /// Moves one UTF-8 provider delta into the arena and returns its range.
@@ -126,14 +186,26 @@ impl ReplyArenaWriter {
         for segment in text.segments() {
             let _ = self.append_bytes(segment);
         }
-        self.arena
-            .slice(start..self.len())
-            .expect("shared reply append remains UTF-8 aligned")
+        ReplyText {
+            arena: self.arena.clone(),
+            range: start..self.len(),
+        }
     }
 
     fn append_bytes(&mut self, bytes: Bytes) -> ReplyText {
         assert!(!self.sealed, "cannot append to a sealed reply arena");
         self.hasher.update(&bytes);
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            for view in &mut self.provider_views {
+                if let Err(error) =
+                    hash_json_string_contents(&mut view.hasher, &mut view.byte_len, text)
+                {
+                    debug_assert!(false, "UTF-8 reply scalar must serialize: {error}");
+                }
+            }
+        } else {
+            debug_assert!(false, "reply chunks must remain valid UTF-8");
+        }
         let mut chunks = self
             .arena
             .inner
@@ -143,9 +215,11 @@ impl ReplyArenaWriter {
         let start = chunks
             .last()
             .map_or(0, |chunk| chunk.start.saturating_add(chunk.bytes.len()));
-        let end = start
-            .checked_add(bytes.len())
-            .expect("reply arena byte length exhausted usize");
+        assert!(
+            bytes.len() <= usize::MAX.saturating_sub(start),
+            "reply arena byte length exhausted usize"
+        );
+        let end = start + bytes.len();
         if !bytes.is_empty() {
             chunks.push(ReplyChunk { start, bytes });
         }
@@ -176,7 +250,91 @@ impl ReplyArenaWriter {
     pub fn seal(mut self) -> ReplyText {
         self.sealed = true;
         let _ = self.arena.inner.digest.set(self.hasher.finalize());
+        let mut provider_views = Vec::with_capacity(self.provider_views.len());
+        for mut view in self.provider_views {
+            view.hasher.update(b"\"");
+            view.byte_len = view.byte_len.saturating_add(1);
+            provider_views.push(IncrementalJsonViewDigest {
+                prefix: view.prefix,
+                hasher_before_suffix: view.hasher,
+                byte_len_before_suffix: view.byte_len,
+            });
+        }
+        if !provider_views.is_empty() {
+            let _ = self.arena.inner.provider_views.set(provider_views);
+        }
         self.arena.snapshot()
+    }
+}
+
+/// Feeds a compact JSON string scalar into BLAKE3 without retaining either
+/// quote. Holding one pending byte lets this stay independent of how serde
+/// partitions its writes while allocating no reply-sized escape buffer.
+fn hash_json_string_contents(
+    hasher: &mut blake3::Hasher,
+    byte_len: &mut u64,
+    text: &str,
+) -> io::Result<()> {
+    struct ContentsWriter<'a> {
+        hasher: &'a mut blake3::Hasher,
+        byte_len: &'a mut u64,
+        opened: bool,
+        pending: Option<u8>,
+    }
+
+    impl io::Write for ContentsWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let original_len = bytes.len();
+            if bytes.is_empty() {
+                return Ok(0);
+            }
+            let bytes = if self.opened {
+                bytes
+            } else {
+                let Some((b'"', contents)) = bytes.split_first() else {
+                    return Err(io::Error::other(
+                        "JSON string serializer omitted its opening quote",
+                    ));
+                };
+                self.opened = true;
+                contents
+            };
+            if bytes.is_empty() {
+                return Ok(original_len);
+            }
+            if let Some(pending) = self.pending.take() {
+                self.hasher.update(&[pending]);
+                *self.byte_len = self.byte_len.saturating_add(1);
+            }
+            if bytes.len() > 1 {
+                let contents = &bytes[..bytes.len() - 1];
+                self.hasher.update(contents);
+                *self.byte_len = self
+                    .byte_len
+                    .saturating_add(u64::try_from(contents.len()).unwrap_or(u64::MAX));
+            }
+            self.pending = bytes.last().copied();
+            Ok(original_len)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = ContentsWriter {
+        hasher,
+        byte_len,
+        opened: false,
+        pending: None,
+    };
+    serde_json::to_writer(&mut writer, text).map_err(io::Error::other)?;
+    if writer.opened && writer.pending == Some(b'"') {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "JSON string serializer omitted its closing quote",
+        ))
     }
 }
 
@@ -189,8 +347,8 @@ fn is_char_boundary(chunks: &[ReplyChunk], offset: usize, len: usize) -> bool {
         (chunk.start <= offset && offset <= end).then(|| {
             let local = offset.saturating_sub(chunk.start);
             std::str::from_utf8(&chunk.bytes)
-                .expect("reply chunks originate from String")
-                .is_char_boundary(local)
+                .ok()
+                .is_some_and(|text| text.is_char_boundary(local))
         })
     }) == Some(true)
 }
@@ -342,6 +500,50 @@ impl ReplyText {
         self.arena.inner.digest.get().copied()
     }
 
+    /// Returns a provider-view block address that was fed incrementally as
+    /// the arena received deltas. Only the complete arena range can carry the
+    /// address. The prefix must match a state seeded before the first delta;
+    /// the now-known structural suffix is appended to a clone of that state.
+    #[must_use]
+    pub fn incremental_json_view(
+        &self,
+        prefix: &[u8],
+        suffix: &[u8],
+    ) -> Option<(blake3::Hash, u64)> {
+        if self.range != (0..self.arena.len()) {
+            return None;
+        }
+        let view = self
+            .arena
+            .inner
+            .provider_views
+            .get()?
+            .iter()
+            .find(|view| view.prefix == prefix)?;
+        let mut hasher = view.hasher_before_suffix.clone();
+        hasher.update(suffix);
+        Some((
+            hasher.finalize(),
+            view.byte_len_before_suffix
+                .saturating_add(u64::try_from(suffix.len()).unwrap_or(u64::MAX)),
+        ))
+    }
+
+    /// Whether this complete range originated in a writer that was fed as a
+    /// streamed provider reply. Provider-view construction uses this bit to
+    /// distinguish ordinary prompt scalars (which have no delta-time hash)
+    /// from replies that must never fall back to a finalization-time pass.
+    #[must_use]
+    pub fn has_incremental_json_views(&self) -> bool {
+        self.range == (0..self.arena.len())
+            && self
+                .arena
+                .inner
+                .provider_views
+                .get()
+                .is_some_and(|views| !views.is_empty())
+    }
+
     /// Returns immutable byte slices for this range. `Bytes::slice` shares
     /// chunk storage; only the small vector and slice headers are allocated.
     #[must_use]
@@ -375,7 +577,11 @@ impl ReplyText {
         // Snapshot cheap Bytes slice headers first. User callbacks and I/O
         // must never hold the arena's read lock and stall the append owner.
         for segment in self.segments() {
-            visit(std::str::from_utf8(&segment).expect("reply range is UTF-8 aligned"));
+            if let Ok(segment) = std::str::from_utf8(&segment) {
+                visit(segment);
+            } else {
+                debug_assert!(false, "reply range must remain UTF-8 aligned");
+            }
         }
     }
 
@@ -567,9 +773,8 @@ impl Serialize for ReplyText {
         S: Serializer,
     {
         if let Some(bytes) = self.contiguous_bytes() {
-            return serializer.serialize_str(
-                std::str::from_utf8(&bytes).expect("reply chunks originate from String"),
-            );
+            let text = std::str::from_utf8(&bytes).map_err(serde::ser::Error::custom)?;
+            return serializer.serialize_str(text);
         }
         serializer.serialize_str(&self.to_owned_string())
     }
@@ -585,6 +790,7 @@ impl<'de> Deserialize<'de> for ReplyText {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::{ReplyArenaWriter, ReplyText};
     use std::sync::Arc;

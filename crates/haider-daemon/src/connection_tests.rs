@@ -354,8 +354,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        107,
-        "102 v0.0.966 features plus agent_cancel_v1 and four v0.0.967 automation features"
+        108,
+        "the additive workspace recovery feature extends the prior 107-feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -428,6 +428,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned(),
             FEATURE_SESSION_MUTATION_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_RENAME_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_WORKSPACE_SET_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_SEEN_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_NEEDS_INPUT_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1.to_owned(),
@@ -1474,6 +1475,7 @@ fn connection_context(
         pid_file_path: std::path::PathBuf::from("/tmp/haiderd.pid"),
         idle_ttl_ms: None,
         warm: false,
+        readiness: crate::lifecycle::ready_for_tests(),
     }
 }
 

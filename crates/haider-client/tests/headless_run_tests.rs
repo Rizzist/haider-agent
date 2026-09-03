@@ -2942,17 +2942,16 @@ async fn assert_blocked(payload: EventPayload, reason: HeadlessBlockingReason) {
             },
         )
         .await;
-        send_event(
-            &mut peer,
-            &attachment_id,
-            envelope(
-                &session_id,
-                &run_id,
-                2,
-                EventPayload::RunState(RunState::Cancelled),
-            ),
-        )
-        .await;
+        let mut terminal = envelope(
+            &session_id,
+            &run_id,
+            2,
+            EventPayload::RunState(RunState::Cancelled),
+        );
+        let payload = terminal.payload.as_object_mut().expect("terminal payload");
+        payload.insert("terminal_kind".into(), serde_json::json!("failure"));
+        payload.insert("error_code".into(), serde_json::json!(reason.code()));
+        send_event(&mut peer, &attachment_id, terminal).await;
     });
     let (result, _) = run_with_events(profile, request(None), 4, Duration::ZERO).await;
     peer.await.expect("peer");

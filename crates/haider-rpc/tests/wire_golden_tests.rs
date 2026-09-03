@@ -68,6 +68,8 @@ fn status_runtime_fields_are_additive_in_both_client_directions() {
             socket_path: None,
             pid_file_path: None,
             ready: false,
+            ready_since: None,
+            providers_loaded: false,
             idle_ttl_ms: None,
             warm: false,
             ..
@@ -88,6 +90,8 @@ fn status_runtime_fields_are_additive_in_both_client_directions() {
         socket_path: Some("/tmp/haider/h.sock".into()),
         pid_file_path: Some("/tmp/haider/haiderd.pid".into()),
         ready: true,
+        ready_since: Some(1_753_500_000_000),
+        providers_loaded: true,
         idle_ttl_ms: Some(30_000),
         warm: true,
     })
@@ -738,6 +742,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "session.set_ssh_scope",
         "session.surface_publish",
         "session.surface_watch",
+        "session.workspace.set",
         "shell.close",
         "shell.exec",
         "shell.list",
@@ -774,8 +779,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        125,
-        "123 v0.0.966 methods plus agent.cancel and status.snapshot"
+        126,
+        "123 v0.0.966 methods plus agent.cancel, status.snapshot, and session.workspace.set"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -821,8 +826,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     assert_eq!(fixture.contract, "haider-client-wire/v1");
     assert_eq!(
         fixture.methods.len(),
-        65,
-        "the supplemental fixture must contain the 65 methods absent from the union transcript"
+        66,
+        "the supplemental fixture must contain the 66 methods absent from the union transcript"
     );
     for pair in fixture.methods {
         assert_eq!(wire_method(&pair.request), pair.request_method);
@@ -1310,8 +1315,8 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
     // prefix. K1 appends exactly one agent.cancel request/response pair:
     // 180 + 2 = 182. The 17 moved method pairs remain absent from the
     // supplemental fixture, so the two sources stay disjoint. K1 adds one
-    // request method: 123 + 1 = 124; the later status.snapshot method makes
-    // the current exhaustive request-method count 125.
+    // request method: 123 + 1 = 124; the later status.snapshot and
+    // session.workspace.set methods make the exhaustive count 126.
     assert_eq!(expected_frames.len(), 182);
     let expected_bytes: Vec<GoldenWireBytes> = expected_frames
         .iter()

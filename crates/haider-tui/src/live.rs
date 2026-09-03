@@ -139,6 +139,7 @@ fn recognized_payload(payload: &serde_json::Value) -> bool {
             .is_ok()
         || haider_protocol::permission::PermissionEventPayload::from_payload_value(payload.clone())
             .is_ok()
+        || haider_protocol::workspace::WorkspaceEventPayload::from_payload_value(payload).is_some()
         || crate::session::is_workflow_graph_event(payload)
 }
 
@@ -568,6 +569,12 @@ pub enum LiveCommand {
         command_id: CommandId,
         session: SessionId,
         worker_generation: u64,
+    },
+    WorkspaceSet {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        path: String,
     },
     /// `computer.permission_open_settings` — grant card's Open Settings button.
     /// The daemon maps the permission enum to a compiled System Settings deep
@@ -1073,6 +1080,7 @@ impl LiveCommand {
             | Self::Submit { command_id, .. }
             | Self::Cancel { command_id, .. }
             | Self::RunRetry { command_id, .. }
+            | Self::WorkspaceSet { command_id, .. }
             | Self::Compact { command_id, .. }
             | Self::BranchCreate { command_id, .. }
             | Self::SessionForkPrompt { command_id, .. }
@@ -1573,6 +1581,12 @@ pub enum LiveReply {
     RunRetried {
         session: SessionId,
     },
+    WorkspaceSelected {
+        command_id: CommandId,
+        session: SessionId,
+        path: String,
+        worker_generation: u64,
+    },
     /// `graph.status` FAILED. A background strip read: it just clears the
     /// in-flight gate and leaves the held reduction untouched (the feature
     /// gate lives at the emitter, so this is never a feature-absent case).
@@ -2061,6 +2075,9 @@ pub struct LiveDriver {
     /// Owner 2026-08-16: the in-flight `run.retry`, for correlating its
     /// typed refusal back to the retry row.
     pending_retry: Option<(CommandId, SessionId)>,
+    /// In-flight `/retry` re-root leg and whether a failed run should be
+    /// retried after the workspace receipt commits.
+    pending_workspace_set: Option<(CommandId, SessionId, bool)>,
     /// In-flight `session.rename` (G2): (command, session), so a typed
     /// refusal lands on the exact session that asked.
     pending_rename: Option<(CommandId, SessionId)>,
@@ -2284,6 +2301,7 @@ impl LiveDriver {
             pending_default_model: None,
             pending_model_select: None,
             pending_retry: None,
+            pending_workspace_set: None,
             pending_rename: None,
             pending_seen: HashMap::new(),
             last_seen_mark: HashMap::new(),
@@ -3461,6 +3479,37 @@ impl LiveDriver {
                 model.apply_run_retried(&session);
                 Vec::new()
             }
+            LiveReply::WorkspaceSelected {
+                command_id,
+                session,
+                path,
+                worker_generation,
+            } => {
+                self.retire(&command_id);
+                self.generations.insert(session.clone(), worker_generation);
+                let retry_after = self.pending_workspace_set.take().is_some_and(
+                    |(pending, pending_session, retry)| {
+                        pending == command_id && pending_session == session && retry
+                    },
+                );
+                if model.active_session.as_ref() == Some(&session) {
+                    model.session_workspace_cwd = Some(path.clone());
+                    model.flash = Some(format!("· workspace re-rooted → {path}"));
+                    model.dirty = true;
+                }
+                if retry_after {
+                    let retry_id = self.mint();
+                    self.pending_retry = Some((retry_id.clone(), session.clone()));
+                    vec![self.enqueue(LiveCommand::RunRetry {
+                        command_id: retry_id,
+                        session,
+                        worker_generation,
+                    })]
+                } else {
+                    model.retry_inflight = false;
+                    Vec::new()
+                }
+            }
             LiveReply::GraphInspect { session, snapshot } => {
                 self.graph_inspect_inflight = false;
                 model.apply_graph_inspect(&session, *snapshot);
@@ -4506,6 +4555,19 @@ impl LiveDriver {
                 presentation,
             } => {
                 if code == "feature_missing" {
+                    if let Some(id) = command_id.as_ref()
+                        && self
+                            .pending_workspace_set
+                            .as_ref()
+                            .is_some_and(|(pending, _, _)| pending == id)
+                        && self.pending_workspace_set.take().is_some()
+                    {
+                        self.retire(id);
+                        model.retry_inflight = false;
+                        model.flash = Some(format!("· workspace recovery failed — {message}"));
+                        model.dirty = true;
+                        return Vec::new();
+                    }
                     if let Some(id) = &command_id {
                         self.retire(id);
                     }
@@ -4665,6 +4727,25 @@ impl LiveDriver {
                 }
                 // A failed `run.retry` (owner 2026-08-16): the typed refusal
                 // lands on the retry row that asked and re-arms it.
+                if let Some(id) = &command_id
+                    && self
+                        .pending_workspace_set
+                        .as_ref()
+                        .is_some_and(|(pending, _, _)| pending == id)
+                    && let Some((_, session, _)) = self.pending_workspace_set.take()
+                {
+                    if !retryable {
+                        self.retire(id);
+                    }
+                    model.retry_inflight = false;
+                    model.record_session_error(
+                        &session,
+                        format!("workspace recovery failed: {message}"),
+                    );
+                    model.flash = Some(format!("· workspace recovery failed — {message}"));
+                    model.dirty = true;
+                    return Vec::new();
+                }
                 if let Some(id) = &command_id
                     && self
                         .pending_retry
@@ -6396,6 +6477,22 @@ impl LiveDriver {
                     worker_generation,
                 })]
             }
+            AppRequest::WorkspaceSet {
+                session,
+                path,
+                retry_after,
+            } => {
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                self.pending_workspace_set =
+                    Some((command_id.clone(), session.clone(), retry_after));
+                vec![self.enqueue(LiveCommand::WorkspaceSet {
+                    command_id,
+                    session,
+                    worker_generation,
+                    path,
+                })]
+            }
             AppRequest::OpenPermissionSettings {
                 session,
                 request_id,
@@ -6736,6 +6833,7 @@ impl LiveDriver {
             | AppRequest::CheckForUpdate
             | AppRequest::RunUpdate
             | AppRequest::AttachRead { .. }
+            | AppRequest::ClipboardRead
             | AppRequest::TalkShell(_)
             | AppRequest::Quit => Vec::new(),
             // DEMO-ONLY VOCABULARY. The reducer refuses every one of these
