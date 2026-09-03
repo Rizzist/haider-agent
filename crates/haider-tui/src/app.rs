@@ -9210,8 +9210,9 @@ impl AppModel {
 
     /// The one talk entry point (TalkChip press and bare `/talk` share
     /// it): toggle-to-talk. Idle starts a session; a press while
-    /// listening COMMITS AND SUBMITS (the Enter gesture); a press while
-    /// starting aborts.
+    /// listening STOPS and commits the transcript into the composer for
+    /// editing (owner 970: never an auto-send — see
+    /// [`Self::talk_commit_stop`]); a press while starting aborts.
     pub fn talk_toggle(&mut self) {
         if self.mode.fabricates_locally() {
             // Demo keeps its canned ◉ hold on the chip; `/talk` says so.
@@ -9232,7 +9233,7 @@ impl AppModel {
                 self.talk_cancel();
                 self.flash = Some("· ◉ talk cancelled".to_owned());
             }
-            crate::talk::TalkPhase::Listening => self.talk_commit_submit(),
+            crate::talk::TalkPhase::Listening => self.talk_commit_stop(),
             crate::talk::TalkPhase::Finishing => {}
         }
     }
@@ -9296,15 +9297,28 @@ impl AppModel {
         ));
     }
 
-    /// Enter law: COMMIT + SUBMIT. Input stops now; the engine assembles
-    /// the definitive transcript and [`Self::handle_talk`]'s `Finished`
-    /// arm realizes it into the composer and submits.
-    fn talk_commit_submit(&mut self) {
+    /// Stop law: COMMIT INTO THE COMPOSER. Input stops now; the engine
+    /// assembles the definitive transcript and [`Self::handle_talk`]'s
+    /// `Finished` arm realizes it into the composer AT THE CURSOR, where
+    /// it is editable and the user sends it with ⏎.
+    ///
+    /// 970 owner requirement 1: dictation does NOT auto-send. The ONLY
+    /// thing that makes this stop submit a turn is the explicit,
+    /// default-off `transcription.auto_send` profile flag — so the
+    /// gesture that ends listening hands you text to read, never a turn
+    /// you never saw. Both stop gestures (the listening toggle and ⏎
+    /// while listening) route here, because "must not auto-send" is a
+    /// property of the transcript, not of which key ended it.
+    fn talk_commit_stop(&mut self) {
         if self.talk.phase != crate::talk::TalkPhase::Listening {
             return;
         }
         self.talk.phase = crate::talk::TalkPhase::Finishing;
-        self.talk.intent = crate::talk::CommitIntent::Submit;
+        self.talk.intent = if self.talk_config.auto_send {
+            crate::talk::CommitIntent::Submit
+        } else {
+            crate::talk::CommitIntent::Insert
+        };
         self.dirty = true;
         self.requests.push(AppRequest::TalkShell(
             crate::talk::TalkShellCommand::Finish {
@@ -9355,7 +9369,7 @@ impl AppModel {
                 true
             }
             KeyCode::Enter => {
-                self.talk_commit_submit();
+                self.talk_commit_stop();
                 true
             }
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => c != 'c',
@@ -9521,7 +9535,16 @@ impl AppModel {
                         if text.is_empty() {
                             self.flash = Some("· ◉ heard nothing".to_owned());
                         } else {
-                            self.composer.insert_str(crate::talk::clamp_realized(&text));
+                            // Owner 970: the transcript lands AT THE CURSOR
+                            // with one separating space, the same shape the
+                            // typing-commit path uses. With insert now the
+                            // DEFAULT (no auto-send), dictating twice is the
+                            // ordinary flow and the two transcripts must not
+                            // fuse into one word. `submit_composer` trims, so
+                            // the space costs the auto-send path nothing.
+                            let mut realized = crate::talk::clamp_realized(&text).to_owned();
+                            realized.push(' ');
+                            self.composer.insert_str(&realized);
                             match intent {
                                 CommitIntent::Submit => self.submit_composer(),
                                 CommitIntent::Insert => {

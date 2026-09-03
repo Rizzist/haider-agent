@@ -61,7 +61,9 @@ fn listening_pulse_animates_across_the_clock_and_is_deterministic() {
         b.iter().any(|cell| cell.hot),
         "the travelling crest lights a gold column"
     );
-    // The threshold that routes real-vs-synthesized is a sane small value.
+    // The floor-level threshold is a sane small value. (970 voicefix: it
+    // no longer ROUTES real-vs-synthesized — `WaveRing::fed()` does, so a
+    // speech pause can never snap the bars to the canned sweep.)
     let listening_signal_min = std::hint::black_box(LISTENING_SIGNAL_MIN);
     assert!(listening_signal_min > 0.0 && listening_signal_min < 0.2);
 }
