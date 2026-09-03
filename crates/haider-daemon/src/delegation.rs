@@ -2098,7 +2098,7 @@ impl DelegationHandle {
                     haider_protocol::EventPayload::Item(ItemEvent::Completed {
                         item: TurnItem::AgentMessage { text },
                         ..
-                    }) if !text.trim().is_empty() => summary = Some(text),
+                    }) if !text.trim().is_empty() => summary = Some(text.into_string()),
                     haider_protocol::EventPayload::ProcessSignalRecorded(signal)
                         if signal.workspace_revision.is_some() =>
                     {

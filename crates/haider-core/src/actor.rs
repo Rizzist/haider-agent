@@ -71,7 +71,7 @@ use haider_protocol::ids::{
     AgentId, ArtifactRef, BranchId, CredentialAlias, DeviceId, EventId, ItemId, MenuId, NodeId,
     RunId, SessionId,
 };
-use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
+use haider_protocol::item::{ItemDelta, ItemEvent, SharedText, ToolStatus, TurnItem};
 use haider_protocol::menu::{
     ErrorRecoveryCardKind, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
 };
@@ -2851,7 +2851,7 @@ impl HarnessActor {
             if let Some(checkpoint) = checkpoint.message.as_ref() {
                 message = Some(TextAccumulator {
                     item_id: checkpoint.item_id.clone(),
-                    text: checkpoint.text.clone(),
+                    text: checkpoint.text.clone().into(),
                 });
                 if !has_message_events {
                     replay.message_applied.clone_from(&checkpoint.text);
@@ -2860,7 +2860,7 @@ impl HarnessActor {
             if let Some(checkpoint) = checkpoint.reasoning.as_ref() {
                 reasoning = Some(TextAccumulator {
                     item_id: checkpoint.item_id.clone(),
-                    text: checkpoint.text.clone(),
+                    text: checkpoint.text.clone().into(),
                 });
                 if !has_reasoning_events {
                     replay.reasoning_applied.clone_from(&checkpoint.text);
@@ -3212,7 +3212,7 @@ impl HarnessActor {
         } else {
             message.as_ref().map_or_else(Vec::new, |message| {
                 vec![Block::Text {
-                    text: message.text.clone(),
+                    text: message.text.as_str().to_owned(),
                 }]
             })
         };
@@ -6256,7 +6256,7 @@ impl HarnessActor {
                     }
                 } else {
                     TurnItem::AgentMessage {
-                        text: String::new(),
+                        text: String::new().into(),
                     }
                 };
                 self.commit_item(
@@ -6270,7 +6270,7 @@ impl HarnessActor {
                 .map_err(DriveError::Store)?;
                 TextAccumulator {
                     item_id,
-                    text: String::new(),
+                    text: SharedText::default(),
                 }
             }
         };
@@ -7180,7 +7180,7 @@ impl HarnessActor {
         };
         let item = if reasoning {
             TurnItem::Reasoning {
-                summary: active.text.clone(),
+                summary: active.text.as_str().to_owned(),
             }
         } else {
             TurnItem::AgentMessage {
@@ -7216,7 +7216,7 @@ impl HarnessActor {
             ))
         })?;
         let item_id = active.item_id.clone();
-        let text = active.text;
+        let text = active.text.into_string();
         self.commit_item(
             run_id,
             ItemEvent::Completed {
@@ -9565,7 +9565,7 @@ impl HarnessActor {
             node: self.next_node_id(),
             parent,
             kind: NodeKind::AssistantCommit {
-                text: String::new(),
+                text: String::new().into(),
                 verdict: VerifyVerdict::NotApplicable,
             },
         };
@@ -9941,30 +9941,31 @@ impl HarnessActor {
         )?;
 
         let message_node = if let Some(active) = message.as_ref() {
+            let node_id = self.next_node_id();
+            let item_id = active.item_id.clone();
+            let text = active.text.clone();
             let node = TreeNode {
-                node: self.next_node_id(),
+                node: node_id.clone(),
                 parent: message_parent,
                 kind: NodeKind::AssistantCommit {
-                    text: active.text.clone(),
+                    text: text.clone(),
                     verdict: VerifyVerdict::NotApplicable,
                 },
             };
             envelopes.push(self.uncommitted_envelope(
                 run_id,
                 EventPayload::Item(ItemEvent::Completed {
-                    item_id: active.item_id.clone(),
-                    item: TurnItem::AgentMessage {
-                        text: active.text.clone(),
-                    },
+                    item_id,
+                    item: TurnItem::AgentMessage { text },
                 }),
                 prompt_verbatim_render(),
             )?);
             envelopes.push(self.uncommitted_envelope(
                 run_id,
-                EventPayload::NodeCommitted(node.clone()),
+                EventPayload::NodeCommitted(node),
                 prompt_omit_render(),
             )?);
-            Some(node)
+            Some(node_id)
         } else {
             None
         };
@@ -9974,7 +9975,7 @@ impl HarnessActor {
                 EventPayload::Item(ItemEvent::Completed {
                     item_id: active.item_id.clone(),
                     item: TurnItem::Reasoning {
-                        summary: active.text.clone(),
+                        summary: active.text.as_str().to_owned(),
                     },
                 }),
                 prompt_verbatim_render(),
@@ -9988,7 +9989,7 @@ impl HarnessActor {
 
         self.append_and_publish_owned(envelopes).await?;
         if let Some(node) = message_node {
-            self.tree_head = Some(node.node);
+            self.tree_head = Some(node);
         }
         *message = None;
         *reasoning = None;
@@ -10018,10 +10019,11 @@ impl HarnessActor {
         payload: EventPayload,
         render: RenderTargets,
         kind: NodeKind,
-    ) -> Result<RawEnvelope, HaiderError> {
+    ) -> Result<(), HaiderError> {
         self.flush_pending_item_delta().await?;
+        let node_id = self.next_node_id();
         let node = TreeNode {
-            node: self.next_node_id(),
+            node: node_id.clone(),
             parent: self.tree_parent().await?,
             kind,
         };
@@ -10029,19 +10031,13 @@ impl HarnessActor {
             self.uncommitted_envelope(run_id, payload, render)?,
             self.uncommitted_envelope(
                 run_id,
-                EventPayload::NodeCommitted(node.clone()),
+                EventPayload::NodeCommitted(node),
                 prompt_omit_render(),
             )?,
         ];
-        let committed = self.append_and_publish_owned(Vec::from(envelopes)).await?;
-        self.tree_head = Some(node.node);
-        committed.first().cloned().ok_or_else(|| {
-            HaiderError::new(
-                ErrorCode::Internal,
-                "tree fragment append returned an empty committed batch",
-                false,
-            )
-        })
+        self.append_and_publish_owned(Vec::from(envelopes)).await?;
+        self.tree_head = Some(node_id);
+        Ok(())
     }
 
     async fn tree_parent(&mut self) -> Result<Option<NodeId>, HaiderError> {
@@ -10444,7 +10440,7 @@ struct ProviderRetryContext<'a> {
 #[derive(Debug)]
 struct TextAccumulator {
     item_id: ItemId,
-    text: String,
+    text: SharedText,
 }
 
 /// Suppresses only the exact already-journaled prefix replayed by a resumed
@@ -10473,12 +10469,12 @@ impl ReplayPrefix {
         if self.message_applied.is_empty() {
             self.message_applied = message
                 .as_ref()
-                .map_or_else(String::new, |item| item.text.clone());
+                .map_or_else(String::new, |item| item.text.as_str().to_owned());
         }
         if self.reasoning_applied.is_empty() {
             self.reasoning_applied = reasoning
                 .as_ref()
-                .map_or_else(String::new, |item| item.text.clone());
+                .map_or_else(String::new, |item| item.text.as_str().to_owned());
         }
         if self.refusal_applied.is_empty() {
             self.refusal_applied = refusal.to_owned();

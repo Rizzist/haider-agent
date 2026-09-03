@@ -71,9 +71,7 @@ fn menu_model() -> AppModel {
 fn streaming_message(id: &str, text: &str) -> EventPayload {
     EventPayload::Item(ItemEvent::Started {
         item_id: ItemId::new(id),
-        item: TurnItem::AgentMessage {
-            text: text.to_owned(),
-        },
+        item: TurnItem::AgentMessage { text: text.into() },
     })
 }
 

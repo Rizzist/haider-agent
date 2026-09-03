@@ -14,6 +14,7 @@ struct AppendRecordingStore {
     batch_sizes: Mutex<Vec<usize>>,
     batches: Mutex<Vec<Vec<EventPayload>>>,
     reject_request_boundary: bool,
+    reject_done_boundary: bool,
 }
 
 #[test]
@@ -42,12 +43,20 @@ impl AppendRecordingStore {
             batch_sizes: Mutex::new(Vec::new()),
             batches: Mutex::new(Vec::new()),
             reject_request_boundary: false,
+            reject_done_boundary: false,
         }
     }
 
     fn rejecting_request_boundary() -> Self {
         Self {
             reject_request_boundary: true,
+            ..Self::new()
+        }
+    }
+
+    fn rejecting_done_boundary() -> Self {
+        Self {
+            reject_done_boundary: true,
             ..Self::new()
         }
     }
@@ -74,7 +83,7 @@ impl StoreHandle for AppendRecordingStore {
                 serde_json::from_value(envelope.payload.clone()).expect("recorded payload is typed")
             })
             .collect::<Vec<_>>();
-        let reject = self.reject_request_boundary
+        let reject_request = self.reject_request_boundary
             && batch.iter().any(|payload| {
                 matches!(
                     payload,
@@ -84,14 +93,18 @@ impl StoreHandle for AppendRecordingStore {
                     }) if kind == PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND
                 )
             });
+        let reject_done = self.reject_done_boundary
+            && batch
+                .iter()
+                .any(|payload| matches!(payload, EventPayload::RunState(RunState::Done)));
         self.batches
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(batch);
-        if reject {
+        if reject_request || reject_done {
             return Err(HaiderError::new(
                 ErrorCode::Internal,
-                "reject combined request boundary",
+                "reject configured append boundary",
                 false,
             ));
         }
@@ -740,6 +753,27 @@ async fn no_boundary_post_stream_facts_share_one_ordered_append() {
             EventPayload::RunState(RunState::Done),
         ]
     ));
+    let completed_text = terminal_batch
+        .iter()
+        .find_map(|payload| match payload {
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: _,
+                item: TurnItem::AgentMessage { text },
+            }) => Some(text),
+            _ => None,
+        })
+        .expect("completed assistant item");
+    let node_text = terminal_batch
+        .iter()
+        .find_map(|payload| match payload {
+            EventPayload::NodeCommitted(TreeNode {
+                kind: NodeKind::AssistantCommit { text, .. },
+                ..
+            }) => Some(text),
+            _ => None,
+        })
+        .expect("assistant history node");
+    assert_eq!(node_text, completed_text);
 
     let journal = store.inner.events(&session_id).await;
     let terminal = journal
@@ -778,6 +812,143 @@ async fn no_boundary_post_stream_facts_share_one_ordered_append() {
         .map(|event| event.event_id)
         .collect::<Vec<_>>();
     assert_eq!(published_ids, terminal_ids);
+}
+
+/// MUTATION CHECK: consume `message`, `reasoning`, or pending usage before the
+/// terminal append succeeds. The injected append rejection then lets error
+/// cleanup terminalize the run with a durable Started assistant item that was
+/// never closed.
+#[tokio::test]
+async fn rejected_post_stream_append_keeps_open_item_for_error_cleanup() {
+    let session_id = SessionId::new("post-stream-rejected-batch");
+    let config = HarnessConfig::for_session(
+        session_id.clone(),
+        DeviceId::new("post-stream-rejected-device"),
+        1,
+        1,
+    );
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "close me after rejection".into(),
+        },
+        FakeStep::EmitUsage {
+            usage: reported_usage(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(AppendRecordingStore::rejecting_done_boundary());
+    let handle = HarnessActor::spawn(config, provider, store.clone());
+
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("post-stream-rejected-run"),
+            messages: vec![Message::user_text("exercise rejected terminal append")],
+        })
+        .await
+        .expect("committed turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+
+    let journal = store.inner.events(&session_id).await;
+    let payloads = journal
+        .iter()
+        .map(|event| {
+            serde_json::from_value::<EventPayload>(event.payload.clone())
+                .expect("typed journal payload")
+        })
+        .collect::<Vec<_>>();
+    let started = payloads
+        .iter()
+        .find_map(|payload| match payload {
+            EventPayload::Item(ItemEvent::Started {
+                item_id,
+                item: TurnItem::AgentMessage { .. },
+            }) => Some(item_id),
+            _ => None,
+        })
+        .expect("assistant item started");
+    assert!(payloads.iter().any(|payload| {
+        matches!(
+            payload,
+            EventPayload::Item(ItemEvent::Completed {
+                item_id,
+                item: TurnItem::AgentMessage { text },
+            }) if item_id == started && text == "close me after rejection"
+        )
+    }));
+    assert!(
+        payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::RunState(RunState::Errored)))
+    );
+    assert!(
+        !payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::RunState(RunState::Done)))
+    );
+}
+
+/// MUTATION CHECK: `take()` any pending terminal input before the append, or
+/// advance tree/state despite the store error. The exact values below then
+/// disappear or an uncommitted terminal becomes observable.
+#[tokio::test]
+async fn rejected_post_stream_append_preserves_every_pending_input() {
+    let session_id = SessionId::new("post-stream-rejected-direct");
+    let config = HarnessConfig::for_session(
+        session_id.clone(),
+        DeviceId::new("post-stream-rejected-direct-device"),
+        1,
+        1,
+    );
+    let store = Arc::new(AppendRecordingStore::rejecting_done_boundary());
+    let provider = Arc::new(FakeProvider::new(vec![]));
+    let (mut actor, handle) = HarnessActor::new(config, provider, store.clone());
+    let original_head = NodeId::new("post-stream-original-head");
+    actor.tree_head_initialized = true;
+    actor.tree_head = Some(original_head.clone());
+    let mut message = Some(TextAccumulator {
+        item_id: ItemId::new("post-stream-message-item"),
+        text: SharedText::from("message survives"),
+    });
+    let mut reasoning = Some(TextAccumulator {
+        item_id: ItemId::new("post-stream-reasoning-item"),
+        text: SharedText::from("reasoning survives"),
+    });
+    let mut pending_usage = Some(PendingUsageCommit {
+        footprint: None,
+        usage: reported_usage(),
+    });
+
+    actor
+        .commit_post_stream_facts(
+            &RunId::new("post-stream-rejected-direct-run"),
+            &mut message,
+            &mut reasoning,
+            &mut pending_usage,
+        )
+        .await
+        .expect_err("terminal batch is rejected");
+
+    assert_eq!(
+        message
+            .as_ref()
+            .map(|active| (active.item_id.as_str(), active.text.as_str())),
+        Some(("post-stream-message-item", "message survives"))
+    );
+    assert_eq!(
+        reasoning
+            .as_ref()
+            .map(|active| (active.item_id.as_str(), active.text.as_str())),
+        Some(("post-stream-reasoning-item", "reasoning survives"))
+    );
+    assert!(pending_usage.is_some());
+    assert_eq!(actor.tree_head.as_ref(), Some(&original_head));
+    assert!(handle.state_receiver().borrow().is_none());
+    assert!(store.inner.events(&session_id).await.is_empty());
 }
 
 /// MUTATION CHECK: infer the boundary from the final empty tool accumulator

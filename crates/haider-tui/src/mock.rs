@@ -113,7 +113,7 @@ pub fn turn_script(turn: u64) -> Vec<EventPayload> {
     script.push(EventPayload::Item(ItemEvent::Started {
         item_id: turn_item(turn, 2),
         item: TurnItem::AgentMessage {
-            text: String::new(),
+            text: String::new().into(),
         },
     }));
     for chunk in [
@@ -133,7 +133,7 @@ pub fn turn_script(turn: u64) -> Vec<EventPayload> {
         item: TurnItem::AgentMessage {
             text: "Reading the failing test first — the boundary check rejects seq 0 \
                    but the fixture starts at 0."
-                .to_owned(),
+                .into(),
         },
     }));
 

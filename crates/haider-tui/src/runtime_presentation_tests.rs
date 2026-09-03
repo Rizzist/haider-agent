@@ -53,7 +53,7 @@ fn started(item: &str) -> EventPayload {
     EventPayload::Item(ItemEvent::Started {
         item_id: ItemId::new(item),
         item: TurnItem::AgentMessage {
-            text: String::new(),
+            text: String::new().into(),
         },
     })
 }

@@ -717,7 +717,7 @@ impl B {
         self.emit(EventPayload::Item(ItemEvent::Started {
             item_id: item_id.clone(),
             item: TurnItem::AgentMessage {
-                text: String::new(),
+                text: String::new().into(),
             },
         }));
         for token in split_word_tokens(text) {
@@ -736,7 +736,7 @@ impl B {
         self.emit(EventPayload::Item(ItemEvent::Completed {
             item_id,
             item: TurnItem::AgentMessage {
-                text: text.to_owned(),
+                text: text.to_owned().into(),
             },
         }));
     }
@@ -1609,7 +1609,7 @@ fn chip_stream(beats: &mut Vec<Beat>, agent: &str, ns: &str, id: &str, text: &st
         payload: EventPayload::Item(ItemEvent::Started {
             item_id: item_id.clone(),
             item: TurnItem::AgentMessage {
-                text: String::new(),
+                text: String::new().into(),
             },
         }),
     });
@@ -1628,7 +1628,7 @@ fn chip_stream(beats: &mut Vec<Beat>, agent: &str, ns: &str, id: &str, text: &st
         payload: EventPayload::Item(ItemEvent::Completed {
             item_id,
             item: TurnItem::AgentMessage {
-                text: text.to_owned(),
+                text: text.to_owned().into(),
             },
         }),
     });
@@ -2189,7 +2189,7 @@ fn aura_stream(beats: &mut Vec<Beat>, id: &str, text: &str) {
     beats.push(Beat::AuraEmit(EventPayload::Item(ItemEvent::Started {
         item_id: item_id.clone(),
         item: TurnItem::AgentMessage {
-            text: String::new(),
+            text: String::new().into(),
         },
     })));
     for token in split_word_tokens(text) {
@@ -2202,7 +2202,7 @@ fn aura_stream(beats: &mut Vec<Beat>, id: &str, text: &str) {
     beats.push(Beat::AuraEmit(EventPayload::Item(ItemEvent::Completed {
         item_id,
         item: TurnItem::AgentMessage {
-            text: text.to_owned(),
+            text: text.to_owned().into(),
         },
     })));
 }

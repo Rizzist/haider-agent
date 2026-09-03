@@ -287,6 +287,10 @@ async fn drive_turns(
             return Err(protocol_error(format!("turn {turn} ended in {terminal:?}")).into());
         }
         emit(json!({"phase": "turn", "turn": turn}))?;
+        // The footprint harness acknowledges only after it has sampled this
+        // exact idle head. This prevents the next submission from racing the
+        // daemon's post-Idle allocator relief and derived-cache compaction.
+        wait_checkpoint_ack(checkpoint_acks)?;
     }
     if attached_settle_seconds > 0 {
         settle_checkpoint(attached_settle_seconds, "attached_settled", checkpoint_acks).await?;

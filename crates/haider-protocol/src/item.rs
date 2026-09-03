@@ -10,7 +10,10 @@ use crate::agent::ChildReport;
 use crate::error::ErrorPresentation;
 use crate::history::TodoItem;
 use crate::ids::{AgentId, ArtifactRef, ItemId};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 const fn is_false(value: &bool) -> bool {
     !*value
@@ -23,6 +26,117 @@ const fn is_false(value: &bool) -> bool {
 /// rendering the first-class command item byte-for-byte, while prompt/audit
 /// consumers can distinguish a user `!` command from model-initiated exec.
 pub const USER_COMMAND_ORIGIN_EXTENSION_KIND: &str = "user_command_origin_v1";
+
+/// Immutable assistant text shared by the completed item and its history
+/// node until each durable envelope has been serialized.
+///
+/// The inner `String` keeps conversion from the streaming accumulator
+/// allocation-free; cloning this leaf increments only the `Arc` count. Its
+/// JSON/MessagePack representation remains exactly the legacy string scalar.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct SharedText(Arc<String>);
+
+impl SharedText {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    #[must_use]
+    pub fn into_string(self) -> String {
+        Arc::try_unwrap(self.0).unwrap_or_else(|text| (*text).clone())
+    }
+
+    pub fn push_str(&mut self, text: &str) {
+        Arc::make_mut(&mut self.0).push_str(text);
+    }
+}
+
+impl Deref for SharedText {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_str()
+    }
+}
+
+impl DerefMut for SharedText {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0).as_mut_str()
+    }
+}
+
+impl AsRef<str> for SharedText {
+    fn as_ref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl From<String> for SharedText {
+    fn from(text: String) -> Self {
+        Self(Arc::new(text))
+    }
+}
+
+impl From<&str> for SharedText {
+    fn from(text: &str) -> Self {
+        Self::from(text.to_owned())
+    }
+}
+
+impl From<SharedText> for String {
+    fn from(text: SharedText) -> Self {
+        text.into_string()
+    }
+}
+
+impl PartialEq<str> for SharedText {
+    fn eq(&self, other: &str) -> bool {
+        self.as_ref() == other
+    }
+}
+
+impl PartialEq<&str> for SharedText {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_ref() == *other
+    }
+}
+
+impl PartialEq<String> for SharedText {
+    fn eq(&self, other: &String) -> bool {
+        self.as_ref() == other
+    }
+}
+
+impl fmt::Debug for SharedText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.0.as_str(), formatter)
+    }
+}
+
+impl fmt::Display for SharedText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0.as_str())
+    }
+}
+
+impl Serialize for SharedText {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.0.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedText {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::from)
+    }
+}
 
 /// Origin values carried by [`UserCommandOriginV1`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,7 +189,7 @@ impl UserCommandOriginV1 {
 #[serde(tag = "item", rename_all = "snake_case")]
 pub enum TurnItem {
     AgentMessage {
-        text: String,
+        text: SharedText,
     },
     /// Assistant text whose provider stream ended after content committed.
     /// This variant is deliberately not replayed as completed assistant
@@ -195,4 +309,33 @@ pub enum ItemDelta {
 pub enum OutputStream {
     Stdout,
     Stderr,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SharedText;
+    use std::sync::Arc;
+
+    /// MUTATION CHECK: make `Clone` duplicate the backing string, serialize
+    /// an object wrapper, or mutate through a clone without copy-on-write.
+    /// This pins both the peak-RSS ownership lever and its legacy wire scalar.
+    #[test]
+    fn shared_text_clones_storage_but_keeps_legacy_wire_bytes() {
+        let original = SharedText::from("assistant answer".to_owned());
+        let mut clone = original.clone();
+        assert!(Arc::ptr_eq(&original.0, &clone.0));
+        assert_eq!(
+            serde_json::to_string(&original).expect("shared text serializes"),
+            r#""assistant answer""#
+        );
+
+        clone.push_str(" extended");
+        assert_eq!(original.as_str(), "assistant answer");
+        assert_eq!(clone.as_str(), "assistant answer extended");
+        assert!(!Arc::ptr_eq(&original.0, &clone.0));
+
+        let decoded: SharedText =
+            serde_json::from_str(r#""assistant answer""#).expect("legacy string decodes");
+        assert_eq!(decoded, original);
+    }
 }

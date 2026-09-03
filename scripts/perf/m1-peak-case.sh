@@ -5,9 +5,11 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 SAMPLER="$SCRIPT_DIR/m1-rss-sampler.py"
+CLIENT_WRAPPER="$SCRIPT_DIR/m1-client-rusage.py"
 BENCH_ROOT=${M1_BENCH_ROOT:-/Users/rizzist/Documents/CODING/haidercode-web}
 HAIDER_BIN=${M1_HAIDER_BIN:-/Users/rizzist/.claude/jobs/1a0b5b6c/tmp/bench967e/bin/haider}
 OUTPUT_ROOT=${M1_OUTPUT_ROOT:-$REPO_ROOT/target/m1-rss}
+MAX_LOAD_1M=${M1_MAX_LOAD_1M:-3}
 RUNS=5
 proxy_pid=
 sampler_pid=
@@ -234,6 +236,7 @@ analyze_run() {
     load=$2
     python3 - "$run_dir" "$load" <<'PY'
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -244,8 +247,6 @@ samples_path = run / "m1-rss.tsv"
 proxy_result = json.loads((run / "proxy-result.json").read_text(encoding="utf-8"))
 
 raw = jsonl.read_bytes()
-if not (3_374_303 - 65_536 <= len(raw) <= 3_374_303 + 65_536):
-    raise SystemExit(f"JSONL size {len(raw)} is outside 3,374,303 +/- 65,536")
 
 def large_x(value):
     if isinstance(value, str):
@@ -260,9 +261,24 @@ t_delta = None
 t_item = None
 t_end = None
 terminal_done = False
+assistant_node_projection = None
+large_text_events = 0
 for line in raw.splitlines():
     event = json.loads(line)
     payload = event.get("payload", {})
+    if large_x(payload):
+        large_text_events += 1
+    if payload.get("type") == "node_committed":
+        kind = payload.get("kind", {})
+        if kind.get("kind") == "assistant_commit":
+            text = kind.get("text")
+            source_item = kind.get("source_item")
+            if isinstance(text, str) and len(text) == 1_114_112:
+                assistant_node_projection = (
+                    "referenced_full_text" if isinstance(source_item, str) else "legacy_text"
+                )
+            elif text is None and isinstance(source_item, str):
+                assistant_node_projection = "reference_only"
     committed = event.get("committed_at_ms")
     if not isinstance(committed, int):
         continue
@@ -286,6 +302,29 @@ for line in raw.splitlines():
         terminal_done = True
 if None in (t_delta, t_item, t_end) or not terminal_done:
     raise SystemExit("JSONL lacks the exact large delta/item/done anchors")
+if assistant_node_projection is None:
+    raise SystemExit("JSONL lacks a valid assistant node projection")
+expected_large_events = 2 if assistant_node_projection == "reference_only" else 3
+if large_text_events != expected_large_events:
+    raise SystemExit(
+        f"JSONL has {large_text_events} large-text events, expected {expected_large_events} "
+        f"for {assistant_node_projection}"
+    )
+expected_projection = os.environ.get("M1_EXPECT_PROJECTION", "either")
+if expected_projection not in ("either", assistant_node_projection):
+    raise SystemExit(
+        f"JSONL projection {assistant_node_projection}, expected {expected_projection}"
+    )
+expected_jsonl_bytes = (
+    3_374_303 - 1_114_112
+    if assistant_node_projection == "reference_only"
+    else 3_374_303
+)
+if not (expected_jsonl_bytes - 65_536 <= len(raw) <= expected_jsonl_bytes + 65_536):
+    raise SystemExit(
+        f"JSONL size {len(raw)} is outside {expected_jsonl_bytes} +/- 65,536 "
+        f"for {assistant_node_projection}"
+    )
 
 samples = []
 for line in samples_path.read_text(encoding="ascii").splitlines()[1:]:
@@ -303,12 +342,15 @@ end_ns = t_end * 1_000_000
 candidates = [
     values
     for values in daemon_by_pid.values()
-    if min(row[0] for row in values) <= delta_ns - 50_000_000
+    # Cold daemon startup can reach the first provider delta in under 50 ms.
+    # A sample at least 10 ms before that delta still proves the selected PID
+    # spans the pre-reply baseline without making a fast run sampler-flaky.
+    if min(row[0] for row in values) <= delta_ns - 10_000_000
     and max(row[0] for row in values) >= end_ns
 ]
 if len(candidates) != 1:
     raise SystemExit(
-        f"sampler did not identify exactly one daemon alive from t_delta-50ms through t_end: {len(candidates)}"
+        f"sampler did not identify exactly one daemon alive from t_delta-10ms through t_end: {len(candidates)}"
     )
 daemon = candidates[0]
 pre = [row for row in daemon if row[0] <= delta_ns - 1_000_000]
@@ -320,11 +362,15 @@ if not pre or not at_item or not window or not cli:
 r_pre = max(pre, key=lambda row: row[0])[4]
 r_item = min(at_item, key=lambda row: row[0])[4]
 r_max = max(row[4] for row in window)
-r_cli_max = max(row[4] for row in cli)
+r_cli_sampled_max = max(row[4] for row in cli)
+client_usage = json.loads((run / "client-rusage.json").read_text(encoding="utf-8"))
+r_cli_max = int(client_usage["max_rss_bytes"])
 summary = {
     "load_1m": load,
     "jsonl_bytes": len(raw),
     "proxy_request_count": proxy_result.get("request_count"),
+    "assistant_node_projection": assistant_node_projection,
+    "large_text_events": large_text_events,
     "daemon_pid": daemon[0][2],
     "t_delta_ms": t_delta,
     "t_item_ms": t_item,
@@ -333,6 +379,7 @@ summary = {
     "R_item_bytes": r_item,
     "R_max_bytes": r_max,
     "R_cli_max_bytes": r_cli_max,
+    "R_cli_sampled_max_bytes": r_cli_sampled_max,
     "delta_post_bytes": r_max - r_item,
     "sanity_growth_bytes": r_max - r_pre,
 }
@@ -424,6 +471,7 @@ PY
             HAIDER_NO_UPDATE_CHECK=1 \
             BENCH_PROXY_API_KEY="$credential" \
             BENCH_PROXY_BASE_URL="$base_url" \
+            python3 "$CLIENT_WRAPPER" --output "$run_dir/client-rusage.json" -- \
             "$HAIDER_BIN" run "$prompt" \
                 --output jsonl \
                 --timeout 15m \
@@ -497,15 +545,15 @@ if [ "$RUNS" -ne 5 ]; then
     exit 2
 fi
 initial_load=$(load_1m)
-if python3 - "$initial_load" <<'PY'
+if python3 - "$initial_load" "$MAX_LOAD_1M" <<'PY'
 import sys
-raise SystemExit(0 if float(sys.argv[1]) < 8 else 1)
+raise SystemExit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)
 PY
 then
     mkdir -p "$OUTPUT_ROOT"
 else
     self_test
-    echo "not measured, load too high (load_1m=$initial_load, required < 8)"
+    echo "not measured, load too high (load_1m=$initial_load, required < $MAX_LOAD_1M)"
     exit 0
 fi
 
@@ -531,12 +579,12 @@ fi
 index=1
 while [ "$index" -le "$RUNS" ]; do
     run_load=$(load_1m)
-    if ! python3 - "$run_load" <<'PY'
+    if ! python3 - "$run_load" "$MAX_LOAD_1M" <<'PY'
 import sys
-raise SystemExit(0 if float(sys.argv[1]) < 8 else 1)
+raise SystemExit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)
 PY
     then
-        echo "not measured, load too high before run $index (load_1m=$run_load, required < 8)" >&2
+        echo "not measured, load too high before run $index (load_1m=$run_load, required < $MAX_LOAD_1M)" >&2
         exit 3
     fi
     run_once "$index" "$run_load"

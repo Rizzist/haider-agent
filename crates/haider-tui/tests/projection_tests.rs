@@ -167,7 +167,7 @@ fn agent_message_streams_then_completed_replaces() {
     projection.apply(&started(
         1,
         TurnItem::AgentMessage {
-            text: String::new(),
+            text: String::new().into(),
         },
     ));
     projection.apply(&delta(
@@ -191,7 +191,7 @@ fn agent_message_streams_then_completed_replaces() {
     assert_eq!(
         block.item,
         TurnItem::AgentMessage {
-            text: "Hello…".to_owned()
+            text: "Hello…".into()
         }
     );
 
@@ -199,7 +199,7 @@ fn agent_message_streams_then_completed_replaces() {
     projection.apply(&completed(
         1,
         TurnItem::AgentMessage {
-            text: "Hello, corrected.".to_owned(),
+            text: "Hello, corrected.".into(),
         },
     ));
     let TranscriptEntry::Item(block) = &projection.entries()[0] else {
@@ -209,7 +209,7 @@ fn agent_message_streams_then_completed_replaces() {
     assert_eq!(
         block.item,
         TurnItem::AgentMessage {
-            text: "Hello, corrected.".to_owned()
+            text: "Hello, corrected.".into()
         }
     );
 }
@@ -682,12 +682,12 @@ fn non_ui_envelopes_advance_seq_without_display_mutation() {
 fn item_lifecycle_is_idempotent_under_redelivery() {
     let mut projection = SessionProjection::new();
     let message = TurnItem::AgentMessage {
-        text: "final".to_owned(),
+        text: "final".into(),
     };
     projection.apply(&started(
         40,
         TurnItem::AgentMessage {
-            text: String::new(),
+            text: String::new().into(),
         },
     ));
     projection.apply(&completed(40, message.clone()));
@@ -697,20 +697,20 @@ fn item_lifecycle_is_idempotent_under_redelivery() {
     projection.apply(&started(
         40,
         TurnItem::AgentMessage {
-            text: String::new(),
+            text: String::new().into(),
         },
     ));
     // Double Started for an OPEN id: no double block.
     projection.apply(&started(
         41,
         TurnItem::AgentMessage {
-            text: String::new(),
+            text: String::new().into(),
         },
     ));
     projection.apply(&started(
         41,
         TurnItem::AgentMessage {
-            text: String::new(),
+            text: String::new().into(),
         },
     ));
 

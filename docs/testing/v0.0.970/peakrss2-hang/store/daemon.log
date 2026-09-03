@@ -1,0 +1,3 @@
+haiderd: TEST MODE — every turn resolves to the injected fake provider
+haiderd: ephemeral-lifecycle event=guard_armed result=registered_or_already_signaled
+haiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1

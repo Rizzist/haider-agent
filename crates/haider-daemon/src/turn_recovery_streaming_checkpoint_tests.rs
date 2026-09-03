@@ -203,7 +203,7 @@ async fn daemon_restart_preserves_route_wait_with_partial_and_completed_tool_eff
             EventPayload::Item(ItemEvent::Started {
                 item_id: item_id.clone(),
                 item: TurnItem::AgentMessage {
-                    text: String::new(),
+                    text: String::new().into(),
                 },
             }),
         ),

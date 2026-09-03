@@ -1,0 +1,1 @@
+/Users/rizzist/haider-run/lane-970-peakrss2/target/release/haiderd --profile memdaemon-footprint --store-dir /tmp/hmd-1-_3pt7ptv/store --runtime-dir /tmp/hmd-1-_3pt7ptv/runtime --startup-ready 3 --launcher-liveness 4

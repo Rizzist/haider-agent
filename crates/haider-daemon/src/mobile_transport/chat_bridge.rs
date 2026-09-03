@@ -1084,7 +1084,7 @@ impl TurnProjection {
     ) -> Result<(), MobileChatError> {
         match item {
             TurnItem::AgentMessage { text } => {
-                self.send_unseen_text(item_id, text, "answer", responder)
+                self.send_unseen_text(item_id, text.into_string(), "answer", responder)
                     .await
             }
             TurnItem::IncompleteAgentMessage { text, .. } => {

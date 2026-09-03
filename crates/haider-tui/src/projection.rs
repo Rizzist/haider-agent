@@ -1496,7 +1496,7 @@ impl SessionProjection {
             SeedRow::Agent(text) => self.apply(&EventPayload::Item(ItemEvent::Completed {
                 item_id: id,
                 item: TurnItem::AgentMessage {
-                    text: (*text).to_owned(),
+                    text: (*text).to_owned().into(),
                 },
             })),
             SeedRow::Tool { name, desc, meta } => {

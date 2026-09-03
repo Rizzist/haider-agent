@@ -1760,7 +1760,9 @@ fn interrupted_terminal_payloads(
     open_items.sort_by_key(|(_, open)| open.started_seq);
     for (item_id, open) in open_items {
         let item = match open.item {
-            TurnItem::AgentMessage { .. } => TurnItem::AgentMessage { text: open.text },
+            TurnItem::AgentMessage { .. } => TurnItem::AgentMessage {
+                text: open.text.into(),
+            },
             TurnItem::Reasoning { .. } => TurnItem::Reasoning { summary: open.text },
             TurnItem::ToolCall {
                 call_id,

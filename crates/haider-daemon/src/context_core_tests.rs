@@ -659,7 +659,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
                 EventPayload::Item(ItemEvent::Completed {
                     item_id,
                     item: TurnItem::AgentMessage {
-                        text: format!("recent answer {ordinal}"),
+                        text: format!("recent answer {ordinal}").into(),
                     },
                 }),
                 PromptRender::Verbatim,
@@ -670,7 +670,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
                     node: assistant_node.clone(),
                     parent: Some(user_node),
                     kind: NodeKind::AssistantCommit {
-                        text: format!("recent answer {ordinal}"),
+                        text: format!("recent answer {ordinal}").into(),
                         verdict: haider_protocol::verify::VerifyVerdict::NotApplicable,
                     },
                 }),

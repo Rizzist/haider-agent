@@ -1,0 +1,10 @@
+{"pipe":"haider.session.jsonl","version":6,"session_id":"session-4857f6874a911882a970ab8f4183262b","generation":1}
+{"role":"user","text":"run tiny process turn 1","at_ms":1788396954313,"seq":4,"ordinal":0}
+{"coverage":6,"generation":1}
+{"coverage":9,"generation":1}
+{"coverage":18,"generation":1}
+{"coverage":22,"generation":1}
+{"coverage":24,"generation":1}
+{"role":"tool","name":"process_exec","summary":"tool call settled as Completed","status":"completed","args_preview":"{\"command\":\":\"}","result_preview":"{\"artifact\":null,\"command_arg_digest\":\"blake3:e5d6ca24ab3f4540a9a0d03dcee1f893ff80cf6041fffccd4195fa75b6e59321\",\"effect_id\":\"effect-session-4857f6874a911882a970","at_ms":1788396954372,"seq":27,"ordinal":0}
+{"coverage":33,"generation":1}
+{"coverage":39,"generation":1}

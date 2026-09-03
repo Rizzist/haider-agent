@@ -1143,13 +1143,14 @@ fn replay_final_text(events: &HeadlessRunEvents) -> io::Result<Option<String>> {
     events.try_for_each(|envelope| {
         let payload = envelope.payload;
         if let Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
-            item:
-                haider_protocol::item::TurnItem::AgentMessage { text }
-                | haider_protocol::item::TurnItem::IncompleteAgentMessage { text, .. },
-            ..
+            item, ..
         })) = serde_json::from_value::<EventPayload>(payload)
         {
-            final_text = Some(text);
+            final_text = match item {
+                haider_protocol::item::TurnItem::AgentMessage { text } => Some(text.into_string()),
+                haider_protocol::item::TurnItem::IncompleteAgentMessage { text, .. } => Some(text),
+                _ => final_text.take(),
+            };
         }
         Ok(())
     })?;

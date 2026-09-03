@@ -735,6 +735,7 @@ async fn trailing_word_boundaries_route_like_the_sim() {
                 _ => None,
             })
             .expect("an opening line")
+            .to_string()
     }
     let got = opening_line("audit the pci flow").await;
     assert!(

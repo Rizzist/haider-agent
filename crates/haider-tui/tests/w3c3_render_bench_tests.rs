@@ -53,7 +53,8 @@ fn replayed(rows: usize) -> AppModel {
                     text: format!(
                         "row {n} — a representative agent line with enough words to wrap at \
                          a normal terminal width and exercise the measurement path"
-                    ),
+                    )
+                    .into(),
                 },
             }));
     }

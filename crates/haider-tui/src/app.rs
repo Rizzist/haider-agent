@@ -1566,7 +1566,7 @@ impl ChipModel {
                                 seed.agent
                             )),
                             item: haider_protocol::item::TurnItem::AgentMessage {
-                                text: text.clone(),
+                                text: text.clone().into(),
                             },
                         },
                     ));
@@ -1836,7 +1836,7 @@ impl ChipModel {
                         .unwrap_or_default();
                     format!("{name} {desc}")
                 }
-                haider_protocol::item::TurnItem::AgentMessage { text } => text.clone(),
+                haider_protocol::item::TurnItem::AgentMessage { text } => text.to_string(),
                 _ => String::new(),
             },
             crate::projection::TranscriptEntry::User { text, .. } => text.clone(),
@@ -2405,7 +2405,7 @@ impl AuraModel {
             haider_protocol::item::ItemEvent::Completed {
                 item_id: haider_protocol::ids::ItemId::new("aura-seed"),
                 item: haider_protocol::item::TurnItem::AgentMessage {
-                    text: "Aura online. I orchestrate local sessions — I don't write code myself. Say or type what to spin up.".to_owned(),
+                    text: "Aura online. I orchestrate local sessions — I don't write code myself. Say or type what to spin up.".into(),
                 },
             },
         ));

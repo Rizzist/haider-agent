@@ -78,6 +78,7 @@ fn completed_message(events: &[RawEnvelope]) -> String {
             _ => None,
         })
         .expect("completed agent message")
+        .into_string()
 }
 
 fn seq_of(events: &[RawEnvelope], want: impl Fn(&EventPayload) -> bool) -> u64 {

@@ -221,7 +221,11 @@ impl SessionExport {
                         turns.push(Turn::User { text, at_ms, seq });
                     }
                     NodeKind::AssistantCommit { text, .. } => {
-                        turns.push(Turn::Assistant { text, at_ms, seq });
+                        turns.push(Turn::Assistant {
+                            text: text.into_string(),
+                            at_ms,
+                            seq,
+                        });
                     }
                     NodeKind::ToolExchange { tool, summary, .. } => {
                         let pending_key = tool_join.as_ref().and_then(|join| {

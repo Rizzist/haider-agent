@@ -447,7 +447,7 @@ fn agent_message(seq_base: u64, model: &mut AppModel, text: &str, complete: bool
         &EventPayload::Item(ItemEvent::Started {
             item_id: item.clone(),
             item: TurnItem::AgentMessage {
-                text: String::new(),
+                text: String::new().into(),
             },
         }),
     ));
@@ -465,9 +465,7 @@ fn agent_message(seq_base: u64, model: &mut AppModel, text: &str, complete: bool
             seq_base + 2,
             &EventPayload::Item(ItemEvent::Completed {
                 item_id: item,
-                item: TurnItem::AgentMessage {
-                    text: text.to_owned(),
-                },
+                item: TurnItem::AgentMessage { text: text.into() },
             }),
         ));
     }

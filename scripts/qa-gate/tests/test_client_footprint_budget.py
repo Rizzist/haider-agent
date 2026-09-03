@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
 import io
 import json
@@ -14,6 +14,7 @@ from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[2] / "perf" / "client-footprint-budget.py"
+WORKFLOW = Path(__file__).resolve().parents[3] / ".github" / "workflows" / "ship-gate.yml"
 SPEC = importlib.util.spec_from_file_location("client_footprint_budget", SCRIPT)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"cannot import {SCRIPT}")
@@ -22,6 +23,122 @@ SPEC.loader.exec_module(client_footprint)
 
 
 class ClientFootprintBudgetTests(unittest.TestCase):
+    def test_calibration_requires_exactly_five_runs(self):
+        required = [
+            "--haider",
+            "/tmp/haider",
+            "--surface",
+            "status-post-command",
+            "--output",
+            "/tmp/client-footprint",
+            "--calibrate",
+        ]
+        for runs in (None, "4", "6"):
+            argv = list(required)
+            if runs is not None:
+                argv.extend(("--runs", runs))
+            with self.subTest(runs=runs), redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(SystemExit, "2"):
+                    client_footprint.parse_args(argv)
+
+        args = client_footprint.parse_args(required + ["--runs", "5"])
+        self.assertTrue(args.calibrate)
+        self.assertEqual(args.runs, client_footprint.CALIBRATION_RUNS)
+
+    def test_calibration_path_records_runner_median_and_headroom(self):
+        footprints = [1_000, 1_100, 1_200, 1_300, 1_400]
+
+        def measured(**_kwargs):
+            footprint = footprints[measured.call_count]
+            measured.call_count += 1
+            return {
+                "phys_footprint_bytes": footprint,
+                "cpu_total_us": footprint // 10,
+                "threads": 1,
+                "vmmap_exit": 0,
+                "load_before_read": 0.5,
+            }
+
+        measured.call_count = 0
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            haider = root / "haider"
+            haider.touch()
+            haider.with_name("haiderd").touch()
+            output = root / "artefact"
+            argv = [
+                "--haider",
+                str(haider),
+                "--surface",
+                "status-post-command",
+                "--output",
+                str(output),
+                "--calibrate",
+                "--runs",
+                "5",
+            ]
+            ci_environment = {
+                "GITHUB_RUN_ID": "33617313643",
+                "GITHUB_RUN_ATTEMPT": "2",
+                "GITHUB_SHA": "abc123",
+                "RUNNER_OS": "macOS",
+                "RUNNER_ARCH": "ARM64",
+            }
+            with (
+                mock.patch.object(client_footprint, "DarwinProcessMetrics"),
+                mock.patch.object(client_footprint, "wait_for_load", return_value=0.5),
+                mock.patch.object(client_footprint, "measure_status", side_effect=measured),
+                mock.patch.dict(os.environ, ci_environment, clear=True),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(client_footprint.main(argv), 0)
+
+            summary = json.loads(
+                (output / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["mode"], "calibration")
+            self.assertEqual(summary["runs"], 5)
+            self.assertEqual(summary["phys_footprint_bytes"]["median"], 1_200)
+            self.assertEqual(summary["derived_budget_bytes"], 1_320)
+            self.assertEqual(
+                summary["budget_basis"],
+                {
+                    "metric": "phys_footprint_bytes.median",
+                    "headroom_percent": 10,
+                    "formula": "ceil(median * 1.10)",
+                },
+            )
+            self.assertEqual(
+                summary["run_context"],
+                {
+                    "github_run_attempt": "2",
+                    "github_run_id": "33617313643",
+                    "github_sha": "abc123",
+                    "runner_arch": "ARM64",
+                    "runner_os": "macOS",
+                },
+            )
+            self.assertEqual(measured.call_count, 5)
+            self.assertEqual(
+                sorted(path.name for path in output.glob("run-*/sample.json")),
+                ["sample.json"] * 5,
+            )
+
+    def test_ship_gate_calibrates_all_three_surfaces_at_n_five(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            "calibrate and enforce settled client footprint budgets (N=5)", workflow
+        )
+        self.assertIn("--calibrate", workflow)
+        self.assertIn("--runs 5", workflow)
+        self.assertIn(
+            "calibrate_surface status-post-command status 2938637", workflow
+        )
+        self.assertIn("calibrate_surface run-post-command run 3794948", workflow)
+        self.assertIn(
+            "calibrate_surface tui-demo-sixel tui-sixel 6110043", workflow
+        )
+
     def test_hermetic_env_removes_all_proxy_routes_and_pins_loopback_bypass(self):
         inherited = {
             "HTTP_PROXY": "http://upper-http.invalid",

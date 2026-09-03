@@ -2023,7 +2023,7 @@ async fn tree_compilation_is_byte_identical_to_journal_rendering() {
             "n-opaque",
             Some("n-user"),
             NodeKind::AssistantCommit {
-                text: String::new(),
+                text: String::new().into(),
                 verdict: VerifyVerdict::NotApplicable,
             },
         ),
@@ -4064,7 +4064,7 @@ async fn measure_cold_fold_after_several_compactions() {
             EventPayload::Item(ItemEvent::Completed {
                 item_id: ItemId::new(format!("timing-answer-{cycle}")),
                 item: TurnItem::AgentMessage {
-                    text: format!("assistant turn {cycle}"),
+                    text: format!("assistant turn {cycle}").into(),
                 },
             }),
             PromptRender::Verbatim,
@@ -4075,7 +4075,7 @@ async fn measure_cold_fold_after_several_compactions() {
             assistant_node.as_str(),
             Some(user_node.as_str()),
             NodeKind::AssistantCommit {
-                text: format!("assistant turn {cycle}"),
+                text: format!("assistant turn {cycle}").into(),
                 verdict: VerifyVerdict::NotApplicable,
             },
         ));
@@ -6110,7 +6110,7 @@ async fn seed_clean_compaction_history(
                 EventPayload::Item(ItemEvent::Completed {
                     item_id: ItemId::new(format!("{name}-assistant-item-{ordinal}")),
                     item: TurnItem::AgentMessage {
-                        text: assistant_text.clone(),
+                        text: assistant_text.clone().into(),
                     },
                 }),
                 PromptRender::Verbatim,
@@ -6121,7 +6121,7 @@ async fn seed_clean_compaction_history(
                 &assistant_node,
                 Some(&user_node),
                 NodeKind::AssistantCommit {
-                    text: assistant_text,
+                    text: assistant_text.into(),
                     verdict: VerifyVerdict::NotApplicable,
                 },
             ),
@@ -6377,7 +6377,7 @@ async fn structural_selection_replays_from_the_append_only_journal_after_restart
             "structural-replay-assistant-node",
             Some("structural-replay-user-node"),
             NodeKind::AssistantCommit {
-                text: String::new(),
+                text: String::new().into(),
                 verdict: VerifyVerdict::NotApplicable,
             },
         ),
@@ -6427,7 +6427,7 @@ async fn structural_selection_replays_from_the_append_only_journal_after_restart
             "structural-replay-current-assistant-node",
             Some("structural-replay-current-node"),
             NodeKind::AssistantCommit {
-                text: String::new(),
+                text: String::new().into(),
                 verdict: VerifyVerdict::NotApplicable,
             },
         ),
@@ -6500,7 +6500,7 @@ async fn structural_selection_replays_from_the_append_only_journal_after_restart
             "structural-replay-reused-assistant-node",
             Some("structural-replay-reused-user-node"),
             NodeKind::AssistantCommit {
-                text: String::new(),
+                text: String::new().into(),
                 verdict: VerifyVerdict::NotApplicable,
             },
         ),

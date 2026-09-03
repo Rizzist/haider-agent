@@ -103,6 +103,12 @@ def proc_rusage(pid: int) -> dict[str, int]:
 
 
 def fake_script(turns: int) -> str:
+    # Keep tool I/O constant so retained bytes/turn cannot be mistaken for
+    # output caching: overwrite exactly 60 bytes and emit exactly 30 bytes.
+    command = (
+        "printf '012345678901234567890123456789012345678901234567890123456789' "
+        "> peakrss2-tool.bin; printf '012345678901234567890123456789'"
+    )
     steps: list[dict[str, Any]] = []
     for turn in range(1, turns + 1):
         call_id = f"memdaemon-{turn}"
@@ -112,7 +118,7 @@ def fake_script(turns: int) -> str:
                     "step": "emit_tool_call",
                     "call_id": call_id,
                     "name": "process_exec",
-                    "args": {"command": ":"},
+                    "args": {"command": command},
                 },
                 {"step": "finish", "reason": "tool_use"},
                 {"step": "expect_tool_result", "call_id": call_id},
@@ -127,6 +133,19 @@ def checkpoint(pid: int) -> dict[str, Any]:
     sample["load_1m"] = os.getloadavg()[0]
     sample["monotonic_ns"] = time.monotonic_ns()
     return sample
+
+
+def linear_slope(points: list[tuple[int, int]]) -> float:
+    if len(points) < 2:
+        return 0.0
+    mean_x = sum(point[0] for point in points) / len(points)
+    mean_y = sum(point[1] for point in points) / len(points)
+    denominator = sum((point[0] - mean_x) ** 2 for point in points)
+    if denominator == 0:
+        return 0.0
+    return sum(
+        (point[0] - mean_x) * (point[1] - mean_y) for point in points
+    ) / denominator
 
 
 def capture_process_reports(
@@ -187,13 +206,30 @@ def retention_store_snapshot(root: Path) -> dict[str, Any]:
                 "WHERE lower(coalesce(payload_kind, '')) LIKE '%effect%'"
             ),
             "hook_outbox_rows": "SELECT count(*) FROM hook_dispatch_outbox",
+            "hook_outbox_coordinate_bytes": (
+                "SELECT coalesce(sum(length(session_id) + 8), 0) "
+                "FROM hook_dispatch_outbox"
+            ),
             "receipt_rows": "SELECT count(*) FROM command_receipts",
             "receipt_json_bytes": (
                 "SELECT coalesce(sum(length(request_json)), 0) + "
                 "coalesce(sum(length(response_json)), 0) FROM command_receipts"
             ),
+            "receipt_record_bytes": (
+                "SELECT coalesce(sum(length(command_id) + length(method) + "
+                "length(request_digest) + length(request_json) + length(state) + "
+                "length(coalesce(session_id, '')) + length(coalesce(run_id, '')) + "
+                "length(coalesce(response_json, '')) + "
+                "length(coalesce(recovery_json, '')) + 32), 0) FROM command_receipts"
+            ),
             "run_head_rows": "SELECT count(*) FROM run_heads",
             "run_head_json_bytes": "SELECT coalesce(sum(length(state_json)), 0) FROM run_heads",
+            "run_head_record_bytes": (
+                "SELECT coalesce(sum(length(session_id) + length(run_id) + "
+                "length(state_json) + length(coalesce(branch_id, '')) + "
+                "length(coalesce(prompt_run_id, '')) + length(checksum) + 32), 0) "
+                "FROM run_heads"
+            ),
             "provider_view_requests": "SELECT count(*) FROM provider_view_requests",
             "provider_view_blocks": "SELECT count(*) FROM provider_view_blocks",
             "provider_view_ref_bytes": (
@@ -222,13 +258,85 @@ def retention_store_snapshot(root: Path) -> dict[str, Any]:
                 "FROM events GROUP BY payload_kind ORDER BY payload_kind"
             )
         }
+        snapshot["event_kind_bytes"] = {
+            str(kind): {"count": int(count), "json_bytes": int(encoded_bytes or 0)}
+            for kind, count, encoded_bytes in connection.execute(
+                "SELECT coalesce(payload_kind, '<null>'), count(*), "
+                "coalesce(sum(length(envelope_json)), 0) FROM events "
+                "GROUP BY payload_kind ORDER BY payload_kind"
+            )
+        }
+        snapshot["effect_payload_kinds"] = {
+            str(kind): {"count": int(count), "encoded_bytes": int(encoded_bytes or 0)}
+            for kind, count, encoded_bytes in connection.execute(
+                "SELECT coalesce(payload_kind, '<null>'), count(*), "
+                "coalesce(sum(length(envelope_json)), 0) FROM events "
+                "WHERE lower(coalesce(payload_kind, '')) LIKE '%effect%' "
+                "GROUP BY payload_kind ORDER BY payload_kind"
+            )
+        }
+        try:
+            snapshot["sqlite_objects"] = {
+                str(name): {
+                    "pages": int(pages),
+                    "allocated_bytes": int(allocated or 0),
+                    "payload_bytes": int(payload or 0),
+                    "unused_bytes": int(unused or 0),
+                }
+                for name, pages, allocated, payload, unused in connection.execute(
+                    "SELECT name, count(*), coalesce(sum(pgsize), 0), "
+                    "coalesce(sum(payload), 0), coalesce(sum(unused), 0) "
+                    "FROM dbstat GROUP BY name ORDER BY name"
+                )
+            }
+        except sqlite3.OperationalError as error:
+            snapshot["sqlite_objects_unavailable"] = str(error)
     finally:
         connection.close()
     cas = store / "provider-view-cas"
     cas_files = [path for path in cas.rglob("*") if path.is_file()] if cas.is_dir() else []
     snapshot["provider_view_cas_files"] = len(cas_files)
     snapshot["provider_view_cas_bytes"] = sum(path.stat().st_size for path in cas_files)
+    lockdown = root / "home" / ".haider" / "lockdown" / "turns.json"
+    snapshot["lockdown_turn_ledger_bytes"] = lockdown.stat().st_size if lockdown.is_file() else 0
+    if lockdown.is_file():
+        try:
+            value = json.loads(lockdown.read_text(encoding="utf-8"))
+            bindings = value.get("bindings", {}) if isinstance(value, dict) else {}
+            snapshot["lockdown_turn_bindings"] = len(bindings)
+        except (OSError, json.JSONDecodeError):
+            snapshot["lockdown_turn_bindings"] = -1
     return snapshot
+
+
+def verify_fixed_tool_io(root: Path, turns: int) -> dict[str, int]:
+    expected_file = b"0123456789" * 6
+    expected_stdout = "0123456789" * 3
+    fixture = root / "workspace" / "peakrss2-tool.bin"
+    written = fixture.read_bytes()
+    if written != expected_file:
+        raise RuntimeError(
+            f"fixed tool fixture wrote {len(written)} bytes, expected exact 60-byte payload"
+        )
+    database = root / "store" / "store.sqlite"
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2)
+    try:
+        previews = []
+        expected_stdout_bytes = expected_stdout.encode("ascii")
+        for (encoded,) in connection.execute(
+            "SELECT envelope_json FROM events "
+            "WHERE lower(coalesce(payload_kind, '')) LIKE '%tool_result%'"
+        ):
+            encoded_bytes = encoded.encode("utf-8") if isinstance(encoded, str) else bytes(encoded)
+            if b"memdaemon-" in encoded_bytes:
+                previews.append(expected_stdout_bytes in encoded_bytes)
+    finally:
+        connection.close()
+    if len(previews) != turns or not all(previews):
+        raise RuntimeError(
+            f"fixed tool stdout proof was {len(previews)} rows, expected {turns} exact 30-byte rows"
+        )
+    return {"write_bytes": len(written), "stdout_bytes_per_turn": len(expected_stdout)}
 
 
 def retention_trace(log_path: Path) -> list[dict[str, Any]]:
@@ -329,11 +437,17 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
                 elif phase == "turn" and daemon_pid is not None:
                     turn = int(event["turn"])
                     if args.retention_attribution:
+                        # The driver is held at this exact idle head. Allow the
+                        # post-publication relief task to complete before
+                        # sampling the retained state.
+                        time.sleep(0.05)
                         retention_turns.append(
                             {"turn": turn, **retention_store_snapshot(root)}
                         )
-                    if turn in (20, args.turns):
                         samples[f"turn_{turn}"] = checkpoint(daemon_pid)
+                    elif turn in (20, args.turns):
+                        samples[f"turn_{turn}"] = checkpoint(daemon_pid)
+                    acknowledge_checkpoint(process)
                 elif phase == "attached_settled" and daemon_pid is not None:
                     samples["attached_settled"] = checkpoint(daemon_pid)
                     acknowledge_checkpoint(process)
@@ -362,6 +476,7 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
                 f"stderr:\n{stderr}"
                 f"haiderd.log:\n{daemon_log}"
             )
+        fixed_tool_io = verify_fixed_tool_io(root, args.turns)
         required = {
             "ready",
             "idle_settled",
@@ -380,6 +495,17 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
         turn_last = samples[f"turn_{args.turns}"]
         post = samples["post_turns_settled"]
         loads = [float(sample["load_1m"]) for sample in samples.values()]
+        per_turn = [
+            (turn, samples[f"turn_{turn}"])
+            for turn in range(1, args.turns + 1)
+            if f"turn_{turn}" in samples
+        ]
+        rss_slope = linear_slope(
+            [(turn, int(sample["rss_bytes"])) for turn, sample in per_turn]
+        )
+        footprint_slope = linear_slope(
+            [(turn, int(sample["footprint_bytes"])) for turn, sample in per_turn]
+        )
         return {
             "attempt": attempt,
             "accepted": max(loads) < MAX_LOAD_1M,
@@ -390,6 +516,7 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
             "reports": reports,
             "retention_store_turns": retention_turns,
             "retention_runtime": retention_trace(root / "haiderd.log"),
+            "fixed_tool_io": fixed_tool_io,
             "idle_cpu_ns": idle["cpu_ns"] - samples["ready"]["cpu_ns"],
             "turn_20_cpu_ns": turn_20["cpu_ns"]
             - samples["workload_start"]["cpu_ns"],
@@ -400,6 +527,10 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
                 post["footprint_bytes"] - idle["footprint_bytes"]
             )
             / args.turns,
+            "active_rss_slope_bytes_per_turn": rss_slope,
+            "active_footprint_slope_bytes_per_turn": footprint_slope,
+            "active_rss_bytes_per_output_byte": rss_slope / 90,
+            "active_footprint_bytes_per_output_byte": footprint_slope / 90,
         }
 
 
@@ -445,6 +576,14 @@ def main() -> int:
     idle_cpu_median, idle_cpu_mad = median_and_mad(idle_cpu_values)
     turn_cpu_median, turn_cpu_mad = median_and_mad(turn_cpu_values)
     growth_median, growth_mad = median_and_mad(growth_values)
+    active_rss_slopes = [run["active_rss_slope_bytes_per_turn"] for run in accepted]
+    active_footprint_slopes = [
+        run["active_footprint_slope_bytes_per_turn"] for run in accepted
+    ]
+    active_rss_median, active_rss_mad = median_and_mad(active_rss_slopes)
+    active_footprint_median, active_footprint_mad = median_and_mad(
+        active_footprint_slopes
+    )
     summary = {
         "schema": "haider.daemon-footprint.v1",
         "runs": args.runs,
@@ -459,6 +598,14 @@ def main() -> int:
             "median_bytes": growth_median,
             "mad_bytes": growth_mad,
             "median_bytes_per_turn": growth_median / args.turns,
+        },
+        "active_retention": {
+            "rss_median_bytes_per_turn": active_rss_median,
+            "rss_mad_bytes_per_turn": active_rss_mad,
+            "rss_median_bytes_per_output_byte": active_rss_median / 90,
+            "footprint_median_bytes_per_turn": active_footprint_median,
+            "footprint_mad_bytes_per_turn": active_footprint_mad,
+            "footprint_median_bytes_per_output_byte": active_footprint_median / 90,
         },
         "idle_cpu": {"median_ns": idle_cpu_median, "mad_ns": idle_cpu_mad},
         "turn_20_cpu": {"median_ns": turn_cpu_median, "mad_ns": turn_cpu_mad},

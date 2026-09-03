@@ -1333,7 +1333,7 @@ fn sidecar_projection(
                     // loses nothing on any journal.
                     compat: run_repeats_items || text.is_empty(),
                     role: "assistant",
-                    text,
+                    text: text.into_string(),
                     reasoning: None,
                     at_ms,
                     seq,
@@ -1595,7 +1595,7 @@ mod tests {
             node(
                 seq,
                 NodeKind::AssistantCommit {
-                    text: text.to_owned(),
+                    text: text.to_owned().into(),
                     verdict: VerifyVerdict::Unverified,
                 },
             ),

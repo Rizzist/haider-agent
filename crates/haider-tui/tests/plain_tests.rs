@@ -35,7 +35,7 @@ fn streaming_agent_text_shows_the_cursor_block() {
     projection.apply(&EventPayload::Item(ItemEvent::Started {
         item_id: ItemId::new("i1"),
         item: TurnItem::AgentMessage {
-            text: String::new(),
+            text: String::new().into(),
         },
     }));
     projection.apply(&EventPayload::Item(ItemEvent::Delta {

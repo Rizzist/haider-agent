@@ -1792,7 +1792,7 @@ impl HeadlessReducer {
                 EventPayload::Item(ItemEvent::Completed {
                     item: TurnItem::AgentMessage { text },
                     ..
-                }) => self.response = Some(text),
+                }) => self.response = Some(text.into_string()),
                 EventPayload::Item(ItemEvent::Completed {
                     item: TurnItem::IncompleteAgentMessage { text, .. },
                     ..

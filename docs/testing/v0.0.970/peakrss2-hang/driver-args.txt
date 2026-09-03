@@ -1,0 +1,1 @@
+/Users/rizzist/haider-run/lane-970-peakrss2/target/release/examples/memdaemon_workload --daemon /Users/rizzist/haider-run/lane-970-peakrss2/target/release/haiderd --root /tmp/hmd-1-_3pt7ptv --turns 40 --settle-seconds 60 --attached-settle-seconds 0 --checkpoint-acks

@@ -3,6 +3,7 @@
 
 use crate::agent::ChildReport;
 use crate::ids::{AgentId, ArtifactRef, NodeId};
+use crate::item::SharedText;
 use crate::peer::PeerMessage;
 use crate::provider::FinishReason;
 use crate::tool::AttachmentBlock;
@@ -37,7 +38,7 @@ pub enum NodeKind {
         message: PeerMessage,
     },
     AssistantCommit {
-        text: String,
+        text: SharedText,
         /// The turn's verification verdict — never an absence (§9.2).
         verdict: VerifyVerdict,
     },

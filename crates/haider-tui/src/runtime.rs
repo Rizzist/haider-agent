@@ -3322,9 +3322,8 @@ fn turn_item_has_visible_content(item: &haider_protocol::item::TurnItem, complet
     use haider_protocol::item::TurnItem;
 
     match item {
-        TurnItem::AgentMessage { text } | TurnItem::IncompleteAgentMessage { text, .. } => {
-            !text.is_empty()
-        }
+        TurnItem::AgentMessage { text } => !text.is_empty(),
+        TurnItem::IncompleteAgentMessage { text, .. } => !text.is_empty(),
         TurnItem::Reasoning { summary } => !summary.is_empty(),
         TurnItem::ToolCall { .. }
         | TurnItem::CommandExecution { .. }

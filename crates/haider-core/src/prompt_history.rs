@@ -4228,7 +4228,9 @@ fn render_journal_with_facts(
             EventPayload::Item(ItemEvent::Completed { item_id, item }) if !is_current => match item
             {
                 TurnItem::AgentMessage { text } => {
-                    messages.push(Message::assistant(vec![Block::Text { text }]));
+                    messages.push(Message::assistant(vec![Block::Text {
+                        text: text.into_string(),
+                    }]));
                 }
                 TurnItem::IncompleteAgentMessage { text, .. }
                     if facts.continued_partial_items.contains(&item_id) =>
