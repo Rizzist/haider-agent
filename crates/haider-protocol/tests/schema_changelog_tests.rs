@@ -118,6 +118,17 @@ headless_kinds! {
     HeadlessRunEventPayload::RunDeadlineExceeded(_) => "run_deadline_exceeded",
 }
 
+const WORKSPACE_KINDS: &[&str] = &["workspace_unavailable", "workspace_selected"];
+
+#[allow(dead_code)]
+fn workspace_kind(payload: &WorkspaceEventPayload) -> &'static str {
+    match payload {
+        WorkspaceEventPayload::WorkspaceUnavailable(_) => "workspace_unavailable",
+        WorkspaceEventPayload::WorkspaceSelected(_) => "workspace_selected",
+    }
+}
+
+
 macro_rules! session_config_kinds {
     ($($pattern:pat => $kind:literal),+ $(,)?) => {
         const SESSION_CONFIG_KINDS: &[&str] = &[$($kind),+];
@@ -138,14 +149,6 @@ session_config_kinds! {
     SessionConfigEventPayload::EffortSelected(_) => "effort_selected",
     SessionConfigEventPayload::FastModeSelected(_) => "fast_mode_selected",
     SessionConfigEventPayload::AgentTypeSelected(_) => "agent_type_selected",
-const WORKSPACE_KINDS: &[&str] = &["workspace_unavailable", "workspace_selected"];
-
-#[allow(dead_code)]
-fn workspace_kind(payload: &WorkspaceEventPayload) -> &'static str {
-    match payload {
-        WorkspaceEventPayload::WorkspaceUnavailable(_) => "workspace_unavailable",
-        WorkspaceEventPayload::WorkspaceSelected(_) => "workspace_selected",
-    }
 }
 
 fn terminal_kinds() -> Vec<String> {
