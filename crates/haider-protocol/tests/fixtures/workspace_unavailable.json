@@ -1,0 +1,6 @@
+{
+  "type": "workspace_unavailable",
+  "path": "/private/tmp/vanished/scratchpad",
+  "reason": "missing",
+  "detail": "No such file or directory (os error 2)"
+}

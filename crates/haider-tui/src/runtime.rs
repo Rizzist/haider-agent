@@ -1842,6 +1842,7 @@ impl DemoDriver {
             | AppRequest::WorkflowGraphResume
             | AppRequest::GraphInspectRefresh
             | AppRequest::RunRetry { .. }
+            | AppRequest::WorkspaceSet { .. }
             | AppRequest::Seen { .. }
             // Computer OS-permission actions are daemon/OS truth — the demo
             // world has no parked TCC grant to open Settings for.

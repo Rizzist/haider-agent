@@ -1149,6 +1149,41 @@ impl EffectBroker {
         let requested_root = workspace_root.as_ref();
         let workspace_root = fs::canonicalize(requested_root)
             .map_err(|error| ToolError::io("canonicalize workspace root", requested_root, error))?;
+        Self::new_canonical_at(
+            journal,
+            workspace_root,
+            session_id,
+            worker_generation,
+            started_at_ms,
+        )
+    }
+
+    /// Creates a broker from a canonical root already validated by session
+    /// authority. Unlike [`Self::new`], this does not perform a second full
+    /// canonicalization walk on the turn-start hot path. The final component
+    /// is still opened as a no-follow directory before any receipt exists.
+    pub fn new_canonical(
+        journal: Box<dyn JournalSink>,
+        workspace_root: impl AsRef<Path>,
+        session_id: SessionId,
+        worker_generation: u64,
+    ) -> ToolResult<Self> {
+        Self::new_canonical_at(
+            journal,
+            workspace_root.as_ref().to_path_buf(),
+            session_id,
+            worker_generation,
+            unix_time_ms(),
+        )
+    }
+
+    fn new_canonical_at(
+        journal: Box<dyn JournalSink>,
+        workspace_root: PathBuf,
+        session_id: SessionId,
+        worker_generation: u64,
+        started_at_ms: u64,
+    ) -> ToolResult<Self> {
         if !workspace_root.is_dir() {
             return Err(ToolError::invalid_argument(format!(
                 "workspace root is not a directory: {}",

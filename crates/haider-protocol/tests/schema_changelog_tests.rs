@@ -3,6 +3,7 @@
 use haider_protocol::EventPayload;
 use haider_protocol::headless::HeadlessRunEventPayload;
 use haider_protocol::item::TurnItem;
+use haider_protocol::workspace::WorkspaceEventPayload;
 use std::fs;
 use std::path::Path;
 
@@ -116,6 +117,16 @@ headless_kinds! {
     HeadlessRunEventPayload::RunDeadlineExceeded(_) => "run_deadline_exceeded",
 }
 
+const WORKSPACE_KINDS: &[&str] = &["workspace_unavailable", "workspace_selected"];
+
+#[allow(dead_code)]
+fn workspace_kind(payload: &WorkspaceEventPayload) -> &'static str {
+    match payload {
+        WorkspaceEventPayload::WorkspaceUnavailable(_) => "workspace_unavailable",
+        WorkspaceEventPayload::WorkspaceSelected(_) => "workspace_selected",
+    }
+}
+
 fn terminal_kinds() -> Vec<String> {
     let source = include_str!("../../haider-client/src/headless.rs");
     let enum_body = source
@@ -172,5 +183,6 @@ fn every_current_automation_kind_is_pinned_in_the_schema_changelog() {
     assert_documented(&changelog, "payload", PAYLOAD_KINDS);
     assert_documented(&changelog, "item", ITEM_KINDS);
     assert_documented(&changelog, "headless", HEADLESS_KINDS);
+    assert_documented(&changelog, "workspace", WORKSPACE_KINDS);
     assert_documented(&changelog, "terminal", terminal_kinds());
 }

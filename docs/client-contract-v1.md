@@ -299,6 +299,7 @@ is §4.1.
 | `models_list_v1` | headless model enumeration composed from `provider.list` and `account.list`; it is not another RPC method |
 | `session_model_select_v1` | `session.select_model` |
 | `session_rename_v1` | `session.rename`, `SessionSummary.title` |
+| `session_workspace_set_v1` | receipt-backed `session.workspace.set`; additive `workspace_unavailable` and `workspace_selected` raw facts |
 | `session_seen_v1` | `session.seen`, `seen_at_ms`, `last_activity_ms` |
 | `session_needs_input_v1` | `SessionSummary.needs_input`, digest `needs_input` |
 | `session_run_id_v1` | summary/digest `run_id` |
@@ -472,6 +473,7 @@ force selector.
 | `session.compact` | `SessionCompact` or `SessionCompactOnBranch` | durable receipt |
 | `session.select_model` | `SessionSelectModel` | durable receipt |
 | `session.rename` | `SessionRename` | durable receipt |
+| `session.workspace.set` | `SessionWorkspaceSet` | durable receipt; validates and canonicalizes the requested root after receipt replay |
 | `session.seen` | `SessionSeen` | durable receipt |
 | `session.select_effort` | `SessionSelectEffort` | durable receipt |
 | `session.select_agent_type` | `SessionSelectAgentType` | durable receipt |
@@ -519,7 +521,7 @@ force selector.
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, pins a request and successful
-response for every one of the 123 v1 request methods. `menu.answer` and resident
+response for every one of the 126 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
 ### 5.3 Account identity and local-login adoption
@@ -2604,8 +2606,8 @@ The machine-checkable contract lives in these fixtures/tests:
   both dedicated non-chat streams, the A/C/D union tail, and the four-frame
   prompt-fork tail. The exact current transcript count is 177.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
-  64 methods absent from the expanded transcript, completing its 59 with golden
-  request and successful response coverage for all 123 request methods and all
+  66 methods absent from the expanded transcript, completing its 60 with golden
+  request and successful response coverage for all 126 request methods and all
   five command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.
