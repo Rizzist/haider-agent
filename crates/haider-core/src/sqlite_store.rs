@@ -859,6 +859,29 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.rename_session(&command))).await
     }
 
+    pub async fn session_workspace_set_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::SelectedWorkspace>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.session_workspace_set_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    pub async fn set_session_workspace(
+        &self,
+        command: haider_store::SessionWorkspaceSetCommand,
+    ) -> Result<haider_store::SessionWorkspaceSetOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.set_session_workspace(&command))).await
+    }
+
     /// Reads the durable shared attention acknowledgement for one session.
     pub async fn session_seen_at(
         &self,

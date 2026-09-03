@@ -7,7 +7,11 @@ use haider_protocol::envelope::{
 use haider_protocol::hook::{HookEventPayload, HookNotice};
 use haider_protocol::ids::{DeviceId, EventId, RunId, SessionId};
 use haider_protocol::state::RunState;
-use haider_store::{EventStore, SessionCreateCommand, SessionCreateOutcome, Store};
+use haider_protocol::workspace::WorkspaceEventPayload;
+use haider_store::{
+    EventStore, SessionCreateCommand, SessionCreateOutcome, SessionWorkspaceSetCommand,
+    SessionWorkspaceSetOutcome, Store,
+};
 
 fn event(
     session_id: &SessionId,
@@ -111,6 +115,99 @@ fn hook_dispatch_outbox_is_atomic_persistent_and_idempotently_acknowledged() {
             .pending_hook_dispatches(16)
             .expect("rollback empty")
             .is_empty()
+    );
+}
+
+/// MUTATION CHECK: omit the pre-selection outbox fence or make it a
+/// post-commit cleanup. Expected RUNTIME failure: an event committed under the
+/// old root remains pending and can be discovered against the new root.
+#[test]
+fn workspace_selection_atomically_fences_old_hook_dispatch_rows() {
+    let profile = tempfile::tempdir().expect("profile");
+    let old_root = profile.path().join("old-root");
+    let new_root = profile.path().join("new-root");
+    std::fs::create_dir(&old_root).expect("old root");
+    std::fs::create_dir(&new_root).expect("new root");
+    let old_root = std::fs::canonicalize(old_root)
+        .expect("canonical old root")
+        .to_string_lossy()
+        .into_owned();
+    let new_root = std::fs::canonicalize(new_root)
+        .expect("canonical new root")
+        .to_string_lossy()
+        .into_owned();
+    let session_id = SessionId::new("hook-workspace-boundary");
+    let store = Store::open(profile.path()).expect("store");
+    let generation = store.worker_generation();
+    assert!(matches!(
+        store
+            .create_session(&SessionCreateCommand {
+                command_id: "create-hook-workspace-boundary".into(),
+                request_digest: "create-hook-workspace-boundary-digest".into(),
+                request_json: r#"{"session":"hook-workspace-boundary"}"#.into(),
+                session_id: session_id.clone(),
+                cwd: old_root.clone(),
+                provider: "fake".into(),
+                model: "fake-model".into(),
+                max_tokens: 4096,
+                permission_overrides: None,
+                effort: None,
+                fast: false,
+                cache_policy: Default::default(),
+                system_prompt_version: "hook-workspace-boundary-v1".into(),
+                event_id: EventId::new("hook-workspace-boundary-created"),
+                device_id: DeviceId::new("hook-outbox-device"),
+            })
+            .expect("create"),
+        SessionCreateOutcome::Committed { .. }
+    ));
+    let mut old_event = [event(
+        &session_id,
+        "old-root-user-message",
+        serde_json::to_value(EventPayload::UserMessage {
+            text: "old root".into(),
+            attachments: Vec::new(),
+            mode: haider_protocol::DeliveryMode::Queue,
+        })
+        .expect("payload"),
+        generation,
+    )];
+    store.append(&mut old_event).expect("old-root event");
+
+    let command = SessionWorkspaceSetCommand {
+        command_id: "set-hook-workspace-boundary".into(),
+        request_digest: "set-hook-workspace-boundary-digest".into(),
+        request_json: r#"{"workspace":"new-root"}"#.into(),
+        session_id: session_id.clone(),
+        worker_generation: generation,
+        path: new_root.clone(),
+        event_id: EventId::new("hook-workspace-boundary-selected"),
+        device_id: DeviceId::new("hook-outbox-device"),
+    };
+    let selected = store
+        .set_session_workspace(&command)
+        .expect("select workspace");
+    let SessionWorkspaceSetOutcome::Committed { selected, .. } = selected else {
+        panic!("fresh selection commits")
+    };
+    let pending = store.pending_hook_dispatches(16).expect("pending");
+    assert_eq!(pending.len(), 1, "only the selection boundary remains");
+    assert_eq!(pending[0].seq, selected.selected_seq);
+    assert!(matches!(
+        WorkspaceEventPayload::from_payload_value(&pending[0].payload),
+        Some(WorkspaceEventPayload::WorkspaceSelected(selected))
+            if selected.path == new_root && selected.previous_path.as_deref() == Some(old_root.as_str())
+    ));
+    assert!(matches!(
+        store
+            .set_session_workspace(&command)
+            .expect("receipt replay"),
+        SessionWorkspaceSetOutcome::IdempotentReplay { .. }
+    ));
+    assert_eq!(
+        store.pending_hook_dispatches(16).expect("pending"),
+        pending,
+        "receipt replay is read-only"
     );
 }
 

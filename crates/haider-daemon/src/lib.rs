@@ -129,6 +129,7 @@ mod usage_report;
 mod wb_web_runtime_tests;
 mod web_search;
 mod worker;
+mod workspace;
 
 #[cfg(test)]
 mod project_instructions_tests;

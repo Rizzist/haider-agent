@@ -2230,6 +2230,7 @@ fn welcome_features() -> BTreeSet<String> {
         haider_rpc::FEATURE_SESSION_CREATE_ADMISSION_V1.to_owned(),
         FEATURE_SESSION_MUTATION_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_RENAME_V1.to_owned(),
+        haider_rpc::FEATURE_SESSION_WORKSPACE_SET_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_SEEN_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_NEEDS_INPUT_V1.to_owned(),
         haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1.to_owned(),

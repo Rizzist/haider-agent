@@ -3525,6 +3525,14 @@ pub enum AppRequest {
     RunRetry {
         session: SessionId,
     },
+    /// Recovery leg for `/retry` when the latest turn reported a vanished
+    /// workspace: select the TUI process's current cwd first, then retry the
+    /// failed run when one exists.
+    WorkspaceSet {
+        session: SessionId,
+        path: String,
+        retry_after: bool,
+    },
     /// Grant card: open the macOS System Settings pane for a parked computer
     /// OS-permission (`computer.permission_open_settings`).
     OpenPermissionSettings {
@@ -7105,6 +7113,24 @@ impl AppModel {
             return;
         };
         if self.retry_inflight {
+            return;
+        }
+        if self.projection.workspace_unavailable().is_some() {
+            if !self.daemon_serves(haider_rpc::FEATURE_SESSION_WORKSPACE_SET_V1) {
+                self.flash = Some(self.stale_daemon_note("workspace recovery"));
+                self.dirty = true;
+                return;
+            }
+            let path = self.cwd.clone();
+            let retry_after = self.projection.run_errored() || self.projection.retrying().is_some();
+            self.flash = Some(format!("· /retry — re-root to {path}"));
+            self.retry_inflight = true;
+            self.requests.push(AppRequest::WorkspaceSet {
+                session,
+                path,
+                retry_after,
+            });
+            self.dirty = true;
             return;
         }
         // Owner 2026-08-17: mid-BACKOFF is retryable too — the daemon's
@@ -14506,6 +14532,10 @@ impl AppModel {
                                 envelope,
                             ) && !crate::session::route_workflow_graph_event(envelope)
                                 && !crate::session::route_permission_event(
+                                    &mut self.projection,
+                                    envelope,
+                                )
+                                && !crate::session::route_workspace_event(
                                     &mut self.projection,
                                     envelope,
                                 )

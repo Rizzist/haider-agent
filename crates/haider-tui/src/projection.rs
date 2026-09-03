@@ -27,6 +27,7 @@ use haider_protocol::menu::Menu;
 use haider_protocol::peer::{PeerDelivery, PeerKind};
 use haider_protocol::provider::Usage;
 use haider_protocol::state::{HarnessStatus, ReadinessCheck, RunState, VerifyStep, WaitReason};
+use haider_protocol::workspace::{WorkspaceEventPayload, WorkspaceUnavailable};
 use std::fmt::Write as _;
 
 /// Command output kept per block for display — the FULL output lives in the
@@ -298,6 +299,7 @@ pub struct SessionProjection {
     /// state with no reported reason synthesizes one — a turn must never
     /// end in a silent ✗.
     run_failure_reported: bool,
+    workspace_unavailable: Option<WorkspaceUnavailable>,
     interrupted: bool,
     entries: Vec<TranscriptEntry>,
     /// Entry ordinals for user prompts. This is raw-transcript metadata,
@@ -531,6 +533,10 @@ impl SessionProjection {
     /// Decode one admitted payload into this projection; an undecodable kind
     /// is counted, never fatal (forward-compat law).
     pub fn apply_payload_json(&mut self, payload: &serde_json::Value) {
+        if let Some(payload) = WorkspaceEventPayload::from_payload_value(payload) {
+            self.apply_workspace_event(&payload);
+            return;
+        }
         match serde_json::from_value::<EventPayload>(payload.clone()) {
             Ok(payload) => self.apply(&payload),
             Err(_) => self.unknown_payloads += 1,
@@ -541,6 +547,29 @@ impl SessionProjection {
     /// the router's hook when IT owns the decode.
     pub fn count_unknown_payload(&mut self) {
         self.unknown_payloads += 1;
+    }
+
+    pub fn apply_workspace_event(&mut self, payload: &WorkspaceEventPayload) {
+        match payload {
+            WorkspaceEventPayload::WorkspaceUnavailable(unavailable) => {
+                self.workspace_unavailable = Some(unavailable.clone());
+                self.push_note(format!(
+                    "⚠ workspace unavailable — {} · {} ({})",
+                    unavailable.path,
+                    unavailable.reason.as_str(),
+                    unavailable.detail
+                ));
+            }
+            WorkspaceEventPayload::WorkspaceSelected(selected) => {
+                self.workspace_unavailable = None;
+                self.push_note(format!("⇄ workspace → {}", selected.path));
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn workspace_unavailable(&self) -> Option<&WorkspaceUnavailable> {
+        self.workspace_unavailable.as_ref()
     }
 
     /// Record which scope opened a menu (report R11 cut 2).
@@ -605,6 +634,11 @@ impl SessionProjection {
                 let was_idle = self.run.as_ref().is_none_or(RunState::is_terminal);
                 if was_idle && !run.is_terminal() {
                     self.streamed_output_chars = 0;
+                    // Availability is re-probed by the daemon for every new
+                    // turn. Drop a prior run's notice at the opening edge; if
+                    // the root is still unavailable, this run's durable fact
+                    // immediately reinstates it.
+                    self.workspace_unavailable = None;
                     // tpsfix: the same opening starts a new throughput turn.
                     self.turn_epoch = self.turn_epoch.saturating_add(1);
                 }
@@ -1560,7 +1594,10 @@ impl SessionProjection {
         if self.turn_epoch == 0 || self.usage_turn != Some(self.turn_epoch) {
             return None;
         }
-        self.usage.as_ref().map(|usage| usage.output).filter(|output| *output > 0)
+        self.usage
+            .as_ref()
+            .map(|usage| usage.output)
+            .filter(|output| *output > 0)
     }
 
     /// M4: the visible retry view — `(attempt, max, delay_ms)` while the run

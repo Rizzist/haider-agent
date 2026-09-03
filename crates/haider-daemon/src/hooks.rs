@@ -304,6 +304,10 @@ struct Discovery {
     notices: Vec<HookNotice>,
     policy: HookTrustPolicy,
     config_changed: bool,
+    /// The stored workspace failed the shared cheap availability probe. This
+    /// is distinct from a valid workspace with no hook configuration: every
+    /// queued event must be acknowledged so it cannot fire after re-rooting.
+    workspace_unavailable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,6 +352,10 @@ struct HookServiceInner {
     /// behind the metadata cursor relevant. The next drain restarts at the
     /// durable beginning exactly once for that discovery change.
     dispatch_rescan_required: AtomicBool,
+    /// Exact runs whose turn-start probe failed. The worker pins this
+    /// synchronously before its next await so restoring the same path cannot
+    /// re-enable hook discovery or execution for that degraded turn.
+    workspace_unavailable_runs: Mutex<HashSet<(SessionId, RunId)>>,
     next_event: AtomicU64,
     #[cfg(test)]
     snapshot_persist_count: AtomicU64,
@@ -383,6 +391,37 @@ impl HookService {
     pub(crate) fn downgrade(&self) -> WeakHookService {
         WeakHookService {
             inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    pub(crate) fn pin_workspace_unavailable(&self, session_id: &SessionId, run_id: &RunId) {
+        self.inner
+            .workspace_unavailable_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((session_id.clone(), run_id.clone()));
+    }
+
+    fn workspace_unavailable_for(&self, session_id: &SessionId, run_id: Option<&RunId>) -> bool {
+        run_id.is_some_and(|run_id| {
+            self.inner
+                .workspace_unavailable_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&(session_id.clone(), run_id.clone()))
+        })
+    }
+
+    fn clear_workspace_unavailable(&self, session_id: &SessionId, run_id: Option<&RunId>) {
+        let mut unavailable = self
+            .inner
+            .workspace_unavailable_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(run_id) = run_id {
+            unavailable.remove(&(session_id.clone(), run_id.clone()));
+        } else {
+            unavailable.retain(|(candidate, _)| candidate != session_id);
         }
     }
 
@@ -925,6 +964,7 @@ impl HookEngine {
                 observed_trusted: Mutex::new(observed_trusted),
                 discovery_cache: Mutex::new(HashMap::new()),
                 dispatch_rescan_required: AtomicBool::new(false),
+                workspace_unavailable_runs: Mutex::new(HashSet::new()),
                 next_event: AtomicU64::new(0),
                 #[cfg(test)]
                 snapshot_persist_count: AtomicU64::new(0),
@@ -1764,6 +1804,7 @@ async fn run_engine(
                         service.inner.committed_wake.send_modify(|_| {});
                     }
                     EngineMessage::SessionDeleted(session_id) => {
+                        service.clear_workspace_unavailable(&session_id, None);
                         dispatch_scan_after_seq.remove(&session_id);
                         state.sessions.remove(&session_id);
                         state.through_seq.remove(&session_id);
@@ -1902,6 +1943,15 @@ fn metadata_dispatch_disposition(
     let Some((_, Ok(discovery))) = context else {
         return MetadataDispatchDisposition::Decode;
     };
+    // The selection fact carries the prior workspace identity needed to stop
+    // its live subscribers/servers, even when the newly selected root has no
+    // hooks or vanished again before this asynchronous drain.
+    if kind == "workspace_selected" {
+        return MetadataDispatchDisposition::Decode;
+    }
+    if discovery.workspace_unavailable {
+        return MetadataDispatchDisposition::Acknowledge;
+    }
     if discovery.config_changed {
         // A nonempty-to-empty transition must pass through the authoritative
         // handler once so live subscriber/server processes are reconciled.
@@ -2081,8 +2131,38 @@ async fn drain_hook_dispatch_page(context: HookDrainContext<'_>) -> HookDrainPag
             waiting_on_inflight = true;
             continue;
         }
-        let discovery =
-            batch_discovery_context(service, &metadata.session_id, &mut batch_discoveries).await;
+        let workspace_unavailable = metadata.workspace_unavailable
+            || service.workspace_unavailable_for(&metadata.session_id, metadata.run_id.as_ref());
+        if workspace_unavailable
+            && metadata.payload_kind.as_deref() != Some("workspace_unavailable")
+        {
+            acks.push((metadata.session_id, metadata.seq));
+            started_dispatch = true;
+            continue;
+        }
+        // The availability fact itself must be decoded to retire any live
+        // workspace subscribers/servers, but it must not trigger discovery.
+        let discovery = if workspace_unavailable {
+            None
+        } else {
+            batch_discovery_context(service, &metadata.session_id, &mut batch_discoveries).await
+        };
+        if let Some((discovery_metadata, result)) = discovery.as_ref()
+            && result
+                .as_ref()
+                .is_ok_and(|discovery| discovery.workspace_unavailable)
+        {
+            let workspace = Path::new(&discovery_metadata.cwd);
+            state
+                .subscribers
+                .retain(|_, handle| handle.workspace_cwd != workspace);
+            service.inner.servers.reconcile_workspace(
+                workspace,
+                &HashSet::new(),
+                &HashSet::new(),
+                Some(&HashSet::new()),
+            );
+        }
         match metadata_dispatch_disposition(
             metadata.payload_kind.as_deref(),
             &discovery,
@@ -2478,6 +2558,58 @@ async fn handle_committed(
     if HookEventPayload::is_engine_fact(&envelope.payload) {
         return true;
     }
+    if let DecodedCommittedPayload::Workspace(
+        haider_protocol::workspace::WorkspaceEventPayload::WorkspaceUnavailable(_),
+    ) = &payload
+    {
+        if let Ok(Some(metadata)) = service
+            .inner
+            .store
+            .session_metadata(&envelope.session_id)
+            .await
+        {
+            let workspace = Path::new(&metadata.cwd);
+            state
+                .subscribers
+                .retain(|_, handle| handle.workspace_cwd != workspace);
+            service.inner.servers.reconcile_workspace(
+                workspace,
+                &HashSet::new(),
+                &HashSet::new(),
+                Some(&HashSet::new()),
+            );
+        }
+        // From this committed point onward the metadata-only outbox query is
+        // the durable fence for every row in the run, including earlier seqs.
+        service.clear_workspace_unavailable(&envelope.session_id, envelope.run_id.as_ref());
+        return true;
+    }
+    if let DecodedCommittedPayload::Workspace(
+        haider_protocol::workspace::WorkspaceEventPayload::WorkspaceSelected(selected),
+    ) = &payload
+    {
+        service.clear_workspace_unavailable(&envelope.session_id, None);
+        if let Some(previous_path) = selected
+            .previous_path
+            .as_deref()
+            .filter(|previous| *previous != selected.path)
+        {
+            let previous = Path::new(previous_path);
+            state
+                .subscribers
+                .retain(|_, handle| handle.workspace_cwd != previous);
+            service.inner.servers.reconcile_workspace(
+                previous,
+                &HashSet::new(),
+                &HashSet::new(),
+                Some(&HashSet::new()),
+            );
+        }
+        return true;
+    }
+    if service.workspace_unavailable_for(&envelope.session_id, envelope.run_id.as_ref()) {
+        return true;
+    }
 
     // A headless acceptance journals its selected provider immediately before
     // the user-message fact in the same batch. It is not account-resolution
@@ -2605,6 +2737,12 @@ async fn handle_committed(
             crate::auto_hermetic::ProviderLockdownPolicy::UnknownProvider,
         ),
     };
+    // The worker can pin the turn while this handler is waiting for its
+    // provider boundary. Recheck before any workspace discovery can become a
+    // subscriber/server reconciliation or executable hook.
+    if service.workspace_unavailable_for(&envelope.session_id, envelope.run_id.as_ref()) {
+        return true;
+    }
     let any_match = discovery
         .hooks
         .values()
@@ -2641,6 +2779,9 @@ async fn handle_committed(
         .await;
     }
     service.prepare_workspace_trust(&discovery).await;
+    if service.workspace_unavailable_for(&envelope.session_id, envelope.run_id.as_ref()) {
+        return true;
+    }
     let current_servers = discovery
         .hooks
         .values()
@@ -2705,6 +2846,9 @@ async fn handle_committed(
 
     let mut prepared_input = None::<Result<Arc<[u8]>, String>>;
     for definition in discovery.hooks.into_values() {
+        if service.workspace_unavailable_for(&envelope.session_id, envelope.run_id.as_ref()) {
+            return true;
+        }
         if !definition.matcher.matches(&envelope, &provider, &facts) {
             continue;
         }
@@ -2795,6 +2939,9 @@ async fn handle_committed(
             }
             None => continue,
         };
+        if service.workspace_unavailable_for(&envelope.session_id, envelope.run_id.as_ref()) {
+            return true;
+        }
         match definition.kind {
             HookKind::Exec => {
                 if !fire_exec(
@@ -3081,6 +3228,7 @@ struct MatchFacts {
 enum DecodedCommittedPayload {
     Core(EventPayload),
     Hook(HookEventPayload),
+    Workspace(haider_protocol::workspace::WorkspaceEventPayload),
     Unknown,
 }
 
@@ -3091,6 +3239,13 @@ struct DecodedCommittedEnvelope {
 
 fn decode_committed_payload(payload: &serde_json::Value) -> DecodedCommittedPayload {
     let kind = payload.get("type").and_then(serde_json::Value::as_str);
+    if matches!(kind, Some("workspace_unavailable" | "workspace_selected")) {
+        return haider_protocol::workspace::WorkspaceEventPayload::from_payload_value(payload)
+            .map_or(
+                DecodedCommittedPayload::Unknown,
+                DecodedCommittedPayload::Workspace,
+            );
+    }
     if matches!(
         kind,
         Some(
@@ -3240,7 +3395,9 @@ fn classify_payload(payload: &DecodedCommittedPayload) -> Option<MatchFacts> {
                 has_attachments: None,
             })
         }
-        DecodedCommittedPayload::Hook(_) | DecodedCommittedPayload::Unknown => None,
+        DecodedCommittedPayload::Hook(_)
+        | DecodedCommittedPayload::Workspace(_)
+        | DecodedCommittedPayload::Unknown => None,
     }
 }
 
@@ -3357,6 +3514,9 @@ async fn fire_exec(
     input: &[u8],
     run_override: bool,
 ) -> bool {
+    if service.workspace_unavailable_for(&cause.session_id, cause.run_id.as_ref()) {
+        return true;
+    }
     if !definition_current(&service, &definition, run_override).await {
         return service
             .journal(
@@ -3369,6 +3529,9 @@ async fn fire_exec(
                 }),
             )
             .await;
+    }
+    if service.workspace_unavailable_for(&cause.session_id, cause.run_id.as_ref()) {
+        return true;
     }
     let result = run_command(
         &definition,
@@ -3407,6 +3570,9 @@ async fn fire_decision(
     decision: DecisionContext,
     run_override: bool,
 ) -> bool {
+    if service.workspace_unavailable_for(&cause.session_id, cause.run_id.as_ref()) {
+        return true;
+    }
     if !definition_current(&service, &definition, run_override).await {
         return service
             .journal(
@@ -3419,6 +3585,9 @@ async fn fire_decision(
                 }),
             )
             .await;
+    }
+    if service.workspace_unavailable_for(&cause.session_id, cause.run_id.as_ref()) {
+        return true;
     }
     let input = match serde_json::to_vec(&json!({
         "schema": "haider.hook.decision.v1",
@@ -4156,6 +4325,15 @@ async fn discover_async(cwd: PathBuf, profile_root: PathBuf) -> Result<Discovery
 }
 
 async fn discover_cached_async(service: &HookService, cwd: PathBuf) -> Result<Discovery, String> {
+    if crate::workspace::unavailable(&cwd).is_some() {
+        return Ok(Discovery {
+            hooks: BTreeMap::new(),
+            notices: Vec::new(),
+            policy: HookTrustPolicy::default(),
+            config_changed: false,
+            workspace_unavailable: true,
+        });
+    }
     let profile_root = service.inner.profile_root.clone();
     let stamp_cwd = cwd.clone();
     let stamp_profile = profile_root.clone();
@@ -4325,6 +4503,7 @@ fn discover(cwd: &Path, profile_root: &Path) -> Result<Discovery, String> {
         notices,
         policy,
         config_changed: false,
+        workspace_unavailable: false,
     })
 }
 

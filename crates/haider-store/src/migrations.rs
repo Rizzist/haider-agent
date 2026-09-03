@@ -19,8 +19,8 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 27;
-const LATEST_SCHEMA_VERSION: u32 = 27;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 28;
+const LATEST_SCHEMA_VERSION: u32 = 28;
 
 struct Migration {
     version: u32,
@@ -692,6 +692,34 @@ const MIGRATIONS: &[Migration] = &[
             ON checkpoints(session_id, run_id, seq DESC);
         ",
     },
+    Migration {
+        version: 28,
+        sql: "
+            ALTER TABLE hook_dispatch_outbox RENAME TO hook_dispatch_outbox_v27;
+            CREATE TABLE hook_dispatch_outbox (
+                session_id TEXT NOT NULL,
+                seq        INTEGER NOT NULL CHECK (seq > 0),
+                run_id     TEXT,
+                workspace_unavailable INTEGER NOT NULL DEFAULT 0
+                    CHECK (workspace_unavailable IN (0, 1)),
+                PRIMARY KEY (session_id, seq),
+                FOREIGN KEY (session_id, seq) REFERENCES events(session_id, seq)
+            );
+            INSERT INTO hook_dispatch_outbox(session_id, seq)
+            SELECT session_id, seq FROM hook_dispatch_outbox_v27;
+            DROP TABLE hook_dispatch_outbox_v27;
+
+            CREATE TABLE workspace_unavailable_runs (
+                session_id TEXT NOT NULL,
+                run_id     TEXT NOT NULL,
+                notice_seq INTEGER NOT NULL CHECK (notice_seq > 0),
+                PRIMARY KEY (session_id, run_id),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY (session_id, notice_seq)
+                    REFERENCES events(session_id, seq) ON DELETE CASCADE
+            );
+        ",
+    },
 ];
 
 // The direct schema for an empty profile. The equivalence pin in
@@ -819,8 +847,21 @@ CREATE TABLE graph_telemetry_projection (
 CREATE TABLE hook_dispatch_outbox (
                 session_id TEXT NOT NULL,
                 seq        INTEGER NOT NULL CHECK (seq > 0),
+                run_id     TEXT,
+                workspace_unavailable INTEGER NOT NULL DEFAULT 0
+                    CHECK (workspace_unavailable IN (0, 1)),
                 PRIMARY KEY (session_id, seq),
                 FOREIGN KEY (session_id, seq) REFERENCES events(session_id, seq)
+            );
+
+CREATE TABLE workspace_unavailable_runs (
+                session_id TEXT NOT NULL,
+                run_id     TEXT NOT NULL,
+                notice_seq INTEGER NOT NULL CHECK (notice_seq > 0),
+                PRIMARY KEY (session_id, run_id),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY (session_id, notice_seq)
+                    REFERENCES events(session_id, seq) ON DELETE CASCADE
             );
 
 CREATE TABLE loom_agent_type_revisions (

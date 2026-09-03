@@ -48,6 +48,7 @@ pub mod tool;
 pub mod typed_agent;
 pub mod usage;
 pub mod verify;
+pub mod workspace;
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-protocol";

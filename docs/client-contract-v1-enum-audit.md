@@ -263,8 +263,17 @@ appendix list every spelling in context.
   `"turn"` | `"session"` | `"profile"` | `"account"` | `"tool"`.
 - `ErrorAction` (`crates/haider-protocol/src/error.rs:89`):
   `"retry"` | `"relogin"` | `"reimport"` | `"edit_key"` | `"switch_account"` | `"top_up"` | `"wait"` | `"choose_model"` | `"contact_admin"` | `"continue_partial"` | `"retry_fresh"` | `"none"`.
-- `ErrorCode` (`crates/haider-protocol/src/error.rs:301`):
-  `"invalid_argument"` | `"unknown_method"` | `"protocol_mismatch"` | `"unauthorized"` | `"credential_missing"` | `"credential_limited"` | `"session_not_found"` | `"run_not_active"` | `"menu_not_found"` | `"menu_already_answered"` | `"single_writer_violation"` | `"busy"` | `"revision_conflict"` | `"loop_limit"` | `"workflow_unfinished"` | `"graph_already_active"` | `"graph_not_active"` | `"graph_wrong_node"` | `"fork_cut_unstable"` | `"provider_error"` | `"provider_timeout"` | `"vision_unsupported"` | `"store_corrupt"` | `"store_locked"` | `"store_full"` | `"store_read_only"` | `"store_unavailable"` | `"permission_denied"` | `"effect_unknown_outcome"` | `"internal"` | `"budget_exhausted"` | `"unknown"`; any other string → Rust `Unknown`.
+- `ErrorCode` (`crates/haider-protocol/src/error.rs`):
+  `"invalid_argument"` | `"unknown_method"` | `"protocol_mismatch"` | `"unauthorized"` | `"credential_missing"` | `"credential_limited"` | `"session_not_found"` | `"run_not_active"` | `"menu_not_found"` | `"menu_already_answered"` | `"single_writer_violation"` | `"busy"` | `"revision_conflict"` | `"loop_limit"` | `"workflow_unfinished"` | `"graph_already_active"` | `"graph_not_active"` | `"graph_wrong_node"` | `"fork_cut_unstable"` | `"workspace_unavailable"` | `"provider_error"` | `"provider_timeout"` | `"vision_unsupported"` | `"store_corrupt"` | `"store_locked"` | `"store_full"` | `"store_read_only"` | `"store_unavailable"` | `"permission_denied"` | `"effect_unknown_outcome"` | `"internal"` | `"budget_exhausted"` | `"unknown"`; any other string → Rust `Unknown`.
+
+### `crates/haider-protocol/src/workspace.rs`
+
+- `WorkspaceEventPayload` (`type` tag): `"workspace_unavailable"` |
+  `"workspace_selected"`.
+- `WorkspaceUnavailableReason`: `"missing"` | `"not_directory"` |
+  `"not_readable"`.
+- `workspace_selected` carries canonical `path` and additive optional
+  `previous_path`; clients must tolerate legacy absence.
 
 ### `crates/haider-protocol/src/headless.rs`
 
