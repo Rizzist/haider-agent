@@ -665,7 +665,7 @@ fn notify_launcher_if_ready(
     readiness: &Readiness,
     launcher_readiness: &mut Option<haider_platform::DaemonReadyNotifier>,
 ) {
-    if !matches!(readiness.current(), DaemonState::Ready) {
+    if !readiness.snapshot().ready {
         return;
     }
     if let Some(notification) = launcher_readiness.take()
@@ -755,6 +755,7 @@ async fn run_inner(
     // this may a listener bind or Ready be advertised.
     states.publish(DaemonState::Recovering);
     let store = SqliteStoreHandle::open_locked(lease).await?;
+    states.mark_store_open();
     let schema_bootstrapped_from_zero = store.schema_bootstrapped_from_zero();
     if let Err(error) = store.initialize_usage_history().await {
         let _ = store.close().await;
@@ -1013,6 +1014,7 @@ async fn run_inner(
         .map_err(DaemonError::from)?;
     hub.install_loom_author_provider(std::sync::Arc::clone(&provider_factory))
         .map_err(DaemonError::from)?;
+    states.mark_providers_loaded();
     // U1: the read-only `usage.report` service shares the account snapshot
     // and (when the vault runs) the SAME credential broker as provider
     // construction, so meter fetches ride the broker's refresh single-flight
@@ -1211,6 +1213,7 @@ async fn run_inner(
             .await;
         }
     }
+    states.mark_recovery_done();
     // Peer mailboxes start only after ordinary turn recovery has handed every
     // previously accepted run back to the worker. This makes an Accepted
     // mailbox record a recovery observation, never a duplicate admission.
@@ -1369,7 +1372,12 @@ async fn run_inner(
         pid_file_path: config.runtime_dir.join(crate::DAEMON_PID_FILE),
         idle_ttl_ms: config.idle_ttl.map(duration_ms),
         warm: daemon_warm,
+        readiness: states.readiness(),
     };
+    if let Some(delay) = config.inject_before_ready_delay {
+        tokio::time::sleep(delay).await;
+    }
+    states.mark_session_hub_accepting_turns();
     // Ready is published under the shutdown transition mutex, so a first
     // signal that races this point either wins (no Ready, drain from
     // Recovering) or loses (Ready, then a normal drain).

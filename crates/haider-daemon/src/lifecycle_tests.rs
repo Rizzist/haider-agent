@@ -31,8 +31,77 @@ fn publish_refuses_an_illegal_edge_in_every_build_and_keeps_the_last_legal_phase
     );
 
     // The publisher is still usable for the legal edge that follows.
+    publisher.mark_store_open();
+    publisher.mark_recovery_done();
+    publisher.mark_providers_loaded();
+    publisher.mark_session_hub_accepting_turns();
     publisher.publish(DaemonState::Ready);
     assert_eq!(readiness.current(), DaemonState::Ready);
+    let snapshot = readiness.snapshot();
+    assert!(snapshot.ready);
+    assert!(snapshot.ready_since_unix_ms.is_some());
+    assert!(snapshot.providers_loaded);
+
+    assert!(publisher.publish(DaemonState::Draining {
+        reason: "test".into(),
+        deadline_unix_ms: 1,
+    }));
+    assert_eq!(
+        readiness.snapshot(),
+        DaemonReadinessSnapshot {
+            ready: false,
+            ready_since_unix_ms: None,
+            providers_loaded: true,
+        },
+        "the positive predicate must fall when the live lifecycle leaves Ready"
+    );
+}
+
+/// MUTATION CHECK: remove any prerequisite from `READY_PREREQUISITES`, or
+/// let a bare `Recovering -> Ready` publication through. Expected failure:
+/// the premature publication succeeds instead of remaining Recovering.
+#[test]
+fn ready_publication_requires_every_startup_prerequisite() {
+    let prerequisites = ["store", "recovery", "providers", "session hub"];
+    for (missing, name) in prerequisites.into_iter().enumerate() {
+        let (publisher, readiness) = StatePublisher::channel();
+        assert!(publisher.publish(DaemonState::Recovering));
+        if missing != 0 {
+            publisher.mark_store_open();
+        }
+        if missing != 1 {
+            publisher.mark_recovery_done();
+        }
+        if missing != 2 {
+            publisher.mark_providers_loaded();
+        }
+        if missing != 3 {
+            publisher.mark_session_hub_accepting_turns();
+        }
+
+        assert!(
+            !publisher.publish(DaemonState::Ready),
+            "Ready publication must fail without {name}"
+        );
+        assert_eq!(readiness.current(), DaemonState::Recovering);
+        assert_eq!(
+            readiness.snapshot(),
+            DaemonReadinessSnapshot {
+                ready: false,
+                ready_since_unix_ms: None,
+                providers_loaded: missing != 2,
+            }
+        );
+    }
+
+    let (publisher, readiness) = StatePublisher::channel();
+    assert!(publisher.publish(DaemonState::Recovering));
+    publisher.mark_store_open();
+    publisher.mark_recovery_done();
+    publisher.mark_providers_loaded();
+    publisher.mark_session_hub_accepting_turns();
+    assert!(publisher.publish(DaemonState::Ready));
+    assert!(readiness.snapshot().ready);
 }
 
 #[test]

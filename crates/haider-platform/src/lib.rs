@@ -73,7 +73,8 @@ pub use spawn::{
     DaemonLivenessWatcher, DaemonReadiness, DaemonReadyNotifier, DaemonSpawn, DaemonSpawnError,
     SpawnedDaemon, allocate_daemon_log_path, publish_active_daemon_log, spawn_daemon,
     spawn_daemon_with_machine_user_home, spawn_daemon_with_piped_stderr,
-    spawn_daemon_with_readiness, spawn_daemon_with_readiness_and_liveness,
+    spawn_daemon_with_readiness, spawn_daemon_with_readiness_and_environment,
+    spawn_daemon_with_readiness_and_liveness,
     spawn_daemon_with_readiness_and_liveness_and_idle_ttl,
 };
 pub use system::local_device_name;
