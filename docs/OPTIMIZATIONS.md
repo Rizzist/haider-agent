@@ -4,6 +4,18 @@ Ideas surfaced by the efficiency rider (gpt-5.6 analysis in the clean-code pass)
 NOT adopted at the time — kept here for later adoption. Each entry: where, idea, why deferred.
 The clean-code reviewer moves entries in/out; adopted entries get the patch tag noted.
 
+## v0.0.972 — R2-19/R2-11 retention attribution and redesign
+
+The v0.0.970 full-set binding rerun held R2-19 and R2-11: on the orchestrator's independent
+five-run, 40-turn daemon protocol, retention moved from 209.6 to 263.2 KiB/turn (+53.6,
++25.6%), with a 170/280 KiB/turn bimodal split, and post-turn-40 footprint increased by
+2.2 MiB. Durable rows and bytes were unchanged.
+
+| Item | Best current attribution | Required v0.0.972 work |
+|---|---|---|
+| R2-19 exact turn-start read bundle | The store-owned bundle scans and decodes each full append-only `RawEnvelope`, then deep-clones matching payloads into `EventPayload`. As the journal grows this creates O(turn²) transient allocation; freed JSON strings, vectors, SQLite row/page buffers, and payload clones can remain in allocator arenas owned by the persistent daemon store actor, Tokio blocking workers, or the SQLite connection. That high-water retention is the leading explanation for the 170/280 KiB bimodality. The existing 16-entry turn-setup reduction cache is bounded, but its heap-rich cloned reductions must also be audited. | Split the protocol by process and instrument allocation/liveness by phase and thread. Replace broad decode-and-filter reads with indexed SQL projections for the current run/headless/latest-context rows, while preserving exact-boundary and corruption detection. Repeat same-machine ABBA at N≥5 and require both retention and post-turn-40 footprint within noise. |
+| R2-11 memory-first submit race buffer | Its 32 KiB/64-frame buffer is owned by the headless CLI path. The binding memory driver submits through `haider_client::Client` and measures only the daemon PID, so that protocol cannot attribute a daemon increase to R2-11. A separate client process or disconnected daemon outbound work may still retain memory. | Run a resident-headless-client soak that exercises `BufferedWireFrames` and measures the client PID. Separately measure daemon outbound queues/tasks before and after client disconnect, with allocation/liveness probes and an N≥5 same-machine control. |
+
 | Where | Idea | Why deferred | Status |
 |---|---|---|---|
 | scripts/supervise-process-lib.sh | Replace 1s ps-polling with kqueue NOTE_TRACK/NOTE_FORK process tracking (needs a tiny compiled helper) | Interim bash tooling; the Rust worker supervisor (W4/E1) owns this properly | planned → E1 |

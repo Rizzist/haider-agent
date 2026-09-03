@@ -3546,14 +3546,17 @@ impl HarnessActor {
                 attachments: request_attachments,
                 cache_metadata: Some(cache_metadata.clone()),
             };
-            let projected_input_tokens = estimate_provider_request_input_tokens(
-                &provider_request.messages,
-                &provider_request.system_prompt,
-                shared_request_tools
-                    .as_deref()
-                    .map_or(provider_request.tools.as_slice(), |tools| tools),
-                &provider_request.attachments,
-            );
+            let projected_input_tokens =
+                estimate_if_budget_guarded(self.config.provider_budget_guard.as_deref(), || {
+                    estimate_provider_request_input_tokens(
+                        &provider_request.messages,
+                        &provider_request.system_prompt,
+                        shared_request_tools
+                            .as_deref()
+                            .map_or(provider_request.tools.as_slice(), |tools| tools),
+                        &provider_request.attachments,
+                    )
+                });
             let mut prepared = if let Some(tools) = shared_request_tools.as_ref() {
                 provider.prepare_turn_with_tools_owned(&mut provider_request, tools)
             } else {
@@ -3778,33 +3781,35 @@ impl HarnessActor {
             // provider transport can observe it. The returned permit keeps
             // capped parent/child requests serialized until this exchange
             // reaches a stream terminal.
-            let mut provider_budget_permit =
-                if let Some(guard) = self.config.provider_budget_guard.as_ref() {
-                    match guard
-                        .before_request(
-                            &run_id,
-                            &self.config.usage_scope.provider,
-                            &provider_request,
-                            projected_input_tokens,
-                        )
-                        .await
-                    {
-                        Ok(permit) => Some(permit),
-                        Err(error) => {
-                            return self
-                                .drive_error_outcome_with_items(
-                                    &run_id,
-                                    &mut message,
-                                    &mut reasoning,
-                                    &mut tools,
-                                    DriveError::from(error),
-                                )
-                                .await;
-                        }
+            let mut provider_budget_permit = if let (Some(guard), Some(projected_input_tokens)) = (
+                self.config.provider_budget_guard.as_ref(),
+                projected_input_tokens,
+            ) {
+                match guard
+                    .before_request(
+                        &run_id,
+                        &self.config.usage_scope.provider,
+                        &provider_request,
+                        projected_input_tokens,
+                    )
+                    .await
+                {
+                    Ok(permit) => Some(permit),
+                    Err(error) => {
+                        return self
+                            .drive_error_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                                DriveError::from(error),
+                            )
+                            .await;
                     }
-                } else {
-                    None
-                };
+                }
+            } else {
+                None
+            };
             let request_attempt_commit_started = self
                 .config
                 .turn_trace
@@ -12429,11 +12434,41 @@ fn estimate_provider_request_input_measure_raw(
     }
 }
 
+/// Evaluates the request-local budget projection only when the caller has a
+/// guard that can consume it. Keeping the guard check at the original
+/// pre-prepare seam preserves capped-run decisions while making ordinary runs
+/// clone- and serialization-free for this estimate.
+fn estimate_if_budget_guarded<G: ?Sized>(
+    guard: Option<&G>,
+    estimate: impl FnOnce() -> u64,
+) -> Option<u64> {
+    guard.map(|_| estimate())
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::items_after_test_module)]
 mod usage_tests {
     use super::*;
     use haider_protocol::provider::UsageSource;
+
+    #[test]
+    fn unbudgeted_provider_request_skips_projection_estimator() {
+        let calls = std::cell::Cell::new(0_u8);
+        let projected = estimate_if_budget_guarded(None::<&()>, || {
+            calls.set(calls.get().saturating_add(1));
+            17
+        });
+
+        assert_eq!(projected, None);
+        assert_eq!(calls.get(), 0);
+
+        let projected = estimate_if_budget_guarded(Some(&()), || {
+            calls.set(calls.get().saturating_add(1));
+            17
+        });
+        assert_eq!(projected, Some(17));
+        assert_eq!(calls.get(), 1);
+    }
 
     fn diagnostic_digests(system: &str, tools: &str, history: &str) -> PrefixDigests {
         PrefixDigests {

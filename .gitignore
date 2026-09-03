@@ -12,3 +12,6 @@ gate-logs/
 dist-*/
 codex-*.out
 target-linux/
+
+# lane evidence dirs (binaries + raw reports) never enter the repo
+.lane-evidence-*/
