@@ -8,7 +8,11 @@ SAMPLER="$SCRIPT_DIR/m1-rss-sampler.py"
 BENCH_ROOT=${M1_BENCH_ROOT:-/Users/rizzist/Documents/CODING/haidercode-web}
 HAIDER_BIN=${M1_HAIDER_BIN:-/Users/rizzist/.claude/jobs/1a0b5b6c/tmp/bench967e/bin/haider}
 OUTPUT_ROOT=${M1_OUTPUT_ROOT:-$REPO_ROOT/target/m1-rss}
+REGION_SNAPSHOT_TOOL=${M1_REGION_SNAPSHOT_TOOL:-}
+REGION_SNAPSHOT_THRESHOLD_BYTES=${M1_REGION_SNAPSHOT_THRESHOLD_BYTES:-0}
+REGION_SNAPSHOT_MIN_GROWTH_BYTES=${M1_REGION_SNAPSHOT_MIN_GROWTH_BYTES:-1}
 RUNS=5
+MAX_LOAD_1M=3
 proxy_pid=
 sampler_pid=
 cli_pid=
@@ -235,6 +239,7 @@ analyze_run() {
     python3 - "$run_dir" "$load" <<'PY'
 import json
 from pathlib import Path
+import shutil
 import sys
 
 run = Path(sys.argv[1])
@@ -321,8 +326,50 @@ r_pre = max(pre, key=lambda row: row[0])[4]
 r_item = min(at_item, key=lambda row: row[0])[4]
 r_max = max(row[4] for row in window)
 r_cli_max = max(row[4] for row in cli)
+region_snapshot = run / "daemon-regions.tsv"
+selected_region = None
+if region_snapshot.exists():
+    prefix = f"{region_snapshot.stem}-"
+    region_candidates = []
+    for path in run.glob(f"{prefix}*{region_snapshot.suffix}"):
+        identity = path.stem.removeprefix(prefix)
+        try:
+            wall_text, rss_text = identity.rsplit("-", 1)
+            snapshot_wall_ns = int(wall_text)
+            snapshot_rss = int(rss_text)
+        except ValueError:
+            continue
+        metadata_fields = path.read_text(encoding="utf-8").splitlines()[0].split()
+        metadata = {}
+        try:
+            for field in metadata_fields[1:]:
+                key, value = field.split("=", 1)
+                metadata[key] = int(value)
+        except ValueError:
+            continue
+        capture_wall_ns = metadata.get("capture_wall_ns")
+        if (
+            item_ns <= snapshot_wall_ns <= item_ns + 30_000_000
+            and isinstance(capture_wall_ns, int)
+            and item_ns <= capture_wall_ns <= item_ns + 30_000_000
+            and metadata.get("pid") == daemon[0][2]
+        ):
+            region_candidates.append(
+                (snapshot_rss, snapshot_wall_ns, path, metadata)
+            )
+    if not region_candidates:
+        raise SystemExit(
+            "region helper did not preserve a capture inside the "
+            "item..item+30ms window"
+        )
+    selected_region = max(
+        region_candidates,
+        key=lambda row: (row[3]["rss_bytes"], row[3]["capture_wall_ns"]),
+    )
+    shutil.copyfile(selected_region[2], run / "daemon-regions-peak.tsv")
 summary = {
     "load_1m": load,
+    "load_start_1m": load,
     "jsonl_bytes": len(raw),
     "proxy_request_count": proxy_result.get("request_count"),
     "daemon_pid": daemon[0][2],
@@ -336,6 +383,23 @@ summary = {
     "delta_post_bytes": r_max - r_item,
     "sanity_growth_bytes": r_max - r_pre,
 }
+if selected_region is not None:
+    summary.update(
+        {
+            "region_snapshot_file": "daemon-regions-peak.tsv",
+            "region_snapshot_source_file": selected_region[2].name,
+            "region_snapshot_trigger_wall_ns": selected_region[1],
+            "region_snapshot_trigger_rss_bytes": selected_region[0],
+            "region_snapshot_capture_wall_ns": selected_region[3]["capture_wall_ns"],
+            "region_snapshot_capture_rss_bytes": selected_region[3]["rss_bytes"],
+            "region_snapshot_capture_minus_sampler_rmax_bytes": (
+                selected_region[3]["rss_bytes"] - r_max
+            ),
+            "region_snapshot_capture_footprint_bytes": selected_region[3][
+                "footprint_bytes"
+            ],
+        }
+    )
 if proxy_result.get("request_count") != 2:
     raise SystemExit(f"fake proxy saw {proxy_result.get('request_count')} requests, expected 2")
 (run / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
@@ -357,6 +421,7 @@ run_once() {
     sampler_stop="$run_dir/sampler-stop"
     root_pid_file="$run_dir/root.pid"
     samples="$run_dir/m1-rss.tsv"
+    region_snapshot="$run_dir/daemon-regions.tsv"
     jsonl="$run_dir/m1-case.jsonl"
     stderr="$run_dir/m1-case.stderr"
 
@@ -397,13 +462,27 @@ PY
     credential=$7
     base_url=$8
 
-    python3 "$SAMPLER" \
-        --output "$samples" \
-        --root-pid-file "$root_pid_file" \
-        --stop-file "$sampler_stop" \
-        --daemon-pid-dir "/tmp/haider-$(id -u)" \
-        --daemon-pid-dir "$home/.haider/runtime" \
-        --require-daemon &
+    if [ -n "$REGION_SNAPSHOT_TOOL" ]; then
+        python3 "$SAMPLER" \
+            --output "$samples" \
+            --root-pid-file "$root_pid_file" \
+            --stop-file "$sampler_stop" \
+            --daemon-pid-dir "/tmp/haider-$(id -u)" \
+            --daemon-pid-dir "$home/.haider/runtime" \
+            --require-daemon \
+            --region-snapshot-tool "$REGION_SNAPSHOT_TOOL" \
+            --region-snapshot-output "$region_snapshot" \
+            --region-snapshot-threshold-bytes "$REGION_SNAPSHOT_THRESHOLD_BYTES" \
+            --region-snapshot-min-growth-bytes "$REGION_SNAPSHOT_MIN_GROWTH_BYTES" &
+    else
+        python3 "$SAMPLER" \
+            --output "$samples" \
+            --root-pid-file "$root_pid_file" \
+            --stop-file "$sampler_stop" \
+            --daemon-pid-dir "/tmp/haider-$(id -u)" \
+            --daemon-pid-dir "$home/.haider/runtime" \
+            --require-daemon &
+    fi
     sampler_pid=$!
     prompt='Follow the model response and complete the conformance task in this repository.'
     (
@@ -421,7 +500,9 @@ PY
             HAIDER_PROFILE_DIR="$config" \
             HAIDER_DISCOVERY_DISABLED=1 \
             HAIDER_DEVICE_DISCOVERY_DISABLED=1 \
+            HAIDER_TEST_DEVICE_NAME=test-mac \
             HAIDER_NO_UPDATE_CHECK=1 \
+            RUST_MIN_STACK=8388608 \
             BENCH_PROXY_API_KEY="$credential" \
             BENCH_PROXY_BASE_URL="$base_url" \
             "$HAIDER_BIN" run "$prompt" \
@@ -497,15 +578,15 @@ if [ "$RUNS" -ne 5 ]; then
     exit 2
 fi
 initial_load=$(load_1m)
-if python3 - "$initial_load" <<'PY'
+if python3 - "$initial_load" "$MAX_LOAD_1M" <<'PY'
 import sys
-raise SystemExit(0 if float(sys.argv[1]) < 8 else 1)
+raise SystemExit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)
 PY
 then
     mkdir -p "$OUTPUT_ROOT"
 else
     self_test
-    echo "not measured, load too high (load_1m=$initial_load, required < 8)"
+    echo "not measured, load too high (load_1m=$initial_load, required < $MAX_LOAD_1M)"
     exit 0
 fi
 
@@ -531,14 +612,33 @@ fi
 index=1
 while [ "$index" -le "$RUNS" ]; do
     run_load=$(load_1m)
-    if ! python3 - "$run_load" <<'PY'
+    if ! python3 - "$run_load" "$MAX_LOAD_1M" <<'PY'
 import sys
-raise SystemExit(0 if float(sys.argv[1]) < 8 else 1)
+raise SystemExit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)
 PY
     then
-        echo "not measured, load too high before run $index (load_1m=$run_load, required < 8)" >&2
+        echo "not measured, load too high before run $index (load_1m=$run_load, required < $MAX_LOAD_1M)" >&2
         exit 3
     fi
     run_once "$index" "$run_load"
+    end_load=$(load_1m)
+    if ! python3 - "$end_load" "$MAX_LOAD_1M" <<'PY'
+import sys
+raise SystemExit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)
+PY
+    then
+        echo "not measured, load too high after run $index (load_1m=$end_load, required < $MAX_LOAD_1M)" >&2
+        exit 4
+    fi
+    python3 - "$run_dir/summary.json" "$end_load" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+summary = json.loads(path.read_text(encoding="utf-8"))
+summary["load_end_1m"] = float(sys.argv[2])
+path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+PY
     index=$((index + 1))
 done
