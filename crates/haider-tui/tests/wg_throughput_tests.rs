@@ -44,15 +44,22 @@ fn draw(model: &AppModel, width: u16, height: u16) -> Vec<String> {
         .collect()
 }
 
-/// Feed a scripted, rising token stream (exact usage) so the tracker holds a
-/// full readout — enough samples for μ/p95, a populated sparkline.
+/// Feed a scripted, rising output stream (with exact usage frames) so the
+/// tracker holds a full readout — enough closed buckets for μ/p95 and a
+/// populated sparkline.
 fn seed_stream(model: &mut AppModel) {
-    // One-second ticks across 40s of mock stream: enough closed 5s BUCKETS
-    // (v0.0.937 bucket law) for a populated sparkline and μ/p95.
-    let mut tok = 0u64;
-    for i in 0..40u64 {
-        tok += 100 + i * 6;
-        model.throughput.observe(1_000 * (i + 1), tok, true);
+    let turn = model.projection.turn_epoch();
+    // t=0 the turn is open with nothing generated yet: the generation clock
+    // starts at the first character, not here (tpsfix — TTFT is excluded).
+    model.throughput.observe(0, turn, 0, None);
+    // 40s of rising generation sampled every 500ms, with the provider's exact
+    // cumulative total landing every 5s (`chars / 4` — the calibration keeps
+    // chars_per_token at exactly 4.0).
+    let mut chars = 0u64;
+    for step in 1..=80u64 {
+        chars += 80 + step;
+        let exact = (step % 10 == 0).then_some(chars / 4);
+        model.throughput.observe(500 * step, turn, chars, exact);
     }
 }
 
@@ -139,7 +146,7 @@ fn wg6_styled_pill_and_plain_share_the_rate() {
     // The two surfaces render throughput in different SHAPES (a compact pill
     // on the identity line vs the verbose plain row) but the SAME numbers —
     // the rate figure appears on both, so they cannot drift on the data.
-    let rate = format!("{} tps", readout.tps);
+    let rate = format!("{} tps", readout.tps.expect("a measured rate"));
     let rows = draw(&model, 100, 30);
     assert!(
         rows.iter().any(|row| row.contains(&rate)),
@@ -185,7 +192,9 @@ fn wg6_approx_readout_wears_the_tilde_in_plain_and_styled() {
     // an estimated rate never reads as a measured one.
     let approx = ThroughputReadout {
         spark: "▁▂▃".to_owned(),
-        tps: 126,
+        tps: Some(126),
+        elapsed_ms: 9_000,
+        phase: haider_tui::throughput::ThroughputPhase::Live,
         approx: true,
         mean: Some(119),
         p95: Some(154),
