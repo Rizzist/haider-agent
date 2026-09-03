@@ -7,13 +7,13 @@
 
 use haider_rpc::LifecyclePhase;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]
 mod lifecycle_tests;
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use tokio::sync::watch;
 
@@ -89,17 +89,66 @@ impl DaemonState {
     }
 }
 
-/// Read side of the daemon phase machine (the R4 readiness handshake's
-/// in-process form; the wire form is `Welcome.lifecycle_phase`).
+const STORE_OPEN: u8 = 1 << 0;
+const RECOVERY_DONE: u8 = 1 << 1;
+const PROVIDERS_LOADED: u8 = 1 << 2;
+const SESSION_HUB_ACCEPTING_TURNS: u8 = 1 << 3;
+const READY_PREREQUISITES: u8 =
+    STORE_OPEN | RECOVERY_DONE | PROVIDERS_LOADED | SESSION_HUB_ACCEPTING_TURNS;
+
+#[derive(Debug, Default)]
+struct ReadinessFacts {
+    prerequisites: AtomicU8,
+    ready_since_unix_ms: AtomicU64,
+}
+
+/// One coherent read of the daemon readiness contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonReadinessSnapshot {
+    /// True only while every startup prerequisite is complete and the
+    /// lifecycle is `Ready`.
+    pub ready: bool,
+    /// Unix epoch milliseconds at the successful Ready publication.
+    pub ready_since_unix_ms: Option<u64>,
+    /// Provider descriptors/factories are registered. This never claims an
+    /// upstream provider connection; providers connect per request.
+    pub providers_loaded: bool,
+}
+
+/// Read side of the daemon phase machine and its positive readiness latch.
 #[derive(Debug, Clone)]
 pub struct Readiness {
     receiver: watch::Receiver<DaemonState>,
+    facts: Arc<ReadinessFacts>,
 }
 
 impl Readiness {
     /// The most recently published state.
     pub fn current(&self) -> DaemonState {
         self.receiver.borrow().clone()
+    }
+
+    /// Reads the one predicate used by status, `haider --ready`, and the
+    /// launcher readiness channel.
+    #[must_use]
+    pub fn snapshot(&self) -> DaemonReadinessSnapshot {
+        // Read Ready before the fact atomics so the watch publication is the
+        // acquire edge for the publisher's preceding stores. Re-read it after
+        // the facts so a concurrent drain cannot produce a positive snapshot.
+        let state_before = self.current();
+        let prerequisites = self.facts.prerequisites.load(Ordering::Acquire);
+        let providers_loaded = prerequisites & PROVIDERS_LOADED != 0;
+        let ready_since = self.facts.ready_since_unix_ms.load(Ordering::Acquire);
+        let state_after = self.current();
+        let ready = matches!(state_before, DaemonState::Ready)
+            && matches!(state_after, DaemonState::Ready)
+            && prerequisites & READY_PREREQUISITES == READY_PREREQUISITES
+            && ready_since != 0;
+        DaemonReadinessSnapshot {
+            ready,
+            ready_since_unix_ms: ready.then_some(ready_since),
+            providers_loaded,
+        }
     }
 
     /// Waits for an actual state publication; callers need no timing sleeps.
@@ -114,12 +163,51 @@ impl Readiness {
 /// Sole writer of [`DaemonState`]; owned by the daemon task in `runtime.rs`.
 pub(crate) struct StatePublisher {
     sender: watch::Sender<DaemonState>,
+    facts: Arc<ReadinessFacts>,
 }
 
 impl StatePublisher {
     pub(crate) fn channel() -> (Self, Readiness) {
         let (sender, receiver) = watch::channel(DaemonState::Starting);
-        (Self { sender }, Readiness { receiver })
+        let facts = Arc::new(ReadinessFacts::default());
+        (
+            Self {
+                sender,
+                facts: Arc::clone(&facts),
+            },
+            Readiness { receiver, facts },
+        )
+    }
+
+    pub(crate) fn readiness(&self) -> Readiness {
+        Readiness {
+            receiver: self.sender.subscribe(),
+            facts: Arc::clone(&self.facts),
+        }
+    }
+
+    pub(crate) fn mark_store_open(&self) {
+        self.facts
+            .prerequisites
+            .fetch_or(STORE_OPEN, Ordering::Release);
+    }
+
+    pub(crate) fn mark_recovery_done(&self) {
+        self.facts
+            .prerequisites
+            .fetch_or(RECOVERY_DONE, Ordering::Release);
+    }
+
+    pub(crate) fn mark_providers_loaded(&self) {
+        self.facts
+            .prerequisites
+            .fetch_or(PROVIDERS_LOADED, Ordering::Release);
+    }
+
+    pub(crate) fn mark_session_hub_accepting_turns(&self) {
+        self.facts
+            .prerequisites
+            .fetch_or(SESSION_HUB_ACCEPTING_TURNS, Ordering::Release);
     }
 
     /// Publishes a state, rejecting illegal transitions in EVERY build.
@@ -130,7 +218,7 @@ impl StatePublisher {
     /// rejected transition is dropped and reported, and the observable phase
     /// keeps its last legal value; `runtime.rs` reaches no such edge today,
     /// which is pinned by the transition-matrix test.
-    pub(crate) fn publish(&self, state: DaemonState) {
+    pub(crate) fn publish(&self, state: DaemonState) -> bool {
         let prior = self.sender.borrow().clone();
         if !prior.can_transition_to(&state) {
             // Refusal, not an abort: the behaviour must be identical in every
@@ -139,10 +227,38 @@ impl StatePublisher {
             eprintln!(
                 "haider-daemon: refusing illegal lifecycle transition {prior:?} -> {state:?}"
             );
-            return;
+            return false;
+        }
+        if matches!(state, DaemonState::Ready) {
+            let prerequisites = self.facts.prerequisites.load(Ordering::Acquire);
+            if prerequisites & READY_PREREQUISITES != READY_PREREQUISITES {
+                eprintln!("haider-daemon: refusing Ready before startup prerequisites completed");
+                return false;
+            }
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let ready_since = u64::try_from(now_ms).unwrap_or(u64::MAX).max(1);
+            self.facts
+                .ready_since_unix_ms
+                .store(ready_since, Ordering::Release);
         }
         self.sender.send_replace(state);
+        true
     }
+}
+
+#[cfg(test)]
+pub(crate) fn ready_for_tests() -> Readiness {
+    let (publisher, readiness) = StatePublisher::channel();
+    assert!(publisher.publish(DaemonState::Recovering));
+    publisher.mark_store_open();
+    publisher.mark_recovery_done();
+    publisher.mark_providers_loaded();
+    publisher.mark_session_hub_accepting_turns();
+    assert!(publisher.publish(DaemonState::Ready));
+    readiness
 }
 
 /// Latest shutdown demand as seen by the daemon task.
@@ -373,8 +489,7 @@ impl ShutdownObserver {
         if self.inner.requests.load(Ordering::Acquire) != 0 {
             return false;
         }
-        states.publish(DaemonState::Ready);
-        true
+        states.publish(DaemonState::Ready)
     }
 }
 
