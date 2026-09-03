@@ -1106,16 +1106,17 @@ fn model_detail_wire(provider: &str, model: DiscoveredModel) -> ModelDetailWire 
         // 970 owner bug 2: project the adapters' own `vision` fact into the
         // catalog row so the composer can refuse a pasted image BEFORE it
         // costs a turn. The provider's per-model declaration wins; the
-        // documented per-family list fills the rest.
-        supports_vision: Some(
-            haider_provider::vision_capability(
-                provider,
-                model
-                    .extensions
-                    .as_ref()
-                    .map(|extensions| extensions.supports_vision),
-            ) != haider_protocol::provider::FeatureResolve::Unsupported,
-        ),
+        // documented per-family list fills the rest. A family that only
+        // serves USER-CONTROLLED slugs projects nothing at all — absence is
+        // "undeclared", never a refusal, and the daemon stays the authority.
+        supports_vision: haider_provider::vision_capability(
+            provider,
+            model
+                .extensions
+                .as_ref()
+                .map(|extensions| extensions.supports_vision),
+        )
+        .map(|resolve| resolve != haider_protocol::provider::FeatureResolve::Unsupported),
     }
 }
 

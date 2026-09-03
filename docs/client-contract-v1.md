@@ -1202,10 +1202,12 @@ clients hold no replacement capability tables.
 `supports_vision` states whether the pair accepts image attachments. It is the
 daemon's projection of the adapter's own `capabilities().vision` — the fact the
 daemon enforces at turn time as `vision_unsupported`. Absence means the daemon
-declares nothing for the pair (an older daemon, or a row recorded before the
-field existed) and is NOT a refusal: a client must attach and let the daemon
-answer. Only an explicit `false` authorizes a client-side refusal, and clients
-hold no replacement vision table.
+declares nothing for the pair: an older daemon, a row recorded before the field
+existed, or — deliberately — a provider family whose model slugs are
+user-controlled, where the adapter's inability to infer a feature must not be
+published as a refusal. Absence is NOT a refusal: a client must attach and let
+the daemon answer. Only an explicit `false` authorizes a client-side refusal,
+and clients hold no replacement vision table.
 
 ### 9.6 Usage and cache optionals
 

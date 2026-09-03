@@ -335,25 +335,20 @@ fn provider_catalog_declares_the_pdf_capability_split() {
 
 #[test]
 fn provider_catalog_declares_the_vision_capability_split() {
-    // 970 owner bug 2: the composer refuses a pasted image client-side on a
-    // pair that declares no vision, so this table has to keep agreeing with
-    // the adapters' own `capabilities().vision`. The documented list lives
-    // on `vision_capability`; this pins it.
+    // 970 owner bug 2: the composer refuses a pasted image client-side ONLY
+    // on a pair that DECLARES no vision, so this table has to keep agreeing
+    // with the adapters' own `capabilities().vision` — and, just as
+    // importantly, has to stay SILENT wherever the adapter's answer is a
+    // statement about its own ignorance rather than about the model.
     for provider in BUILTIN_PROVIDER_NAMES {
-        let expected = if matches!(
-            provider,
-            "anthropic"
-                | "anthropic-oauth"
-                | "bedrock"
-                | "vertex"
-                | "openai"
-                | "openai-oauth"
-                | "gemini"
-                | "grok-oauth"
-        ) {
-            FeatureResolve::Native
-        } else {
-            FeatureResolve::Unsupported
+        let expected = match provider {
+            "anthropic" | "anthropic-oauth" | "bedrock" | "vertex" | "openai"
+            | "openai-oauth" | "gemini" | "grok-oauth" => Some(FeatureResolve::Native),
+            // The one first-party, fixed, genuinely text-only seed catalog.
+            "deepseek" => Some(FeatureResolve::Unsupported),
+            // kimi-oauth answers per-model; openai-compatible / haider-code /
+            // xai serve USER-CONTROLLED slugs. All undeclared.
+            _ => None,
         };
         assert_eq!(
             haider_provider::vision_capability(provider, None),
@@ -363,20 +358,30 @@ fn provider_catalog_declares_the_vision_capability_split() {
     }
     assert_eq!(
         haider_provider::vision_capability("custom-profile", None),
-        FeatureResolve::Unsupported,
-        "an unknown/custom provider is conservative: the generic OpenAI \
-         schema carries no vision fact to infer from"
+        None,
+        "an unknown/custom provider declares NOTHING: its slugs are the \
+         user's, so the daemon stays the authority"
     );
+    // The families whose slugs are user-controlled must never hand a client
+    // a refusal it would enforce — xAI serves vision-capable Grok builds and
+    // the first-party gateway's catalog rotates.
+    for provider in ["openai-compatible", "haider-code", "xai"] {
+        assert_eq!(
+            haider_provider::vision_capability(provider, None),
+            None,
+            "{provider} serves user-controlled slugs and must stay undeclared"
+        );
+    }
     // A provider's OWN per-model declaration always wins over the family
     // default, in BOTH directions (Kimi publishes `supports_image_in`).
     assert_eq!(
         haider_provider::vision_capability("kimi-oauth", Some(true)),
-        FeatureResolve::Native,
-        "a model that declares vision gets it even in an Unsupported family"
+        Some(FeatureResolve::Native),
+        "a model that declares vision gets it even in an undeclared family"
     );
     assert_eq!(
         haider_provider::vision_capability("openai", Some(false)),
-        FeatureResolve::Unsupported,
+        Some(FeatureResolve::Unsupported),
         "a model that declares NO vision is refused even in a Native family"
     );
 }
