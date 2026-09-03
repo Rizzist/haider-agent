@@ -296,6 +296,15 @@ pub struct SessionProjection {
     /// delta), reset at each new turn's start; approximate tokens are derived
     /// as `chars / 4`.
     streamed_output_chars: u64,
+    /// tpsfix (v0.0.970): a monotone TURN counter, bumped on every genuine turn
+    /// opening (idle/none → non-terminal). It is the identity the throughput
+    /// estimator resets on, and the gate that stops a usage frame committed by
+    /// an EARLIER turn from being read as this turn's total — the root cause of
+    /// the `0 tps` → `5000 tps` flap, because `Usage::output` is cumulative
+    /// within a run and the projection keeps the last frame after the run ends.
+    turn_epoch: u64,
+    /// The turn epoch at which the retained `usage` frame was committed.
+    usage_turn: Option<u64>,
     /// Latest durable context-occupancy snapshot (W7b), consumed from the
     /// journal's `context_footprint_v1` extension items — never a
     /// transcript row (one arrives per provider round).
@@ -512,6 +521,8 @@ impl SessionProjection {
                 let was_idle = self.run.as_ref().is_none_or(RunState::is_terminal);
                 if was_idle && !run.is_terminal() {
                     self.streamed_output_chars = 0;
+                    // tpsfix: the same opening starts a new throughput turn.
+                    self.turn_epoch = self.turn_epoch.saturating_add(1);
                 }
                 if matches!(run, RunState::Cancelled) {
                     self.interrupted = true;
@@ -564,7 +575,11 @@ impl SessionProjection {
             ),
             EventPayload::Item(event) => self.apply_item(event),
             EventPayload::ToolResult { call_id, result } => self.apply_tool_result(call_id, result),
-            EventPayload::Usage(usage) => self.usage = Some(usage.clone()),
+            EventPayload::Usage(usage) => {
+                self.usage = Some(usage.clone());
+                // tpsfix: stamp the frame with the turn that produced it.
+                self.usage_turn = Some(self.turn_epoch);
+            }
             // The failed run's PUBLIC reason joins the transcript (W5g-6):
             // the envelope always carried it; only the badge ever showed.
             EventPayload::RunFailed {
@@ -1373,6 +1388,42 @@ impl SessionProjection {
     #[must_use]
     pub const fn streamed_output_tokens_approx(&self) -> u64 {
         self.streamed_output_chars / 4
+    }
+
+    /// tpsfix: this turn's cumulative GENERATED characters — assistant text,
+    /// reasoning, and tool-call arguments. The smooth signal the throughput
+    /// estimator differentiates (provider usage arrives as a step function and
+    /// is used only to calibrate the ratio).
+    #[must_use]
+    pub const fn streamed_output_chars(&self) -> u64 {
+        self.streamed_output_chars
+    }
+
+    /// tpsfix: the monotone turn counter — see [`Self::turn_epoch`]'s field.
+    #[must_use]
+    pub const fn turn_epoch(&self) -> u64 {
+        self.turn_epoch
+    }
+
+    /// tpsfix: true while a turn is live (a non-terminal run state). Broader
+    /// than [`Self::is_streaming`] on purpose: a turn parked on a tool, a
+    /// permission menu or provider backoff has NOT ended, and settling its
+    /// throughput early would publish a final figure mid-turn.
+    #[must_use]
+    pub fn turn_live(&self) -> bool {
+        self.run.as_ref().is_some_and(|run| !run.is_terminal())
+    }
+
+    /// tpsfix: the provider's EXACT output-token total for the CURRENT turn, or
+    /// `None` when the retained usage frame belongs to an earlier turn (or none
+    /// exists). `Usage::output` already includes reasoning tokens on every
+    /// provider the harness speaks, so `Usage::reasoning` is never added to it.
+    #[must_use]
+    pub fn turn_output_tokens_exact(&self) -> Option<u64> {
+        if self.turn_epoch == 0 || self.usage_turn != Some(self.turn_epoch) {
+            return None;
+        }
+        self.usage.as_ref().map(|usage| usage.output).filter(|output| *output > 0)
     }
 
     /// M4: the visible retry view — `(attempt, max, delay_ms)` while the run
