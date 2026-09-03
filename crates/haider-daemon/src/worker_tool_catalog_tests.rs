@@ -2,6 +2,52 @@
 
 use super::*;
 
+#[tokio::test]
+async fn unavailable_workspace_tool_call_is_a_typed_rejection_without_an_effect() {
+    let dispatcher = WorkspaceUnavailableToolDispatcher {
+        unavailable: WorkspaceUnavailable {
+            path: "/gone".into(),
+            reason: haider_protocol::workspace::WorkspaceUnavailableReason::Missing,
+            detail: "not found".into(),
+        },
+    };
+    let result = dispatcher
+        .execute(
+            &RunId::new("workspace-unavailable-run"),
+            &ItemId::new("workspace-unavailable-item"),
+            "workspace-unavailable-call",
+            "read",
+            serde_json::json!({"path":"README.md"}),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("workspace refusal is a completed tool result");
+    let ToolDispatchResult::Completed(result) = result else {
+        panic!("workspace refusal must not park")
+    };
+    assert_eq!(result.status, ToolResultStatus::Rejected);
+    assert_eq!(
+        result
+            .presentation
+            .as_ref()
+            .map(|presentation| presentation.subcode.as_str()),
+        Some(ErrorCode::WorkspaceUnavailable.as_subcode())
+    );
+    let preview: serde_json::Value = serde_json::from_str(&result.preview).expect("typed preview");
+    assert_eq!(
+        preview
+            .pointer("/error/kind")
+            .and_then(serde_json::Value::as_str),
+        Some("workspace_unavailable")
+    );
+    assert_eq!(
+        preview
+            .pointer("/error/path")
+            .and_then(serde_json::Value::as_str),
+        Some("/gone")
+    );
+}
+
 struct PeerPermissionJournal;
 
 #[async_trait::async_trait]

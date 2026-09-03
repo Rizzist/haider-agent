@@ -105,6 +105,7 @@ use haider_protocol::typed_agent::{
     TypedAgentInstallJob, TypedAgentInstallProgress, TypedAgentInstallState,
     TypedAgentInstallTerminalStateV1, TypedAgentRequiredCli,
 };
+use haider_protocol::workspace::WorkspaceEventPayload;
 use haider_protocol::{DeliveryMode, EventPayload};
 use rusqlite::{
     Connection, Error as SqliteError, ErrorCode as SqliteErrorCode, OptionalExtension, Transaction,
@@ -231,7 +232,12 @@ pub struct CommittedSeqRange {
 pub struct PendingHookDispatchMetadata {
     pub session_id: SessionId,
     pub seq: u64,
+    pub run_id: Option<RunId>,
     pub payload_kind: Option<String>,
+    /// A durable turn-start availability fact exists for this exact run.
+    /// Hook recovery uses this indexed bit to suppress earlier outbox rows
+    /// from the same run without decoding them or re-probing the workspace.
+    pub workspace_unavailable: bool,
 }
 
 /// One payload-kind-filtered reducer page plus the committed journal head
@@ -1099,6 +1105,40 @@ pub enum SessionRenameOutcome {
     /// journaled, or updated. Only the internal auto-title path can see
     /// this — an explicit rename never sets the guard.
     Skipped,
+}
+
+/// Secret-free coordinates for one atomic session workspace replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionWorkspaceSetCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    /// Canonical absolute path validated and opened by the daemon.
+    pub path: String,
+    pub event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Stable response stored in the committed `session.workspace.set` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SelectedWorkspace {
+    pub session_id: SessionId,
+    pub path: String,
+    pub selected_seq: u64,
+    pub worker_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionWorkspaceSetOutcome {
+    Committed {
+        selected: SelectedWorkspace,
+        envelope: Box<RawEnvelope>,
+    },
+    IdempotentReplay {
+        selected: SelectedWorkspace,
+    },
 }
 
 /// Secret-free coordinates for one atomic durable attention acknowledgement.
@@ -9191,6 +9231,26 @@ impl Store {
         )
     }
 
+    /// Looks up a committed `session.workspace.set` response before path,
+    /// session, generation, or metadata validation (response-loss replay).
+    pub fn session_workspace_set_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<SelectedWorkspace>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "session.workspace.set",
+            request_digest,
+            request_json,
+            "session-workspace-set",
+        )
+    }
+
     /// Returns the durable attention acknowledgement for a session. `None`
     /// is a real never-seen value, distinct from an absent legacy summary.
     pub fn session_seen_at(&self, session_id: &SessionId) -> StoreResult<Option<u64>> {
@@ -9476,6 +9536,156 @@ impl Store {
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(SessionRenameOutcome::Committed {
             renamed,
+            envelope: Box::new(envelopes.remove(0)),
+        })
+    }
+
+    /// Atomically commits a canonical session workspace, its additive audit
+    /// fact, and the replayable command receipt.
+    pub fn set_session_workspace(
+        &self,
+        command: &SessionWorkspaceSetCommand,
+    ) -> StoreResult<SessionWorkspaceSetOutcome> {
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        if command.path.is_empty() || !std::path::Path::new(&command.path).is_absolute() {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "session workspace must be an absolute canonical path",
+                false,
+            ));
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(selected) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            "session.workspace.set",
+            &command.request_digest,
+            &command.request_json,
+            "session-workspace-set",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(SessionWorkspaceSetOutcome::IdempotentReplay { selected });
+        }
+        require_typed_session(&transaction, &command.session_id)?;
+        let metadata_json: String = transaction
+            .query_row(
+                "SELECT meta_json FROM sessions WHERE id = ?1",
+                [command.session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        let Some(mut metadata) = decode_session_metadata(&command.session_id, &metadata_json)?
+        else {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "legacy session has no live-worker metadata",
+                false,
+            ));
+        };
+        let previous_path = metadata.cwd.clone();
+        metadata.cwd.clone_from(&command.path);
+        let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize session metadata: {error}"),
+                false,
+            )
+        })?;
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            "session.workspace.set",
+            &command.request_digest,
+            &command.request_json,
+            now,
+        )?;
+        let updated_rows = transaction
+            .execute(
+                "UPDATE sessions SET meta_json = ?2 WHERE id = ?1",
+                params![command.session_id.as_str(), updated_metadata],
+            )
+            .map_err(map_sqlite_error)?;
+        if updated_rows != 1 {
+            return Err(corrupt("session row disappeared during workspace set"));
+        }
+        let payload = haider_protocol::workspace::WorkspaceEventPayload::WorkspaceSelected(
+            haider_protocol::workspace::WorkspaceSelected {
+                path: command.path.clone(),
+                previous_path: Some(previous_path),
+            },
+        )
+        .to_payload_value()
+        .map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize workspace-selected payload: {error}"),
+                false,
+            )
+        })?;
+        let mut envelopes = vec![unstamped_raw_command_envelope(
+            command.event_id.clone(),
+            &command.session_id,
+            None,
+            None,
+            command.device_id.clone(),
+            self.worker_generation,
+            payload,
+            PromptRender::Omit,
+        )?];
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let selected = SelectedWorkspace {
+            session_id: command.session_id.clone(),
+            path: command.path.clone(),
+            selected_seq: envelopes[0].seq,
+            worker_generation: self.worker_generation,
+        };
+        // Workspace identity is an execution boundary for hooks. Rows from
+        // before this selection must never be rediscovered against the new
+        // metadata root if the asynchronous hook drain loses the race.
+        transaction
+            .execute(
+                "DELETE FROM hook_dispatch_outbox
+                 WHERE session_id = ?1 AND seq < ?2",
+                params![
+                    command.session_id.as_str(),
+                    to_sqlite_integer(selected.selected_seq)?
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        transaction
+            .execute(
+                "DELETE FROM workspace_unavailable_runs WHERE session_id = ?1",
+                [command.session_id.as_str()],
+            )
+            .map_err(map_sqlite_error)?;
+        finalize_command_receipt(
+            &transaction,
+            &command.command_id,
+            command.session_id.as_str(),
+            None,
+            Some(selected.selected_seq),
+            &selected,
+            now,
+            "session-workspace-set",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(SessionWorkspaceSetOutcome::Committed {
+            selected,
             envelope: Box::new(envelopes.remove(0)),
         })
     }
@@ -11750,8 +11960,8 @@ impl Store {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut statement = connection
             .prepare_cached(
-                "SELECT e.session_id, e.seq, e.payload_kind,
-                        length(e.envelope_json)
+                "SELECT e.session_id, e.seq, o.run_id, e.payload_kind,
+                        length(e.envelope_json), o.workspace_unavailable
                  FROM hook_dispatch_outbox AS o
                  JOIN events AS e
                    ON e.session_id = o.session_id AND e.seq = o.seq
@@ -11768,8 +11978,10 @@ impl Store {
         while let Some(row) = rows.next().map_err(map_sqlite_error)? {
             let session_id = row.get::<_, String>(0).map_err(map_sqlite_error)?;
             let seq = row.get::<_, i64>(1).map_err(map_sqlite_error)?;
-            let payload_kind = row.get::<_, Option<String>>(2).map_err(map_sqlite_error)?;
-            let encoded_len = row.get::<_, i64>(3).map_err(map_sqlite_error)?;
+            let run_id = row.get::<_, Option<String>>(2).map_err(map_sqlite_error)?;
+            let payload_kind = row.get::<_, Option<String>>(3).map_err(map_sqlite_error)?;
+            let encoded_len = row.get::<_, i64>(4).map_err(map_sqlite_error)?;
+            let workspace_unavailable = row.get::<_, bool>(5).map_err(map_sqlite_error)?;
             let seq = u64::try_from(seq)
                 .map_err(|_| corrupt("hook outbox contains a negative event sequence"))?;
             let encoded_len = usize::try_from(encoded_len)
@@ -11781,7 +11993,9 @@ impl Store {
             metadata.push(PendingHookDispatchMetadata {
                 session_id: SessionId::new(session_id),
                 seq,
+                run_id: run_id.map(RunId::new),
                 payload_kind,
+                workspace_unavailable,
             });
             if encoded_bytes >= byte_budget {
                 break;
@@ -19756,12 +19970,54 @@ fn enqueue_hook_dispatch(transaction: &Connection, envelope: &RawEnvelope) -> St
     {
         return Ok(());
     }
+    let workspace_unavailable = matches!(
+        haider_protocol::workspace::WorkspaceEventPayload::from_payload_value(&envelope.payload),
+        Some(haider_protocol::workspace::WorkspaceEventPayload::WorkspaceUnavailable(_))
+    );
+    if workspace_unavailable {
+        let run_id = envelope.run_id.as_ref().ok_or_else(|| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                "workspace-unavailable hook boundary has no run id",
+                false,
+            )
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO workspace_unavailable_runs(session_id, run_id, notice_seq)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id, run_id) DO UPDATE SET notice_seq = excluded.notice_seq",
+                params![
+                    envelope.session_id.as_str(),
+                    run_id.as_str(),
+                    to_sqlite_integer(envelope.seq)?
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        transaction
+            .execute(
+                "UPDATE hook_dispatch_outbox
+                 SET workspace_unavailable = 1
+                 WHERE session_id = ?1 AND run_id = ?2",
+                params![envelope.session_id.as_str(), run_id.as_str()],
+            )
+            .map_err(map_sqlite_error)?;
+    }
     transaction
         .execute(
-            "INSERT INTO hook_dispatch_outbox(session_id, seq) VALUES (?1, ?2)",
+            "INSERT INTO hook_dispatch_outbox(
+                 session_id, seq, run_id, workspace_unavailable
+             ) VALUES (
+                 ?1, ?2, ?3,
+                 EXISTS(
+                     SELECT 1 FROM workspace_unavailable_runs
+                     WHERE session_id = ?1 AND run_id = ?3
+                 )
+             )",
             params![
                 envelope.session_id.as_str(),
-                to_sqlite_integer(envelope.seq)?
+                to_sqlite_integer(envelope.seq)?,
+                envelope.run_id.as_ref().map(RunId::as_str),
             ],
         )
         .map_err(map_sqlite_error)?;
@@ -21271,6 +21527,11 @@ fn validate_worker_run_transitions(
             .and_then(serde_json::Value::as_str);
         let supplemental_project_instructions = kind == Some("project_instructions_loaded")
             && decode_payload::<ProjectInstructionsEventPayload>(&envelope.payload).is_ok();
+        let supplemental_workspace_unavailable = kind == Some("workspace_unavailable")
+            && matches!(
+                decode_payload::<WorkspaceEventPayload>(&envelope.payload),
+                Ok(WorkspaceEventPayload::WorkspaceUnavailable(_))
+            );
         let supplemental_computer_permission =
             matches!(
                 kind,
@@ -21288,6 +21549,7 @@ fn validate_worker_run_transitions(
             );
         let Some(run_id) = envelope.run_id.as_ref() else {
             if supplemental_project_instructions
+                || supplemental_workspace_unavailable
                 || supplemental_computer_permission
                 || supplemental_run_budget
                 || supplemental_run_deadline
@@ -21301,6 +21563,7 @@ fn validate_worker_run_transitions(
             continue;
         };
         if (supplemental_project_instructions
+            || supplemental_workspace_unavailable
             || supplemental_computer_permission
             || supplemental_run_budget
             || supplemental_run_deadline)
@@ -21325,6 +21588,7 @@ fn validate_worker_run_transitions(
             Ok(payload) => Some(payload),
             Err(_)
                 if supplemental_project_instructions
+                    || supplemental_workspace_unavailable
                     || supplemental_computer_permission
                     || supplemental_run_budget =>
             {
@@ -25919,7 +26183,7 @@ mod run_head_projection_tests {
 
     /// MUTATION CHECK: remove one projected run from `expected` or change its
     /// state. Expected runtime failure on both passes: exact equality proves
-    /// v23's run-head backfill remains untouched through v27 and reopen.
+    /// v23's run-head backfill remains untouched through v28 and reopen.
     #[test]
     fn store_open_migrates_and_backfills_a_v22_journal_idempotently() {
         let root = tempfile::tempdir().expect("profile");
@@ -25935,7 +26199,10 @@ mod run_head_projection_tests {
         }
         let raw = Connection::open(&database_path).expect("open raw v22 fixture");
         raw.execute_batch(
-            "DROP TABLE checkpoints;
+            "DROP TABLE workspace_unavailable_runs;
+             ALTER TABLE hook_dispatch_outbox DROP COLUMN workspace_unavailable;
+             ALTER TABLE hook_dispatch_outbox DROP COLUMN run_id;
+             DROP TABLE checkpoints;
              DROP TABLE loom_registry_events;
              DROP TABLE loom_agent_type_revisions;
              ALTER TABLE loom_agent_types DROP COLUMN archived;
@@ -25959,7 +26226,7 @@ mod run_head_projection_tests {
 
         for pass in 0..2 {
             let store = Store::open(root.path()).expect("migrate v22 store");
-            assert_eq!(store.schema_version().expect("schema version"), 27);
+            assert_eq!(store.schema_version().expect("schema version"), 28);
             let connection = store.connection().expect("migrated journal connection");
             assert_eq!(
                 load_projected_run_heads(&connection, &SessionId::new("run-head-session"))

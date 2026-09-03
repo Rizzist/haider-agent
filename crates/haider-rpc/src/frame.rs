@@ -409,6 +409,9 @@ pub const FEATURE_SESSION_MODEL_SELECT_V1: &str = "session_model_select_v1";
 /// `session_renamed` config fact is journaled atomically with the receipt,
 /// and `session.list` summaries carry the title.
 pub const FEATURE_SESSION_RENAME_V1: &str = "session_rename_v1";
+/// Daemon implements receipt-backed replacement of a session's canonical
+/// workspace root (`session.workspace.set`).
+pub const FEATURE_SESSION_WORKSPACE_SET_V1: &str = "session_workspace_set_v1";
 /// Daemon implements the durable, shared per-session attention acknowledgement
 /// (`session.seen`) and attention fields on session summaries.
 pub const FEATURE_SESSION_SEEN_V1: &str = "session_seen_v1";
@@ -3504,6 +3507,14 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
     },
+    /// Replace this session's stored workspace with a freshly validated root.
+    #[serde(rename = "session.workspace.set")]
+    SessionWorkspaceSet {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        path: String,
+    },
     /// Receipted durable acknowledgement that one surface has viewed this
     /// session. The daemon advances the timestamp monotonically and replays
     /// the original receipt for a repeated command id.
@@ -4562,6 +4573,14 @@ pub enum ResponseBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
         renamed_seq: u64,
+        worker_generation: u64,
+    },
+    /// Durable coordinates of a committed workspace selection.
+    #[serde(rename = "session.workspace.set")]
+    SessionWorkspaceSet {
+        session_id: SessionId,
+        path: String,
+        selected_seq: u64,
         worker_generation: u64,
     },
     /// Durable coordinates of a committed attention acknowledgement. A

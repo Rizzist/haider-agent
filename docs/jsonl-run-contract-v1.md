@@ -84,6 +84,17 @@ the model and the turn continues to another provider request. This is not a
 run failure and adds no JSONL field, payload kind, cursor rule, or terminal
 kind.
 
+If a session's stored workspace root is missing, is not a directory, or cannot
+be opened, a plain chat run continues. Its stream contains exactly one durable,
+prompt-omitted raw envelope with `payload.type == "workspace_unavailable"`,
+plus `path`, typed `reason`, and bounded `detail`. Cwd-dependent tool calls
+complete as rejected tool results with `error.kind == "workspace_unavailable"`;
+they are not provider failures. A successful `session.workspace.set` mutation
+journals `payload.type == "workspace_selected"` with the new canonical `path`
+and optional `previous_path` (present on current producers, absent on legacy
+facts). Both payload kinds are additive and must be preserved by raw-envelope
+readers.
+
 ## Exactly one typed terminal
 
 An attached run ends with exactly one terminal envelope. It is still the
@@ -113,6 +124,9 @@ smaller terminal from `state`. A compatibility reader may deterministically
 add terminal fields omitted by a pre-v0.0.970 journal row, but it does not
 rewrite that retained row. Presentation-only derived fields stay outside the
 durable payload on both live and replay paths.
+`workspace_unavailable` is never mapped to `provider_error`; a plain degraded
+chat still ends with `success`, while a workspace-required direct operation
+uses the ordinary non-provider `failure` terminal.
 
 The durable `run_budget_exhausted` fact precedes a budget terminal. New writers
 include additive `decision` detail: `spent`, `projected`, `cap`, and a typed

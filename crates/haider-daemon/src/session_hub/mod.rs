@@ -126,17 +126,18 @@ use haider_core::{
     PromptHistoryCache, ProviderViewAppendOutcome, ProviderViewAppendRequest, QueueConsumeCommand,
     QueueConsumeOutcome, QueuePromoteCommand, QueuePromoteOutcome, QueueRemoveCommand,
     QueueRemoveOutcome, QueueSnapshot, RenamedSession, RunRetryCommand, RunRetryOutcome,
-    SeenSession, SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel,
+    SeenSession, SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel, SelectedWorkspace,
     SessionCreateCommand, SessionCreateOutcome, SessionForkCommand, SessionForkOutcome,
     SessionMetaforkCommit, SessionProjectionCheckpoint, SessionPromptForkCommand,
     SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
     SessionSelectAgentTypeCommand, SessionSelectAgentTypeOutcome, SessionSelectEffortCommand,
     SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
-    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, SwitchedGraph, TurnAcceptCommand,
-    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
-    TurnCancellationStatus, TurnTraceContext, envelopes_contain_terminal, register_turn_trace,
-    turn_trace_for_envelopes, turn_trace_ordinal, unregister_turn_trace_for_envelopes,
+    SessionSelectModelCommand, SessionSelectModelOutcome, SessionWorkspaceSetCommand,
+    SessionWorkspaceSetOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
+    StoreHandle, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
+    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus, TurnTraceContext,
+    envelopes_contain_terminal, register_turn_trace, turn_trace_for_envelopes, turn_trace_ordinal,
+    unregister_turn_trace_for_envelopes,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::agent::AgentManifest;
@@ -1857,6 +1858,10 @@ enum ActorCommand {
     Rename {
         command: SessionRenameCommand,
         completed: oneshot::Sender<Result<SessionRenameOutcome, HaiderError>>,
+    },
+    SetWorkspace {
+        command: SessionWorkspaceSetCommand,
+        completed: oneshot::Sender<Result<SessionWorkspaceSetOutcome, HaiderError>>,
     },
     Seen {
         command: SessionSeenCommand,
@@ -5025,6 +5030,40 @@ impl SessionHub {
         actor
             .commands
             .send(ActorCommand::Rename { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn session_workspace_set_receipt(
+        &self,
+        command_id: &CommandId,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<SelectedWorkspace>, SessionHubError> {
+        self.inner
+            .store
+            .session_workspace_set_receipt(
+                command_id.0.clone(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn set_session_workspace(
+        &self,
+        command: SessionWorkspaceSetCommand,
+    ) -> Result<SessionWorkspaceSetOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::SetWorkspace { command, completed })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result

@@ -69,27 +69,39 @@ fn listening_pulse_animates_across_the_clock_and_is_deterministic() {
 #[test]
 fn throughput_pill_is_compact_and_carries_the_rate() {
     let readout = ThroughputReadout {
-        spark: "▁▂▃▄▅".into(),
-        tps: 126,
+        spark: "▁▂▃▄▅▆".into(),
+        tps: Some(126),
+        elapsed_ms: 8_000,
+        phase: haider_tui::throughput::ThroughputPhase::Live,
         approx: false,
         mean: Some(119),
         p95: Some(154),
     };
     let pill = readout.pill_text();
-    // Compact: the rate + sparkline + mean, but NOT the verbose "Throughput"
-    // label or p95 (the identity line is tight).
+    // Compact: the rate + sparkline, but NOT the verbose "Throughput" label,
+    // and (tpsfix 2026-09-03) neither μ nor p95 — the widget is a fixed
+    // PILL_WIDTH strip and μ duplicates the settled headline number.
     assert!(pill.contains("126 tps"), "{pill}");
-    assert!(pill.contains("▁▂▃▄▅"), "{pill}");
-    assert!(pill.contains("μ119"), "{pill}");
+    assert!(pill.contains("▁▂▃▄▅▆"), "{pill}");
+    assert!(!pill.contains('μ'), "μ dropped from the compact widget: {pill}");
     assert!(!pill.contains("Throughput"), "no verbose label: {pill}");
     assert!(
         !pill.contains("p95"),
         "p95 dropped on the tight line: {pill}"
     );
-    // The approx `~` still rides an estimated rate.
+    assert_eq!(
+        pill.chars().count(),
+        haider_tui::throughput::PILL_WIDTH,
+        "the widget is a FIXED cell budget: {pill:?}"
+    );
+    // The approx `~` still rides an estimated rate, and costs no extra cell.
     let approx = ThroughputReadout {
         approx: true,
         ..readout
     };
     assert!(approx.pill_text().contains("~126 tps"));
+    assert_eq!(
+        approx.pill_text().chars().count(),
+        haider_tui::throughput::PILL_WIDTH
+    );
 }

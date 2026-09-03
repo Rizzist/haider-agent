@@ -507,6 +507,7 @@ async fn issue(
                 | LiveCommand::CheckpointRedo { .. }
                 | LiveCommand::CheckpointRollbackTurn { .. }
                 | LiveCommand::ProviderSetTrust { .. }
+                | LiveCommand::WorkspaceSet { .. }
         ) {
             let _ = replies
                 .send(LiveReply::Failed {
@@ -659,6 +660,7 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
             haider_rpc::FEATURE_SESSION_PROMPT_FORK_V1,
         ],
         LiveCommand::MonitorList { .. } => &[haider_rpc::FEATURE_MONITOR_CONTROL_V1],
+        LiveCommand::WorkspaceSet { .. } => &[haider_rpc::FEATURE_SESSION_WORKSPACE_SET_V1],
         LiveCommand::ProviderSetTrust { .. } | LiveCommand::LockdownStatus { .. } => {
             &[haider_rpc::FEATURE_PROVIDER_LOCKDOWN_V1]
         }
@@ -1408,6 +1410,17 @@ pub fn request_body_for_features(
             command_id,
             session_id: session,
             worker_generation,
+        },
+        LiveCommand::WorkspaceSet {
+            command_id,
+            session,
+            worker_generation,
+            path,
+        } => RequestBody::SessionWorkspaceSet {
+            command_id,
+            session_id: session,
+            worker_generation,
+            path,
         },
         LiveCommand::GraphPin {
             command_id,
@@ -2257,6 +2270,22 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 worker_generation,
             }]
         }),
+        ResponseBody::SessionWorkspaceSet {
+            session_id,
+            path,
+            worker_generation,
+            ..
+        } => context
+            .command_id
+            .clone()
+            .map_or_else(Vec::new, |command_id| {
+                vec![LiveReply::WorkspaceSelected {
+                    command_id,
+                    session: session_id,
+                    path,
+                    worker_generation,
+                }]
+            }),
         ResponseBody::SessionSeen {
             session_id,
             worker_generation,

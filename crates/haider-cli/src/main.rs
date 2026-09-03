@@ -32,6 +32,7 @@ pub(crate) mod session_config;
 pub(crate) mod session_item;
 pub(crate) mod session_recover;
 pub(crate) mod session_seen;
+pub(crate) mod session_workspace;
 pub(crate) mod shell_registry;
 pub(crate) mod ssh;
 pub(crate) mod update;
@@ -405,6 +406,14 @@ async fn dispatch(args: &[String]) -> ExitCode {
         {
             session_seen::session_seen_command(session_id, rest).await
         }
+        [command, subcommand, rest @ ..] if command == "session" && subcommand == "workspace" => {
+            session_workspace::session_workspace_command(None, rest).await
+        }
+        [command, session_id, subcommand, rest @ ..]
+            if command == "session" && subcommand == "workspace" =>
+        {
+            session_workspace::session_workspace_command(Some(session_id), rest).await
+        }
         [command, session_id, subcommand, seq, rest @ ..]
             if command == "session" && subcommand == "item" =>
         {
@@ -475,6 +484,7 @@ async fn dispatch(args: &[String]) -> ExitCode {
                  session <id> [--json|--watch] [--no-spawn], \
                  session <id> config [--json] [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>], \
                  session <id> seen, session <id> recover [--json] [--probe|--mark-done|--retry|--abandon], \
+                 session workspace set <path>, session <id> workspace set <path>, \
                  session <id> item <seq> --json [--masked] [--no-spawn], \
                  account list [--json], account import <codex|claude-code> [--confirm], account refresh <alias>, account remove <alias> --confirm, \
                  account add <alias> --base-url <url> [--api-key <key>|--api-key-env <VAR>|--api-key-stdin|--no-auth] [--api-family openai|anthropic] [--response-open-timeout <dur>] [--chunk-idle-timeout <dur>] [--semantic-progress-timeout <dur>] [--json], \

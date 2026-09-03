@@ -352,6 +352,8 @@ pub enum ErrorCode {
     GraphWrongNode,
     /// A prompt-fork cut cannot yet be resolved at a stable idle boundary.
     ForkCutUnstable,
+    /// The session's stored workspace root is missing or unusable.
+    WorkspaceUnavailable,
     // providers
     ProviderError,
     ProviderTimeout,
@@ -398,6 +400,7 @@ impl ErrorCode {
             Self::GraphNotActive => "graph_not_active",
             Self::GraphWrongNode => "graph_wrong_node",
             Self::ForkCutUnstable => "fork_cut_unstable",
+            Self::WorkspaceUnavailable => "workspace_unavailable",
             Self::ProviderError => "provider_error",
             Self::ProviderTimeout => "provider_timeout",
             Self::VisionUnsupported => "vision_unsupported",
@@ -437,6 +440,7 @@ impl ErrorCode {
             Self::GraphNotActive => "graph-not-active",
             Self::GraphWrongNode => "graph-wrong-node",
             Self::ForkCutUnstable => "fork-cut-unstable",
+            Self::WorkspaceUnavailable => "workspace-unavailable",
             Self::ProviderError => "provider-error",
             Self::ProviderTimeout => "provider-timeout",
             Self::VisionUnsupported => "vision-unsupported",

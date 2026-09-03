@@ -235,3 +235,18 @@ not all been called out together in this ledger. Their schema status is:
   typed producer or decoder for it. No field schema is therefore claimed
   here. Forward readers must preserve its complete opaque JSON payload and
   must not reject, drop, or reinterpret it while replaying the envelope.
+### v0.0.970 — workspace availability and recovery
+
+- New additive workspace facts outside the closed core `EventPayload` union:
+  `workspace:workspace_unavailable` and `workspace:workspace_selected`.
+  The former carries the stored `path`, a typed `reason` (`missing`,
+  `not_directory`, or `not_readable`), and a bounded `detail`; it is emitted
+  once for each degraded turn. The latter records the canonical root selected
+  by the receipt-backed `session.workspace.set` mutation and the additive
+  optional `previous_path` used to retire old-root hook processes (absent only
+  on legacy facts).
+- New error code `workspace_unavailable` (presentation subcode
+  `workspace-unavailable`). It classifies cwd-dependent tool/direct-shell
+  refusals separately from provider failures.
+- Raw-envelope and JSONL readers must preserve these additive facts. Existing
+  valid-workspace streams and `schema_version = 1` remain byte-stable.

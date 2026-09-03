@@ -3525,6 +3525,14 @@ pub enum AppRequest {
     RunRetry {
         session: SessionId,
     },
+    /// Recovery leg for `/retry` when the latest turn reported a vanished
+    /// workspace: select the TUI process's current cwd first, then retry the
+    /// failed run when one exists.
+    WorkspaceSet {
+        session: SessionId,
+        path: String,
+        retry_after: bool,
+    },
     /// Grant card: open the macOS System Settings pane for a parked computer
     /// OS-permission (`computer.permission_open_settings`).
     OpenPermissionSettings {
@@ -3957,7 +3965,7 @@ pub enum Hit {
     /// The sticky origin line — carries the scroll-back that puts the
     /// producing prompt's first row at the viewport top (sim jumpToSticky:
     /// stay AT the prompt, tui.js:2637-2645).
-    StickyJump(u16),
+    StickyJump(u64),
     /// 954 owner item: the bottom jump band — click returns the transcript
     /// to follow (scroll-back 0); the unseen counter clears through the
     /// watermark the next FOLLOWING frame stamps.
@@ -4996,12 +5004,12 @@ pub struct AppModel {
     /// applies reconcile-then-apply (review r5 P2-2): fold to the
     /// ≤1-frame-stale [`Self::scroll_max`], then apply the notch clamped
     /// to it — bursts bank no debt; the frame's reconcile is the backstop.
-    pub scroll_back: std::cell::Cell<u16>,
+    pub scroll_back: std::cell::Cell<u64>,
     /// Max scroll-back of the LAST rendered frame — written by the
     /// renderer; wheel notches and sticky jumps clamp against it
     /// (reconcile-then-apply, review r5 P2-2). Starts at 0 (review r2
     /// P2-6).
-    pub scroll_max: std::cell::Cell<u16>,
+    pub scroll_max: std::cell::Cell<u64>,
     /// Entry-count watermark for the bottom jump band's "new" counter —
     /// renderer-written (the same frame-feedback `Cell` discipline):
     /// every FOLLOWING frame (scroll-back 0) stamps the transcript entry
@@ -7105,6 +7113,24 @@ impl AppModel {
             return;
         };
         if self.retry_inflight {
+            return;
+        }
+        if self.projection.workspace_unavailable().is_some() {
+            if !self.daemon_serves(haider_rpc::FEATURE_SESSION_WORKSPACE_SET_V1) {
+                self.flash = Some(self.stale_daemon_note("workspace recovery"));
+                self.dirty = true;
+                return;
+            }
+            let path = self.cwd.clone();
+            let retry_after = self.projection.run_errored() || self.projection.retrying().is_some();
+            self.flash = Some(format!("· /retry — re-root to {path}"));
+            self.retry_inflight = true;
+            self.requests.push(AppRequest::WorkspaceSet {
+                session,
+                path,
+                retry_after,
+            });
+            self.dirty = true;
             return;
         }
         // Owner 2026-08-17: mid-BACKOFF is retryable too — the daemon's
@@ -14295,19 +14321,23 @@ impl AppModel {
     /// shape, so idle frames stay byte-identical (WG3).
     pub fn note_throughput(&mut self) {
         // PERSISTENCE (owner 2026-08-15): off-stream the tracker is left
-        // untouched, so the last turn's readout stays visible at rest — the
-        // old off-stream reset made persistence depend on whether any tick
-        // happened to land while idle. The next turn's cumulative count
-        // regresses past the old one and the tracker self-resets (WG4), so
-        // no idle reset is needed; idle frames stay byte-identical because
-        // an unfed tracker is static.
-        if self.projection.is_streaming() {
-            let now = self.clock_ms;
-            let (tokens, exact) = match self.projection.usage().map(|usage| usage.output) {
-                Some(output) if output > 0 => (output, true),
-                _ => (self.projection.streamed_output_tokens_approx(), false),
-            };
-            self.throughput.observe(now, tokens, exact);
+        // untouched, so the last turn's readout stays visible at rest — it is
+        // SETTLED, not cleared, and the next turn's epoch starts it over.
+        //
+        // tpsfix (v0.0.970): the estimator is fed the smooth streamed-character
+        // signal plus the provider's exact per-turn total, and the turn epoch
+        // that owns both. It samples through the WHOLE live turn (thinking and
+        // tool time included) so a mid-turn pause never publishes a final
+        // figure; the generation clock inside the estimator still starts at the
+        // first output token, so TTFT stays excluded.
+        let now = self.clock_ms;
+        let turn = self.projection.turn_epoch();
+        let exact = self.projection.turn_output_tokens_exact();
+        if self.projection.turn_live() {
+            self.throughput
+                .observe(now, turn, self.projection.streamed_output_chars(), exact);
+        } else {
+            self.throughput.settle(now, turn, exact);
         }
     }
 
@@ -14502,6 +14532,10 @@ impl AppModel {
                                 envelope,
                             ) && !crate::session::route_workflow_graph_event(envelope)
                                 && !crate::session::route_permission_event(
+                                    &mut self.projection,
+                                    envelope,
+                                )
+                                && !crate::session::route_workspace_event(
                                     &mut self.projection,
                                     envelope,
                                 )

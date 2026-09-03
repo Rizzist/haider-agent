@@ -423,6 +423,7 @@ impl SessionState {
                                 &mut self.projection,
                                 envelope,
                             ) && !route_workflow_graph_event(envelope)
+                                && !route_workspace_event(&mut self.projection, envelope)
                             {
                                 self.projection.count_unknown_payload();
                             }
@@ -828,6 +829,18 @@ pub fn route_permission_event(projection: &mut SessionProjection, envelope: &Raw
             projection.resolve_permission_card(&resolved.request_id);
         }
     }
+    true
+}
+
+/// Route the additive workspace event union without treating it as a client /
+/// daemon compatibility mismatch.
+pub fn route_workspace_event(projection: &mut SessionProjection, envelope: &RawEnvelope) -> bool {
+    let Some(payload) =
+        haider_protocol::workspace::WorkspaceEventPayload::from_payload_value(&envelope.payload)
+    else {
+        return false;
+    };
+    projection.apply_workspace_event(&payload);
     true
 }
 

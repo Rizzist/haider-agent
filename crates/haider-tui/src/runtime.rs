@@ -581,6 +581,7 @@ pub async fn run_demo(
     mut model: AppModel,
     mut store: Option<crate::demo_store::DemoStore>,
 ) -> std::io::Result<()> {
+    seed_footprint_replay(&mut model);
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     let initial_size = terminal.size()?;
@@ -805,6 +806,40 @@ pub async fn run_demo(
         store.save(&model);
     }
     Ok(())
+}
+
+/// Deterministic long-transcript seam for the settled client-footprint
+/// harness. One raw assistant message contains `N` visual rows, matching a
+/// real long response: raw bytes are stored once and the renderer must retain
+/// only its viewport window. The variable is intentionally demo-only and is
+/// stripped from normal footprint environments unless the harness opts in.
+fn seed_footprint_replay(model: &mut AppModel) {
+    let Some(rows) = std::env::var("HAIDER_TUI_FOOTPRINT_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|rows| *rows > 0)
+    else {
+        return;
+    };
+    let Some(session) = model.sessions.first().map(|entry| entry.id.clone()) else {
+        return;
+    };
+    model.open_session(&session);
+    let mut text = String::with_capacity(rows.saturating_mul(12));
+    for row in 0..rows {
+        // Formatting directly into the retained raw buffer avoids one
+        // temporary allocation per synthetic row, which would pollute the
+        // settled process-footprint comparison with allocator high-water.
+        let _ = std::fmt::Write::write_fmt(&mut text, format_args!("replay row {row}\n"));
+    }
+    model.projection.apply(&haider_protocol::EventPayload::Item(
+        haider_protocol::item::ItemEvent::Completed {
+            item_id: haider_protocol::ids::ItemId::new("footprint-replay"),
+            item: haider_protocol::item::TurnItem::AgentMessage { text },
+        },
+    ));
+    model.screen = crate::app::Screen::Session;
+    model.dirty = true;
 }
 
 /// The sim's idle(i) decay window (tui.js:1562: 30s of nothing).
@@ -1807,6 +1842,7 @@ impl DemoDriver {
             | AppRequest::WorkflowGraphResume
             | AppRequest::GraphInspectRefresh
             | AppRequest::RunRetry { .. }
+            | AppRequest::WorkspaceSet { .. }
             | AppRequest::Seen { .. }
             // Computer OS-permission actions are daemon/OS truth — the demo
             // world has no parked TCC grant to open Settings for.
