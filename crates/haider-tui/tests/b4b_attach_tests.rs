@@ -71,7 +71,9 @@ fn raw(seq: u64, payload: &EventPayload) -> RawEnvelope {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("payload serializes"),
+        payload: serde_json::to_value(payload)
+            .expect("payload serializes")
+            .into(),
     }
 }
 
@@ -750,7 +752,8 @@ fn pending_attachments_clear_on_submit_and_survive_branch_switch_capture() {
         },
     }
     .to_payload_value()
-    .expect("branch fact serializes");
+    .expect("branch fact serializes")
+    .into();
     assert_eq!(model.route_raw(&branch_envelope), RawOutcome::Applied);
 
     // A ready chip on main…

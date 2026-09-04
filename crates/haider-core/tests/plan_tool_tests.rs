@@ -76,7 +76,7 @@ async fn plan_journals_the_document_and_auto_accepts_without_parking() {
     let events = store.events(&SessionId::new(SESSION)).await;
     let payloads: Vec<EventPayload> = events
         .iter()
-        .map(|event| serde_json::from_value(event.payload.clone()).expect("typed payload"))
+        .map(|event| serde_json::from_value(event.payload.clone().into()).expect("typed payload"))
         .collect();
     let opened: Vec<_> = payloads
         .iter()

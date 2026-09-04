@@ -147,7 +147,8 @@ fn committed_answer(opening: RawEnvelope, menu: MenuId) -> RawEnvelope {
             value: None,
             via: AnswerVia::Rpc,
         }))
-        .expect("answer serializes"),
+        .expect("answer serializes")
+        .into(),
         ..opening
     }
 }
@@ -238,7 +239,7 @@ async fn permission_menu_parks_in_permission_required_and_needs_committed_answer
         .await
         .into_iter()
         .find(|event| {
-            serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+            serde_json::from_value::<EventPayload>(event.payload.clone().into()).is_ok_and(
                 |payload| matches!(payload, EventPayload::MenuOpened(ref opened) if opened.id == menu),
             )
         })
@@ -365,7 +366,8 @@ async fn recovered_approval_preserves_image_ref_and_resolves_it_for_continuation
             prompt: PromptRender::Pruned,
         },
         payload: serde_json::to_value(EventPayload::MenuOpened(menu.clone()))
-            .expect("opening payload"),
+            .expect("opening payload")
+            .into(),
     };
     handle
         .apply_committed_menu_event(committed_answer(opening, menu.id))
@@ -397,7 +399,7 @@ async fn recovered_approval_preserves_image_ref_and_resolves_it_for_continuation
             .events(&session_id)
             .await
             .iter()
-            .any(|event| serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
+            .any(|event| serde_json::from_value::<EventPayload>(event.payload.clone().into()).is_ok_and(
                 |payload| matches!(payload, EventPayload::ToolResult { result, .. } if result.images == [image.clone()])
             ))
     );

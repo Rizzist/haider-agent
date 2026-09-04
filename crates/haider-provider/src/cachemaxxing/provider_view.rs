@@ -171,7 +171,10 @@ pub(crate) fn prepared_array_provider_view_with_system(
     let history = prompt_payload.get(history_key)?.as_array()?;
     let history_wire_start = history_wire_start.min(history.len());
     let stable_wire_end = stable_wire_end.max(history_wire_start).min(history.len());
-    let history_blocks = serialize_values(&history[history_wire_start..stable_wire_end])?;
+    let history_blocks = serialize_values(&history[history_wire_start..stable_wire_end])?
+        .into_iter()
+        .map(ProviderViewBlobV1::new)
+        .collect();
     let previous_history_blocks = match previous_wire_end {
         Some(end) => Some(serialize_value_refs(
             &history[history_wire_start..end.max(history_wire_start).min(history.len())],
@@ -195,7 +198,7 @@ pub(crate) fn prepared_serialized_provider_view(
     dialect: &str,
     system: Option<&serde_json::Value>,
     tools: Option<&serde_json::Value>,
-    history_blocks: Vec<Vec<u8>>,
+    history_blobs: Vec<ProviderViewBlobV1>,
     previous_history_blocks: Option<Vec<haider_protocol::cache::ProviderViewBlockRefV1>>,
     boundaries: Vec<ProviderViewBoundaryV1>,
 ) -> Option<PreparedProviderView> {
@@ -211,10 +214,6 @@ pub(crate) fn prepared_serialized_provider_view(
     );
     let system_blob = ProviderViewBlobV1::new(system_bytes);
     let tool_schema_blob = ProviderViewBlobV1::new(tool_schema_bytes);
-    let history_blobs = history_blocks
-        .into_iter()
-        .map(ProviderViewBlobV1::new)
-        .collect::<Vec<_>>();
     let system_block = system_blob.block.clone();
     let tool_schema_block = tool_schema_blob.block.clone();
     let history_blocks = history_blobs

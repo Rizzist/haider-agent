@@ -3,7 +3,10 @@
 use crate::ids::SessionId;
 use crate::item::TurnItem;
 use crate::provider::CacheRequestDiagnosticV1;
+use crate::reply::ReplyText;
 use serde::{Deserialize, Serialize};
+use std::io;
+use std::io::Write as _;
 
 /// Current exact provider-view ledger encoding. Older/future encodings remain
 /// decodable for audit, but cannot authorize fork cache inheritance.
@@ -66,7 +69,23 @@ impl ProviderViewBlockRefV1 {
 #[derive(Debug)]
 pub struct ProviderViewBlobV1 {
     pub block: ProviderViewBlockRefV1,
-    pub bytes: Vec<u8>,
+    bytes: ProviderViewBlobBytesV1,
+    incrementally_hashed: bool,
+}
+
+#[derive(Debug)]
+enum ProviderViewBlobBytesV1 {
+    Contiguous(Vec<u8>),
+    Segmented(Vec<ProviderViewBlobSegmentV1>),
+}
+
+/// One exact byte segment of a transient provider-view CAS object. Reply
+/// segments retain the canonical arena range and are JSON-escaped only while
+/// hashing or writing the object.
+#[derive(Debug)]
+pub enum ProviderViewBlobSegmentV1 {
+    Bytes(Vec<u8>),
+    JsonString(ReplyText),
 }
 
 impl ProviderViewBlobV1 {
@@ -74,9 +93,207 @@ impl ProviderViewBlobV1 {
     pub fn new(bytes: Vec<u8>) -> Self {
         Self {
             block: ProviderViewBlockRefV1::for_bytes(&bytes),
-            bytes,
+            bytes: ProviderViewBlobBytesV1::Contiguous(bytes),
+            incrementally_hashed: false,
         }
     }
+
+    /// Builds a content-addressed object without joining reply ranges into a
+    /// second string or byte vector. A streamed reply must carry an
+    /// incremental digest seeded before its first delta; ordinary prompt
+    /// scalars without a delta-time hash retain the legacy bounded writer.
+    pub fn segmented(segments: Vec<ProviderViewBlobSegmentV1>) -> io::Result<Self> {
+        let bytes = ProviderViewBlobBytesV1::Segmented(segments);
+        let incremental = incremental_block_for_provider_view_bytes(&bytes);
+        let requires_incremental = match &bytes {
+            ProviderViewBlobBytesV1::Segmented(segments) => segments.iter().any(|segment| {
+                matches!(segment, ProviderViewBlobSegmentV1::JsonString(text) if text.has_incremental_json_views())
+            }),
+            ProviderViewBlobBytesV1::Contiguous(_) => false,
+        };
+        if requires_incremental && incremental.is_none() {
+            return Err(io::Error::other(
+                "streamed reply provider view lacks one exact incremental digest candidate",
+            ));
+        }
+        let incrementally_hashed = incremental.is_some();
+        let block = match incremental {
+            Some(block) => block,
+            None => block_for_provider_view_bytes(&bytes)?,
+        };
+        Ok(Self {
+            block,
+            bytes,
+            incrementally_hashed,
+        })
+    }
+
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        usize::try_from(self.block.byte_len).unwrap_or(usize::MAX)
+    }
+
+    #[must_use]
+    pub fn is_segmented(&self) -> bool {
+        matches!(self.bytes, ProviderViewBlobBytesV1::Segmented(_))
+    }
+
+    #[must_use]
+    pub fn is_incrementally_hashed(&self) -> bool {
+        self.incrementally_hashed
+    }
+
+    /// Recomputes the address from the retained representation as a test and
+    /// diagnostic oracle. Publication trusts the producer's incremental
+    /// address and validates only the streamed byte count, avoiding a second
+    /// full pass over the canonical reply.
+    pub fn computed_block(&self) -> io::Result<ProviderViewBlockRefV1> {
+        block_for_provider_view_bytes(&self.bytes)
+    }
+
+    pub fn write_to(&self, writer: &mut (impl io::Write + ?Sized)) -> io::Result<()> {
+        match &self.bytes {
+            ProviderViewBlobBytesV1::Contiguous(bytes) => writer.write_all(bytes),
+            ProviderViewBlobBytesV1::Segmented(segments) => {
+                for segment in segments {
+                    match segment {
+                        ProviderViewBlobSegmentV1::Bytes(bytes) => writer.write_all(bytes)?,
+                        ProviderViewBlobSegmentV1::JsonString(text) => {
+                            write_json_reply_scalar(writer, text)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Feeds the exact block bytes into a sink in bounded windows. This is
+    /// used by provider prefix digests and never materializes a full reply.
+    pub fn visit_bytes(&self, mut visit: impl FnMut(&[u8])) -> io::Result<()> {
+        struct VisitorWriter<'a, F>(&'a mut F);
+        impl<F: FnMut(&[u8])> io::Write for VisitorWriter<'_, F> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                (self.0)(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        self.write_to(&mut VisitorWriter(&mut visit))
+    }
+}
+
+fn incremental_block_for_provider_view_bytes(
+    bytes: &ProviderViewBlobBytesV1,
+) -> Option<ProviderViewBlockRefV1> {
+    let ProviderViewBlobBytesV1::Segmented(segments) = bytes else {
+        return None;
+    };
+    let reply_index = segments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, segment)| {
+            matches!(segment, ProviderViewBlobSegmentV1::JsonString(_)).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let [reply_index] = reply_index.as_slice() else {
+        return None;
+    };
+    let ProviderViewBlobSegmentV1::JsonString(text) = &segments[*reply_index] else {
+        return None;
+    };
+    let mut prefix = Vec::new();
+    for segment in &segments[..*reply_index] {
+        let ProviderViewBlobSegmentV1::Bytes(bytes) = segment else {
+            return None;
+        };
+        prefix.extend_from_slice(bytes);
+    }
+    let mut suffix = Vec::new();
+    for segment in &segments[reply_index.saturating_add(1)..] {
+        let ProviderViewBlobSegmentV1::Bytes(bytes) = segment else {
+            return None;
+        };
+        suffix.extend_from_slice(bytes);
+    }
+    let (digest, byte_len) = text.incremental_json_view(&prefix, &suffix)?;
+    Some(ProviderViewBlockRefV1 {
+        content_hash: format!("blake3:{}", digest.to_hex()),
+        byte_len,
+    })
+}
+
+fn block_for_provider_view_bytes(
+    bytes: &ProviderViewBlobBytesV1,
+) -> io::Result<ProviderViewBlockRefV1> {
+    struct HashWriter {
+        hasher: blake3::Hasher,
+        len: u64,
+    }
+    impl io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.hasher.update(bytes);
+            self.len = self
+                .len
+                .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                .ok_or_else(|| io::Error::other("provider-view block length overflow"))?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = HashWriter {
+        hasher: blake3::Hasher::new(),
+        len: 0,
+    };
+    match bytes {
+        ProviderViewBlobBytesV1::Contiguous(bytes) => writer.write_all(bytes)?,
+        ProviderViewBlobBytesV1::Segmented(segments) => {
+            for segment in segments {
+                match segment {
+                    ProviderViewBlobSegmentV1::Bytes(bytes) => writer.write_all(bytes)?,
+                    ProviderViewBlobSegmentV1::JsonString(text) => {
+                        write_json_reply_scalar(&mut writer, text)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(ProviderViewBlockRefV1 {
+        content_hash: format!("blake3:{}", writer.hasher.finalize().to_hex()),
+        byte_len: writer.len,
+    })
+}
+
+fn write_json_reply_scalar(
+    writer: &mut (impl io::Write + ?Sized),
+    text: &ReplyText,
+) -> io::Result<()> {
+    const WINDOW_BYTES: usize = 16 * 1_024;
+    writer.write_all(b"\"")?;
+    let mut result = Ok(());
+    text.visit_strs(|segment| {
+        let mut start = 0;
+        while result.is_ok() && start < segment.len() {
+            let mut end = start.saturating_add(WINDOW_BYTES).min(segment.len());
+            while end > start && !segment.is_char_boundary(end) {
+                end -= 1;
+            }
+            match serde_json::to_vec(&segment[start..end]) {
+                Ok(encoded) => result = writer.write_all(&encoded[1..encoded.len() - 1]),
+                Err(error) => result = Err(io::Error::other(error)),
+            }
+            start = end;
+        }
+    });
+    result?;
+    writer.write_all(b"\"")
 }
 
 /// Durable lookup cursor for the SQLite/CAS request view.
@@ -372,5 +589,58 @@ impl CacheEpochTransitionV1 {
             label.push_str(" · plan");
         }
         label
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod incremental_provider_view_tests {
+    use super::{ProviderViewBlobSegmentV1, ProviderViewBlobV1, ProviderViewBlockRefV1};
+    use crate::reply::ReplyArenaWriter;
+
+    #[test]
+    fn per_delta_json_hash_matches_the_legacy_complete_canonical_bytes() {
+        let prefix = br#"{"content":[{"text":"#;
+        let suffix = br#","type":"output_text"}],"role":"assistant","type":"message"}"#;
+        let tail = "\"quote\"\\\nمرز 😀";
+        let mut writer =
+            ReplyArenaWriter::new().with_incremental_json_view(prefix, b"deferred suffix");
+        let _ = writer.append("left ".to_owned());
+        let _ = writer.append(tail.to_owned());
+        let text = writer.seal();
+        let blob = ProviderViewBlobV1::segmented(vec![
+            ProviderViewBlobSegmentV1::Bytes(prefix.to_vec()),
+            ProviderViewBlobSegmentV1::JsonString(text),
+            ProviderViewBlobSegmentV1::Bytes(suffix.to_vec()),
+        ])
+        .expect("segmented provider view");
+
+        let legacy = serde_json::to_vec(&serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": format!("left {tail}")}],
+        }))
+        .expect("legacy complete JSON");
+        assert!(blob.is_incrementally_hashed());
+        assert_eq!(blob.block, ProviderViewBlockRefV1::for_bytes(&legacy));
+        assert_eq!(
+            blob.computed_block().expect("legacy complete hash"),
+            blob.block
+        );
+    }
+
+    #[test]
+    fn streamed_reply_with_an_unseeded_prefix_cannot_fall_back_to_a_full_pass() {
+        let mut writer = ReplyArenaWriter::new().with_standard_provider_json_views();
+        let _ = writer.append("streamed native reply".to_owned());
+        let text = writer.seal();
+        let error = ProviderViewBlobV1::segmented(vec![
+            ProviderViewBlobSegmentV1::Bytes(br#"{"signature":"late","thinking":"#.to_vec()),
+            ProviderViewBlobSegmentV1::JsonString(text),
+            ProviderViewBlobSegmentV1::Bytes(br#","type":"thinking"}"#.to_vec()),
+        ])
+        .expect_err("an unseeded streamed shape must fail closed");
+
+        assert!(error.to_string().contains("incremental digest candidate"));
     }
 }

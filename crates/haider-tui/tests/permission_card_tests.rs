@@ -92,7 +92,7 @@ fn raw(session: &SessionId, seq: u64, payload: serde_json::Value) -> RawEnvelope
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     }
 }
 

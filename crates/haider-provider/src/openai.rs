@@ -21,8 +21,10 @@ use haider_protocol::computer::{ComputerAction, ScreenPoint, ScrollDirection};
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::provider::{
     Block, CacheStatAvailability, CapabilityDoc, FeatureResolve, FinishReason, NormalizedUsage,
-    ReasoningAccounting, StreamEvent, Usage, UsageSource, WebSource,
+    ProviderOpaqueData, ReasoningAccounting, StreamEvent, Usage, UsageSource, WebSource,
 };
+use haider_protocol::reply::ReplyArenaWriter;
+use haider_protocol::reply::ReplyText;
 use haider_protocol::tool::AttachmentBlock;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use serde::Deserialize;
@@ -836,12 +838,21 @@ impl OpenAiProvider {
         &self,
         request: &TurnRequest,
     ) -> Result<reqwest::Response, ProviderError> {
-        let mut payload = match crate::take_prepared_wire_payload() {
-            Some(prepared) => prepared.payload,
-            None => self.request_payload(request)?,
+        let mut prepared = match crate::take_prepared_wire_payload() {
+            Some(prepared) => prepared,
+            None => crate::PreparedWire {
+                payload: self.request_payload(request)?,
+                history_boundary: None,
+                reply_bindings: Vec::new(),
+            },
         };
-        refresh_openai_cache_routing(request, self.http.codex_responses_lite, &mut payload, None);
-        let body = crate::serialize_json_body(payload)?;
+        refresh_openai_cache_routing(
+            request,
+            self.http.codex_responses_lite,
+            &mut prepared.payload,
+            None,
+        );
+        let body = crate::serialize_prepared_json_body(prepared)?;
         let route_gating = crate::RouteGating::for_endpoint(&self.api_url);
         self.http
             .post_json_body(&self.api_url, body, route_gating)
@@ -915,12 +926,14 @@ impl Provider for OpenAiProvider {
             self.effort.as_deref(),
             self.web_search,
             boundary,
+            true,
         )
         .ok()?;
         let stable_wire_end = rendered.stable_wire_end;
         let previous_wire_end = rendered.previous_wire_end;
         let message_wire_ends = rendered.message_wire_ends;
         let mut full_payload = rendered.payload;
+        let reply_bindings = rendered.reply_bindings;
         let rendered_system = if self.http.codex_responses_lite {
             request.system_prompt.as_ref().and_then(|_| {
                 full_payload
@@ -952,6 +965,7 @@ impl Provider for OpenAiProvider {
                 history_wire_start,
                 stable_wire_end,
                 previous_wire_end,
+                &reply_bindings,
             )?;
         let mut provider_view = crate::cachemaxxing::prepared_serialized_provider_view(
             request,
@@ -973,10 +987,13 @@ impl Provider for OpenAiProvider {
                 self.http.codex_responses_lite && request.system_prompt.is_some(),
                 previous_history_block_len,
             )?;
-        if previous_immutable_history_digest.is_none() {
-            previous_immutable_history_digest = previous_wire_end.map(|end| {
-                crate::exact_optional_wire_digest(Some(&history[..end.min(history.len())]))
-            });
+        if previous_immutable_history_digest.is_none()
+            && let Some(end) = previous_wire_end
+        {
+            previous_immutable_history_digest = Some(crate::exact_json_digest_with_replies(
+                &Some(&history[..end.min(history.len())]),
+                &reply_bindings,
+            )?);
         }
         let header_epoch = provider_view.ledger().header_epoch.as_str();
         apply_openai_cache_controls(
@@ -998,6 +1015,7 @@ impl Provider for OpenAiProvider {
             wire: Some(crate::PreparedWire {
                 payload: full_payload,
                 history_boundary: None,
+                reply_bindings,
             }),
             turn_trace: None,
         })
@@ -1751,14 +1769,18 @@ impl OpenAiCompatibleProvider {
         &self,
         request: &TurnRequest,
     ) -> Result<reqwest::Request, ProviderError> {
-        let mut payload = match crate::take_prepared_wire_payload() {
-            Some(prepared) => prepared.payload,
-            None => self.request_payload(request)?,
+        let mut prepared = match crate::take_prepared_wire_payload() {
+            Some(prepared) => prepared,
+            None => crate::PreparedWire {
+                payload: self.request_payload(request)?,
+                history_boundary: None,
+                reply_bindings: Vec::new(),
+            },
         };
         if matches!(
             self.dialect,
             CompatibleDialect::Generic | CompatibleDialect::KimiOAuth
-        ) && let Some(object) = payload.as_object_mut()
+        ) && let Some(object) = prepared.payload.as_object_mut()
         {
             let key = request
                 .cache_metadata
@@ -1783,7 +1805,7 @@ impl OpenAiCompatibleProvider {
                 object.remove("prompt_cache_key");
             }
         }
-        let body = crate::serialize_json_body(payload)?;
+        let body = crate::serialize_prepared_json_body(prepared)?;
         let mut outbound = self
             .http
             .post_json_body_request(&self.chat_url, body)
@@ -1867,7 +1889,7 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.cacheable_history_end();
         self.http.validate_model(request).ok()?;
-        let (mut full_payload, stable_wire_end, previous_wire_end) =
+        let (mut full_payload, stable_wire_end, previous_wire_end, reply_bindings) =
             chat_request_json_with_boundary(
                 request,
                 tools,
@@ -1875,6 +1897,7 @@ impl Provider for OpenAiCompatibleProvider {
                 self.kimi_thinking.as_ref(),
                 self.kimi_reasoning_effort.as_deref(),
                 boundary,
+                true,
             )
             .ok()?;
         // Kimi's cohort key is a routing overlay, not prompt content. Remove
@@ -1901,6 +1924,7 @@ impl Provider for OpenAiCompatibleProvider {
                 history_wire_start,
                 stable_wire_end,
                 previous_wire_end,
+                &reply_bindings,
             )?;
         let mut provider_view = crate::cachemaxxing::prepared_serialized_provider_view(
             request,
@@ -1921,10 +1945,13 @@ impl Provider for OpenAiCompatibleProvider {
             request.system_prompt.is_some(),
             previous_history_block_len,
         )?;
-        if previous_immutable_history_digest.is_none() {
-            previous_immutable_history_digest = previous_wire_end.map(|end| {
-                crate::exact_optional_wire_digest(Some(&history[..end.min(history.len())]))
-            });
+        if previous_immutable_history_digest.is_none()
+            && let Some(end) = previous_wire_end
+        {
+            previous_immutable_history_digest = Some(crate::exact_json_digest_with_replies(
+                &Some(&history[..end.min(history.len())]),
+                &reply_bindings,
+            )?);
         }
         if !matches!(
             self.dialect,
@@ -1980,6 +2007,7 @@ impl Provider for OpenAiCompatibleProvider {
             wire: Some(crate::PreparedWire {
                 payload: full_payload,
                 history_boundary: None,
+                reply_bindings,
             }),
             turn_trace: None,
         })
@@ -2485,6 +2513,8 @@ struct ResponsesDecoder {
     pending_tool_events: Vec<StreamEvent>,
     saw_tool: bool,
     saw_refusal: bool,
+    text: Option<ReplyArenaWriter>,
+    reasoning: Option<ReplyArenaWriter>,
     terminal: bool,
 }
 
@@ -2505,6 +2535,8 @@ impl ResponsesDecoder {
             pending_tool_events: Vec::new(),
             saw_tool: false,
             saw_refusal: false,
+            text: Some(ReplyArenaWriter::new().with_standard_provider_json_views()),
+            reasoning: Some(ReplyArenaWriter::new().with_standard_provider_json_views()),
             terminal: false,
         }
     }
@@ -2564,7 +2596,7 @@ impl ResponsesDecoder {
         if frame.data == "[DONE]" {
             return Ok(Vec::new());
         }
-        let value: serde_json::Value = match serde_json::from_str(&frame.data) {
+        let mut value: serde_json::Value = match serde_json::from_str(&frame.data) {
             Ok(value) => value,
             Err(_) if matches!(frame.event.as_deref(), Some("response.failed" | "error")) => {
                 return Err(openai_stream_error_prose(&frame.data));
@@ -2595,12 +2627,24 @@ impl ResponsesDecoder {
             )));
         }
         match event_type {
-            "response.output_text.delta" => Ok(vec![StreamEvent::TextDelta {
-                text: required_string(&value, "delta", event_type)?,
-            }]),
+            "response.output_text.delta" => {
+                let text = required_string(&value, "delta", event_type)?;
+                Ok(vec![StreamEvent::TextDelta {
+                    text: self
+                        .text
+                        .as_mut()
+                        .ok_or_else(|| malformed("OpenAI text arena is already sealed"))?
+                        .append(text),
+                }])
+            }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                let text = required_string(&value, "delta", event_type)?;
                 Ok(vec![StreamEvent::ReasoningDelta {
-                    text: required_string(&value, "delta", event_type)?,
+                    text: self
+                        .reasoning
+                        .as_mut()
+                        .ok_or_else(|| malformed("OpenAI reasoning arena is already sealed"))?
+                        .append(text),
                 }])
             }
             "response.refusal.delta" => {
@@ -2612,7 +2656,7 @@ impl ResponsesDecoder {
             "response.output_item.added" => self.output_item_added(&value),
             "response.function_call_arguments.delta" => self.function_arguments_delta(&value),
             "response.function_call_arguments.done" => self.function_arguments_done(&value),
-            "response.output_item.done" => self.output_item_done(&value),
+            "response.output_item.done" => self.output_item_done(&mut value),
             "response.completed" => self.response_terminal(&value, false),
             "response.incomplete" => self.response_terminal(&value, true),
             "response.failed" | "error" => Err(openai_stream_error(&value)),
@@ -2709,18 +2753,78 @@ impl ResponsesDecoder {
 
     fn output_item_done(
         &mut self,
-        value: &serde_json::Value,
+        value: &mut serde_json::Value,
     ) -> Result<Vec<StreamEvent>, ProviderError> {
+        if value
+            .get("item")
+            .and_then(|item| item.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("reasoning")
+        {
+            let mut item = value
+                .get_mut("item")
+                .map(std::mem::take)
+                .and_then(|item| match item {
+                    serde_json::Value::Object(item) => Some(item),
+                    _ => None,
+                })
+                .ok_or_else(|| malformed("OpenAI reasoning item is not an object"))?;
+            let summary_text = item
+                .get_mut("summary")
+                .and_then(serde_json::Value::as_array_mut)
+                .and_then(|summary| summary.first_mut())
+                .and_then(serde_json::Value::as_object_mut)
+                .and_then(|summary| summary.remove("text"))
+                .and_then(|text| match text {
+                    serde_json::Value::String(text) => Some(text),
+                    _ => None,
+                });
+            let mut events = Vec::new();
+            let data = if let Some(summary_text) = summary_text {
+                let writer = self
+                    .reasoning
+                    .as_mut()
+                    .ok_or_else(|| malformed("OpenAI reasoning arena is already sealed"))?;
+                let existing = writer.snapshot();
+                let text = if existing.is_empty() {
+                    writer.append(summary_text)
+                } else {
+                    if existing != summary_text {
+                        return Err(malformed(
+                            "OpenAI completed reasoning summary disagrees with streamed deltas",
+                        ));
+                    }
+                    existing
+                };
+                let summary = item
+                    .get_mut("summary")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .and_then(|summary| summary.first_mut())
+                    .and_then(serde_json::Value::as_object_mut)
+                    .ok_or_else(|| malformed("OpenAI reasoning summary shape changed"))?;
+                summary.insert(
+                    "text".into(),
+                    serde_json::Value::String("__haider_openai_reasoning_summary_reply__".into()),
+                );
+                ProviderOpaqueData::with_reply(
+                    serde_json::Value::Object(item),
+                    "__haider_openai_reasoning_summary_reply__",
+                    text,
+                )
+                .ok_or_else(|| malformed("OpenAI reasoning template lost its reply marker"))?
+            } else {
+                serde_json::Value::Object(item).into()
+            };
+            events.push(StreamEvent::ProviderOpaque {
+                provider: OPENAI_PROVIDER_NAME.into(),
+                data,
+            });
+            return Ok(events);
+        }
         let Some(item) = value.get("item").and_then(serde_json::Value::as_object) else {
             return Ok(Vec::new());
         };
         match item.get("type").and_then(serde_json::Value::as_str) {
-            Some("reasoning") => {
-                return Ok(vec![StreamEvent::ProviderOpaque {
-                    provider: OPENAI_PROVIDER_NAME.into(),
-                    data: serde_json::Value::Object(item.clone()),
-                }]);
-            }
             // W-B: a HOSTED web_search_call is provider-executed — it never
             // enters the local dispatch loop. The finished item is captured
             // verbatim (the reasoning-item channel) so follow-up requests
@@ -2830,6 +2934,12 @@ impl ResponsesDecoder {
         } else {
             FinishReason::EndTurn
         };
+        if let Some(writer) = self.text.take() {
+            drop(writer.seal());
+        }
+        if let Some(writer) = self.reasoning.take() {
+            drop(writer.seal());
+        }
         events.push(StreamEvent::Finish { reason });
         Ok(events)
     }
@@ -2873,7 +2983,7 @@ fn native_computer_call_events(
 
     let mut events = vec![StreamEvent::ProviderOpaque {
         provider: OPENAI_PROVIDER_NAME.into(),
-        data: serde_json::Value::Object(item.clone()),
+        data: serde_json::Value::Object(item.clone()).into(),
     }];
     for (index, action) in actions.into_iter().enumerate() {
         let action_call_id = native_computer_action_call_id(&call_id, index);
@@ -3172,7 +3282,7 @@ fn hosted_web_search_call_events(
     vec![
         StreamEvent::ProviderOpaque {
             provider: OPENAI_PROVIDER_NAME.into(),
-            data: serde_json::Value::Object(item.clone()),
+            data: serde_json::Value::Object(item.clone()).into(),
         },
         StreamEvent::ServerToolUse {
             call_id: call_id.clone(),
@@ -3325,6 +3435,8 @@ struct ChatDecoder {
     open_calls: BTreeMap<usize, ChatFunctionCall>,
     pending_tool_events: Vec<StreamEvent>,
     finish_reason: Option<FinishReason>,
+    text: Option<ReplyArenaWriter>,
+    reasoning: Option<ReplyArenaWriter>,
     terminal: bool,
 }
 
@@ -3349,6 +3461,8 @@ impl ChatDecoder {
             open_calls: BTreeMap::new(),
             pending_tool_events: Vec::new(),
             finish_reason: None,
+            text: Some(ReplyArenaWriter::new().with_standard_provider_json_views()),
+            reasoning: Some(ReplyArenaWriter::new()),
             terminal: false,
         }
     }
@@ -3446,7 +3560,13 @@ impl ChatDecoder {
             if let Some(text) = delta.get("content").and_then(serde_json::Value::as_str)
                 && !text.is_empty()
             {
-                events.push(StreamEvent::TextDelta { text: text.into() });
+                events.push(StreamEvent::TextDelta {
+                    text: self
+                        .text
+                        .as_mut()
+                        .ok_or_else(|| malformed("OpenAI-compatible text arena is already sealed"))?
+                        .append(text.to_owned()),
+                });
             }
             if let Some(text) = delta
                 .get("reasoning_content")
@@ -3454,7 +3574,15 @@ impl ChatDecoder {
                 .and_then(serde_json::Value::as_str)
                 && !text.is_empty()
             {
-                events.push(StreamEvent::ReasoningDelta { text: text.into() });
+                events.push(StreamEvent::ReasoningDelta {
+                    text: self
+                        .reasoning
+                        .as_mut()
+                        .ok_or_else(|| {
+                            malformed("OpenAI-compatible reasoning arena is already sealed")
+                        })?
+                        .append(text.to_owned()),
+                });
             }
             if let Some(refusal) = delta.get("refusal").and_then(serde_json::Value::as_str)
                 && !refusal.is_empty()
@@ -3534,7 +3662,7 @@ impl ChatDecoder {
                 synthesized_id,
             });
         }
-        let call = self.open_calls.get(&index).ok_or_else(|| {
+        let call = self.open_calls.get_mut(&index).ok_or_else(|| {
             malformed(format!(
                 "OpenAI-compatible tool index {index} disappeared after start"
             ))
@@ -3594,6 +3722,12 @@ impl ChatDecoder {
             self.pending_tool_events.clear();
             Vec::new()
         };
+        if let Some(writer) = self.text.take() {
+            drop(writer.seal());
+        }
+        if let Some(writer) = self.reasoning.take() {
+            drop(writer.seal());
+        }
         events.push(StreamEvent::Finish { reason });
         events
     }
@@ -4128,6 +4262,7 @@ struct ResponsesNeutralRender {
     stable_wire_end: usize,
     previous_wire_end: Option<usize>,
     message_wire_ends: Vec<usize>,
+    reply_bindings: Vec<crate::PreparedReplyBinding>,
 }
 
 fn responses_request_json_with_boundary(
@@ -4144,6 +4279,7 @@ fn responses_request_json_with_boundary(
         effort,
         hosted_web_search,
         stable_history_end,
+        false,
     )?;
     apply_openai_cache_controls(
         request,
@@ -4168,6 +4304,7 @@ fn responses_request_json_neutral_with_boundary(
     effort: Option<&str>,
     hosted_web_search: bool,
     stable_history_end: usize,
+    bind_large_replies: bool,
 ) -> Result<ResponsesNeutralRender, ProviderError> {
     let computer_kind = openai_computer_tool_kind(&request.model, codex_responses_lite);
     let computer_display = latest_computer_display_dimensions(request).unwrap_or((
@@ -4186,6 +4323,7 @@ fn responses_request_json_neutral_with_boundary(
         })
         .collect::<HashSet<_>>();
     let mut input = Vec::new();
+    let mut reply_bindings = Vec::new();
     // Current codex sends subscription instructions as the first developer
     // input item and leaves the top-level `instructions` parameter null. Keep
     // the API-key Responses shape unchanged.
@@ -4222,7 +4360,17 @@ fn responses_request_json_neutral_with_boundary(
                     } else {
                         "input_text"
                     };
-                    content.push(serde_json::json!({"type": content_type, "text": text}));
+                    let mut rendered = serde_json::Map::new();
+                    rendered.insert("type".into(), content_type.into());
+                    rendered.insert(
+                        "text".into(),
+                        if bind_large_replies {
+                            crate::reply_json_value(text, &mut reply_bindings)
+                        } else {
+                            serde_json::Value::String(text.to_owned_string())
+                        },
+                    );
+                    content.push(serde_json::Value::Object(rendered));
                 }
                 Block::Text { .. } => {
                     return Err(invalid_request(
@@ -4437,7 +4585,11 @@ fn responses_request_json_neutral_with_boundary(
                     if provider == OPENAI_PROVIDER_NAME && data.is_object() =>
                 {
                     flush_response_message(&mut input, message.role, &mut content);
-                    input.push(data.clone());
+                    input.push(crate::provider_opaque_json_value(
+                        data,
+                        bind_large_replies,
+                        &mut reply_bindings,
+                    )?);
                 }
                 Block::ProviderOpaque { provider, .. } if provider == OPENAI_PROVIDER_NAME => {
                     return Err(invalid_request(
@@ -4506,12 +4658,15 @@ fn responses_request_json_neutral_with_boundary(
     //     models).
     // The API-key Responses path keeps its original shape.
     let stable_wire_end = stable_wire_end.unwrap_or(input.len());
-    let mut payload = serde_json::json!({
-        "model": request.model,
-        "input": input,
-        "stream": true,
-        "store": false,
-    });
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "model".into(),
+        serde_json::Value::String(request.model.clone()),
+    );
+    payload.insert("input".into(), serde_json::Value::Array(input));
+    payload.insert("stream".into(), serde_json::Value::Bool(true));
+    payload.insert("store".into(), serde_json::Value::Bool(false));
+    let mut payload = serde_json::Value::Object(payload);
     let object = payload
         .as_object_mut()
         .ok_or_else(|| internal("OpenAI Responses request payload was not a JSON object"))?;
@@ -4566,6 +4721,7 @@ fn responses_request_json_neutral_with_boundary(
         stable_wire_end,
         previous_wire_end,
         message_wire_ends,
+        reply_bindings,
     })
 }
 
@@ -5147,11 +5303,14 @@ fn flush_response_message(
         MessageRole::User | MessageRole::Tool => "user",
         MessageRole::Assistant => "assistant",
     };
-    input.push(serde_json::json!({
-        "type": "message",
-        "role": role,
-        "content": std::mem::take(content),
-    }));
+    let mut message = serde_json::Map::new();
+    message.insert("type".into(), serde_json::Value::String("message".into()));
+    message.insert("role".into(), serde_json::Value::String(role.into()));
+    message.insert(
+        "content".into(),
+        serde_json::Value::Array(std::mem::take(content)),
+    );
+    input.push(serde_json::Value::Object(message));
 }
 
 fn chat_request_json(
@@ -5167,8 +5326,9 @@ fn chat_request_json(
         kimi_thinking,
         kimi_reasoning_effort,
         request.messages.len(),
+        false,
     )
-    .map(|(payload, _, _)| payload)
+    .map(|(payload, _, _, _)| payload)
 }
 
 fn chat_request_json_with_boundary(
@@ -5178,9 +5338,19 @@ fn chat_request_json_with_boundary(
     kimi_thinking: Option<&KimiThinkingConfig>,
     kimi_reasoning_effort: Option<&str>,
     stable_history_end: usize,
-) -> Result<(serde_json::Value, usize, Option<usize>), ProviderError> {
+    bind_large_replies: bool,
+) -> Result<
+    (
+        serde_json::Value,
+        usize,
+        Option<usize>,
+        Vec<crate::PreparedReplyBinding>,
+    ),
+    ProviderError,
+> {
     let attachments = attachment_index(request)?;
     let mut messages = Vec::new();
+    let mut reply_bindings = Vec::new();
     if let Some(system) = &request.system_prompt {
         messages.push(serde_json::json!({"role": "system", "content": system}));
     }
@@ -5195,11 +5365,28 @@ fn chat_request_json_with_boundary(
     for (message_index, message) in request.messages.iter().enumerate() {
         match message.role {
             MessageRole::Assistant => {
-                let mut text = String::new();
+                let mut text = None::<ReplyText>;
+                let mut joined_ranges = None::<ReplyArenaWriter>;
                 let mut tool_calls = Vec::new();
                 for block in &message.blocks {
                     match block {
-                        Block::Text { text: delta } => text.push_str(delta),
+                        Block::Text { text: delta } => {
+                            if let Some(writer) = joined_ranges.as_mut() {
+                                let _ = writer.append_shared(delta);
+                            } else if let Some(previous) = text.take() {
+                                if let Some(joined) = previous.try_join(delta) {
+                                    text = Some(joined);
+                                } else {
+                                    let mut writer =
+                                        ReplyArenaWriter::new().with_standard_provider_json_views();
+                                    let _ = writer.append_shared(&previous);
+                                    let _ = writer.append_shared(delta);
+                                    joined_ranges = Some(writer);
+                                }
+                            } else {
+                                text = Some(delta.clone());
+                            }
+                        }
                         Block::ToolCall {
                             call_id,
                             name,
@@ -5219,7 +5406,11 @@ fn chat_request_json_with_boundary(
                         Block::ProviderOpaque { provider, data }
                             if provider == OPENAI_COMPATIBLE_PROVIDER_NAME && data.is_object() =>
                         {
-                            messages.push(data.clone());
+                            messages.push(crate::provider_opaque_json_value(
+                                data,
+                                bind_large_replies,
+                                &mut reply_bindings,
+                            )?);
                         }
                         Block::Reasoning { .. } => {
                             return Err(invalid_request(
@@ -5233,10 +5424,20 @@ fn chat_request_json_with_boundary(
                         }
                     }
                 }
-                let mut wire = serde_json::json!({
-                    "role": "assistant",
-                    "content": (!text.is_empty()).then_some(text),
-                });
+                let mut wire = serde_json::Map::new();
+                wire.insert("role".into(), serde_json::Value::String("assistant".into()));
+                let text = joined_ranges.map(ReplyArenaWriter::seal).or(text);
+                let content = if let Some(text) = text {
+                    if bind_large_replies {
+                        crate::reply_json_value(&text, &mut reply_bindings)
+                    } else {
+                        serde_json::Value::String(text.to_owned_string())
+                    }
+                } else {
+                    serde_json::Value::Null
+                };
+                wire.insert("content".into(), content);
+                let mut wire = serde_json::Value::Object(wire);
                 if !tool_calls.is_empty() {
                     wire.as_object_mut()
                         .ok_or_else(|| internal("Chat assistant message was not an object"))?
@@ -5250,7 +5451,17 @@ fn chat_request_json_with_boundary(
                 for block in &message.blocks {
                     match block {
                         Block::Text { text } => {
-                            content.push(serde_json::json!({"type": "text", "text": text}));
+                            let mut block = serde_json::Map::new();
+                            block.insert("type".into(), "text".into());
+                            block.insert(
+                                "text".into(),
+                                if bind_large_replies {
+                                    crate::reply_json_value(text, &mut reply_bindings)
+                                } else {
+                                    serde_json::Value::String(text.to_owned_string())
+                                },
+                            );
+                            content.push(serde_json::Value::Object(block));
                         }
                         Block::Attachment(AttachmentBlock::Image { artifact, mime, .. }) => {
                             let data = resolved_attachment(&attachments, artifact.as_str())?;
@@ -5276,7 +5487,11 @@ fn chat_request_json_with_boundary(
                         Block::ProviderOpaque { provider, data }
                             if provider == OPENAI_COMPATIBLE_PROVIDER_NAME && data.is_object() =>
                         {
-                            messages.push(data.clone());
+                            messages.push(crate::provider_opaque_json_value(
+                                data,
+                                bind_large_replies,
+                                &mut reply_bindings,
+                            )?);
                         }
                         Block::Reasoning { .. } => {
                             return Err(invalid_request(
@@ -5291,7 +5506,10 @@ fn chat_request_json_with_boundary(
                     }
                 }
                 if !content.is_empty() {
-                    messages.push(serde_json::json!({"role": "user", "content": content}));
+                    let mut wire = serde_json::Map::new();
+                    wire.insert("role".into(), serde_json::Value::String("user".into()));
+                    wire.insert("content".into(), serde_json::Value::Array(content));
+                    messages.push(serde_json::Value::Object(wire));
                 }
                 for (call_id, preview, images) in results {
                     messages.push(serde_json::json!({
@@ -5349,12 +5567,18 @@ fn chat_request_json_with_boundary(
         })
         .collect::<Vec<_>>();
     let stable_wire_end = stable_wire_end.unwrap_or(messages.len());
-    let mut payload = serde_json::json!({
-        "model": request.model,
-        "messages": messages,
-        "stream": true,
-        "stream_options": {"include_usage": true},
-    });
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "model".into(),
+        serde_json::Value::String(request.model.clone()),
+    );
+    payload.insert("messages".into(), serde_json::Value::Array(messages));
+    payload.insert("stream".into(), serde_json::Value::Bool(true));
+    payload.insert(
+        "stream_options".into(),
+        serde_json::json!({"include_usage": true}),
+    );
+    let mut payload = serde_json::Value::Object(payload);
     let object = payload
         .as_object_mut()
         .ok_or_else(|| internal("Chat request payload was not an object"))?;
@@ -5407,7 +5631,7 @@ fn chat_request_json_with_boundary(
     if !tools.is_empty() {
         object.insert("tools".into(), serde_json::Value::Array(tools));
     }
-    Ok((payload, stable_wire_end, previous_wire_end))
+    Ok((payload, stable_wire_end, previous_wire_end, reply_bindings))
 }
 
 /// OpenAI-compatible ordering law: the tool-role result is immediately

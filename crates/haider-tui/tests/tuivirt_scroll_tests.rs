@@ -429,7 +429,7 @@ fn edits_appends_and_completions_never_render_stale_rows() {
         EventPayload::Item(ItemEvent::Started {
             item_id: item.clone(),
             item: TurnItem::AgentMessage {
-                text: String::new(),
+                text: String::new().into(),
             },
         }),
     );
@@ -439,7 +439,7 @@ fn edits_appends_and_completions_never_render_stale_rows() {
             EventPayload::Item(ItemEvent::Delta {
                 item_id: item.clone(),
                 delta: ItemDelta::Text {
-                    text: delta.to_owned(),
+                    text: delta.to_owned().into(),
                 },
             }),
         );
@@ -457,7 +457,7 @@ fn edits_appends_and_completions_never_render_stale_rows() {
         EventPayload::Item(ItemEvent::Delta {
             item_id: item.clone(),
             delta: ItemDelta::Text {
-                text: " batched".to_owned(),
+                text: " batched".to_owned().into(),
             },
         }),
     );
@@ -473,7 +473,7 @@ fn edits_appends_and_completions_never_render_stale_rows() {
         EventPayload::Item(ItemEvent::Completed {
             item_id: item.clone(),
             item: TurnItem::AgentMessage {
-                text: "alpha beta gamma (final)".to_owned(),
+                text: "alpha beta gamma (final)".to_owned().into(),
             },
         }),
     );
@@ -530,7 +530,7 @@ fn edits_appends_and_completions_never_render_stale_rows() {
         EventPayload::Item(ItemEvent::Completed {
             item_id: item,
             item: TurnItem::AgentMessage {
-                text: "replaced entirely".to_owned(),
+                text: "replaced entirely".to_owned().into(),
             },
         }),
     );

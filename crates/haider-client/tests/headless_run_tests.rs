@@ -311,7 +311,7 @@ fn envelope(
             durable: true,
             prompt: PromptRender::Verbatim,
         },
-        payload: serde_json::to_value(payload).expect("payload"),
+        payload: serde_json::to_value(payload).expect("payload").into(),
     }
 }
 
@@ -1042,7 +1042,7 @@ async fn control_attach_precedes_submit_and_pre_response_events_correlate() {
     let (result, events) = run_with_events(profile, request(None), 4, Duration::ZERO).await;
     peer.await.expect("peer");
     assert_eq!(result.outcome, HeadlessOutcome::Done);
-    assert_eq!(result.response.as_deref(), Some("daemon answer"));
+    assert_eq!(result.response, Some("daemon answer".into()));
     assert_eq!(result.terminal_seq, Some(3));
     // Two-phase announcement law: resolution-time first (created_seq from
     // session.create — the mock's 0), the acceptance-time refinement second.
@@ -1605,7 +1605,7 @@ async fn duplicate_and_gap_replay_is_lossless_under_output_backpressure() {
         run_with_events(profile, request(None), 1, Duration::from_millis(40)).await;
     peer.await.expect("peer");
     assert_eq!(result.outcome, HeadlessOutcome::Done);
-    assert_eq!(result.response.as_deref(), Some("replayed"));
+    assert_eq!(result.response, Some("replayed".into()));
     let seqs = events
         .into_iter()
         .filter_map(|event| match event {
@@ -2362,7 +2362,7 @@ async fn adjacent_store_failure_and_errored_terminal_return_without_hanging() {
     assert!(matches!(
         events.last(),
         Some(HeadlessEvent::Terminal(terminal))
-            if serde_json::from_value::<EventPayload>(terminal.envelope.payload.clone())
+            if serde_json::from_value::<EventPayload>(terminal.envelope.payload.clone().into())
                 .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Errored))
     ));
 }

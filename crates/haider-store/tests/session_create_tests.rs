@@ -223,7 +223,8 @@ fn session_create_commits_metadata_created_and_receipt_atomically_and_replays_af
         assert_eq!(created.created_seq, 1);
         assert_eq!(created.metadata.cwd, "/tmp/work");
         assert_eq!(
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()).expect("payload"),
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
+                .expect("payload"),
             EventPayload::SessionState(SessionState::Created)
         );
         assert_eq!(
@@ -397,7 +398,7 @@ fn legacy_append_metadata_remains_none() {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: json!({"type": "legacy"}),
+        payload: json!({"type": "legacy"}).into(),
     }];
     store.append(&mut envelope).expect("append");
     assert_eq!(store.session_metadata(&session_id).expect("metadata"), None);

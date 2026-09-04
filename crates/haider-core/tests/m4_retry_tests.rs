@@ -115,7 +115,7 @@ fn spawn(
 }
 
 fn typed(envelope: &RawEnvelope) -> EventPayload {
-    serde_json::from_value(envelope.payload.clone()).expect("known payload")
+    serde_json::from_value(envelope.payload.clone().into()).expect("known payload")
 }
 
 fn retrying_states(events: &[RawEnvelope]) -> Vec<RunState> {

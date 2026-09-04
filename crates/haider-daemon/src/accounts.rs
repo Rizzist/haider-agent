@@ -46,7 +46,9 @@ use haider_protocol::credential::{
     AccountIdentity, AuthMethod, CredentialAttentionReason, CredentialDescriptor, CredentialStatus,
     RotationCause, RotationEvent,
 };
-use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+use haider_protocol::envelope::{
+    EventEnvelope, PromptRender, RawPayload, RenderTargets, SCHEMA_VERSION,
+};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{CredentialAlias, DeviceId, EventId};
 use haider_protocol::lockdown::{ProviderAuthChanged, ProviderTrustChanged};
@@ -5134,8 +5136,9 @@ async fn journal_provider_management_event(
     store: &SqliteStoreHandle,
     event_id: EventId,
     provider: &str,
-    payload: serde_json::Value,
+    payload: impl Into<RawPayload>,
 ) -> Result<(), HaiderError> {
+    let payload = payload.into();
     let profile_id = store.profile_installation_id().await?;
     for session_id in store.session_ids().await? {
         let Some(metadata) = store.session_metadata(&session_id).await? else {

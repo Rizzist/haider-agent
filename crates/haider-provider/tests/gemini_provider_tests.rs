@@ -71,13 +71,52 @@ fn manifest_replays_every_declared_gemini_fixture_in_either_promotion_state() {
 fn gemini_stream_decodes_text_reasoning_toolcall_usage_finish() {
     let directory = fixture_directory();
     let expected: Vec<ExpectedItem> = read_json(&directory.join("combined.events.json"));
+    let actual =
+        replay_gemini_sse(&fs::read(directory.join("combined.sse")).expect("combined wire"));
     assert_eq!(
-        replay_gemini_sse(&fs::read(directory.join("combined.sse")).expect("combined wire")),
+        actual,
         expected
             .into_iter()
             .map(ExpectedItem::into_result)
             .collect::<Vec<_>>()
     );
+    let signed = match &actual[1] {
+        Ok(StreamEvent::ProviderOpaque { data, .. }) => data,
+        other => panic!("expected signed thought, got {other:?}"),
+    };
+    let reasoning = match &actual[2] {
+        Ok(StreamEvent::ReasoningDelta { text }) => text,
+        other => panic!("expected signed thought delta, got {other:?}"),
+    };
+    assert!(
+        signed
+            .reply_text()
+            .is_some_and(|text| text.shares_arena_with(reasoning)),
+        "Gemini signed part must reference the decoder arena"
+    );
+    assert_ne!(signed.template()["part"]["text"], "checking");
+}
+
+#[test]
+fn gemini_plain_text_frames_share_one_incrementally_hashed_arena() {
+    let wire = concat!(
+        r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"left "}]}}]}"#,
+        "\n\n",
+        r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"right"}]},"finishReason":"STOP"}]}"#,
+        "\n\n",
+    );
+    let deltas = replay_gemini_sse(wire.as_bytes())
+        .into_iter()
+        .filter_map(|item| match item.expect("Gemini stream is valid") {
+            StreamEvent::TextDelta { text } => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(deltas.len(), 2);
+    assert!(deltas[0].shares_arena_with(&deltas[1]));
+    assert_eq!(deltas[0].byte_range(), 0..5);
+    assert_eq!(deltas[1].byte_range(), 5..10);
 }
 
 /// The mandatory poison-every-session regression: decode the real first
@@ -180,7 +219,7 @@ fn gemini_opaque_roundtrips_and_foreign_provider_opaque_is_rejected() {
         messages: vec![Message::assistant(vec![
             Block::ProviderOpaque {
                 provider: "gemini".into(),
-                data: signed.clone(),
+                data: signed.clone().into(),
             },
             Block::ToolCall {
                 call_id: "gemini-call-0000000000000000".into(),
@@ -207,7 +246,7 @@ fn gemini_opaque_roundtrips_and_foreign_provider_opaque_is_rejected() {
     let mut foreign = request;
     foreign.messages[0].blocks[0] = Block::ProviderOpaque {
         provider: "openai".into(),
-        data: serde_json::json!({"type":"reasoning"}),
+        data: serde_json::json!({"type":"reasoning"}).into(),
     };
     let error = provider("gemini-2.5-flash")
         .request_payload(&foreign)

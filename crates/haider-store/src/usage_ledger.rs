@@ -804,7 +804,7 @@ impl UsageJournalReducer {
 fn is_session_fork_audit(envelope: &RawEnvelope) -> bool {
     envelope.payload.get("type").and_then(Value::as_str) == Some("session_forked")
         && matches!(
-            SessionForkEventPayload::deserialize(&envelope.payload),
+            SessionForkEventPayload::deserialize(&*envelope.payload),
             Ok(SessionForkEventPayload::SessionForked(_))
         )
 }
@@ -815,7 +815,7 @@ fn fold_usage_envelope(
     errors: &mut BTreeMap<(UsageSlotAddress, UsageLedgerLane), u64>,
     envelope: &RawEnvelope,
 ) {
-    let Ok(payload) = EventPayload::deserialize(&envelope.payload) else {
+    let Ok(payload) = envelope.payload.decode_event() else {
         return;
     };
     match payload {

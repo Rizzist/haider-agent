@@ -177,7 +177,7 @@ async fn run_turn(
     .await;
     loop {
         if let WireFrame::Event { envelope, .. } = client.next().await
-            && serde_json::from_value::<EventPayload>(envelope.payload)
+            && serde_json::from_value::<EventPayload>(envelope.payload.into())
                 .is_ok_and(|payload| matches!(payload, EventPayload::RunState(RunState::Done)))
         {
             return;

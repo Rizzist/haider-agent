@@ -146,15 +146,13 @@ pub fn forkable_prompts_in(envelopes: &[RawEnvelope]) -> Vec<ForkablePrompt> {
     envelopes
         .iter()
         .filter(|envelope| envelope.agent_id.is_none())
-        .filter_map(|envelope| {
-            match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
-                Ok(EventPayload::UserMessage { text, .. }) => Some(ForkablePrompt {
-                    seq: envelope.seq,
-                    text,
-                    branch_id: envelope.branch_id.clone(),
-                }),
-                _ => None,
-            }
+        .filter_map(|envelope| match envelope.payload.decode_event() {
+            Ok(EventPayload::UserMessage { text, .. }) => Some(ForkablePrompt {
+                seq: envelope.seq,
+                text,
+                branch_id: envelope.branch_id.clone(),
+            }),
+            _ => None,
         })
         .collect()
 }

@@ -4321,7 +4321,7 @@ fn monitor_envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     }
 }
 

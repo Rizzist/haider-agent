@@ -211,8 +211,7 @@ async fn collect_result(
             // the resulting `OutputClosed`).
             break;
         }
-        if let Ok(EventPayload::ToolResult { call_id, result }) =
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+        if let Ok(EventPayload::ToolResult { call_id, result }) = envelope.payload.decode_event()
             && call_id == wanted_call_id
             && envelope.branch_id.as_ref().map(|branch| branch.as_str())
                 == wanted_branch_id.as_deref()
@@ -251,7 +250,7 @@ async fn collect_target(
         } else if let Some(join) = found_join.as_mut()
             && join.result.is_none()
             && let Ok(EventPayload::ToolResult { call_id, result }) =
-                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                envelope.payload.decode_event()
             && call_id == join.call_id
             && found
                 .as_ref()
@@ -286,7 +285,7 @@ fn item_document(
             ("seq".into(), envelope.seq.into()),
         ])
     };
-    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+    let Ok(payload) = envelope.payload.decode_event() else {
         return other_document(base(), payload_kind(&envelope.payload));
     };
     match payload {
@@ -310,7 +309,7 @@ fn item_document(
             }
             NodeKind::UserTurn { text, .. } => text_document(base(), "user", &text, masked),
             NodeKind::AssistantCommit { text, .. } => {
-                text_document(base(), "assistant", &text, masked)
+                text_document(base(), "assistant", &text.to_owned_string(), masked)
             }
             _ => other_document(base(), "node_committed"),
         },
@@ -466,7 +465,7 @@ mod tests {
                 durable: true,
                 prompt: haider_protocol::envelope::PromptRender::Omit,
             },
-            payload,
+            payload: payload.into(),
         }
     }
 

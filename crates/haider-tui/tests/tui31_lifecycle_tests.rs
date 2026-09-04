@@ -728,7 +728,7 @@ async fn trailing_word_boundaries_route_like_the_sim() {
             .find_map(|entry| match entry {
                 TranscriptEntry::Item(block) if !block.streaming => match &block.item {
                     haider_protocol::item::TurnItem::AgentMessage { text } if !text.is_empty() => {
-                        Some(text.clone())
+                        Some(text.to_owned_string())
                     }
                     _ => None,
                 },

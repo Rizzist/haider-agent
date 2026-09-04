@@ -180,7 +180,8 @@ fn physical_requests_land_in_attributed_model_rows() {
                 "source": "provider_reported",
                 "account": "account-main"
             }
-        }),
+        })
+        .into(),
     };
     let reduced = reduce_journal_usage(&[
         usage_event("usage-request-one", 1, 12, 3),
@@ -431,7 +432,8 @@ fn journal_backfill_marks_its_day_header() {
                     "auth_scope": "oauth_subscription",
                     "cache_epoch": "epoch-1"
                 }
-            }),
+            })
+            .into(),
         },
         EventEnvelope {
             schema_version: SCHEMA_VERSION,
@@ -457,7 +459,8 @@ fn journal_backfill_marks_its_day_header() {
                 "code": "provider_error",
                 "message": "provider request failed",
                 "retryable": true
-            }),
+            })
+            .into(),
         },
         EventEnvelope {
             schema_version: SCHEMA_VERSION,
@@ -495,7 +498,8 @@ fn journal_backfill_marks_its_day_header() {
                     "speed": "standard",
                     "cache_epoch": "epoch-live"
                 }
-            }),
+            })
+            .into(),
         },
     ];
     store.append(&mut envelopes).expect("append usage journal");

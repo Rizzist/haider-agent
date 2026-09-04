@@ -1019,14 +1019,13 @@ fn render_rows_after(
 fn render_projected_rows(
     rows: impl IntoIterator<Item = haider_protocol::pipe::SidecarRow>,
 ) -> String {
-    let mut data = String::new();
+    let mut data = Vec::new();
     for row in rows {
-        if let Ok(line) = serde_json::to_string(&row) {
-            data.push_str(&line);
-            data.push('\n');
+        if row.write_json(&mut data).is_ok() {
+            data.push(b'\n');
         }
     }
-    data
+    String::from_utf8(data).unwrap_or_default()
 }
 
 fn coverage_line(coverage: u64, generation: u64) -> Result<String, PipeNativeError> {

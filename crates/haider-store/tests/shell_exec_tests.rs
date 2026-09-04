@@ -122,7 +122,7 @@ fn shell_acceptance_atomically_commits_receipt_without_user_message() {
     let payloads = envelopes
         .iter()
         .map(|event| {
-            serde_json::from_value::<EventPayload>(event.payload.clone()).expect("payload")
+            serde_json::from_value::<EventPayload>(event.payload.clone().into()).expect("payload")
         })
         .collect::<Vec<_>>();
     assert!(matches!(
@@ -288,7 +288,7 @@ fn shell_acceptance_preserves_a_registered_named_branch() {
         .iter()
         .find_map(|envelope| {
             let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into()).ok()?
             else {
                 return None;
             };
@@ -315,7 +315,8 @@ fn shell_acceptance_preserves_a_registered_named_branch() {
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
-            .expect("done payload"),
+            .expect("done payload")
+            .into(),
     }];
     store
         .append_worker(&mut done)

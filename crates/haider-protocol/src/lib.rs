@@ -38,6 +38,7 @@ pub mod pipe;
 pub mod project_instructions;
 pub mod provider;
 pub mod queue;
+pub mod reply;
 pub mod retry;
 pub mod rpc;
 pub mod session;

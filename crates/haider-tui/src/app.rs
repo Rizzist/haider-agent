@@ -1566,7 +1566,7 @@ impl ChipModel {
                                 seed.agent
                             )),
                             item: haider_protocol::item::TurnItem::AgentMessage {
-                                text: text.clone(),
+                                text: text.clone().into(),
                             },
                         },
                     ));
@@ -1836,7 +1836,13 @@ impl ChipModel {
                         .unwrap_or_default();
                     format!("{name} {desc}")
                 }
-                haider_protocol::item::TurnItem::AgentMessage { text } => text.clone(),
+                haider_protocol::item::TurnItem::AgentMessage { text } => {
+                    let (mut preview, truncated) = text.to_owned_prefix(52);
+                    if truncated {
+                        preview.push('…');
+                    }
+                    preview
+                }
                 _ => String::new(),
             },
             crate::projection::TranscriptEntry::User { text, .. } => text.clone(),
@@ -2405,7 +2411,7 @@ impl AuraModel {
             haider_protocol::item::ItemEvent::Completed {
                 item_id: haider_protocol::ids::ItemId::new("aura-seed"),
                 item: haider_protocol::item::TurnItem::AgentMessage {
-                    text: "Aura online. I orchestrate local sessions — I don't write code myself. Say or type what to spin up.".to_owned(),
+                    text: "Aura online. I orchestrate local sessions — I don't write code myself. Say or type what to spin up.".into(),
                 },
             },
         ));
@@ -4321,9 +4327,9 @@ impl ImageNotice {
     #[must_use]
     pub fn text(&self) -> String {
         match self {
-            Self::NoVision { model } => format!(
-                "{model} does not accept images — pick a vision model or /attach as text"
-            ),
+            Self::NoVision { model } => {
+                format!("{model} does not accept images — pick a vision model or /attach as text")
+            }
             Self::ClipboardEmpty => "nothing on the clipboard to paste".to_owned(),
             Self::ClipboardUnreadable { note } => format!("clipboard — {note}"),
         }
@@ -14751,7 +14757,7 @@ impl AppModel {
             RawOutcome::Applied => {
                 self.dirty = true;
                 if let Ok(EventPayload::ClientDiagnostic { code, message, .. }) =
-                    serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                    envelope.payload.decode_event()
                     && code == "client-daemon-incompatible"
                 {
                     self.compatibility_diagnostic =
@@ -14775,8 +14781,7 @@ impl AppModel {
                 // never. The active session keeps its own edge tracker, so only
                 // NON-active sessions are evaluated here (no double-fire).
                 if self.active_session.as_ref() != Some(&envelope.session_id)
-                    && let Ok(EventPayload::RunState(state)) =
-                        serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                    && let Ok(EventPayload::RunState(state)) = envelope.payload.decode_event()
                 {
                     let title = self
                         .sessions
@@ -14847,7 +14852,7 @@ impl AppModel {
                     }
                 }
                 if matches!(note, crate::branch::AdmittedNote::Content) {
-                    match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+                    match envelope.payload.decode_event() {
                         Ok(payload) => {
                             // The origin marker is intentionally `ui=false`:
                             // consume it as display metadata for the linked

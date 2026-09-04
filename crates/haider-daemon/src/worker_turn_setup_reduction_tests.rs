@@ -102,7 +102,7 @@ fn setup_reduction_envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     }
 }
 

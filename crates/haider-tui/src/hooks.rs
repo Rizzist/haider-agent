@@ -345,8 +345,7 @@ impl HookFactsLog {
         {
             self.current_run = Some(run.clone());
         }
-        if let Ok(haider_protocol::EventPayload::MenuOpened(menu)) =
-            serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload.clone())
+        if let Ok(haider_protocol::EventPayload::MenuOpened(menu)) = envelope.payload.decode_event()
         {
             self.menus.retain(|held| held.id != menu.id);
             self.menus.push_front(menu);
@@ -359,7 +358,8 @@ impl HookFactsLog {
         }
         // A future fact kind this build cannot decode is tolerated like any
         // unknown payload (forward-compat law) — never fatal, never guessed.
-        let Ok(fact) = HookEventPayload::from_payload_value(envelope.payload.clone()) else {
+        let Ok(fact) = HookEventPayload::from_payload_value(envelope.payload.to_json_value())
+        else {
             return;
         };
         let entry = match fact {

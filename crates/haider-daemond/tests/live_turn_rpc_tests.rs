@@ -333,7 +333,7 @@ impl Provider for DurableEntryProvider {
             }
             let run = envelopes.iter().find_map(|envelope| {
                 let payload =
-                    serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?;
+                    serde_json::from_value::<EventPayload>(envelope.payload.clone().into()).ok()?;
                 matches!(
                     payload,
                     EventPayload::UserMessage { ref text, .. } if text == "say hello"
@@ -344,7 +344,7 @@ impl Provider for DurableEntryProvider {
             let run = run.expect("UserMessage is durable before provider entry");
             assert!(envelopes.iter().any(|envelope| {
                 envelope.run_id.as_ref() == Some(&run)
-                    && serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                    && serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                         .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Queued))
             }));
             self.inspections.fetch_add(1, Ordering::SeqCst);
@@ -380,7 +380,9 @@ fn recovery_fixture_envelope(
             durable: true,
             prompt,
         },
-        payload: serde_json::to_value(payload).expect("recovery payload"),
+        payload: serde_json::to_value(payload)
+            .expect("recovery payload")
+            .into(),
     }
 }
 
@@ -624,7 +626,7 @@ async fn next_permission_menu(client: &mut UdsClient) -> (haider_protocol::menu:
     loop {
         if let WireFrame::Event { envelope, .. } = client.next().await
             && let Ok(EventPayload::MenuOpened(menu)) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
+                serde_json::from_value::<EventPayload>(envelope.payload.into())
             && matches!(
                 menu.kind,
                 haider_protocol::menu::MenuKind::Permission { .. }
@@ -650,7 +652,7 @@ async fn next_permission_menu_before_create(
         };
         if let WireFrame::Event { envelope, .. } = frame
             && let Ok(EventPayload::MenuOpened(menu)) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
+                serde_json::from_value::<EventPayload>(envelope.payload.into())
             && matches!(
                 menu.kind,
                 haider_protocol::menu::MenuKind::Permission { .. }
@@ -717,8 +719,8 @@ async fn events_until_terminal(
             if HookEventPayload::is_engine_fact(&envelope.payload) {
                 continue;
             }
-            let payload =
-                serde_json::from_value::<EventPayload>(envelope.payload).expect("typed event");
+            let payload = serde_json::from_value::<EventPayload>(envelope.payload.into())
+                .expect("typed event");
             let terminal = matches!(
                 payload,
                 EventPayload::RunState(RunState::Done | RunState::Errored | RunState::Cancelled)
@@ -735,7 +737,7 @@ async fn next_idle(client: &mut UdsClient) -> bool {
     loop {
         if let WireFrame::Event { envelope, .. } = client.next().await
             && let Ok(EventPayload::SessionState(SessionState::Idle { interrupted })) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
+                serde_json::from_value::<EventPayload>(envelope.payload.into())
         {
             return interrupted;
         }
@@ -834,7 +836,8 @@ impl WindowsProcessStartTrace {
         if envelope.run_id.as_ref() != Some(&self.run_id) {
             return;
         }
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
+        else {
             return;
         };
         match payload {
@@ -1170,7 +1173,8 @@ fn observed_frame_kind(frame: &WireFrame) -> String {
 
 #[cfg(windows)]
 fn observed_event_kind(envelope: &RawEnvelope) -> String {
-    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
+    else {
         return "Event/Unparsed".into();
     };
     match payload {
@@ -1245,7 +1249,8 @@ impl WindowsExecStartObserver {
         if envelope.run_id.as_ref() != Some(run_id) {
             return None;
         }
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
+        else {
             return None;
         };
         match payload {
@@ -1808,25 +1813,27 @@ async fn reconnect_exec_start_observer(
 #[cfg(not(windows))]
 fn exec_child_started(envelope: &RawEnvelope, run_id: &RunId, _output_tail: &mut Vec<u8>) -> bool {
     envelope.run_id.as_ref() == Some(run_id)
-        && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(|payload| {
-            let EventPayload::Item(ItemEvent::Delta {
-                delta: ItemDelta::CommandOutput { chunk_b64, .. },
-                ..
-            }) = payload
-            else {
-                return false;
-            };
-            BASE64
-                .decode(chunk_b64)
-                .expect("command output base64")
-                .windows(b"started".len())
-                .any(|window| window == b"started")
-        })
+        && serde_json::from_value::<EventPayload>(envelope.payload.clone().into()).is_ok_and(
+            |payload| {
+                let EventPayload::Item(ItemEvent::Delta {
+                    delta: ItemDelta::CommandOutput { chunk_b64, .. },
+                    ..
+                }) = payload
+                else {
+                    return false;
+                };
+                BASE64
+                    .decode(chunk_b64)
+                    .expect("command output base64")
+                    .windows(b"started".len())
+                    .any(|window| window == b"started")
+            },
+        )
 }
 
 fn run_terminal(envelope: &RawEnvelope, run_id: &RunId) -> bool {
     envelope.run_id.as_ref() == Some(run_id)
-        && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+        && serde_json::from_value::<EventPayload>(envelope.payload.clone().into()).is_ok_and(
             |payload| matches!(payload, EventPayload::RunState(state) if state.is_terminal()),
         )
 }
@@ -1903,7 +1910,7 @@ async fn settle_process_start_attempt_before_retry(
                     }
                 }
                 WireFrame::Event { envelope, .. } => {
-                    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload)
+                    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.into())
                     else {
                         continue;
                     };
@@ -1979,7 +1986,7 @@ async fn cancel_live_windows_attempt(
                     ),
                 },
                 WireFrame::Event { envelope, .. } => {
-                    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload)
+                    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.into())
                     else {
                         continue;
                     };
@@ -2125,7 +2132,7 @@ fn payloads_for_run<'a>(
     envelopes
         .iter()
         .filter(move |envelope| envelope.run_id.as_ref() == Some(run_id))
-        .filter_map(|envelope| serde_json::from_value(envelope.payload.clone()).ok())
+        .filter_map(|envelope| serde_json::from_value(envelope.payload.clone().into()).ok())
 }
 
 #[cfg(unix)]
@@ -2598,13 +2605,15 @@ async fn compaction_summary_request_carries_no_image_attachments() {
     )
     .await;
     assert!(journal.iter().any(|envelope| {
-        serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(|payload| {
-            matches!(
-                payload,
-                EventPayload::UserMessage { attachments, .. }
-                    if attachments == vec![image.clone()]
-            )
-        })
+        serde_json::from_value::<EventPayload>(envelope.payload.clone().into()).is_ok_and(
+            |payload| {
+                matches!(
+                    payload,
+                    EventPayload::UserMessage { attachments, .. }
+                        if attachments == vec![image.clone()]
+                )
+            },
+        )
     }));
 
     task.shutdown_handle().request("test complete");
@@ -2761,13 +2770,15 @@ async fn file_attachment_is_inlined_with_header_and_never_reaches_the_provider()
     // prompt-compile concern, never a journal rewrite.
     let journal = read_session(&mut client, &config, session_id, "read-after-file-turn").await;
     assert!(journal.iter().any(|envelope| {
-        serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(|payload| {
-            matches!(
-                payload,
-                EventPayload::UserMessage { attachments, .. }
-                    if attachments == vec![file.clone()]
-            )
-        })
+        serde_json::from_value::<EventPayload>(envelope.payload.clone().into()).is_ok_and(
+            |payload| {
+                matches!(
+                    payload,
+                    EventPayload::UserMessage { attachments, .. }
+                        if attachments == vec![file.clone()]
+                )
+            },
+        )
     }));
 
     task.shutdown_handle().request("test complete");
@@ -2938,8 +2949,9 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
                 // session-config fact (the auto-title `session_renamed`),
                 // which is NOT core-EventPayload vocabulary by design.
                 // Everything else must still decode strictly typed.
-                let payload = match serde_json::from_value::<EventPayload>(envelope.payload.clone())
-                {
+                let payload = match serde_json::from_value::<EventPayload>(
+                    envelope.payload.clone().into(),
+                ) {
                     Ok(payload) => Some(payload),
                     Err(_) => {
                         assert!(
@@ -3046,7 +3058,7 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
         envelope.seq == u64::try_from(index).expect("test index") + 1
     }));
     assert_eq!(
-        serde_json::from_value::<EventPayload>(durable[0].payload.clone())
+        serde_json::from_value::<EventPayload>(durable[0].payload.clone().into())
             .expect("created payload"),
         EventPayload::SessionState(SessionState::Created)
     );
@@ -3191,7 +3203,7 @@ async fn vanished_workspace_degrades_plain_turn_and_workspace_set_replays() {
             Some("project_instructions_loaded"),
             "unavailable workspace must not journal an empty instruction transition"
         );
-        let payload = serde_json::from_value::<EventPayload>(envelope.payload)
+        let payload = serde_json::from_value::<EventPayload>(envelope.payload.into())
             .expect("non-workspace turn event remains core typed");
         let done = payload == EventPayload::RunState(RunState::Done);
         core.push(payload);
@@ -3442,7 +3454,7 @@ async fn scenario_4_lost_submit_response_replays_one_run_and_one_provider_reques
                 {
                     if result.envelopes.iter().any(|envelope| {
                         envelope.run_id.as_ref() == Some(&run_id)
-                            && serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                            && serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                                 .is_ok_and(|payload| {
                                     matches!(payload, EventPayload::RunState(ref state) if state.is_terminal())
                                 })
@@ -3462,7 +3474,7 @@ async fn scenario_4_lost_submit_response_replays_one_run_and_one_provider_reques
             .iter()
             .filter(|envelope| {
                 envelope.run_id.as_ref() == Some(&run_id)
-                    && serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                    && serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                         .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. }))
             })
             .count(),
@@ -3704,7 +3716,7 @@ async fn scenario_6_request_input_round_trip_uses_second_control_attachment() {
     let (menu_id, request_seq, opening_generation) = loop {
         if let WireFrame::Event { envelope, .. } = submitter.next().await
             && let Ok(EventPayload::MenuOpened(menu)) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
+                serde_json::from_value::<EventPayload>(envelope.payload.into())
         {
             break (menu.id, envelope.seq, envelope.worker_generation);
         }
@@ -3846,7 +3858,7 @@ async fn scenario_7_two_menu_answers_race_and_only_first_commit_wins() {
     let (menu_id, request_seq, opening_generation) = loop {
         if let WireFrame::Event { envelope, .. } = submitter.next().await
             && let Ok(EventPayload::MenuOpened(menu)) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
+                serde_json::from_value::<EventPayload>(envelope.payload.into())
         {
             break (menu.id, envelope.seq, envelope.worker_generation);
         }
@@ -3998,8 +4010,8 @@ async fn scenario_8_wire_cancel_closes_open_items_and_cancelled_is_run_terminal(
         if let WireFrame::Event { envelope, .. } = client.next().await
             && envelope.run_id.as_ref() == Some(&run_id)
         {
-            let payload =
-                serde_json::from_value::<EventPayload>(envelope.payload).expect("typed event");
+            let payload = serde_json::from_value::<EventPayload>(envelope.payload.into())
+                .expect("typed event");
             let has_delta = matches!(
                 payload,
                 EventPayload::Item(haider_protocol::item::ItemEvent::Delta { .. })
@@ -4034,8 +4046,8 @@ async fn scenario_8_wire_cancel_closes_open_items_and_cancelled_is_run_terminal(
                 ..
             } => response_seen = true,
             WireFrame::Event { envelope, .. } if envelope.run_id.as_ref() == Some(&run_id) => {
-                let payload =
-                    serde_json::from_value::<EventPayload>(envelope.payload).expect("typed event");
+                let payload = serde_json::from_value::<EventPayload>(envelope.payload.into())
+                    .expect("typed event");
                 let terminal = payload == EventPayload::RunState(RunState::Cancelled);
                 let seq = envelope.seq;
                 events.push((seq, payload));
@@ -4077,7 +4089,7 @@ async fn scenario_8_wire_cancel_closes_open_items_and_cancelled_is_run_terminal(
     let payloads = run_envelopes
         .iter()
         .filter_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into()).ok()
         })
         .collect::<Vec<_>>();
     for started in payloads.iter().filter_map(|payload| match payload {
@@ -4286,7 +4298,9 @@ impl ClosingHeldEffectDispatcher {
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload: serde_json::to_value(payload).expect("effect payload"),
+            payload: serde_json::to_value(payload)
+                .expect("effect payload")
+                .into(),
         }];
         StoreHandle::append(&self.context.store, &mut envelopes).await?;
         Ok(())
@@ -4415,7 +4429,7 @@ async fn held_effect_reconciles_unknown_before_cancelled() {
         .into_iter()
         .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
         .filter_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload)
+            serde_json::from_value::<EventPayload>(envelope.payload.into())
                 .ok()
                 .map(|payload| (envelope.seq, payload))
         })
@@ -4616,12 +4630,14 @@ async fn scenario_9_restart_resumes_only_queued_and_terminalizes_streaming() {
     loop {
         if let WireFrame::Event { envelope, .. } = first.next().await
             && envelope.run_id.as_ref() == Some(&streaming_run)
-            && serde_json::from_value::<EventPayload>(envelope.payload).is_ok_and(|payload| {
-                matches!(
-                    payload,
-                    EventPayload::Item(haider_protocol::item::ItemEvent::Delta { .. })
-                )
-            })
+            && serde_json::from_value::<EventPayload>(envelope.payload.into()).is_ok_and(
+                |payload| {
+                    matches!(
+                        payload,
+                        EventPayload::Item(haider_protocol::item::ItemEvent::Delta { .. })
+                    )
+                },
+            )
         {
             break;
         }
@@ -4823,7 +4839,7 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
             )
             .await;
             if durable.iter().any(|envelope| {
-                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                     .is_ok_and(|payload| matches!(payload, EventPayload::RunState(RunState::Done)))
                     && envelope.run_id.is_some()
             }) {
@@ -4922,7 +4938,7 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
     let run_id = durable
         .iter()
         .find_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                 .is_ok_and(|payload| {
                     matches!(
                         payload,
@@ -5090,7 +5106,7 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
         .iter()
         .flat_map(|message| message.blocks.iter())
         .filter_map(|block| match block {
-            Block::Text { text } => Some(text.as_str()),
+            Block::Text { text } => Some(text.to_owned_string()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -5103,7 +5119,7 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
         .position(|text| *text == "explain the command result")
         .expect("current user prompt reaches provider");
     assert!(command_record < current_prompt);
-    let command_record = text_blocks[command_record];
+    let command_record = &text_blocks[command_record];
     assert!(command_record.contains("origin: user_command"));
     // The record JSON-encodes command and output (json_string_fields_v1 —
     // the anti-forgery framing law pinned in haider-provider), so raw
@@ -5310,7 +5326,8 @@ async fn w8a_shell_exec_cancel_kills_the_process_tree() {
                     response_seen = true;
                 }
                 WireFrame::Event { envelope, .. } => {
-                    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload)
+                    let Ok(payload) =
+                        serde_json::from_value::<EventPayload>(envelope.payload.into())
                     else {
                         continue;
                     };
@@ -5410,7 +5427,7 @@ async fn w8a_shell_exec_cancel_kills_the_process_tree() {
         .flat_map(|message| message.blocks.iter())
         .filter_map(|block| match block {
             Block::Text { text } if text.contains("[user-initiated shell command]") => {
-                Some(text.as_str())
+                Some(text.to_owned_string())
             }
             _ => None,
         })
@@ -5423,7 +5440,6 @@ async fn w8a_shell_exec_cancel_kills_the_process_tree() {
     );
     let command_record = command_records
         .last()
-        .copied()
         .expect("next provider turn contains the cancelled shell record");
     assert!(command_record.contains("origin: user_command"));
     #[cfg(not(windows))]
@@ -5623,7 +5639,7 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
     loop {
         if let WireFrame::Event { envelope, .. } = client.next().await
             && envelope.run_id.as_ref() == Some(&active_run)
-            && serde_json::from_value::<EventPayload>(envelope.payload)
+            && serde_json::from_value::<EventPayload>(envelope.payload.into())
                 .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Thinking))
         {
             break;
@@ -5766,7 +5782,7 @@ async fn metadata_less_prior_generation_queued_run_terminalizes_and_reaches_read
     )));
     assert!(events.iter().any(|envelope| {
         matches!(
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
             Ok(EventPayload::SessionState(SessionState::Idle {
                 interrupted: true
             }))
@@ -5809,7 +5825,8 @@ async fn metadata_less_live_submit_is_correlated_invalid_argument_without_accept
             payload: serde_json::to_value(EventPayload::SessionState(SessionState::Idle {
                 interrupted: false,
             }))
-            .expect("idle payload"),
+            .expect("idle payload")
+            .into(),
         }];
         store.append(&mut events).expect("legacy session row");
     }
@@ -5878,7 +5895,7 @@ async fn metadata_less_live_submit_is_correlated_invalid_argument_without_accept
     let store = Store::open(&config.store_dir).expect("inspect store");
     let events = store.journal_replay(&session_id).expect("history");
     assert!(!events.iter().any(|envelope| {
-        serde_json::from_value::<EventPayload>(envelope.payload.clone())
+        serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
             .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Queued))
     }));
 }
@@ -6070,7 +6087,7 @@ async fn revoked_credential_checkpoint_terminalizes_menu_and_reaches_ready() {
         if let WireFrame::Event { envelope, .. } = client.next().await
             && envelope.run_id.as_ref() == Some(&run_id)
             && let Ok(EventPayload::MenuOpened(menu)) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
+                serde_json::from_value::<EventPayload>(envelope.payload.into())
         {
             break menu.id;
         }
@@ -6104,7 +6121,7 @@ async fn revoked_credential_checkpoint_terminalizes_menu_and_reaches_ready() {
     )));
     assert!(events.iter().any(|envelope| {
         matches!(
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
             Ok(EventPayload::SessionState(SessionState::Idle {
                 interrupted: true
             }))
@@ -6171,7 +6188,7 @@ async fn checkpoint_then_later_queued_recovery_reaches_ready_without_starting_qu
         if let WireFrame::Event { envelope, .. } = client.next().await
             && envelope.run_id.as_ref() == Some(&checkpoint_run)
             && let Ok(EventPayload::MenuOpened(menu)) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
+                serde_json::from_value::<EventPayload>(envelope.payload.into())
         {
             break menu.id;
         }
@@ -6304,7 +6321,7 @@ async fn scenario_10_restart_replays_request_input_without_reexecuting_prior_req
         if let WireFrame::Event { envelope, .. } = first.next().await
             && envelope.run_id.as_ref() == Some(&run_id)
             && let Ok(EventPayload::MenuOpened(menu)) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
+                serde_json::from_value::<EventPayload>(envelope.payload.into())
         {
             break (menu.id, envelope.seq, envelope.worker_generation);
         }
@@ -6338,7 +6355,7 @@ async fn scenario_10_restart_replays_request_input_without_reexecuting_prior_req
     assert!(replay_frames.iter().any(|envelope| {
         envelope.run_id.as_ref() == Some(&run_id)
             && matches!(
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
                 Ok(EventPayload::MenuOpened(ref menu)) if menu.id == menu_id
             )
     }));
@@ -6399,7 +6416,7 @@ async fn scenario_10_restart_replays_request_input_without_reexecuting_prior_req
         .iter()
         .find(|envelope| {
             matches!(
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
                 Ok(EventPayload::MenuAnswered(answer)) if answer.menu == menu_id
             )
         })
@@ -6530,7 +6547,9 @@ impl ToolDispatcher for HoldingEffectDispatcher {
                     durable: true,
                     prompt: PromptRender::Omit,
                 },
-                payload: serde_json::to_value(payload).expect("effect payload"),
+                payload: serde_json::to_value(payload)
+                    .expect("effect payload")
+                    .into(),
             })
             .collect::<Vec<_>>();
         StoreHandle::append(&self.context.store, &mut envelopes).await?;
@@ -6879,7 +6898,8 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
     };
     assert_eq!(created.seq, 1);
     assert_eq!(
-        serde_json::from_value::<EventPayload>(created.payload.clone()).expect("typed payload"),
+        serde_json::from_value::<EventPayload>(created.payload.clone().into())
+            .expect("typed payload"),
         EventPayload::SessionState(SessionState::Created)
     );
     assert!(matches!(
@@ -8469,7 +8489,7 @@ async fn w4a1_committed_approval_crash_before_dispatched_is_safely_lost() {
         .iter()
         .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
         .filter_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                 .ok()
                 .map(|payload| (envelope.seq, payload))
         })
@@ -8548,7 +8568,7 @@ async fn w4a1_committed_approval_crash_before_dispatched_is_safely_lost() {
         .iter()
         .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
         .filter_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                 .ok()
                 .map(|payload| (envelope.seq, payload))
         })
@@ -8714,11 +8734,11 @@ impl TestHubJournal {
                         durable: true,
                         prompt: PromptRender::Omit,
                     },
-                    payload: serde_json::to_value(payload).map_err(|error| {
-                        haider_tools::ToolError::Runtime {
+                    payload: serde_json::to_value(payload)
+                        .map_err(|error| haider_tools::ToolError::Runtime {
                             message: error.to_string(),
-                        }
-                    })?,
+                        })?
+                        .into(),
                 })
             })
             .collect::<ToolResult<Vec<_>>>()?;
@@ -9039,7 +9059,7 @@ async fn w4a2_dispatched_exec_restarts_as_unknown_without_rerun() {
             && let Ok(EventPayload::Item(ItemEvent::Delta {
                 delta: ItemDelta::CommandOutput { chunk_b64, .. },
                 ..
-            })) = serde_json::from_value::<EventPayload>(envelope.payload)
+            })) = serde_json::from_value::<EventPayload>(envelope.payload.into())
             && BASE64
                 .decode(chunk_b64)
                 .expect("command output base64")
@@ -9825,7 +9845,7 @@ async fn graceful_drain_parks_a_request_input_checkpoint_for_recovery() {
         if let WireFrame::Event { envelope, .. } = first.next().await
             && envelope.run_id.as_ref() == Some(&run_id)
             && let Ok(EventPayload::MenuOpened(menu)) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
+                serde_json::from_value::<EventPayload>(envelope.payload.into())
         {
             break (menu.id, envelope.seq, envelope.worker_generation);
         }
@@ -9837,7 +9857,7 @@ async fn graceful_drain_parks_a_request_input_checkpoint_for_recovery() {
         if let WireFrame::Event { envelope, .. } = first.next().await
             && envelope.run_id.as_ref() == Some(&run_id)
             && matches!(
-                serde_json::from_value::<EventPayload>(envelope.payload),
+                serde_json::from_value::<EventPayload>(envelope.payload.into()),
                 Ok(EventPayload::RunState(RunState::InputRequired { .. }))
             )
         {
@@ -9875,7 +9895,7 @@ async fn graceful_drain_parks_a_request_input_checkpoint_for_recovery() {
     assert!(replay_frames.iter().any(|envelope| {
         envelope.run_id.as_ref() == Some(&run_id)
             && matches!(
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
                 Ok(EventPayload::MenuOpened(ref menu)) if menu.id == menu_id
             )
     }));
@@ -9885,7 +9905,7 @@ async fn graceful_drain_parks_a_request_input_checkpoint_for_recovery() {
         !replay_frames.iter().any(|envelope| {
             envelope.run_id.as_ref() == Some(&run_id)
                 && matches!(
-                    serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                    serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
                     Ok(EventPayload::RunState(
                         RunState::Cancelled | RunState::Cancelling | RunState::Errored
                     )) | Ok(EventPayload::RunFailed { .. })

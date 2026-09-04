@@ -835,7 +835,7 @@ fn seed_footprint_replay(model: &mut AppModel) {
     model.projection.apply(&haider_protocol::EventPayload::Item(
         haider_protocol::item::ItemEvent::Completed {
             item_id: haider_protocol::ids::ItemId::new("footprint-replay"),
-            item: haider_protocol::item::TurnItem::AgentMessage { text },
+            item: haider_protocol::item::TurnItem::AgentMessage { text: text.into() },
         },
     ));
     model.screen = crate::app::Screen::Session;
@@ -3357,7 +3357,7 @@ fn observe_turn_presentation(
     if !matches!(event_type, Some("run_state" | "item")) {
         return ImmediatePresentation::default();
     }
-    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+    let Ok(payload) = envelope.payload.decode_event() else {
         return ImmediatePresentation::default();
     };
     match payload {

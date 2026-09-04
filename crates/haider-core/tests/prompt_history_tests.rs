@@ -56,7 +56,7 @@ fn envelope(
             durable: true,
             prompt,
         },
-        payload: serde_json::to_value(payload).expect("payload"),
+        payload: serde_json::to_value(payload).expect("payload").into(),
     }
 }
 
@@ -336,7 +336,7 @@ async fn current_run_recovery_keeps_every_durable_steer_message() {
         .iter()
         .flat_map(|message| &message.blocks)
         .filter_map(|block| match block {
-            Block::Text { text } => Some(text.as_str()),
+            Block::Text { text } => Some(text.to_owned_string()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -547,7 +547,7 @@ async fn user_command_output_keeps_raw_delta_but_models_head_marker_and_failure_
         .expect("read raw command journal");
     let stored_chunk = stored
         .into_iter()
-        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.into()).ok())
         .find_map(|payload| match payload {
             EventPayload::Item(ItemEvent::Delta {
                 delta: ItemDelta::CommandOutput { chunk_b64, .. },
@@ -573,7 +573,8 @@ async fn user_command_output_keeps_raw_delta_but_models_head_marker_and_failure_
     };
     assert!(text.contains("HEAD: cargo test --locked"));
     assert!(text.contains("TAIL: linker failed with exit 1"));
-    let output_json = text
+    let rendered = text.to_owned_string();
+    let output_json = rendered
         .lines()
         .find_map(|line| line.strip_prefix("output_json (stdout/stderr in capture order): "))
         .expect("portable output JSON string");
@@ -2023,7 +2024,7 @@ async fn tree_compilation_is_byte_identical_to_journal_rendering() {
             "n-opaque",
             Some("n-user"),
             NodeKind::AssistantCommit {
-                text: String::new(),
+                text: String::new().into(),
                 verdict: VerifyVerdict::NotApplicable,
             },
         ),
@@ -2408,7 +2409,7 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
         .iter()
         .flat_map(|message| &message.blocks)
         .filter_map(|block| match block {
-            Block::Text { text } => Some(text.as_str()),
+            Block::Text { text } => Some(text.to_owned_string()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -3123,7 +3124,8 @@ async fn checkpoint_from_another_branch_is_rejected() {
         },
         payload: BranchCreated { branch }
             .to_payload_value()
-            .expect("branch payload"),
+            .expect("branch payload")
+            .into(),
     };
     let mut events = vec![
         scoped(
@@ -4064,7 +4066,7 @@ async fn measure_cold_fold_after_several_compactions() {
             EventPayload::Item(ItemEvent::Completed {
                 item_id: ItemId::new(format!("timing-answer-{cycle}")),
                 item: TurnItem::AgentMessage {
-                    text: format!("assistant turn {cycle}"),
+                    text: format!("assistant turn {cycle}").into(),
                 },
             }),
             PromptRender::Verbatim,
@@ -4075,7 +4077,7 @@ async fn measure_cold_fold_after_several_compactions() {
             assistant_node.as_str(),
             Some(user_node.as_str()),
             NodeKind::AssistantCommit {
-                text: format!("assistant turn {cycle}"),
+                text: format!("assistant turn {cycle}").into(),
                 verdict: VerifyVerdict::NotApplicable,
             },
         ));
@@ -4087,7 +4089,7 @@ async fn measure_cold_fold_after_several_compactions() {
                 EventPayload::RunState(RunState::Thinking),
                 PromptRender::Omit,
             );
-            ignored.payload = serde_json::json!({
+            *ignored.payload = serde_json::json!({
                 "type": "timing_filler",
                 "padding": "0123456789abcdef0123456789abcdef"
             });
@@ -4342,7 +4344,7 @@ async fn crash_after_intent_never_half_substitutes_the_prompt() {
         .iter()
         .flat_map(|message| &message.blocks)
         .filter_map(|block| match block {
-            Block::Text { text } => Some(text.as_str()),
+            Block::Text { text } => Some(text.to_owned_string()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -4356,7 +4358,7 @@ async fn crash_after_intent_never_half_substitutes_the_prompt() {
             .await
             .iter()
             .filter(|event| matches!(
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                serde_json::from_value::<EventPayload>(event.payload.clone().into()),
                 Ok(EventPayload::Item(ItemEvent::Completed {
                     item: TurnItem::Extension { ref kind, .. },
                     ..
@@ -4635,7 +4637,7 @@ async fn journal_keeps_full_tool_output_while_replay_builds_the_same_compact_mod
         .expect("read raw tool journal");
     let stored_preview = stored
         .into_iter()
-        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.into()).ok())
         .find_map(|payload| match payload {
             EventPayload::ToolResult { call_id, result } if call_id == "raw-call" => {
                 Some(result.preview)
@@ -4781,7 +4783,7 @@ async fn branch_agent_and_nonterminal_history_are_excluded_structurally() {
         .iter()
         .flat_map(|message| &message.blocks)
         .filter_map(|block| match block {
-            Block::Text { text } => Some(text.as_str()),
+            Block::Text { text } => Some(text.to_owned_string()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -5017,7 +5019,8 @@ async fn branch_agent_and_nonterminal_history_are_excluded_structurally() {
             },
         }
         .to_payload_value()
-        .expect("branch payload"),
+        .expect("branch payload")
+        .into(),
     });
     StoreHandle::append(&tree_store, &mut tree_events)
         .await
@@ -5229,7 +5232,7 @@ async fn branch_agent_and_nonterminal_history_are_excluded_structurally() {
         .iter()
         .flat_map(|message| &message.blocks)
         .filter_map(|block| match block {
-            Block::Text { text } => Some(text.as_str()),
+            Block::Text { text } => Some(text.to_owned_string()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -5433,7 +5436,8 @@ async fn named_forks_before_and_after_compaction_diverge() {
             },
             payload: BranchCreated { branch: descriptor }
                 .to_payload_value()
-                .expect("branch payload"),
+                .expect("branch payload")
+                .into(),
         });
     }
     StoreHandle::append(&store, &mut events)
@@ -5649,7 +5653,8 @@ async fn nested_lineage_uses_every_owner_ceiling_and_virgin_head() {
             },
             payload: BranchCreated { branch: descriptor }
                 .to_payload_value()
-                .expect("branch payload"),
+                .expect("branch payload")
+                .into(),
         });
     }
     StoreHandle::append(&store, &mut events)
@@ -5712,7 +5717,7 @@ async fn task_facts_reach_the_next_turn_prompt_and_omit_is_the_off_switch() {
             EventPayload::IdleDecayed,
             prompt,
         );
-        fact.payload = payload.to_payload_value().expect("task payload");
+        *fact.payload = payload.to_payload_value().expect("task payload");
         fact
     };
     let started = TaskEventPayload::TaskStarted(TaskStarted {
@@ -6110,7 +6115,7 @@ async fn seed_clean_compaction_history(
                 EventPayload::Item(ItemEvent::Completed {
                     item_id: ItemId::new(format!("{name}-assistant-item-{ordinal}")),
                     item: TurnItem::AgentMessage {
-                        text: assistant_text.clone(),
+                        text: assistant_text.clone().into(),
                     },
                 }),
                 PromptRender::Verbatim,
@@ -6121,7 +6126,7 @@ async fn seed_clean_compaction_history(
                 &assistant_node,
                 Some(&user_node),
                 NodeKind::AssistantCommit {
-                    text: assistant_text,
+                    text: assistant_text.into(),
                     verdict: VerifyVerdict::NotApplicable,
                 },
             ),
@@ -6377,7 +6382,7 @@ async fn structural_selection_replays_from_the_append_only_journal_after_restart
             "structural-replay-assistant-node",
             Some("structural-replay-user-node"),
             NodeKind::AssistantCommit {
-                text: String::new(),
+                text: String::new().into(),
                 verdict: VerifyVerdict::NotApplicable,
             },
         ),
@@ -6427,7 +6432,7 @@ async fn structural_selection_replays_from_the_append_only_journal_after_restart
             "structural-replay-current-assistant-node",
             Some("structural-replay-current-node"),
             NodeKind::AssistantCommit {
-                text: String::new(),
+                text: String::new().into(),
                 verdict: VerifyVerdict::NotApplicable,
             },
         ),
@@ -6500,7 +6505,7 @@ async fn structural_selection_replays_from_the_append_only_journal_after_restart
             "structural-replay-reused-assistant-node",
             Some("structural-replay-reused-user-node"),
             NodeKind::AssistantCommit {
-                text: String::new(),
+                text: String::new().into(),
                 verdict: VerifyVerdict::NotApplicable,
             },
         ),
@@ -6811,7 +6816,7 @@ async fn replacement_summary_source_never_contains_the_prior_summary() {
         .iter()
         .flat_map(|message| &message.blocks)
         .filter_map(|block| match block {
-            Block::Text { text } => Some(text.as_str()),
+            Block::Text { text } => Some(text.to_owned_string()),
             _ => None,
         })
         .collect::<Vec<_>>();

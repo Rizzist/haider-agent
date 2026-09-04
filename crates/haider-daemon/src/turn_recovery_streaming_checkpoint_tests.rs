@@ -80,7 +80,9 @@ fn fact(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("encode recovery fact"),
+        payload: serde_json::to_value(payload)
+            .expect("encode recovery fact")
+            .into(),
     }
 }
 
@@ -203,7 +205,7 @@ async fn daemon_restart_preserves_route_wait_with_partial_and_completed_tool_eff
             EventPayload::Item(ItemEvent::Started {
                 item_id: item_id.clone(),
                 item: TurnItem::AgentMessage {
-                    text: String::new(),
+                    text: String::new().into(),
                 },
             }),
         ),
@@ -451,13 +453,13 @@ async fn daemon_restart_preserves_route_wait_with_partial_and_completed_tool_eff
         .await
         .expect("read recovered journal");
     assert!(events.iter().any(|event| matches!(
-        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        event.payload.decode_event(),
         Ok(EventPayload::RunState(RunState::Waiting {
             reason: WaitReason::NetworkUnavailable
         }))
     )));
     assert!(!events.iter().any(|event| matches!(
-        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        event.payload.decode_event(),
         Ok(EventPayload::RunFailed { .. } | EventPayload::RunState(RunState::Errored))
     )));
 }
@@ -632,7 +634,7 @@ async fn shared_visitor_receives_each_multi_session_page_once() {
             &format!("{name}-post-terminal-hook"),
             EventPayload::RunState(RunState::Done),
         );
-        post_terminal_hook.payload = haider_protocol::hook::HookEventPayload::HookNotice(
+        *post_terminal_hook.payload = haider_protocol::hook::HookEventPayload::HookNotice(
             haider_protocol::hook::HookNotice {
                 hook: Some("post-terminal".into()),
                 digest: None,

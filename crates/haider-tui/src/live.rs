@@ -5652,7 +5652,7 @@ impl LiveDriver {
                     revision,
                     ..
                 }) = haider_protocol::hook::HookEventPayload::from_payload_value(
-                    envelope.payload.clone(),
+                    envelope.payload.to_json_value(),
                 )
                 && revision > model.hooks.revision
                 && let Some(cwd) = self.hooks_cwd.clone()
@@ -5674,9 +5674,10 @@ impl LiveDriver {
         if model.active_session.as_ref() != Some(session) {
             return;
         }
-        let Ok(payload) = serde_json::from_value::<
-            haider_protocol::session::SessionConfigEventPayload,
-        >(envelope.payload.clone()) else {
+        let Ok(payload) = envelope
+            .payload
+            .decode::<haider_protocol::session::SessionConfigEventPayload>()
+        else {
             return;
         };
         match payload {
@@ -5736,9 +5737,7 @@ impl LiveDriver {
     /// `MenuAnswered`/`MenuClosed`, which is the ONLY authority that a
     /// durable answer landed — a correlated echo would be a second one.
     fn record_menu(&mut self, session: &SessionId, envelope: &RawEnvelope) {
-        let Ok(payload) =
-            serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload.clone())
-        else {
+        let Ok(payload) = envelope.payload.decode_event() else {
             return;
         };
         match payload {

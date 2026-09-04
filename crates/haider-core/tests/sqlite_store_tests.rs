@@ -48,7 +48,7 @@ fn provider() -> Arc<FakeProvider> {
 }
 
 fn typed(envelope: &RawEnvelope) -> EventPayload {
-    serde_json::from_value(envelope.payload.clone()).expect("known event payload")
+    serde_json::from_value(envelope.payload.clone().into()).expect("known event payload")
 }
 
 async fn finish_actor(handle: haider_core::HarnessHandle, actor: JoinHandle<()>) {

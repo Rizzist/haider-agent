@@ -136,7 +136,9 @@ async fn e1a_actor_preserves_failed_and_successful_tool_status() {
         let events = store.events(&session).await;
         let payloads = events
             .iter()
-            .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.clone()).ok())
+            .filter_map(|event| {
+                serde_json::from_value::<EventPayload>(event.payload.clone().into()).ok()
+            })
             .collect::<Vec<_>>();
         let completed = payloads
             .iter()
@@ -229,7 +231,7 @@ async fn e1b_refusal_only_is_visible_done_and_nonempty() {
     let refusals = events
         .iter()
         .filter_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into()).ok()
         })
         .filter_map(|payload| match payload {
             EventPayload::Item(ItemEvent::Completed {
@@ -268,7 +270,10 @@ async fn e1b_normal_completion_has_no_refusal_row() {
             .events(&SessionId::new("e1-normal"))
             .await
             .iter()
-            .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.clone()).ok())
+            .filter_map(|event| serde_json::from_value::<EventPayload>(
+                event.payload.clone().into()
+            )
+            .ok())
             .all(|payload| !matches!(
                 payload,
                 EventPayload::Item(ItemEvent::Completed {
@@ -345,7 +350,7 @@ async fn premature_eof_after_content_is_run_failed_not_input_required() {
         .events(&SessionId::new("e1-midstream-eof"))
         .await
         .into_iter()
-        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.into()).ok())
         .collect::<Vec<_>>();
     assert!(payloads.iter().any(|payload| matches!(
         payload,
@@ -418,7 +423,7 @@ async fn e3a_quota_exhaustion_card_has_top_up_and_zero_retries() {
         .events(&SessionId::new("e3-quota-card"))
         .await
         .into_iter()
-        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.into()).ok())
         .collect::<Vec<_>>();
     let presentation = payloads
         .iter()
@@ -480,7 +485,7 @@ async fn e3b_oauth_expired_produces_relogin_card() {
         .events(&session)
         .await
         .into_iter()
-        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.into()).ok())
         .collect::<Vec<_>>();
     let presentation = payloads
         .iter()
@@ -565,7 +570,7 @@ async fn e4a_midstream_failure_journals_incomplete_item_and_choice_card() {
         .events(&SessionId::new("e4-marker"))
         .await
         .into_iter()
-        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.into()).ok())
         .collect::<Vec<_>>();
     assert!(payloads.iter().any(|payload| matches!(
         payload,
@@ -670,7 +675,7 @@ async fn e4a_midstream_failure_preserves_provider_explanation() {
         .events(&SessionId::new("e4-provider-detail"))
         .await
         .into_iter()
-        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.into()).ok())
         .collect::<Vec<_>>();
     let presentations = payloads.iter().filter_map(|payload| match payload {
         EventPayload::Item(ItemEvent::Completed {
@@ -823,7 +828,7 @@ async fn autonomous_partial_stream_preserves_output_without_human_wait() {
         .events(&session)
         .await
         .into_iter()
-        .map(|event| serde_json::from_value::<EventPayload>(event.payload).expect("typed"))
+        .map(|event| serde_json::from_value::<EventPayload>(event.payload.into()).expect("typed"))
         .collect::<Vec<_>>();
     assert!(!payloads.iter().any(|payload| matches!(
         payload,
@@ -946,7 +951,7 @@ async fn recovered_autonomous_partial_stream_continues_without_waiting() {
             .events(&session)
             .await
             .into_iter()
-            .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+            .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.into()).ok())
             .any(|payload| matches!(
                 payload,
                 EventPayload::RunState(RunState::InputRequired { .. })

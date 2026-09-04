@@ -189,18 +189,16 @@ impl World {
                     .expect("read journal");
                 if let Some(opening) = events.into_iter().find(|event| {
                     event.run_id.as_ref() == Some(&run_id)
-                        && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
-                            |payload| {
-                                matches!(
-                                    payload,
-                                    EventPayload::MenuOpened(ref menu)
-                                        if matches!(menu.kind, MenuKind::GraphAbandonConfirm { .. })
-                                )
-                            },
-                        )
+                        && event.payload.decode_event().is_ok_and(|payload| {
+                            matches!(
+                                payload,
+                                EventPayload::MenuOpened(ref menu)
+                                    if matches!(menu.kind, MenuKind::GraphAbandonConfirm { .. })
+                            )
+                        })
                 }) {
                     let EventPayload::MenuOpened(menu) =
-                        serde_json::from_value(opening.payload).expect("typed menu")
+                        serde_json::from_value(opening.payload.into()).expect("typed menu")
                     else {
                         unreachable!();
                     };
@@ -244,9 +242,9 @@ impl World {
                     .expect("read journal");
                 if events.iter().any(|event| {
                     event.run_id.as_ref() == Some(run_id)
-                        && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
-                            |payload| matches!(payload, EventPayload::RunState(RunState::Done)),
-                        )
+                        && event.payload.decode_event().is_ok_and(|payload| {
+                            matches!(payload, EventPayload::RunState(RunState::Done))
+                        })
                 }) {
                     break;
                 }
@@ -264,7 +262,9 @@ impl World {
             .expect("read journal")
             .into_iter()
             .filter_map(|event| {
-                serde_json::from_value::<EventPayload>(event.payload.clone())
+                event
+                    .payload
+                    .decode_event()
                     .ok()
                     .map(|payload| (payload, event.render.prompt))
             })
@@ -443,7 +443,7 @@ async fn graph_evidence_tool_dispatches_to_daemon_gate_authority() {
                 }
                 match message.blocks.as_slice() {
                     [Block::Text { text }] if text.starts_with("GraphBrief:") => {
-                        Some((index, text.as_str()))
+                        Some((index, text.to_owned_string()))
                     }
                     _ => None,
                 }
@@ -559,7 +559,7 @@ async fn outstanding_verify_evidence_allows_a_normal_provider_turn_to_finish() {
     assert!(events.iter().any(|event| {
         event.run_id.as_ref() == Some(&run_id)
             && matches!(
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                event.payload.decode_event(),
                 Ok(EventPayload::RunState(RunState::Done))
             )
     }));

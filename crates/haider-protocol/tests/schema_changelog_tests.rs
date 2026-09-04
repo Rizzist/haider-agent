@@ -128,7 +128,6 @@ fn workspace_kind(payload: &WorkspaceEventPayload) -> &'static str {
     }
 }
 
-
 macro_rules! session_config_kinds {
     ($($pattern:pat => $kind:literal),+ $(,)?) => {
         const SESSION_CONFIG_KINDS: &[&str] = &[$($kind),+];

@@ -829,9 +829,7 @@ async fn foreign_store_cannot_expire_a_target_claimed_core_accept_crash() {
     let mut user_records = 0;
     let mut peer_nodes = 0;
     for envelope in &accepted_events {
-        let Ok(payload) =
-            serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload.clone())
-        else {
+        let Ok(payload) = envelope.payload.decode_event() else {
             continue;
         };
         match payload {
@@ -1542,7 +1540,9 @@ async fn socket_sender_cannot_claim_verified_haider_provenance() {
     let message = events
         .iter()
         .find_map(|event| {
-            serde_json::from_value::<haider_protocol::EventPayload>(event.payload.clone())
+            event
+                .payload
+                .decode_event()
                 .ok()
                 .and_then(|payload| match payload {
                     haider_protocol::EventPayload::PeerMessage(message) => Some(message),
@@ -1708,7 +1708,7 @@ async fn two_daemons_deliver_only_after_the_busy_target_turn_boundary() {
         .expect("target history");
     assert!(
         before.iter().all(|event| !matches!(
-            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            event.payload.decode_event(),
             Ok(EventPayload::PeerMessage(_))
         )),
         "busy target must not receive peer text mid-turn"
@@ -1734,7 +1734,8 @@ async fn two_daemons_deliver_only_after_the_busy_target_turn_boundary() {
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
-            .expect("terminal state JSON"),
+            .expect("terminal state JSON")
+            .into(),
     }];
     target_hub
         .append(&mut terminal)
@@ -1749,7 +1750,7 @@ async fn two_daemons_deliver_only_after_the_busy_target_turn_boundary() {
             .expect("target history");
         let target_received = events.iter().any(|event| {
             matches!(
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                event.payload.decode_event(),
                 Ok(EventPayload::PeerMessage(_))
             )
         });

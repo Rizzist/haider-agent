@@ -308,17 +308,8 @@ pub trait StoreHandle: Send + Sync {
             .collect::<HashSet<_>>();
         let actual = blobs
             .into_iter()
-            .map(|blob| {
-                let computed = ProviderViewBlockRefV1::for_bytes(&blob.bytes);
-                (computed == blob.block).then_some(computed).ok_or_else(|| {
-                    HaiderError::new(
-                        haider_protocol::error::ErrorCode::InvalidArgument,
-                        "provider-view blob does not match its content address",
-                        false,
-                    )
-                })
-            })
-            .collect::<Result<HashSet<_>, _>>()?;
+            .map(|blob| blob.block)
+            .collect::<HashSet<_>>();
         if actual != expected {
             return Err(HaiderError::new(
                 haider_protocol::error::ErrorCode::InvalidArgument,

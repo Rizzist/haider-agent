@@ -87,7 +87,7 @@ fn terminal_main_turn(store: &Store, session_id: &SessionId, suffix: &str) -> (R
         .iter()
         .find_map(|envelope| {
             let EventPayload::NodeCommitted(node) =
-                serde_json::from_value(envelope.payload.clone()).ok()?
+                serde_json::from_value(envelope.payload.clone().into()).ok()?
             else {
                 return None;
             };
@@ -171,7 +171,7 @@ fn raw(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("payload"),
+        payload: serde_json::to_value(payload).expect("payload").into(),
     }
 }
 
@@ -483,7 +483,7 @@ fn branch_turns_parent_stamp_and_advance_only_the_selected_head() {
     assert_eq!(accepted.branch_id, Some(branch_id.clone()));
     for envelope in &envelopes {
         if matches!(
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
             Ok(EventPayload::SessionState(_))
         ) {
             assert_eq!(envelope.branch_id, None);
@@ -495,7 +495,7 @@ fn branch_turns_parent_stamp_and_advance_only_the_selected_head() {
         .iter()
         .find_map(|envelope| {
             let EventPayload::NodeCommitted(node) =
-                serde_json::from_value(envelope.payload.clone()).ok()?
+                serde_json::from_value(envelope.payload.clone().into()).ok()?
             else {
                 return None;
             };
@@ -565,7 +565,7 @@ fn branch_turns_parent_stamp_and_advance_only_the_selected_head() {
         .iter()
         .find_map(|envelope| {
             let EventPayload::NodeCommitted(node) =
-                serde_json::from_value(envelope.payload.clone()).ok()?
+                serde_json::from_value(envelope.payload.clone().into()).ok()?
             else {
                 return None;
             };
@@ -700,7 +700,7 @@ fn a_named_branch_serializes_nonterminal_turns_but_other_branches_may_queue() {
         .iter()
         .find_map(|envelope| {
             let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into()).ok()?
             else {
                 return None;
             };

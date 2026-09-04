@@ -44,7 +44,7 @@ fn raw_task(seq: u64, at_ms: u64, payload: &TaskEventPayload) -> RawEnvelope {
             durable: true,
             prompt: PromptRender::Verbatim,
         },
-        payload: payload.to_payload_value().expect("task payload"),
+        payload: payload.to_payload_value().expect("task payload").into(),
     }
 }
 

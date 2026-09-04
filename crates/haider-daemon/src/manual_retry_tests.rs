@@ -316,7 +316,9 @@ fn envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("serialize test payload"),
+        payload: serde_json::to_value(payload)
+            .expect("serialize test payload")
+            .into(),
     }
 }
 
@@ -372,7 +374,9 @@ async fn wait_for_store_state(
                 .into_iter()
                 .any(|event| {
                     event.run_id.as_ref() == Some(run_id)
-                        && serde_json::from_value::<EventPayload>(event.payload)
+                        && event
+                            .payload
+                            .decode_event()
                             .is_ok_and(|payload| payload == EventPayload::RunState(wanted.clone()))
                 });
             if found {
@@ -400,7 +404,7 @@ async fn wait_for_retrying_event(
                 .find(|event| {
                     event.run_id.as_ref() == Some(run_id)
                         && matches!(
-                            serde_json::from_value::<EventPayload>(event.payload.clone()),
+                            event.payload.decode_event(),
                             Ok(EventPayload::RunState(RunState::Retrying { .. }))
                         )
                 })
@@ -471,10 +475,10 @@ async fn run_retry_terminal_failure_starts_one_fresh_run_on_the_same_user_turn()
     assert_eq!(
         events
             .iter()
-            .filter(
-                |event| serde_json::from_value::<EventPayload>(event.payload.clone())
-                    .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. }))
-            )
+            .filter(|event| event
+                .payload
+                .decode_event()
+                .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. })))
             .count(),
         1,
         "manual retry never commits a second UserMessage"
@@ -483,9 +487,11 @@ async fn run_retry_terminal_failure_starts_one_fresh_run_on_the_same_user_turn()
         events
             .iter()
             .filter(
-                |event| RunRetryEventPayload::from_payload_value(event.payload.clone()).is_ok_and(
-                    |payload| matches!(payload, RunRetryEventPayload::RunRetried { .. })
-                )
+                |event| RunRetryEventPayload::from_payload_value(event.payload.clone().into())
+                    .is_ok_and(|payload| matches!(
+                        payload,
+                        RunRetryEventPayload::RunRetried { .. }
+                    ))
             )
             .count(),
         1
@@ -581,7 +587,9 @@ async fn run_retry_of_failed_retry_reuses_the_original_user_turn() {
         events
             .iter()
             .filter(|event| {
-                serde_json::from_value::<EventPayload>(event.payload.clone())
+                event
+                    .payload
+                    .decode_event()
                     .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. }))
             })
             .count(),
@@ -592,7 +600,7 @@ async fn run_retry_of_failed_retry_reuses_the_original_user_turn() {
         events
             .iter()
             .filter(|event| {
-                RunRetryEventPayload::from_payload_value(event.payload.clone())
+                RunRetryEventPayload::from_payload_value(event.payload.clone().into())
                     .is_ok_and(|payload| matches!(payload, RunRetryEventPayload::RunRetried { .. }))
             })
             .count(),
@@ -650,7 +658,7 @@ async fn run_retry_lost_handoff_recovers_once_after_restart() {
         .expect("accepted retry history")
         .into_iter()
         .find_map(|event| {
-            RunRetryEventPayload::from_payload_value(event.payload)
+            RunRetryEventPayload::from_payload_value(event.payload.into())
                 .is_ok_and(|payload| matches!(payload, RunRetryEventPayload::RunRetried { .. }))
                 .then_some(event.run_id)
                 .flatten()
@@ -808,9 +816,11 @@ async fn run_retry_duplicate_while_live_is_refused_without_a_second_run() {
         events
             .iter()
             .filter(
-                |event| RunRetryEventPayload::from_payload_value(event.payload.clone()).is_ok_and(
-                    |payload| matches!(payload, RunRetryEventPayload::RunRetried { .. })
-                )
+                |event| RunRetryEventPayload::from_payload_value(event.payload.clone().into())
+                    .is_ok_and(|payload| matches!(
+                        payload,
+                        RunRetryEventPayload::RunRetried { .. }
+                    ))
             )
             .count(),
         1,
@@ -971,7 +981,7 @@ async fn run_retry_mid_backoff_wakes_exact_attempt_and_receipt_replay_is_noop() 
         "the natural wait is still pending"
     );
     assert!(matches!(
-        serde_json::from_value::<EventPayload>(retrying_event.payload.clone()),
+        retrying_event.payload.decode_event(),
         Ok(EventPayload::RunState(RunState::Retrying {
             attempt: 2,
             max: 10,
@@ -1036,7 +1046,7 @@ async fn run_retry_mid_backoff_wakes_exact_attempt_and_receipt_replay_is_noop() 
         events
             .iter()
             .filter(|event| {
-                RunRetryEventPayload::from_payload_value(event.payload.clone())
+                RunRetryEventPayload::from_payload_value(event.payload.clone().into())
                     .is_ok_and(|payload| matches!(payload, RunRetryEventPayload::RunRetried { .. }))
             })
             .count(),

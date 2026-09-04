@@ -4,7 +4,9 @@ use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
 use haider_protocol::context::{ContextCompactionTier, ContextEconomy};
-use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+use haider_protocol::envelope::{
+    EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
+};
 use haider_protocol::history::{NodeKind, TreeNode};
 use haider_protocol::ids::{
     AgentId, BranchId, DeviceId, EventId, ItemId, LeaseId, NodeId, RunId, SessionId,
@@ -90,7 +92,7 @@ fn source_turn_for_agent(
         .iter()
         .find(|envelope| {
             matches!(
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
                 Ok(EventPayload::UserMessage { .. })
             )
         })
@@ -100,7 +102,7 @@ fn source_turn_for_agent(
         .iter()
         .find_map(|envelope| {
             let EventPayload::NodeCommitted(TreeNode { node, .. }) =
-                serde_json::from_value(envelope.payload.clone()).ok()?
+                serde_json::from_value(envelope.payload.clone().into()).ok()?
             else {
                 return None;
             };
@@ -126,7 +128,9 @@ fn source_turn_for_agent(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(EventPayload::RunState(RunState::Done)).expect("payload"),
+        payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
+            .expect("payload")
+            .into(),
     }];
     store
         .append_worker(&mut done)
@@ -396,7 +400,8 @@ fn append_provider_view_head_data(
                 item_id: ItemId::new(format!("provider-view-item-{session_id}-{attempt}")),
                 item,
             }))
-            .expect("provider view payload"),
+            .expect("provider view payload")
+            .into(),
         },
         EventEnvelope {
             schema_version: SCHEMA_VERSION,
@@ -421,7 +426,8 @@ fn append_provider_view_head_data(
                     verdict: VerifyVerdict::NotApplicable,
                 },
             }))
-            .expect("provider view head payload"),
+            .expect("provider view head payload")
+            .into(),
         },
     ];
     store
@@ -435,7 +441,7 @@ fn append_provider_view_head_data(
     )
 }
 
-fn fork_audit(envelopes: &[EventEnvelope<serde_json::Value>]) -> SessionForked {
+fn fork_audit(envelopes: &[RawEnvelope]) -> SessionForked {
     envelopes
         .last()
         .and_then(|envelope| SessionForked::from_payload_value(&envelope.payload))
@@ -554,7 +560,7 @@ fn session_fork_keeps_parent_byte_identical_and_replays_idempotently() {
         .find(|envelope| {
             envelope.seq <= seq
                 && matches!(
-                    serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                    serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
                     Ok(EventPayload::RunState(RunState::Queued))
                 )
         })
@@ -1689,7 +1695,7 @@ fn fork_from_named_branch_materializes_only_that_lineage_as_child_main() {
         .iter()
         .find_map(|envelope| {
             let EventPayload::NodeCommitted(node) =
-                serde_json::from_value(envelope.payload.clone()).ok()?
+                serde_json::from_value(envelope.payload.clone().into()).ok()?
             else {
                 return None;
             };
@@ -1715,7 +1721,9 @@ fn fork_from_named_branch_materializes_only_that_lineage_as_child_main() {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(EventPayload::RunState(RunState::Done)).expect("payload"),
+        payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
+            .expect("payload")
+            .into(),
     }];
     store
         .append_worker(&mut done)
@@ -1882,7 +1890,9 @@ fn fork_boundary_closes_each_nonterminal_agent_scope_independently() {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(EventPayload::RunState(state)).expect("run state payload"),
+        payload: serde_json::to_value(EventPayload::RunState(state))
+            .expect("run state payload")
+            .into(),
     };
     let mut scoped_states = [
         scoped_state("fork-root-thinking", None, RunState::Thinking),
@@ -1926,7 +1936,7 @@ fn fork_boundary_closes_each_nonterminal_agent_scope_independently() {
         .filter(|envelope| envelope.run_id.as_ref() == Some(&shared_run))
         .filter(|envelope| {
             matches!(
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
                 Ok(EventPayload::RunState(RunState::Cancelled))
             )
         })

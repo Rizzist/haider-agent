@@ -55,12 +55,12 @@ pub enum Turn {
         seq: u64,
     },
     Assistant {
-        text: String,
+        text: haider_protocol::reply::ReplyText,
         at_ms: u64,
         seq: u64,
     },
     AssistantIncomplete {
-        text: String,
+        text: haider_protocol::reply::ReplyText,
         interruption: ErrorPresentation,
         at_ms: u64,
         seq: u64,
@@ -209,8 +209,7 @@ impl SessionExport {
         let mut pending_tools = HashMap::<(Option<String>, Option<String>, String), usize>::new();
         for envelope in ordered {
             let tool_join = joiner.observe(envelope);
-            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
-            else {
+            let Ok(payload) = envelope.payload.decode_event() else {
                 continue;
             };
             let at_ms = envelope.committed_at_ms;
@@ -312,8 +311,8 @@ impl SessionExport {
             .map(|title| apply_mask(title, masked))
     }
 
-    fn text(&self, raw: &str, masked: bool) -> String {
-        apply_mask(raw, masked)
+    fn text<T: std::fmt::Display + ?Sized>(&self, raw: &T, masked: bool) -> String {
+        apply_mask(&raw.to_string(), masked)
     }
 
     fn foreign_assistant_text(&self, turn: &Turn, masked: bool) -> Option<String> {

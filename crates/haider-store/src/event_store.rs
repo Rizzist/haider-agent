@@ -37,7 +37,8 @@ use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectOutcome, EffectPhase, WorkspaceMutation,
 };
 use haider_protocol::envelope::{
-    EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, envelope_weight_bytes,
+    EventEnvelope, PromptRender, RawEnvelope, RawPayload, RenderTargets, SCHEMA_VERSION,
+    envelope_weight_bytes, write_envelope_messagepack,
 };
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::graph::{
@@ -73,7 +74,9 @@ use haider_protocol::ids::{
     AgentId, ArtifactRef, BranchId, CheckpointId, DeviceId, EffectId, EventId, GraphId,
     GraphRunSetId, ItemId, MenuId, NodeId, RunId, SessionId, WorkspaceRevision,
 };
-use haider_protocol::item::{CommandExecutionOrigin, ItemEvent, TurnItem, UserCommandOriginV1};
+use haider_protocol::item::{
+    CommandExecutionOrigin, ItemDelta, ItemEvent, TurnItem, UserCommandOriginV1,
+};
 use haider_protocol::loom::{
     LoomAgentType, LoomRegistration, LoomRegistryDelta, LoomRegistryDeltaKind,
     LoomRegistryEntryKind, LoomRegistryEntryRef, LoomRegistryRecord, LoomRegistrySnapshot,
@@ -86,6 +89,7 @@ use haider_protocol::permission::PermissionEventPayload;
 use haider_protocol::pipe::{InstructEvidenceRef, TranscriptProjector};
 use haider_protocol::project_instructions::ProjectInstructionsEventPayload;
 use haider_protocol::queue::{QueueChange, QueueDelta, QueueRow};
+use haider_protocol::reply::{ReplyArenaWriter, ReplyText};
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::session::{
     EffortSelected, FastModeSelected, ModelSelected, SessionInteractionModeV1, SessionMetadataV1,
@@ -109,12 +113,15 @@ use haider_protocol::workspace::WorkspaceEventPayload;
 use haider_protocol::{DeliveryMode, EventPayload};
 use rusqlite::{
     Connection, Error as SqliteError, ErrorCode as SqliteErrorCode, OptionalExtension, Transaction,
-    TransactionBehavior, params,
+    TransactionBehavior,
+    blob::ZeroBlob,
+    params,
     types::{Value as SqlValue, ValueRef},
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -2585,6 +2592,7 @@ impl Store {
                 envelopes.extend(page);
             }
         }
+        canonicalize_reply_page(&mut envelopes);
         Ok(envelopes)
     }
 
@@ -2595,6 +2603,7 @@ impl Store {
         for session_id in self.session_ids()? {
             envelopes.extend(self.journal_replay(&session_id)?);
         }
+        canonicalize_reply_page(&mut envelopes);
         Ok(envelopes)
     }
 
@@ -5165,13 +5174,12 @@ impl Store {
             .map_err(map_sqlite_error)?;
         let event_id = process_signal_event_id(&command.session_id, &command.signal.effect_id);
         if let Some(envelope) = load_envelope_by_event_id(&transaction, &event_id)? {
-            let existing = serde_json::from_value::<EventPayload>(envelope.payload.clone())
-                .map_err(|error| {
-                    corrupt(format!(
-                        "process signal event {} does not decode: {error}",
-                        envelope.event_id
-                    ))
-                })?;
+            let existing = envelope.payload.decode_event().map_err(|error| {
+                corrupt(format!(
+                    "process signal event {} does not decode: {error}",
+                    envelope.event_id
+                ))
+            })?;
             let EventPayload::ProcessSignalRecorded(existing_signal) = existing else {
                 return Err(graph_evidence_error(
                     ErrorCode::InvalidArgument,
@@ -6011,7 +6019,7 @@ impl Store {
                 "cache observation names no durable collapsed child evidence",
             )
         })?;
-        let evidence = match serde_json::from_value::<EventPayload>(collapse.payload) {
+        let evidence = match collapse.payload.decode_event() {
             Ok(EventPayload::EvidenceRecorded(evidence)) => evidence,
             _ => {
                 return Err(child_cache_error(
@@ -8160,7 +8168,7 @@ impl Store {
             )
             .map_err(map_sqlite_error)?;
 
-        let payload = serde_json::to_value(EventPayload::SessionState(SessionState::Created))
+        let payload = RawPayload::from_event(EventPayload::SessionState(SessionState::Created))
             .map_err(|error| {
                 store_error(
                     ErrorCode::InvalidArgument,
@@ -8189,27 +8197,7 @@ impl Store {
             },
             payload,
         };
-        let envelope_bytes = encode_envelope(&envelope).map_err(|error| {
-            store_error(
-                ErrorCode::InvalidArgument,
-                format!("cannot serialize session-created envelope: {error}"),
-                false,
-            )
-        })?;
-        transaction
-            .execute(
-                "INSERT INTO events(
-                    session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
-                 ) VALUES (?1, 1, ?2, ?3, ?4, ?5)",
-                params![
-                    command.session_id.as_str(),
-                    envelope_bytes,
-                    command.event_id.as_str(),
-                    created_at_sql,
-                    payload_kind(&envelope),
-                ],
-            )
-            .map_err(map_sqlite_error)?;
+        insert_encoded_event(transaction, &envelope)?;
         enqueue_hook_dispatch(transaction, &envelope)?;
         transaction
             .execute(
@@ -8876,7 +8864,8 @@ impl Store {
                     format!("cannot serialize session-fork audit fact: {error}"),
                     false,
                 )
-            })?,
+            })?
+            .into(),
         };
         fork_resident_bytes = fork_resident_bytes.saturating_add(envelope_weight_bytes(&audit));
         ensure_fork_resident_budget(fork_resident_bytes)?;
@@ -12706,7 +12695,7 @@ impl Store {
             ));
         }
         if !matches!(
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            envelope.payload.decode_event(),
             Ok(EventPayload::SessionState(SessionState::Idle { .. }))
         ) {
             return Err(store_error(
@@ -12995,7 +12984,9 @@ impl Store {
             .iter()
             .rev()
             .find_map(|envelope| {
-                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                envelope
+                    .payload
+                    .decode_event()
                     .ok()
                     .and_then(|payload| match payload {
                         EventPayload::CheckpointRecorded(checkpoint) => Some(checkpoint),
@@ -13173,6 +13164,7 @@ impl Store {
                 break;
             }
         }
+        canonicalize_reply_page(&mut envelopes);
         Ok(envelopes)
     }
 
@@ -13267,6 +13259,7 @@ impl Store {
         loop {
             let page = self.read(session, since_seq, REPLAY_PAGE_SIZE)?;
             if page.is_empty() {
+                canonicalize_reply_page(&mut replay);
                 return Ok(replay);
             }
             since_seq = page.last().map_or(since_seq, |envelope| envelope.seq);
@@ -14050,8 +14043,7 @@ fn graph_evidence_provenance(
                     "invalid graph signal provenance envelope in session {session_id}: {error}"
                 ))
             })?;
-            if let Ok(EventPayload::ProcessSignalRecorded(signal)) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
+            if let Ok(EventPayload::ProcessSignalRecorded(signal)) = envelope.payload.decode_event()
             {
                 let key = (
                     signal.run_id.clone(),
@@ -14112,7 +14104,7 @@ fn graph_evidence_provenance(
                 effect,
                 workspace_mutation: Some(mutation),
                 ..
-            })) = serde_json::from_value::<EventPayload>(envelope.payload)
+            })) = envelope.payload.decode_event()
             else {
                 continue;
             };
@@ -14258,6 +14250,7 @@ fn load_graph_reduction_envelopes(
             ))
         })?);
     }
+    canonicalize_reply_page(&mut envelopes);
     Ok(envelopes)
 }
 
@@ -15331,9 +15324,7 @@ fn validate_computer_observation_effect(
         if envelope.run_id.as_ref() != Some(&command.run_id) {
             continue;
         }
-        let Ok(EventPayload::Effect(phase)) =
-            serde_json::from_value::<EventPayload>(envelope.payload)
-        else {
+        let Ok(EventPayload::Effect(phase)) = envelope.payload.decode_event() else {
             continue;
         };
         match phase {
@@ -15550,7 +15541,7 @@ fn load_workspace_mutation(
             outcome,
             workspace_mutation: Some(mutation),
             ..
-        })) = serde_json::from_value::<EventPayload>(envelope.payload)
+        })) = envelope.payload.decode_event()
         else {
             continue;
         };
@@ -15600,7 +15591,7 @@ fn load_workspace_mutation(
                 ))
             })?;
             let Ok(EventPayload::Effect(EffectPhase::Intent(intent))) =
-                serde_json::from_value::<EventPayload>(intent_envelope.payload)
+                intent_envelope.payload.decode_event()
             else {
                 continue;
             };
@@ -15840,9 +15831,7 @@ fn load_child_graph_attachments(
                 "invalid child attachment envelope in session {session_id}: {error}"
             ))
         })?;
-        if let Ok(EventPayload::ChildGraphAttached(item)) =
-            serde_json::from_value::<EventPayload>(envelope.payload)
-        {
+        if let Ok(EventPayload::ChildGraphAttached(item)) = envelope.payload.decode_event() {
             attached.push(item);
         }
     }
@@ -15861,9 +15850,7 @@ fn child_graph_is_descendant(
     }
     let mut next = HashMap::<GraphId, GraphId>::new();
     for envelope in load_graph_reduction_envelopes(connection, session_id)? {
-        if let Ok(EventPayload::GraphSuperseded(replaced)) =
-            serde_json::from_value::<EventPayload>(envelope.payload)
-        {
+        if let Ok(EventPayload::GraphSuperseded(replaced)) = envelope.payload.decode_event() {
             next.insert(replaced.old, replaced.new);
         }
     }
@@ -15937,9 +15924,7 @@ fn load_child_template_observations(
         let envelope = decode_envelope_column(row, 0).map_err(|error| {
             corrupt(format!("invalid child cache observation envelope: {error}"))
         })?;
-        if let Ok(EventPayload::ChildTemplateObserved(item)) =
-            serde_json::from_value::<EventPayload>(envelope.payload)
-        {
+        if let Ok(EventPayload::ChildTemplateObserved(item)) = envelope.payload.decode_event() {
             observed.push((envelope.session_id, item));
         }
     }
@@ -15996,7 +15981,7 @@ fn validate_child_template_observation_provenance(
     let reject = |message| child_cache_error(error_kind, message);
     let collapse = load_envelope(connection, session_id, observed.collapse_evidence_seq)?
         .ok_or_else(|| reject("cached observation names no collapsed evidence"))?;
-    let evidence = match serde_json::from_value::<EventPayload>(collapse.payload) {
+    let evidence = match collapse.payload.decode_event() {
         Ok(EventPayload::EvidenceRecorded(evidence)) => evidence,
         _ => return Err(reject("cached observation sequence is not graph evidence")),
     };
@@ -16161,7 +16146,7 @@ fn load_process_signal(
             "referenced process signal is not recorded in this session",
         )
     })?;
-    let signal = match serde_json::from_value::<EventPayload>(envelope.payload) {
+    let signal = match envelope.payload.decode_event() {
         Ok(EventPayload::ProcessSignalRecorded(signal)) => signal,
         _ => {
             return Err(corrupt(format!("event {event_id} is not a process signal")));
@@ -16297,9 +16282,7 @@ fn graph_attempt_opened_seq(
         .into_iter()
         .rev()
     {
-        let Ok(EventPayload::GraphAttemptOpened(opened)) =
-            serde_json::from_value::<EventPayload>(envelope.payload)
-        else {
+        let Ok(EventPayload::GraphAttemptOpened(opened)) = envelope.payload.decode_event() else {
             continue;
         };
         if opened.graph_id == *graph_id && opened.node == node && opened.attempt == attempt {
@@ -16347,8 +16330,7 @@ fn process_signals_since(
         if envelope.branch_id.as_ref() != branch_id {
             continue;
         }
-        let Ok(EventPayload::ProcessSignalRecorded(signal)) =
-            serde_json::from_value::<EventPayload>(envelope.payload)
+        let Ok(EventPayload::ProcessSignalRecorded(signal)) = envelope.payload.decode_event()
         else {
             continue;
         };
@@ -16478,7 +16460,7 @@ fn process_effect_outcome_seq(
             ))
         })?;
         let Ok(EventPayload::Effect(EffectPhase::Outcome { effect, .. })) =
-            serde_json::from_value::<EventPayload>(envelope.payload)
+            envelope.payload.decode_event()
         else {
             continue;
         };
@@ -16554,9 +16536,7 @@ fn validate_process_signal_provenance(
                 "invalid effect envelope in session {session_id}: {error}"
             ))
         })?;
-        let Ok(EventPayload::Effect(phase)) =
-            serde_json::from_value::<EventPayload>(envelope.payload)
-        else {
+        let Ok(EventPayload::Effect(phase)) = envelope.payload.decode_event() else {
             continue;
         };
         match phase {
@@ -17853,7 +17833,9 @@ fn main_timeline_retrying_event_id(
     })?;
     let main_timeline = envelope.branch_id.is_none() && envelope.agent_id.is_none();
     let exact_run = envelope.run_id.as_ref() == Some(run_id);
-    let retrying = serde_json::from_value::<EventPayload>(envelope.payload)
+    let retrying = envelope
+        .payload
+        .decode_event()
         .is_ok_and(|payload| matches!(payload, EventPayload::RunState(RunState::Retrying { .. })));
     Ok((main_timeline && exact_run && retrying).then_some(envelope.event_id))
 }
@@ -18053,9 +18035,7 @@ fn latest_tree_head(
         if envelope.branch_id.as_ref() != branch_id || envelope.agent_id.as_ref() != agent_id {
             continue;
         }
-        if let Ok(EventPayload::NodeCommitted(node)) =
-            serde_json::from_value::<EventPayload>(envelope.payload)
-        {
+        if let Ok(EventPayload::NodeCommitted(node)) = envelope.payload.decode_event() {
             return Ok(Some(node.node));
         }
     }
@@ -18073,7 +18053,7 @@ fn unstamped_command_envelope(
     payload: EventPayload,
     prompt: PromptRender,
 ) -> StoreResult<RawEnvelope> {
-    let payload = serde_json::to_value(payload).map_err(|error| {
+    let payload = RawPayload::from_event(payload).map_err(|error| {
         store_error(
             ErrorCode::InvalidArgument,
             format!("cannot serialize command envelope payload: {error}"),
@@ -18100,7 +18080,7 @@ fn unstamped_raw_command_envelope(
     run_id: Option<RunId>,
     device_id: DeviceId,
     worker_generation: u64,
-    payload: serde_json::Value,
+    payload: impl Into<RawPayload>,
     prompt: PromptRender,
 ) -> StoreResult<RawEnvelope> {
     Ok(EventEnvelope {
@@ -18122,7 +18102,7 @@ fn unstamped_raw_command_envelope(
             durable: true,
             prompt,
         },
-        payload,
+        payload: payload.into(),
     })
 }
 
@@ -19222,7 +19202,7 @@ fn augment_workflow_graph_envelopes(
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload: payload_json,
+            payload: payload_json.into(),
         });
     }
     Ok(())
@@ -19414,13 +19394,6 @@ fn append_transaction_envelopes(
         .map_err(|_| corrupt("database contains a negative event sequence"))?
         .checked_add(1)
         .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
-    let mut insert = transaction
-        .prepare_cached(
-            "INSERT INTO events(
-                session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )
-        .map_err(map_sqlite_error)?;
     for (offset, envelope) in envelopes.iter_mut().enumerate() {
         let offset = u64::try_from(offset).map_err(|_| corrupt("event batch is too large"))?;
         envelope.seq = first
@@ -19430,29 +19403,12 @@ fn append_transaction_envelopes(
         stamp_queue_delta(envelope)?;
         stamp_workspace_mutation(transaction, envelope)?;
         let checkpoint = stamp_checkpoint_record(transaction, envelope)?;
-        let bytes = encode_envelope(envelope).map_err(|error| {
-            store_error(
-                ErrorCode::InvalidArgument,
-                format!("cannot serialize command envelope: {error}"),
-                false,
-            )
-        })?;
-        insert
-            .execute(params![
-                session_id.as_str(),
-                to_sqlite_integer(envelope.seq)?,
-                bytes,
-                envelope.event_id.as_str(),
-                to_sqlite_integer(committed_at_ms)?,
-                payload_kind(envelope),
-            ])
-            .map_err(map_sqlite_error)?;
+        insert_encoded_event(transaction, envelope)?;
         enqueue_hook_dispatch(transaction, envelope)?;
         if let Some(checkpoint) = checkpoint.as_ref() {
             project_checkpoint_record(transaction, envelope, checkpoint)?;
         }
     }
-    drop(insert);
     update_run_head_projection_after_append(transaction, session_id, envelopes)?;
     update_workflow_graph_projection_after_append(transaction, session_id, envelopes)?;
     if envelopes
@@ -19818,7 +19774,7 @@ fn resolve_menu_transaction(
 
     let committed_at_ms = now_ms()?;
     let event_id = menu_resolution_event_id(command);
-    let payload = serde_json::to_value(EventPayload::MenuAnswered(command.answer.clone()))
+    let payload = RawPayload::from_event(EventPayload::MenuAnswered(command.answer.clone()))
         .map_err(|error| {
             store_error(
                 ErrorCode::InvalidArgument,
@@ -19961,7 +19917,7 @@ fn resolve_menu_transaction(
                     durable: true,
                     prompt: PromptRender::Omit,
                 },
-                payload: serde_json::to_value(payload).map_err(|error| {
+                payload: RawPayload::from_event(payload).map_err(|error| {
                     store_error(
                         ErrorCode::InvalidArgument,
                         format!("cannot serialize graph menu settlement: {error}"),
@@ -20041,7 +19997,7 @@ fn resolve_menu_transaction(
                             durable: true,
                             prompt: PromptRender::Omit,
                         },
-                        payload: serde_json::to_value(payload).map_err(|error| {
+                        payload: RawPayload::from_event(payload).map_err(|error| {
                             store_error(
                                 ErrorCode::InvalidArgument,
                                 format!("cannot serialize graph finalization settlement: {error}"),
@@ -20346,7 +20302,7 @@ fn historical_resolution(
                 command.session_id
             ))
         })?;
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+        let Ok(payload) = envelope.payload.decode_event() else {
             continue;
         };
         match payload {
@@ -20487,6 +20443,7 @@ impl EventStore for Store {
             )?;
             envelopes.push(envelope);
         }
+        canonicalize_reply_page(&mut envelopes);
         Ok(envelopes)
     }
 
@@ -20554,7 +20511,7 @@ fn stamp_provider_view_attempt(
             ));
         }
         *data = stored_data.clone();
-        envelope.payload = serde_json::to_value(payload).map_err(|error| {
+        envelope.payload = RawPayload::from_event(payload).map_err(|error| {
             store_error(
                 ErrorCode::Internal,
                 format!("provider-view attempt envelope could not serialize: {error}"),
@@ -20667,41 +20624,16 @@ fn append_envelopes_in_transaction(
     let last_seq = first_seq
         .checked_add(batch_len - 1)
         .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
-    {
-        let mut insert = transaction
-            .prepare_cached(
-                "INSERT INTO events(
-                    session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            )
-            .map_err(map_sqlite_error)?;
-        for (seq, envelope) in (first_seq..=last_seq).zip(envelopes.iter_mut()) {
-            envelope.seq = seq;
-            envelope.committed_at_ms = committed_at_ms;
-            stamp_queue_delta(envelope)?;
-            stamp_workspace_mutation(transaction, envelope)?;
-            let checkpoint = stamp_checkpoint_record(transaction, envelope)?;
-            let envelope_bytes = encode_envelope(envelope).map_err(|error| {
-                store_error(
-                    ErrorCode::InvalidArgument,
-                    format!("cannot serialize event envelope: {error}"),
-                    false,
-                )
-            })?;
-            insert
-                .execute(params![
-                    session.as_str(),
-                    to_sqlite_integer(seq)?,
-                    envelope_bytes,
-                    envelope.event_id.as_str(),
-                    committed_at_sql,
-                    payload_kind(envelope),
-                ])
-                .map_err(map_sqlite_error)?;
-            enqueue_hook_dispatch(transaction, envelope)?;
-            if let Some(checkpoint) = checkpoint.as_ref() {
-                project_checkpoint_record(transaction, envelope, checkpoint)?;
-            }
+    for (seq, envelope) in (first_seq..=last_seq).zip(envelopes.iter_mut()) {
+        envelope.seq = seq;
+        envelope.committed_at_ms = committed_at_ms;
+        stamp_queue_delta(envelope)?;
+        stamp_workspace_mutation(transaction, envelope)?;
+        let checkpoint = stamp_checkpoint_record(transaction, envelope)?;
+        insert_encoded_event(transaction, envelope)?;
+        enqueue_hook_dispatch(transaction, envelope)?;
+        if let Some(checkpoint) = checkpoint.as_ref() {
+            project_checkpoint_record(transaction, envelope, checkpoint)?;
         }
     }
     update_run_head_projection_after_append(transaction, &session, envelopes)?;
@@ -20785,7 +20717,7 @@ fn stamp_queue_delta(envelope: &mut RawEnvelope) -> StoreResult<()> {
         row.created_at_ms = envelope.committed_at_ms;
     }
     envelope.payload =
-        serde_json::to_value(EventPayload::QueueChanged(delta)).map_err(|error| {
+        RawPayload::from_event(EventPayload::QueueChanged(delta)).map_err(|error| {
             store_error(
                 ErrorCode::InvalidArgument,
                 format!("cannot serialize stamped queue delta: {error}"),
@@ -20815,7 +20747,7 @@ fn stamp_workspace_mutation(
         {
             validate_workspace_mutation_intent(transaction, envelope, &effect, &mutation)?;
             stamp_workspace_mutation_fields(envelope.seq, &effect, &mut mutation);
-            envelope.payload = serde_json::to_value(EventPayload::Effect(EffectPhase::Outcome {
+            envelope.payload = RawPayload::from_event(EventPayload::Effect(EffectPhase::Outcome {
                 effect,
                 outcome,
                 freshness,
@@ -20851,13 +20783,16 @@ fn stamp_workspace_mutation(
     validate_workspace_mutation_intent(transaction, envelope, &effect, &mutation)?;
     stamp_workspace_mutation_fields(envelope.seq, &effect, &mut mutation);
     completed.workspace_mutation = Some(mutation);
-    envelope.payload = completed.to_payload_value().map_err(|error| {
-        store_error(
-            ErrorCode::InvalidArgument,
-            format!("cannot serialize background workspace mutation: {error}"),
-            false,
-        )
-    })?;
+    envelope.payload = completed
+        .to_payload_value()
+        .map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize background workspace mutation: {error}"),
+                false,
+            )
+        })?
+        .into();
     Ok(())
 }
 
@@ -20950,7 +20885,7 @@ fn stamp_checkpoint_record(
             outcome: _,
             workspace_mutation: Some(mutation),
             ..
-        })) = serde_json::from_value::<EventPayload>(candidate.payload)
+        })) = candidate.payload.decode_event()
         else {
             continue;
         };
@@ -20984,14 +20919,14 @@ fn stamp_checkpoint_record(
     checkpoint.seq = envelope.seq;
     checkpoint.workspace_revision = Some(revision);
     checkpoint.recorded_at_ms = envelope.committed_at_ms;
-    envelope.payload = serde_json::to_value(EventPayload::CheckpointRecorded(checkpoint.clone()))
+    envelope.payload = RawPayload::from_event(EventPayload::CheckpointRecorded(checkpoint.clone()))
         .map_err(|error| {
-        store_error(
-            ErrorCode::InvalidArgument,
-            format!("cannot serialize stamped checkpoint: {error}"),
-            false,
-        )
-    })?;
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize stamped checkpoint: {error}"),
+                false,
+            )
+        })?;
     Ok(Some(checkpoint))
 }
 
@@ -21106,7 +21041,7 @@ fn validate_workspace_mutation_intent(
             ))
         })?;
         let Ok(EventPayload::Effect(EffectPhase::Intent(intent))) =
-            serde_json::from_value::<EventPayload>(candidate.payload)
+            candidate.payload.decode_event()
         else {
             continue;
         };
@@ -23024,16 +22959,11 @@ fn ensure_fork_resident_budget(resident_bytes: usize) -> StoreResult<()> {
 fn preflight_session_fork_storage(root: &Path, envelopes: &[RawEnvelope]) -> StoreResult<()> {
     let mut envelope_bytes = 0_u64;
     for envelope in envelopes {
-        let encoded = encode_envelope(envelope).map_err(|error| {
-            store_error(
-                ErrorCode::InvalidArgument,
-                format!("cannot estimate forked envelope storage: {error}"),
-                false,
-            )
-        })?;
+        let encoded_len = encoded_envelope_len(envelope)
+            .map_err(|error| store_io_error("estimate forked envelope storage", error))?;
         envelope_bytes = checked_fork_storage_add(
             envelope_bytes,
-            u64::try_from(encoded.len()).map_err(|_| fork_storage_overflow())?,
+            u64::try_from(encoded_len).map_err(|_| fork_storage_overflow())?,
         )?;
     }
 
@@ -23100,17 +23030,30 @@ fn add_projected_pipe_rows(
     bytes: &mut u64,
 ) -> StoreResult<()> {
     for row in rows {
-        let encoded = serde_json::to_vec(&row).map_err(|error| {
+        #[derive(Default)]
+        struct CountingWriter(u64);
+        impl std::io::Write for CountingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self
+                    .0
+                    .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                    .ok_or_else(|| std::io::Error::other("Pipe row size overflow"))?;
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut encoded = CountingWriter::default();
+        row.write_json(&mut encoded).map_err(|error| {
             store_error(
                 ErrorCode::InvalidArgument,
                 format!("cannot estimate forked Pipe row storage: {error}"),
                 false,
             )
         })?;
-        let row_bytes = u64::try_from(encoded.len())
-            .map_err(|_| fork_storage_overflow())?
-            .checked_add(1)
-            .ok_or_else(fork_storage_overflow)?;
+        let row_bytes = encoded.0.checked_add(1).ok_or_else(fork_storage_overflow)?;
         *bytes = checked_fork_storage_add(*bytes, row_bytes)?;
     }
     Ok(())
@@ -23180,28 +23123,7 @@ fn fork_run_boundary_event_id(
 }
 
 fn insert_forked_envelope(connection: &Connection, envelope: &RawEnvelope) -> StoreResult<()> {
-    let bytes = encode_envelope(envelope).map_err(|error| {
-        store_error(
-            ErrorCode::InvalidArgument,
-            format!("cannot serialize forked envelope: {error}"),
-            false,
-        )
-    })?;
-    connection
-        .execute(
-            "INSERT INTO events(
-                session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                envelope.session_id.as_str(),
-                to_sqlite_integer(envelope.seq)?,
-                bytes,
-                envelope.event_id.as_str(),
-                to_sqlite_integer(envelope.committed_at_ms)?,
-                payload_kind(envelope),
-            ],
-        )
-        .map_err(map_sqlite_error)?;
+    insert_encoded_event(connection, envelope)?;
     Ok(())
 }
 
@@ -23242,7 +23164,7 @@ fn append_fork_boundary_closures(
             .map_err(|_| corrupt("forked journal is too large"))?
             .checked_add(1)
             .ok_or_else(|| corrupt("forked journal sequence space is exhausted"))?;
-        let mut payload = serde_json::to_value(EventPayload::RunState(RunState::Cancelled))
+        let mut payload = RawPayload::from_event(EventPayload::RunState(RunState::Cancelled))
             .map_err(|error| {
                 store_error(
                     ErrorCode::InvalidArgument,
@@ -23311,7 +23233,7 @@ fn append_fork_boundary_closures(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(EventPayload::SessionState(SessionState::Idle {
+        payload: RawPayload::from_event(EventPayload::SessionState(SessionState::Idle {
             interrupted: false,
         }))
         .map_err(|error| {
@@ -23892,8 +23814,76 @@ fn parse_store_synchronous(value: &str) -> StoreResult<StoreSynchronous> {
     }
 }
 
+#[cfg(test)]
 fn encode_envelope(envelope: &RawEnvelope) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-    rmp_serde::to_vec_named(envelope)
+    let mut encoded = Vec::new();
+    write_envelope_messagepack(&mut encoded, envelope)
+        .map_err(|error| rmp_serde::encode::Error::Syntax(error.to_string()))?;
+    Ok(encoded)
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    len: usize,
+}
+
+impl io::Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.len = self
+            .len
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("encoded envelope length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encoded_envelope_len(envelope: &RawEnvelope) -> io::Result<usize> {
+    let mut counter = CountingWriter::default();
+    write_envelope_messagepack(&mut counter, envelope)?;
+    Ok(counter.len)
+}
+
+/// Inserts an event through SQLite's incremental BLOB API. The serializer is
+/// run once to count the exact byte length and once to fill the zeroblob; its
+/// only scratch allocation is the small reply-free envelope skeleton.
+fn insert_encoded_event(connection: &Connection, envelope: &RawEnvelope) -> StoreResult<()> {
+    let encoded_len = encoded_envelope_len(envelope)
+        .map_err(|error| store_io_error("measure event envelope", error))?;
+    let blob_len = i32::try_from(encoded_len).map_err(|_| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            "encoded event envelope exceeds SQLite incremental BLOB limits",
+            false,
+        )
+    })?;
+    connection
+        .execute(
+            "INSERT INTO events(
+                session_id, seq, envelope_json, event_id, committed_at_ms, payload_kind
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                envelope.session_id.as_str(),
+                to_sqlite_integer(envelope.seq)?,
+                ZeroBlob(blob_len),
+                envelope.event_id.as_str(),
+                to_sqlite_integer(envelope.committed_at_ms)?,
+                payload_kind(envelope),
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+    let row_id = connection.last_insert_rowid();
+    let mut blob = connection
+        .blob_open("main", "events", "envelope_json", row_id, false)
+        .map_err(map_sqlite_error)?;
+    write_envelope_messagepack(&mut blob, envelope)
+        .map_err(|error| store_io_error("write event envelope", error))?;
+    blob.flush()
+        .map_err(|error| store_io_error("flush event envelope", error))?;
+    Ok(())
 }
 
 fn payload_kind(envelope: &RawEnvelope) -> &str {
@@ -23989,6 +23979,7 @@ fn read_reducer_page_with_connection(
             break;
         }
     }
+    canonicalize_reply_page(&mut envelopes);
     Ok(envelopes)
 }
 
@@ -24061,6 +24052,99 @@ fn decode_envelope_column(row: &rusqlite::Row<'_>, index: usize) -> Result<RawEn
         ValueRef::Null => Err("encoded envelope has SQLite NULL storage class".to_owned()),
         ValueRef::Integer(_) => Err("encoded envelope has SQLite INTEGER storage class".to_owned()),
         ValueRef::Real(_) => Err("encoded envelope has SQLite REAL storage class".to_owned()),
+    }
+}
+
+/// Rebinds independently decoded delta/completed/node reply scalars to one
+/// arena per item within a replay page. The stored bytes remain authoritative;
+/// equality is checked before a repeated completed/node scalar is released.
+fn canonicalize_reply_page(envelopes: &mut [RawEnvelope]) {
+    type Scope = (Option<RunId>, Option<BranchId>, Option<AgentId>);
+    type ActiveKey = (Scope, ItemId);
+    type CompletedKey = (Scope, u8, usize, blake3::Hash);
+
+    fn lane(item: &TurnItem) -> Option<(u8, &ReplyText)> {
+        match item {
+            TurnItem::AgentMessage { text } | TurnItem::IncompleteAgentMessage { text, .. } => {
+                Some((0, text))
+            }
+            TurnItem::Reasoning { summary } => Some((1, summary)),
+            _ => None,
+        }
+    }
+
+    fn content_key(scope: &Scope, lane: u8, text: &ReplyText) -> Option<CompletedKey> {
+        Some((scope.clone(), lane, text.len(), text.arena_digest()?))
+    }
+
+    fn writer_for(lane: u8) -> ReplyArenaWriter {
+        if lane == 0 {
+            ReplyArenaWriter::new().with_standard_provider_json_views()
+        } else {
+            ReplyArenaWriter::new()
+        }
+    }
+
+    let mut active = HashMap::<ActiveKey, (u8, ReplyArenaWriter)>::new();
+    let mut completed = HashMap::<CompletedKey, ReplyText>::new();
+    for envelope in envelopes {
+        let scope = (
+            envelope.run_id.clone(),
+            envelope.branch_id.clone(),
+            envelope.agent_id.clone(),
+        );
+        let Ok(event) = envelope.payload.decode_event() else {
+            continue;
+        };
+        let replacement = match event {
+            EventPayload::Item(ItemEvent::Started { item_id, item }) => {
+                let Some((lane, text)) = lane(&item) else {
+                    continue;
+                };
+                let mut writer = writer_for(lane);
+                let range = writer.append_shared(text);
+                active.insert((scope, item_id), (lane, writer));
+                Some(range)
+            }
+            EventPayload::Item(ItemEvent::Delta { item_id, delta }) => {
+                let (inferred_lane, text) = match &delta {
+                    ItemDelta::Text { text } => (0, text),
+                    ItemDelta::Reasoning { text } => (1, text),
+                    _ => continue,
+                };
+                let (_, writer) = active
+                    .entry((scope, item_id))
+                    .or_insert_with(|| (inferred_lane, writer_for(inferred_lane)));
+                Some(writer.append_shared(text))
+            }
+            EventPayload::Item(ItemEvent::Completed { item_id, item }) => {
+                let Some((item_lane, stored)) = lane(&item) else {
+                    continue;
+                };
+                let canonical = active
+                    .remove(&(scope.clone(), item_id))
+                    .map(|(_, writer)| writer.seal())
+                    .filter(|canonical| canonical == stored)
+                    .unwrap_or_else(|| stored.clone());
+                if let Some(key) = content_key(&scope, item_lane, &canonical) {
+                    completed.insert(key, canonical.clone());
+                }
+                Some(canonical)
+            }
+            EventPayload::NodeCommitted(node) => {
+                let NodeKind::AssistantCommit { text, .. } = node.kind else {
+                    continue;
+                };
+                content_key(&scope, 0, &text)
+                    .and_then(|key| completed.get(&key))
+                    .filter(|canonical| *canonical == &text)
+                    .cloned()
+            }
+            _ => None,
+        };
+        if let Some(text) = replacement {
+            let _ = envelope.payload.replace_reply_text(text);
+        }
     }
 }
 
@@ -25423,7 +25507,7 @@ mod reducer_filter_tests {
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload,
+            payload: payload.into(),
         }
     }
 
@@ -25776,7 +25860,7 @@ mod run_head_projection_tests {
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload,
+            payload: payload.into(),
         }
     }
 
@@ -25817,9 +25901,7 @@ mod run_head_projection_tests {
             let Some(run_id) = envelope.run_id.clone() else {
                 continue;
             };
-            let Ok(EventPayload::RunState(state)) =
-                serde_json::from_value::<EventPayload>(envelope.payload.clone())
-            else {
+            let Ok(EventPayload::RunState(state)) = envelope.payload.decode_event() else {
                 continue;
             };
             if states
@@ -25842,7 +25924,7 @@ mod run_head_projection_tests {
                 continue;
             };
             if let Ok(RunRetryEventPayload::RunRetried { prompt_run_id, .. }) =
-                RunRetryEventPayload::from_payload_value(envelope.payload.clone())
+                RunRetryEventPayload::from_payload_value(envelope.payload.clone().into())
             {
                 let head = runs
                     .entry(run_id.clone())
@@ -25860,8 +25942,7 @@ mod run_head_projection_tests {
                 head.prompt_run_id = Some(prompt_run_id);
                 continue;
             }
-            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
-            else {
+            let Ok(payload) = envelope.payload.decode_event() else {
                 continue;
             };
             match payload {
@@ -26587,7 +26668,8 @@ mod streaming_usage_checkpoint_tests {
                     "auth_scope": "api_key",
                     "cache_epoch": "epoch-1"
                 }
-            }),
+            })
+            .into(),
         }
     }
 
@@ -26618,7 +26700,8 @@ mod streaming_usage_checkpoint_tests {
             "fork_seq": 2,
             "mode": "fork",
             "context_epoch": "fresh"
-        });
+        })
+        .into();
         store.append(&mut envelope).expect("append fork audit");
     }
 
@@ -26790,7 +26873,7 @@ mod m2d_law_tests {
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload: serde_json::to_value(payload).expect("serialize M2d law fact"),
+            payload: RawPayload::from_event(payload).expect("serialize M2d law fact"),
         }
     }
 
@@ -26913,7 +26996,8 @@ mod memory_projection_tests {
             payload: serde_json::to_value(EventPayload::SessionState(SessionState::Idle {
                 interrupted: false,
             }))
-            .expect("encode idle state"),
+            .expect("encode idle state")
+            .into(),
         }
     }
 

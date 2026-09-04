@@ -48,12 +48,12 @@ fn checkpoint_command_effect_batch_keeps_outcome_before_checkpoint() {
 
     assert_eq!(envelopes.len(), 5);
     assert!(matches!(
-        serde_json::from_value::<EventPayload>(envelopes[3].payload.clone())
+        serde_json::from_value::<EventPayload>(envelopes[3].payload.clone().into())
             .expect("outcome decodes"),
         EventPayload::Effect(EffectPhase::Outcome { .. })
     ));
     assert!(matches!(
-        serde_json::from_value::<EventPayload>(envelopes[4].payload.clone())
+        serde_json::from_value::<EventPayload>(envelopes[4].payload.clone().into())
             .expect("checkpoint decodes"),
         EventPayload::CheckpointRecorded(_)
     ));

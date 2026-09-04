@@ -862,7 +862,7 @@ fn provider_request_attempts(
         .iter()
         .filter(|envelope| envelope.run_id.as_ref() == Some(run_id))
         .filter_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                 .ok()
                 .and_then(|payload| match payload {
                     EventPayload::Item(ItemEvent::Completed { item, .. }) => {
@@ -888,7 +888,8 @@ async fn wait_for_delegated_question(client: &mut UdsClient, run_id: &RunId) -> 
             if envelope.run_id.as_ref() != Some(run_id) {
                 continue;
             }
-            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.into())
+            else {
                 continue;
             };
             match payload {
@@ -949,12 +950,12 @@ async fn wait_for_cancelled_child_reap(
             )
             .await;
             let cancelled = journal.iter().position(|envelope| {
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into()).is_ok_and(
                     |payload| matches!(payload, EventPayload::RunState(RunState::Cancelled)),
                 )
             });
             let idle = journal.iter().position(|envelope| {
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into()).is_ok_and(
                     |payload| {
                         matches!(
                             payload,
@@ -1045,7 +1046,7 @@ async fn events_until_any_terminal(
                 if envelope.run_id.as_ref() != Some(run_id) {
                     continue;
                 }
-                let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+                let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.into()) else {
                     continue;
                 };
                 let terminal = match &payload {
@@ -1092,12 +1093,16 @@ async fn wait_for_session_idle(client: &mut UdsClient, session_id: &SessionId) {
             if &envelope.session_id != session_id {
                 continue;
             }
-            if serde_json::from_value::<EventPayload>(envelope.payload).is_ok_and(|payload| {
-                matches!(
-                    payload,
-                    EventPayload::SessionState(haider_protocol::state::SessionState::Idle { .. })
-                )
-            }) {
+            if serde_json::from_value::<EventPayload>(envelope.payload.into()).is_ok_and(
+                |payload| {
+                    matches!(
+                        payload,
+                        EventPayload::SessionState(
+                            haider_protocol::state::SessionState::Idle { .. }
+                        )
+                    )
+                },
+            ) {
                 return;
             }
         }
@@ -1136,7 +1141,8 @@ async fn cancel_and_collect_terminal(
                     ..
                 } => response_seen = true,
                 WireFrame::Event { envelope, .. } if envelope.run_id.as_ref() == Some(&run_id) => {
-                    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload)
+                    let Ok(payload) =
+                        serde_json::from_value::<EventPayload>(envelope.payload.into())
                     else {
                         continue;
                     };
@@ -1293,7 +1299,8 @@ async fn submit_turn_allow_always(
             if envelope.run_id.as_ref() != Some(&run_id) {
                 continue;
             }
-            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.into())
+            else {
                 continue;
             };
             if let EventPayload::MenuOpened(menu) = &payload
@@ -1942,7 +1949,7 @@ async fn headless_workflow_resumes_after_daemon_crash_between_stages() {
     .await;
     let replay_terminal = replay.iter().filter_map(|envelope| {
         (envelope.run_id.as_ref() == Some(&run_id))
-            .then(|| serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok())
+            .then(|| serde_json::from_value::<EventPayload>(envelope.payload.clone().into()).ok())
             .flatten()
             .and_then(|payload| match payload {
                 EventPayload::RunState(state) if state.is_terminal() => Some(state),
@@ -2089,7 +2096,7 @@ async fn workflow_recovery_after_budget_admission_preserves_spend_and_ordinal() 
                     if envelope.run_id.as_ref() != Some(&run_id) {
                         continue;
                     }
-                    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+                    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.into()) else {
                         continue;
                     };
                     match payload {
@@ -2132,7 +2139,7 @@ async fn workflow_recovery_after_budget_admission_preserves_spend_and_ordinal() 
         .iter()
         .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
         .filter_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into()).ok()
         })
         .collect::<Vec<_>>();
     let replay_failure = replay_payloads.iter().find_map(|payload| match payload {
@@ -2190,7 +2197,7 @@ async fn workflow_recovery_after_budget_admission_preserves_spend_and_ordinal() 
         .iter()
         .filter(|envelope| envelope.run_id.as_ref() == Some(&run_id))
         .filter_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                 .ok()
                 .and_then(|payload| match payload {
                     EventPayload::Usage(usage) => Some(usage),
@@ -2722,7 +2729,7 @@ async fn cancelling_process_exec_kills_the_real_process_group() {
                         WireFrame::Event { envelope, .. }
                             if envelope.run_id.as_ref() == Some(&run) =>
                         {
-                            match serde_json::from_value::<EventPayload>(envelope.payload) {
+                            match serde_json::from_value::<EventPayload>(envelope.payload.into()) {
                                 Ok(EventPayload::RunFailed { code, message, .. }) => {
                                     startup_failure = Some((code, message));
                                 }
@@ -3439,7 +3446,7 @@ async fn manually_cancelled_running_child_releases_parent() {
             let events = journal
                 .into_iter()
                 .filter(|envelope| envelope.run_id.as_ref() == Some(&parent_run))
-                .filter_map(|envelope| serde_json::from_value(envelope.payload).ok())
+                .filter_map(|envelope| serde_json::from_value(envelope.payload.into()).ok())
                 .collect::<Vec<EventPayload>>();
             let terminal = events.iter().any(|payload| {
                 matches!(
@@ -3632,7 +3639,7 @@ async fn fork_from_prompt_preserves_source_cache_and_privilege_boundaries() {
         .iter()
         .find_map(|envelope| {
             matches!(
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
                 Ok(EventPayload::UserMessage { text, .. }) if text == "editable second prompt"
             )
             .then_some(envelope.seq)
@@ -3640,7 +3647,7 @@ async fn fork_from_prompt_preserves_source_cache_and_privilege_boundaries() {
         .expect("selected source prompt has a durable sequence");
     assert!(source_before.iter().any(|envelope| {
         envelope.run_id.as_ref() == Some(&second_run)
-            && serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            && serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                 .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Done))
     }));
 
@@ -3698,7 +3705,7 @@ async fn fork_from_prompt_preserves_source_cache_and_privilege_boundaries() {
     .await;
     assert!(!child_replay.iter().any(|envelope| {
         matches!(
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
             Ok(EventPayload::UserMessage { text, .. }) if text == "editable second prompt"
         )
     }));
@@ -3931,7 +3938,7 @@ async fn terminal_child_run_without_session_idle_still_releases_parent() {
     .await;
     assert!(queued_response.iter().any(|envelope| {
         envelope.run_id.as_ref() == Some(&queued_run)
-            && serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            && serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                 .is_ok_and(|payload| matches!(payload, EventPayload::RunState(RunState::Queued)))
     }));
     let (parent_events, child_journal) =
@@ -3944,7 +3951,7 @@ async fn terminal_child_run_without_session_idle_still_releases_parent() {
                 let events = journal
                     .into_iter()
                     .filter(|envelope| envelope.run_id.as_ref() == Some(&parent_run))
-                    .filter_map(|envelope| serde_json::from_value(envelope.payload).ok())
+                    .filter_map(|envelope| serde_json::from_value(envelope.payload.into()).ok())
                     .collect::<Vec<EventPayload>>();
                 let terminal = events
                     .iter()
@@ -3986,7 +3993,7 @@ async fn terminal_child_run_without_session_idle_still_releases_parent() {
             {
                 return None;
             }
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                 .is_ok_and(|payload| matches!(payload, EventPayload::RunState(RunState::Done)))
                 .then_some(envelope.seq)
         })
@@ -3994,32 +4001,30 @@ async fn terminal_child_run_without_session_idle_still_releases_parent() {
     assert!(
         child_journal.iter().any(|envelope| {
             envelope.run_id.as_ref() == Some(&queued_run)
-                && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
-                    |payload| {
+                && serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
+                    .is_ok_and(|payload| {
                         matches!(
                             payload,
                             EventPayload::RunState(
                                 RunState::Thinking | RunState::Streaming | RunState::RunningTool
                             )
                         )
-                    },
-                )
+                    })
         }),
         "queued child run did not keep the session active"
     );
     assert!(
         !child_journal.iter().any(|envelope| {
             envelope.seq > child_terminal_seq
-                && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
-                    |payload| {
+                && serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
+                    .is_ok_and(|payload| {
                         matches!(
                             payload,
                             EventPayload::SessionState(
                                 haider_protocol::state::SessionState::Idle { .. }
                             )
                         )
-                    },
-                )
+                    })
         }),
         "child emitted Idle after the first run terminal, invalidating the regression shape"
     );

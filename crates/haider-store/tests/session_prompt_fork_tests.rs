@@ -121,7 +121,7 @@ fn accept_turn_with(
         .iter()
         .find(|envelope| {
             matches!(
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
                 Ok(EventPayload::UserMessage { .. })
             )
         })
@@ -131,7 +131,7 @@ fn accept_turn_with(
         .iter()
         .find_map(|envelope| {
             let EventPayload::NodeCommitted(node) =
-                serde_json::from_value(envelope.payload.clone()).ok()?
+                serde_json::from_value(envelope.payload.clone().into()).ok()?
             else {
                 return None;
             };
@@ -191,7 +191,9 @@ fn raw(
             durable: true,
             prompt,
         },
-        payload: serde_json::to_value(payload).expect("encode fixture payload"),
+        payload: serde_json::to_value(payload)
+            .expect("encode fixture payload")
+            .into(),
     }
 }
 
@@ -1753,7 +1755,7 @@ fn replace_committed_payload(
         .into_iter()
         .find(|envelope| envelope.seq == seq)
         .expect("corruption target");
-    envelope.payload = payload;
+    *envelope.payload = payload;
     let connection =
         rusqlite::Connection::open(store.database_path()).expect("open corruption fixture db");
     connection

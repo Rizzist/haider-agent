@@ -240,7 +240,7 @@ async fn direct_rpc_submit(
             .into_iter()
             .any(|envelope| {
                 envelope.run_id.as_ref() == Some(&run_id)
-                    && serde_json::from_value::<EventPayload>(envelope.payload).is_ok_and(
+                    && serde_json::from_value::<EventPayload>(envelope.payload.into()).is_ok_and(
                         |payload| {
                             matches!(
                                 payload,

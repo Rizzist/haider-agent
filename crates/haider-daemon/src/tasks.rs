@@ -952,7 +952,7 @@ impl TaskFacade {
                     continue;
                 };
                 if let Ok(haider_protocol::EventPayload::RunState(state)) =
-                    serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload)
+                    envelope.payload.decode_event()
                 {
                     states.insert(run_id, (state, envelope.branch_id, envelope.seq));
                 }
@@ -1115,7 +1115,7 @@ impl TaskFacade {
                 durable: true,
                 prompt,
             },
-            payload,
+            payload: payload.into(),
         }
     }
 }

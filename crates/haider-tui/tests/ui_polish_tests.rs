@@ -85,7 +85,10 @@ fn throughput_pill_is_compact_and_carries_the_rate() {
     // PILL_WIDTH strip and μ duplicates the settled headline number.
     assert!(pill.contains("126 tps"), "{pill}");
     assert!(pill.contains("▁▂▃▄▅▆"), "{pill}");
-    assert!(!pill.contains('μ'), "μ dropped from the compact widget: {pill}");
+    assert!(
+        !pill.contains('μ'),
+        "μ dropped from the compact widget: {pill}"
+    );
     assert!(!pill.contains("Throughput"), "no verbose label: {pill}");
     assert!(
         !pill.contains("p95"),

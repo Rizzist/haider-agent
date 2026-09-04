@@ -81,7 +81,7 @@ fn envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     }
 }
 
@@ -113,7 +113,10 @@ fn worker_append_accepts_project_instruction_fact_for_an_active_run() {
     )];
     store.append_worker(&mut batch).expect("worker fact append");
     let read = store.read(&session_id, 0, 32).expect("read journal");
-    assert_eq!(read.last().expect("fact event").payload, payload);
+    assert_eq!(
+        read.last().expect("fact event").payload.to_json_value(),
+        payload
+    );
     assert_eq!(
         read.last().expect("fact event").render.prompt,
         PromptRender::Omit

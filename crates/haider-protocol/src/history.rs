@@ -5,6 +5,7 @@ use crate::agent::ChildReport;
 use crate::ids::{AgentId, ArtifactRef, NodeId};
 use crate::peer::PeerMessage;
 use crate::provider::FinishReason;
+use crate::reply::ReplyText;
 use crate::tool::AttachmentBlock;
 use crate::verify::VerifyVerdict;
 use serde::{Deserialize, Serialize};
@@ -37,7 +38,7 @@ pub enum NodeKind {
         message: PeerMessage,
     },
     AssistantCommit {
-        text: String,
+        text: ReplyText,
         /// The turn's verification verdict — never an absence (§9.2).
         verdict: VerifyVerdict,
     },

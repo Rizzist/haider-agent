@@ -656,7 +656,9 @@ fn envelope(session_id: &SessionId, event: &str, payload: EventPayload) -> RawEn
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("payload serializes"),
+        payload: serde_json::to_value(payload)
+            .expect("payload serializes")
+            .into(),
     }
 }
 
@@ -980,7 +982,8 @@ fn append_permission_checkpoint(
                 attachments: Vec::new(),
                 mode: haider_protocol::DeliveryMode::Queue,
             })
-            .expect("user payload"),
+            .expect("user payload")
+            .into(),
             ..envelope(session_id, "template-user", EventPayload::IdleDecayed)
         },
         EventEnvelope {
@@ -996,21 +999,26 @@ fn append_permission_checkpoint(
                     status: ToolStatus::InProgress,
                 },
             }))
-            .expect("item payload"),
+            .expect("item payload")
+            .into(),
             ..envelope(session_id, "template-item", EventPayload::IdleDecayed)
         },
         EventEnvelope {
             run_id: Some(run_id.clone()),
             worker_generation: generation,
             event_id: EventId::new(format!("menu-{run_id}")),
-            payload: serde_json::to_value(EventPayload::MenuOpened(menu)).expect("menu payload"),
+            payload: serde_json::to_value(EventPayload::MenuOpened(menu))
+                .expect("menu payload")
+                .into(),
             ..envelope(session_id, "template-menu", EventPayload::IdleDecayed)
         },
         EventEnvelope {
             run_id: Some(run_id.clone()),
             worker_generation: generation,
             event_id: EventId::new(format!("state-{run_id}")),
-            payload: serde_json::to_value(EventPayload::RunState(state)).expect("state payload"),
+            payload: serde_json::to_value(EventPayload::RunState(state))
+                .expect("state payload")
+                .into(),
             ..envelope(session_id, "template-state", EventPayload::IdleDecayed)
         },
     ];
@@ -1100,7 +1108,7 @@ async fn recovery_dual_reads_historical_and_canonical_permission_states() {
     for session_id in [&old_session, &new_session] {
         let events = recovered.read(session_id, 0, 64).await.expect("read");
         assert!(!events.into_iter().any(|event| {
-            serde_json::from_value::<EventPayload>(event.payload).is_ok_and(
+            event.payload.decode_event().is_ok_and(
                 |payload| matches!(payload, EventPayload::RunState(state) if state.is_terminal()),
             )
         }));

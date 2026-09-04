@@ -197,7 +197,7 @@ fn raw_workflow_started(session: SessionId, seq: u64) -> RawEnvelope {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: started.to_payload_value().expect("workflow payload"),
+        payload: started.to_payload_value().expect("workflow payload").into(),
     }
 }
 

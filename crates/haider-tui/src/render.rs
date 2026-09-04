@@ -331,16 +331,60 @@ fn cache_transcript_entry_window(
     }
 }
 
-fn indexed_agent_line<'a>(text: &'a str, starts: &[u32], index: usize) -> &'a str {
+fn indexed_agent_line(
+    text: &haider_protocol::reply::ReplyText,
+    starts: &[u32],
+    index: usize,
+) -> String {
     let start = usize::try_from(starts[index]).unwrap_or(0);
     let end = starts
         .get(index + 1)
         .and_then(|offset| usize::try_from(*offset).ok())
         .unwrap_or(text.len());
-    text.get(start..end)
-        .unwrap_or_default()
-        .strip_suffix('\n')
-        .unwrap_or_else(|| text.get(start..end).unwrap_or_default())
+    bounded_agent_line(text, start, end)
+}
+
+/// Materializes at most the renderer's extreme-line budget from an arena
+/// range. A single pathological logical line must not recreate a full reply
+/// allocation merely to truncate it immediately afterward.
+fn bounded_agent_line(
+    text: &haider_protocol::reply::ReplyText,
+    start: usize,
+    end: usize,
+) -> String {
+    let Some(line) = text.slice(start..end) else {
+        return String::new();
+    };
+    let mut chars = 0_usize;
+    let mut bytes = 0_usize;
+    let mut truncated = false;
+    line.visit_strs(|segment| {
+        if truncated {
+            return;
+        }
+        for character in segment.chars() {
+            if chars == EXTREME_LOGICAL_LINE_CHARS {
+                truncated = true;
+                break;
+            }
+            chars = chars.saturating_add(1);
+            bytes = bytes.saturating_add(character.len_utf8());
+        }
+    });
+    let visible = if truncated {
+        line.slice(0..bytes).unwrap_or_default()
+    } else {
+        line
+    };
+    let mut visible = visible.to_owned_string();
+    if !truncated {
+        if visible.ends_with('\n') {
+            visible.pop();
+        }
+    } else {
+        visible.push_str(" ⋯ extreme line truncated · /export expands raw text");
+    }
+    visible
 }
 
 fn extreme_agent_body_lines(
@@ -356,19 +400,6 @@ fn extreme_agent_body_lines(
             Span::styled("▏ ", theme.rail_style()),
         ]))];
     }
-    let capped;
-    let source_line = if source_line.len() > EXTREME_LOGICAL_LINE_CHARS {
-        capped = format!(
-            "{} ⋯ extreme line truncated · /export expands raw text",
-            source_line
-                .chars()
-                .take(EXTREME_LOGICAL_LINE_CHARS)
-                .collect::<String>()
-        );
-        capped.as_str()
-    } else {
-        source_line
-    };
     let mut markdown = crate::md::render_markdown(source_line)
         .into_iter()
         .next()
@@ -395,7 +426,7 @@ fn extreme_agent_body_lines(
 /// intersecting the requested row window are parsed, wrapped, and retained.
 fn cache_extreme_agent_entry(
     block: &ItemBlock,
-    text: &str,
+    text: &haider_protocol::reply::ReplyText,
     theme: &Theme,
     width: u16,
     window: Option<(u64, u64)>,
@@ -403,7 +434,8 @@ fn cache_extreme_agent_entry(
     let budget = (width as usize).saturating_sub(3);
     let starts = &block.agent_line_starts;
     if starts.is_empty() {
-        let lines = extreme_agent_body_lines(text, true, block.streaming, theme, budget);
+        let text = bounded_agent_line(text, 0, text.len());
+        let lines = extreme_agent_body_lines(&text, true, block.streaming, theme, budget);
         let height = 2u64.saturating_add(u64::try_from(lines.len()).unwrap_or(u64::MAX));
         return CachedTranscriptEntry {
             retained_height: u64::try_from(lines.len()).unwrap_or(u64::MAX),
@@ -424,7 +456,7 @@ fn cache_extreme_agent_entry(
         .iter()
         .map(|&index| {
             let height = extreme_agent_body_lines(
-                indexed_agent_line(text, starts, index),
+                &indexed_agent_line(text, starts, index),
                 index == last,
                 block.streaming,
                 theme,
@@ -486,7 +518,7 @@ fn cache_extreme_agent_entry(
     }
     for index in first..end {
         lines.extend(extreme_agent_body_lines(
-            indexed_agent_line(text, starts, index),
+            &indexed_agent_line(text, starts, index),
             index == last,
             block.streaming,
             theme,
@@ -9796,10 +9828,14 @@ fn render_aura(
                         ),
                     ]));
                     let budget = (transcript_area.width as usize).saturating_sub(3);
+                    let (mut text, truncated) = text.to_owned_prefix(EXTREME_LOGICAL_LINE_CHARS);
+                    if truncated {
+                        text.push_str(" ⋯ /export expands raw text");
+                    }
                     let body = if block.streaming {
                         wrap_body(&format!("{text}▮"), budget.max(1))
                     } else {
-                        wrap_body(text, budget.max(1))
+                        wrap_body(&text, budget.max(1))
                     };
                     for row in body {
                         lines.push(Line::from(vec![
@@ -13213,7 +13249,8 @@ fn item_lines<'a>(
                     Span::styled("▏ ", theme.rail_style()),
                 ]));
             } else {
-                let mut md_lines = crate::md::render_markdown(text);
+                let text = text.to_owned_string();
+                let mut md_lines = crate::md::render_markdown(&text);
                 if block.streaming
                     && let Some(tail) = md_lines.last_mut()
                 {
@@ -13265,7 +13302,11 @@ fn item_lines<'a>(
             ]));
             let budget = (width as usize).saturating_sub(3);
             if budget > 0 {
-                for markdown_line in crate::md::render_markdown(text) {
+                let (mut text, truncated) = text.to_owned_prefix(EXTREME_LOGICAL_LINE_CHARS);
+                if truncated {
+                    text.push_str(" ⋯ /export expands raw text");
+                }
+                for markdown_line in crate::md::render_markdown(&text) {
                     for row in crate::md::wrap_spans(&markdown_line.spans, budget) {
                         let mut spans =
                             vec![Span::raw(" "), Span::styled("▏ ", theme.rail_style())];
@@ -13289,7 +13330,17 @@ fn item_lines<'a>(
         TurnItem::Reasoning { summary } => {
             lines.push(Line::from(vec![
                 Span::styled(" · ", theme.faint_style()),
-                Span::styled(summary.as_str(), theme.dim_style()),
+                Span::styled(
+                    {
+                        let (mut text, truncated) =
+                            summary.to_owned_prefix(EXTREME_LOGICAL_LINE_CHARS);
+                        if truncated {
+                            text.push_str(" ⋯ /export expands raw text");
+                        }
+                        text
+                    },
+                    theme.dim_style(),
+                ),
             ]));
         }
         TurnItem::ToolCall {

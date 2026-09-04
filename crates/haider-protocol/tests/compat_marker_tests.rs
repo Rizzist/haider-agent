@@ -35,7 +35,7 @@ fn envelope(seq: u64, run: &str, payload: serde_json::Value) -> RawEnvelope {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     }
 }
 
@@ -47,7 +47,7 @@ fn assistant_commit(seq: u64, run: &str, text: &str) -> RawEnvelope {
             node: NodeId::new(format!("node-{seq}")),
             parent: None,
             kind: NodeKind::AssistantCommit {
-                text: text.to_owned(),
+                text: text.to_owned().into(),
                 verdict: VerifyVerdict::Unverified,
             },
         }))
@@ -62,7 +62,7 @@ fn item_completed(seq: u64, run: &str, text: &str) -> RawEnvelope {
         serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
             item_id: ItemId::new(format!("item-{seq}")),
             item: TurnItem::AgentMessage {
-                text: text.to_owned(),
+                text: text.to_owned().into(),
             },
         }))
         .expect("item serializes"),
