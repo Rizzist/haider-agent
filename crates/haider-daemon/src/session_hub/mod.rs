@@ -1136,22 +1136,28 @@ struct HubInner {
     resident_windows: Mutex<HashMap<SessionId, ResidentWindowState>>,
 }
 
-/// What a release may do to the prompt cache.
+/// What a release does to the prompt cache.
 ///
-/// The two arms are not "soft" and "hard": they differ in what the session is
-/// about to do next. An idle or window release ends the turn, so the bodies go
-/// and the next prompt is rebuilt by replay. A compaction release lands
-/// mid-turn, immediately before the continuation compiles the post-cut window,
-/// so the cache is trimmed to its compiled prefixes instead.
+/// The arms differ by how soon this session compiles a prompt again, because
+/// eviction is only cheap when nothing needs the bodies back. Full eviction
+/// makes the next compile replay the journal from zero; trimming keeps the
+/// compiled prefixes and drops what precedes them.
 #[derive(Clone, Copy)]
-enum DerivedStateEpoch {
-    /// The turn ended. Drop the bodies; keep the evicted shell whose
-    /// compaction keys and saved checkpoint cursors still describe this
-    /// context.
-    TurnEnded,
-    /// A semantic compaction replaced the context and the run continues on
-    /// the new window.
-    Compacted,
+enum PromptCacheDisposition {
+    /// Nothing has touched this session for the idle delay. Drop the bodies;
+    /// the shell keeps the compaction keys and saved checkpoint cursors that
+    /// still describe this context.
+    EvictBodies,
+    /// The session is still working: a compaction just replaced the context
+    /// mid-turn, or a continuously hot session hit its resident-turn window.
+    /// Either way the next prompt compiles within milliseconds, so a full
+    /// eviction would only buy a replay.
+    ///
+    /// MEASURED: evicting at the 50-turn window cut instead cost
+    /// 23,233,076 B against 20,808,208 B over 200 uncompacted turns
+    /// (N=2/side), because each cut forced a full replay that rebuilt every
+    /// envelope it had just dropped.
+    TrimToPrefixes,
 }
 
 #[derive(Default)]
@@ -2366,17 +2372,17 @@ impl SessionHub {
         &self,
         session_id: &SessionId,
         head_seq: u64,
-        epoch: DerivedStateEpoch,
+        disposition: PromptCacheDisposition,
         phase: &str,
     ) {
-        let prompt_bytes = match epoch {
-            DerivedStateEpoch::TurnEnded => {
+        let prompt_bytes = match disposition {
+            PromptCacheDisposition::EvictBodies => {
                 self.inner
                     .prompt_history
                     .evict_session_bodies(session_id)
                     .await
             }
-            DerivedStateEpoch::Compacted => {
+            PromptCacheDisposition::TrimToPrefixes => {
                 self.inner
                     .prompt_history
                     .compact_session_history(session_id)
@@ -2415,7 +2421,7 @@ impl SessionHub {
             observe_bytes,
             dead_budget_runs,
             allocator_bytes,
-            hard_epoch = matches!(epoch, DerivedStateEpoch::Compacted),
+            trimmed = matches!(disposition, PromptCacheDisposition::TrimToPrefixes),
             phase,
             "released all journal-reconstructible session state"
         );
@@ -2455,7 +2461,7 @@ impl SessionHub {
         self.release_session_derived_state(
             session_id,
             head_seq,
-            DerivedStateEpoch::Compacted,
+            PromptCacheDisposition::TrimToPrefixes,
             "compaction_released",
         )
         .await;
@@ -2522,7 +2528,7 @@ impl SessionHub {
                 .release_session_derived_state(
                     &task_session,
                     idle_seq,
-                    DerivedStateEpoch::TurnEnded,
+                    PromptCacheDisposition::EvictBodies,
                     "idle_released",
                 )
                 .await;
@@ -8204,7 +8210,7 @@ impl HubStoreHandle {
                     .release_session_derived_state(
                         &self.session_id,
                         envelope.seq,
-                        DerivedStateEpoch::TurnEnded,
+                        PromptCacheDisposition::TrimToPrefixes,
                         "window_released",
                     )
                     .await;

@@ -591,7 +591,8 @@ def main() -> int:
         "settled_growth": {
             "median_bytes": growth_median,
             "mad_bytes": growth_mad,
-            "median_bytes_per_turn": growth_median / args.turns,
+            "median_bytes_per_turn": growth_median
+            / (args.turns * args.fleet_sessions),
         },
         "compaction_return": None
         if compaction_return is None
