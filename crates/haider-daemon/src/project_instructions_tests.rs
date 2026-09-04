@@ -371,10 +371,14 @@ fn shared_policy_pins_inspect_edit_verify_contract_and_worked_example() {
         "the action contract must precede its worked example"
     );
     assert_eq!(policy.len(), EXPECTED_POLICY_BYTES);
-    assert!(
-        EXPECTED_POLICY_BYTES > PRE_ACTBIAS_POLICY_BYTES,
-        "the deliberate action contract must increase the shared policy"
-    );
+    // Compile-time pin: the deliberate action contract must increase the
+    // shared policy (clippy::assertions_on_constants wants the const form).
+    const {
+        assert!(
+            EXPECTED_POLICY_BYTES > PRE_ACTBIAS_POLICY_BYTES,
+            "the deliberate action contract must increase the shared policy"
+        );
+    }
 }
 
 /// CACHE ITEM 962. The tool pack represents the daemon's grant-filtered
