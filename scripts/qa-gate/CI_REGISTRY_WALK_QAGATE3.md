@@ -177,3 +177,21 @@ Read against the final uncommitted tree before verification. “checked: none”
 - #94 fixed — pipe drain grace is exactly two 500 ms process batches (1,000 ms), with the arithmetic adjacent to the constant; other monitor deadlines retain named budgets
 - #95 checked — monitor runners wait outside negotiated connections, and control requests are one-shot; no retained RPC link gains an unserviced wait
 - #96 checked — no warm-retention or turn-performance policy changed
+
+## v0.0.970 chocofix delta walk
+
+- #1-#18 checked: none — release packaging metadata/workflow only; no product protocol, migration, or dependency surface changed
+- #19 fixed — Python compilation, six focused packaging regressions, workflow YAML parsing, full workspace tests/Clippy, and `git diff --check` cover the changed surface
+- #20 checked — the Rust baseline was updated and verified unchanged at 4,748; the six new Python tests are separately CI-wired and no Rust test was removed or weakened
+- #21-#40 checked: none — no affected product surface
+- #41 fixed — every packaging regression uses a short `TemporaryDirectory` root and bounded synthetic archive
+- #42-#63 checked: none — no affected runtime or product surface
+- #64 checked — runtime binaries are untouched; the mandatory sibling prebuild succeeded
+- #65-#70 checked: none — no affected product surface
+- #71 checked — real npm packing plus synthetic Chocolatey nupkg inspection cover the exact publishable archive shapes; Windows CI performs the real `choco pack`
+- #72-#73 checked — no native discovery or fixed-byte product read window changed
+- #74 fixed — packaging tests use synthetic data and never read host credentials, HOME, or profiles
+- #75-#76 checked: none — no affected product surface
+- #77 checked — no unsafe code was added and workspace/tests Clippy passes with warnings denied; the standalone guard's existing four-test mismatch is confined to untouched `haider-tui` (`git diff --quiet -- crates/haider-tui` passes), so this lane does not rewrite that unrelated baseline
+- #78-#93 checked: none — no affected product surface
+- #94-#96 checked — no deadline, negotiated-connection wait, or turn-performance policy changed

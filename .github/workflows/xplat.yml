@@ -59,6 +59,9 @@ jobs:
       - name: check (all targets; report every reachable error)
         if: matrix.phase == 'check'
         run: cargo check --workspace --all-targets --locked --keep-going --target ${{ matrix.target }}
+      - name: release packaging regression tests (Windows)
+        if: matrix.phase == 'check' && runner.os == 'Windows'
+        run: python -m unittest scripts/tests/test_release_packaging.py
       - name: clippy (all targets; report every reachable error)
         if: matrix.phase == 'clippy'
         run: cargo clippy --workspace --all-targets --locked --keep-going --target ${{ matrix.target }} -- -D warnings

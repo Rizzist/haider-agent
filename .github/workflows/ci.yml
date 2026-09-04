@@ -50,6 +50,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
       - name: repo guards
         run: cargo run -p xtask -- check
+      - name: release packaging regression tests
+        run: python3 -m unittest scripts/tests/test_release_packaging.py
       - name: self-test
         env:
           # The CLI-only self-test embeds the same deep actor future that
