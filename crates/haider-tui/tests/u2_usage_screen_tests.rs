@@ -389,7 +389,8 @@ fn masked_runs_cap_at_eight_without_padding_short_runs() {
 
 // ---- per-state rendering ---------------------------------------------
 
-/// 954 scope law: `s` cycles accounts ⇄ global. Global renders ONE line
+/// 970 scope law: one `s` from accounts opens the reset calendar, then the
+/// established global → history → models sequence continues. Global renders ONE line
 /// per account (every tab, not just selected), headlining the window with
 /// the LEAST runway, and keeps the shared THIS DEVICE totals footer; the
 /// per-provider detail (window names like `five_hour` on their own lines)
@@ -405,6 +406,13 @@ fn s_cycles_scope_and_global_renders_compact_overview() {
     assert!(
         rows.join("\n").contains("· accounts"),
         "the screen opens on the accounts scope"
+    );
+
+    model.handle(key(KeyCode::Char('s')));
+    let (rows, _) = draw(&model, 110, 30);
+    assert!(
+        rows.join("\n").contains("· calendar"),
+        "one s from accounts opens the reset calendar"
     );
 
     model.handle(key(KeyCode::Char('s')));
@@ -428,14 +436,14 @@ fn s_cycles_scope_and_global_renders_compact_overview() {
     let (rows, _) = draw(&model, 110, 30);
     assert!(
         rows.join("\n").contains("· history"),
-        "the ring's third stop is history"
+        "history keeps its place after calendar and global"
     );
 
     model.handle(key(KeyCode::Char('s')));
     let (rows, _) = draw(&model, 110, 30);
     assert!(
         rows.join("\n").contains("· models"),
-        "the ring's fourth stop is models"
+        "models keeps its place after history"
     );
 
     model.handle(key(KeyCode::Char('s')));
@@ -446,7 +454,7 @@ fn s_cycles_scope_and_global_renders_compact_overview() {
     );
 
     model.handle(key(KeyCode::Char('s')));
-    assert_eq!(model.usage.scope, UsageScope::Global);
+    assert_eq!(model.usage.scope, UsageScope::Calendar);
     model.handle(key(KeyCode::Esc));
     run_slash(&mut model, "/usage");
     assert_eq!(
@@ -461,6 +469,7 @@ fn scope_strip_pins_every_active_scope_and_clicks_by_value() {
     let mut model = usage_model();
     for active in [
         UsageScope::Accounts,
+        UsageScope::Calendar,
         UsageScope::Global,
         UsageScope::History,
         UsageScope::Models,
@@ -468,12 +477,13 @@ fn scope_strip_pins_every_active_scope_and_clicks_by_value() {
         model.usage.scope = active;
         let (rows, hits) = draw(&model, 120, 30);
         assert!(
-            rows.join("\n")
-                .contains("accounts · global · history · models    s next scope · ← → account"),
+            rows.join("\n").contains(
+                "accounts · calendar · global · history · models    s next scope · ← → account"
+            ),
             "the shared strip renders on {active:?}"
         );
         let styles = scope_strip_modifiers(&model);
-        assert_eq!(styles.len(), 4, "four scope labels are clickable");
+        assert_eq!(styles.len(), 5, "five scope labels are clickable");
         for (scope, modifier) in styles {
             assert_eq!(
                 modifier.contains(Modifier::BOLD),
@@ -500,6 +510,7 @@ fn direct_usage_scope_arguments_land_and_keep_the_provider_filter() {
 
     for (command, expected) in [
         ("/usage models", UsageScope::Models),
+        ("/usage calendar", UsageScope::Calendar),
         ("/usage global", UsageScope::Global),
         ("/usage accounts", UsageScope::Accounts),
     ] {
@@ -521,7 +532,7 @@ fn models_scope_orders_and_folds_selectable_ledger_ranges() {
         UsageHistoryDailyTotalV1, UsageHistoryModelTotalV1, UsageHistoryRangeDayV1,
     };
     let mut model = usage_model();
-    for _ in 0..3 {
+    for _ in 0..4 {
         model.handle(key(KeyCode::Char('s')));
     }
     assert_eq!(model.usage.scope, UsageScope::Models);
@@ -704,6 +715,7 @@ fn models_scope_names_empty_attribution_and_scrolls_long_tables() {
 fn history_scope_renders_absence_zero_and_activity_distinctly() {
     use haider_protocol::usage::{UsageHistoryDailyTotalV1, UsageHistoryRangeDayV1};
     let mut model = usage_model();
+    model.handle(key(KeyCode::Char('s')));
     model.handle(key(KeyCode::Char('s')));
     model.handle(key(KeyCode::Char('s')));
     assert_eq!(model.usage.scope, UsageScope::History);

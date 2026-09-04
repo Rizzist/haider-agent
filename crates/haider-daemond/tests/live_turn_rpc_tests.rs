@@ -5552,6 +5552,8 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
             "computer",
             // §E: effect-free session monitor registry administration.
             "monitor",
+            // v0.0.970 modelcat: effect-free cached model/provider inventory.
+            "list_models",
             // 965: peer discovery/messaging and SSH inventory/execution are
             // canonical registry entries with their own typed effects.
             "peer_list",

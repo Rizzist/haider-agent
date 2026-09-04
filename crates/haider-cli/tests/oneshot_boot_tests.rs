@@ -787,7 +787,8 @@ fn fresh_daemon_lockdown_status_reports_defaults_without_a_policy() {
             "web_fetch",
             "peer_list",
             "ssh_list",
-            "spawn_subagent"
+            "spawn_subagent",
+            "list_models"
         ])
     );
     wait_for_daemon_gone(&profile.profile);

@@ -1,0 +1,49 @@
+# tuivirt golden · oauth_calendar_dark · 80x24
+00|USAGE · calendar — meters are provider truth · stats are this device's journal ·|
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×5; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×11; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×64
+01|  accounts · calendar · global · history · models    s next scope · ← → account |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×11; Rgb(217, 181, 68)/Rgb(15, 15, 15)/BOLD×8; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×28; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×5; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×14; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×3; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×8; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1
+02|  demo — usage is live daemon truth, never fabricated; run bare `haider` against|
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×80
+03|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+04|  September 2026 · UTC reset calendar · provider timestamps only                |
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×16; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×48; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×16
+05|  [04] today · a5 five-hour · aW weekly · letters map to every account below    |
+   ~ Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×76; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×4
+06|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+07|  Sun        Mon        Tue        Wed        Thu        Fri        Sat         |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×77; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1
+08|   30         31         01         02         03        [04] a5     05  c5     |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×2; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×22; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×33; Rgb(217, 181, 68)/Rgb(39, 35, 21)/BOLD×11; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×11; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1
+09|   06         07         08         09         10  aW     11  cW     12         |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×46; Rgb(217, 181, 68)/Rgb(15, 15, 15)/NONE×22; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×12
+10|   13         14         15         16         17         18         19         |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+11|   20         21         22         23         24         25         26         |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+12|   27         28         29         30         01         02         03         |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×46; Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1
+13|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+14|  RESET MARKERS — exact meter fields · unknown is never inferred                |
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/BOLD×15; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×49; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×16
+15|  > a anthropic · 5h Fri 04 Sep 16:42 · W Thu 10 Sep 08:15 UTC                  |
+   ~ Rgb(217, 181, 68)/Rgb(15, 15, 15)/BOLD×62; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×18
+16|    b anthropic2 · 5h reset unknown · W reset unknown UTC · meter unavailable (c|
+   ~ Rgb(255, 183, 87)/Rgb(15, 15, 15)/NONE×80
+17|    c codex-work · 5h Sat 05 Sep 02:30 · W Fri 11 Sep 18:05 UTC                 |
+   ~ Rgb(242, 242, 242)/Rgb(15, 15, 15)/NONE×63; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×17
+18|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+19|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+20|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+21|                                                                                |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×80
+22|</> account · ↑↓ provider · PgUp/PgDn scroll · f refresh · s next scope · esc ba|
+   ~ Rgb(58, 58, 58)/Rgb(15, 15, 15)/NONE×80
+23| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                        |
+   ~ Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×1; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×4; Rgb(68, 68, 68)/Rgb(15, 15, 15)/NONE×2; Rgb(139, 148, 158)/Rgb(15, 15, 15)/NONE×33; Rgb(212, 212, 212)/Rgb(15, 15, 15)/NONE×38

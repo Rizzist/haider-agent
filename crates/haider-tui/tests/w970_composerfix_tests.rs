@@ -13,8 +13,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use haider_rpc::ModelDetailWire;
-use haider_tui::app::{AppEvent, AppModel, AppRequest, ChipModel, ImageNotice, RuntimeMode, Screen};
-use haider_tui::script::{ChipDisplayState, ChipSeed};
+use haider_tui::app::{
+    AppEvent, AppModel, AppRequest, ChipModel, ImageNotice, RuntimeMode, Screen,
+};
 use haider_tui::clipboard::{
     ClipboardContent, ClipboardError, ClipboardSource, FakeClipboard, MAX_CLIPBOARD_IMAGE_BYTES,
 };
@@ -22,6 +23,7 @@ use haider_tui::composer::PendingKind;
 use haider_tui::mock::{seed_account_rows, seed_provider_summaries};
 use haider_tui::render::render;
 use haider_tui::runtime::{attach_read_effects, clipboard_paste_effects};
+use haider_tui::script::{ChipDisplayState, ChipSeed};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -62,7 +64,9 @@ fn live_model(vision: Option<bool>) -> AppModel {
         .into_iter()
         .collect();
     model.daemon_version = Some("0.0.970".to_owned());
-    model.providers.apply_snapshot(summaries_declaring_vision(vision), 1);
+    model
+        .providers
+        .apply_snapshot(summaries_declaring_vision(vision), 1);
     model.accounts.apply_snapshot(seed_account_rows(), Some(1));
     model.identity.provider = "anthropic".to_owned();
     model.identity.model_short = "claude-opus-5".to_owned();
@@ -208,11 +212,15 @@ fn a_fake_image_clipboard_encodes_a_real_png() {
 
 #[test]
 fn the_image_debug_never_dumps_pixels() {
-    let ClipboardContent::Image(image) = FakeClipboard::image(8, 8).read().expect("readable") else {
+    let ClipboardContent::Image(image) = FakeClipboard::image(8, 8).read().expect("readable")
+    else {
         panic!("expected an image");
     };
     let rendered = format!("{image:?}");
-    assert!(rendered.contains("png_bytes"), "size, not bytes: {rendered}");
+    assert!(
+        rendered.contains("png_bytes"),
+        "size, not bytes: {rendered}"
+    );
     assert!(
         !rendered.contains("137, 80"),
         "the pixel array must never reach a log line: {rendered}"
@@ -328,7 +336,10 @@ fn the_refusal_names_the_model_and_both_ways_out() {
         model: "deepseek-v4".to_owned(),
     };
     let text = notice.text();
-    assert!(text.starts_with("deepseek-v4 does not accept images"), "{text}");
+    assert!(
+        text.starts_with("deepseek-v4 does not accept images"),
+        "{text}"
+    );
     assert!(text.contains("vision model"), "{text}");
     assert!(text.contains("/attach as text"), "{text}");
 }

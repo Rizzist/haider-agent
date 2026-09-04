@@ -146,47 +146,17 @@ impl crate::oauth::ClaudeNativeCredentialStore for StubClaudeNative {
     }
 }
 
-fn assert_native_claude_discovered() {
+#[test]
+fn strict_discovery_never_touches_native_store_when_file_is_absent() {
     let home = fixture_home();
     let missing_file = home.path().join(".claude/.credentials.json");
     let native = StubClaudeNative::with_bytes(CLAUDE_NATIVE_FIXTURE);
-    let candidate = discover_claude_at(&missing_file, &native).expect("native Claude candidate");
-    assert_eq!(native.reads.load(Ordering::SeqCst), 1);
-    assert_eq!(candidate.wire.provider, "anthropic-oauth");
-    assert_eq!(candidate.wire.source_label, "Linked to Claude Code");
-    assert_eq!(candidate.wire.freshness, "fresh");
-    assert_eq!(candidate.wire.expires_at_ms, Some(4_102_444_800_123));
-    assert!(candidate.wire.import_supported);
-    assert_eq!(candidate.import_source, Some("claude-code"));
+    assert!(discover_claude_at(&missing_file, &native).is_none());
+    assert_eq!(native.reads.load(Ordering::SeqCst), 0);
 }
 
-/// Platform-agnostic coverage for the seam shared by the cfg-gated macOS and
-/// Windows adapters. The platform-specific laws below pin adapter selection.
 #[test]
-fn native_secure_store_seam_discovers_claude_when_file_is_absent() {
-    assert_native_claude_discovered();
-}
-
-/// MUTATION CHECK: bypass the native seam after a file miss. Expected runtime
-/// failure: the macOS-only candidate disappears.
-#[cfg(target_os = "macos")]
-#[test]
-fn macos_keychain_seam_discovers_claude_when_file_is_absent() {
-    assert_native_claude_discovered();
-}
-
-/// MUTATION CHECK: bypass the native seam after a file miss. Expected runtime
-/// failure: the Windows-only candidate disappears.
-#[cfg(target_os = "windows")]
-#[test]
-fn windows_credential_manager_seam_discovers_claude_when_file_is_absent() {
-    assert_native_claude_discovered();
-}
-
-/// MUTATION CHECK: restore file-first selection. Expected runtime failure:
-/// the native owner label/expiry is replaced by the imported file snapshot.
-#[test]
-fn claude_native_owner_store_precedes_an_imported_file_snapshot() {
+fn strict_discovery_links_readable_claude_file_as_policy_blocked_without_native_touch() {
     let home = fixture_home();
     let file = home.path().join(".claude/.credentials.json");
     write_store(
@@ -202,52 +172,32 @@ fn claude_native_owner_store_precedes_an_imported_file_snapshot() {
 }"#,
     );
     let native = StubClaudeNative::with_bytes(CLAUDE_NATIVE_FIXTURE);
-    let candidate = discover_claude_at(&file, &native).expect("native Claude candidate");
-    assert_eq!(native.reads.load(Ordering::SeqCst), 1);
-    assert_eq!(candidate.wire.expires_at_ms, Some(4_102_444_800_123));
-    assert_eq!(candidate.wire.source_label, "Linked to Claude Code");
+    let candidate = discover_claude_at(&file, &native).expect("Claude file candidate");
+    assert_eq!(native.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(candidate.wire.provider, "anthropic-oauth");
+    assert_eq!(candidate.wire.expires_at_ms, Some(4_102_444_800_999));
     assert_eq!(
-        candidate.wire.path,
-        "mock native store: Claude Code-credentials"
+        candidate.wire.source_label,
+        "Claude Code credential file (read-only)"
     );
+    assert!(!candidate.wire.import_supported);
+    assert!(candidate.wire.unsupported_reason.is_some());
+    assert_eq!(candidate.import_source, None);
 }
 
-/// MUTATION CHECK: surface native absence/denial as a discovery error. Expected
-/// runtime failure: either call panics or returns a synthetic candidate.
 #[test]
-fn claude_native_absent_or_denied_degrades_to_clean_not_found() {
+fn native_denial_does_not_suppress_an_explicitly_readable_claude_file() {
     let home = fixture_home();
     let file = home.path().join(".claude/.credentials.json");
-    let absent = StubClaudeNative::unavailable();
+    write_store(
+        home.path(),
+        ".claude/.credentials.json",
+        CLAUDE_NATIVE_FIXTURE,
+    );
     let denied = StubClaudeNative::unavailable();
-    let absent_error = match crate::oauth::load_claude_credential_input(
-        &file,
-        &absent,
-        crate::oauth::ClaudeNativeReadEvent::Significant,
-    ) {
-        Err(error) => error,
-        Ok(_) => panic!("absent native store unexpectedly returned a credential"),
-    };
-    let denied_error = match crate::oauth::load_claude_credential_input(
-        &file,
-        &denied,
-        crate::oauth::ClaudeNativeReadEvent::Significant,
-    ) {
-        Err(error) => error,
-        Ok(_) => panic!("denied native store unexpectedly returned a credential"),
-    };
-    assert_eq!(
-        absent_error.code,
-        haider_protocol::error::ErrorCode::CredentialMissing
-    );
-    assert_eq!(
-        denied_error.code,
-        haider_protocol::error::ErrorCode::CredentialMissing
-    );
-    assert!(discover_claude_at(&file, &absent).is_none());
-    assert!(discover_claude_at(&file, &denied).is_none());
-    assert_eq!(absent.reads.load(Ordering::SeqCst), 2);
-    assert_eq!(denied.reads.load(Ordering::SeqCst), 2);
+    let candidate = discover_claude_at(&file, &denied).expect("readable file survives denial");
+    assert!(!candidate.wire.import_supported);
+    assert_eq!(denied.reads.load(Ordering::SeqCst), 0);
 }
 
 fn codex_access_jwt() -> String {
@@ -430,10 +380,17 @@ fn discovery_reports_metadata_never_token_bytes() {
     assert_eq!(codex.import_source, Some("codex"));
 
     let claude = by_provider("anthropic-oauth");
-    assert_eq!(claude.wire.source_label, "Claude Code credential file");
+    assert_eq!(
+        claude.wire.source_label,
+        "Claude Code credential file (read-only)"
+    );
     assert_eq!(claude.wire.expires_at_ms, Some(4_102_444_800_123));
-    assert!(claude.wire.import_supported);
-    assert_eq!(claude.import_source, Some("claude-code"));
+    assert!(!claude.wire.import_supported);
+    assert_eq!(claude.import_source, None);
+    assert!(
+        claude.wire.unsupported_reason.is_some(),
+        "Claude Code subscription credentials remain read-only metadata"
+    );
 
     let kimi = by_provider("kimi-oauth");
     assert_eq!(kimi.wire.expires_at_ms, Some(4_102_444_800_000));
@@ -602,4 +559,22 @@ fn discovery_env_switch_disables_even_when_profile_allows() {
     assert!(discovery_is_disabled(false));
     let probe = format!("dc1_{}", "0".repeat(64));
     assert!(candidate_by_id(false, &probe).is_none());
+}
+
+/// Structurally valid JSON without the required Codex token fields is a
+/// distinct operator-facing condition, not malformed JSON.
+#[test]
+fn linked_codex_missing_required_fields_are_reported_as_missing_fields() {
+    for document in [br#"{}"#.as_slice(), br#"{"tokens":{}}"#.as_slice()] {
+        let result = linked_codex_material(
+            Path::new("auth.json"),
+            zeroize::Zeroizing::new(document.to_vec()),
+            haider_accounts::CredentialStoreMode::File,
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(LinkedSourceReadFailure::MissingFields)
+        ));
+    }
 }

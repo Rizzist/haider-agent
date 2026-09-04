@@ -1807,6 +1807,7 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
         vault_supported: false,
         discovery_disabled: false,
         device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+        sources: Arc::new(std::sync::Mutex::new(Vec::new())),
         vault: None,
     })
     .expect("accounts install");
@@ -1898,6 +1899,7 @@ async fn r2_03_default_scope_is_absent_and_create_replay_never_reopens_it() {
         vault_supported: true,
         discovery_disabled: true,
         device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+        sources: Arc::new(std::sync::Mutex::new(Vec::new())),
         vault: Some(vault.clone()),
     })
     .expect("accounts install");
@@ -2058,6 +2060,7 @@ async fn r2_03_default_scope_is_absent_and_create_replay_never_reopens_it() {
             vault_supported: true,
             discovery_disabled: true,
             device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+            sources: Arc::new(std::sync::Mutex::new(Vec::new())),
             vault: Some(vault),
         })
         .expect("restarted accounts install");
@@ -2137,6 +2140,7 @@ async fn r2_03_default_scope_is_absent_and_create_replay_never_reopens_it() {
             vault_supported: true,
             discovery_disabled: true,
             device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+            sources: Arc::new(std::sync::Mutex::new(Vec::new())),
             vault: Some(failure_vault.clone()),
         })
         .expect("failure accounts install");
@@ -3335,6 +3339,7 @@ async fn provider_command_distinguishes_known_absence_from_lookup_failure() {
         vault_supported: false,
         discovery_disabled: false,
         device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+        sources: Arc::new(std::sync::Mutex::new(Vec::new())),
         vault: None,
     })
     .expect("accounts install");
@@ -4790,6 +4795,7 @@ async fn provider_models_refresh_requires_control_and_hands_off_correlation() {
         vault_supported: true,
         discovery_disabled: false,
         device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+        sources: Arc::new(std::sync::Mutex::new(Vec::new())),
         vault: Some(Arc::new(haider_accounts::MemoryVault::default())),
     })
     .expect("install accounts");
@@ -6837,6 +6843,7 @@ fn transcription_facade(vault: Arc<dyn haider_accounts::Vault>) -> crate::accoun
         vault_supported: true,
         discovery_disabled: false,
         device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+        sources: Arc::new(std::sync::Mutex::new(Vec::new())),
         vault: Some(vault),
     }
 }

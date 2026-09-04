@@ -659,7 +659,10 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
             haider_rpc::FEATURE_SESSION_FORK_V1,
             haider_rpc::FEATURE_SESSION_PROMPT_FORK_V1,
         ],
-        LiveCommand::MonitorList { .. } => &[haider_rpc::FEATURE_MONITOR_CONTROL_V1],
+        LiveCommand::MonitorList { .. }
+        | LiveCommand::MonitorRemove { .. }
+        | LiveCommand::MonitorMutate { .. }
+        | LiveCommand::MonitorWatch { .. } => &[haider_rpc::FEATURE_MONITOR_CONTROL_V1],
         LiveCommand::WorkspaceSet { .. } => &[haider_rpc::FEATURE_SESSION_WORKSPACE_SET_V1],
         LiveCommand::ProviderSetTrust { .. } | LiveCommand::LockdownStatus { .. } => {
             &[haider_rpc::FEATURE_PROVIDER_LOCKDOWN_V1]
@@ -1288,6 +1291,35 @@ pub fn request_body_for_features(
         LiveCommand::ShellClose { id } => RequestBody::ShellClose { id },
         LiveCommand::MonitorList { session } => RequestBody::MonitorList {
             session_id: session,
+        },
+        LiveCommand::MonitorRemove {
+            command_id,
+            session,
+            worker_generation,
+            monitor_id,
+        } => RequestBody::MonitorRemove {
+            command_id,
+            session_id: session,
+            worker_generation,
+            monitor_id,
+        },
+        LiveCommand::MonitorMutate {
+            command_id,
+            session,
+            worker_generation,
+            mutation,
+        } => RequestBody::MonitorMutate {
+            command_id,
+            session_id: session,
+            worker_generation,
+            mutation,
+        },
+        LiveCommand::MonitorWatch {
+            session,
+            after_cursor,
+        } => RequestBody::MonitorWatch {
+            session_id: session,
+            after_cursor,
         },
         LiveCommand::HooksList { cwd } => RequestBody::HooksList { cwd },
         // U2: parameterless read (U1's wire) — CONSUMED, never redefined.
@@ -1942,6 +1974,11 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::ShellList { shells } => vec![LiveReply::ShellListed { shells }],
         ResponseBody::ShellClose { shell } => vec![LiveReply::ShellChanged { shell }],
         ResponseBody::MonitorList { receipt } => vec![LiveReply::MonitorListed { receipt }],
+        ResponseBody::MonitorMutate { receipt } => vec![LiveReply::MonitorMutated { receipt }],
+        ResponseBody::MonitorRemove { receipt } => vec![LiveReply::MonitorRemoved { receipt }],
+        // The watch REGISTRATION carries no fire of its own; deliveries
+        // arrive as their own frames (see `WireFrame::MonitorDelivery`).
+        ResponseBody::MonitorWatch { .. } => Vec::new(),
         ResponseBody::HooksList {
             policy,
             revision,
@@ -2188,10 +2225,29 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::AccountList {
             descriptors,
             revision,
+            sources,
             ..
         } => vec![LiveReply::Accounts {
             descriptors,
             revision,
+            sources: sources
+                .into_iter()
+                .map(|source| crate::app::AccountSourceRow {
+                    source_id: source.source_id,
+                    account_alias: source.account_alias,
+                    kind: source.kind,
+                    label: source.label,
+                    path: source.path,
+                    credential_store: source.credential_store,
+                    refresh_owner: source.refresh_owner,
+                    health: source.health,
+                    last_seen_at_ms: source.last_seen_at_ms,
+                    last_refreshed_at_ms: source.last_refreshed_at_ms,
+                    access_expires_at_ms: source.access_expires_at_ms,
+                    plan: source.plan,
+                    masked_identity: source.masked_identity,
+                })
+                .collect(),
         }],
         ResponseBody::AccountDeviceCandidates {
             discovery_disabled,
@@ -2656,6 +2712,21 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
         WireFrame::ShellOutput { id, chunk_b64, .. } => {
             vec![LiveReply::SshShellOutput { id, chunk_b64 }]
         }
+        // 970 owner item 3: the monitor DELIVERY lane. The report names its
+        // own session, so the note lands on the right transcript without
+        // needing request context.
+        WireFrame::MonitorDelivery { report, .. } => vec![LiveReply::MonitorFired {
+            session: report.session_id.clone(),
+            report: Box::new(report),
+        }],
+        WireFrame::MonitorDeliveryCaughtUp {
+            session_id,
+            high_water_cursor,
+            ..
+        } => vec![LiveReply::MonitorCaughtUp {
+            session: session_id,
+            high_water_cursor,
+        }],
         // This TUI is a publisher, not a consumer, of profile-level resident
         // binding signals. Name the known frame explicitly so it can never be
         // confused with the forward-compat fallback below.

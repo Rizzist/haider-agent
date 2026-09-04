@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used)]
 
 use super::*;
+use crate::model_select::SelectionRefusal;
 
 #[tokio::test]
 async fn unavailable_workspace_tool_call_is_a_typed_rejection_without_an_effect() {
@@ -164,6 +165,7 @@ fn lockdown_turn_advertises_only_the_fixed_reduced_pack() {
         "todo_write",
         "plan",
         "spawn_subagent",
+        "list_models",
         "peer_list",
         "ssh_list",
     ] {
@@ -222,6 +224,7 @@ fn auto_hermetic_turn_advertises_no_egress_tools() {
         "peer_list",
         "ssh_list",
         "spawn_subagent",
+        "list_models",
         "process_exec",
     ] {
         assert!(!names.contains(&egress), "advertised egress tool {egress}");
@@ -365,6 +368,43 @@ fn lockdown_refusal_is_typed_and_compacted_for_the_model() {
         "RefusedByLockdown { tool: peer_send, reason: peer messaging is outside the fixed envelope }"
     );
     assert_eq!(result.status, ToolResultStatus::Rejected);
+}
+
+/// The selector refusal is committed inside the durable tool-result preview;
+/// suggestions therefore belong to the typed payload before journal append,
+/// not to a live-only presentation wrapper.
+#[test]
+fn spawn_model_refusal_preview_schema_includes_bounded_suggestions() {
+    let result = selection_rejection_result(&SelectionRefusal::ModelNotResolvable {
+        model: "glm4.7 flash".into(),
+        candidates: Vec::new(),
+        suggestions: vec![
+            "glm-4.7-flashx · haider-code".into(),
+            "glm-4.7-flash · local".into(),
+        ],
+    });
+    let preview: serde_json::Value =
+        serde_json::from_str(&result.preview).expect("typed selector refusal preview");
+    assert_eq!(result.status, ToolResultStatus::Rejected);
+    assert_eq!(preview["status"], "rejected");
+    assert_eq!(preview["error"]["kind"], "model_not_resolvable");
+    assert_eq!(
+        preview["error"]["details"],
+        serde_json::json!({
+            "kind": "model_not_resolvable",
+            "model": "glm4.7 flash",
+            "candidates": [],
+            "suggestions": [
+                "glm-4.7-flashx · haider-code",
+                "glm-4.7-flash · local",
+            ],
+        })
+    );
+    assert!(
+        preview["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("call list_models"))
+    );
 }
 
 /// MUTATION CHECK: return `HaiderError::InvalidArgument` from the cached
@@ -709,6 +749,38 @@ fn peer_tool_surface_is_manifest_and_digest_pinned() {
     assert_eq!(
         canonical_tool_definitions_digest(&actual),
         canonical_tool_definitions_digest(&expected)
+    );
+}
+
+/// MUTATION CHECK: make catalog discovery effectful, drop the filter, or let
+/// its daemon route drift away from the advertised manifest.
+#[test]
+fn list_models_surface_is_manifest_route_and_text_pinned() {
+    let list = registered_tool_by_name("list_models").expect("list_models manifest");
+    assert_eq!(list.route, RegisteredToolRoute::ListModels);
+    assert_eq!(list.default, ToolPermissionDefault::Allow);
+    assert_eq!(list.manifest.dispatch, DispatchMode::Await);
+    assert!(list.manifest.effects.is_empty());
+    assert_eq!(
+        provider_definition(&list.manifest),
+        ToolDefinition {
+            name: "list_models".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"filter": {"type": "string"}}
+            }),
+        }
+    );
+    let manual = tool_manual_line("list_models").expect("list_models manual line");
+    assert_eq!(
+        manual,
+        "list_models(filter?) — read the daemon's cached model/provider catalog; filter matches model, provider, or alias without a network refresh"
+    );
+    let spawn = tool_manual_line("spawn_subagent").expect("spawn_subagent manual line");
+    assert_eq!(
+        spawn,
+        "spawn_subagent(task, prompt, model?, provider?, agent_type?, workflow?, workflow_trigger?, parent_slot?, workflow_author?) — delegate one bounded task to a depth-capped child; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)"
     );
 }
 

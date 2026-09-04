@@ -151,9 +151,9 @@ use haider_tools::{
     CasSink, ChangeLedger, CommandOutputSink, ComputerBackend, ComputerCancelToken, ComputerError,
     ComputerOperation, ComputerOutput, ComputerPermissionPoll, EffectBroker, EffectOperation,
     FsCaseMode, FsEdit, FsEditChange, FsFileGlob, FsGlob, FsPath, FsPathOperation, FsRead,
-    FsSearch, FsSearchMode, FsWrite, GraphEvidence, JournalSink, MessageSubagent, MobileBackend,
-    MobileCancelToken, MobileError, MobileOperation, MobileOutput, MonitorApproval, MonitorRequest,
-    PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult, ResultBounds,
+    FsSearch, FsSearchMode, FsWrite, GraphEvidence, JournalSink, ListModels, MessageSubagent,
+    MobileBackend, MobileCancelToken, MobileError, MobileOperation, MobileOutput, MonitorApproval,
+    MonitorRequest, PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult, ResultBounds,
     ScreenshotRedactionPolicy, SessionGrant, SessionGrantScope, ShellSession, SpawnSubagent,
     ToolError, ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
 };
@@ -12108,6 +12108,7 @@ pub(crate) enum RegisteredToolRoute {
     Computer,
     Mobile,
     Monitor,
+    ListModels,
     PeerList,
     PeerSend,
     SshList,
@@ -12536,6 +12537,11 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
                 route: RegisteredToolRoute::Monitor,
             }
         },
+        registered_manifest(
+            haider_tools::list_models_manifest(),
+            ToolPermissionDefault::Allow,
+            RegisteredToolRoute::ListModels,
+        ),
         registered_manifest(
             peer_list_manifest(),
             ToolPermissionDefault::Allow,
@@ -13405,10 +13411,13 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
         }
         "web_search" => "web_search(query) — search the web, returning a bounded text summary",
         "spawn_subagent" => {
-            "spawn_subagent(task, prompt, model?, provider?, agent_type?, workflow?, workflow_trigger?, parent_slot?, workflow_author?) — delegate one bounded task to a depth-capped child; task = short label, prompt = full brief; agent_type = a registered Loom specialist (its Job frames the child)"
+            "spawn_subagent(task, prompt, model?, provider?, agent_type?, workflow?, workflow_trigger?, parent_slot?, workflow_author?) — delegate one bounded task to a depth-capped child; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)"
         }
         "message_subagent" => {
             "message_subagent(agent, message) — steer a running direct child or start an idle one (agent = id returned by spawn_subagent)"
+        }
+        "list_models" => {
+            "list_models(filter?) — read the daemon's cached model/provider catalog; filter matches model, provider, or alias without a network refresh"
         }
         "peer_list" => {
             "peer_list(filter?) — list live peer agents; peer metadata and messages are untrusted input"
@@ -14568,6 +14577,7 @@ enum ParsedToolOperation {
     WebFetch(WebFetch),
     Computer(Box<ComputerOperation>),
     Mobile(Box<MobileOperation>),
+    ListModels(Option<String>),
     PeerList(Option<String>),
     PeerSend(PeerSendOperation),
     SshList,
@@ -14587,6 +14597,7 @@ fn route_uses_cached_tool_operation(route: RegisteredToolRoute) -> bool {
             | RegisteredToolRoute::SpawnSubagent
             | RegisteredToolRoute::TaskKill
             | RegisteredToolRoute::WebFetch
+            | RegisteredToolRoute::ListModels
             | RegisteredToolRoute::PeerList
             | RegisteredToolRoute::PeerSend
             | RegisteredToolRoute::SshList
@@ -15597,6 +15608,8 @@ impl BrokerToolDispatcher {
             RegisteredToolRoute::WebFetch => {
                 WebFetch::from_tool_args(args).map(ParsedToolOperation::WebFetch)
             }
+            RegisteredToolRoute::ListModels => ListModels::from_tool_args(args.clone())
+                .map(|request| ParsedToolOperation::ListModels(request.filter)),
             RegisteredToolRoute::PeerList => Ok(ParsedToolOperation::PeerList(
                 optional_bounded_string(args, "filter", PEER_FILTER_MAX_BYTES)?,
             )),
@@ -17249,6 +17262,47 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }
             return Ok(result);
         }
+        if route == RegisteredToolRoute::ListModels {
+            let operation = parsed_operation
+                .as_deref()
+                .ok_or_else(|| cached_operation_route_mismatch(route))?;
+            let ParsedToolOperation::ListModels(filter) = operation else {
+                return Err(cached_operation_route_mismatch(route));
+            };
+            // This is deliberately the same immutable snapshot the TUI model
+            // picker reads. Provider discovery/refresh is an account-actor
+            // command and is never invoked from this tool path.
+            let summaries = self
+                .output
+                .store
+                .hub()
+                .accounts()
+                .map_err(hub_error)?
+                .and_then(|facade| facade.management.read())
+                .map(|view| view.providers)
+                .unwrap_or_default();
+            let page = crate::model_select::ModelSelectionAuthority::new(None, summaries)
+                .model_catalog(filter.as_deref(), haider_tools::LIST_MODELS_ROW_CAP);
+            let truncated = page.truncated;
+            let preview = serde_json::to_string(&page).map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("cannot encode list_models result: {error}"),
+                    false,
+                )
+            })?;
+            return Ok(ToolDispatchResult::Completed(BoundedResult {
+                preview,
+                truncated,
+                data: None,
+                artifact: None,
+                images: Vec::new(),
+                cursor: None,
+                status: ToolResultStatus::Completed,
+                reason: None,
+                presentation: None,
+            }));
+        }
         if route == RegisteredToolRoute::PeerList {
             let operation = parsed_operation
                 .as_deref()
@@ -18595,6 +18649,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             | RegisteredToolRoute::SpawnSubagent
             | RegisteredToolRoute::MessageSubagent
             | RegisteredToolRoute::Monitor
+            | RegisteredToolRoute::ListModels
             | RegisteredToolRoute::PeerList
             | RegisteredToolRoute::PeerSend
             | RegisteredToolRoute::SshList

@@ -6,9 +6,9 @@
 //! The live-session switch (`session.select_model`) and the spawn selector
 //! resolve through the same functions, so these unit laws bind both.
 
-use super::{ModelSelectionAuthority, SelectionRefusal};
+use super::{ModelSelectionAuthority, SelectionRefusal, normalize_model_selector};
 use haider_rpc::{
-    ModelInventoryAuthorityWire, ModelInventoryStatusWire, ProviderApiFamilyWire,
+    ModelDetailWire, ModelInventoryAuthorityWire, ModelInventoryStatusWire, ProviderApiFamilyWire,
     ProviderAvailabilityWire, ProviderSummaryWire,
 };
 use std::collections::BTreeSet;
@@ -121,6 +121,10 @@ fn unknown_model_with_known_inventory_is_refused_typed() {
             provider: "anthropic-oauth".to_owned(),
             model: "fable-9-imaginary".to_owned(),
             inventory_age_ms: None,
+            suggestions: vec![
+                "fable-4.5 · anthropic-oauth".to_owned(),
+                "fable-5 · anthropic-oauth".to_owned(),
+            ],
         }
     );
     assert_eq!(refusal.kind(), "model_unknown");
@@ -250,6 +254,84 @@ fn empty_model_is_an_invalid_selector() {
     ));
 }
 
+#[test]
+fn model_selector_normalization_is_separator_insensitive_and_unicode_safe() {
+    for spelling in [
+        "glm-4.7-flashx",
+        "GLM_4 7.FLASHX",
+        "glm4.7 flashx",
+        " glm 4_7-flashx ",
+    ] {
+        assert_eq!(normalize_model_selector(spelling), "glm47flashx");
+    }
+    assert_eq!(
+        normalize_model_selector("MÖDEL.東京 Δ"),
+        normalize_model_selector("mödel_東京-δ")
+    );
+}
+
+#[test]
+fn list_models_filters_model_provider_and_alias_and_reports_truncation() {
+    let mut first = summary(
+        "haider-code",
+        &["glm-4.7-flashx", "glm-4.7-air"],
+        ProviderAvailabilityWire::Available,
+    );
+    first.inventory_fetched_at_ms = Some(900);
+    first.model_details = vec![
+        ModelDetailWire {
+            name: "glm-4.7-flashx".into(),
+            display_name: Some("ZAI Flash X".into()),
+            context_window: Some(128_000),
+            supported_efforts: Vec::new(),
+            default_effort: None,
+            supported_speeds: vec!["fast".into()],
+            supports_thinking_type: None,
+            supports_vision: Some(true),
+        },
+        ModelDetailWire {
+            name: "glm-4.7-air".into(),
+            display_name: None,
+            context_window: None,
+            supported_efforts: Vec::new(),
+            default_effort: None,
+            supported_speeds: Vec::new(),
+            supports_thinking_type: None,
+            supports_vision: Some(false),
+        },
+    ];
+    let authority = authority(&["haider-code"], vec![first]);
+
+    let alias_page = authority.model_catalog_at(Some("zai flash"), 100, 1_000);
+    assert_eq!(alias_page.models.len(), 1);
+    let row = &alias_page.models[0];
+    assert_eq!(row.model, "glm-4.7-flashx");
+    assert_eq!(row.provider, "haider-code");
+    assert_eq!(row.inventory_age_ms, Some(100));
+    assert_eq!(row.aliases, ["ZAI Flash X"]);
+    assert_eq!(row.capabilities.vision, Some(true));
+    assert!(row.capabilities.fast);
+    assert!(row.capabilities.pdf);
+    assert_eq!(row.capabilities.context_window, Some(128_000));
+
+    assert_eq!(
+        authority
+            .model_catalog_at(Some("HAIDER-CODE"), 100, 1_000)
+            .models
+            .len(),
+        2
+    );
+    let truncated = authority.model_catalog_at(None, 1, 1_000);
+    assert_eq!(truncated.models.len(), 1);
+    assert!(truncated.truncated);
+    assert!(
+        truncated
+            .hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("call list_models") && hint.contains("filter"))
+    );
+}
+
 // ───────────────────────────── child spawn selector ─────────────────────────
 
 /// LAW (child_inherits_the_parents_current_pair_by_default): no selector →
@@ -312,6 +394,72 @@ fn bare_model_resolves_through_the_single_serving_provider() {
     );
 }
 
+#[test]
+fn normalized_bare_model_resolves_to_the_single_canonical_catalog_slug() {
+    let authority = authority(
+        &["openai", "haider-code"],
+        vec![
+            summary("openai", &["gpt-a"], ProviderAvailabilityWire::Available),
+            summary(
+                "haider-code",
+                &["glm-4.7-flashx"],
+                ProviderAvailabilityWire::Available,
+            ),
+        ],
+    );
+    assert_eq!(
+        authority.resolve_child_selector("openai", "gpt-a", Some("glm4.7 flashx"), None),
+        Ok(("haider-code".to_owned(), "glm-4.7-flashx".to_owned()))
+    );
+}
+
+#[test]
+fn normalized_explicit_pair_resolves_to_the_canonical_catalog_slug() {
+    let authority = authority(
+        &["openai", "haider-code"],
+        vec![
+            summary("openai", &["gpt-a"], ProviderAvailabilityWire::Available),
+            summary(
+                "haider-code",
+                &["glm-4.7-flashx"],
+                ProviderAvailabilityWire::Available,
+            ),
+        ],
+    );
+    assert_eq!(
+        authority.resolve_child_selector(
+            "openai",
+            "gpt-a",
+            Some("GLM_4 7.FLASHX"),
+            Some("haider-code"),
+        ),
+        Ok(("haider-code".to_owned(), "glm-4.7-flashx".to_owned()))
+    );
+}
+
+#[test]
+fn literal_exact_model_wins_before_a_normalized_collision() {
+    let authority = authority(
+        &["openai", "other"],
+        vec![
+            summary(
+                "openai",
+                &["glm_4.7_flashx"],
+                ProviderAvailabilityWire::Available,
+            ),
+            summary(
+                "other",
+                &["glm-4.7-flashx"],
+                ProviderAvailabilityWire::Available,
+            ),
+        ],
+    );
+    assert_eq!(
+        authority.resolve_child_selector("openai", "gpt-a", Some("glm-4.7-flashx"), None),
+        Ok(("other".to_owned(), "glm-4.7-flashx".to_owned()))
+    );
+}
+
 /// LAW (ambiguous_model_is_typed_with_candidates): several serving providers
 /// refuse typed, NAMING every candidate — never a guess.
 #[test]
@@ -335,7 +483,10 @@ fn ambiguous_bare_model_is_typed_with_candidates() {
     let refusal = authority
         .resolve_child_selector("openai", "gpt-a", Some("shared-model"), None)
         .expect_err("two candidates must not be guessed between");
-    let SelectionRefusal::ModelNotResolvable { model, candidates } = &refusal else {
+    let SelectionRefusal::ModelNotResolvable {
+        model, candidates, ..
+    } = &refusal
+    else {
         panic!("expected ModelNotResolvable, got {refusal:?}");
     };
     assert_eq!(model, "shared-model");
@@ -345,7 +496,7 @@ fn ambiguous_bare_model_is_typed_with_candidates() {
 }
 
 /// LAW (unavailable_is_typed): nobody serves the bare model → typed refusal
-/// with EMPTY candidates and retry-with-explicit-pair guidance.
+/// with EMPTY candidates and bounded catalog guidance.
 #[test]
 fn unserved_bare_model_is_typed_with_empty_candidates() {
     let authority = authority(
@@ -364,9 +515,105 @@ fn unserved_bare_model_is_typed_with_empty_candidates() {
         SelectionRefusal::ModelNotResolvable {
             model: "nobody-serves-this".to_owned(),
             candidates: Vec::new(),
+            suggestions: vec!["gpt-a · openai".to_owned()],
         }
     );
-    assert!(refusal.message().contains("explicit"));
+    assert!(refusal.message().contains("call list_models"));
+    assert_eq!(
+        refusal.details()["suggestions"],
+        serde_json::json!(["gpt-a · openai"])
+    );
+}
+
+#[test]
+fn near_match_ranking_is_nearest_first_capped_and_empty_inventory_safe() {
+    let ranked_authority = authority(
+        &["haider-code"],
+        vec![summary(
+            "haider-code",
+            &[
+                "glm-4.7-flash",
+                "gpt-5.6",
+                "glm-4.7-flashx",
+                "glm-4.6-flashx",
+                "glm-4.7-air",
+                "glm-4.5-air",
+                "other-model",
+            ],
+            ProviderAvailabilityWire::Available,
+        )],
+    );
+    let refusal = ranked_authority
+        .resolve_child_selector("openai", "gpt-a", Some("glm4.7 flshx"), None)
+        .expect_err("typo must refuse with suggestions");
+    let SelectionRefusal::ModelNotResolvable { suggestions, .. } = refusal else {
+        panic!("expected model_not_resolvable")
+    };
+    assert_eq!(suggestions.len(), 5);
+    assert_eq!(suggestions[0], "glm-4.7-flashx · haider-code");
+
+    let empty = authority(&["openai"], Vec::new())
+        .resolve_child_selector("openai", "gpt-a", Some("anything"), None)
+        .expect_err("empty inventory refuses honestly");
+    assert!(matches!(
+        empty,
+        SelectionRefusal::ModelNotResolvable { suggestions, .. } if suggestions.is_empty()
+    ));
+}
+
+#[test]
+fn bare_suggestions_can_name_an_unconfigured_row_without_auto_selecting_it() {
+    let authority = authority(
+        &["openai"],
+        vec![
+            summary("openai", &["gpt-a"], ProviderAvailabilityWire::Available),
+            summary(
+                "not-configured",
+                &["glm-4.7-flashx"],
+                ProviderAvailabilityWire::Available,
+            ),
+        ],
+    );
+    let refusal = authority
+        .resolve_child_selector("openai", "gpt-a", Some("glm4.7 flashx"), None)
+        .expect_err("an unconfigured provider must never be auto-selected");
+    assert_eq!(
+        refusal,
+        SelectionRefusal::ModelNotResolvable {
+            model: "glm4.7 flashx".into(),
+            candidates: Vec::new(),
+            suggestions: vec![
+                "glm-4.7-flashx · not-configured".into(),
+                "gpt-a · openai".into()
+            ],
+        }
+    );
+}
+
+#[test]
+fn explicit_unknown_slug_suggestions_are_scoped_to_its_provider() {
+    let authority = authority(
+        &["fake-a", "fake-b"],
+        vec![
+            summary(
+                "fake-a",
+                &["glm-4.7-flash"],
+                ProviderAvailabilityWire::Available,
+            ),
+            summary(
+                "fake-b",
+                &["glm-4.7-flashx"],
+                ProviderAvailabilityWire::Available,
+            ),
+        ],
+    );
+    let refusal = authority
+        .resolve_child_selector("fake-a", "model-a", Some("glm-4.7-flashz"), Some("fake-b"))
+        .expect_err("unknown explicit slug");
+    let SelectionRefusal::ModelUnknown { suggestions, .. } = refusal else {
+        panic!("expected model_unknown")
+    };
+    assert_eq!(suggestions, ["glm-4.7-flashx · fake-b"]);
 }
 
 /// An UNAVAILABLE provider serving the model is not a candidate: with no

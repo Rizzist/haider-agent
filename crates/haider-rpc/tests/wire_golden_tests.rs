@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use common::{TEST_FRAME_LIMIT, transcript};
+use common::{TEST_FRAME_LIMIT, account_source_transcript, transcript};
 use haider_protocol::session::SessionPermissionOverridesV1;
 use haider_rpc::{
     AccountAddMethod, CancelStatus, DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED,
@@ -661,6 +661,10 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "account.set_active",
         "account.set_default_model",
         "account.set_label",
+        "account.source_add",
+        "account.source_list",
+        "account.source_remove",
+        "account.source_scan",
         "agent.cancel",
         "agent.message",
         "artifact.put",
@@ -780,8 +784,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        127,
-        "123 v0.0.966 methods plus agent.cancel, status.snapshot, session.workspace.set, and monitor.mutate"
+        131,
+        "126 pre-v0.0.970 methods plus four account source registry methods and monitor.mutate"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -791,7 +795,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
 
     let mut requests_by_id = BTreeMap::new();
     let mut responses_by_id = BTreeMap::new();
-    for frame in transcript() {
+    for frame in transcript().into_iter().chain(account_source_transcript()) {
         match frame {
             WireFrame::Request { request_id, body } => {
                 let value = serde_json::to_value(body).expect("encode transcript request");
@@ -815,8 +819,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     }
     assert_eq!(
         covered.len(),
-        60,
-        "42 historical plus 17 A/C/D tail method pairs plus agent.cancel"
+        64,
+        "60 pre-v0.0.970 request pairs plus four account source registry pairs"
     );
 
     let fixture: ContractMethodFixture = serde_json::from_str(
@@ -3505,6 +3509,7 @@ fn management_reads_preserve_legacy_account_list_and_tolerate_future_providers()
             revision: None,
             provider_active: Vec::new(),
             provider_defaults: Vec::new(),
+            sources: Vec::new(),
             availability: None,
         }
     );

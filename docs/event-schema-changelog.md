@@ -286,3 +286,19 @@ not all been called out together in this ledger. Their schema status is:
 - No `RawEnvelope`, automation event kind, or `schema_version` changed. This
   entry records an additive RPC request field and the explicit summary-field
   semantic correction above.
+
+### v0.0.970 — model catalog and selector guidance
+
+- New effectless `list_models` agent tool. Its bounded result projects the
+  daemon's already-discovered provider summaries and model-detail rows; it
+  does not refresh inventory or perform a network request. The tool result is
+  retained and replayed under the existing `payload:tool_result` contract.
+- Additive `suggestions` array at
+  `payload:tool_result.preview.error.details.suggestions` for typed
+  `spawn_subagent` selector refusals. The daemon ranks and caps these catalog
+  rows before committing the tool result. Existing `kind`, `model`,
+  `provider`, `candidates`, and `inventory_age` fields keep their meanings;
+  the refusal error codes are unchanged.
+- Replay must emit the retained tool-result preview byte-for-byte. Suggestions
+  are never recomputed or decorated during replay. `SCHEMA_VERSION` remains 1
+  because this is an additive nested field on an existing payload kind.

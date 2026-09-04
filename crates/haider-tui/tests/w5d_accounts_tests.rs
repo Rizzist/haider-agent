@@ -7,7 +7,11 @@ use haider_protocol::credential::{
     AuthMethod, CredentialAttentionReason, CredentialDescriptor, CredentialStatus,
 };
 use haider_protocol::ids::CredentialAlias;
-use haider_tui::app::{AccountRow, AppEvent, AppModel, AppRequest, PendingCacheChange, Screen};
+use haider_tui::app::{
+    AccountRow, AccountSourceRow, AppEvent, AppModel, AppRequest, PendingCacheChange, Screen,
+};
+use haider_tui::link::{CommandContext, map_response};
+use haider_tui::live::{LiveCommand, LiveReply};
 use haider_tui::mock::{SEED_ACCOUNT_PROVIDERS, SEED_ACCOUNTS, seed_account_rows};
 use haider_tui::render::render;
 use ratatui::Terminal;
@@ -72,6 +76,31 @@ fn descriptor(alias: &str, provider: &str, method: AuthMethod) -> CredentialDesc
         label: None,
         account_identity: None,
         created_at_ms: None,
+    }
+}
+
+fn account_source(
+    alias: Option<&str>,
+    kind: &str,
+    label: &str,
+    store: &str,
+    owner: &str,
+    health: &str,
+) -> AccountSourceRow {
+    AccountSourceRow {
+        source_id: format!("source-{label}"),
+        account_alias: alias.map(CredentialAlias::new),
+        kind: kind.into(),
+        label: label.into(),
+        path: None,
+        credential_store: store.into(),
+        refresh_owner: owner.into(),
+        health: health.into(),
+        last_seen_at_ms: Some(1_788_523_200_000),
+        last_refreshed_at_ms: Some(1_788_540_120_000),
+        access_expires_at_ms: Some(1_788_543_720_000),
+        plan: Some("plus".into()),
+        masked_identity: Some("d**@c***.dev".into()),
     }
 }
 
@@ -180,6 +209,96 @@ fn accounts_screen_renders_the_sim_hierarchy() {
     assert!(frame.contains("[+ Add custom server]"));
     // Hints line.
     assert!(frame.contains("click an account to make it active"));
+}
+
+/// 970 source projection: a linked account exposes its stable source badge,
+/// refresh owner, health, plan, masked identity, and exact timestamps. An
+/// enrolled keyring root that cannot be read without Codex remains visible
+/// instead of masquerading as a credential failure or disappearing.
+#[test]
+fn accounts_screen_renders_linked_and_unlinked_source_truth() {
+    let mut model = accounts_model();
+    let row =
+        AccountRow::from_descriptor(&descriptor("codex-work", "openai-oauth", AuthMethod::OAuth));
+    model.accounts.apply_snapshot(vec![row], Some(7));
+    model.accounts.apply_sources(vec![
+        account_source(
+            Some("codex-work"),
+            "codex_home",
+            "Work Codex",
+            "file",
+            "codex",
+            "ready",
+        ),
+        account_source(
+            None,
+            "codex_home",
+            "Personal Codex",
+            "keyring",
+            "codex",
+            "requires_origin_client",
+        ),
+    ]);
+
+    let frame = draw(&model, 180, 42);
+    assert!(frame.contains("[codex home] Work Codex · file · refresh: codex · ready"));
+    assert!(frame.contains("d**@c***.dev · plus"));
+    assert!(frame.contains("refreshed Fri 04 September 2026 · 16:42 UTC"));
+    assert!(frame.contains("expires Fri 04 September 2026 · 17:42 UTC"));
+    assert!(frame.contains("seen Fri 04 September 2026 · 12:00 UTC"));
+    assert!(frame.contains("ENROLLED SOURCES — without a linked account"));
+    assert!(frame.contains(
+        "[codex home] Personal Codex · keyring · refresh: codex · not readable without Codex"
+    ));
+    assert!(frame.contains("account not linked"));
+}
+
+#[test]
+fn account_list_link_carries_sources_without_dropping_or_rederiving_them() {
+    let source = account_source(
+        Some("codex-work"),
+        "codex_home",
+        "Work Codex",
+        "file",
+        "codex",
+        "ready",
+    );
+    let replies = map_response(
+        &CommandContext::of(&LiveCommand::AccountList),
+        serde_json::from_value(serde_json::json!({
+            "method": "account.list",
+            "descriptors": [descriptor(
+                "codex-work",
+                "openai-oauth",
+                AuthMethod::OAuth,
+            )],
+            "revision": 9,
+            "sources": [{
+                "source_id": source.source_id,
+                "account_alias": "codex-work",
+                "kind": source.kind,
+                "label": source.label,
+                "credential_store": source.credential_store,
+                "refresh_owner": source.refresh_owner,
+                "health": source.health,
+                "last_seen_at_ms": source.last_seen_at_ms,
+                "last_refreshed_at_ms": source.last_refreshed_at_ms,
+                "access_expires_at_ms": source.access_expires_at_ms,
+                "plan": source.plan,
+                "masked_identity": source.masked_identity,
+            }]
+        }))
+        .expect("account.list source fixture decodes"),
+    );
+    assert!(matches!(
+        replies.as_slice(),
+        [LiveReply::Accounts { sources, revision: Some(9), .. }]
+            if sources.len() == 1
+                && sources[0].account_alias.as_ref().map(CredentialAlias::as_str)
+                    == Some("codex-work")
+                && sources[0].last_refreshed_at_ms == Some(1_788_540_120_000)
+                && sources[0].access_expires_at_ms == Some(1_788_543_720_000)
+    ));
 }
 
 /// LAW (report §5.1) — OPTIMISTIC SELECTION IS FORBIDDEN.
@@ -366,6 +485,30 @@ fn keychain_attention_rows_render_typed_actionable_remedies() {
         (
             CredentialAttentionReason::KeychainLocked,
             "needs attention — keychain locked · unlock login keychain (password may have changed)",
+        ),
+        (
+            CredentialAttentionReason::KeychainMissing,
+            "needs attention — Claude Code credential missing · re-link",
+        ),
+        (
+            CredentialAttentionReason::KeychainUnavailable,
+            "needs attention — keychain unavailable · retry refresh or re-link",
+        ),
+        (
+            CredentialAttentionReason::SourceGone,
+            "needs attention — source gone · re-link or remove",
+        ),
+        (
+            CredentialAttentionReason::SourceUnreadable,
+            "needs attention — source unreadable · check permissions or re-link",
+        ),
+        (
+            CredentialAttentionReason::OriginClientRequired,
+            "needs attention — origin client required · refresh in the origin client",
+        ),
+        (
+            CredentialAttentionReason::PolicyBlocked,
+            "needs attention — policy blocked · use a supported credential",
         ),
     ];
     for (reason, expected) in cases {

@@ -12,7 +12,7 @@ use super::*;
 use crate::session_hub::{FrameSendError, FrameSink};
 
 #[test]
-fn macos_keychain_ui_is_reserved_for_explicit_import_intent() {
+fn every_macos_keychain_event_is_strictly_no_ui() {
     for event in [
         ClaudeNativeReadEvent::Ordinary,
         ClaudeNativeReadEvent::AdoptionDiscovery,
@@ -21,10 +21,7 @@ fn macos_keychain_ui_is_reserved_for_explicit_import_intent() {
         let plan = event.macos_keychain_query_plan();
         assert!(plan.skip_authenticated_attribute_items);
         assert!(plan.skip_authenticated_data_items);
-        assert_eq!(
-            plan.allow_interactive_data_fallback,
-            matches!(event, ClaudeNativeReadEvent::Significant)
-        );
+        assert!(!plan.allow_interactive_data_fallback);
     }
 
     assert_eq!(
@@ -37,7 +34,7 @@ fn macos_keychain_ui_is_reserved_for_explicit_import_intent() {
     );
     assert_eq!(
         ClaudeNativeReadEvent::Significant.credential_interaction_resolution(),
-        haider_core::InteractionResolution::AwaitHuman
+        haider_core::InteractionResolution::FailClosed
     );
 }
 
@@ -1690,25 +1687,12 @@ async fn forced_401_reread_never_adopts_an_actively_marked_rotating_bundle() {
     assert!(broker.shutdown().await);
 }
 
-/// C2 DECISION: this pinned law is EXTENDED, not superseded. “One-use” is
-/// the import-only eager bootstrap marker, not a one-refresh lifetime budget.
-/// Durable receipt provenance selects serialized rotation for this first
-/// refresh and every later due/401 refresh, while the sanctioned OpenAI
-/// registration remains Conservative so ordinary loopback-PKCE is unchanged.
-///
-/// MUTATION CHECK 1: remove the imported-Codex branch from `resolve_oauth`.
-/// Expected runtime failure: the imported bundle returns its old access token
-/// without the refresh call asserted below. MUTATION CHECK 2: carry the
-/// import's one-use marker into `refreshed_bundle`. Expected runtime failure:
-/// the second resolution refreshes again. MUTATION CHECK 3: treat one-use as
-/// a lifetime refresh budget or drop receipt-scoped serialized refresh.
-/// Expected RUNTIME failure: the later genuinely expired imported generation
-/// does not perform the second POST. MUTATION CHECK 4: default ordinary
-/// bundles to the import marker. Expected runtime failure: the opaque
-/// loopback-PKCE bundle also refreshes instead of retaining the normal
-/// 30-second broker skew.
+/// Source-owned OAuth law: an imported Codex snapshot can be re-read, but
+/// Haider never spends its rotating refresh token. A source miss fails closed
+/// with zero token-endpoint calls; an independently Haider-owned PKCE grant
+/// retains the existing refresh behavior.
 #[tokio::test]
-async fn codex_fallback_refresh_is_one_use_and_import_scoped_at_the_broker_call_site() {
+async fn codex_import_never_uses_refresh_fallback_at_the_broker_call_site() {
     let server = FakeOAuthServer::start(FakeMode::Success, false).await;
     let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
     registration.provider_id = haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned();
@@ -1759,66 +1743,15 @@ async fn codex_fallback_refresh_is_one_use_and_import_scoped_at_the_broker_call_
         RefreshFenceRegistry::default(),
     )
     .expect("imported broker");
-    let refreshed = imported_broker
+    let error = imported_broker
         .resolve(&imported_descriptor)
         .await
-        .expect("resolve imported fallback");
-    assert_eq!(refreshed.expose_secret(), b"ACCESS_ROTATED_SENTINEL_3a19");
-    assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 1);
-    let retained_refresh = imported_broker
-        .resolve(&imported_descriptor)
-        .await
-        .expect("resolve refreshed import");
-    assert_eq!(
-        retained_refresh.expose_secret(),
-        b"ACCESS_ROTATED_SENTINEL_3a19"
-    );
+        .expect_err("stale source-owned import fails closed");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
     assert_eq!(
         server.state.refresh_calls.load(Ordering::SeqCst),
-        1,
-        "the import marker must clear after the first durable refresh"
-    );
-
-    let stored = vault
-        .resolve(&imported_descriptor.alias)
-        .and_then(|stored| OAuthTokenBundleV1::decode(stored.expose_secret()))
-        .expect("first refreshed import");
-    assert!(!stored.refresh_on_first_use());
-    let later_due = OAuthTokenBundleV1::new(
-        stored.provider_id.clone(),
-        stored.issuer.clone(),
-        stored.audience.clone(),
-        stored.resource.clone(),
-        stored.token_type.clone(),
-        Zeroizing::new(stored.access_token().to_vec()),
-        stored
-            .refresh_token()
-            .map(|token| Zeroizing::new(token.to_vec())),
-        now_ms().expect("clock").saturating_sub(1),
-        stored.refresh_expires_at_unix_ms,
-        stored.granted_scopes.clone(),
-        stored.identity.clone(),
-        stored.generation,
-    )
-    .expect("later-due import");
-    vault
-        .put(
-            &imported_descriptor.alias,
-            &later_due.encode().expect("encode later-due import"),
-        )
-        .expect("age refreshed import");
-    let later_refreshed = imported_broker
-        .resolve(&imported_descriptor)
-        .await
-        .expect("later imported lifecycle refresh");
-    assert_eq!(
-        later_refreshed.expose_secret(),
-        b"ACCESS_ROTATED_SENTINEL_3a19"
-    );
-    assert_eq!(
-        server.state.refresh_calls.load(Ordering::SeqCst),
-        2,
-        "consuming the eager marker must not disable later lifecycle refresh"
+        0,
+        "Haider must never spend an origin-owned refresh token"
     );
     assert!(imported_broker.shutdown().await);
 
@@ -1876,7 +1809,7 @@ async fn codex_fallback_refresh_is_one_use_and_import_scoped_at_the_broker_call_
     assert_eq!(retained.expose_secret(), b"fake-pkce-access-token-1");
     assert_eq!(
         server.state.refresh_calls.load(Ordering::SeqCst),
-        2,
+        0,
         "opaque PKCE token must retain the normal refresh skew"
     );
     assert!(pkce_broker.shutdown().await);
@@ -2012,6 +1945,68 @@ fn claude_file_and_native_secret_share_parser_and_fresh_bundle() {
     assert_eq!(secure_bundle.access_token(), file_bundle.access_token());
     assert_eq!(secure_bundle.refresh_token(), file_bundle.refresh_token());
     assert!(secure_bundle.expires_at_unix_ms > now_ms().expect("clock"));
+}
+
+/// Strict source precedence: native-store failures are health information,
+/// not a veto over an explicitly enrolled, readable file source.
+#[test]
+fn denied_or_locked_native_store_never_suppresses_readable_claude_file() {
+    let fixture_dir = tempfile::tempdir().expect("Claude import fixture directory");
+    let file_path = fixture_dir.path().join(".credentials.json");
+    std::fs::write(&file_path, CLAUDE_SECURE_STORE_FIXTURE).expect("write Claude fixture");
+
+    for failure in [
+        ClaudeNativeCredentialFailure::Denied,
+        ClaudeNativeCredentialFailure::Locked,
+        ClaudeNativeCredentialFailure::Unavailable,
+        ClaudeNativeCredentialFailure::TimedOut,
+    ] {
+        let native = FailingClaudeNative {
+            failure,
+            reads: AtomicUsize::new(0),
+        };
+        let input =
+            load_claude_credential_input(&file_path, &native, ClaudeNativeReadEvent::Significant)
+                .expect("readable enrolled file wins");
+        assert_eq!(input.location, file_path);
+        assert!(!input.native_owner);
+        assert_eq!(native.reads.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn anthropic_native_login_gets_a_stable_synthetic_account_identity() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    let mut registration = server.registration(Arc::new(FakeIdentityVerifier));
+    registration.provider_id = haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned();
+    registration.identity_mode = RuntimeIdentityMode::TokenEndpointGrant {
+        display_identity: "Anthropic login".into(),
+    };
+    registration.scopes = SCOPES.split_ascii_whitespace().map(str::to_owned).collect();
+    let body = serde_json::json!({
+        "access_token": ACCESS_SENTINEL,
+        "refresh_token": REFRESH_SENTINEL,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "scope": SCOPES
+    })
+    .to_string();
+
+    let first = token_bundle_from_response(&registration, body.as_bytes(), b"nonce", 1, None)
+        .await
+        .expect("Anthropic grant");
+    let identity = first.account_identity.as_ref().expect("synthetic identity");
+    assert!(
+        identity
+            .account_id
+            .as_deref()
+            .is_some_and(|account_id| account_id.starts_with("anthropic:"))
+    );
+    assert_eq!(identity.display_name.as_deref(), Some("Anthropic login"));
+
+    let refreshed = refresh_bundle_from_response(&registration, body.as_bytes(), &first)
+        .expect("refresh bundle");
+    assert_eq!(refreshed.account_identity, first.account_identity);
 }
 
 /// MUTATION CHECK: force either body builder to ignore the registration's
@@ -4181,50 +4176,33 @@ async fn concurrent_imported_refreshers_adopt_not_destroy() {
         &descriptor,
     );
 
-    let first_resolve = {
-        let first = first.clone();
-        let descriptor = descriptor.clone();
-        tokio::spawn(async move { first.resolve(&descriptor).await })
-    };
-    wait_for_refresh_calls(&server, 1).await;
-    let second_resolve = {
-        let second = second.clone();
-        let descriptor = descriptor.clone();
-        tokio::spawn(async move { second.resolve(&descriptor).await })
-    };
-    tokio::task::yield_now().await;
-    server.release_refresh();
-
-    for resolved in [first_resolve, second_resolve] {
-        let access = resolved
-            .await
-            .expect("imported resolve joins")
-            .expect("imported resolve authorized");
-        assert_eq!(access.expose_secret(), b"ACCESS_ROTATED_SENTINEL_3a19");
+    let (first_error, second_error) =
+        tokio::join!(first.resolve(&descriptor), second.resolve(&descriptor),);
+    for error in [first_error, second_error] {
+        let error = error.expect_err("source-owned import must require a fresh origin snapshot");
+        assert_eq!(error.code, ErrorCode::Unauthorized);
+        assert!(!error.retryable);
     }
     assert_eq!(
         server.state.refresh_calls.load(Ordering::SeqCst),
-        1,
-        "the rotated Codex refresh token must never be replayed"
+        0,
+        "Haider must never submit an origin-owned Codex refresh token"
     );
-    assert_eq!(
-        *server
+    assert!(
+        server
             .state
             .refresh_token_fingerprints
             .lock()
-            .expect("refresh token fingerprints"),
-        [*blake3::hash(REFRESH_SENTINEL.as_bytes()).as_bytes()],
-        "only generation one's token may reach the endpoint, exactly once"
+            .expect("refresh token fingerprints")
+            .is_empty(),
+        "no imported refresh token may reach the endpoint"
     );
     let stored = second_vault
         .resolve(&descriptor.alias)
         .and_then(|stored| OAuthTokenBundleV1::decode(stored.expose_secret()))
-        .expect("durable imported rotation");
-    assert_eq!(stored.generation, 2);
-    assert_eq!(
-        stored.refresh_token(),
-        Some(b"REFRESH_ROTATED_SENTINEL_8c21".as_slice())
-    );
+        .expect("unchanged imported snapshot");
+    assert_eq!(stored.generation, 1);
+    assert_eq!(stored.refresh_token(), Some(REFRESH_SENTINEL.as_bytes()));
     assert_eq!(stored.refresh_rejected_until_unix_ms, None);
     assert!(first.shutdown().await);
     assert!(second.shutdown().await);
@@ -4318,23 +4296,24 @@ async fn imported_refresh_retries_only_explicit_statuses_and_restores_bundle() {
     let error = broker
         .resolve(&descriptor)
         .await
-        .expect_err("exhausted explicit retry statuses remain retryable");
-    assert!(error.retryable);
-    assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 3);
-    assert_eq!(
-        *server
+        .expect_err("source-owned imports never enter the endpoint retry loop");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+    assert!(!error.retryable);
+    assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        server
             .state
             .refresh_token_fingerprints
             .lock()
-            .expect("refresh token fingerprints"),
-        [*blake3::hash(REFRESH_SENTINEL.as_bytes()).as_bytes(); 3],
-        "only explicit retryable statuses may replay the same request, at the bounded count"
+            .expect("refresh token fingerprints")
+            .is_empty(),
+        "an origin-owned token must never enter Haider's retry loop"
     );
     let restored = vault.resolve(&descriptor.alias).expect("restored import");
     assert_eq!(
         restored.expose_secret(),
         encoded.as_slice(),
-        "the exact pre-request bundle must replace uncertainty before retry escapes"
+        "the source snapshot must remain byte-identical"
     );
     assert!(broker.shutdown().await);
 }
@@ -4369,12 +4348,12 @@ async fn imported_ambiguous_transport_never_replays_uncertain_token() {
         .resolve(&descriptor)
         .await
         .expect_err("ambiguous transport requires Codex re-import");
-    assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 1);
-    let uncertain = second_vault
+    assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 0);
+    let unchanged = second_vault
         .resolve(&descriptor.alias)
         .and_then(|stored| OAuthTokenBundleV1::decode(stored.expose_secret()))
-        .expect("durable uncertain import");
-    assert_eq!(uncertain.refresh_rejected_until_unix_ms, Some(u64::MAX));
+        .expect("unchanged source snapshot");
+    assert_eq!(unchanged.refresh_rejected_until_unix_ms, None);
 
     let (second, _) = independent_imported_codex_broker(
         &server,
@@ -4387,16 +4366,16 @@ async fn imported_ambiguous_transport_never_replays_uncertain_token() {
         .expect_err("successor refuses uncertain Codex refresh");
     assert_eq!(
         server.state.refresh_calls.load(Ordering::SeqCst),
-        1,
-        "a possibly-spent token must not be replayed after restart"
+        0,
+        "an origin-owned token must not be submitted before or after restart"
     );
-    assert_eq!(
-        *server
+    assert!(
+        server
             .state
             .refresh_token_fingerprints
             .lock()
-            .expect("refresh token fingerprints"),
-        [*blake3::hash(REFRESH_SENTINEL.as_bytes()).as_bytes()]
+            .expect("refresh token fingerprints")
+            .is_empty()
     );
     for error in [&first_error, &second_error] {
         assert_eq!(error.code, ErrorCode::Unauthorized);
@@ -4492,18 +4471,14 @@ async fn terminal_invalid_grant_names_reimport_remedy_typed() {
     }
     assert_eq!(
         server.state.refresh_calls.load(Ordering::SeqCst),
-        1,
-        "a rejected imported refresh token must never be replayed"
+        0,
+        "an imported refresh token must never be submitted by Haider"
     );
     let stored = second_vault
         .resolve(&descriptor.alias)
         .and_then(|stored| OAuthTokenBundleV1::decode(stored.expose_secret()))
-        .expect("tombstoned imported bundle");
-    assert!(
-        stored
-            .refresh_rejected_until_unix_ms
-            .is_some_and(|until| until > now_ms().expect("clock"))
-    );
+        .expect("unchanged imported bundle");
+    assert_eq!(stored.refresh_rejected_until_unix_ms, None);
     let formatted = format!("{first_error:?}{second_error:?}");
     for secret in [
         RAW_ERROR_SENTINEL,
@@ -4603,18 +4578,19 @@ async fn imported_refresh_retains_token_when_response_does_not_rotate() {
         .expect("seed non-rotating import");
     let (broker, _) =
         independent_imported_codex_broker(&server, vault.clone() as Arc<dyn Vault>, &descriptor);
-    let access = broker
+    let error = broker
         .resolve(&descriptor)
         .await
-        .expect("non-rotating imported refresh");
-    assert_eq!(access.expose_secret(), b"ACCESS_ROTATED_SENTINEL_3a19");
+        .expect_err("source-owned import requires an origin refresh");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+    assert!(!error.retryable);
     let stored = vault
         .resolve(&descriptor.alias)
         .and_then(|stored| OAuthTokenBundleV1::decode(stored.expose_secret()))
-        .expect("durable non-rotating response");
-    assert_eq!(stored.generation, 2);
+        .expect("unchanged source snapshot");
+    assert_eq!(stored.generation, 1);
     assert_eq!(stored.refresh_token(), Some(REFRESH_SENTINEL.as_bytes()));
-    assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(server.state.refresh_calls.load(Ordering::SeqCst), 0);
     assert!(broker.shutdown().await);
 }
 

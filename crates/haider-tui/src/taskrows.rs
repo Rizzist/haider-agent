@@ -199,3 +199,59 @@ pub fn tasks_line(panel: &TaskPanel, clock_ms: u64) -> Option<String> {
         segments.join(" · ")
     ))
 }
+
+// ---------------------------------------------------------------------------
+// 970 monitorui — the band task line's right-aligned background counts.
+// ---------------------------------------------------------------------------
+
+/// Which overlay one band count opens. The COUNT is the shared truth; the
+/// renderer turns the kind into the click target, so screen and hit map can
+/// never disagree about what a count means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandCountKind {
+    Shells,
+    Monitors,
+}
+
+/// One right-aligned count on the `▾ subagents` band row — Claude Code's
+/// task line (`· 2 shells · 1 monitor`). Each is separately clickable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BandCount {
+    pub kind: BandCountKind,
+    /// Rendered text INCLUDING its leading `· ` separator.
+    pub text: String,
+}
+
+/// The band row's background counts, in fixed order (shells then monitors).
+/// A zero count is omitted entirely — never `· 0 shells` — so the row stays
+/// quiet until there is something to say.
+#[must_use]
+pub fn band_counts(shells: usize, monitors: usize) -> Vec<BandCount> {
+    let mut counts = Vec::new();
+    if shells > 0 {
+        counts.push(BandCount {
+            kind: BandCountKind::Shells,
+            text: format!("· {shells} shell{}", if shells == 1 { "" } else { "s" }),
+        });
+    }
+    if monitors > 0 {
+        counts.push(BandCount {
+            kind: BandCountKind::Monitors,
+            text: format!(
+                "· {monitors} monitor{}",
+                if monitors == 1 { "" } else { "s" }
+            ),
+        });
+    }
+    counts
+}
+
+/// The counts joined for measurement/mirroring: `· 2 shells · 1 monitor`.
+#[must_use]
+pub fn band_counts_text(counts: &[BandCount]) -> String {
+    counts
+        .iter()
+        .map(|count| count.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}

@@ -36,6 +36,7 @@ pub(crate) const ALLOWED_TOOLS: &[&str] = &[
     "peer_list",
     "ssh_list",
     "spawn_subagent",
+    "list_models",
 ];
 
 #[derive(Debug)]

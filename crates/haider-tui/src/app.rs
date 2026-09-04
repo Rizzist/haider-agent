@@ -289,6 +289,26 @@ impl AccountRow {
     }
 }
 
+/// Secret-free source metadata paired with an account descriptor by alias.
+/// This is a TUI projection rather than the wire type, matching `AccountRow`:
+/// rendering never depends on transport-only fields or credential material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSourceRow {
+    pub source_id: String,
+    pub account_alias: Option<haider_protocol::ids::CredentialAlias>,
+    pub kind: String,
+    pub label: String,
+    pub path: Option<String>,
+    pub credential_store: String,
+    pub refresh_owner: String,
+    pub health: String,
+    pub last_seen_at_ms: Option<u64>,
+    pub last_refreshed_at_ms: Option<u64>,
+    pub access_expires_at_ms: Option<u64>,
+    pub plan: Option<String>,
+    pub masked_identity: Option<String>,
+}
+
 /// Probe fixtures use only these whole-alias shapes: `probefix`,
 /// `probefix-api[-N]`, or `probe<PID>-api`. Keeping the match anchored avoids
 /// hiding legitimate aliases that merely contain the word `probe`.
@@ -320,6 +340,10 @@ fn canonical_positive_decimal(value: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct AccountsState {
     pub rows: Vec<AccountRow>,
+    /// Secret-free credential-source metadata from the same `account.list`
+    /// snapshot. Entries join to rows by stable alias; alias-less/unmatched
+    /// enrolled roots remain visible as sources without linked accounts.
+    pub sources: Vec<AccountSourceRow>,
     /// Management revision the rows were read at; an older reply is DROPPED.
     pub revision: Option<u64>,
     /// Last account action (sim `acctMsg`), shown under the head line.
@@ -634,6 +658,13 @@ impl AccountsState {
             self.cursor = self.rows.len().saturating_sub(1);
         }
         true
+    }
+
+    /// Installs the source half of an accepted `account.list` snapshot.
+    /// Kept separate from `apply_snapshot` so legacy/demo callers retain
+    /// their established account-row fixture seam.
+    pub fn apply_sources(&mut self, sources: Vec<AccountSourceRow>) {
+        self.sources = sources;
     }
 }
 
@@ -1242,6 +1273,8 @@ pub struct UsageGroup {
 /// and partially-priced cost sums say so instead of understating
 /// silently. `Models` is a range-selectable provider/model fold over the
 /// same usage-history ledger RPC; no dead tab ships before its data source.
+/// `Calendar` is a pure projection of the provider meter reset instants in
+/// the held `usage.report`: it reads no client clock and invents no cadence.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum UsageScope {
     #[default]
@@ -1252,6 +1285,8 @@ pub enum UsageScope {
     History,
     /// Per-model/provider rows folded over a selectable UTC ledger range.
     Models,
+    /// Month grid of exact provider-published five-hour and weekly resets.
+    Calendar,
 }
 
 impl UsageScope {
@@ -1262,6 +1297,7 @@ impl UsageScope {
             Self::Global => "global",
             Self::History => "history",
             Self::Models => "models",
+            Self::Calendar => "calendar",
         }
     }
 
@@ -1272,6 +1308,7 @@ impl UsageScope {
             "global" => Some(Self::Global),
             "history" => Some(Self::History),
             "models" => Some(Self::Models),
+            "calendar" => Some(Self::Calendar),
             _ => None,
         }
     }
@@ -1280,7 +1317,8 @@ impl UsageScope {
     #[must_use]
     pub fn next(self) -> Self {
         match self {
-            Self::Accounts => Self::Global,
+            Self::Accounts => Self::Calendar,
+            Self::Calendar => Self::Global,
             Self::Global => Self::History,
             Self::History => Self::Models,
             Self::Models => Self::Accounts,
@@ -2045,6 +2083,175 @@ pub fn report_note(report: &haider_protocol::agent::ChildReport) -> String {
         ReportVerification::Unverified => "unverified",
     };
     format!("└ subagent report ({verdict}) — {}", report.summary)
+}
+
+// ---------------------------------------------------------------------------
+// 970 monitorui — the monitor display vocabulary. ONE composition each for
+// the source line, the state chip, and the fired note, so the overlay, the
+// transcript and the tests can never word a monitor three different ways.
+// ---------------------------------------------------------------------------
+
+/// Bound applied to any command/summary excerpt on a monitor row.
+const MONITOR_EXCERPT_CHARS: usize = 48;
+
+fn monitor_excerpt(text: &str) -> String {
+    let flat = text.replace(['\n', '\r'], " ");
+    let trimmed = flat.trim();
+    if trimmed.chars().count() <= MONITOR_EXCERPT_CHARS {
+        trimmed.to_owned()
+    } else {
+        let mut cut: String = trimmed.chars().take(MONITOR_EXCERPT_CHARS).collect();
+        cut.push('…');
+        cut
+    }
+}
+
+/// A human interval: `60s`, `5m`, `2h`. Monitor intervals are coarse by
+/// nature, so sub-second precision is deliberately dropped. The unit only
+/// steps up PAST two of the next one, so the owner's `timer 60s` stays
+/// `60s` rather than rounding into a `1m` nobody typed.
+fn monitor_interval(interval_ms: u64) -> String {
+    let seconds = interval_ms / 1000;
+    if seconds < 120 {
+        format!("{seconds}s")
+    } else if seconds < 7200 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h", seconds / 3600)
+    }
+}
+
+/// What one monitor WATCHES, in one line: `timer 60s`,
+/// `poll gh run 123 · until conclusion`, `cli codex exec …`, `file src/x.rs`.
+/// The daemon's own `source_summary` wins when it sent one — this is the
+/// client's honest fallback for the typed source it already holds.
+#[must_use]
+pub fn monitor_source_summary(monitor: &haider_rpc::MonitorRegistrationWire) -> String {
+    if !monitor.source_summary.trim().is_empty() {
+        return monitor_excerpt(&monitor.source_summary);
+    }
+    use haider_rpc::MonitorSourceWire as S;
+    match &monitor.source {
+        S::Sms => "sms".to_owned(),
+        S::Process { command, .. } => format!("process {}", monitor_excerpt(command)),
+        S::File { path } => format!("file {}", monitor_excerpt(path)),
+        S::Poll {
+            command,
+            interval_ms,
+            until,
+            ..
+        } => {
+            let until = match until {
+                haider_rpc::MonitorPollUntilWire::ExitCode { code } => {
+                    format!("until exit {code}")
+                }
+                haider_rpc::MonitorPollUntilWire::StdoutMatches { pattern, .. } => {
+                    format!("until /{}/", monitor_excerpt(pattern))
+                }
+                haider_rpc::MonitorPollUntilWire::StdoutChanged => "until changed".to_owned(),
+                _ => "until ?".to_owned(),
+            };
+            format!(
+                "poll {} · {} · {until}",
+                monitor_excerpt(command),
+                monitor_interval(*interval_ms)
+            )
+        }
+        S::Timer { interval_ms } => format!("timer {}", monitor_interval(*interval_ms)),
+        S::Cli { preset, argv, .. } => {
+            let preset = match preset {
+                haider_rpc::MonitorCliPresetWire::Codex => "codex",
+                haider_rpc::MonitorCliPresetWire::ClaudeCode => "claude-code",
+                haider_rpc::MonitorCliPresetWire::Opencode => "opencode",
+                haider_rpc::MonitorCliPresetWire::Antigravity => "antigravity",
+                haider_rpc::MonitorCliPresetWire::GhCi => "gh-ci",
+                haider_rpc::MonitorCliPresetWire::Custom => "custom",
+                _ => "cli",
+            };
+            if argv.is_empty() {
+                format!("cli {preset}")
+            } else {
+                format!("cli {preset} {}", monitor_excerpt(&argv.join(" ")))
+            }
+        }
+        _ => "unknown source".to_owned(),
+    }
+}
+
+/// The row's state chip word. `firing` is a CLIENT overlay on daemon truth
+/// (see [`AppModel::monitor_row_state`]) and reads the same as the rest.
+#[must_use]
+pub const fn monitor_state_chip(state: haider_rpc::MonitorStateWire) -> &'static str {
+    match state {
+        haider_rpc::MonitorStateWire::Armed => "armed",
+        haider_rpc::MonitorStateWire::Paused => "paused",
+        haider_rpc::MonitorStateWire::Firing => "firing",
+        haider_rpc::MonitorStateWire::Exited => "exited",
+    }
+}
+
+/// The ambient transcript note one monitor delivery becomes (owner item 3):
+/// `◉ monitor timer-60s fired → …`. Never a modal — a fire is news.
+#[must_use]
+pub fn monitor_fired_note(report: &haider_rpc::MonitorDeliveryReportWire) -> String {
+    let summary = report
+        .events
+        .last()
+        .map(|event| monitor_event_summary(&event.payload))
+        .filter(|summary| !summary.is_empty());
+    let coalesced = if report.coalesced_count > 1 {
+        format!(" · {} events", report.coalesced_count)
+    } else {
+        String::new()
+    };
+    match summary {
+        Some(summary) => format!(
+            "◉ monitor {} fired{coalesced} → {summary}",
+            report.monitor_id
+        ),
+        None => format!("◉ monitor {} fired{coalesced}", report.monitor_id),
+    }
+}
+
+/// One event payload's one-line summary. The payload is opaque data from a
+/// watched source, so it is excerpted and flattened, never interpreted.
+fn monitor_event_summary(payload: &haider_rpc::MonitorEventPayloadWire) -> String {
+    use haider_rpc::MonitorEventPayloadWire as P;
+    let text = match payload {
+        // The SMS body is the message itself — the ADDRESS is not echoed
+        // into the transcript.
+        P::Sms { body, .. } => body.clone(),
+        P::Process {
+            line, exit_code, ..
+        }
+        | P::Cli {
+            line, exit_code, ..
+        } => match exit_code {
+            Some(code) if line.trim().is_empty() => format!("exit {code}"),
+            Some(code) => format!("{line} · exit {code}"),
+            None => line.clone(),
+        },
+        P::File { payload } | P::Poll { payload } => payload.clone(),
+        P::Timer { tick, .. } => format!("tick {tick}"),
+        _ => String::new(),
+    };
+    monitor_excerpt(&text)
+}
+
+/// A structured refusal in the user's words. Never a raw debug dump.
+fn monitor_rejection_note(rejection: &haider_rpc::MonitorControlRejectionWire) -> String {
+    use haider_rpc::MonitorControlRejectionWire as R;
+    match rejection {
+        R::NotFound { monitor_id } => format!("· no monitor {monitor_id}"),
+        R::CapabilityDenied { .. } => "· monitor control needs a control attachment".to_owned(),
+        R::ControlAttachmentRequired => "· monitor control needs a control attachment".to_owned(),
+        R::SessionNotFound => "· that session is gone".to_owned(),
+        R::InvalidRequest { detail, .. } => format!("· monitor refused — {detail}"),
+        R::ServiceStopped => "· the monitor service is stopped".to_owned(),
+        R::StoreUnavailable { detail, .. } => format!("· monitor store unavailable — {detail}"),
+        R::CommandConflict => "· another monitor command is in flight".to_owned(),
+        _ => "· monitor control refused".to_owned(),
+    }
 }
 
 /// A chip's display name: callsign + honorific when one is claimed, the
@@ -3266,6 +3473,24 @@ pub enum AppRequest {
         id: String,
     },
     MonitorList,
+    /// `monitor.remove` — stop one monitor for good (970 owner item 2).
+    /// Durable: it carries a command id through the outbox, so a socket
+    /// loss retries the stop rather than silently dropping it.
+    MonitorRemove {
+        monitor_id: String,
+    },
+    /// `monitor.mutate` / pause.
+    MonitorPause {
+        monitor_id: String,
+    },
+    /// `monitor.mutate` / resume.
+    MonitorResume {
+        monitor_id: String,
+    },
+    /// `monitor.mutate` / trigger — fire this monitor once, now.
+    MonitorTrigger {
+        monitor_id: String,
+    },
     /// `/hooks` live (H4): read the daemon's hook discovery for `cwd` —
     /// workspace + profile truth. The cwd is CAPTURED AT ISSUANCE (the B2b
     /// capture law): a later screen or session switch cannot retarget the
@@ -3959,12 +4184,29 @@ pub enum Hit {
     BackChip,
     TalkChip,
     HelpHint,
-    /// Clickable shell-count segment in the existing bottom status strip.
+    /// Clickable shell count on the band's task line (970 owner item 1 —
+    /// it moved off the bottom status strip onto the `▾ subagents` row).
     ShellStatus,
-    /// Clickable monitor-count segment in the existing bottom status strip.
+    /// Clickable monitor count on the band's task line (970 owner item 1).
     MonitorStatus,
     /// Close affordance for the shell-registry overlay.
     ShellClose(String),
+    /// One monitor row in the `/monitors` overlay — selects it and reveals
+    /// its actions. Carries the monitor id, never an ordinal, so a stale
+    /// hit map can never act on a different monitor (the value-carrying
+    /// hit law).
+    MonitorRow(String),
+    /// Row action: stop (remove) the monitor. Arm-then-confirm.
+    MonitorStop(String),
+    /// Row action: pause an armed monitor, resume a paused one.
+    MonitorPause(String),
+    /// Row action: fire the monitor now.
+    MonitorTrigger(String),
+    /// Row action: hand the edit to the AGENT by prefilling the composer
+    /// with `/monitor edit <id>: `.
+    MonitorEdit(String),
+    /// Row action: copy the monitor id.
+    MonitorCopyId(String),
     /// A SubTree row — opens the chip's own view.
     ChipRow(String),
     /// The SubTree header (collapse toggle).
@@ -5049,8 +5291,19 @@ pub struct AppModel {
     /// Full-body interactive SSH pane. Distinct from the shell-list overlay,
     /// monitor details, and subagent surfaces.
     pub ssh_terminal: Option<SshTerminalPane>,
-    /// Existing monitor details floated over the body from the status strip.
+    /// Existing monitor details floated over the body from the band's
+    /// `· N monitors` count.
     pub monitors_open: bool,
+    /// Selected monitor row in the overlay's keyboard path.
+    pub monitors_cursor: usize,
+    /// The monitor whose destructive overlay stop is awaiting a second `x`.
+    /// Moving the cursor or closing the overlay disarms it.
+    pub monitors_stop_armed: Option<String>,
+    /// Monitors this client has seen FIRE whose woken subturn has not yet
+    /// completed (owner item 3). A display overlay on daemon truth only —
+    /// [`AppModel::monitor_row_state`] is the single reader, and the set is
+    /// cleared the moment the session goes idle again.
+    pub monitors_firing: std::collections::HashSet<String>,
     /// Small status-line explainer overlay for the active lockdown provider.
     pub lockdown_overlay: bool,
     pub lockdown_status: Option<haider_rpc::LockdownStatusWire>,
@@ -5396,6 +5649,9 @@ impl Default for AppModel {
             },
             ssh_terminal: None,
             monitors_open: false,
+            monitors_cursor: 0,
+            monitors_stop_armed: None,
+            monitors_firing: std::collections::HashSet::new(),
             lockdown_overlay: false,
             lockdown_status: None,
             lockdown_provider: None,
@@ -7712,9 +7968,65 @@ impl AppModel {
             self.dirty = true;
             return;
         }
+        // 970 owner item 2: keyboard parity with the overlay's click
+        // targets — j/k select, x stops (arm-then-confirm), p pauses or
+        // resumes by the row's own state, t triggers, e hands the edit to
+        // the agent, y copies the id. The overlay owns every key while it
+        // is showing, exactly as `/ssh` and `/shells` do.
         if self.monitors_open {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-                self.monitors_open = false;
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.monitors_open = false;
+                    self.monitors_stop_armed = None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.monitors_cursor = self.monitors_cursor.saturating_sub(1);
+                    self.monitors_stop_armed = None;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.monitors_cursor = self
+                        .monitors_cursor
+                        .saturating_add(1)
+                        .min(self.monitors.len().saturating_sub(1));
+                    self.monitors_stop_armed = None;
+                }
+                KeyCode::Char('x') => {
+                    if let Some(id) = self.monitors_selected_id() {
+                        if self.monitors_stop_armed.as_deref() == Some(id.as_str()) {
+                            self.monitors_stop_armed = None;
+                            self.monitor_stop(id);
+                        } else {
+                            self.monitors_stop_armed = Some(id.clone());
+                            self.flash =
+                                Some(format!("· stop monitor {id}? press x again to confirm"));
+                        }
+                    }
+                }
+                KeyCode::Char('p') => {
+                    if let Some(id) = self.monitors_selected_id() {
+                        self.monitors_stop_armed = None;
+                        self.monitor_toggle_pause(id);
+                    }
+                }
+                KeyCode::Char('t') => {
+                    if let Some(id) = self.monitors_selected_id() {
+                        self.monitors_stop_armed = None;
+                        self.monitor_trigger(id);
+                    }
+                }
+                KeyCode::Char('e') => {
+                    if let Some(id) = self.monitors_selected_id() {
+                        self.monitors_stop_armed = None;
+                        self.monitor_edit_with_agent(&id);
+                    }
+                }
+                KeyCode::Char('y') => {
+                    if let Some(id) = self.monitors_selected_id() {
+                        self.monitors_stop_armed = None;
+                        self.monitor_copy_id(&id);
+                    }
+                }
+                _ => {}
             }
             self.dirty = true;
             return;
@@ -10696,7 +11008,8 @@ impl AppModel {
             UsageScope::Accounts
             | UsageScope::Global
             | UsageScope::History
-            | UsageScope::Models => {}
+            | UsageScope::Models
+            | UsageScope::Calendar => {}
         }
     }
 
@@ -10753,7 +11066,12 @@ impl AppModel {
                 self.usage.follow_cursor.set(true);
                 self.dirty = true;
             }
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('<')
+            | KeyCode::Char('>') => {
                 let groups = self.usage.groups();
                 let Some(group) = groups.get(self.usage.cursor.min(groups.len().saturating_sub(1)))
                 else {
@@ -10764,7 +11082,7 @@ impl AppModel {
                     return;
                 }
                 let current = self.usage.selected_tab(group);
-                let next = if matches!(code, KeyCode::Right | KeyCode::Tab) {
+                let next = if matches!(code, KeyCode::Right | KeyCode::Tab | KeyCode::Char('>')) {
                     (current + 1) % len
                 } else {
                     (current + len - 1) % len
@@ -13825,7 +14143,7 @@ impl AppModel {
             "peer" | "peers" => self.peer_command(&remainder),
             "ssh" => self.ssh_command(&remainder),
             "shells" => self.shells_command(&remainder),
-            "monitors" => self.monitors_command(),
+            "monitors" => self.monitors_command(&remainder),
             "providers" => self.enter_providers(),
             "hooks" => self.enter_hooks(),
             // CG-M1: `/graph [pin|abandon|status]`.
@@ -13838,7 +14156,7 @@ impl AppModel {
             // Owner 2026-08-16: manual retry of the failed turn — the
             // keyboard path to the ambient retry row's click.
             "retry" => self.issue_run_retry(),
-            // `/usage [history|models|global|accounts] [provider]`: a
+            // `/usage [history|models|calendar|global|accounts] [provider]`: a
             // leading scope lands directly; otherwise the first token keeps
             // the existing provider-prefix meaning.
             "usage" => {
@@ -14155,7 +14473,34 @@ impl AppModel {
         }
     }
 
-    fn monitors_command(&mut self) {
+    /// The band task line's LIVE shell count — starting/running only, the
+    /// same filter the retired status segment applied. One truth for the
+    /// row, its hit map, and the tests.
+    #[must_use]
+    pub fn live_shell_count(&self) -> usize {
+        self.shells
+            .iter()
+            .filter(|shell| {
+                matches!(
+                    &shell.status,
+                    haider_rpc::ShellStatusWire::Starting | haider_rpc::ShellStatusWire::Running
+                )
+            })
+            .count()
+    }
+
+    /// The right-aligned counts on the `▾ subagents` band row (970 owner
+    /// item 1). Empty when there is nothing running — the row then collapses
+    /// exactly as it did before.
+    #[must_use]
+    pub fn band_counts(&self) -> Vec<crate::taskrows::BandCount> {
+        crate::taskrows::band_counts(self.live_shell_count(), self.monitor_count)
+    }
+
+    /// `/monitors` and its control subcommands. A bare `/monitors` opens the
+    /// overlay against fresh daemon truth; `stop|pause|resume <id>` act on one
+    /// row without opening anything (owner item 4).
+    fn monitors_command(&mut self, argument: &str) {
         self.dirty = true;
         if self.mode.fabricates_locally() {
             self.flash = Some("· /monitors — live only; monitors are daemon truth".into());
@@ -14169,12 +14514,141 @@ impl AppModel {
             self.flash = Some(self.stale_daemon_note("monitor details"));
             return;
         }
-        self.monitors_open = true;
-        self.requests.push(AppRequest::MonitorList);
-        self.flash = Some("· reading existing monitor registry…".into());
+        let argument = argument.trim();
+        if argument.is_empty() {
+            self.monitors_open = true;
+            self.monitors_cursor = 0;
+            self.requests.push(AppRequest::MonitorList);
+            self.flash = Some("· reading existing monitor registry…".into());
+            return;
+        }
+        let (verb, id) = argument
+            .split_once(char::is_whitespace)
+            .unwrap_or((argument, ""));
+        let id = id.trim();
+        if id.is_empty() {
+            self.flash = Some("· /monitors [stop|pause|resume <id>]".into());
+            return;
+        }
+        match verb {
+            "stop" | "remove" => self.monitor_stop(id.to_owned()),
+            "pause" => self.monitor_pause(id.to_owned()),
+            "resume" => self.monitor_resume(id.to_owned()),
+            _ => self.flash = Some("· /monitors [stop|pause|resume <id>]".into()),
+        }
     }
 
-    pub(crate) fn apply_monitor_list(&mut self, receipt: haider_rpc::MonitorListReceiptWire) {
+    pub(crate) fn monitor_stop(&mut self, monitor_id: String) {
+        self.flash = Some(format!("· stopping monitor {monitor_id}…"));
+        self.requests.push(AppRequest::MonitorRemove { monitor_id });
+        self.dirty = true;
+    }
+
+    pub(crate) fn monitor_pause(&mut self, monitor_id: String) {
+        self.flash = Some(format!("· pausing monitor {monitor_id}…"));
+        self.requests.push(AppRequest::MonitorPause { monitor_id });
+        self.dirty = true;
+    }
+
+    pub(crate) fn monitor_resume(&mut self, monitor_id: String) {
+        self.flash = Some(format!("· resuming monitor {monitor_id}…"));
+        self.requests.push(AppRequest::MonitorResume { monitor_id });
+        self.dirty = true;
+    }
+
+    pub(crate) fn monitor_trigger(&mut self, monitor_id: String) {
+        self.flash = Some(format!("· triggering monitor {monitor_id}…"));
+        self.requests
+            .push(AppRequest::MonitorTrigger { monitor_id });
+        self.dirty = true;
+    }
+
+    /// Pause or resume by the row's OWN state — one key/click for the pair,
+    /// so the overlay never asks the user which verb applies.
+    pub(crate) fn monitor_toggle_pause(&mut self, monitor_id: String) {
+        let paused = self
+            .monitors
+            .iter()
+            .find(|monitor| monitor.monitor_id == monitor_id)
+            .is_some_and(|monitor| matches!(monitor.state, haider_rpc::MonitorStateWire::Paused));
+        if paused {
+            self.monitor_resume(monitor_id);
+        } else {
+            self.monitor_pause(monitor_id);
+        }
+    }
+
+    /// The prefill that hands one monitor's edit to the AGENT (owner item 2):
+    /// the composer opens on `/monitor edit <id>: ` and the user types what to
+    /// change in prose — the model then calls `monitor.update`.
+    #[must_use]
+    pub fn monitor_edit_prefill(monitor_id: &str) -> String {
+        format!("/monitor edit {monitor_id}: ")
+    }
+
+    pub(crate) fn monitor_edit_with_agent(&mut self, monitor_id: &str) {
+        self.monitors_open = false;
+        self.composer
+            .set_text(Self::monitor_edit_prefill(monitor_id));
+        // The draft opens on a slash, but what follows is PROSE for the
+        // agent — the palette must not sit over it offering commands.
+        self.palette_dismissed = true;
+        self.flash = Some("· describe the change — the agent edits the monitor".into());
+        self.dirty = true;
+    }
+
+    pub(crate) fn monitor_copy_id(&mut self, monitor_id: &str) {
+        // The reducer already holds the exact text (TUI5 item 5), so it
+        // travels in the request and the runtime runs the shared
+        // pbcopy + OSC 52 path.
+        self.requests
+            .push(AppRequest::CopyText(monitor_id.to_owned()));
+        self.flash = Some(format!("· copied {monitor_id}"));
+        self.dirty = true;
+    }
+
+    /// The overlay's selected row id, if the registry is non-empty.
+    #[must_use]
+    pub fn monitors_selected_id(&self) -> Option<String> {
+        self.monitors
+            .get(self.monitors_cursor)
+            .map(|monitor| monitor.monitor_id.clone())
+    }
+
+    /// The state one row RENDERS as: daemon truth, except that a monitor this
+    /// client has seen fire reads `firing` until the woken subturn completes
+    /// (owner item 3).
+    #[must_use]
+    pub fn monitor_row_state(
+        &self,
+        monitor: &haider_rpc::MonitorRegistrationWire,
+    ) -> haider_rpc::MonitorStateWire {
+        if self.monitors_firing.contains(&monitor.monitor_id) {
+            haider_rpc::MonitorStateWire::Firing
+        } else {
+            monitor.state
+        }
+    }
+
+    /// One monitor delivery reaching this session: an ambient transcript note
+    /// and a `firing` chip that stands until the woken subturn completes.
+    /// Never a modal — the fire is news, not a question.
+    pub fn apply_monitor_fired(&mut self, report: &haider_rpc::MonitorDeliveryReportWire) {
+        self.monitors_firing.insert(report.monitor_id.clone());
+        self.projection.push_note(monitor_fired_note(report));
+        self.dirty = true;
+    }
+
+    /// The woken subturn finished: every row this client marked `firing`
+    /// falls back to daemon truth.
+    pub(crate) fn clear_monitor_firing(&mut self) {
+        if !self.monitors_firing.is_empty() {
+            self.monitors_firing.clear();
+            self.dirty = true;
+        }
+    }
+
+    pub fn apply_monitor_list(&mut self, receipt: haider_rpc::MonitorListReceiptWire) {
         self.monitors = match receipt.outcome {
             haider_rpc::MonitorListOutcomeWire::Listed { monitors } => monitors,
             haider_rpc::MonitorListOutcomeWire::Rejected { .. }
@@ -14182,7 +14656,61 @@ impl AppModel {
             _ => Vec::new(),
         };
         self.monitor_count = self.monitors.len();
+        self.monitors_cursor = self
+            .monitors_cursor
+            .min(self.monitors.len().saturating_sub(1));
         self.flash = None;
+        self.dirty = true;
+    }
+
+    /// A pause/resume/trigger/update receipt: the returned row REPLACES the
+    /// one we hold, so the chip follows daemon truth rather than an optimistic
+    /// local guess.
+    pub fn apply_monitor_mutate(&mut self, receipt: haider_rpc::MonitorMutateReceiptWire) {
+        match receipt.outcome {
+            haider_rpc::MonitorMutateOutcomeWire::Updated { monitor }
+            | haider_rpc::MonitorMutateOutcomeWire::Paused { monitor }
+            | haider_rpc::MonitorMutateOutcomeWire::Resumed { monitor } => {
+                self.monitors_firing.remove(&monitor.monitor_id);
+                if let Some(slot) = self
+                    .monitors
+                    .iter_mut()
+                    .find(|row| row.monitor_id == monitor.monitor_id)
+                {
+                    *slot = monitor;
+                } else {
+                    self.monitors.push(monitor);
+                }
+                self.monitor_count = self.monitors.len();
+                self.flash = None;
+            }
+            haider_rpc::MonitorMutateOutcomeWire::Triggered { monitor_id } => {
+                self.flash = Some(format!("· triggered {monitor_id}"));
+            }
+            haider_rpc::MonitorMutateOutcomeWire::Rejected { rejection } => {
+                self.flash = Some(monitor_rejection_note(&rejection));
+            }
+            _ => self.flash = Some("· monitor control refused".into()),
+        }
+        self.dirty = true;
+    }
+
+    pub fn apply_monitor_remove(&mut self, receipt: haider_rpc::MonitorRemoveReceiptWire) {
+        match receipt.outcome {
+            haider_rpc::MonitorRemoveOutcomeWire::Removed { monitor_id } => {
+                self.monitors.retain(|row| row.monitor_id != monitor_id);
+                self.monitors_firing.remove(&monitor_id);
+                self.monitor_count = self.monitors.len();
+                self.monitors_cursor = self
+                    .monitors_cursor
+                    .min(self.monitors.len().saturating_sub(1));
+                self.flash = Some(format!("· stopped {monitor_id}"));
+            }
+            haider_rpc::MonitorRemoveOutcomeWire::Rejected { rejection } => {
+                self.flash = Some(monitor_rejection_note(&rejection));
+            }
+            _ => self.flash = Some("· monitor control refused".into()),
+        }
         self.dirty = true;
     }
 
@@ -15389,6 +15917,9 @@ impl AppModel {
             if state.is_terminal() {
                 self.turn_active = false;
                 self.auto_resuming = false;
+                // 970 owner item 3: the woken subturn is over, so every row
+                // this client painted `firing` falls back to daemon truth.
+                self.clear_monitor_firing();
                 // The `♪ speaking` tag ends where the TURN ends. A trailing
                 // `Voice(false)` beat could not: a branch parked on a menu
                 // never reaches its own tail, so later ordinary rows kept
@@ -15564,6 +16095,14 @@ impl AppModel {
         self.lockdown_status = None;
         self.lockdown_overlay = false;
         self.turn_active = false;
+        // Monitors are SESSION truth — a new session inherits none of the
+        // previous one's registry, cursor, or firing overlay.
+        self.monitors.clear();
+        self.monitor_count = 0;
+        self.monitors_open = false;
+        self.monitors_cursor = 0;
+        self.monitors_stop_armed = None;
+        self.monitors_firing.clear();
         self.msg_queue.clear();
         self.queue_mode = false;
         self.subturn_mode = false;
@@ -16341,7 +16880,18 @@ impl AppModel {
         if self.ssh_open {
             return;
         }
-        if self.monitors_open && !matches!(hit, Hit::MonitorStatus) {
+        if self.monitors_open
+            && !matches!(
+                hit,
+                Hit::MonitorStatus
+                    | Hit::MonitorRow(_)
+                    | Hit::MonitorStop(_)
+                    | Hit::MonitorPause(_)
+                    | Hit::MonitorTrigger(_)
+                    | Hit::MonitorEdit(_)
+                    | Hit::MonitorCopyId(_)
+            )
+        {
             return;
         }
         if self.lockdown_overlay {
@@ -16670,10 +17220,48 @@ impl AppModel {
             }
             Hit::HelpHint if self.screen == Screen::Launcher => self.help_open = true,
             Hit::ShellStatus => self.shells_command(""),
-            Hit::MonitorStatus => self.monitors_command(),
+            Hit::MonitorStatus => self.monitors_command(""),
             Hit::ShellClose(id) if self.shells_open => {
                 self.requests.push(AppRequest::ShellClose { id });
                 self.flash = Some("· closing shell…".into());
+            }
+            // 970 owner item 2: the overlay's row actions. Every arm
+            // re-checks the overlay flag — local chrome never acts from a
+            // hit map drawn for a screen that is no longer showing.
+            Hit::MonitorRow(id) if self.monitors_open => {
+                if let Some(index) = self
+                    .monitors
+                    .iter()
+                    .position(|monitor| monitor.monitor_id == id)
+                {
+                    self.monitors_cursor = index;
+                }
+                self.monitors_stop_armed = None;
+            }
+            Hit::MonitorStop(id) if self.monitors_open => {
+                if self.monitors_stop_armed.as_deref() == Some(id.as_str()) {
+                    self.monitors_stop_armed = None;
+                    self.monitor_stop(id);
+                } else {
+                    self.flash = Some(format!("· stop monitor {id}? click stop again to confirm"));
+                    self.monitors_stop_armed = Some(id);
+                }
+            }
+            Hit::MonitorPause(id) if self.monitors_open => {
+                self.monitors_stop_armed = None;
+                self.monitor_toggle_pause(id);
+            }
+            Hit::MonitorTrigger(id) if self.monitors_open => {
+                self.monitors_stop_armed = None;
+                self.monitor_trigger(id);
+            }
+            Hit::MonitorEdit(id) if self.monitors_open => {
+                self.monitors_stop_armed = None;
+                self.monitor_edit_with_agent(&id);
+            }
+            Hit::MonitorCopyId(id) if self.monitors_open => {
+                self.monitors_stop_armed = None;
+                self.monitor_copy_id(&id);
             }
             // The SubTree panel exists only on the session/subagent screens,
             // and its rows only while it is expanded.

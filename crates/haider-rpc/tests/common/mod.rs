@@ -31,8 +31,8 @@ use haider_protocol::usage::{
     AccountMeterStateV1, AccountUsageReportV1, LocalUsageStatsV1, UsageReportV1, UsageWindowV1,
 };
 use haider_rpc::{
-    AccountAddMethod, AttachMode, AttachState, AttachmentId, CancelStatus, Capability, ClientKind,
-    CommandId, DeviceCredentialCandidateWire, ERROR_CODE_ALREADY_RESOLVED,
+    AccountAddMethod, AccountSourceWire, AttachMode, AttachState, AttachmentId, CancelStatus,
+    Capability, ClientKind, CommandId, DeviceCredentialCandidateWire, ERROR_CODE_ALREADY_RESOLVED,
     ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_PROVIDER_REMOVE_REFUSED,
     ERROR_CODE_REVISION_CONFLICT, ErrorData, FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1,
     FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_DEVICE_V1,
@@ -539,6 +539,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 revision: None,
                 provider_active: Vec::new(),
                 provider_defaults: Vec::new(),
+                sources: Vec::new(),
                 availability: None,
             },
         },
@@ -670,6 +671,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     provider: "anthropic".into(),
                     model: "frontier-anthropic".into(),
                 }],
+                sources: Vec::new(),
                 availability: None,
             },
         },
@@ -2069,6 +2071,64 @@ pub fn transcript() -> Vec<WireFrame> {
     frames
 }
 
+/// v0.0.970 source-registry request/success pairs. Kept separate from the
+/// frozen historical transcript so older append-only index assertions retain
+/// their exact coordinates.
+pub fn account_source_transcript() -> Vec<WireFrame> {
+    vec![
+        WireFrame::Request {
+            request_id: RequestId::new("request-account-source-list"),
+            body: RequestBody::AccountSourceList,
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-account-source-list"),
+            body: ResponseBody::AccountSourceList {
+                sources: vec![golden_account_source()],
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-account-source-add"),
+            body: RequestBody::AccountSourceAdd {
+                command_id: CommandId::new("command-account-source-add"),
+                kind: "codex_home".into(),
+                root: "/home/golden/.codex".into(),
+                label: Some("Codex work".into()),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-account-source-add"),
+            body: ResponseBody::AccountSourceAdd {
+                source: golden_account_source(),
+                sources: vec![golden_account_source()],
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-account-source-remove"),
+            body: RequestBody::AccountSourceRemove {
+                command_id: CommandId::new("command-account-source-remove"),
+                source_id: "src1_golden".into(),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-account-source-remove"),
+            body: ResponseBody::AccountSourceRemove {
+                source_id: "src1_golden".into(),
+                sources: Vec::new(),
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-account-source-scan"),
+            body: RequestBody::AccountSourceScan,
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-account-source-scan"),
+            body: ResponseBody::AccountSourceScan {
+                sources: vec![golden_account_source()],
+            },
+        },
+    ]
+}
+
 /// A/C/D union tail. These method pairs are decoded through the public wire
 /// types before the byte golden is generated, so serde defaults and canonical
 /// field ordering remain part of the transcript contract.
@@ -2410,6 +2470,24 @@ pub fn golden_descriptor() -> CredentialDescriptor {
         label: None,
         account_identity: None,
         created_at_ms: None,
+    }
+}
+
+pub fn golden_account_source() -> AccountSourceWire {
+    AccountSourceWire {
+        source_id: "src1_golden".into(),
+        account_alias: Some(CredentialAlias::new("anthropic-0123456789abcdef01234567")),
+        kind: "codex_home".into(),
+        label: "Codex work".into(),
+        path: Some("/home/golden/.codex".into()),
+        credential_store: "file".into(),
+        refresh_owner: "source".into(),
+        health: "linked".into(),
+        last_seen_at_ms: Some(1_753_500_000_000),
+        last_refreshed_at_ms: Some(1_753_499_900_000),
+        access_expires_at_ms: Some(1_753_503_600_000),
+        plan: Some("pro".into()),
+        masked_identity: Some("go***@example.invalid".into()),
     }
 }
 

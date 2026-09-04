@@ -319,6 +319,9 @@ pub const FEATURE_ACCOUNT_OAUTH_IMPORT_SOURCES_V1: &str = "account_oauth_import_
 pub const FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1: &str = "account_device_discovery_v1";
 /// Daemon implements durable `account.add` for an OAuth-ready reference.
 pub const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";
+/// Daemon owns a durable, profile-scoped registry of external credential
+/// roots and publishes source ownership/health beside `account.list`.
+pub const FEATURE_ACCOUNT_SOURCES_V1: &str = "account_sources_v1";
 /// Daemon serves `account.list_watch` and pushes `AccountsChanged` on every
 /// published registry revision, so a client mirrors the account list without
 /// polling.
@@ -1399,6 +1402,31 @@ pub struct DeviceCredentialCandidateWire {
     /// `source` so older candidate bytes retain their historical prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<haider_protocol::credential::AccountIdentity>,
+}
+
+/// Public, secret-free state for one durable credential source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountSourceWire {
+    pub source_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_alias: Option<haider_protocol::ids::CredentialAlias>,
+    pub kind: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub credential_store: String,
+    pub refresh_owner: String,
+    pub health: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refreshed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_expires_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub masked_identity: Option<String>,
 }
 
 /// Typed, secret-free notice that a first-party CLI login can be copied into
@@ -3893,6 +3921,28 @@ pub enum RequestBody {
     /// Reads only bounded, non-secret metadata from known first-party stores.
     #[serde(rename = "account.device_candidates")]
     AccountDeviceCandidates,
+    /// Lists the durable profile-scoped credential source registry.
+    #[serde(rename = "account.source_list")]
+    AccountSourceList,
+    /// Enrolls one external root. The daemon canonicalizes and bounds it.
+    #[serde(rename = "account.source_add")]
+    AccountSourceAdd {
+        command_id: CommandId,
+        kind: String,
+        root: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// Removes one durable enrollment. Its account remains visible as
+    /// unlinked/source-gone until separately removed.
+    #[serde(rename = "account.source_remove")]
+    AccountSourceRemove {
+        command_id: CommandId,
+        source_id: String,
+    },
+    /// Reconciles every enrolled source immediately.
+    #[serde(rename = "account.source_scan")]
+    AccountSourceScan,
     /// Imports one candidate by opaque identifier. The daemon re-discovers
     /// and reads the local source; credential bytes never cross this frame.
     #[serde(rename = "account.import_device")]
@@ -4954,6 +5004,28 @@ pub enum ResponseBody {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         adoption_available: Vec<AccountAdoptionAvailable>,
     },
+    #[serde(rename = "account.source_list")]
+    AccountSourceList {
+        #[serde(default)]
+        sources: Vec<AccountSourceWire>,
+    },
+    #[serde(rename = "account.source_add")]
+    AccountSourceAdd {
+        source: AccountSourceWire,
+        #[serde(default)]
+        sources: Vec<AccountSourceWire>,
+    },
+    #[serde(rename = "account.source_remove")]
+    AccountSourceRemove {
+        source_id: String,
+        #[serde(default)]
+        sources: Vec<AccountSourceWire>,
+    },
+    #[serde(rename = "account.source_scan")]
+    AccountSourceScan {
+        #[serde(default)]
+        sources: Vec<AccountSourceWire>,
+    },
     #[serde(rename = "account.import_device")]
     AccountImportDevice {
         descriptor: haider_protocol::credential::CredentialDescriptor,
@@ -5001,6 +5073,10 @@ pub enum ResponseBody {
         provider_active: Vec<ProviderActiveWire>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         provider_defaults: Vec<ProviderDefaultWire>,
+        /// Source ownership/health, keyed by `account_alias`. Older daemons
+        /// omit this additive projection.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sources: Vec<AccountSourceWire>,
         /// Omitted by older daemons. `Available` plus an empty descriptor
         /// list means genuinely empty; `Unavailable` means the empty legacy
         /// fields are not account truth.

@@ -1718,6 +1718,7 @@ dependencies = [
 name = "haider-accounts"
 version = "0.0.969"
 dependencies = [
+ "blake3",
  "haider-platform",
  "haider-protocol",
  "hex",
@@ -1825,6 +1826,7 @@ dependencies = [
  "sha2 0.10.9",
  "subtle",
  "tempfile",
+ "time",
  "tokio",
  "tracing",
  "url",
@@ -2004,6 +2006,7 @@ dependencies = [
  "haider-client",
  "haider-platform",
  "haider-protocol",
+ "haider-provider",
  "haider-rpc",
  "haider-stt",
  "image",

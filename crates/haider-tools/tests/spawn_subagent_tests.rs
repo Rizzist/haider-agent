@@ -34,6 +34,13 @@ fn spawn_manifest_is_deferred_and_agent_spawn_effectful() {
         manifest.input_schema["required"],
         serde_json::json!(["task", "prompt"])
     );
+    let model_description = manifest.input_schema["properties"]["model"]["description"]
+        .as_str()
+        .expect("model description");
+    assert_eq!(
+        model_description,
+        "Optional model for the child; omitted, the child inherits this session's current model. A bare selector matches case-insensitively and ignores '-', '_', '.', and whitespace; literal exact matches win. Call list_models to inspect valid model/provider pairs."
+    );
 }
 
 /// MUTATION CHECK: stop trimming/bounding either user-controlled string.
