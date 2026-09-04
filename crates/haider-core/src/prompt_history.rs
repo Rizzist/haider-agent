@@ -974,6 +974,22 @@ impl PromptHistoryCache {
     /// Drops journal-reconstructible bodies and compiled cursor shells for one
     /// quiescent session. The daemon calls this only after proving the journal
     /// is still at the same idle head.
+    /// Drops one session's cached generation whole.
+    ///
+    /// Unlike eviction this releases the shell too: the compaction keys,
+    /// saved checkpoint cursors and collection high-water that describe a
+    /// window the session has left. The caller is responsible for the
+    /// ordering that makes this cheap — a durable prompt checkpoint for the
+    /// CURRENT window must already exist, or the next compile replays the
+    /// journal from zero and rebuilds exactly what was released.
+    pub async fn remove_session(&self, session_id: &SessionId) -> usize {
+        self.sessions
+            .lock()
+            .await
+            .remove(session_id)
+            .map_or(0, |cached| cached.retained_heap_bytes())
+    }
+
     pub async fn evict_session_bodies(&self, session_id: &SessionId) -> usize {
         let mut sessions = self.sessions.lock().await;
         let Some(cached) = sessions.get_mut(session_id) else {

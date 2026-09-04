@@ -31,6 +31,43 @@ use haider_store::{
     SessionCreateCommand, ShellExecAcceptCommand, ShellExecAcceptOutcome, TurnAcceptCommand,
 };
 
+/// MUTATION CHECK: leave `compacted_since_release` set after a window cut
+/// consumes it and every later cut swaps the generation, so a session that
+/// compacted once keeps paying a checkpoint reload forever; never set it and
+/// the compaction boundary never becomes a generation swap at all.
+#[tokio::test]
+async fn a_compaction_arms_exactly_one_generation_swap() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store, SessionHubConfig::default()).expect("hub");
+    let session_id = SessionId::new("swap-arming");
+
+    let close_window = |hub: &SessionHub| {
+        for turn in 1..RESIDENT_TURN_WINDOW {
+            assert!(
+                hub.advance_resident_window(&session_id).is_none(),
+                "early window cut at {turn}"
+            );
+        }
+        hub.advance_resident_window(&session_id)
+    };
+
+    assert!(matches!(
+        close_window(&hub),
+        Some(PromptCacheDisposition::TrimToPrefixes)
+    ));
+
+    hub.release_compacted_session_state(&session_id, 0).await;
+    assert!(matches!(
+        close_window(&hub),
+        Some(PromptCacheDisposition::SwapGeneration)
+    ));
+    assert!(matches!(
+        close_window(&hub),
+        Some(PromptCacheDisposition::TrimToPrefixes)
+    ));
+}
+
 /// MUTATION CHECK: drop the `candidate != session_id` half of the retain
 /// predicate and the sweep evicts a neighbouring session's slots; drop the
 /// `strong_count` half and it evicts the live run's own coordinator, which

@@ -1148,9 +1148,8 @@ enum PromptCacheDisposition {
     /// the shell keeps the compaction keys and saved checkpoint cursors that
     /// still describe this context.
     EvictBodies,
-    /// The session is still working: a compaction just replaced the context
-    /// mid-turn, or a continuously hot session hit its resident-turn window.
-    /// Either way the next prompt compiles within milliseconds, so a full
+    /// A continuously hot session hit its resident-turn window. The next
+    /// prompt compiles within milliseconds on this same timeline, so a full
     /// eviction would only buy a replay.
     ///
     /// MEASURED: evicting at the 50-turn window cut instead cost
@@ -1158,12 +1157,34 @@ enum PromptCacheDisposition {
     /// (N=2/side), because each cut forced a full replay that rebuilt every
     /// envelope it had just dropped.
     TrimToPrefixes,
+    /// A semantic compaction just committed and the run continues on the new
+    /// window. Nothing is done to the cache here on purpose.
+    ///
+    /// MEASURED: trimming at this point cost 23,527,976 B against
+    /// 20,677,184 B over 200 turns compacted every 50 (N=3/side). The cut
+    /// lands before the cache has consumed the compaction node, so a trim
+    /// compiles and then retains a prefix for the exact epoch the compaction
+    /// is discarding. The digests and reductions keyed to the compacted range
+    /// are still released: those are dead at the cut, the prefixes are not.
+    LeaveToEpochInvalidation,
+    /// The generation swap. The session has compacted and has since compiled
+    /// at least one prompt on the new window, which is what writes the
+    /// durable post-compaction prompt checkpoint. Only now is dropping the
+    /// whole entry cheap: the next compile seeds from that checkpoint — the
+    /// summary plus the retained suffix — instead of replaying the journal,
+    /// so every Arc projection, decoded envelope, index, boundary projector
+    /// and reply arena belonging to the old window goes at once.
+    SwapGeneration,
 }
 
 #[derive(Default)]
 struct ResidentWindowState {
     terminal_turns: u64,
     scheduled_release: Option<ScheduledIdleRelease>,
+    /// Set when a semantic compaction commits, cleared by the release that
+    /// consumes it. It is what turns the next release into a generation swap
+    /// rather than a body eviction.
+    compacted_since_release: bool,
 }
 
 struct ScheduledIdleRelease {
@@ -2388,6 +2409,10 @@ impl SessionHub {
                     .compact_session_history(session_id)
                     .await
             }
+            PromptCacheDisposition::LeaveToEpochInvalidation => 0,
+            PromptCacheDisposition::SwapGeneration => {
+                self.inner.prompt_history.remove_session(session_id).await
+            }
         };
         let turn_setup_entries = self
             .inner
@@ -2421,7 +2446,12 @@ impl SessionHub {
             observe_bytes,
             dead_budget_runs,
             allocator_bytes,
-            trimmed = matches!(disposition, PromptCacheDisposition::TrimToPrefixes),
+            prompt_disposition = match disposition {
+                PromptCacheDisposition::EvictBodies => "evict_bodies",
+                PromptCacheDisposition::TrimToPrefixes => "trim_to_prefixes",
+                PromptCacheDisposition::LeaveToEpochInvalidation => "epoch_invalidation",
+                PromptCacheDisposition::SwapGeneration => "swap_generation",
+            },
             phase,
             "released all journal-reconstructible session state"
         );
@@ -2448,33 +2478,50 @@ impl SessionHub {
     async fn release_compacted_session_state(&self, session_id: &SessionId, head_seq: u64) {
         self.trace_retention_snapshot(session_id, head_seq, "compaction_committed")
             .await;
-        if let Some(mut state) = self
-            .inner
-            .resident_windows
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session_id)
-            && let Some(scheduled) = state.scheduled_release.take()
         {
-            scheduled.abort.abort();
+            let mut windows = self
+                .inner
+                .resident_windows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = windows.entry(session_id.clone()).or_default();
+            if let Some(scheduled) = state.scheduled_release.take() {
+                scheduled.abort.abort();
+            }
+            // The cut restarts the window and arms the generation swap: the
+            // next release drops the whole cached generation instead of its
+            // bodies, by which point the continuation has written the durable
+            // post-compaction prompt checkpoint that seeds the new one.
+            state.terminal_turns = 0;
+            state.compacted_since_release = true;
         }
         self.release_session_derived_state(
             session_id,
             head_seq,
-            PromptCacheDisposition::TrimToPrefixes,
+            PromptCacheDisposition::LeaveToEpochInvalidation,
             "compaction_released",
         )
         .await;
     }
 
-    fn advance_resident_window(&self, session_id: &SessionId) -> bool {
+    /// Counts one terminal turn and reports how to release when the resident
+    /// window closes. A window that closes on a session which has compacted
+    /// since its last release swaps the generation instead of trimming it.
+    fn advance_resident_window(&self, session_id: &SessionId) -> Option<PromptCacheDisposition> {
         let mut windows = self
             .inner
             .resident_windows
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = windows.entry(session_id.clone()).or_default();
-        advance_resident_turn(state)
+        if !advance_resident_turn(state) {
+            return None;
+        }
+        Some(if std::mem::take(&mut state.compacted_since_release) {
+            PromptCacheDisposition::SwapGeneration
+        } else {
+            PromptCacheDisposition::TrimToPrefixes
+        })
     }
 
     fn schedule_idle_derived_state_release(&self, session_id: SessionId, idle_seq: u64) {
@@ -2500,7 +2547,7 @@ impl SessionHub {
             let Some(inner) = weak.upgrade() else {
                 return;
             };
-            let current = {
+            let swap = {
                 let mut windows = inner
                     .resident_windows
                     .lock()
@@ -2517,20 +2564,18 @@ impl SessionHub {
                 }
                 state.scheduled_release.take();
                 state.terminal_turns = 0;
-                true
+                std::mem::take(&mut state.compacted_since_release)
             };
-            if !current
-                || !matches!(inner.store.latest_seq(&task_session).await, Ok(head) if head == idle_seq)
-            {
+            if !matches!(inner.store.latest_seq(&task_session).await, Ok(head) if head == idle_seq) {
                 return;
             }
+            let (disposition, phase) = if swap {
+                (PromptCacheDisposition::SwapGeneration, "swap_released")
+            } else {
+                (PromptCacheDisposition::EvictBodies, "idle_released")
+            };
             SessionHub { inner }
-                .release_session_derived_state(
-                    &task_session,
-                    idle_seq,
-                    PromptCacheDisposition::EvictBodies,
-                    "idle_released",
-                )
+                .release_session_derived_state(&task_session, idle_seq, disposition, phase)
                 .await;
         });
         let abort = task.abort_handle();
@@ -8205,12 +8250,12 @@ impl HubStoreHandle {
             self.hub
                 .trace_retention_snapshot(&self.session_id, envelope.seq, "idle")
                 .await;
-            if self.hub.advance_resident_window(&self.session_id) {
+            if let Some(disposition) = self.hub.advance_resident_window(&self.session_id) {
                 self.hub
                     .release_session_derived_state(
                         &self.session_id,
                         envelope.seq,
-                        PromptCacheDisposition::TrimToPrefixes,
+                        disposition,
                         "window_released",
                     )
                     .await;

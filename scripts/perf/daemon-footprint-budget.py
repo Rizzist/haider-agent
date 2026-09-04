@@ -27,7 +27,7 @@ DEFAULT_TURNS = 40
 DEFAULT_SETTLE_SECONDS = 60
 DEFAULT_COMPACTION_SETTLE_SECONDS = 5
 DEFAULT_FLEET_BUDGET_BYTES = 250 * 1024 * 1024
-MAX_LOAD_1M = 4.0
+DEFAULT_MAX_LOAD_1M = 4.0
 
 # Calibrated at 1.10x the N=5 final release medians (60 s settled, load1m < 4).
 # Both are upper bounds, so lower footprints always pass.
@@ -85,6 +85,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--fleet-budget-bytes", type=int, default=DEFAULT_FLEET_BUDGET_BYTES
+    )
+    parser.add_argument(
+        "--max-load-1m",
+        type=float,
+        default=DEFAULT_MAX_LOAD_1M,
+        help="reject runs sampled at or above this 1-minute load average; the "
+        "calibrated budgets assume the 4.0 default, so raising it makes the "
+        "absolute footprints comparable only within the same invocation",
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--artifacts-dir", type=Path)
@@ -479,7 +487,7 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
                     previous_footprint = compacted
         return {
             "attempt": attempt,
-            "accepted": max(loads) < MAX_LOAD_1M,
+            "accepted": max(loads) < args.max_load_1m,
             "uptime_before": uptime_before,
             "load_1m_max": max(loads),
             "daemon_pid": daemon_pid,
@@ -526,8 +534,10 @@ def main() -> int:
     while len(accepted) < args.runs:
         attempts += 1
         if attempts > args.runs * 4:
-            raise SystemExit("could not admit N runs below load1m < 4")
-        while os.getloadavg()[0] >= MAX_LOAD_1M:
+            raise SystemExit(
+                f"could not admit {args.runs} runs below load1m < {args.max_load_1m}"
+            )
+        while os.getloadavg()[0] >= args.max_load_1m:
             time.sleep(5)
         result = run_once(args, attempts)
         print(json.dumps(result, separators=(",", ":")), flush=True)
@@ -584,7 +594,7 @@ def main() -> int:
         "compaction_settle_seconds": args.compaction_settle_seconds,
         "settle_seconds": args.settle_seconds,
         "attached_settle_seconds": args.attached_settle_seconds,
-        "load_1m_limit": MAX_LOAD_1M,
+        "load_1m_limit": args.max_load_1m,
         "rejected_runs": len(rejected),
         "idle": {"median_bytes": idle_median, "mad_bytes": idle_mad},
         "post_turns": {"median_bytes": post_median, "mad_bytes": post_mad},
