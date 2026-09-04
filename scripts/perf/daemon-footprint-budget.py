@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Measure and enforce the macOS daemon settled-footprint budget.
+"""Measure and enforce macOS daemon settled-footprint and live-window budgets.
 
-The workload keeps one liveness-spawned daemon and one session alive for all
-40 tiny process-exec turns.  Measurements use proc_pid_rusage's physical
-footprint and CPU counters, avoiding `ps` sampling races and measurement
-processes in the daemon tree.
+The workload can compact one long-lived session every N turns or leave a fleet
+of idle sessions resident in one daemon. Measurements use proc_pid_rusage's
+physical footprint and CPU counters, avoiding `ps` sampling races.
 """
 
 from __future__ import annotations
@@ -26,6 +25,8 @@ from typing import Any
 DEFAULT_RUNS = 5
 DEFAULT_TURNS = 40
 DEFAULT_SETTLE_SECONDS = 60
+DEFAULT_COMPACTION_SETTLE_SECONDS = 5
+DEFAULT_FLEET_BUDGET_BYTES = 250 * 1024 * 1024
 MAX_LOAD_1M = 4.0
 
 # Calibrated at 1.10x the N=5 final release medians (60 s settled, load1m < 4).
@@ -56,6 +57,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--driver", type=Path, required=True)
     parser.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     parser.add_argument("--turns", type=int, default=DEFAULT_TURNS)
+    parser.add_argument("--compact-every", type=int)
+    parser.add_argument(
+        "--compaction-settle-seconds",
+        type=int,
+        default=DEFAULT_COMPACTION_SETTLE_SECONDS,
+        help="idle time before each post-compaction footprint checkpoint",
+    )
+    parser.add_argument(
+        "--fleet-sessions",
+        type=int,
+        default=1,
+        help="number of idle sessions to create and drive in the same daemon",
+    )
     parser.add_argument("--settle-seconds", type=int, default=DEFAULT_SETTLE_SECONDS)
     parser.add_argument("--attached-settle-seconds", type=int, default=0)
     parser.add_argument(
@@ -69,16 +83,25 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_POST_TURNS_BUDGET_BYTES,
     )
+    parser.add_argument(
+        "--fleet-budget-bytes", type=int, default=DEFAULT_FLEET_BUDGET_BYTES
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--artifacts-dir", type=Path)
     args = parser.parse_args()
     if (
         args.runs < 1
-        or args.turns < 20
+        or args.turns < 1
+        or args.fleet_sessions < 1
+        or (args.compact_every is not None and args.compact_every < 1)
         or args.settle_seconds < 0
         or args.attached_settle_seconds < 0
+        or args.compaction_settle_seconds < 0
     ):
-        parser.error("runs must be positive, turns >= 20, and settle times non-negative")
+        parser.error(
+            "runs, turns, fleet sessions, and compact interval must be positive; "
+            "settle times must be non-negative"
+        )
     return args
 
 
@@ -102,23 +125,34 @@ def proc_rusage(pid: int) -> dict[str, int]:
     }
 
 
-def fake_script(turns: int) -> str:
+def fake_script(turns: int, sessions: int, compact_every: int | None) -> str:
     steps: list[dict[str, Any]] = []
-    for turn in range(1, turns + 1):
-        call_id = f"memdaemon-{turn}"
-        steps.extend(
-            [
-                {
-                    "step": "emit_tool_call",
-                    "call_id": call_id,
-                    "name": "process_exec",
-                    "args": {"command": ":"},
-                },
-                {"step": "finish", "reason": "tool_use"},
-                {"step": "expect_tool_result", "call_id": call_id},
-                {"step": "finish", "reason": "end_turn"},
-            ]
-        )
+    for session in range(1, sessions + 1):
+        for turn in range(1, turns + 1):
+            call_id = f"memdaemon-{session}-{turn}"
+            steps.extend(
+                [
+                    {
+                        "step": "emit_tool_call",
+                        "call_id": call_id,
+                        "name": "process_exec",
+                        "args": {"command": ":"},
+                    },
+                    {"step": "finish", "reason": "tool_use"},
+                    {"step": "expect_tool_result", "call_id": call_id},
+                    {"step": "finish", "reason": "end_turn"},
+                ]
+            )
+            if compact_every is not None and turn % compact_every == 0:
+                steps.extend(
+                    [
+                        {
+                            "step": "emit_text",
+                            "text": f"summary through session {session} turn {turn}",
+                        },
+                        {"step": "finish", "reason": "end_turn"},
+                    ]
+                )
     return json.dumps(steps, separators=(",", ":"))
 
 
@@ -268,7 +302,9 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
                 "RUST_MIN_STACK": "8388608",
                 "HAIDER_DISCOVERY_DISABLED": "1",
                 "HAIDER_TEST_DEVICE_NAME": "test-mac",
-                "HAIDER_TEST_FAKE_PROVIDER": fake_script(args.turns),
+                "HAIDER_TEST_FAKE_PROVIDER": fake_script(
+                    args.turns, args.fleet_sessions, args.compact_every
+                ),
             }
         )
         if args.retention_attribution:
@@ -281,12 +317,16 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
             str(root),
             "--turns",
             str(args.turns),
+            "--sessions",
+            str(args.fleet_sessions),
             "--settle-seconds",
             str(args.settle_seconds),
             "--attached-settle-seconds",
             str(args.attached_settle_seconds),
             "--checkpoint-acks",
         ]
+        if args.compact_every is not None:
+            command.extend(["--compact-every", str(args.compact_every)])
         uptime_before = subprocess.run(
             ["uptime"], check=True, capture_output=True, text=True
         ).stdout.strip()
@@ -328,12 +368,35 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
                     acknowledge_checkpoint(process)
                 elif phase == "turn" and daemon_pid is not None:
                     turn = int(event["turn"])
+                    session = int(event.get("session", 1))
                     if args.retention_attribution:
                         retention_turns.append(
-                            {"turn": turn, **retention_store_snapshot(root)}
+                            {
+                                "session": session,
+                                "turn": turn,
+                                **retention_store_snapshot(root),
+                            }
                         )
-                    if turn in (20, args.turns):
+                    if args.fleet_sessions == 1 and turn in (min(20, args.turns), args.turns):
                         samples[f"turn_{turn}"] = checkpoint(daemon_pid)
+                    if args.compact_every is not None and turn % args.compact_every == 0:
+                        samples[f"pre_compaction_s{session}_t{turn}"] = checkpoint(
+                            daemon_pid
+                        )
+                elif phase == "compaction" and daemon_pid is not None:
+                    session = int(event.get("session", 1))
+                    turn = int(event["turn"])
+                    time.sleep(args.compaction_settle_seconds)
+                    samples[f"post_compaction_s{session}_t{turn}"] = checkpoint(
+                        daemon_pid
+                    )
+                    acknowledge_checkpoint(process)
+                elif phase == "session_complete" and daemon_pid is not None:
+                    session = int(event["session"])
+                    if session in {1, 10, 25, 50, 75, args.fleet_sessions}:
+                        samples[f"fleet_sessions_{session}"] = checkpoint(daemon_pid)
+                elif phase == "turns_complete" and daemon_pid is not None:
+                    samples["fleet_complete"] = checkpoint(daemon_pid)
                 elif phase == "attached_settled" and daemon_pid is not None:
                     samples["attached_settled"] = checkpoint(daemon_pid)
                     acknowledge_checkpoint(process)
@@ -362,24 +425,56 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
                 f"stderr:\n{stderr}"
                 f"haiderd.log:\n{daemon_log}"
             )
+        middle_turn = min(20, args.turns)
         required = {
             "ready",
             "idle_settled",
             "workload_start",
-            "turn_20",
-            f"turn_{args.turns}",
+            "fleet_complete",
             "post_turns_settled",
         }
+        if args.fleet_sessions == 1:
+            required.update({f"turn_{middle_turn}", f"turn_{args.turns}"})
         if args.attached_settle_seconds > 0:
             required.add("attached_settled")
         missing = required.difference(samples)
         if missing:
             raise RuntimeError(f"workload omitted checkpoints: {sorted(missing)}")
         idle = samples["idle_settled"]
-        turn_20 = samples["turn_20"]
-        turn_last = samples[f"turn_{args.turns}"]
+        turn_middle = samples.get(f"turn_{middle_turn}", samples["fleet_complete"])
+        turn_last = samples.get(f"turn_{args.turns}", samples["fleet_complete"])
         post = samples["post_turns_settled"]
         loads = [float(sample["load_1m"]) for sample in samples.values()]
+        compaction_returns: list[dict[str, Any]] = []
+        previous_footprint = idle["footprint_bytes"]
+        if args.compact_every is not None:
+            for session in range(1, args.fleet_sessions + 1):
+                for turn in range(args.compact_every, args.turns + 1, args.compact_every):
+                    pre = samples[f"pre_compaction_s{session}_t{turn}"][
+                        "footprint_bytes"
+                    ]
+                    compacted = samples[f"post_compaction_s{session}_t{turn}"][
+                        "footprint_bytes"
+                    ]
+                    growth = max(0, pre - previous_footprint)
+                    retained = max(0, compacted - previous_footprint)
+                    returned = max(0, pre - compacted)
+                    compaction_returns.append(
+                        {
+                            "session": session,
+                            "turn": turn,
+                            "before_bytes": pre,
+                            "after_bytes": compacted,
+                            "returned_bytes": returned,
+                            "return_percent_of_growth": (
+                                100.0 * returned / growth if growth else 0.0
+                            ),
+                            "residual_percent_of_pre_growth": (
+                                100.0 * retained / growth if growth else 0.0
+                            ),
+                        }
+                    )
+                    previous_footprint = compacted
         return {
             "attempt": attempt,
             "accepted": max(loads) < MAX_LOAD_1M,
@@ -387,12 +482,17 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
             "load_1m_max": max(loads),
             "daemon_pid": daemon_pid,
             "samples": samples,
+            "compaction_returns": compaction_returns,
             "reports": reports,
             "retention_store_turns": retention_turns,
             "retention_runtime": retention_trace(root / "haiderd.log"),
             "idle_cpu_ns": idle["cpu_ns"] - samples["ready"]["cpu_ns"],
-            "turn_20_cpu_ns": turn_20["cpu_ns"]
+            "turn_middle_cpu_ns": turn_middle["cpu_ns"]
             - samples["workload_start"]["cpu_ns"],
+            "workload_cpu_ns": samples["fleet_complete"]["cpu_ns"]
+            - samples["workload_start"]["cpu_ns"],
+            "workload_wall_ns": samples["fleet_complete"]["monotonic_ns"]
+            - samples["workload_start"]["monotonic_ns"],
             "immediate_growth_bytes": turn_last["footprint_bytes"]
             - idle["footprint_bytes"],
             "settled_growth_bytes": post["footprint_bytes"] - idle["footprint_bytes"],
@@ -438,17 +538,48 @@ def main() -> int:
         run["samples"]["post_turns_settled"]["footprint_bytes"] for run in accepted
     ]
     idle_cpu_values = [run["idle_cpu_ns"] for run in accepted]
-    turn_cpu_values = [run["turn_20_cpu_ns"] for run in accepted]
+    turn_cpu_values = [run["turn_middle_cpu_ns"] for run in accepted]
+    workload_cpu_values = [run["workload_cpu_ns"] for run in accepted]
+    workload_wall_values = [run["workload_wall_ns"] for run in accepted]
     growth_values = [run["settled_growth_bytes"] for run in accepted]
+    compaction_return_values = [
+        cycle["return_percent_of_growth"]
+        for run in accepted
+        for cycle in run["compaction_returns"]
+    ]
+    compaction_residual_values = [
+        cycle["residual_percent_of_pre_growth"]
+        for run in accepted
+        for cycle in run["compaction_returns"]
+    ]
+    post_compaction_values = [
+        cycle["after_bytes"]
+        for run in accepted
+        for cycle in run["compaction_returns"]
+    ]
     idle_median, idle_mad = median_and_mad(idle_values)
     post_median, post_mad = median_and_mad(post_values)
     idle_cpu_median, idle_cpu_mad = median_and_mad(idle_cpu_values)
     turn_cpu_median, turn_cpu_mad = median_and_mad(turn_cpu_values)
+    workload_cpu_median, workload_cpu_mad = median_and_mad(workload_cpu_values)
+    workload_wall_median, workload_wall_mad = median_and_mad(workload_wall_values)
     growth_median, growth_mad = median_and_mad(growth_values)
+    compaction_return = (
+        median_and_mad(compaction_return_values) if compaction_return_values else None
+    )
+    compaction_residual = (
+        median_and_mad(compaction_residual_values) if compaction_residual_values else None
+    )
+    post_compaction = (
+        median_and_mad(post_compaction_values) if post_compaction_values else None
+    )
     summary = {
-        "schema": "haider.daemon-footprint.v1",
+        "schema": "haider.daemon-footprint.v2",
         "runs": args.runs,
         "turns": args.turns,
+        "fleet_sessions": args.fleet_sessions,
+        "compact_every": args.compact_every,
+        "compaction_settle_seconds": args.compaction_settle_seconds,
         "settle_seconds": args.settle_seconds,
         "attached_settle_seconds": args.attached_settle_seconds,
         "load_1m_limit": MAX_LOAD_1M,
@@ -460,11 +591,40 @@ def main() -> int:
             "mad_bytes": growth_mad,
             "median_bytes_per_turn": growth_median / args.turns,
         },
+        "compaction_return": None
+        if compaction_return is None
+        else {
+            "median_percent_of_growth": compaction_return[0],
+            "mad_percentage_points": compaction_return[1],
+            "median_residual_percent_of_pre_growth": compaction_residual[0],
+            "residual_mad_percentage_points": compaction_residual[1],
+            "post_compaction_median_bytes": post_compaction[0],
+            "post_compaction_mad_bytes": post_compaction[1],
+            "post_compaction_span_bytes": max(post_compaction_values)
+            - min(post_compaction_values),
+        },
+        "fleet": {
+            "sessions": args.fleet_sessions,
+            "turns_per_session": args.turns,
+            "measured_turns": args.fleet_sessions * args.turns,
+            "settled_median_bytes": post_median,
+            "settled_mad_bytes": post_mad,
+            "budget_bytes": args.fleet_budget_bytes,
+        },
         "idle_cpu": {"median_ns": idle_cpu_median, "mad_ns": idle_cpu_mad},
-        "turn_20_cpu": {"median_ns": turn_cpu_median, "mad_ns": turn_cpu_mad},
+        "turn_middle_cpu": {"median_ns": turn_cpu_median, "mad_ns": turn_cpu_mad},
+        "workload_cpu": {
+            "median_ns": workload_cpu_median,
+            "mad_ns": workload_cpu_mad,
+        },
+        "workload_wall": {
+            "median_ns": workload_wall_median,
+            "mad_ns": workload_wall_mad,
+        },
         "budgets": {
             "idle_bytes": args.idle_budget_bytes,
             "post_turns_bytes": args.post_turns_budget_bytes,
+            "fleet_bytes": args.fleet_budget_bytes,
             "calibrated_idle_1_10x": int(idle_median * 1.10 + 0.999),
             "calibrated_post_turns_1_10x": int(post_median * 1.10 + 0.999),
         },
@@ -482,9 +642,21 @@ def main() -> int:
         failures.append(
             f"idle median {idle_median:.0f} > budget {args.idle_budget_bytes}"
         )
-    if args.post_turns_budget_bytes and post_median > args.post_turns_budget_bytes:
+    if (
+        args.fleet_sessions == 1
+        and args.post_turns_budget_bytes
+        and post_median > args.post_turns_budget_bytes
+    ):
         failures.append(
             f"post-turn median {post_median:.0f} > budget {args.post_turns_budget_bytes}"
+        )
+    if (
+        args.fleet_sessions > 1
+        and args.fleet_budget_bytes
+        and post_median > args.fleet_budget_bytes
+    ):
+        failures.append(
+            f"fleet settled median {post_median:.0f} > budget {args.fleet_budget_bytes}"
         )
     if failures:
         print("daemon footprint budget: FAIL: " + "; ".join(failures), file=sys.stderr)

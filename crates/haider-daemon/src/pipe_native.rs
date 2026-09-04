@@ -543,6 +543,17 @@ impl PipeNativeWriter {
             .remove(session_id);
     }
 
+    pub(crate) fn retention_stats(&self, session_id: &SessionId) -> (usize, usize) {
+        let reconciled = self
+            .reconciled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session_item_runs = reconciled
+            .get(session_id)
+            .map_or(0, |state| state.projector.retained_item_run_count());
+        (reconciled.len(), session_item_runs)
+    }
+
     /// Maintains one session after its journal batch has committed. Ordinary
     /// appends are intentionally not fsynced: the journal owns durability and
     /// boot reconciliation heals a lost or torn sidecar tail. Errors are

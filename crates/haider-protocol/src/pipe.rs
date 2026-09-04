@@ -339,6 +339,11 @@ impl TranscriptProjector {
         if is_compaction_node(envelope)
             && let Some(run_key) = run_key.as_ref()
         {
+            // Everything before this node is already durable in the sidecar.
+            // Compatibility classification for later rows must be learned
+            // from the live post-compaction suffix, not from every item run
+            // the daemon has observed since this session was opened.
+            self.item_runs.clear();
             self.compacting_runs
                 .entry(run_key.clone())
                 .or_insert(PendingCompaction {
@@ -415,6 +420,10 @@ impl TranscriptProjector {
             self.open_reasoning.remove(run_key);
             self.pending_reasoning.remove(run_key);
             if self.compacting_runs.remove(run_key).is_some() {
+                // The boundary seals every compatibility decision made for
+                // this compaction run. Retaining its item identity would make
+                // the projector's heap follow the number of prior epochs.
+                self.item_runs.clear();
                 self.buffered.push_back(BufferedRow {
                     row: SidecarRow(SidecarRowKind::CompactionBoundary(CompactionBoundaryRow {
                         kind: "compaction_boundary",
@@ -446,6 +455,11 @@ impl TranscriptProjector {
             .drain(..)
             .map(|buffered| buffered.row)
             .collect()
+    }
+
+    /// Diagnostic retained-set size used by the daemon footprint harness.
+    pub fn retained_item_run_count(&self) -> usize {
+        self.item_runs.len()
     }
 
     /// Flush unresolved tool joins at a durable journal EOF while preserving
@@ -2272,11 +2286,14 @@ mod tests {
     #[test]
     fn compaction_boundary_appears_only_when_the_turn_settles() {
         let mut projector = TranscriptProjector::default();
+        projector.prewarm(&reasoning_started(0, "old-run", "old-item"));
+        assert_eq!(projector.retained_item_run_count(), 1);
         assert!(
             projector
                 .push(&compaction(1, "compact-run", "one"))
                 .is_empty()
         );
+        assert_eq!(projector.retained_item_run_count(), 0);
         assert!(
             projector
                 .push(&run_state(2, "compact-run", RunState::Thinking))

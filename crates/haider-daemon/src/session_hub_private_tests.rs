@@ -31,6 +31,20 @@ use haider_store::{
     SessionCreateCommand, ShellExecAcceptCommand, ShellExecAcceptOutcome, TurnAcceptCommand,
 };
 
+/// MUTATION CHECK: removing or moving the equality makes a continuously hot
+/// session retain a 51st turn, or release one turn before the documented
+/// live-window bound.
+#[test]
+fn resident_window_hard_cut_fires_exactly_at_fifty_turns() {
+    let mut state = ResidentWindowState::default();
+    for turn in 1..RESIDENT_TURN_WINDOW {
+        assert!(!advance_resident_turn(&mut state), "early cut at {turn}");
+    }
+    assert!(advance_resident_turn(&mut state));
+    assert_eq!(state.terminal_turns, 0);
+    assert!(!advance_resident_turn(&mut state));
+}
+
 /// MUTATION CHECK: requiring a fetch timestamp before considering a known
 /// inventory miss skips refresh-on-miss for legacy cached inventories.
 #[test]

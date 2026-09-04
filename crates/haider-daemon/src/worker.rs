@@ -1901,12 +1901,16 @@ impl ContextCompactor for DaemonContextCompactor {
                 Ok(envelope)
             })
             .collect::<Result<Vec<_>, HaiderError>>()?;
-        self.store
+        let committed = self
+            .store
             .append_at_head(expected_head, &mut envelopes)
             .await?;
         self.store
             .persist_context_economy(self.store.session_id(), &economy)
             .await?;
+        self.store
+            .release_compacted_session_state(committed.last_seq)
+            .await;
         Ok(haider_core::ContextCompactionOutcome {
             summary: Message::user_text(summary),
             economy,
@@ -4049,7 +4053,10 @@ async fn run_supervisor(
     // A nudge's accepted user-message sequence is its process-stable delivery
     // key. Existing messages are already part of a restarted turn's compiled
     // prompt; new messages are inserted when they cross into the live harness.
-    let mut delivered_nudges = durable_user_message_seqs(&lease).await.unwrap_or_default();
+    let delivered_nudges = durable_user_message_seqs(&lease).await.unwrap_or_default();
+    lease
+        .hub()
+        .install_delivered_nudges(lease.session_id().clone(), delivered_nudges);
     // W-A: rebuild this session's background-task projection and reap
     // prior-generation orphans as soon as the session becomes live again.
     {
@@ -4487,7 +4494,8 @@ async fn run_supervisor(
                             let result = deliver_mid_turn_to_active(
                                 turn,
                                 &active_run,
-                                &mut delivered_nudges,
+                                lease.hub(),
+                                lease.session_id(),
                                 run_id,
                                 accepted_seq,
                                 text,
@@ -5030,7 +5038,8 @@ async fn run_supervisor(
 fn deliver_mid_turn_to_active(
     turn: &mut ActiveTurn,
     active_run: &RunId,
-    delivered_nudges: &mut HashSet<u64>,
+    hub: &SessionHub,
+    session_id: &SessionId,
     run_id: RunId,
     accepted_seq: u64,
     text: String,
@@ -5043,7 +5052,7 @@ fn deliver_mid_turn_to_active(
             false,
         ));
     }
-    if delivered_nudges.contains(&accepted_seq) {
+    if hub.nudge_was_delivered(session_id, accepted_seq) {
         return Ok(());
     }
     let result = match mode {
@@ -5056,7 +5065,7 @@ fn deliver_mid_turn_to_active(
         )),
     };
     if result.is_ok() {
-        delivered_nudges.insert(accepted_seq);
+        hub.note_delivered_nudge(session_id, accepted_seq);
     }
     result
 }
@@ -5574,12 +5583,20 @@ async fn durable_user_message_seqs(store: &HubStoreHandle) -> Result<HashSet<u64
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
         for envelope in page {
-            if envelope
-                .payload
-                .decode_event()
-                .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. }))
-            {
-                sequences.insert(envelope.seq);
+            if let Ok(payload) = envelope.payload.decode_event() {
+                match payload {
+                    EventPayload::UserMessage { .. } => {
+                        sequences.insert(envelope.seq);
+                    }
+                    // Mid-turn delivery dedupe belongs only to the current
+                    // live turn. An Idle fact proves every earlier user
+                    // message is already part of durable prompt history; a
+                    // daemon restart must not rebuild a transcript-age set.
+                    EventPayload::SessionState(haider_protocol::state::SessionState::Idle {
+                        ..
+                    }) => sequences.clear(),
+                    _ => {}
+                }
             }
         }
     }

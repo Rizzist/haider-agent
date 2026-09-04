@@ -27,6 +27,8 @@ struct Args {
     daemon: PathBuf,
     root: PathBuf,
     turns: u32,
+    sessions: u32,
+    compact_every: Option<u32>,
     settle_seconds: u64,
     attached_settle_seconds: u64,
     checkpoint_acks: bool,
@@ -44,6 +46,8 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
     let mut daemon = None;
     let mut root = None;
     let mut turns = 40_u32;
+    let mut sessions = 1_u32;
+    let mut compact_every = None;
     let mut settle_seconds = 60_u64;
     let mut attached_settle_seconds = 0_u64;
     let mut checkpoint_acks = false;
@@ -57,19 +61,26 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--daemon" => daemon = Some(PathBuf::from(value()?)),
             "--root" => root = Some(PathBuf::from(value()?)),
             "--turns" => turns = value()?.parse()?,
+            "--sessions" => sessions = value()?.parse()?,
+            "--compact-every" => compact_every = Some(value()?.parse()?),
             "--settle-seconds" => settle_seconds = value()?.parse()?,
             "--attached-settle-seconds" => attached_settle_seconds = value()?.parse()?,
             "--checkpoint-acks" => checkpoint_acks = true,
             _ => return Err(invalid_input(format!("unknown argument: {argument}")).into()),
         }
     }
-    if turns == 0 {
-        return Err(invalid_input("--turns must be positive").into());
+    if turns == 0 || sessions == 0 || compact_every == Some(0) {
+        return Err(invalid_input(
+            "--turns, --sessions, and an optional --compact-every must be positive",
+        )
+        .into());
     }
     Ok(Args {
         daemon: daemon.ok_or_else(|| invalid_input("--daemon is required"))?,
         root: root.ok_or_else(|| invalid_input("--root is required"))?,
         turns,
+        sessions,
+        compact_every,
         settle_seconds,
         attached_settle_seconds,
         checkpoint_acks,
@@ -134,6 +145,8 @@ async fn drive_turns(
     endpoint: &Path,
     workspace: &Path,
     turns: u32,
+    session_ordinal: u32,
+    compact_every: Option<u32>,
     attached_settle_seconds: u64,
     checkpoint_acks: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -145,7 +158,7 @@ async fn drive_turns(
 
     let create = client
         .request(RequestBody::SessionCreateWithPermissionOverrides {
-            command_id: CommandId::new("memdaemon-create"),
+            command_id: CommandId::new(format!("memdaemon-create-{session_ordinal}")),
             cwd: workspace.to_string_lossy().into_owned(),
             provider: "fake".into(),
             model: "fake-v1".into(),
@@ -214,7 +227,7 @@ async fn drive_turns(
     for turn in 1..=turns {
         let response = client
             .request(RequestBody::TurnSubmit {
-                command_id: CommandId::new(format!("memdaemon-turn-{turn}")),
+                command_id: CommandId::new(format!("memdaemon-turn-{session_ordinal}-{turn}")),
                 session_id: session_id.clone(),
                 worker_generation,
                 text: format!("run tiny process turn {turn}"),
@@ -287,7 +300,92 @@ async fn drive_turns(
         if terminal != RunState::Done {
             return Err(protocol_error(format!("turn {turn} ended in {terminal:?}")).into());
         }
-        emit(json!({"phase": "turn", "turn": turn}))?;
+        emit(json!({"phase": "turn", "session": session_ordinal, "turn": turn}))?;
+        if compact_every.is_some_and(|interval| turn % interval == 0) {
+            let response = client
+                .request(RequestBody::SessionCompact {
+                    command_id: CommandId::new(format!(
+                        "memdaemon-compact-{session_ordinal}-{turn}"
+                    )),
+                    session_id: session_id.clone(),
+                    worker_generation,
+                })
+                .await?;
+            let compact_run = match response {
+                ResponseBody::SessionCompact {
+                    session_id: accepted_session,
+                    run_id,
+                    worker_generation: accepted_generation,
+                    ..
+                } if accepted_session == session_id => {
+                    worker_generation = accepted_generation;
+                    run_id
+                }
+                ResponseBody::Error { code, message, .. } => {
+                    return Err(protocol_error(format!(
+                        "session.compact after turn {turn} failed: {code}: {message}"
+                    ))
+                    .into());
+                }
+                other => {
+                    return Err(protocol_error(format!(
+                        "session.compact after turn {turn} returned an unexpected response: {other:?}"
+                    ))
+                    .into());
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let mut terminal = false;
+                let mut idle = false;
+                while !terminal || !idle {
+                    let Some(frame) = events.recv().await else {
+                        return Err(protocol_error(format!(
+                            "disconnected while waiting for compaction after turn {turn}"
+                        )));
+                    };
+                    let WireFrame::Event {
+                        session_id: event_session,
+                        envelope,
+                        ..
+                    } = frame
+                    else {
+                        continue;
+                    };
+                    if event_session != session_id {
+                        continue;
+                    }
+                    let Ok(payload) =
+                        serde_json::from_value::<EventPayload>(envelope.payload.into())
+                    else {
+                        continue;
+                    };
+                    match payload {
+                        EventPayload::RunState(state)
+                            if envelope.run_id.as_ref() == Some(&compact_run)
+                                && state.is_terminal() =>
+                        {
+                            if state != RunState::Done {
+                                return Err(protocol_error(format!(
+                                    "compaction after turn {turn} ended in {state:?}"
+                                )));
+                            }
+                            terminal = true;
+                        }
+                        EventPayload::SessionState(SessionState::Idle { .. }) => idle = true,
+                        _ => {}
+                    }
+                }
+                Ok::<(), io::Error>(())
+            })
+            .await
+            .map_err(|_| protocol_error(format!("compaction after turn {turn} timed out")))??;
+            emit(json!({
+                "phase": "compaction",
+                "session": session_ordinal,
+                "turn": turn
+            }))?;
+            wait_checkpoint_ack(checkpoint_acks)?;
+        }
     }
     if attached_settle_seconds > 0 {
         settle_checkpoint(attached_settle_seconds, "attached_settled", checkpoint_acks).await?;
@@ -324,15 +422,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
         emit(json!({"phase": "ready", "pid": pid}))?;
         wait_checkpoint_ack(args.checkpoint_acks)?;
         settle_checkpoint(args.settle_seconds, "idle_settled", args.checkpoint_acks).await?;
-        drive_turns(
-            &endpoint_path_for(&runtime, PROFILE_ID),
-            &workspace,
-            args.turns,
-            args.attached_settle_seconds,
-            args.checkpoint_acks,
-        )
-        .await?;
-        emit(json!({"phase": "turns_complete", "turns": args.turns}))?;
+        let endpoint = endpoint_path_for(&runtime, PROFILE_ID);
+        for session in 1..=args.sessions {
+            drive_turns(
+                &endpoint,
+                &workspace,
+                args.turns,
+                session,
+                args.compact_every,
+                if args.sessions == 1 {
+                    args.attached_settle_seconds
+                } else {
+                    0
+                },
+                args.checkpoint_acks,
+            )
+            .await?;
+            emit(json!({
+                "phase": "session_complete",
+                "session": session,
+                "sessions": args.sessions
+            }))?;
+        }
+        emit(json!({
+            "phase": "turns_complete",
+            "turns": args.turns,
+            "sessions": args.sessions
+        }))?;
         settle_checkpoint(
             args.settle_seconds,
             "post_turns_settled",

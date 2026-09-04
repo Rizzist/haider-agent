@@ -201,6 +201,9 @@ const PUBLICATION_RING_CAPACITY: usize = 256;
 /// the exact idle journal head remains unchanged for five seconds, all state
 /// released below is reconstructible from that journal and its checkpoints.
 const IDLE_DERIVED_STATE_RELEASE_DELAY: Duration = Duration::from_secs(5);
+/// Even a continuously busy session gets a hard derived-state cut after this
+/// many terminal turns. Semantic compaction resets the same counter sooner.
+const RESIDENT_TURN_WINDOW: u64 = 50;
 
 fn retention_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1128,6 +1131,33 @@ struct HubInner {
     /// Like prompt history, this is daemon-lifetime only; restart rebuilds
     /// from journal authority before installing a new revision.
     turn_setup_reductions: TurnSetupReductionCache,
+    /// Coalesces delayed idle releases and bounds hot derived state even when
+    /// a session never remains idle long enough for the timer to fire.
+    resident_windows: Mutex<HashMap<SessionId, ResidentWindowState>>,
+    /// Process-local delivery idempotency for the one live turn. Terminal
+    /// idle and semantic compaction both clear it; durable receipts remain
+    /// the cross-turn authority.
+    delivered_nudges: Mutex<HashMap<SessionId, HashSet<u64>>>,
+}
+
+#[derive(Default)]
+struct ResidentWindowState {
+    terminal_turns: u64,
+    scheduled_release: Option<ScheduledIdleRelease>,
+}
+
+struct ScheduledIdleRelease {
+    idle_seq: u64,
+    abort: tokio::task::AbortHandle,
+}
+
+fn advance_resident_turn(state: &mut ResidentWindowState) -> bool {
+    state.terminal_turns = state.terminal_turns.saturating_add(1);
+    if state.terminal_turns < RESIDENT_TURN_WINDOW {
+        return false;
+    }
+    state.terminal_turns = 0;
+    true
 }
 
 #[derive(Default)]
@@ -2258,6 +2288,31 @@ impl SessionHub {
             .values()
             .filter(|owner| owner.session_id == *session_id)
             .count();
+        let (pipe_sessions, pipe_session_item_runs) =
+            self.inner.pipe_native.retention_stats(session_id);
+        let (resident_terminal_turns, scheduled_idle_releases) = {
+            let windows = self
+                .inner
+                .resident_windows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                windows
+                    .get(session_id)
+                    .map_or(0, |state| state.terminal_turns),
+                windows
+                    .values()
+                    .filter(|state| state.scheduled_release.is_some())
+                    .count(),
+            )
+        };
+        let delivered_nudges = self
+            .inner
+            .delivered_nudges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .map_or(0, HashSet::len);
         eprintln!(
             "haider_retention {}",
             serde_json::json!({
@@ -2271,55 +2326,186 @@ impl SessionHub {
                 "observe_bytes": observe_bytes,
                 "observe_session_runs": observe_session_runs,
                 "observe_session_bytes": observe_session_bytes,
+                "pipe_sessions": pipe_sessions,
+                "pipe_session_item_runs": pipe_session_item_runs,
+                "resident_terminal_turns": resident_terminal_turns,
+                "scheduled_idle_releases": scheduled_idle_releases,
+                "delivered_nudges": delivered_nudges,
                 "attachments": attachments,
             })
         );
     }
 
+    async fn release_session_derived_state(
+        &self,
+        session_id: &SessionId,
+        head_seq: u64,
+        phase: &str,
+    ) {
+        let prompt_bytes = self.inner.prompt_history.remove_session(session_id).await;
+        let turn_setup_entries = self
+            .inner
+            .turn_setup_reductions
+            .remove_session(session_id)
+            .await;
+        let observe_bytes = self
+            .inner
+            .observe_digests
+            .remove_ready_at_head(session_id, head_seq);
+        // A semantic compaction also cancels an in-progress rebuild. The
+        // exact-head helper above accounts Ready bytes; this unconditional
+        // removal covers both Ready-at-a-different-head and Building.
+        self.inner.observe_digests.remove(session_id);
+        if let Err(error) = self.inner.store.release_memory().await {
+            tracing::debug!(
+                session_id = %session_id,
+                ?error,
+                "derived-state SQLite memory release failed"
+            );
+        }
+        let allocator_bytes = haider_platform::allocator_pressure_relief();
+        self.trace_retention_snapshot(session_id, head_seq, phase)
+            .await;
+        tracing::debug!(
+            session_id = %session_id,
+            head_seq,
+            prompt_bytes,
+            turn_setup_entries,
+            observe_bytes,
+            allocator_bytes,
+            phase,
+            "released all journal-reconstructible session state"
+        );
+    }
+
+    async fn release_compacted_session_state(&self, session_id: &SessionId, head_seq: u64) {
+        self.trace_retention_snapshot(session_id, head_seq, "compaction_committed")
+            .await;
+        if let Some(mut state) = self
+            .inner
+            .resident_windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id)
+            && let Some(scheduled) = state.scheduled_release.take()
+        {
+            scheduled.abort.abort();
+        }
+        self.clear_delivered_nudges(session_id);
+        self.release_session_derived_state(session_id, head_seq, "compaction_released")
+            .await;
+    }
+
+    pub(crate) fn install_delivered_nudges(&self, session_id: SessionId, sequences: HashSet<u64>) {
+        let mut delivered = self
+            .inner
+            .delivered_nudges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sequences.is_empty() {
+            delivered.remove(&session_id);
+        } else {
+            delivered.insert(session_id, sequences);
+        }
+    }
+
+    pub(crate) fn nudge_was_delivered(&self, session_id: &SessionId, seq: u64) -> bool {
+        self.inner
+            .delivered_nudges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .is_some_and(|sequences| sequences.contains(&seq))
+    }
+
+    pub(crate) fn note_delivered_nudge(&self, session_id: &SessionId, seq: u64) {
+        self.inner
+            .delivered_nudges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session_id.clone())
+            .or_default()
+            .insert(seq);
+    }
+
+    fn clear_delivered_nudges(&self, session_id: &SessionId) {
+        self.inner
+            .delivered_nudges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+    }
+
+    fn advance_resident_window(&self, session_id: &SessionId) -> bool {
+        let mut windows = self
+            .inner
+            .resident_windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = windows.entry(session_id.clone()).or_default();
+        advance_resident_turn(state)
+    }
+
     fn schedule_idle_derived_state_release(&self, session_id: SessionId, idle_seq: u64) {
+        {
+            let mut windows = self
+                .inner
+                .resident_windows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(previous) = windows
+                .entry(session_id.clone())
+                .or_default()
+                .scheduled_release
+                .take()
+            {
+                previous.abort.abort();
+            }
+        }
         let weak = Arc::downgrade(&self.inner);
-        tokio::spawn(async move {
+        let task_session = session_id.clone();
+        let task = tokio::spawn(async move {
             tokio::time::sleep(IDLE_DERIVED_STATE_RELEASE_DELAY).await;
             let Some(inner) = weak.upgrade() else {
                 return;
             };
-            if !matches!(inner.store.latest_seq(&session_id).await, Ok(head) if head == idle_seq) {
+            let current = {
+                let mut windows = inner
+                    .resident_windows
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(state) = windows.get_mut(&task_session) else {
+                    return;
+                };
+                if state
+                    .scheduled_release
+                    .as_ref()
+                    .is_none_or(|scheduled| scheduled.idle_seq != idle_seq)
+                {
+                    return;
+                }
+                state.scheduled_release.take();
+                state.terminal_turns = 0;
+                true
+            };
+            if !current
+                || !matches!(inner.store.latest_seq(&task_session).await, Ok(head) if head == idle_seq)
+            {
                 return;
             }
-
-            let prompt_bytes = inner.prompt_history.evict_session_bodies(&session_id).await;
-            let turn_setup_entries = inner
-                .turn_setup_reductions
-                .remove_session(&session_id)
+            SessionHub { inner }
+                .release_session_derived_state(&task_session, idle_seq, "idle_released")
                 .await;
-            let observe_bytes = inner
-                .observe_digests
-                .remove_ready_at_head(&session_id, idle_seq);
-            if let Err(error) = inner.store.release_memory().await {
-                tracing::debug!(
-                    session_id = %session_id,
-                    ?error,
-                    "idle SQLite memory release failed"
-                );
-            }
-            let allocator_bytes = haider_platform::allocator_pressure_relief();
-            if retention_trace_enabled() {
-                let hub = SessionHub {
-                    inner: Arc::clone(&inner),
-                };
-                hub.trace_retention_snapshot(&session_id, idle_seq, "released")
-                    .await;
-            }
-            tracing::debug!(
-                session_id = %session_id,
-                idle_seq,
-                prompt_bytes,
-                turn_setup_entries,
-                observe_bytes,
-                allocator_bytes,
-                "released journal-reconstructible idle session state"
-            );
         });
+        let abort = task.abort_handle();
+        drop(task);
+        self.inner
+            .resident_windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session_id)
+            .or_default()
+            .scheduled_release = Some(ScheduledIdleRelease { idle_seq, abort });
     }
 
     /// Creates a hub with production's no-op boundary observer.
@@ -2452,6 +2638,8 @@ impl SessionHub {
             lockdown_turn_bound: Notify::new(),
             prompt_history: PromptHistoryCache::default(),
             turn_setup_reductions: TurnSetupReductionCache::default(),
+            resident_windows: Mutex::new(HashMap::new()),
+            delivered_nudges: Mutex::new(HashMap::new()),
         });
         let hub = Self { inner };
         hub.spawn_shell_registry_events()?;
@@ -6200,6 +6388,17 @@ impl SessionHub {
             }
         }
         self.inner.pipe_native.release_clean(session_id);
+        self.clear_delivered_nudges(session_id);
+        if let Some(mut state) = self
+            .inner
+            .resident_windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id)
+            && let Some(scheduled) = state.scheduled_release.take()
+        {
+            scheduled.abort.abort();
+        }
         self.inner
             .workflow_selection_serials
             .lock()
@@ -7732,6 +7931,14 @@ impl HubStoreHandle {
         })
     }
 
+    /// Marks a semantic compaction as a hard in-memory epoch boundary after
+    /// its journal batch and context-economy record are durable.
+    pub(crate) async fn release_compacted_session_state(&self, head_seq: u64) {
+        self.hub
+            .release_compacted_session_state(&self.session_id, head_seq)
+            .await;
+    }
+
     pub(crate) async fn claim_context_compaction_receipt(
         &self,
         command_id: String,
@@ -7961,32 +8168,43 @@ impl HubStoreHandle {
             .map_err(|_| hub_closed_store_error())?;
         let settled = response.await.map_err(|_| hub_closed_store_error())??;
         if let Some(envelope) = &settled {
+            self.hub.clear_delivered_nudges(&self.session_id);
             self.hub
                 .trace_retention_snapshot(&self.session_id, envelope.seq, "idle")
                 .await;
-            let compacted_prompt_bytes = self
-                .hub
-                .inner
-                .prompt_history
-                .compact_session_history(&self.session_id)
-                .await;
-            if retention_trace_enabled() {
+            if self.hub.advance_resident_window(&self.session_id) {
                 self.hub
-                    .trace_retention_snapshot(&self.session_id, envelope.seq, "compacted")
+                    .release_session_derived_state(
+                        &self.session_id,
+                        envelope.seq,
+                        "window_released",
+                    )
                     .await;
+            } else {
+                let compacted_prompt_bytes = self
+                    .hub
+                    .inner
+                    .prompt_history
+                    .compact_session_history(&self.session_id)
+                    .await;
+                if retention_trace_enabled() {
+                    self.hub
+                        .trace_retention_snapshot(&self.session_id, envelope.seq, "compacted")
+                        .await;
+                }
+                // Each physical request briefly materializes the growing
+                // prompt and provider request. Compact the journal-derived
+                // state first, then scavenge pages released at this exact
+                // idle head instead of carrying their high-water forward.
+                let allocator_bytes = haider_platform::allocator_pressure_relief();
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    idle_seq = envelope.seq,
+                    compacted_prompt_bytes,
+                    allocator_bytes,
+                    "compacted prompt history at terminal idle boundary"
+                );
             }
-            // Each physical request briefly materializes the growing prompt
-            // and provider request. Compact the journal-derived prompt state
-            // first, then scavenge the pages it released at this exact idle
-            // head instead of carrying their high-water into the next turn.
-            let allocator_bytes = haider_platform::allocator_pressure_relief();
-            tracing::debug!(
-                session_id = %self.session_id,
-                idle_seq = envelope.seq,
-                compacted_prompt_bytes,
-                allocator_bytes,
-                "compacted prompt history at terminal idle boundary"
-            );
             self.hub
                 .schedule_idle_derived_state_release(self.session_id.clone(), envelope.seq);
         }
