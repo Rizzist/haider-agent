@@ -73,7 +73,9 @@ fn daemon_compactor_fuses_provider_view_and_cache_attempt_publication() {
         .find("let replay_cache_diagnostic")
         .expect("cache diagnostic");
     let fused = compact_body
-        .find("self.record_request_attempt(run_id, 1, pending_provider_view")
+        .find(
+            "self.record_request_attempt(\n            run_id,\n            &replay_correlation,\n            pending_provider_view",
+        )
         .expect("fused request-attempt publication");
     let provider_open = compact_body
         .find("self.provider.stream_prepared_turn(request, prepared)")
@@ -572,6 +574,9 @@ async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
             ..UsageScope::default()
         },
         usage_account: None,
+        turn_ordinal: 1,
+        request_ordinals: haider_provider::ProviderRequestOrdinal::new(0),
+        turn_trace: None,
     };
     let intent = CompactionIntent {
         operation_id: "cu1-compaction".into(),
@@ -714,6 +719,9 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
             ..UsageScope::default()
         },
         usage_account: None,
+        turn_ordinal: 1,
+        request_ordinals: haider_provider::ProviderRequestOrdinal::new(0),
+        turn_trace: None,
     };
     let intent = CompactionIntent {
         operation_id: "cu1-compaction-fallback".into(),

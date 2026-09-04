@@ -988,7 +988,7 @@ impl AnthropicProvider {
                 }
             }
         };
-        Ok(request)
+        crate::apply_provider_request_headers(request)
     }
 
     async fn send_request(
@@ -1505,6 +1505,10 @@ impl Provider for AnthropicProvider {
         );
         crate::restore_attachment_moves(request, &mut attachment_moves);
         prepared
+    }
+
+    fn claim_prewarm(&self) -> bool {
+        crate::claim_optional_http_prewarm(&self.api_url)
     }
 
     async fn prewarm(&self) {

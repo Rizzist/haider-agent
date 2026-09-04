@@ -472,6 +472,10 @@ async fn full_turn_commits_exact_projected_sequence() {
         .iter()
         .map(|event| normalize(event.payload.clone().into()))
         .collect();
+    let correlation_run_id = events
+        .iter()
+        .find_map(|event| event.run_id.as_ref())
+        .expect("turn event run id");
     let expected = vec![
         serde_json::json!({"type":"run_state","state":"queued"}),
         serde_json::json!({
@@ -499,6 +503,13 @@ async fn full_turn_commits_exact_projected_sequence() {
                 "kind":"cache_request_attempt_v1",
                 "data":{
                     "ordinal":1,
+                    "correlation":{
+                        "request_kind":"primary",
+                        "request_ordinal":1,
+                        "run_id":correlation_run_id.as_str(),
+                        "session_id":SESSION,
+                        "turn_ordinal":1
+                    },
                     "diagnostic":{
                         "stable_prefix_tokens":3,
                         "history_message_count":0,
@@ -523,6 +534,13 @@ async fn full_turn_commits_exact_projected_sequence() {
                 "kind":"cache_request_attempt_v1",
                 "data":{
                     "ordinal":1,
+                    "correlation":{
+                        "request_kind":"primary",
+                        "request_ordinal":1,
+                        "run_id":correlation_run_id.as_str(),
+                        "session_id":SESSION,
+                        "turn_ordinal":1
+                    },
                     "diagnostic":{
                         "stable_prefix_tokens":3,
                         "history_message_count":0,

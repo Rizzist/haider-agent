@@ -558,7 +558,75 @@ ID (`crates/haider-tools/src/message_subagent.rs:7-36`, `:39-64`). An external
 controller uses the existing `agent.message` method above. To stop a child and
 its descendants, use `agent.cancel`.
 
-## 9. Compatibility and no silent degradation
+## 9. Provider request correlation
+
+Every turn-owned outbound provider HTTP request carries these two headers:
+
+```text
+X-Haider-Turn: <session_id>/<run_id>/<turn_ordinal>/<request_ordinal>
+X-Haider-Request-Kind: primary|side|warmup
+```
+
+`turn_ordinal` is an unsigned, unpadded, 1-based ordinal that increases for
+each new run accepted in one session. A steer or subturn delivered to an
+existing run keeps that run's ordinal. `request_ordinal` is also unsigned,
+unpadded, and 1-based, but is scoped to the turn: every physical request gets
+the next value, including transport/provider retries and a request reissued
+after restart. The complete slash-delimited value is therefore the stable
+join key for one physical provider attempt; neither opaque ID may be empty,
+contain `/`, contain non-visible ASCII, or exceed 256 bytes.
+
+`primary` identifies model requests that directly advance a root user turn.
+A normal model continuation after a tool result remains `primary`. `side`
+identifies delegated-child model requests, context summarization/compaction,
+estimation, session-owned Loom drafting inference, provider cache-resource
+create/delete operations owned by the turn, and provider-facing tool-support
+requests such as subscription web search. `warmup` is reserved for an
+explicitly enabled, unmeasured connection prewarm; ordinary startup or
+first-turn traffic must not infer it. A deduped or otherwise skipped prewarm
+does not allocate a request ordinal.
+
+Headers are the default and authoritative transport surface on OpenAI native
+and compatible adapters, Anthropic, Gemini, and turn-owned auxiliary HTTP
+provider calls. Correlation is never injected into the ordinary JSON body of
+a strict provider schema. An adapter may explicitly declare that its schema
+accepts a top-level `metadata` object; when both that declaration and
+`HAIDER_PROVIDER_BODY_METADATA=1` are present, Haider also writes
+`metadata.haider_turn` and `metadata.haider_request_kind`. Native OpenAI
+Responses declares that support. Compatible, Anthropic, and Gemini schemas do
+not. The body mirror is diagnostic convenience only; consumers join on the
+headers.
+
+Before opening the network request, the daemon commits the same identity in a
+prompt-omitted request-attempt journal marker. Model/compaction requests use
+the additive `correlation` field of `cache_request_attempt_v1`; auxiliary
+provider HTTP calls use `provider_request_attempt_v1`. With
+`HAIDER_DAEMON_TRACE=1`, every request-scoped `haider.turn` record carries
+`session_id`, `run_id`, the exact `turn_id`, `request_kind`, `turn_ordinal`,
+and `request_ordinal`. Turn-level accept/terminal records use request ordinal
+zero and do not claim a physical-request ID. Journal, trace, and
+proxy/provider ledgers must compare equal on request coordinates; deriving
+identity from prompt/body text is forbidden.
+
+This contract is scoped to requests owned by a durable turn or durable
+session inference operation. Turn-triggered Gemini cache-resource
+create/delete calls, opt-in connection prewarm, and `loom.author.draft` are
+therefore covered. Loom drafting first commits the prompt-omitted
+`provider_operation_reserved` lifecycle fact, then journals its `side` request
+attempt; the reservation participates only in durable turn-ordinal identity
+and is excluded from conversation observation, hooks, and agent-usage timing.
+This preserves session-monotonic ordinals without introducing a conversation
+message or a run-state transition. Session forks omit the reservation run and
+all of its parent-owned request-attempt audit facts rather than rewriting their
+envelope session while retaining embedded parent coordinates. Catalog reads,
+credential validation, cache cleanup
+with no durable turn or session-inference owner, and other out-of-turn
+control-plane HTTP calls have no run/request-attempt journal coordinate and
+omit these headers. ACP adapters use local JSON-RPC over supervised stdio
+rather than an HTTP provider request, so there is no HTTP header surface to
+mutate.
+
+## 10. Compatibility and no silent degradation
 
 Within wire protocol major v1, evolution is additive: optional fields, feature-
 gated methods, unknown-tolerant variants, and raw event families. Existing
@@ -594,6 +662,10 @@ meaning is at `crates/haider-client/src/profile.rs:187-200` on that branch.
 
 ### 2026-09-03 — v0.0.970
 
+- Added stable per-turn provider request correlation headers, matching
+  request-attempt journal coordinates, and matching opt-in daemon trace
+  fields. Existing strict provider JSON bodies remain unchanged by default;
+  the metadata mirror requires both adapter support and explicit opt-in.
 - Added default-compatible `ready_since` and `providers_loaded` fields to
   `status.snapshot`, projected as `daemon.ready_since` and
   `daemon.providers_loaded` by `haider status --json`.

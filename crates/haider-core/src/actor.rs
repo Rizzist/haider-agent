@@ -51,8 +51,8 @@ use haider_protocol::EventPayload;
 use haider_protocol::agent::{AgentManifest, ChildReport, ChipState, ReportVerification};
 use haider_protocol::cache::{
     CACHE_REQUEST_ATTEMPT_EXTENSION_KIND, CacheEpochTransitionReason, CacheEpochTransitionV1,
-    CacheRequestAttemptV1, PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND, ProviderViewAttemptV1,
-    ProviderViewBlobV1, ProviderViewLedgerV1,
+    CacheRequestAttemptV1, PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND, ProviderRequestAttemptV1,
+    ProviderRequestKind, ProviderViewAttemptV1, ProviderViewBlobV1, ProviderViewLedgerV1,
 };
 use haider_protocol::context::{
     ContextAccounting, ContextCompactionTier, ContextEconomy, ContextFootprint,
@@ -93,9 +93,10 @@ use haider_protocol::tool::{
 use haider_protocol::verify::VerifyVerdict;
 use haider_provider::{
     Message, PROVIDER_DEADLINE_SAFETY_MARGIN, PromptCacheMetadata, Provider, ProviderError,
-    ProviderErrorKind, ProviderStream, ProviderStreamItem, ProviderTimeoutReason,
-    ROUTE_STATE_POLL_INTERVAL, ResolvedAttachment, ToolDefinition, TurnRequest, TurnTraceContext,
-    apply_tool_result_image_budget, before_provider_request_deadline, canonical_tool_definitions,
+    ProviderErrorKind, ProviderRequestOrdinal, ProviderStream, ProviderStreamItem,
+    ProviderTimeoutReason, ROUTE_STATE_POLL_INTERVAL, ResolvedAttachment, ToolDefinition,
+    TurnRequest, TurnTraceContext, apply_tool_result_image_budget,
+    before_provider_request_deadline, canonical_tool_definitions,
     canonical_tool_definitions_digest, deadline_exhausted_error,
     degrade_tool_result_images_to_placeholders, effective_request_budget,
     validate_provider_view_prefix,
@@ -430,12 +431,12 @@ pub const CONTEXT_SUMMARY_TIER_PERCENT: u64 = 85;
 pub const CONTEXT_STRUCTURAL_TIER_ONE_RETAINED_TOOL_PAIRS: usize = 24;
 pub const CONTEXT_STRUCTURAL_TIER_TWO_RETAINED_TOOL_PAIRS: usize = 12;
 
-static TURN_TRACE_REGISTRY: OnceLock<Mutex<HashMap<RunId, TurnTraceContext>>> = OnceLock::new();
+static TURN_TRACE_REGISTRY: OnceLock<Mutex<HashMap<(SessionId, RunId), TurnTraceContext>>> =
+    OnceLock::new();
 
-/// Stable numeric correlation shared by daemon and client trace records. The
-/// FNV-1a digest is deliberately one-way diagnostic metadata: the session ID
-/// itself is never emitted, and the accepted sequence disambiguates turns in
-/// one session.
+/// Legacy numeric correlation retained for the client-side terminal trace.
+/// Provider and daemon request-attempt records use the declared session/run/
+/// turn/request coordinates instead; this digest is not a transport identity.
 #[doc(hidden)]
 #[must_use]
 pub fn turn_trace_ordinal(session_id: &SessionId, accepted_seq: u64) -> u64 {
@@ -453,26 +454,26 @@ pub fn turn_trace_ordinal(session_id: &SessionId, accepted_seq: u64) -> u64 {
     digest.max(1)
 }
 
-/// Registers one content-free trace context after durable turn acceptance.
-/// The run ID is only an in-process lookup key and is never emitted.
+/// Registers one trace context after durable turn acceptance. The composite
+/// key prevents equal run IDs in distinct sessions from aliasing each other.
 #[doc(hidden)]
-pub fn register_turn_trace(run_id: RunId, trace: TurnTraceContext) {
+pub fn register_turn_trace(session_id: SessionId, run_id: RunId, trace: TurnTraceContext) {
     let mut registry = TURN_TRACE_REGISTRY
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    registry.insert(run_id, trace);
+    registry.insert((session_id, run_id), trace);
 }
 
 /// Returns the accepted trace context for worker/provider setup.
 #[doc(hidden)]
 #[must_use]
-pub fn registered_turn_trace(run_id: &RunId) -> Option<TurnTraceContext> {
+pub fn registered_turn_trace(session_id: &SessionId, run_id: &RunId) -> Option<TurnTraceContext> {
     TURN_TRACE_REGISTRY.get().and_then(|registry| {
         registry
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(run_id)
+            .get(&(session_id.clone(), run_id.clone()))
             .cloned()
     })
 }
@@ -482,10 +483,10 @@ pub fn registered_turn_trace(run_id: &RunId) -> Option<TurnTraceContext> {
 #[doc(hidden)]
 #[must_use]
 pub fn turn_trace_for_envelopes(envelopes: &[RawEnvelope]) -> Option<TurnTraceContext> {
-    envelopes
+    let envelope = envelopes
         .iter()
-        .find_map(|envelope| envelope.run_id.as_ref())
-        .and_then(registered_turn_trace)
+        .find(|envelope| envelope.run_id.is_some())?;
+    registered_turn_trace(&envelope.session_id, envelope.run_id.as_ref()?)
 }
 
 #[doc(hidden)]
@@ -499,17 +500,19 @@ pub fn envelopes_contain_terminal(envelopes: &[RawEnvelope]) -> bool {
 /// briefly, but no future turn can resolve this entry.
 #[doc(hidden)]
 pub fn unregister_turn_trace_for_envelopes(envelopes: &[RawEnvelope]) {
-    let Some(run_id) = envelopes
-        .iter()
-        .find_map(|envelope| envelope.run_id.as_ref())
-    else {
+    let Some((session_id, run_id)) = envelopes.iter().find_map(|envelope| {
+        envelope
+            .run_id
+            .as_ref()
+            .map(|run_id| (&envelope.session_id, run_id))
+    }) else {
         return;
     };
     if let Some(registry) = TURN_TRACE_REGISTRY.get() {
         registry
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(run_id);
+            .remove(&(session_id.clone(), run_id.clone()));
     }
 }
 
@@ -669,6 +672,15 @@ pub struct HarnessConfig {
     /// Physical request-attempt ordinal already consumed before recovery.
     /// This keeps durable cache/provider-view coordinates monotonic.
     pub provider_request_ordinal_already_made: u64,
+    /// Durable 1-based run/turn coordinate allocated by the session store.
+    pub turn_ordinal: u64,
+    /// Shared physical-attempt namespace for actor, compaction, and auxiliary
+    /// turn-owned provider work. Standalone embedders may leave it absent.
+    pub provider_request_ordinals: Option<ProviderRequestOrdinal>,
+    /// Daemon-owned journal hook for auxiliary HTTP calls issued inside an
+    /// adapter under the current primary request (for example cache CRUD).
+    pub provider_request_attempt_recorder:
+        Option<Arc<dyn haider_provider::ProviderRequestAttemptRecorder>>,
     /// A restart-reconstructed admission retry has no trustworthy in-memory
     /// cumulative baseline. Keep each durable response snapshot request-local
     /// while retaining cumulative accounting inside the actor.
@@ -778,6 +790,9 @@ impl HarnessConfig {
             max_provider_requests_per_turn: DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN,
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
+            turn_ordinal: 1,
+            provider_request_ordinals: None,
+            provider_request_attempt_recorder: None,
             recovery_request_local_usage: false,
             max_continuations_per_turn: DEFAULT_MAX_CONTINUATIONS_PER_TURN,
             deferred_command_capacity: DEFAULT_DEFERRED_COMMAND_CAPACITY,
@@ -3154,7 +3169,14 @@ impl HarnessActor {
         // replay and invalidate both the provider-view ledger and cache key.
         let mut logical_request_cacheable_history_end = stable_history_end;
         let mut completed_usage: Option<Usage> = None;
-        let mut provider_request_ordinal = self.config.provider_request_ordinal_already_made;
+        let request_ordinals = self
+            .config
+            .provider_request_ordinals
+            .clone()
+            .unwrap_or_else(|| {
+                ProviderRequestOrdinal::new(self.config.provider_request_ordinal_already_made)
+            });
+        let mut provider_request_ordinal;
         let mut previous_cache_request = self.config.cache_previous_request.clone();
         let mut previous_provider_view = self.config.cache_previous_provider_view.clone();
         let mut pending_previous_cache_request: Option<PreviousCacheRequest> = None;
@@ -3394,7 +3416,49 @@ impl HarnessActor {
                     .await;
             }
             provider_attempt = provider_attempt.saturating_add(1);
-            provider_request_ordinal = provider_request_ordinal.saturating_add(1);
+            provider_request_ordinal = match request_ordinals.next() {
+                Ok(ordinal) => ordinal,
+                Err(error) => {
+                    return self
+                        .errored_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                            HaiderError::new(ErrorCode::Internal, error.to_string(), false),
+                        )
+                        .await;
+                }
+            };
+            let request_correlation = ProviderRequestAttemptV1 {
+                session_id: self.config.session_id.clone(),
+                run_id: run_id.clone(),
+                turn_ordinal: self.config.turn_ordinal,
+                request_ordinal: provider_request_ordinal,
+                request_kind: if self.config.agent_id.is_some() {
+                    ProviderRequestKind::Side
+                } else {
+                    ProviderRequestKind::Primary
+                },
+            };
+            if !request_correlation.coordinates_valid() {
+                return self
+                    .errored_outcome_with_items(
+                        &run_id,
+                        &mut message,
+                        &mut reasoning,
+                        &mut tools,
+                        HaiderError::new(
+                            ErrorCode::Internal,
+                            "turn correlation coordinates are invalid or ambiguous",
+                            false,
+                        ),
+                    )
+                    .await;
+            }
+            if let Some(trace) = self.config.turn_trace.as_ref() {
+                trace.register_request(&request_correlation);
+            }
             let previous_stable_history_end = previous_provider_view
                 .as_ref()
                 .and_then(|view| usize::try_from(view.stable_history_end).ok())
@@ -3745,6 +3809,7 @@ impl HarnessActor {
             );
             let request_attempt = CacheRequestAttemptV1 {
                 ordinal: provider_request_ordinal,
+                correlation: Some(request_correlation.clone()),
                 diagnostic: request_cache_diagnostic.clone(),
             };
             let request_attempt_data = match serde_json::to_value(request_attempt) {
@@ -3858,6 +3923,9 @@ impl HarnessActor {
             let opening_provider = Arc::clone(&attempt_provider);
             let provider_deadline_state = Arc::clone(&self.provider_deadline_state);
             let provider_request_ref = &provider_request;
+            let request_metadata_body_support = opening_provider.request_metadata_body_support();
+            let auxiliary_recorder = self.config.provider_request_attempt_recorder.clone();
+            let opening_correlation = request_correlation.clone();
             let mut opening = Box::pin(before_provider_request_deadline(
                 self.config.provider_deadline,
                 async move {
@@ -3865,9 +3933,27 @@ impl HarnessActor {
                     // after the next request has positive deadline admission.
                     // Until then, a prior retry remains in its admission state.
                     provider_deadline_state.begin_provider_request();
-                    opening_provider
-                        .stream_prepared_turn_ref(provider_request_ref, prepared)
-                        .await
+                    let open =
+                        opening_provider.stream_prepared_turn_ref(provider_request_ref, prepared);
+                    match auxiliary_recorder {
+                        Some(recorder) => {
+                            haider_provider::scope_provider_request_with_recorder(
+                                opening_correlation,
+                                request_metadata_body_support,
+                                recorder,
+                                open,
+                            )
+                            .await
+                        }
+                        None => {
+                            haider_provider::scope_provider_request(
+                                opening_correlation,
+                                request_metadata_body_support,
+                                open,
+                            )
+                            .await
+                        }
+                    }
                 },
             ));
             let mut opening_network_waiting = false;
@@ -12873,6 +12959,7 @@ mod usage_tests {
         );
         let attempt = CacheRequestAttemptV1 {
             ordinal: 1,
+            correlation: None,
             diagnostic: diagnostic.clone(),
         }
         .extension_item()
@@ -13027,6 +13114,7 @@ mod usage_tests {
             );
             last_size = serde_json::to_vec(&CacheRequestAttemptV1 {
                 ordinal: 1,
+                correlation: None,
                 diagnostic,
             })
             .expect("diagnostic serializes")

@@ -2190,8 +2190,8 @@ async fn workflow_recovery_after_budget_admission_preserves_spend_and_ordinal() 
             .iter()
             .map(|attempt| attempt.ordinal)
             .collect::<Vec<_>>(),
-        vec![1, 1, 2],
-        "the retried first hop retains its logical ordinal before hop two"
+        vec![1, 2, 3],
+        "restart retry and later hop each receive a fresh physical ordinal"
     );
     let usage = journal
         .iter()

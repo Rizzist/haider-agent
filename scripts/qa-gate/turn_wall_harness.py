@@ -78,7 +78,15 @@ def _trace_records(text: str) -> list[dict[str, int | str]]:
                     record[key] = int(value)
                 except ValueError:
                     continue
-            elif key in {"target", "phase", "level"}:
+            elif key in {
+                "target",
+                "phase",
+                "level",
+                "session_id",
+                "run_id",
+                "turn_id",
+                "request_kind",
+            }:
                 record[key] = value
         if record.get("target") == "haider.turn" and isinstance(record.get("phase"), str):
             records.append(record)
@@ -597,9 +605,9 @@ def run_harness(
                     "provider_requests": len(ledger),
                     "terminal_kind": parsed["terminal_kind"],
                     "terminal_seq": parsed["terminal_seq"],
-                    "turn_ordinal": (
-                        client_terminal[0].get("turn_ordinal") if client_terminal else None
-                    ),
+                    "session_id": ledger[0]["turn_id"].split("/")[0],
+                    "run_id": ledger[0]["turn_id"].split("/")[1],
+                    "turn_ordinal": int(ledger[0]["turn_id"].split("/")[2]),
                 }
                 if reported:
                     samples[shape].append(row)
@@ -756,8 +764,14 @@ def run_harness(
     trace_records = _trace_records(trace_text) if trace else []
     trace_stage_summary: dict[str, Any] = {}
     if trace:
-        grouped: dict[int, list[dict[str, int | str]]] = {}
+        grouped: dict[tuple[str, str, int], list[dict[str, int | str]]] = {}
         for record in trace_records:
+            session_id = record.get("session_id")
+            run_id = record.get("run_id")
+            # Client-side terminal timing is intentionally a separate trace
+            # source. Only daemon records carry the locked provider tuple.
+            if not isinstance(session_id, str) or not isinstance(run_id, str):
+                continue
             ordinal = record.get("turn_ordinal")
             if not isinstance(ordinal, int) or ordinal <= 0:
                 correctness_failures.append(f"trace record has invalid turn_ordinal={ordinal!r}")
@@ -778,8 +792,8 @@ def run_harness(
                 correctness_failures.append(
                     f"trace turn={ordinal} phase={record.get('phase')} has reversed timestamps"
                 )
-            grouped.setdefault(ordinal, []).append(record)
-        seen_ordinals: set[int] = set()
+            grouped.setdefault((session_id, run_id, ordinal), []).append(record)
+        seen_turns: set[tuple[str, str, int]] = set()
         for shape in ("single", "tool"):
             expected_requests = 1 if shape == "single" else 2
             for row in samples[shape]:
@@ -789,12 +803,13 @@ def run_harness(
                         f"{shape} sample={row['index']} has no client trace ordinal"
                     )
                     continue
-                if ordinal in seen_ordinals:
-                    correctness_failures.append(f"trace turn ordinal reused={ordinal}")
-                seen_ordinals.add(ordinal)
-                records = grouped.get(ordinal, [])
+                key = (str(row["session_id"]), str(row["run_id"]), ordinal)
+                if key in seen_turns:
+                    correctness_failures.append(f"trace turn identity reused={key!r}")
+                seen_turns.add(key)
+                records = grouped.get(key, [])
                 phases = [record.get("phase") for record in records]
-                for phase in ("accept", "terminal_commit", "client_terminal_seen"):
+                for phase in ("accept", "terminal_commit"):
                     if phases.count(phase) != 1:
                         correctness_failures.append(
                             f"trace turn={ordinal} phase={phase} expected=1 "
@@ -809,6 +824,21 @@ def run_harness(
                         correctness_failures.append(
                             f"trace turn={ordinal} phase={phase} request_ordinals={ordinals!r}"
                         )
+                    for record in phase_records:
+                        request_ordinal = int(record["request_ordinal"])
+                        expected_turn_id = (
+                            f"{key[0]}/{key[1]}/{key[2]}/{request_ordinal}"
+                        )
+                        if record.get("turn_id") != expected_turn_id:
+                            correctness_failures.append(
+                                f"trace request identity mismatch expected={expected_turn_id!r} "
+                                f"actual={record.get('turn_id')!r}"
+                            )
+                        if record.get("request_kind") != "primary":
+                            correctness_failures.append(
+                                f"trace benchmark request kind must be primary "
+                                f"actual={record.get('request_kind')!r}"
+                            )
                 journal_txns = sorted(
                     int(record["txn_ordinal"])
                     for record in records
@@ -831,7 +861,14 @@ def run_harness(
                         f"expected={expected_transactions} actual={len(journal_txns)}"
                     )
         measured_trace = [
-            record for record in trace_records if record.get("turn_ordinal") in seen_ordinals
+            record
+            for record in trace_records
+            if (
+                record.get("session_id"),
+                record.get("run_id"),
+                record.get("turn_ordinal"),
+            )
+            in seen_turns
         ]
         for phase in sorted(
             {str(record["phase"]) for record in measured_trace if "phase" in record}

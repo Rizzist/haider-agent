@@ -1116,6 +1116,16 @@ impl SqliteStoreHandle {
         .await
     }
 
+    pub async fn turn_ordinal(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+    ) -> Result<Option<u64>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.turn_ordinal(&session_id, &run_id)))
+            .await
+    }
+
     /// Blocking-pool adapter for `Store::accept_turn` (R3 atomic
     /// acceptance; see its caller contract on fence-vs-replay order).
     pub async fn accept_turn(
