@@ -4056,10 +4056,7 @@ async fn run_supervisor(
     // A nudge's accepted user-message sequence is its process-stable delivery
     // key. Existing messages are already part of a restarted turn's compiled
     // prompt; new messages are inserted when they cross into the live harness.
-    let delivered_nudges = durable_user_message_seqs(&lease).await.unwrap_or_default();
-    lease
-        .hub()
-        .install_delivered_nudges(lease.session_id().clone(), delivered_nudges);
+    let mut delivered_nudges = durable_user_message_seqs(&lease).await.unwrap_or_default();
     // W-A: rebuild this session's background-task projection and reap
     // prior-generation orphans as soon as the session becomes live again.
     {
@@ -4497,8 +4494,7 @@ async fn run_supervisor(
                             let result = deliver_mid_turn_to_active(
                                 turn,
                                 &active_run,
-                                lease.hub(),
-                                lease.session_id(),
+                                &mut delivered_nudges,
                                 run_id,
                                 accepted_seq,
                                 text,
@@ -4601,6 +4597,11 @@ async fn run_supervisor(
                 }
                 outcome = turn.outcome.as_mut() => {
                     if let Some(mut finished) = active.take() {
+                        // Mid-turn delivery dedupe is scoped to the turn that
+                        // just ended: every sequence in it is now part of
+                        // durable prompt history, so carrying it forward
+                        // would grow this set with transcript age.
+                        delivered_nudges.clear();
                         let (outcome_state, outcome_error, mut drive_error) = match outcome {
                             Ok(outcome) => (Some(outcome.state), outcome.error, None),
                             Err(error) => (None, None, Some(error)),
@@ -5041,8 +5042,7 @@ async fn run_supervisor(
 fn deliver_mid_turn_to_active(
     turn: &mut ActiveTurn,
     active_run: &RunId,
-    hub: &SessionHub,
-    session_id: &SessionId,
+    delivered_nudges: &mut HashSet<u64>,
     run_id: RunId,
     accepted_seq: u64,
     text: String,
@@ -5055,7 +5055,7 @@ fn deliver_mid_turn_to_active(
             false,
         ));
     }
-    if hub.nudge_was_delivered(session_id, accepted_seq) {
+    if delivered_nudges.contains(&accepted_seq) {
         return Ok(());
     }
     let result = match mode {
@@ -5068,7 +5068,7 @@ fn deliver_mid_turn_to_active(
         )),
     };
     if result.is_ok() {
-        hub.note_delivered_nudge(session_id, accepted_seq);
+        delivered_nudges.insert(accepted_seq);
     }
     result
 }

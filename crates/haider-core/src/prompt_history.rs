@@ -984,20 +984,6 @@ impl PromptHistoryCache {
         released
     }
 
-    /// Removes every journal-reconstructible allocation for one session.
-    ///
-    /// A semantic compaction is a hard cache epoch boundary: keeping even an
-    /// empty `CachedPromptSession` would retain historical compaction keys,
-    /// saved cursors, and collection high-water. The durable journal and
-    /// prompt checkpoints remain the rebuild authority.
-    pub async fn remove_session(&self, session_id: &SessionId) -> usize {
-        self.sessions
-            .lock()
-            .await
-            .remove(session_id)
-            .map_or(0, |cached| cached.retained_heap_bytes())
-    }
-
     async fn compile_provider_projection_with_artifacts(
         &self,
         store: &dyn StoreHandle,

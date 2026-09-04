@@ -1134,10 +1134,24 @@ struct HubInner {
     /// Coalesces delayed idle releases and bounds hot derived state even when
     /// a session never remains idle long enough for the timer to fire.
     resident_windows: Mutex<HashMap<SessionId, ResidentWindowState>>,
-    /// Process-local delivery idempotency for the one live turn. Terminal
-    /// idle and semantic compaction both clear it; durable receipts remain
-    /// the cross-turn authority.
-    delivered_nudges: Mutex<HashMap<SessionId, HashSet<u64>>>,
+}
+
+/// What a release may do to the prompt cache.
+///
+/// The two arms are not "soft" and "hard": they differ in what the session is
+/// about to do next. An idle or window release ends the turn, so the bodies go
+/// and the next prompt is rebuilt by replay. A compaction release lands
+/// mid-turn, immediately before the continuation compiles the post-cut window,
+/// so the cache is trimmed to its compiled prefixes instead.
+#[derive(Clone, Copy)]
+enum DerivedStateEpoch {
+    /// The turn ended. Drop the bodies; keep the evicted shell whose
+    /// compaction keys and saved checkpoint cursors still describe this
+    /// context.
+    TurnEnded,
+    /// A semantic compaction replaced the context and the run continues on
+    /// the new window.
+    Compacted,
 }
 
 #[derive(Default)]
@@ -2314,13 +2328,6 @@ impl SessionHub {
             .keys()
             .filter(|(candidate, _)| candidate == session_id)
             .count();
-        let delivered_nudges = self
-            .inner
-            .delivered_nudges
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(session_id)
-            .map_or(0, HashSet::len);
         eprintln!(
             "haider_retention {}",
             serde_json::json!({
@@ -2338,20 +2345,44 @@ impl SessionHub {
                 "pipe_session_item_runs": pipe_session_item_runs,
                 "resident_terminal_turns": resident_terminal_turns,
                 "scheduled_idle_releases": scheduled_idle_releases,
-                "delivered_nudges": delivered_nudges,
                 "budget_runs": budget_runs,
                 "attachments": attachments,
             })
         );
     }
 
+    /// Releases every journal-reconstructible allocation this session holds.
+    ///
+    /// MEASURED, and the reason neither arm removes the cache entry outright:
+    /// dropping it resets the cache's head, so the next compile reloads a
+    /// durable prompt checkpoint and then retains that checkpoint's prefix
+    /// node/run id sets. On the turn-ended path that cost 281,703 B/turn
+    /// against 219,035 B/turn over 40 turns (N=4/side); on the compaction
+    /// path a 200-turn session compacted every 50 turns settled at
+    /// 27,279,936 B against 25,297,472 B (N=3/side). The journal and its
+    /// checkpoints stay the rebuild authority either way, so the choice here
+    /// is which resident shape is cheaper, and it is not removal.
     async fn release_session_derived_state(
         &self,
         session_id: &SessionId,
         head_seq: u64,
+        epoch: DerivedStateEpoch,
         phase: &str,
     ) {
-        let prompt_bytes = self.inner.prompt_history.remove_session(session_id).await;
+        let prompt_bytes = match epoch {
+            DerivedStateEpoch::TurnEnded => {
+                self.inner
+                    .prompt_history
+                    .evict_session_bodies(session_id)
+                    .await
+            }
+            DerivedStateEpoch::Compacted => {
+                self.inner
+                    .prompt_history
+                    .compact_session_history(session_id)
+                    .await
+            }
+        };
         let turn_setup_entries = self
             .inner
             .turn_setup_reductions
@@ -2384,6 +2415,7 @@ impl SessionHub {
             observe_bytes,
             dead_budget_runs,
             allocator_bytes,
+            hard_epoch = matches!(epoch, DerivedStateEpoch::Compacted),
             phase,
             "released all journal-reconstructible session state"
         );
@@ -2420,49 +2452,13 @@ impl SessionHub {
         {
             scheduled.abort.abort();
         }
-        self.clear_delivered_nudges(session_id);
-        self.release_session_derived_state(session_id, head_seq, "compaction_released")
-            .await;
-    }
-
-    pub(crate) fn install_delivered_nudges(&self, session_id: SessionId, sequences: HashSet<u64>) {
-        let mut delivered = self
-            .inner
-            .delivered_nudges
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if sequences.is_empty() {
-            delivered.remove(&session_id);
-        } else {
-            delivered.insert(session_id, sequences);
-        }
-    }
-
-    pub(crate) fn nudge_was_delivered(&self, session_id: &SessionId, seq: u64) -> bool {
-        self.inner
-            .delivered_nudges
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(session_id)
-            .is_some_and(|sequences| sequences.contains(&seq))
-    }
-
-    pub(crate) fn note_delivered_nudge(&self, session_id: &SessionId, seq: u64) {
-        self.inner
-            .delivered_nudges
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(session_id.clone())
-            .or_default()
-            .insert(seq);
-    }
-
-    fn clear_delivered_nudges(&self, session_id: &SessionId) {
-        self.inner
-            .delivered_nudges
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session_id);
+        self.release_session_derived_state(
+            session_id,
+            head_seq,
+            DerivedStateEpoch::Compacted,
+            "compaction_released",
+        )
+        .await;
     }
 
     fn advance_resident_window(&self, session_id: &SessionId) -> bool {
@@ -2523,7 +2519,12 @@ impl SessionHub {
                 return;
             }
             SessionHub { inner }
-                .release_session_derived_state(&task_session, idle_seq, "idle_released")
+                .release_session_derived_state(
+                    &task_session,
+                    idle_seq,
+                    DerivedStateEpoch::TurnEnded,
+                    "idle_released",
+                )
                 .await;
         });
         let abort = task.abort_handle();
@@ -2668,7 +2669,6 @@ impl SessionHub {
             prompt_history: PromptHistoryCache::default(),
             turn_setup_reductions: TurnSetupReductionCache::default(),
             resident_windows: Mutex::new(HashMap::new()),
-            delivered_nudges: Mutex::new(HashMap::new()),
         });
         let hub = Self { inner };
         hub.spawn_shell_registry_events()?;
@@ -6417,7 +6417,6 @@ impl SessionHub {
             }
         }
         self.inner.pipe_native.release_clean(session_id);
-        self.clear_delivered_nudges(session_id);
         if let Some(mut state) = self
             .inner
             .resident_windows
@@ -8197,7 +8196,6 @@ impl HubStoreHandle {
             .map_err(|_| hub_closed_store_error())?;
         let settled = response.await.map_err(|_| hub_closed_store_error())??;
         if let Some(envelope) = &settled {
-            self.hub.clear_delivered_nudges(&self.session_id);
             self.hub
                 .trace_retention_snapshot(&self.session_id, envelope.seq, "idle")
                 .await;
@@ -8206,6 +8204,7 @@ impl HubStoreHandle {
                     .release_session_derived_state(
                         &self.session_id,
                         envelope.seq,
+                        DerivedStateEpoch::TurnEnded,
                         "window_released",
                     )
                     .await;

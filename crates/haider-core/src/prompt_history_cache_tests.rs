@@ -13,23 +13,6 @@ use haider_protocol::verify::VerifyVerdict;
 
 struct NoArtifacts;
 
-#[tokio::test]
-async fn hard_session_removal_drops_the_cache_shell() {
-    let cache = PromptHistoryCache::default();
-    let session_id = SessionId::new("prompt-hard-removal");
-    let mut cached = CachedPromptSession::default();
-    cached.envelopes.reserve(32);
-    cache
-        .sessions
-        .lock()
-        .await
-        .insert(session_id.clone(), cached);
-
-    assert_eq!(cache.retention_stats().await.sessions, 1);
-    assert!(cache.remove_session(&session_id).await > 0);
-    assert_eq!(cache.retention_stats().await.sessions, 0);
-}
-
 #[async_trait]
 impl ArtifactReader for NoArtifacts {
     async fn read_artifact(&self, artifact: &ArtifactRef) -> Result<Vec<u8>, HaiderError> {
