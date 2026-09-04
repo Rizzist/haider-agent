@@ -12,8 +12,8 @@ use haider_provider::{
     ANTHROPIC_API_URL, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_PROVIDER_NAME,
     ANTHROPIC_PROVIDER_NAME, BEDROCK_MANTLE_DEFAULT_BASE_URL, BEDROCK_PROVIDER_NAME,
     BEDROCK_SEED_MODELS, DEEPSEEK_BASE_URL, DEEPSEEK_PROVIDER_NAME, DEEPSEEK_SEED_MODELS,
-    DiscoveredModel, GEMINI_API_BASE_URL, GEMINI_PROVIDER_NAME, GROK_OAUTH_BASE_URL,
-    GROK_OAUTH_PROVIDER_NAME, HAIDER_CODE_BASE_URL, HAIDER_CODE_PROVIDER_NAME,
+    DiscoveredModel, GEMINI_API_BASE_URL, GEMINI_PROVIDER_NAME, GOOGLE_ANTIGRAVITY_PROVIDER_NAME,
+    GROK_OAUTH_BASE_URL, GROK_OAUTH_PROVIDER_NAME, HAIDER_CODE_BASE_URL, HAIDER_CODE_PROVIDER_NAME,
     HAIDER_CODE_SEED_MODELS, KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME,
     OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
     OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL, ProviderErrorKind,
@@ -1404,6 +1404,24 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
             ProviderApiFamilyWire::GeminiGenerateContent,
             Some(GEMINI_API_BASE_URL.to_owned()),
             ProviderAuthRequirementWire::ApiKey,
+            true,
+            ProviderProvenance::BuiltIn,
+        ),
+        // v0.0.970: the supervised Google Antigravity agent. This is an
+        // EXECUTION KIND, not a transport — Haider launches Google's own
+        // `antigravity-acp` executable and speaks newline-delimited JSON-RPC
+        // to it over stdio — so there is NO base URL to seed and none is
+        // invented. It follows the KIMI/Grok inventory law rather than the
+        // DeepSeek one: a subscription agent's own catalog is the only
+        // inventory truth, so the profile boots inventory-empty with no
+        // default model and the first authenticated connection's discovery
+        // fills it. A seed list here would fill the summary and SUPPRESS the
+        // W5f-2d auto-discovery trigger. The API-key `gemini` arm directly
+        // above is untouched: these are two separate provider classes.
+        GOOGLE_ANTIGRAVITY_PROVIDER_NAME => (
+            ProviderApiFamilyWire::AcpAgent,
+            None,
+            ProviderAuthRequirementWire::OAuth,
             true,
             ProviderProvenance::BuiltIn,
         ),

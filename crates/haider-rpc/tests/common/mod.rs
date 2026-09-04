@@ -2068,6 +2068,7 @@ pub fn transcript() -> Vec<WireFrame> {
     append_prompt_fork_contract_tail(&mut frames, fork_metadata);
     append_fleet_identity_contract_tail(&mut frames);
     append_agent_cancel_contract_tail(&mut frames);
+    append_acp_agent_family_tail(&mut frames);
     frames
 }
 
@@ -2454,6 +2455,41 @@ fn append_agent_cancel_contract_tail(frames: &mut Vec<WireFrame>) {
         },
     ]);
     debug_assert_eq!(FEATURE_AGENT_CANCEL_V1, "agent_cancel_v1");
+}
+
+/// v0.0.970 appends the supervised-agent EXECUTION KIND to the tolerant
+/// provider-family vocabulary. Google's Antigravity account is served by
+/// launching Google's own `antigravity-acp` executable and speaking ACP to it
+/// over stdio, so the row carries no endpoint, no seeded inventory and no
+/// default model: the authenticated agent's own catalog is the only inventory
+/// truth. Appended at the very end, so every preceding frame keeps its exact
+/// coordinate and its golden bytes.
+fn append_acp_agent_family_tail(frames: &mut Vec<WireFrame>) {
+    frames.push(WireFrame::Response {
+        request_id: RequestId::new("request-acp-agent-provider"),
+        body: ResponseBody::ProviderList {
+            providers: vec![ProviderSummaryWire {
+                provider: "google-antigravity".into(),
+                api_family: ProviderApiFamilyWire::AcpAgent,
+                endpoint: None,
+                response_open_timeout_ms: None,
+                chunk_idle_timeout_ms: None,
+                semantic_progress_timeout_ms: None,
+                models: Vec::new(),
+                model_details: Vec::new(),
+                inventory_fetched_at_ms: None,
+                inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Authoritative,
+                auth_methods: vec![AuthMethod::OAuth],
+                availability: ProviderAvailabilityWire::Available,
+                availability_reason: None,
+                default_model: None,
+                enabled: true,
+                trust: haider_rpc::ProviderTrustWire::Full,
+            }],
+            revision: 13,
+            availability: None,
+        },
+    });
 }
 
 /// Golden credential descriptor: public global alias, verified display

@@ -49,6 +49,13 @@
 //! documented on [`DaemonState`] and enforced by the state publisher.
 
 mod accounts;
+pub mod antigravity_install;
+#[cfg(test)]
+mod antigravity_install_tests;
+mod antigravity_session;
+#[cfg(test)]
+#[path = "antigravity_session_tests.rs"]
+mod antigravity_session_tests;
 mod auto_hermetic;
 #[cfg(test)]
 #[path = "auto_hermetic_tests.rs"]

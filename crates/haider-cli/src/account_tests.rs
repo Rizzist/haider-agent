@@ -171,6 +171,70 @@ fn source_and_profile_default_commands_have_exact_grammar() {
     );
 }
 
+/// LAW (970 layer B): `source add` accepts every enrolled kind's durable
+/// name and its short alias, and nothing else. The usage line names the
+/// same vocabulary the daemon parses.
+#[test]
+fn source_add_accepts_every_enrolled_source_kind_vocabulary() {
+    for kind in [
+        "codex",
+        "codex_home",
+        "claude",
+        "claude_file",
+        "grok",
+        "grok_home",
+        "kimi",
+        "kimi_code_home",
+    ] {
+        assert_eq!(
+            parse_account_command(&[
+                "source".into(),
+                "add".into(),
+                kind.into(),
+                "/tmp/root".into()
+            ]),
+            Ok(AccountCommand::SourceAdd {
+                kind: kind.into(),
+                root: "/tmp/root".into(),
+                label: None,
+            }),
+            "{kind}"
+        );
+        assert_eq!(
+            parse_account_command(&[
+                "source".into(),
+                "add".into(),
+                kind.into(),
+                "/tmp/root".into(),
+                "--label".into(),
+                "Origin".into(),
+            ]),
+            Ok(AccountCommand::SourceAdd {
+                kind: kind.into(),
+                root: "/tmp/root".into(),
+                label: Some("Origin".into()),
+            }),
+            "{kind} with a label"
+        );
+    }
+    for rejected in ["grok_cli", "kimi-code", "keyring", "gemini"] {
+        assert!(
+            parse_account_command(&[
+                "source".into(),
+                "add".into(),
+                rejected.into(),
+                "/tmp/root".into(),
+            ])
+            .is_err(),
+            "{rejected}"
+        );
+    }
+    let usage = account_usage();
+    for kind in ["codex", "claude_file", "grok", "kimi_code_home"] {
+        assert!(usage.contains(kind), "usage names {kind}");
+    }
+}
+
 #[tokio::test]
 async fn account_use_resolves_alias_then_sets_the_profile_default() {
     let selected = descriptor("work");

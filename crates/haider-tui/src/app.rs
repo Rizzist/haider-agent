@@ -18,7 +18,7 @@ use haider_protocol::menu::{
 use haider_protocol::state::{HarnessStatus, RunState};
 use haider_protocol::{DeliveryMode, EventPayload};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Sim `autoBlurb` (tui.js:401-406): strip a leading slash-command token,
 /// keep the first seven words, cap at 46 chars, capitalize the first letter.
@@ -4316,6 +4316,43 @@ pub enum Hit {
     HookFiring(MenuId),
 }
 
+/// The Google Antigravity provider id (970). Haider supervises Google's
+/// official `antigravity-acp` agent and speaks ACP to it: **Google owns the
+/// OAuth**, the profile and the refresh, and no Google token ever enters
+/// Haider's vault. Deliberately distinct from the API-key `gemini` provider,
+/// which is a separate account with a separate credential.
+pub const GOOGLE_ANTIGRAVITY_PROVIDER: &str = "google-antigravity";
+
+/// The terms warning, VERBATIM (owner decision 2026-09-03). The provider
+/// ships ENABLED BY DEFAULT with no policy gate; this text is the disclosure
+/// that replaces the gate — shown once before the first login and then as a
+/// standing badge on `/accounts` for as long as a Google account exists.
+///
+/// Renderers WRAP it to the terminal width and never reword it
+/// (`docs/testing/v0.0.970/googleoauth.md` §1.6 is the authority).
+pub const GOOGLE_ANTIGRAVITY_TERMS_WARNING: &str = "Google's published terms restrict third-party access to Gemini subscriptions/Antigravity; Google ships this ACP agent for editors and reportedly does not enforce the clause — use at your own risk.";
+
+/// Journal subject for the acknowledgement of
+/// [`GOOGLE_ANTIGRAVITY_TERMS_WARNING`] (see [`crate::terms_journal`]).
+pub const GOOGLE_ANTIGRAVITY_TERMS_SUBJECT: &str = "google-antigravity-terms";
+
+/// Credential-source KIND for an account reached through Google's agent.
+/// Google's agent owns the token in its own `$GEMINI_HOME` profile, so this
+/// names a real credential source that simply is not Haider's — the accounts
+/// screen renders it through the one source renderer, badged
+/// `google-antigravity (ACP)`.
+pub const GOOGLE_ANTIGRAVITY_SOURCE_KIND: &str = "google_antigravity";
+
+/// What Google's agent COSTS, measured first-hand on 2026-09-04 and pinned in
+/// `docs/testing/v0.0.970/_antigravity-pins.md`. Every figure here was read
+/// off the artefact — a renderer must never estimate one, and a platform we
+/// have not measured gets a measurement, never an extrapolation.
+pub const GOOGLE_ANTIGRAVITY_COST_LINES: &[&str] = &[
+    "first run downloads ~316 MB (macOS arm64; ~682 MB on Linux x86_64)",
+    "~885 MiB on disk once installed (~2.0 GB on Linux)",
+    "~225 MiB resident while running · about 15 s to cold start",
+];
+
 /// The `/accounts` add-row buttons (sim order, tui.js:3621-3628; B6b adds
 /// the two providers the sim never knew — Kimi's device-flow OAuth and the
 /// Gemini API key — between the sim rows and the HF/custom tail).
@@ -4329,6 +4366,11 @@ pub enum AccountAddKind {
     /// SuperGrok/X Premium subscription sign-in via xAI's RFC-8628 device
     /// grant and dedicated CLI chat proxy.
     GrokOAuth,
+    /// 970 — Gemini subscription access through Google's own official
+    /// `antigravity-acp` agent. AGENT-OWNED OAuth: Google's binary performs
+    /// the sign-in and keeps the token, so this is never an API-key route
+    /// (that is [`Self::GeminiApi`], a different account entirely).
+    GoogleAntigravity,
     GeminiApi,
     /// Haider Code hosted-model plans through the fixed first-party API.
     HaiderCodeApi,
@@ -5475,6 +5517,21 @@ pub struct AppModel {
     pub custom_add: Option<CustomProviderCard>,
     /// Monotonic attempt counter for custom-provider cards.
     pub custom_attempt_seq: u64,
+    /// 970 — the open Google Antigravity FIRST-LOGIN disclosure, carrying the
+    /// add kind it runs on confirmation. `Some` only while this profile has
+    /// not yet journalled [`GOOGLE_ANTIGRAVITY_TERMS_SUBJECT`]: the owner's
+    /// decision is one warning before the first login, then the standing
+    /// `/accounts` badge — never a gate and never a repeated interstitial.
+    pub antigravity_consent: Option<AccountAddKind>,
+    /// Terms warnings this profile has been shown and accepted, seeded at
+    /// boot from [`crate::terms_journal`]. A durable user DECISION, not a
+    /// display preference: it lives in the profile's acknowledgement journal
+    /// rather than the TUI settings file.
+    pub acknowledged_terms: BTreeSet<String>,
+    /// Monotonic commit counter for [`Self::acknowledged_terms`] — the
+    /// persistence sync writes when it moves (the theme/notification shape,
+    /// so a re-affirmation is never silently dropped).
+    pub terms_ack_commits: u64,
     /// `/hooks` screen state (H4): the `hooks.list` snapshot, cursor,
     /// confirmation card and in-flight receipt gate. APP-level like
     /// `tools_inventory` — the listing is workspace truth, not session
@@ -5700,6 +5757,9 @@ impl Default for AppModel {
             oauth_attempt_seq: 0,
             custom_add: None,
             custom_attempt_seq: 0,
+            antigravity_consent: None,
+            acknowledged_terms: BTreeSet::new(),
+            terms_ack_commits: 0,
             hooks: crate::hooks::HooksScreenState::default(),
             hook_facts: crate::hooks::HookFactsLog::default(),
             tasks: crate::taskrows::TaskPanel::default(),
@@ -11389,6 +11449,12 @@ impl AppModel {
             // flow-agnostic by design.
             AccountAddKind::KimiOAuth => ("kimi-oauth", "Kimi — Moonshot"),
             AccountAddKind::GrokOAuth => ("grok-oauth", "Grok — xAI"),
+            // 970: the same oauth_start/status/add wire again — the daemon
+            // supervises Google's agent behind it, so the card stays
+            // flow-agnostic and only its copy names the agent-owned login.
+            AccountAddKind::GoogleAntigravity => {
+                (GOOGLE_ANTIGRAVITY_PROVIDER, "Google Antigravity")
+            }
             AccountAddKind::OpenAiApi
             | AccountAddKind::AnthropicApi
             | AccountAddKind::GeminiApi
@@ -11424,6 +11490,60 @@ impl AppModel {
         self.dirty = true;
     }
 
+    /// The `/login google` door (970). The FIRST login on this profile opens
+    /// the disclosure card — who performs the sign-in, what the agent costs,
+    /// and the verbatim terms warning — and starts nothing until the user
+    /// confirms. A profile that already journalled the acknowledgement goes
+    /// straight to the flow: the owner asked for ONE warning, plus the
+    /// standing `/accounts` badge, never a repeated interstitial.
+    fn open_antigravity_add(&mut self) {
+        if self.oauth_add.is_some()
+            || self.custom_add.is_some()
+            || self.antigravity_consent.is_some()
+        {
+            return;
+        }
+        if self
+            .acknowledged_terms
+            .contains(GOOGLE_ANTIGRAVITY_TERMS_SUBJECT)
+        {
+            self.open_oauth_add(AccountAddKind::GoogleAntigravity);
+            return;
+        }
+        self.accounts.message = None;
+        self.antigravity_consent = Some(AccountAddKind::GoogleAntigravity);
+        self.dirty = true;
+    }
+
+    /// `[1]` on the disclosure card: RECORD the acknowledgement, then start
+    /// the flow. The record is the durable evidence that this user was shown
+    /// the warning and continued; the write itself is the runtime's
+    /// (`crate::runtime::sync_terms_persistence`), keyed on the commit
+    /// counter bumped here, so the reducer stays IO-free.
+    fn confirm_antigravity_consent(&mut self) {
+        let Some(kind) = self.antigravity_consent.take() else {
+            return;
+        };
+        if self
+            .acknowledged_terms
+            .insert(GOOGLE_ANTIGRAVITY_TERMS_SUBJECT.to_owned())
+        {
+            self.terms_ack_commits = self.terms_ack_commits.saturating_add(1);
+        }
+        self.dirty = true;
+        self.open_oauth_add(kind);
+    }
+
+    /// `[2]`/esc on the disclosure card: nothing starts, nothing is
+    /// downloaded, and NOTHING is journalled — a declined warning leaves no
+    /// record of an acceptance that never happened.
+    fn decline_antigravity_consent(&mut self) {
+        if self.antigravity_consent.take().is_some() {
+            self.accounts.message = Some("· Google Antigravity sign-in cancelled".to_owned());
+            self.dirty = true;
+        }
+    }
+
     /// Starts the existing OAuth adoption flow against the active alias.
     /// Unlike ordinary add, recovery must preserve the daemon-owned account
     /// identity so a successful flow replaces that descriptor.
@@ -11436,6 +11556,7 @@ impl AppModel {
             "anthropic-oauth" => "Anthropic — Claude",
             "kimi-oauth" => "Kimi — Moonshot",
             "grok-oauth" => "Grok — xAI",
+            GOOGLE_ANTIGRAVITY_PROVIDER => "Google Antigravity",
             _ => {
                 self.accounts.message = Some(format!(
                     "· re-login is not available for {provider}; add it again"
@@ -11582,6 +11703,10 @@ impl AppModel {
                             // provider id.
                             "kimi-oauth" => ("kimi-oauth", "you@kimi.com · Kimi Code"),
                             "grok-oauth" => ("grok-oauth", "you@x.ai · SuperGrok"),
+                            GOOGLE_ANTIGRAVITY_PROVIDER => (
+                                GOOGLE_ANTIGRAVITY_PROVIDER,
+                                "you@gmail.com · Gemini subscription",
+                            ),
                             _ => ("anthropic", "you@me.com · Claude Max"),
                         };
                         let alias = card.alias.clone();
@@ -12350,6 +12475,18 @@ impl AppModel {
     /// Keys on the `/accounts` screen (no composer; the login card, when
     /// open, is total-modal and never reaches here).
     fn handle_accounts_key(&mut self, code: KeyCode) {
+        // 970 — the disclosure card owns the keyboard exactly like the other
+        // accounts cards: nothing starts until `[1]`, and `[2]`/esc leaves
+        // no record. It closes before `open_oauth_add` runs, so at most one
+        // of these three guards can ever be live.
+        if self.antigravity_consent.is_some() {
+            match code {
+                KeyCode::Char('1') => self.confirm_antigravity_consent(),
+                KeyCode::Esc | KeyCode::Char('2') => self.decline_antigravity_consent(),
+                _ => {}
+            }
+            return;
+        }
         if self.oauth_add.is_some() {
             self.handle_oauth_card_key(code);
             return;
@@ -13842,6 +13979,23 @@ impl AppModel {
                     ("kimi" | "grok", "api") => {
                         self.flash = Some(format!(
                             "· /login {provider} api — no API-key flow for this provider; try /login {provider} oauth"
+                        ));
+                    }
+                    // 970 — Google Antigravity. `/login google` is the
+                    // PREFERRED shortcut and needs no method word (the login
+                    // is Google's agent's to perform, so there is only one);
+                    // the explicit existing grammar reaches the same door.
+                    ("google" | GOOGLE_ANTIGRAVITY_PROVIDER, "" | "oauth") => {
+                        self.enter_accounts();
+                        self.handle_hit(Hit::AccountAdd(AccountAddKind::GoogleAntigravity));
+                    }
+                    // Every other method word is refused, and the refusal
+                    // names the OTHER Google account a user may actually
+                    // want: the API-key `gemini` provider is a separate
+                    // credential, not a spelling of this one.
+                    ("google" | GOOGLE_ANTIGRAVITY_PROVIDER, _) => {
+                        self.flash = Some(format!(
+                            "· /login {provider} {method} — Google Antigravity is agent-owned OAuth only; try /login google · the API-key Gemini provider is a separate account (/login gemini api)"
                         ));
                     }
                     (provider, "api") => self.open_login_card(provider, alias),
@@ -17065,6 +17219,19 @@ impl AppModel {
                         } else {
                             self.accounts.message =
                                 Some(self.stale_daemon_note("Grok OAuth sign-in"));
+                            self.dirty = true;
+                        }
+                    }
+                    // 970: the ACP adapter ships with NO feature bit (the
+                    // B6a/Gemini precedent), so `provider.list` truth is its
+                    // capability signal — a daemon that does not list the
+                    // class would bounce the eventual account obscurely.
+                    AccountAddKind::GoogleAntigravity => {
+                        if self.daemon_lists_provider(GOOGLE_ANTIGRAVITY_PROVIDER) {
+                            self.open_antigravity_add();
+                        } else {
+                            self.accounts.message =
+                                Some(self.stale_daemon_note("Google Antigravity accounts"));
                             self.dirty = true;
                         }
                     }

@@ -1855,9 +1855,11 @@ fn codex_import_leniently_reads_fake_jwt_claims() {
     assert!(bundle.id_token().is_some(), "ID token remains vault-only");
 }
 
-/// MUTATION CHECK: remove either untagged Grok CLI auth.json arm, lose the
-/// refresh token, or trust a mismatched issuer. Each official shape below
-/// must yield the same sanctioned provider identity without exposing bytes.
+/// MUTATION CHECK: remove either untagged Grok CLI auth.json arm, or trust a
+/// mismatched issuer. Each official shape below must yield the same
+/// sanctioned provider identity without exposing bytes. The bundle shape
+/// carries a refresh token that the Grok CLI alone may spend, so neither arm
+/// may ever surface one.
 #[test]
 fn grok_cli_import_accepts_bare_and_bundle_auth_json_shapes() {
     let registration = OAuthProviderCatalog::default()
@@ -1888,12 +1890,293 @@ fn grok_cli_import_accepts_bare_and_bundle_auth_json_shapes() {
     .expect("object Grok token bundle");
     assert_eq!(object.provider_id, "grok-oauth");
     assert_eq!(object.access_token(), b"fake-grok-object-access");
-    assert_eq!(
-        object.refresh_token(),
-        Some(b"fake-grok-object-refresh".as_slice())
+    assert!(
+        object.refresh_token().is_none(),
+        "the Grok CLI owns rotation; Haider never copies its refresh token"
     );
     assert_eq!(object.generation, 2);
     assert_eq!(object.granted_scopes, registration.scopes);
+}
+
+const GROK_SOURCE_OWNED_REFRESH: &str = "fake-grok-source-owned-refresh-9f21";
+const KIMI_SOURCE_OWNED_REFRESH: &str = "fake-kimi-source-owned-refresh-4c07";
+
+fn grok_source_owned_fixture() -> Vec<u8> {
+    format!(
+        r#"{{"access_token":"fake-grok-source-owned-access","refresh_token":"{GROK_SOURCE_OWNED_REFRESH}","expires_in":3600}}"#
+    )
+    .into_bytes()
+}
+
+/// An already-expired Kimi store: `expires_at` is one second past the epoch,
+/// so the imported bundle is due for refresh without any field surgery.
+fn kimi_source_owned_fixture() -> Vec<u8> {
+    format!(
+        r#"{{"access_token":"fake-kimi-source-owned-access","refresh_token":"{KIMI_SOURCE_OWNED_REFRESH}","expires_at":1.0,"expires_in":3600,"scope":"all","token_type":"Bearer"}}"#
+    )
+    .into_bytes()
+}
+
+/// LAW: source_owned_imports_never_copy_a_rotating_refresh_token.
+///
+/// Both the official Grok CLI and the Kimi Code CLI rotate their refresh
+/// token with reuse detection, so a second copy in Haider's vault is a way
+/// to log the user out of their own CLI. Every import of those two sources
+/// is ACCESS-ONLY, and the import SPEC — not a per-source parser — is the
+/// authority that says so; it names the same origin owner that linked
+/// discovery records for the same CLI.
+///
+/// MUTATION CHECK: re-add a `refresh_token` field to `KimiCredentials` or
+/// `GrokCredentials`, mint either import through `OAuthTokenBundleV1::new`
+/// instead of the shared `source_owned_refresh_bundle` constructor, or flip
+/// either spec's `refresh_owner` to `Haider`. Expected runtime failure: an
+/// assertion below observes a retained refresh token, the fixture's refresh
+/// bytes inside the encoded vault payload, or a spec claiming Haider owns
+/// another CLI's rotation.
+#[test]
+fn source_owned_imports_never_copy_a_rotating_refresh_token() {
+    for (source, owner) in [
+        ("codex", OAuthImportRefreshOwner::Haider),
+        ("claude-code", OAuthImportRefreshOwner::Haider),
+        (
+            "grok-cli",
+            OAuthImportRefreshOwner::Source(
+                haider_accounts::CredentialSourceKind::GrokHome.refresh_owner(),
+            ),
+        ),
+        (
+            "kimi-code",
+            OAuthImportRefreshOwner::Source(
+                haider_accounts::CredentialSourceKind::KimiCodeHome.refresh_owner(),
+            ),
+        ),
+    ] {
+        let spec = oauth_import_source_spec(source).expect("import source spec");
+        assert_eq!(
+            spec.refresh_owner, owner,
+            "`{source}` must declare the same refresh owner as linked discovery"
+        );
+    }
+
+    let catalog = OAuthProviderCatalog::default();
+    let grok = grok_import_bundle(
+        Path::new("/tmp/fake-grok-auth.json"),
+        &grok_source_owned_fixture(),
+        &catalog
+            .registration(haider_provider::GROK_OAUTH_PROVIDER_NAME)
+            .expect("Grok OAuth registration"),
+        1,
+    )
+    .expect("Grok import bundle");
+    let kimi = kimi_import_bundle(
+        Path::new("/tmp/fake-kimi-credentials.json"),
+        &kimi_source_owned_fixture(),
+        &catalog
+            .registration(haider_provider::KIMI_OAUTH_PROVIDER_NAME)
+            .expect("Kimi OAuth registration"),
+        1,
+    )
+    .expect("Kimi import bundle");
+
+    assert_eq!(grok.access_token(), b"fake-grok-source-owned-access");
+    assert_eq!(kimi.access_token(), b"fake-kimi-source-owned-access");
+    for (bundle, forbidden) in [
+        (&grok, GROK_SOURCE_OWNED_REFRESH),
+        (&kimi, KIMI_SOURCE_OWNED_REFRESH),
+    ] {
+        assert!(
+            bundle.refresh_token().is_none(),
+            "the `{}` import retained a refresh token its origin CLI owns",
+            bundle.provider_id
+        );
+        let encoded = bundle.encode().expect("encode source-owned bundle");
+        assert!(
+            !encoded
+                .windows(forbidden.len())
+                .any(|window| window == forbidden.as_bytes()),
+            "the encoded vault payload carried the origin CLI's refresh token"
+        );
+    }
+}
+
+/// LAW: imported_source_owned_credentials_never_reach_a_token_endpoint.
+///
+/// The stored bundle read back out of the vault carries no refresh token,
+/// and an expired one resolves to a typed re-login instead of a token
+/// request — for the conservative Grok registration and for Kimi's
+/// serialized-rotating one alike.
+///
+/// MUTATION CHECK: let either import copy its refresh token, or let a
+/// refresh boundary fall through to the endpoint when a bundle has none.
+/// Expected RUNTIME failure: the vault round-trip observes a refresh token,
+/// or the fake authority records a POST or a submitted refresh token.
+#[tokio::test]
+async fn imported_source_owned_credentials_never_reach_a_token_endpoint() {
+    let server = FakeOAuthServer::start(FakeMode::Success, false).await;
+    server
+        .state
+        .expect_refresh_binding
+        .store(false, Ordering::SeqCst);
+
+    let mut grok_registration = server.registration(Arc::new(FakeIdentityVerifier));
+    grok_registration.provider_id = haider_provider::GROK_OAUTH_PROVIDER_NAME.to_owned();
+    let mut grok = grok_import_bundle(
+        Path::new("/tmp/fake-grok-auth.json"),
+        &grok_source_owned_fixture(),
+        &grok_registration,
+        1,
+    )
+    .expect("Grok import bundle");
+    // The Grok store carries a relative lifetime only, so the imported bundle
+    // is always minted in the future. Move its clock back to reach the exact
+    // refresh boundary this law is about.
+    grok.expires_at_unix_ms = now_ms().expect("clock").saturating_sub(1);
+    assert_source_owned_import_cannot_refresh(
+        &server,
+        grok_registration,
+        "imported-grok-cli",
+        &grok,
+        GROK_SOURCE_OWNED_REFRESH.as_bytes(),
+    )
+    .await;
+
+    let mut kimi_registration = server
+        .registration(Arc::new(FakeIdentityVerifier))
+        .with_test_device_flow();
+    kimi_registration.provider_id = haider_provider::KIMI_OAUTH_PROVIDER_NAME.to_owned();
+    let kimi = kimi_import_bundle(
+        Path::new("/tmp/fake-kimi-credentials.json"),
+        &kimi_source_owned_fixture(),
+        &kimi_registration,
+        1,
+    )
+    .expect("Kimi import bundle");
+    assert_source_owned_import_cannot_refresh(
+        &server,
+        kimi_registration,
+        "imported-kimi-code",
+        &kimi,
+        KIMI_SOURCE_OWNED_REFRESH.as_bytes(),
+    )
+    .await;
+}
+
+async fn assert_source_owned_import_cannot_refresh(
+    server: &FakeOAuthServer,
+    registration: OAuthProviderRegistration,
+    alias: &str,
+    bundle: &OAuthTokenBundleV1,
+    forbidden_refresh: &[u8],
+) {
+    let mut descriptor = oauth_descriptor_for_test();
+    descriptor.alias = CredentialAlias::new(alias);
+    descriptor.provider = registration.provider_id.clone();
+    descriptor.identity = bundle.identity.display_identity.clone();
+
+    let memory_vault = Arc::new(MemoryVault::new());
+    let encoded = bundle.encode().expect("encode source-owned import");
+    assert!(
+        !encoded
+            .windows(forbidden_refresh.len())
+            .any(|window| window == forbidden_refresh),
+        "the vault payload carried the origin CLI's refresh token"
+    );
+    memory_vault
+        .put(&descriptor.alias, &encoded)
+        .expect("seed source-owned import");
+    let stored = OAuthTokenBundleV1::decode(
+        memory_vault
+            .resolve(&descriptor.alias)
+            .expect("stored source-owned import")
+            .expose_secret(),
+    )
+    .expect("decode stored source-owned import");
+    assert!(
+        stored.refresh_token().is_none(),
+        "the STORED `{}` bundle must carry no refresh token",
+        descriptor.provider
+    );
+
+    let vault = memory_vault as Arc<dyn Vault>;
+    let snapshot = Arc::new(Mutex::new(vec![descriptor.clone()]));
+    let broker = CredentialBroker::new(
+        Arc::clone(&vault),
+        OAuthProviderCatalog::with_test_registrations([registration])
+            .expect("source-owned catalog"),
+        Arc::clone(&snapshot),
+        start_status_actor(&snapshot, Arc::clone(&vault)),
+    )
+    .expect("source-owned broker");
+    broker
+        .resolve(&descriptor)
+        .await
+        .expect_err("Haider cannot refresh a credential the origin CLI owns");
+    assert_eq!(
+        server.state.refresh_calls.load(Ordering::SeqCst),
+        0,
+        "an origin-owned credential must never reach a token endpoint"
+    );
+    assert!(
+        server
+            .state
+            .refresh_token_fingerprints
+            .lock()
+            .expect("refresh token fingerprints")
+            .is_empty(),
+        "the origin CLI's refresh token must never be submitted"
+    );
+    assert!(broker.shutdown().await);
+}
+
+/// LAW: kimi_import_path_prefers_the_current_cli_root.
+///
+/// `@moonshot-ai/kimi-code` writes `~/.kimi-code`; the superseded Python CLI
+/// wrote `~/.kimi` with the same relative path and fields. The current root
+/// wins, the legacy root is only a fallback, and with neither present the
+/// current root is still the honest path a "not found" reason names.
+///
+/// MUTATION CHECK: swap the two roots, consult the legacy root first, or
+/// answer with the legacy path when nothing exists. Expected runtime
+/// failure: one of the four resolutions below names the wrong file.
+#[test]
+fn kimi_import_path_prefers_the_current_cli_root_then_the_legacy_one() {
+    let home = tempfile::tempdir().expect("import home fixture");
+    let spec = oauth_import_source_spec("kimi-code").expect("kimi-code spec");
+    let current = home.path().join(".kimi-code/credentials/kimi-code.json");
+    let legacy = home.path().join(".kimi/credentials/kimi-code.json");
+
+    assert_eq!(
+        oauth_import_path_in_home(spec, home.path()),
+        current,
+        "with neither store present the current root is the honest answer"
+    );
+
+    write_import_path_fixture(&legacy);
+    assert_eq!(
+        oauth_import_path_in_home(spec, home.path()),
+        legacy,
+        "a legacy-only install stays importable"
+    );
+
+    write_import_path_fixture(&current);
+    assert_eq!(
+        oauth_import_path_in_home(spec, home.path()),
+        current,
+        "the current CLI's store always wins"
+    );
+
+    // A source with no superseded location never gains a fallback.
+    let codex = oauth_import_source_spec("codex").expect("codex spec");
+    assert_eq!(
+        oauth_import_path_in_home(codex, home.path()),
+        home.path().join(".codex/auth.json")
+    );
+}
+
+fn write_import_path_fixture(path: &Path) {
+    std::fs::create_dir_all(path.parent().expect("import fixture parent"))
+        .expect("create import fixture directory");
+    std::fs::write(path, b"{}").expect("write import fixture");
 }
 
 /// MUTATION CHECK: give native-store bytes a separate parser or bypass the

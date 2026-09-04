@@ -70,12 +70,13 @@ fn add_row_is_bottom_anchored_even_when_empty() {
         .iter()
         .position(|row| row.contains("click an account to make it active"))
         .expect("hints rendered");
-    // Bottom block: buttons(7, since U1 added the OpenCode Zen/Go row,
-    // G4a the Ollama/LM Studio row, G4b the Azure/Bedrock/Vertex row, and
-    // 940 split the six-button API row 4+3 to seat Haider Code — seven
-    // buttons do not fit one 100-col line) + blank + hints, then status.
+    // Bottom block: buttons(8, since U1 added the OpenCode Zen/Go row,
+    // G4a the Ollama/LM Studio row, G4b the Azure/Bedrock/Vertex row, 940
+    // split the six-button API row 4+3 to seat Haider Code, and 970 gave
+    // Google Antigravity a row of its own — eight buttons do not fit one
+    // 100-col line) + blank + hints, then status.
     assert!(
-        button_row >= rows.len() - 10,
+        button_row >= rows.len() - 11,
         "add row must sit at the bottom (row {button_row} of {})",
         rows.len()
     );

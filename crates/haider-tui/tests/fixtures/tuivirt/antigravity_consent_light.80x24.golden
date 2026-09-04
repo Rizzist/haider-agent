@@ -1,0 +1,49 @@
+# tuivirt golden · antigravity_consent_light · 80x24
+00|ACCOUNTS — auth is harness-owned · the ADE reads this list                      |
+   ~ Rgb(23, 23, 23)/Rgb(253, 253, 253)/BOLD×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×50; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×22
+01|                                                                                |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
+02|  no accounts yet — add one below, or /login <provider> api                     |
+   ~ Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×59; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×21
+03|                                                                                |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
+04|                                                                                |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
+05|                                                                                |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
+06|                                                                                |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
+07|◉ Google Antigravity — the sign-in is Google's, not Haider's                    |
+   ~ Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×2; Rgb(156, 78, 6)/Rgb(253, 253, 253)/NONE×58; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×20
+08|  Google's own official antigravity-acp agent performs the OAuth and keeps      |
+   ~ Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×75; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×5
+09|  the token — no Google credential ever enters Haider's vault.                  |
+   ~ Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×62; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×18
+10|  That agent is proprietary Google software, run under Google's terms           |
+   ~ Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×70; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×10
+11|  (antigravity.google/terms).                                                   |
+   ~ Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×29; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×51
+12|  · first run downloads ~316 MB (macOS arm64; ~682 MB on Linux x86_64)          |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×70; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×10
+13|  · ~885 MiB on disk once installed (~2.0 GB on Linux)                          |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×54; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×26
+14|  · ~225 MiB resident while running · about 15 s to cold start                  |
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×62; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×18
+15|  ⚠ terms warning                                                               |
+   ~ Rgb(156, 78, 6)/Rgb(253, 253, 253)/NONE×17; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×63
+16|    Google's published terms restrict third-party access to Gemini              |
+   ~ Rgb(156, 78, 6)/Rgb(253, 253, 253)/NONE×67; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×13
+17|    subscriptions/Antigravity; Google ships this ACP agent for editors and      |
+   ~ Rgb(156, 78, 6)/Rgb(253, 253, 253)/NONE×75; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×5
+18|    reportedly does not enforce the clause — use at your own risk.              |
+   ~ Rgb(156, 78, 6)/Rgb(253, 253, 253)/NONE×66; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×14
+19|  [1] install Google's agent and sign in · [2] cancel                           |
+   ~ Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×53; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×27
+20|                                                                                |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
+21|                                                                                |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
+22|click an account to make it active · + adds via OAuth / API · x removes · r reve|
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×80
+23| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                        |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×1; Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×2; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×4; Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×2; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×33; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×38

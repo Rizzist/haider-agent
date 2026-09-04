@@ -1860,3 +1860,236 @@ fn meter_routing_is_flavor_and_provider_strict() {
         );
     }
 }
+
+/// LAW (970 layer B): a LINKED Grok CLI row carries no stored tier — the
+/// Grok store has no such field and the access token is never decoded for
+/// one. The tier reaches the report through the existing live `grok-oauth`
+/// meter, with no code path specific to linked rows.
+///
+/// MUTATION CHECK: stop overwriting `plan` from the meter reading, or route
+/// a linked `grok-oauth` descriptor away from `UsageMeterEndpoint::GrokOauth`.
+/// Expected runtime failure: `SuperGrok` never arrives and the weekly window
+/// disappears.
+#[tokio::test]
+async fn linked_grok_source_row_reports_its_tier_from_the_live_meter() {
+    use haider_provider::UsageMeterEndpoint;
+    let body = br#"{
+        "subscriptionTier": "SuperGrok",
+        "config": {
+            "creditUsagePercent": 42.5,
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2026-07-03T04:01:09.238389+00:00",
+                "end": "2026-07-10T04:01:09.238389+00:00"
+            }
+        }
+    }"#
+    .to_vec();
+    let http = Arc::new(StubHttp::new([(
+        UsageMeterEndpoint::GrokOauth.url().to_owned(),
+        (200, body),
+    )]));
+
+    // Exactly the descriptor source reconciliation writes for a linked
+    // `~/.grok` root: OAuth, `grok-oauth`, an email identity, and NO plan.
+    let mut linked = descriptor("grok-oauth", "grok-2f8c1d0a4b6e", AuthMethod::OAuth);
+    linked.identity = "pilot@example.test".into();
+    linked.account_identity = Some(AccountIdentity {
+        email: Some("pilot@example.test".into()),
+        display_name: None,
+        account_id: Some("xai:user-linked".into()),
+        plan: None,
+        issuer: Some("https://auth.x.ai".into()),
+        captured_at: 1,
+        verified: false,
+    });
+    assert_eq!(meter_for(&linked), Some(UsageMeterEndpoint::GrokOauth));
+
+    let service = service_with_clock(
+        vec![linked],
+        Some(Arc::new(StubTokens {
+            bytes: b"linked-access-token".to_vec(),
+        })),
+        Arc::clone(&http) as Arc<dyn UsageMeterHttp>,
+        Arc::new(AtomicU64::new(1_777_075_200_000)),
+    );
+    let (_root, store) = empty_store().await;
+    let report = service.report(&store).await.expect("report");
+
+    assert_eq!(report.accounts.len(), 1);
+    assert_eq!(
+        report.accounts[0].plan.as_deref(),
+        Some("SuperGrok"),
+        "the tier renders from the meter reading, never from the store"
+    );
+    let AccountMeterStateV1::Metered { windows } = &report.accounts[0].meter else {
+        panic!("a linked Grok row is metered like any other grok-oauth account");
+    };
+    assert_eq!(windows[0].window, "weekly");
+    assert_eq!(http.calls(), 1);
+    assert_eq!(
+        http.requests()[0].0,
+        UsageMeterEndpoint::GrokOauth.url(),
+        "no linked-row-specific endpoint exists"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// v0.0.970: honest absence for the supervised Antigravity agent
+// ---------------------------------------------------------------------------
+
+/// Antigravity exposes NO structured quota over ACP (verified twice against
+/// the published v1 schema and the live 1.1.1 binary), so the account reports
+/// typed unavailability — never zero usage, never a synthesized reset, and
+/// never a probe to an endpoint that does not exist.
+///
+/// MUTATION CHECK: answer `AccountMeterStateV1::LocalOnly` for this provider.
+/// Expected runtime failure: the state assertion below, because `LocalOnly`
+/// asserts Haider's own counters are the truth for an agent that reports no
+/// tokens at all — which renders as zero usage.
+#[tokio::test]
+async fn a_supervised_agent_account_reports_unavailable_not_zero_usage() {
+    let http = Arc::new(StubHttp::new([]));
+    let service = service_with_clock(
+        vec![descriptor(
+            "google-antigravity",
+            "google-work",
+            AuthMethod::OAuth,
+        )],
+        None,
+        Arc::clone(&http) as Arc<dyn UsageMeterHttp>,
+        Arc::new(AtomicU64::new(1_000_000)),
+    );
+    let (_root, store) = empty_store().await;
+    let report = service.report(&store).await.expect("report");
+
+    let account = &report.accounts[0];
+    assert_eq!(
+        account.meter,
+        AccountMeterStateV1::Unavailable {
+            reason: "provider_exposes_no_quota".into()
+        }
+    );
+    assert!(
+        !matches!(account.meter, AccountMeterStateV1::Metered { .. }),
+        "absent data is never rendered as a metered window"
+    );
+    assert_eq!(
+        account.plan, None,
+        "no plan is claimed: the agent never reports one, and a model in the \
+         catalog is not evidence of Pro or Ultra"
+    );
+    assert_eq!(
+        http.calls(),
+        0,
+        "there is no quota endpoint to probe, so none is probed"
+    );
+    // The local fold contributes nothing, which is exactly why `LocalOnly`
+    // would have been a lie here.
+    assert_eq!(account.local.input_tokens, 0);
+    assert_eq!(account.local.output_tokens, 0);
+
+    // `meter_for` still declines the account: no HTTP meter exists for it.
+    assert!(
+        meter_for(&descriptor(
+            "google-antigravity",
+            "google-work",
+            AuthMethod::OAuth
+        ))
+        .is_none()
+    );
+}
+
+/// A provider-supplied retry instant IS published, exactly as given, and
+/// nothing else ever becomes a timestamp.
+///
+/// MUTATION CHECK: derive `resets_at_ms` from Google's documented five-hour
+/// cadence (`now + 5h`) instead of the descriptor's instant. Expected runtime
+/// failure: the exact-instant assertion, since the clock is 1_000_000 and the
+/// published window would move.
+#[tokio::test]
+async fn only_a_provider_supplied_retry_instant_becomes_a_published_window() {
+    let mut limited = descriptor("google-antigravity", "google-limited", AuthMethod::OAuth);
+    // A provider-supplied instant that is NOT any multiple of five hours or a
+    // week from the clock, so no cadence arithmetic could have produced it.
+    limited.status = CredentialStatus::Limited {
+        until_ms: 1_763_500_123_456,
+    };
+    let http = Arc::new(StubHttp::new([]));
+    let service = service_with_clock(
+        vec![limited],
+        None,
+        Arc::clone(&http) as Arc<dyn UsageMeterHttp>,
+        Arc::new(AtomicU64::new(1_000_000)),
+    );
+    let (_root, store) = empty_store().await;
+    let report = service.report(&store).await.expect("report");
+
+    let AccountMeterStateV1::Metered { windows } = &report.accounts[0].meter else {
+        panic!("a provider-supplied retry instant is publishable");
+    };
+    assert_eq!(
+        windows.len(),
+        1,
+        "exactly the one window the provider named"
+    );
+    assert_eq!(windows[0].window, "retry_after");
+    assert!(
+        (windows[0].utilization - 1.0).abs() < f64::EPSILON,
+        "a rate-limited account is fully consumed, which is what the upstream \
+         error said"
+    );
+    assert_eq!(windows[0].resets_at_ms, Some(1_763_500_123_456));
+    assert_eq!(windows[0].label, None);
+    assert_eq!(report.accounts[0].plan, None);
+    assert_eq!(http.calls(), 0);
+}
+
+/// Every durable credential failure keeps its OWN typed reason rather than
+/// collapsing into the no-quota reason: a revoked Google login is a different,
+/// more actionable state than "this protocol publishes no quota".
+///
+/// MUTATION CHECK: return the no-quota reason unconditionally from
+/// `agent_owned_meter_state`. Expected runtime failure: each of the four
+/// typed-reason assertions below.
+#[test]
+fn a_supervised_agent_keeps_the_typed_credential_reasons() {
+    use super::{ACP_AGENT_NO_QUOTA_REASON, agent_owned_meter, agent_owned_meter_state};
+
+    for (status, expected) in [
+        (CredentialStatus::Ok, ACP_AGENT_NO_QUOTA_REASON),
+        (CredentialStatus::Expired, "credential_expired"),
+        (CredentialStatus::Revoked, "credential_revoked"),
+        (
+            CredentialStatus::NeedsAttention {
+                reason: CredentialAttentionReason::SourceGone,
+            },
+            "credential_source_gone",
+        ),
+    ] {
+        assert_eq!(
+            agent_owned_meter_state(&status),
+            AccountMeterStateV1::Unavailable {
+                reason: expected.into()
+            },
+            "{status:?}"
+        );
+    }
+
+    // The lane is scoped to the supervised agent's OAuth accounts only.
+    assert!(agent_owned_meter(&descriptor(
+        "google-antigravity",
+        "google-work",
+        AuthMethod::OAuth
+    )));
+    assert!(!agent_owned_meter(&descriptor(
+        "gemini",
+        "gemini-key",
+        AuthMethod::ApiKey
+    )));
+    assert!(!agent_owned_meter(&descriptor(
+        "google-antigravity",
+        "impossible",
+        AuthMethod::ApiKey
+    )));
+}

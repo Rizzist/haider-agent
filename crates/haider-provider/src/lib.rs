@@ -10,6 +10,9 @@
 //! - [`FakeProvider`] is fixture-driven and deterministic — the same script
 //!   yields the same event sequence (`Delay` only adds wall time).
 
+pub mod acp;
+#[cfg(test)]
+mod acp_tests;
 mod anthropic;
 #[cfg(test)]
 mod anthropic_tests;
@@ -1116,6 +1119,10 @@ fn serialize_prepared_json_body_ref(prepared: &PreparedWire) -> Result<Vec<u8>, 
     Ok(writer.finish())
 }
 
+pub use acp::{
+    ACP_OAUTH_PERSONAL_METHOD_ID, AntigravityAcpProvider, AntigravitySessionConfig,
+    GOOGLE_ANTIGRAVITY_PROVIDER_NAME,
+};
 pub use anthropic::{
     ANTHROPIC_API_URL, ANTHROPIC_COMPUTER_BETA_20250124, ANTHROPIC_COMPUTER_BETA_20251124,
     ANTHROPIC_FAST_BETA_VALUE, ANTHROPIC_OAUTH_BASE_URL, ANTHROPIC_OAUTH_BETA_HEADER,
@@ -1196,7 +1203,7 @@ pub use webfetch::{
 /// Provider classes backed by production account credentials in this release.
 /// New named providers append to this stable roster; custom endpoint profiles
 /// remain a separate registry concern.
-pub const BUILTIN_PROVIDER_NAMES: [&str; 13] = [
+pub const BUILTIN_PROVIDER_NAMES: [&str; 14] = [
     ANTHROPIC_PROVIDER_NAME,
     ANTHROPIC_OAUTH_PROVIDER_NAME,
     OPENAI_PROVIDER_NAME,
@@ -1210,6 +1217,11 @@ pub const BUILTIN_PROVIDER_NAMES: [&str; 13] = [
     XAI_PROVIDER_NAME,
     GROK_OAUTH_PROVIDER_NAME,
     HAIDER_CODE_PROVIDER_NAME,
+    // v0.0.970: the supervised Google Antigravity agent. It is a SEPARATE
+    // class from the API-key `gemini` provider above and does not change it:
+    // Google owns the OAuth, and Haider speaks ACP to Google's own executable
+    // instead of a GenerateContent endpoint.
+    GOOGLE_ANTIGRAVITY_PROVIDER_NAME,
 ];
 
 /// Provider-catalog declaration for PDF shaping. Every Anthropic Messages
@@ -1260,6 +1272,7 @@ pub fn pdf_document_capability(provider: &str) -> FeatureResolve {
 /// | `grok-oauth` | `Native` | `openai.rs` `grok_capabilities_from_model` |
 /// | `kimi-oauth` | per-model, else UNDECLARED | `openai.rs` `kimi_capabilities_from_model` |
 /// | `deepseek` | `Unsupported` | text-only catalog (`DEEPSEEK_SEED_MODELS`) |
+/// | `google-antigravity` | `Unsupported` | `acp/antigravity.rs` `prompt_blocks` sends text only |
 /// | `openai-compatible`, `haider-code`, `xai`, custom profiles | UNDECLARED | `openai.rs` `compatible_capabilities` |
 ///
 /// WHY THE LAST ROW IS UNDECLARED RATHER THAN `Unsupported`. Those families
@@ -1296,7 +1309,15 @@ pub fn vision_capability(provider: &str, model_declares: Option<bool>) -> Option
     ) {
         return Some(FeatureResolve::Native);
     }
-    if provider == DEEPSEEK_PROVIDER_NAME {
+    // `deepseek` is a fixed, first-party, genuinely text-only seed catalog.
+    // `google-antigravity` is declared here for a DIFFERENT but equally
+    // definite reason: its ACP turn builder sends text content blocks only, so
+    // an image would be dropped on the way out rather than refused. Leaving it
+    // undeclared would let the composer accept a paste that can never arrive.
+    if matches!(
+        provider,
+        DEEPSEEK_PROVIDER_NAME | GOOGLE_ANTIGRAVITY_PROVIDER_NAME
+    ) {
         return Some(FeatureResolve::Unsupported);
     }
     None
@@ -3719,10 +3740,52 @@ mod e2_contract_tests {
 
     #[test]
     fn builtin_provider_roster_includes_both_xai_lanes() {
-        assert_eq!(BUILTIN_PROVIDER_NAMES.len(), 13);
+        // 13 pre-v0.0.970 classes + 1 supervised-agent class = 14.
+        assert_eq!(BUILTIN_PROVIDER_NAMES.len(), 14);
         assert!(BUILTIN_PROVIDER_NAMES.contains(&XAI_PROVIDER_NAME));
         assert!(BUILTIN_PROVIDER_NAMES.contains(&GROK_OAUTH_PROVIDER_NAME));
         assert!(BUILTIN_PROVIDER_NAMES.contains(&HAIDER_CODE_PROVIDER_NAME));
+    }
+
+    /// The Antigravity class is admitted WITHOUT disturbing the roster it
+    /// joined: the API-key `gemini` class keeps its own separate entry, and
+    /// every pre-v0.0.970 name keeps its exact position, so a caller that
+    /// indexes the roster reads the same provider it always did.
+    ///
+    /// MUTATION CHECK: replace `GEMINI_PROVIDER_NAME` in the roster with
+    /// `GOOGLE_ANTIGRAVITY_PROVIDER_NAME` instead of appending. Expected
+    /// runtime failure: the prefix assertion below rejects the reordering and
+    /// the `gemini` membership assertion fails.
+    #[test]
+    fn builtin_provider_roster_appends_google_antigravity_without_moving_a_name() {
+        assert_eq!(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, "google-antigravity");
+        assert!(BUILTIN_PROVIDER_NAMES.contains(&GOOGLE_ANTIGRAVITY_PROVIDER_NAME));
+        assert!(BUILTIN_PROVIDER_NAMES.contains(&GEMINI_PROVIDER_NAME));
+        assert_ne!(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, GEMINI_PROVIDER_NAME);
+        assert_eq!(
+            &BUILTIN_PROVIDER_NAMES[..13],
+            [
+                ANTHROPIC_PROVIDER_NAME,
+                ANTHROPIC_OAUTH_PROVIDER_NAME,
+                OPENAI_PROVIDER_NAME,
+                OPENAI_OAUTH_PROVIDER_NAME,
+                OPENAI_COMPATIBLE_PROVIDER_NAME,
+                KIMI_OAUTH_PROVIDER_NAME,
+                GEMINI_PROVIDER_NAME,
+                BEDROCK_PROVIDER_NAME,
+                VERTEX_PROVIDER_NAME,
+                DEEPSEEK_PROVIDER_NAME,
+                XAI_PROVIDER_NAME,
+                GROK_OAUTH_PROVIDER_NAME,
+                HAIDER_CODE_PROVIDER_NAME,
+            ],
+            "the roster is append-only"
+        );
+        assert_eq!(BUILTIN_PROVIDER_NAMES[13], GOOGLE_ANTIGRAVITY_PROVIDER_NAME);
+        // Every name is distinct: an accidental duplicate would silently give
+        // one class two roster slots.
+        let unique: std::collections::BTreeSet<&str> = BUILTIN_PROVIDER_NAMES.into_iter().collect();
+        assert_eq!(unique.len(), BUILTIN_PROVIDER_NAMES.len());
     }
 
     #[test]

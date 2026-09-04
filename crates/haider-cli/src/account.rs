@@ -250,7 +250,14 @@ pub(crate) fn parse_account_command(rest: &[String]) -> Result<AccountCommand, S
                 && subcommand == "add"
                 && matches!(
                     kind.as_str(),
-                    "codex" | "codex_home" | "claude" | "claude_file"
+                    "codex"
+                        | "codex_home"
+                        | "claude"
+                        | "claude_file"
+                        | "grok"
+                        | "grok_home"
+                        | "kimi"
+                        | "kimi_code_home"
                 )
                 && !root.is_empty() =>
         {
@@ -265,7 +272,14 @@ pub(crate) fn parse_account_command(rest: &[String]) -> Result<AccountCommand, S
                 && subcommand == "add"
                 && matches!(
                     kind.as_str(),
-                    "codex" | "codex_home" | "claude" | "claude_file"
+                    "codex"
+                        | "codex_home"
+                        | "claude"
+                        | "claude_file"
+                        | "grok"
+                        | "grok_home"
+                        | "kimi"
+                        | "kimi_code_home"
                 )
                 && !root.is_empty()
                 && label_flag == "--label"
@@ -369,7 +383,7 @@ pub(crate) fn parse_account_command(rest: &[String]) -> Result<AccountCommand, S
 }
 
 fn account_usage() -> String {
-    "expected list [--json], use <alias> [--confirm], source list [--json], source add <codex|claude_file> <root> [--label <label>], source remove <source-id>, source scan [--json], import <codex|claude-code> [--confirm], refresh <alias>, remove <alias> --confirm, add <alias> --base-url <url> [--api-key <key> | --api-key-env <VAR> | --api-key-stdin | --no-auth] [--api-family openai|anthropic] [--response-open-timeout <duration>] [--chunk-idle-timeout <duration>] [--semantic-progress-timeout <duration>] [--lockdown|--full] [--json], probe <alias> [--json], or update <alias> [mutable options] [--json]".into()
+    "expected list [--json], use <alias> [--confirm], source list [--json], source add <codex|claude_file|grok|kimi_code_home> <root> [--label <label>], source remove <source-id>, source scan [--json], import <codex|claude-code> [--confirm], refresh <alias>, remove <alias> --confirm, add <alias> --base-url <url> [--api-key <key> | --api-key-env <VAR> | --api-key-stdin | --no-auth] [--api-family openai|anthropic] [--response-open-timeout <duration>] [--chunk-idle-timeout <duration>] [--semantic-progress-timeout <duration>] [--lockdown|--full] [--json], probe <alias> [--json], or update <alias> [mutable options] [--json]".into()
 }
 
 fn parse_custom_options(
