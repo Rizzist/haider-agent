@@ -79,11 +79,18 @@ async fn anthropic_request_has_locked_correlation_headers_without_body_mutation(
         correlated.headers()[crate::HAIDER_REQUEST_KIND_HEADER],
         "primary"
     );
-    assert_eq!(
-        baseline.body().unwrap().as_bytes(),
-        correlated.body().unwrap().as_bytes()
-    );
-    let expected_body = correlated.body().unwrap().as_bytes().unwrap().to_vec();
+    let baseline_body = baseline
+        .body()
+        .expect("baseline request body")
+        .as_bytes()
+        .expect("baseline request byte body");
+    let correlated_body = correlated
+        .body()
+        .expect("correlated request body")
+        .as_bytes()
+        .expect("correlated request byte body");
+    assert_eq!(baseline_body, correlated_body);
+    let expected_body = correlated_body.to_vec();
     let ledger = crate::capture_in_fake_proxy_ledger(correlated).await;
     assert_eq!(
         ledger.headers.get("x-haider-turn").map(String::as_str),

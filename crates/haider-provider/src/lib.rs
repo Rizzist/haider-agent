@@ -3251,6 +3251,7 @@ pub(crate) struct FakeProxyLedgerRow {
 /// returns the proxy's wire ledger row. Only the destination URL is replaced;
 /// the adapter-authored method, headers, and body are sent unchanged.
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 pub(crate) async fn capture_in_fake_proxy_ledger(
     mut request: reqwest::Request,
 ) -> FakeProxyLedgerRow {

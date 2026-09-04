@@ -73,7 +73,9 @@ fn daemon_compactor_fuses_provider_view_and_cache_attempt_publication() {
         .find("let replay_cache_diagnostic")
         .expect("cache diagnostic");
     let fused = compact_body
-        .find("self.record_request_attempt(run_id, 1, pending_provider_view")
+        .find(
+            "self.record_request_attempt(\n            run_id,\n            &replay_correlation,\n            pending_provider_view",
+        )
         .expect("fused request-attempt publication");
     let provider_open = compact_body
         .find("self.provider.stream_prepared_turn(request, prepared)")

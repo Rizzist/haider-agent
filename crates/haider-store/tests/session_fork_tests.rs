@@ -180,7 +180,7 @@ fn append_provider_operation(store: &Store, session_id: &SessionId) -> RunId {
         causation_id: None,
         correlation_id: None,
         committed_at_ms: 0,
-        render: hidden.clone(),
+        render: hidden,
         payload,
     };
     let mut envelopes = [

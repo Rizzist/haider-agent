@@ -2325,7 +2325,7 @@ mod composite_recovery_tests {
         let encoded = rmp_serde::to_vec(&reduction).expect("encode composite checkpoint");
         let recovered: RunReduction =
             rmp_serde::from_slice(&encoded).expect("decode composite checkpoint");
-        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v7");
+        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v8");
         assert_eq!(
             recovered
                 .workflow_deferral

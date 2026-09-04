@@ -282,9 +282,11 @@ mod web_search_tests {
         }
     }
 
+    type PostedRequest = (String, Vec<u8>, serde_json::Value, ProviderRequestAttemptV1);
+
     #[derive(Default)]
     struct StubHttp {
-        posts: Mutex<Vec<(String, Vec<u8>, serde_json::Value, ProviderRequestAttemptV1)>>,
+        posts: Mutex<Vec<PostedRequest>>,
         reply: Mutex<Option<(u16, Vec<u8>)>>,
     }
 
@@ -296,7 +298,7 @@ mod web_search_tests {
             })
         }
 
-        fn posts(&self) -> Vec<(String, Vec<u8>, serde_json::Value, ProviderRequestAttemptV1)> {
+        fn posts(&self) -> Vec<PostedRequest> {
             self.posts
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
