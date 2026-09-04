@@ -49,6 +49,9 @@ mod worker_tool_catalog_tests;
 #[cfg(test)]
 #[path = "worker_turn_setup_reduction_tests.rs"]
 mod worker_turn_setup_reduction_tests;
+#[cfg(test)]
+#[path = "worker_live_window_tests.rs"]
+mod worker_live_window_tests;
 
 use crate::delegation::{DelegationHandle, MessageCoordinates, SpawnCoordinates};
 use crate::diagnostics::{EffectBreadcrumb, EffectDiagnostics};
@@ -5584,21 +5587,27 @@ async fn durable_user_message_seqs(store: &HubStoreHandle) -> Result<HashSet<u64
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
         for envelope in page {
             if let Ok(payload) = envelope.payload.decode_event() {
-                match payload {
-                    EventPayload::UserMessage { .. } => {
-                        sequences.insert(envelope.seq);
-                    }
-                    // Mid-turn delivery dedupe belongs only to the current
-                    // live turn. An Idle fact proves every earlier user
-                    // message is already part of durable prompt history; a
-                    // daemon restart must not rebuild a transcript-age set.
-                    EventPayload::SessionState(haider_protocol::state::SessionState::Idle {
-                        ..
-                    }) => sequences.clear(),
-                    _ => {}
-                }
+                fold_live_turn_nudge_seq(&mut sequences, envelope.seq, &payload);
             }
         }
+    }
+}
+
+/// Folds one journal fact into the live turn's mid-turn delivery dedupe set.
+///
+/// Mid-turn delivery dedupe belongs only to the turn that is live now. An
+/// Idle fact proves every earlier user message is already part of durable
+/// prompt history, so a rebuild after a restart must resume from that
+/// boundary instead of reconstructing a set that follows transcript age.
+fn fold_live_turn_nudge_seq(sequences: &mut HashSet<u64>, seq: u64, payload: &EventPayload) {
+    match payload {
+        EventPayload::UserMessage { .. } => {
+            sequences.insert(seq);
+        }
+        EventPayload::SessionState(haider_protocol::state::SessionState::Idle { .. }) => {
+            sequences.clear();
+        }
+        _ => {}
     }
 }
 

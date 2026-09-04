@@ -435,7 +435,9 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
         }
         if args.fleet_sessions == 1:
             required.update({f"turn_{middle_turn}", f"turn_{args.turns}"})
-        if args.attached_settle_seconds > 0:
+        # A fleet run drives its sessions back to back, so the driver skips
+        # the attached checkpoint that belongs to one long-lived client.
+        if args.attached_settle_seconds > 0 and args.fleet_sessions == 1:
             required.add("attached_settled")
         missing = required.difference(samples)
         if missing:
@@ -499,7 +501,7 @@ def run_once(args: argparse.Namespace, attempt: int) -> dict[str, Any]:
             "settled_bytes_per_turn": (
                 post["footprint_bytes"] - idle["footprint_bytes"]
             )
-            / args.turns,
+            / (args.turns * args.fleet_sessions),
         }
 
 

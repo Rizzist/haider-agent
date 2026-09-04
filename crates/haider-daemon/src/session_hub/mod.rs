@@ -2306,6 +2306,14 @@ impl SessionHub {
                     .count(),
             )
         };
+        let budget_runs = self
+            .inner
+            .run_budget_coordinators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .filter(|(candidate, _)| candidate == session_id)
+            .count();
         let delivered_nudges = self
             .inner
             .delivered_nudges
@@ -2331,6 +2339,7 @@ impl SessionHub {
                 "resident_terminal_turns": resident_terminal_turns,
                 "scheduled_idle_releases": scheduled_idle_releases,
                 "delivered_nudges": delivered_nudges,
+                "budget_runs": budget_runs,
                 "attachments": attachments,
             })
         );
@@ -2356,6 +2365,7 @@ impl SessionHub {
         // exact-head helper above accounts Ready bytes; this unconditional
         // removal covers both Ready-at-a-different-head and Building.
         self.inner.observe_digests.remove(session_id);
+        let dead_budget_runs = self.sweep_dead_run_budget_coordinators(session_id);
         if let Err(error) = self.inner.store.release_memory().await {
             tracing::debug!(
                 session_id = %session_id,
@@ -2372,10 +2382,29 @@ impl SessionHub {
             prompt_bytes,
             turn_setup_entries,
             observe_bytes,
+            dead_budget_runs,
             allocator_bytes,
             phase,
             "released all journal-reconstructible session state"
         );
+    }
+
+    /// Drops this session's expired run-budget coordinator slots.
+    ///
+    /// The map holds `Weak` handles and reclaims one only when a later lookup
+    /// misses on that exact key, which never happens for a finished run: a
+    /// long session would otherwise carry one dead `(session, run)` key per
+    /// turn. Live runs still hold a strong count and are kept.
+    fn sweep_dead_run_budget_coordinators(&self, session_id: &SessionId) -> usize {
+        let mut coordinators = self
+            .inner
+            .run_budget_coordinators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = coordinators.len();
+        coordinators
+            .retain(|(candidate, _), weak| candidate != session_id || weak.strong_count() > 0);
+        before.saturating_sub(coordinators.len())
     }
 
     async fn release_compacted_session_state(&self, session_id: &SessionId, head_seq: u64) {

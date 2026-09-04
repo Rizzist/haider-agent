@@ -31,6 +31,50 @@ use haider_store::{
     SessionCreateCommand, ShellExecAcceptCommand, ShellExecAcceptOutcome, TurnAcceptCommand,
 };
 
+/// MUTATION CHECK: drop the `candidate != session_id` half of the retain
+/// predicate and the sweep evicts a neighbouring session's slots; drop the
+/// `strong_count` half and it evicts the live run's own coordinator, which
+/// `--max-cost` needs for the next provider request.
+#[tokio::test]
+async fn the_release_boundary_sweeps_only_this_sessions_finished_budget_runs() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store, SessionHubConfig::default()).expect("hub");
+    let session_id = SessionId::new("budget-sweep");
+    let neighbour = SessionId::new("budget-sweep-neighbour");
+    {
+        let mut coordinators = hub
+            .inner
+            .run_budget_coordinators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for turn in 0..40_u64 {
+            coordinators.insert(
+                (session_id.clone(), RunId::new(format!("run-{turn}"))),
+                std::sync::Weak::new(),
+            );
+        }
+        coordinators.insert(
+            (neighbour.clone(), RunId::new("neighbour-run")),
+            std::sync::Weak::new(),
+        );
+        assert_eq!(coordinators.len(), 41);
+    }
+
+    assert_eq!(hub.sweep_dead_run_budget_coordinators(&session_id), 40);
+
+    let coordinators = hub
+        .inner
+        .run_budget_coordinators
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(
+        coordinators.keys().collect::<Vec<_>>(),
+        vec![&(neighbour, RunId::new("neighbour-run"))],
+        "a finished run leaves no slot behind, and no neighbour is touched"
+    );
+}
+
 /// MUTATION CHECK: removing or moving the equality makes a continuously hot
 /// session retain a 51st turn, or release one turn before the documented
 /// live-window bound.

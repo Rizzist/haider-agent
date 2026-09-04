@@ -292,6 +292,7 @@ impl TranscriptProjector {
                 .map_or(envelope.seq, |seq| seq.max(envelope.seq)),
         );
         self.note_item_run(envelope);
+        self.forget_terminal_item_run(envelope);
         let _ = self.joiner.observe(envelope);
     }
 
@@ -306,6 +307,18 @@ impl TranscriptProjector {
             && let Some(run_id) = envelope.run_id.as_ref()
         {
             self.item_runs.insert(run_id.as_str().to_owned());
+        }
+    }
+
+    /// Releases a finished run's item identity. Only an `AssistantCommit`
+    /// node consults this set, and a terminal run commits no further
+    /// assistant nodes, so the retained set tracks the runs still live in
+    /// the window instead of every run this journal has ever carried.
+    fn forget_terminal_item_run(&mut self, envelope: &RawEnvelope) {
+        if is_terminal_run_state(envelope)
+            && let Some(run_id) = envelope.run_id.as_ref()
+        {
+            self.item_runs.remove(run_id.as_str());
         }
     }
 
@@ -339,11 +352,6 @@ impl TranscriptProjector {
         if is_compaction_node(envelope)
             && let Some(run_key) = run_key.as_ref()
         {
-            // Everything before this node is already durable in the sidecar.
-            // Compatibility classification for later rows must be learned
-            // from the live post-compaction suffix, not from every item run
-            // the daemon has observed since this session was opened.
-            self.item_runs.clear();
             self.compacting_runs
                 .entry(run_key.clone())
                 .or_insert(PendingCompaction {
@@ -419,11 +427,8 @@ impl TranscriptProjector {
             self.settle_waiting_assistants(run_key);
             self.open_reasoning.remove(run_key);
             self.pending_reasoning.remove(run_key);
+            self.forget_terminal_item_run(envelope);
             if self.compacting_runs.remove(run_key).is_some() {
-                // The boundary seals every compatibility decision made for
-                // this compaction run. Retaining its item identity would make
-                // the projector's heap follow the number of prior epochs.
-                self.item_runs.clear();
                 self.buffered.push_back(BufferedRow {
                     row: SidecarRow(SidecarRowKind::CompactionBoundary(CompactionBoundaryRow {
                         kind: "compaction_boundary",
@@ -2286,14 +2291,11 @@ mod tests {
     #[test]
     fn compaction_boundary_appears_only_when_the_turn_settles() {
         let mut projector = TranscriptProjector::default();
-        projector.prewarm(&reasoning_started(0, "old-run", "old-item"));
-        assert_eq!(projector.retained_item_run_count(), 1);
         assert!(
             projector
                 .push(&compaction(1, "compact-run", "one"))
                 .is_empty()
         );
-        assert_eq!(projector.retained_item_run_count(), 0);
         assert!(
             projector
                 .push(&run_state(2, "compact-run", RunState::Thinking))
@@ -2308,6 +2310,54 @@ mod tests {
             rows[0].pipe_body_line(),
             "C  3 1700000000003 |compaction boundary|"
         );
+    }
+
+    /// MUTATION CHECK: drop `forget_terminal_item_run` from `prewarm` and a
+    /// boot rebuild retains one item-run key per run in the whole journal,
+    /// so the projector's retained set follows transcript age.
+    #[test]
+    fn a_terminal_run_releases_its_item_identity_on_prewarm() {
+        let mut projector = TranscriptProjector::default();
+        for run in 0..8_u64 {
+            projector.prewarm(&reasoning_started(run * 2, &format!("run-{run}"), "item"));
+            assert_eq!(projector.retained_item_run_count(), 1);
+            projector.prewarm(&run_state(run * 2 + 1, &format!("run-{run}"), RunState::Done));
+            assert_eq!(projector.retained_item_run_count(), 0);
+        }
+    }
+
+    /// MUTATION CHECK: clear the whole set at a compaction node or at the
+    /// compaction boundary instead of evicting the terminal run, and the
+    /// still-live compacting run loses its item identity: its next
+    /// `assistant_commit` is projected uncompat and an item-canonical client
+    /// renders the summary twice.
+    #[test]
+    fn a_live_run_keeps_its_item_identity_across_a_compaction_node() {
+        let mut projector = TranscriptProjector::default();
+        assert!(
+            projector
+                .push(&reasoning_started(1, "compact-run", "item"))
+                .is_empty()
+        );
+        assert!(
+            projector
+                .push(&compaction(2, "compact-run", "one"))
+                .is_empty()
+        );
+        assert_eq!(projector.retained_item_run_count(), 1);
+        assert!(
+            projector
+                .push(&assistant(3, "compact-run", "summary"))
+                .is_empty()
+        );
+        let rows = projector.push(&run_state(4, "compact-run", RunState::Done));
+        let commit = rows
+            .iter()
+            .map(|row| serde_json::to_value(row).expect("row serializes"))
+            .find(|row| row["role"] == "assistant")
+            .expect("the post-compaction assistant commit projects");
+        assert_eq!(commit["compat"], true);
+        assert_eq!(projector.retained_item_run_count(), 0);
     }
 
     /// MUTATION CHECK: let a settled compacting run bypass an earlier open
