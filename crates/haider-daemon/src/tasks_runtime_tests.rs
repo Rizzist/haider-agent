@@ -289,7 +289,7 @@ async fn process_effect_phases(
     read_all(store, session_id)
         .await
         .into_iter()
-        .filter_map(|envelope| serde_json::from_value::<EventPayload>(envelope.payload).ok())
+        .filter_map(|envelope| envelope.payload.decode_event().ok())
         .filter_map(|payload| match payload {
             EventPayload::Effect(phase) => Some(phase),
             _ => None,

@@ -1,0 +1,20 @@
+error[E0308]: mismatched types
+    --> crates/haider-daemon/src/tasks_runtime_tests.rs:292:71
+     |
+ 292 |         .filter_map(|envelope| serde_json::from_value::<EventPayload>(envelope.payload).ok())
+     |                                -------------------------------------- ^^^^^^^^^^^^^^^^ expected `Value`, found `RawPayload`
+     |                                |
+     |                                arguments to this function are incorrect
+     |
+note: function defined here
+    --> /Users/rizzist/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/src/value/mod.rs:1037:8
+     |
+1037 | pub fn from_value<T>(value: Value) -> Result<T, Error>
+     |        ^^^^^^^^^^
+help: call `Into::into` on this expression to convert `RawPayload` into `serde_json::Value`
+     |
+ 292 |         .filter_map(|envelope| serde_json::from_value::<EventPayload>(envelope.payload.into()).ok())
+     |                                                                                       +++++++
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `haider-daemon` (lib test) due to 1 previous error
