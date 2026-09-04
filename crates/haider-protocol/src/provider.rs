@@ -3,8 +3,9 @@
 //! envelopes; capability documents make degradation explicit, never silent.
 
 use crate::ids::{AgentId, CredentialAlias, RunId};
+use crate::reply::ReplyText;
 use crate::tool::{AttachmentBlock, ImageBlockRef};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Stable durable-extension kind used for provider-native continuation state.
 pub const PROVIDER_OPAQUE_EXTENSION_KIND: &str = "provider_opaque";
@@ -13,6 +14,176 @@ pub const PROVIDER_OPAQUE_EXTENSION_KIND: &str = "provider_opaque";
 /// turn's citations/grounding produced (W-B). Display-only: provider replay
 /// rides the provider-opaque channel, never this item.
 pub const WEB_SOURCES_EXTENSION_KIND: &str = "web_sources_v1";
+
+/// Provider-native JSON which may borrow one large text scalar from the
+/// canonical reply arena.
+///
+/// The template contains a unique string marker at the provider field that
+/// owns the text. Provider request and journal writers replace that marker
+/// while streaming, so signed/native continuation state never needs a second
+/// reply-sized `String`. Plain opaque objects continue to use `Json`-equivalent
+/// construction through [`From<serde_json::Value>`].
+#[derive(Clone, Debug)]
+pub struct ProviderOpaqueData {
+    template: serde_json::Value,
+    reply: Option<ProviderOpaqueReply>,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderOpaqueReply {
+    marker: String,
+    text: ReplyText,
+}
+
+impl ProviderOpaqueData {
+    #[must_use]
+    pub fn from_json(value: serde_json::Value) -> Self {
+        Self {
+            template: value,
+            reply: None,
+        }
+    }
+
+    /// Binds the one occurrence of `marker` in `template` to `text`.
+    #[must_use]
+    pub fn with_reply(
+        template: serde_json::Value,
+        marker: impl Into<String>,
+        text: ReplyText,
+    ) -> Option<Self> {
+        let marker = marker.into();
+        (count_string_marker(&template, &marker) == 1).then_some(Self {
+            template,
+            reply: Some(ProviderOpaqueReply { marker, text }),
+        })
+    }
+
+    #[must_use]
+    pub fn template(&self) -> &serde_json::Value {
+        &self.template
+    }
+
+    #[must_use]
+    pub fn reply_binding(&self) -> Option<(&str, &ReplyText)> {
+        self.reply
+            .as_ref()
+            .map(|reply| (reply.marker.as_str(), &reply.text))
+    }
+
+    #[must_use]
+    pub fn reply_text(&self) -> Option<&ReplyText> {
+        self.reply.as_ref().map(|reply| &reply.text)
+    }
+
+    #[must_use]
+    pub fn is_object(&self) -> bool {
+        self.template.is_object()
+    }
+
+    #[must_use]
+    pub fn as_object(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.template.as_object()
+    }
+
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&serde_json::Value> {
+        self.template.get(key)
+    }
+
+    /// Compatibility materialization for APIs that explicitly require a JSON
+    /// DOM. Hot journal/provider paths use the template and range directly.
+    #[must_use]
+    pub fn to_json_value(&self) -> serde_json::Value {
+        let mut value = self.template.clone();
+        if let Some(reply) = &self.reply {
+            replace_string_marker(
+                &mut value,
+                &reply.marker,
+                serde_json::Value::String(reply.text.to_owned_string()),
+            );
+        }
+        value
+    }
+}
+
+impl From<serde_json::Value> for ProviderOpaqueData {
+    fn from(value: serde_json::Value) -> Self {
+        Self::from_json(value)
+    }
+}
+
+impl PartialEq for ProviderOpaqueData {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_json_value() == other.to_json_value()
+    }
+}
+
+impl PartialEq<serde_json::Value> for ProviderOpaqueData {
+    fn eq(&self, other: &serde_json::Value) -> bool {
+        self.to_json_value() == *other
+    }
+}
+
+impl std::ops::Index<&str> for ProviderOpaqueData {
+    type Output = serde_json::Value;
+
+    fn index(&self, key: &str) -> &Self::Output {
+        &self.template[key]
+    }
+}
+
+impl Serialize for ProviderOpaqueData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.to_json_value().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderOpaqueData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        serde_json::Value::deserialize(deserializer).map(Self::from_json)
+    }
+}
+
+fn count_string_marker(value: &serde_json::Value, marker: &str) -> usize {
+    match value {
+        serde_json::Value::String(text) => usize::from(text == marker),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| count_string_marker(value, marker))
+            .sum(),
+        serde_json::Value::Object(fields) => fields
+            .values()
+            .map(|value| count_string_marker(value, marker))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn replace_string_marker(
+    value: &mut serde_json::Value,
+    marker: &str,
+    replacement: serde_json::Value,
+) -> bool {
+    match value {
+        serde_json::Value::String(text) if text == marker => {
+            *value = replacement;
+            true
+        }
+        serde_json::Value::Array(values) => values
+            .iter_mut()
+            .any(|value| replace_string_marker(value, marker, replacement.clone())),
+        serde_json::Value::Object(fields) => fields
+            .values_mut()
+            .any(|value| replace_string_marker(value, marker, replacement.clone())),
+        _ => false,
+    }
+}
 
 /// One cited/grounded web source surfaced by a provider-executed web tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,7 +198,7 @@ pub struct WebSource {
 #[serde(tag = "block", rename_all = "snake_case")]
 pub enum Block {
     Text {
-        text: String,
+        text: ReplyText,
     },
     Reasoning {
         summary: String,
@@ -51,7 +222,7 @@ pub enum Block {
     /// an Anthropic session continues losslessly on Anthropic (§4).
     ProviderOpaque {
         provider: String,
-        data: serde_json::Value,
+        data: ProviderOpaqueData,
     },
 }
 
@@ -68,10 +239,10 @@ pub enum StreamEvent {
     /// treating this as content or permitting a replay.
     NetworkRestored,
     TextDelta {
-        text: String,
+        text: ReplyText,
     },
     ReasoningDelta {
-        text: String,
+        text: ReplyText,
     },
     /// Provider refusal content remains semantically distinct from assistant
     /// text. Consumers may display it, but must not replay it as an answer.
@@ -81,7 +252,7 @@ pub enum StreamEvent {
     /// Provider-native continuation state for lossless, same-family replay.
     ProviderOpaque {
         provider: String,
-        data: serde_json::Value,
+        data: ProviderOpaqueData,
     },
     ToolCallStart {
         call_id: String,

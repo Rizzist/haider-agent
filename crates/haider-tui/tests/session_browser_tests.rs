@@ -111,7 +111,7 @@ fn live_envelope(id: &SessionId, committed_at_ms: u64) -> RawEnvelope {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::json!({"type": "browser_activity_probe"}),
+        payload: serde_json::json!({"type": "browser_activity_probe"}).into(),
     }
 }
 

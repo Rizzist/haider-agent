@@ -862,7 +862,7 @@ fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
                 .decode(&output_tail_b64)
                 .unwrap_or_default();
             let agent_line_starts = match &item {
-                TurnItem::AgentMessage { text } => crate::projection::index_agent_text(text),
+                TurnItem::AgentMessage { text } => crate::projection::index_agent_reply(text),
                 _ => Vec::new(),
             };
             TranscriptEntry::Item(ItemBlock {

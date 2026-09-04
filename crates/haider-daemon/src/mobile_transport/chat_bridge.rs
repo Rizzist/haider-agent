@@ -937,7 +937,7 @@ fn response_map(
 
 #[derive(Default)]
 struct TurnProjection {
-    item_text: HashMap<String, String>,
+    item_text: HashMap<String, haider_protocol::reply::ReplyText>,
     tools: HashMap<String, ToolProjection>,
     failure: Option<MobileChatError>,
     terminal: Option<RunState>,
@@ -958,7 +958,7 @@ impl TurnProjection {
         envelope: RawEnvelope,
         responder: &ChatResponder,
     ) -> Result<bool, MobileChatError> {
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+        let Ok(payload) = envelope.payload.decode_event() else {
             return Ok(false);
         };
         match payload {
@@ -1039,19 +1039,19 @@ impl TurnProjection {
                 let key = item_id.as_str().to_owned();
                 match delta {
                     ItemDelta::Text { text } => {
-                        self.item_text.entry(key).or_default().push_str(&text);
+                        self.note_item_delta(key, &text);
                         responder
                             .send(ChatEvent::Delta {
-                                text,
+                                text: text.to_owned_string(),
                                 segment: "answer",
                             })
                             .await
                     }
                     ItemDelta::Reasoning { text } => {
-                        self.item_text.entry(key).or_default().push_str(&text);
+                        self.note_item_delta(key, &text);
                         responder
                             .send(ChatEvent::Delta {
-                                text,
+                                text: text.to_owned_string(),
                                 segment: "thinking",
                             })
                             .await
@@ -1159,7 +1159,7 @@ impl TurnProjection {
                     .await
             }
             TurnItem::Refusal { reason } => {
-                self.send_unseen_text(item_id, reason, "answer", responder)
+                self.send_unseen_text(item_id, reason.into(), "answer", responder)
                     .await
             }
             _ => Ok(()),
@@ -1169,16 +1169,19 @@ impl TurnProjection {
     async fn send_unseen_text(
         &mut self,
         item_id: &str,
-        complete: String,
+        complete: haider_protocol::reply::ReplyText,
         segment: &'static str,
         responder: &ChatResponder,
     ) -> Result<(), MobileChatError> {
-        let seen = self.item_text.entry(item_id.to_owned()).or_default();
+        let seen = self.item_text.get(item_id);
+        let offset = seen
+            .filter(|seen| seen.is_prefix_of(&complete))
+            .map_or(0, |seen| seen.len());
         let delta = complete
-            .strip_prefix(seen.as_str())
-            .unwrap_or(complete.as_str())
-            .to_owned();
-        *seen = complete;
+            .slice(offset..complete.len())
+            .unwrap_or_else(|| complete.clone())
+            .to_owned_string();
+        self.item_text.insert(item_id.to_owned(), complete);
         if delta.is_empty() {
             Ok(())
         } else {
@@ -1189,6 +1192,21 @@ impl TurnProjection {
                 })
                 .await
         }
+    }
+
+    fn note_item_delta(&mut self, item_id: String, delta: &haider_protocol::reply::ReplyText) {
+        let Some(previous) = self.item_text.remove(&item_id) else {
+            self.item_text.insert(item_id, delta.clone());
+            return;
+        };
+        if let Some(joined) = previous.try_join(delta) {
+            self.item_text.insert(item_id, joined);
+            return;
+        }
+        let mut writer = haider_protocol::reply::ReplyArenaWriter::new();
+        let _ = writer.append_shared(&previous);
+        let _ = writer.append_shared(delta);
+        self.item_text.insert(item_id, writer.seal());
     }
 
     fn terminal_result(&mut self) -> Result<(), MobileChatError> {

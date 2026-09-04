@@ -86,7 +86,8 @@ fn mark_running(store: &Store, session_id: &SessionId, run_id: &RunId, suffix: &
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(EventPayload::RunState(RunState::Thinking))
-            .expect("thinking payload"),
+            .expect("thinking payload")
+            .into(),
     }];
     store
         .append_worker(&mut envelopes)
@@ -243,7 +244,7 @@ fn promote_preserves_text_as_one_durable_steer_and_cannot_double_deliver() {
     let delivery = &promoted.envelopes[1];
     assert!(!delivery.render.ui);
     assert!(matches!(
-        serde_json::from_value::<EventPayload>(delivery.payload.clone()).expect("delivery payload"),
+        serde_json::from_value::<EventPayload>(delivery.payload.clone().into()).expect("delivery payload"),
         EventPayload::UserMessage { text: delivered, mode: DeliveryMode::Steer, .. }
             if delivered == text
     ));
@@ -274,7 +275,7 @@ fn consumed_row_disappears_with_a_revision_bearing_delta() {
         .expect("row was held");
     assert!(consumed.revision > 0);
     assert!(matches!(
-        serde_json::from_value::<EventPayload>(consumed.envelope.payload.clone())
+        serde_json::from_value::<EventPayload>(consumed.envelope.payload.clone().into())
             .expect("delta payload"),
         EventPayload::QueueChanged(delta)
             if delta.revision == consumed.revision
@@ -318,7 +319,8 @@ fn reserved_queue_changed_payload_without_revision_cannot_commit() {
         payload: serde_json::json!({
             "type": "queue_changed",
             "change": {"kind": "removed", "id": "some-row"}
-        }),
+        })
+        .into(),
     }];
     let error = store
         .append(&mut malformed)

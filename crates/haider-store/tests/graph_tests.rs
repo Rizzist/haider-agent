@@ -265,14 +265,16 @@ fn raw_envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("serialize test payload"),
+        payload: serde_json::to_value(payload)
+            .expect("serialize test payload")
+            .into(),
     }
 }
 
 fn graph_human_menu_graphs(envelopes: &[haider_protocol::envelope::RawEnvelope]) -> Vec<GraphId> {
     envelopes
         .iter()
-        .filter_map(|envelope| serde_json::from_value(envelope.payload.clone()).ok())
+        .filter_map(|envelope| serde_json::from_value(envelope.payload.clone().into()).ok())
         .filter_map(|payload| match payload {
             EventPayload::MenuOpened(Menu {
                 kind: MenuKind::GraphHumanConfirm { graph_id, .. },
@@ -286,7 +288,7 @@ fn graph_human_menu_graphs(envelopes: &[haider_protocol::envelope::RawEnvelope])
 fn closed_menu_ids(envelopes: &[haider_protocol::envelope::RawEnvelope]) -> Vec<MenuId> {
     envelopes
         .iter()
-        .filter_map(|envelope| serde_json::from_value(envelope.payload.clone()).ok())
+        .filter_map(|envelope| serde_json::from_value(envelope.payload.clone().into()).ok())
         .filter_map(|payload| match payload {
             EventPayload::MenuClosed { menu, .. } => Some(menu),
             _ => None,
@@ -581,7 +583,7 @@ fn append_workspace_mutation(
     let EventPayload::Effect(EffectPhase::Outcome {
         workspace_mutation: Some(mutation),
         ..
-    }) = serde_json::from_value::<EventPayload>(facts[1].payload.clone())
+    }) = serde_json::from_value::<EventPayload>(facts[1].payload.clone().into())
         .expect("decode stamped mutation")
     else {
         panic!("mutation outcome remains present");
@@ -963,7 +965,7 @@ fn evidence_validates_open_node_normalizes_detail_and_stamps_fingerprint() {
         evidence_fingerprint("cargo test failed")
     );
     let EventPayload::EvidenceRecorded(fact) =
-        serde_json::from_value(envelopes[0].payload.clone()).expect("decode fact")
+        serde_json::from_value(envelopes[0].payload.clone().into()).expect("decode fact")
     else {
         panic!("first graph-evidence fact must be EvidenceRecorded");
     };
@@ -990,7 +992,7 @@ fn command_green_advances_build_without_any_model_selected_successor() {
     };
     let facts = envelopes
         .iter()
-        .map(|envelope| serde_json::from_value(envelope.payload.clone()).expect("fact"))
+        .map(|envelope| serde_json::from_value(envelope.payload.clone().into()).expect("fact"))
         .collect::<Vec<EventPayload>>();
     assert!(matches!(facts[0], EventPayload::EvidenceRecorded(_)));
     assert!(matches!(facts[1], EventPayload::GraphGateSatisfied(_)));
@@ -1436,7 +1438,7 @@ fn workspace_revisions_advance_only_on_mutations_and_rebuild_uniformly() {
             "background-mutation-completed",
             EventPayload::RunState(RunState::Thinking),
         );
-        background_completion.payload = completed.to_payload_value().expect("task payload");
+        background_completion.payload = completed.to_payload_value().expect("task payload").into();
         let mut background_completion = vec![background_completion];
         store
             .append(&mut background_completion)
@@ -2133,7 +2135,7 @@ fn eighth_unsatisfied_epoch_blocks_rounds_exhausted_without_back_edge_facts() {
     let history = store.journal_replay(&session_id).expect("history");
     let backwards_advanced = history.iter().any(|envelope| {
         matches!(
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
             Ok(EventPayload::GraphAdvanced(advanced))
                 if advanced.from_node == haider_protocol::graph::verify_node()
                     && advanced.to_node == haider_protocol::graph::build_node()
@@ -2396,7 +2398,7 @@ fn replaying_the_same_signal_and_evidence_is_exactly_once() {
     let mut signals = 0;
     let mut evidence = 0;
     for envelope in store.journal_replay(&session_id).expect("journal") {
-        match serde_json::from_value::<EventPayload>(envelope.payload) {
+        match serde_json::from_value::<EventPayload>(envelope.payload.into()) {
             Ok(EventPayload::ProcessSignalRecorded(signal))
                 if signal.effect_id == signal_command.signal.effect_id =>
             {
@@ -2445,7 +2447,7 @@ fn reach_ship(
         .expect("history")
         .into_iter()
         .find_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload)
+            serde_json::from_value::<EventPayload>(envelope.payload.into())
                 .ok()
                 .and_then(|payload| match payload {
                     EventPayload::MenuOpened(menu) if menu.id == menu_id => Some(envelope.seq),
@@ -2684,7 +2686,7 @@ fn switch_and_abandon_terminalize_unfinished_run_set_children_and_their_menus() 
     assert!(closed_menu_ids(&envelopes).contains(&switch_child_menu));
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
             Ok(EventPayload::GraphSuperseded(GraphSuperseded { old, new }))
                 if old == switch_child && new == replacement
         )
@@ -2754,7 +2756,7 @@ fn switch_and_abandon_terminalize_unfinished_run_set_children_and_their_menus() 
     assert!(closed_menu_ids(&envelopes).contains(&abandon_child_menu));
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
             Ok(EventPayload::GraphAbandoned(ref abandoned))
                 if abandoned.graph_id == abandon_child
         )
@@ -2823,7 +2825,7 @@ fn abandoning_ship_closes_its_unanswered_confirmation_menu() {
     };
     assert_eq!(envelopes.len(), 2);
     assert!(matches!(
-        serde_json::from_value::<EventPayload>(envelopes[1].payload.clone()),
+        serde_json::from_value::<EventPayload>(envelopes[1].payload.clone().into()),
         Ok(EventPayload::MenuClosed { ref menu, .. }) if menu == &menu_id
     ));
     let error = store
@@ -2905,7 +2907,7 @@ fn m2b_non_linear_ready_set_is_declaration_ordered() {
     let kinds = envelopes
         .iter()
         .filter_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into()).ok()
         })
         .filter_map(|payload| match payload {
             EventPayload::GraphNodeReadied(readied) => Some(readied.node),
@@ -2947,7 +2949,8 @@ fn m2b_ship_loop_keeps_legacy_gate_and_advance_facts() {
     let payloads = envelopes
         .iter()
         .map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()).expect("payload")
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
+                .expect("payload")
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -3005,7 +3008,8 @@ fn m2b_ship_loop_keeps_legacy_gate_and_advance_facts() {
     let payloads = envelopes
         .iter()
         .map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()).expect("payload")
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
+                .expect("payload")
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -3044,7 +3048,7 @@ fn m2b_ship_loop_keeps_legacy_gate_and_advance_facts() {
         .expect("history")
         .into_iter()
         .find_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload)
+            serde_json::from_value::<EventPayload>(envelope.payload.into())
                 .ok()
                 .and_then(|payload| match payload {
                     EventPayload::MenuOpened(menu) if menu.id == menu_id => Some(envelope.seq),
@@ -3069,7 +3073,8 @@ fn m2b_ship_loop_keeps_legacy_gate_and_advance_facts() {
     let payloads = follow_up
         .iter()
         .map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()).expect("payload")
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
+                .expect("payload")
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -3230,7 +3235,7 @@ fn compiled_loom_red_targets_survive_registry_pin_and_converge_at_runtime() {
         .read(&session_id, 0, 64)
         .expect("read frozen pin")
         .into_iter()
-        .filter_map(|envelope| serde_json::from_value(envelope.payload).ok())
+        .filter_map(|envelope| serde_json::from_value(envelope.payload.into()).ok())
         .find_map(|payload| match payload {
             EventPayload::GraphPinned(pin) if pin.graph_id == pinned.graph_id => Some(pin.nodes),
             _ => None,
@@ -3390,7 +3395,7 @@ fn seedless_workflow_abandon_rejects_projection_and_replays_exactly() {
         .iter()
         .find_map(|envelope| {
             matches!(
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
                 Ok(EventPayload::GraphAbandoned(_))
             )
             .then_some(envelope.event_id.clone())
@@ -3915,7 +3920,8 @@ fn m2b_switch_is_one_batch_closes_menu_and_retains_both_roots() {
     let payloads = envelopes
         .iter()
         .map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()).expect("payload")
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
+                .expect("payload")
         })
         .collect::<Vec<_>>();
     assert!(matches!(payloads[0], EventPayload::GraphSuperseded(_)));
@@ -4163,7 +4169,7 @@ fn record_catalog_green(
                 .expect("history")
                 .into_iter()
                 .find_map(|envelope| {
-                    serde_json::from_value::<EventPayload>(envelope.payload)
+                    serde_json::from_value::<EventPayload>(envelope.payload.into())
                         .ok()
                         .and_then(|payload| match payload {
                             EventPayload::MenuOpened(menu) if menu.id == menu_id => {
@@ -4204,7 +4210,7 @@ fn graph_pending_menu_for_node(
         .into_iter()
         .rev()
         .find_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload)
+            serde_json::from_value::<EventPayload>(envelope.payload.into())
                 .ok()
                 .and_then(|payload| match payload {
                     EventPayload::MenuOpened(menu)
@@ -4302,7 +4308,8 @@ fn m2c_first_finalization_defers_and_second_requires_explicit_exit() {
         "law 1: the first deferral emits the reminder"
     );
     assert!(matches!(
-        serde_json::from_value::<EventPayload>(envelopes[0].payload.clone()).expect("payload"),
+        serde_json::from_value::<EventPayload>(envelopes[0].payload.clone().into())
+            .expect("payload"),
         EventPayload::GraphFinalizationDeferred(GraphFinalizationDeferred { .. })
     ));
     assert!(
@@ -4311,7 +4318,7 @@ fn m2c_first_finalization_defers_and_second_requires_explicit_exit() {
             .expect("journal")
             .iter()
             .any(|envelope| {
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into()).is_ok_and(
                     |payload| {
                         payload == EventPayload::RunState(haider_protocol::state::RunState::Done)
                     },
@@ -4397,7 +4404,7 @@ fn m2c_first_finalization_defers_and_second_requires_explicit_exit() {
         panic!("fresh abandon answer commits");
     };
     assert!(follow_up.iter().any(|envelope| {
-        serde_json::from_value::<EventPayload>(envelope.payload.clone())
+        serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
             .is_ok_and(|payload| matches!(payload, EventPayload::GraphAbandoned(_)))
     }));
     assert_eq!(
@@ -4472,7 +4479,7 @@ fn autonomous_finalization_continues_after_progress_but_same_state_fails_closed(
         .journal_replay(&session_id)
         .expect("journal")
         .into_iter()
-        .map(|event| serde_json::from_value::<EventPayload>(event.payload).expect("payload"))
+        .map(|event| serde_json::from_value::<EventPayload>(event.payload.into()).expect("payload"))
         .collect::<Vec<_>>();
     assert!(!payloads.iter().any(|payload| matches!(
         payload,
@@ -4522,7 +4529,7 @@ fn m2c_one_reminder_coordinate_survives_store_reopen() {
         .expect("journal")
         .into_iter()
         .filter(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                 .is_ok_and(|payload| matches!(payload, EventPayload::GraphFinalizationDeferred(_)))
         })
         .count();
@@ -4699,7 +4706,7 @@ fn m2c_worker_done_rechecks_graph_authority_in_append_transaction() {
             .expect("journal")
             .iter()
             .any(|envelope| {
-                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                     .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Done))
             })
     );
@@ -4878,7 +4885,7 @@ fn telemetry_envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("payload"),
+        payload: serde_json::to_value(payload).expect("payload").into(),
     }
 }
 
@@ -6253,7 +6260,7 @@ fn projected_event_envelope(
         event_id,
         EventPayload::IdleDecayed,
     );
-    envelope.payload = event.to_payload_value().expect("activation payload");
+    envelope.payload = event.to_payload_value().expect("activation payload").into();
     envelope
 }
 

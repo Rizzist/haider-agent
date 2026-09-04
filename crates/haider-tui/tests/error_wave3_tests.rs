@@ -286,7 +286,7 @@ fn sustained_unknown_payloads_emit_one_durable_compatibility_diagnostic() {
             replay_through_seq: 0,
         },
     );
-    let raw = |seq, payload| haider_protocol::envelope::EventEnvelope {
+    let raw = |seq, payload: serde_json::Value| haider_protocol::envelope::EventEnvelope {
         schema_version: 1,
         event_id: haider_protocol::ids::EventId::new(format!("future-{seq}")),
         seq,
@@ -305,7 +305,7 @@ fn sustained_unknown_payloads_emit_one_durable_compatibility_diagnostic() {
             durable: true,
             prompt: haider_protocol::envelope::PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     };
     for seq in 1..3 {
         assert!(

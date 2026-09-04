@@ -7,7 +7,7 @@ use haider_protocol::DeliveryMode;
 use haider_protocol::envelope::{EventEnvelope, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::history::{NodeKind, TreeNode};
 use haider_protocol::ids::{DeviceId, NodeId};
-use haider_protocol::item::{ItemEvent, TurnItem};
+use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::state::RunState;
 use haider_protocol::verify::VerifyVerdict;
 
@@ -50,7 +50,8 @@ fn pressure_envelope(session_id: &SessionId, ordinal: u64) -> RawEnvelope {
         payload: serde_json::json!({
             "type": "prompt_cache_pressure_probe",
             "padding": padding,
-        }),
+        })
+        .into(),
     }
 }
 
@@ -70,7 +71,7 @@ async fn retained_value_trees_evict_and_the_next_hit_recompiles() {
     let mut visible = pressure_envelope(&session_id, ENVELOPE_COUNT);
     visible.run_id = Some(current_run.clone());
     visible.render.prompt = PromptRender::Verbatim;
-    visible.payload = serde_json::json!({
+    *visible.payload = serde_json::json!({
         "type": "user_message",
         "text": "projection rebuilt after retained-body eviction",
         "attachments": []
@@ -81,7 +82,9 @@ async fn retained_value_trees_evict_and_the_next_hit_recompiles() {
         .await
         .expect("pressure journal appends");
 
-    let serialized_bytes = serialized_body_bytes(&envelopes);
+    let serialized_bytes = serde_json::to_vec(&envelopes)
+        .expect("pressure journal serializes")
+        .len();
     let retained_bytes = envelopes
         .iter()
         .map(envelope_weight_bytes)
@@ -140,7 +143,7 @@ async fn explicit_idle_eviction_drops_bodies_but_keeps_replay_correct() {
     let mut visible = pressure_envelope(&session_id, 1);
     visible.run_id = Some(current_run.clone());
     visible.render.prompt = PromptRender::Verbatim;
-    visible.payload = serde_json::json!({
+    *visible.payload = serde_json::json!({
         "type": "user_message",
         "text": "rebuild me after idle",
         "attachments": []
@@ -184,6 +187,103 @@ async fn explicit_idle_eviction_drops_bodies_but_keeps_replay_correct() {
     assert_eq!(rebuilt, first);
 }
 
+/// MUTATION CHECK: make reply canonicalization local to one 256-envelope
+/// store page. The completed item and assistant node then retain independent
+/// decoded strings from the delta ranges after a restart replay.
+#[tokio::test]
+async fn reply_arena_remains_canonical_across_history_page_boundaries() {
+    fn assert_canonical(envelopes: &[RawEnvelope], expected: &str) {
+        let mut ranges = Vec::new();
+        for envelope in envelopes {
+            match envelope
+                .payload
+                .decode_event()
+                .expect("decode cached event")
+            {
+                EventPayload::Item(ItemEvent::Delta {
+                    delta: ItemDelta::Text { text },
+                    ..
+                })
+                | EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::AgentMessage { text },
+                    ..
+                }) => ranges.push(text),
+                EventPayload::NodeCommitted(TreeNode {
+                    kind: NodeKind::AssistantCommit { text, .. },
+                    ..
+                }) => ranges.push(text),
+                _ => {}
+            }
+        }
+        let canonical = ranges.last().expect("assistant node range");
+        assert_eq!(canonical, expected);
+        assert!(
+            ranges
+                .iter()
+                .all(|range| range.shares_arena_with(canonical)),
+            "every delta, completed item, and node must share one replay arena"
+        );
+    }
+
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("prompt-reply-arena-page-boundary");
+    let item_id = ItemId::new("prompt-reply-arena-item");
+    let mut envelopes = Vec::new();
+    let mut next_seq = 1_u64;
+    let mut push_round_tripped = |payload: EventPayload| {
+        let mut envelope = pressure_envelope(&session_id, next_seq);
+        *envelope.payload = serde_json::to_value(payload).expect("encode reply event");
+        let encoded = serde_json::to_vec(&envelope).expect("encode stored envelope");
+        let decoded: RawEnvelope =
+            serde_json::from_slice(&encoded).expect("decode independent stored envelope");
+        envelopes.push(decoded);
+        next_seq = next_seq.saturating_add(1);
+    };
+
+    push_round_tripped(EventPayload::Item(ItemEvent::Started {
+        item_id: item_id.clone(),
+        item: TurnItem::AgentMessage {
+            text: ReplyText::default(),
+        },
+    }));
+    for _ in 0..HISTORY_PAGE {
+        push_round_tripped(EventPayload::Item(ItemEvent::Delta {
+            item_id: item_id.clone(),
+            delta: ItemDelta::Text { text: "x".into() },
+        }));
+    }
+    let expected = "x".repeat(HISTORY_PAGE);
+    push_round_tripped(EventPayload::Item(ItemEvent::Completed {
+        item_id,
+        item: TurnItem::AgentMessage {
+            text: expected.clone().into(),
+        },
+    }));
+    push_round_tripped(EventPayload::NodeCommitted(TreeNode {
+        node: NodeId::new("prompt-reply-arena-node"),
+        parent: None,
+        kind: NodeKind::AssistantCommit {
+            text: expected.clone().into(),
+            verdict: VerifyVerdict::NotApplicable,
+        },
+    }));
+    store
+        .append(&mut envelopes)
+        .await
+        .expect("append independently decoded reply events");
+    drop(envelopes);
+
+    let uncached = read_all(&store, &session_id).await.expect("paged read_all");
+    assert_canonical(&uncached, &expected);
+    let head = store.latest_seq(&session_id).await.expect("journal head");
+    let cached = replay_cached_session(&store, &session_id, head)
+        .await
+        .expect("paged cached replay");
+    assert_canonical(&cached.envelopes, &expected);
+    assert!(cached.active_reply_arenas.is_empty());
+    assert!(cached.completed_reply_arenas.is_empty());
+}
+
 /// MUTATION CHECK: retaining the complete decoded journal at terminal idle
 /// makes the post-compaction envelope count stay at the old head; dropping the
 /// compiled append prefix makes the next run fall back instead of exercising
@@ -199,7 +299,7 @@ async fn idle_compaction_keeps_cross_run_prefix_and_replays_only_the_new_suffix(
     let mut first_user = pressure_envelope(&session_id, 1);
     first_user.run_id = Some(first_run.clone());
     first_user.render.prompt = PromptRender::Verbatim;
-    first_user.payload = serde_json::to_value(EventPayload::UserMessage {
+    *first_user.payload = serde_json::to_value(EventPayload::UserMessage {
         text: "first cached turn".into(),
         attachments: Vec::new(),
         mode: DeliveryMode::Queue,
@@ -208,7 +308,7 @@ async fn idle_compaction_keeps_cross_run_prefix_and_replays_only_the_new_suffix(
     let mut first_events = vec![first_user, {
         let mut envelope = pressure_envelope(&session_id, 2);
         envelope.run_id = Some(first_run.clone());
-        envelope.payload = serde_json::to_value(EventPayload::NodeCommitted(TreeNode {
+        *envelope.payload = serde_json::to_value(EventPayload::NodeCommitted(TreeNode {
             node: NodeId::new("prompt-idle-prefix-first-user-node"),
             parent: None,
             kind: NodeKind::UserTurn {
@@ -251,7 +351,7 @@ async fn idle_compaction_keeps_cross_run_prefix_and_replays_only_the_new_suffix(
             let mut envelope = pressure_envelope(&session_id, 3);
             envelope.run_id = Some(first_run.clone());
             envelope.render.prompt = PromptRender::Verbatim;
-            envelope.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+            *envelope.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
                 item_id: ItemId::new("prompt-idle-prefix-answer"),
                 item: TurnItem::AgentMessage {
                     text: "answer retained through suffix extension".into(),
@@ -263,7 +363,7 @@ async fn idle_compaction_keeps_cross_run_prefix_and_replays_only_the_new_suffix(
         {
             let mut envelope = pressure_envelope(&session_id, 4);
             envelope.run_id = Some(first_run.clone());
-            envelope.payload = serde_json::to_value(EventPayload::NodeCommitted(TreeNode {
+            *envelope.payload = serde_json::to_value(EventPayload::NodeCommitted(TreeNode {
                 node: NodeId::new("prompt-idle-prefix-first-answer-node"),
                 parent: Some(NodeId::new("prompt-idle-prefix-first-user-node")),
                 kind: NodeKind::AssistantCommit {
@@ -277,7 +377,7 @@ async fn idle_compaction_keeps_cross_run_prefix_and_replays_only_the_new_suffix(
         {
             let mut envelope = pressure_envelope(&session_id, 5);
             envelope.run_id = Some(first_run.clone());
-            envelope.payload = serde_json::to_value(EventPayload::RunState(RunState::Done))
+            *envelope.payload = serde_json::to_value(EventPayload::RunState(RunState::Done))
                 .expect("terminal payload");
             envelope
         },
@@ -285,7 +385,7 @@ async fn idle_compaction_keeps_cross_run_prefix_and_replays_only_the_new_suffix(
             let mut envelope = pressure_envelope(&session_id, 6);
             envelope.run_id = Some(next_run.clone());
             envelope.render.prompt = PromptRender::Verbatim;
-            envelope.payload = serde_json::to_value(EventPayload::UserMessage {
+            *envelope.payload = serde_json::to_value(EventPayload::UserMessage {
                 text: "next cached turn".into(),
                 attachments: Vec::new(),
                 mode: DeliveryMode::Queue,
@@ -296,7 +396,7 @@ async fn idle_compaction_keeps_cross_run_prefix_and_replays_only_the_new_suffix(
         {
             let mut envelope = pressure_envelope(&session_id, 7);
             envelope.run_id = Some(next_run.clone());
-            envelope.payload = serde_json::to_value(EventPayload::NodeCommitted(TreeNode {
+            *envelope.payload = serde_json::to_value(EventPayload::NodeCommitted(TreeNode {
                 node: NodeId::new("prompt-idle-prefix-next-user-node"),
                 parent: Some(NodeId::new("prompt-idle-prefix-first-answer-node")),
                 kind: NodeKind::UserTurn {

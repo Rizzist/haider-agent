@@ -911,7 +911,7 @@ pub(crate) fn write_raw_envelope_jsonl(
     mut output: impl Write,
     envelope: &haider_protocol::envelope::RawEnvelope,
 ) -> io::Result<()> {
-    serde_json::to_writer(&mut output, envelope).map_err(io::Error::other)?;
+    haider_protocol::envelope::write_envelope_json(&mut output, envelope)?;
     output.write_all(b"\n")?;
     output.flush()
 }

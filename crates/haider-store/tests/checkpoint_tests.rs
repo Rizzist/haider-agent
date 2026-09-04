@@ -61,7 +61,9 @@ fn envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("encode checkpoint event"),
+        payload: serde_json::to_value(payload)
+            .expect("encode checkpoint event")
+            .into(),
     }
 }
 
@@ -138,7 +140,8 @@ fn checkpoint_fact_is_stamped_and_projected_in_the_effect_transaction() {
 
     store.append(&mut events).expect("append checkpoint batch");
     let EventPayload::CheckpointRecorded(stamped) =
-        serde_json::from_value(events[2].payload.clone()).expect("decode stamped checkpoint")
+        serde_json::from_value(events[2].payload.clone().into())
+            .expect("decode stamped checkpoint")
     else {
         panic!("checkpoint fact remains present");
     };

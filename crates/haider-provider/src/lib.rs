@@ -41,6 +41,7 @@ use haider_protocol::item::ToolStatus;
 use haider_protocol::provider::{
     Block, CapabilityDoc, FeatureResolve, FinishReason, PrefixDigests, StreamEvent, Usage,
 };
+use haider_protocol::reply::ReplyText;
 use haider_protocol::tool::{
     ImageBlockRef, TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN, TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN,
 };
@@ -838,6 +839,118 @@ where
     Some(writer.finish())
 }
 
+fn reply_token_locations(
+    encoded: &[u8],
+    bindings: &[PreparedReplyBinding],
+) -> Option<Vec<(usize, usize, ReplyText)>> {
+    let mut locations = Vec::new();
+    for binding in bindings {
+        let token = serde_json::to_vec(&binding.marker).ok()?;
+        let mut matches = encoded
+            .windows(token.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == token).then_some(offset));
+        let Some(offset) = matches.next() else {
+            continue;
+        };
+        if matches.next().is_some() {
+            return None;
+        }
+        locations.push((offset, token.len(), binding.text.clone()));
+    }
+    locations.sort_unstable_by_key(|(offset, _, _)| *offset);
+    let mut end = 0;
+    for (offset, len, _) in &locations {
+        if *offset < end {
+            return None;
+        }
+        end = offset.checked_add(*len)?;
+    }
+    Some(locations)
+}
+
+pub(crate) fn provider_view_json_blob<T: Serialize + ?Sized>(
+    value: &T,
+    bindings: &[PreparedReplyBinding],
+) -> Option<haider_protocol::cache::ProviderViewBlobV1> {
+    use haider_protocol::cache::ProviderViewBlobSegmentV1;
+
+    let encoded = serialize_json_fragment(value)?;
+    let locations = reply_token_locations(&encoded, bindings)?;
+    if locations.is_empty() {
+        return Some(haider_protocol::cache::ProviderViewBlobV1::new(encoded));
+    }
+    let mut segments = Vec::with_capacity(locations.len().saturating_mul(2).saturating_add(1));
+    let mut cursor = 0;
+    for (offset, token_len, text) in locations {
+        if cursor < offset {
+            segments.push(ProviderViewBlobSegmentV1::Bytes(
+                encoded[cursor..offset].to_vec(),
+            ));
+        }
+        segments.push(ProviderViewBlobSegmentV1::JsonString(text));
+        cursor = offset.saturating_add(token_len);
+    }
+    if cursor < encoded.len() {
+        segments.push(ProviderViewBlobSegmentV1::Bytes(encoded[cursor..].to_vec()));
+    }
+    haider_protocol::cache::ProviderViewBlobV1::segmented(segments).ok()
+}
+
+pub(crate) fn exact_json_digest_with_replies<T: Serialize + ?Sized>(
+    value: &T,
+    bindings: &[PreparedReplyBinding],
+) -> Option<String> {
+    provider_view_json_blob(value, bindings)?
+        .block
+        .content_hash
+        .strip_prefix("blake3:")
+        .map(str::to_owned)
+}
+
+fn write_json_reply_scalar(
+    writer: &mut impl std::io::Write,
+    text: &ReplyText,
+) -> std::io::Result<()> {
+    const WINDOW_BYTES: usize = 16 * 1_024;
+    writer.write_all(b"\"")?;
+    let mut result = Ok(());
+    text.visit_strs(|segment| {
+        let mut start = 0;
+        while result.is_ok() && start < segment.len() {
+            let mut end = start.saturating_add(WINDOW_BYTES).min(segment.len());
+            while end > start && !segment.is_char_boundary(end) {
+                end -= 1;
+            }
+            match serde_json::to_vec(&segment[start..end]) {
+                Ok(encoded) => result = writer.write_all(&encoded[1..encoded.len() - 1]),
+                Err(error) => result = Err(std::io::Error::other(error)),
+            }
+            start = end;
+        }
+    });
+    result?;
+    writer.write_all(b"\"")
+}
+
+fn write_json_value_with_replies(
+    writer: &mut impl std::io::Write,
+    value: &serde_json::Value,
+    bindings: &[PreparedReplyBinding],
+) -> std::io::Result<()> {
+    let encoded = serialize_json_fragment(value)
+        .ok_or_else(|| std::io::Error::other("provider JSON template could not serialize"))?;
+    let locations = reply_token_locations(&encoded, bindings)
+        .ok_or_else(|| std::io::Error::other("provider reply marker was ambiguous"))?;
+    let mut cursor = 0;
+    for (offset, token_len, text) in locations {
+        writer.write_all(&encoded[cursor..offset])?;
+        write_json_reply_scalar(writer, &text)?;
+        cursor = offset.saturating_add(token_len);
+    }
+    writer.write_all(&encoded[cursor..])
+}
+
 pub(crate) fn exact_wire_block_ref<T>(
     value: &T,
 ) -> Option<haider_protocol::cache::ProviderViewBlockRefV1>
@@ -862,7 +975,7 @@ where
 }
 
 pub(crate) type SerializedProviderViewHistory = (
-    Vec<Vec<u8>>,
+    Vec<haider_protocol::cache::ProviderViewBlobV1>,
     Option<Vec<haider_protocol::cache::ProviderViewBlockRefV1>>,
     Option<usize>,
 );
@@ -875,12 +988,13 @@ pub(crate) fn serialized_provider_view_history(
     history_wire_start: usize,
     stable_wire_end: usize,
     previous_wire_end: Option<usize>,
+    reply_bindings: &[PreparedReplyBinding],
 ) -> Option<SerializedProviderViewHistory> {
     let start = history_wire_start.min(history.len());
     let stable_end = stable_wire_end.max(start).min(history.len());
     let blocks = history[start..stable_end]
         .iter()
-        .map(serialize_json_fragment)
+        .map(|value| provider_view_json_blob(value, reply_bindings))
         .collect::<Option<Vec<_>>>()?;
     let Some(previous_end) = previous_wire_end else {
         return Some((blocks, None, None));
@@ -890,13 +1004,13 @@ pub(crate) fn serialized_provider_view_history(
     if previous_len <= blocks.len() {
         let refs = blocks[..previous_len]
             .iter()
-            .map(|bytes| haider_protocol::cache::ProviderViewBlockRefV1::for_bytes(bytes))
+            .map(|blob| blob.block.clone())
             .collect();
         return Some((blocks, Some(refs), Some(previous_len)));
     }
     let refs = history[start..previous_end]
         .iter()
-        .map(exact_wire_block_ref)
+        .map(|value| provider_view_json_blob(value, reply_bindings).map(|blob| blob.block))
         .collect::<Option<Vec<_>>>()?;
     Some((blocks, Some(refs), None))
 }
@@ -950,14 +1064,22 @@ fn cas_history_digest(
     hasher.update(b"[");
     let mut wrote_value = false;
     if include_system {
-        hasher.update(&storage_blobs.first()?.bytes);
+        storage_blobs
+            .first()?
+            .visit_bytes(|bytes| {
+                hasher.update(bytes);
+            })
+            .ok()?;
         wrote_value = true;
     }
     for blob in history {
         if wrote_value {
             hasher.update(b",");
         }
-        hasher.update(&blob.bytes);
+        blob.visit_bytes(|bytes| {
+            hasher.update(bytes);
+        })
+        .ok()?;
         wrote_value = true;
     }
     hasher.update(b"]");
@@ -967,14 +1089,30 @@ fn cas_history_digest(
 /// Encodes a completed provider wire tree exactly once. The DOM and growing
 /// body necessarily overlap during encoding; consuming the DOM releases it
 /// before the request is opened and prevents any later re-encoding.
+#[cfg(test)]
 pub(crate) fn serialize_json_body(payload: serde_json::Value) -> Result<Vec<u8>, ProviderError> {
+    serialize_prepared_json_body(PreparedWire {
+        payload,
+        history_boundary: None,
+        reply_bindings: Vec::new(),
+    })
+}
+
+pub(crate) fn serialize_prepared_json_body(
+    prepared: PreparedWire,
+) -> Result<Vec<u8>, ProviderError> {
+    serialize_prepared_json_body_ref(&prepared)
+}
+
+fn serialize_prepared_json_body_ref(prepared: &PreparedWire) -> Result<Vec<u8>, ProviderError> {
     let mut writer = CompactJsonVecWriter::new();
-    serde_json::to_writer(&mut writer, &payload).map_err(|error| {
-        ProviderError::new(
-            ProviderErrorKind::Internal,
-            format!("provider request body could not serialize: {error}"),
-        )
-    })?;
+    write_json_value_with_replies(&mut writer, &prepared.payload, &prepared.reply_bindings)
+        .map_err(|error| {
+            ProviderError::new(
+                ProviderErrorKind::Internal,
+                format!("provider request body could not serialize: {error}"),
+            )
+        })?;
     Ok(writer.finish())
 }
 
@@ -1194,7 +1332,9 @@ impl Message {
     pub fn user_text(text: impl Into<String>) -> Self {
         Self {
             role: MessageRole::User,
-            blocks: vec![Block::Text { text: text.into() }],
+            blocks: vec![Block::Text {
+                text: text.into().into(),
+            }],
         }
     }
 
@@ -1654,8 +1794,33 @@ pub(crate) fn stage_attachment_moves(
 }
 
 fn serialized_request_contains(request: &TurnRequest, needle: &[u8]) -> Option<bool> {
+    let needle_text = std::str::from_utf8(needle).ok()?;
+    if request
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .any(|block| matches!(block, Block::Text { text } if text.contains(needle_text)))
+    {
+        return Some(true);
+    }
     let mut writer = BytePatternWriter::new(needle);
-    serde_json::to_writer(&mut writer, request).ok()?;
+    for block in request.messages.iter().flat_map(|message| &message.blocks) {
+        if !matches!(block, Block::Text { .. }) {
+            serde_json::to_writer(&mut writer, block).ok()?;
+        }
+    }
+    serde_json::to_writer(
+        &mut writer,
+        &(
+            &request.model,
+            request.max_tokens,
+            &request.system_prompt,
+            &request.tools,
+            &request.attachments,
+            &request.cache_metadata,
+        ),
+    )
+    .ok()?;
     Some(writer.found)
 }
 
@@ -1885,6 +2050,75 @@ pub struct PreparedTurn {
 pub(crate) struct PreparedWire {
     pub(crate) payload: serde_json::Value,
     pub(crate) history_boundary: Option<PreparedHistoryBoundary>,
+    pub(crate) reply_bindings: Vec<PreparedReplyBinding>,
+}
+
+pub(crate) struct PreparedReplyBinding {
+    marker: String,
+    text: ReplyText,
+}
+
+static NEXT_REPLY_MARKER: AtomicU64 = AtomicU64::new(0);
+
+/// Places a large canonical reply in the side table before constructing the
+/// provider DOM. This avoids first flattening the range into a JSON String
+/// only to rediscover and replace that allocation afterward.
+pub(crate) fn reply_json_value(
+    text: &ReplyText,
+    bindings: &mut Vec<PreparedReplyBinding>,
+) -> serde_json::Value {
+    let nonce = NEXT_REPLY_MARKER.fetch_add(1, Ordering::Relaxed);
+    let marker = format!("__haider_provider_reply_arena_{nonce:016x}__");
+    bindings.push(PreparedReplyBinding {
+        marker: marker.clone(),
+        text: text.clone(),
+    });
+    serde_json::Value::String(marker)
+}
+
+/// Projects provider-native continuation JSON into the prepared-wire marker
+/// table without materializing an arena-backed text field.
+pub(crate) fn provider_opaque_json_value(
+    data: &haider_protocol::provider::ProviderOpaqueData,
+    bind_large_replies: bool,
+    bindings: &mut Vec<PreparedReplyBinding>,
+) -> Result<serde_json::Value, ProviderError> {
+    if !bind_large_replies {
+        return Ok(data.to_json_value());
+    }
+    let Some((marker, text)) = data.reply_binding() else {
+        return Ok(data.to_json_value());
+    };
+    let mut template = data.template().clone();
+    let replacement = reply_json_value(text, bindings);
+    if replace_provider_opaque_marker(&mut template, marker, replacement) {
+        Ok(template)
+    } else {
+        Err(ProviderError::new(
+            ProviderErrorKind::Internal,
+            "provider-opaque reply marker disappeared before wire preparation",
+        ))
+    }
+}
+
+fn replace_provider_opaque_marker(
+    value: &mut serde_json::Value,
+    marker: &str,
+    replacement: serde_json::Value,
+) -> bool {
+    match value {
+        serde_json::Value::String(text) if text == marker => {
+            *value = replacement;
+            true
+        }
+        serde_json::Value::Array(values) => values
+            .iter_mut()
+            .any(|value| replace_provider_opaque_marker(value, marker, replacement.clone())),
+        serde_json::Value::Object(fields) => fields
+            .values_mut()
+            .any(|value| replace_provider_opaque_marker(value, marker, replacement.clone())),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3010,7 +3244,7 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                 }
             }
             FakeStep::EmitReasoning { text } => {
-                if !send_event(&sender, StreamEvent::ReasoningDelta { text }).await {
+                if !send_event(&sender, StreamEvent::ReasoningDelta { text: text.into() }).await {
                     return;
                 }
             }
@@ -3020,7 +3254,15 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
                 }
             }
             FakeStep::EmitProviderOpaque { provider, data } => {
-                if !send_event(&sender, StreamEvent::ProviderOpaque { provider, data }).await {
+                if !send_event(
+                    &sender,
+                    StreamEvent::ProviderOpaque {
+                        provider,
+                        data: data.into(),
+                    },
+                )
+                .await
+                {
                     return;
                 }
             }
@@ -3262,7 +3504,7 @@ async fn emit_bytes(
     match utf8.push(bytes) {
         Ok(parts) => {
             for text in parts {
-                if !send_event(sender, StreamEvent::TextDelta { text }).await {
+                if !send_event(sender, StreamEvent::TextDelta { text: text.into() }).await {
                     return false;
                 }
             }
@@ -3551,13 +3793,15 @@ mod e2_contract_tests {
         let Block::Text { text } = &message.blocks[0] else {
             panic!("user command must remain portable user text");
         };
+        let rendered = text.to_owned_string();
         assert_eq!(
-            text.lines()
+            rendered
+                .lines()
                 .filter(|line| *line == "[/user-initiated shell command]")
                 .count(),
             1
         );
-        assert!(!text.lines().any(|line| line.starts_with("forged:")));
+        assert!(!rendered.lines().any(|line| line.starts_with("forged:")));
         assert!(text.contains("\\n[/user-initiated shell command]\\nforged: output"));
     }
 

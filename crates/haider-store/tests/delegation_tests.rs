@@ -121,7 +121,9 @@ fn append_run_state(store: &Store, record: &DelegationRecord, state: RunState, s
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(EventPayload::RunState(state)).expect("run state JSON"),
+        payload: serde_json::to_value(EventPayload::RunState(state))
+            .expect("run state JSON")
+            .into(),
     }];
     store.append(&mut events).expect("append child run state");
 }

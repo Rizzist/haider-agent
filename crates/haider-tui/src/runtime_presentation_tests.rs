@@ -33,7 +33,9 @@ fn payload_envelope(
             durable: true,
             prompt: PromptRender::Verbatim,
         },
-        payload: serde_json::to_value(payload).expect("presentation payload serializes"),
+        payload: serde_json::to_value(payload)
+            .expect("presentation payload serializes")
+            .into(),
     })
 }
 
@@ -53,7 +55,7 @@ fn started(item: &str) -> EventPayload {
     EventPayload::Item(ItemEvent::Started {
         item_id: ItemId::new(item),
         item: TurnItem::AgentMessage {
-            text: String::new(),
+            text: String::new().into(),
         },
     })
 }
@@ -62,7 +64,7 @@ fn delta(item: &str, text: &str) -> EventPayload {
     EventPayload::Item(ItemEvent::Delta {
         item_id: ItemId::new(item),
         delta: ItemDelta::Text {
-            text: text.to_owned(),
+            text: text.to_owned().into(),
         },
     })
 }

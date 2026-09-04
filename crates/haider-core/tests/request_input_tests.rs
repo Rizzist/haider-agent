@@ -97,7 +97,7 @@ async fn autonomous_request_input_uses_only_its_declared_default() {
         .events(&SessionId::new(SESSION))
         .await
         .into_iter()
-        .map(|event| serde_json::from_value::<EventPayload>(event.payload).expect("typed"))
+        .map(|event| serde_json::from_value::<EventPayload>(event.payload.into()).expect("typed"))
         .collect::<Vec<_>>();
     assert!(!payloads.iter().any(|payload| matches!(
         payload,
@@ -161,7 +161,7 @@ async fn autonomous_request_input_without_default_returns_typed_tool_result() {
         .events(&SessionId::new(SESSION))
         .await
         .into_iter()
-        .map(|event| serde_json::from_value::<EventPayload>(event.payload).expect("typed"))
+        .map(|event| serde_json::from_value::<EventPayload>(event.payload.into()).expect("typed"))
         .collect::<Vec<_>>();
     assert!(!payloads.iter().any(|payload| matches!(
         payload,
@@ -251,7 +251,7 @@ async fn autonomous_request_input_checkpoint_resumes_after_restart_without_waiti
             .events(&SessionId::new(SESSION))
             .await
             .into_iter()
-            .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+            .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.into()).ok())
             .any(|payload| matches!(
                 payload,
                 EventPayload::RunState(RunState::InputRequired { .. })
@@ -345,7 +345,8 @@ async fn branch_scoped_request_input_keeps_every_interaction_on_its_branch() {
     let payloads = events
         .iter()
         .map(|event| {
-            serde_json::from_value::<EventPayload>(event.payload.clone()).expect("typed payload")
+            serde_json::from_value::<EventPayload>(event.payload.clone().into())
+                .expect("typed payload")
         })
         .collect::<Vec<_>>();
     assert!(
@@ -437,7 +438,7 @@ async fn request_input_journals_menu_round_trip_and_returns_answer_as_tool_resul
     let events = store.events(&SessionId::new(SESSION)).await;
     let payloads: Vec<EventPayload> = events
         .iter()
-        .map(|event| serde_json::from_value(event.payload.clone()).expect("typed payload"))
+        .map(|event| serde_json::from_value(event.payload.clone().into()).expect("typed payload"))
         .collect();
     let opened: Vec<_> = payloads
         .iter()
@@ -584,7 +585,7 @@ async fn committed_menu_event_wakes_waiter_without_reappending_resolution() {
         .await
         .into_iter()
         .find(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                 .is_ok_and(|payload| matches!(payload, EventPayload::MenuOpened(_)))
         })
         .expect("menu opening is durable");
@@ -600,7 +601,8 @@ async fn committed_menu_event_wakes_waiter_without_reappending_resolution() {
             value: None,
             via: AnswerVia::Rpc,
         }))
-        .expect("answer serializes"),
+        .expect("answer serializes")
+        .into(),
         ..opening
     }];
     store
@@ -620,7 +622,7 @@ async fn committed_menu_event_wakes_waiter_without_reappending_resolution() {
         history
             .iter()
             .filter(|envelope| {
-                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                serde_json::from_value::<EventPayload>(envelope.payload.clone().into())
                     .is_ok_and(|payload| matches!(payload, EventPayload::MenuAnswered(_)))
             })
             .count(),
@@ -696,7 +698,7 @@ async fn provider_request_ceiling_ends_the_same_turn_with_typed_loop_limit() {
     assert!(matches!(
         events
             .last()
-            .map(|event| serde_json::from_value(event.payload.clone()).expect("payload")),
+            .map(|event| serde_json::from_value(event.payload.clone().into()).expect("payload")),
         Some(EventPayload::RunState(RunState::Errored))
     ));
 }
@@ -818,7 +820,7 @@ async fn free_form_question_requires_and_returns_the_typed_value() {
         .events(&SessionId::new(SESSION))
         .await
         .iter()
-        .map(|event| serde_json::from_value(event.payload.clone()).expect("typed payload"))
+        .map(|event| serde_json::from_value(event.payload.clone().into()).expect("typed payload"))
         .collect();
     assert!(payloads.iter().any(|payload| matches!(
         payload,
@@ -874,7 +876,7 @@ async fn cancellation_while_input_is_required_closes_the_tool_as_cancelled() {
         .events(&SessionId::new(SESSION))
         .await
         .iter()
-        .map(|event| serde_json::from_value(event.payload.clone()).expect("typed payload"))
+        .map(|event| serde_json::from_value(event.payload.clone().into()).expect("typed payload"))
         .collect();
     assert!(
         payloads

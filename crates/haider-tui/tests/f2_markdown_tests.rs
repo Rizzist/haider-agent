@@ -426,7 +426,9 @@ fn raw(seq: u64, payload: &EventPayload) -> RawEnvelope {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("payload serializes"),
+        payload: serde_json::to_value(payload)
+            .expect("payload serializes")
+            .into(),
     }
 }
 
@@ -447,7 +449,7 @@ fn agent_message(seq_base: u64, model: &mut AppModel, text: &str, complete: bool
         &EventPayload::Item(ItemEvent::Started {
             item_id: item.clone(),
             item: TurnItem::AgentMessage {
-                text: String::new(),
+                text: String::new().into(),
             },
         }),
     ));
@@ -456,7 +458,7 @@ fn agent_message(seq_base: u64, model: &mut AppModel, text: &str, complete: bool
         &EventPayload::Item(ItemEvent::Delta {
             item_id: item.clone(),
             delta: ItemDelta::Text {
-                text: text.to_owned(),
+                text: text.to_owned().into(),
             },
         }),
     ));
@@ -466,7 +468,7 @@ fn agent_message(seq_base: u64, model: &mut AppModel, text: &str, complete: bool
             &EventPayload::Item(ItemEvent::Completed {
                 item_id: item,
                 item: TurnItem::AgentMessage {
-                    text: text.to_owned(),
+                    text: text.to_owned().into(),
                 },
             }),
         ));
@@ -561,7 +563,7 @@ fn streaming_tail_restyles_when_the_span_closes() {
         &EventPayload::Item(ItemEvent::Delta {
             item_id: item,
             delta: ItemDelta::Text {
-                text: "7** done".to_owned(),
+                text: "7** done".to_owned().into(),
             },
         }),
     ));

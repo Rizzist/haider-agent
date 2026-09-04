@@ -266,6 +266,7 @@ impl QueuedFrame {
 pub(crate) enum OutboundBytes {
     Contiguous(Arc<Zeroizing<Vec<u8>>>),
     Framed(Arc<uds_codec::ZeroizingEncodedFrame>),
+    Event(Arc<uds_codec::ZeroizingEncodedEventFrame>),
 }
 
 impl OutboundBytes {
@@ -273,6 +274,7 @@ impl OutboundBytes {
         match self {
             Self::Contiguous(bytes) => bytes.len(),
             Self::Framed(frame) => frame.framed_len(),
+            Self::Event(frame) => frame.framed_len(),
         }
     }
 }
@@ -307,6 +309,12 @@ impl From<Zeroizing<Vec<u8>>> for OutboundBytes {
 impl From<uds_codec::ZeroizingEncodedFrame> for OutboundBytes {
     fn from(frame: uds_codec::ZeroizingEncodedFrame) -> Self {
         Self::Framed(Arc::new(frame))
+    }
+}
+
+impl From<uds_codec::ZeroizingEncodedEventFrame> for OutboundBytes {
+    fn from(frame: uds_codec::ZeroizingEncodedEventFrame) -> Self {
+        Self::Event(Arc::new(frame))
     }
 }
 
@@ -1768,6 +1776,73 @@ where
                 let prefix_written = written.min(prefix_remaining);
                 prefix_offset += prefix_written;
                 body_offset += written.saturating_sub(prefix_written);
+            }
+            Ok(())
+        }
+        OutboundBytes::Event(frame) => {
+            writer.write_all(frame.prefix()).await?;
+            match frame.body_parts() {
+                uds_codec::EncodedEventBodyRef::Contiguous(body) => writer.write_all(body).await,
+                uds_codec::EncodedEventBodyRef::Reply {
+                    head,
+                    text,
+                    tail,
+                    encoding,
+                } => {
+                    writer.write_all(head).await?;
+                    write_reply_scalar_async(writer, text, encoding).await?;
+                    writer.write_all(tail).await
+                }
+            }
+        }
+    }
+}
+
+async fn write_reply_scalar_async<W>(
+    writer: &mut W,
+    text: &haider_protocol::reply::ReplyText,
+    encoding: haider_rpc::WireEncoding,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match encoding {
+        haider_rpc::WireEncoding::Json => {
+            writer.write_all(b"\"").await?;
+            for segment in text.segments() {
+                let segment = std::str::from_utf8(&segment)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                let mut start = 0;
+                while start < segment.len() {
+                    let mut end = start.saturating_add(16 * 1_024).min(segment.len());
+                    while end > start && !segment.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let encoded =
+                        serde_json::to_vec(&segment[start..end]).map_err(std::io::Error::other)?;
+                    writer.write_all(&encoded[1..encoded.len() - 1]).await?;
+                    start = end;
+                }
+            }
+            writer.write_all(b"\"").await
+        }
+        haider_rpc::WireEncoding::MessagePack => {
+            let len = text.len();
+            if len < 32 {
+                writer.write_all(&[0xa0 | len as u8]).await?;
+            } else if let Ok(len) = u8::try_from(len) {
+                writer.write_all(&[0xd9, len]).await?;
+            } else if let Ok(len) = u16::try_from(len) {
+                writer.write_all(&[0xda]).await?;
+                writer.write_all(&len.to_be_bytes()).await?;
+            } else {
+                let len = u32::try_from(len)
+                    .map_err(|_| std::io::Error::other("MessagePack reply exceeds str32"))?;
+                writer.write_all(&[0xdb]).await?;
+                writer.write_all(&len.to_be_bytes()).await?;
+            }
+            for segment in text.segments() {
+                writer.write_all(&segment).await?;
             }
             Ok(())
         }

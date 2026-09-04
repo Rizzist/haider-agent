@@ -1385,9 +1385,7 @@ impl SessionFolder {
                 }
             }
             "usage" => {
-                let Ok(mut usage) =
-                    serde_json::from_value::<UsagePayload>(envelope.payload.clone())
-                else {
+                let Ok(mut usage) = envelope.payload.decode::<UsagePayload>() else {
                     return;
                 };
                 let request_ordinal = usage.request.as_ref().map(|request| request.ordinal);
@@ -1426,10 +1424,17 @@ impl SessionFolder {
                 self.chunks.insert(key, (usage, model, envelope.seq));
             }
             "item" => {
-                let payload = &envelope.payload;
-                if let Ok(EventPayload::Item(event)) =
-                    serde_json::from_value::<EventPayload>(payload.clone())
+                if envelope
+                    .payload
+                    .get("item")
+                    .and_then(|item| item.get("item"))
+                    .and_then(serde_json::Value::as_str)
+                    != Some("tool_call")
                 {
+                    return;
+                }
+                let payload = &envelope.payload;
+                if let Ok(EventPayload::Item(event)) = payload.decode_event() {
                     match event {
                         ItemEvent::Started { item_id, item }
                         | ItemEvent::Completed { item_id, item }
@@ -1469,9 +1474,7 @@ impl SessionFolder {
                 self.stats.lines_removed = self.stats.lines_removed.saturating_add(removed);
             }
             "run_state" => {
-                if let Ok(EventPayload::RunState(state)) =
-                    serde_json::from_value::<EventPayload>(envelope.payload.clone())
-                {
+                if let Ok(EventPayload::RunState(state)) = envelope.payload.decode_event() {
                     let timing = self.timings.entry(envelope_agent).or_default();
                     if state.is_terminal() {
                         timing.live = false;

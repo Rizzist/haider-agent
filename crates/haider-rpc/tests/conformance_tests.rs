@@ -701,7 +701,8 @@ fn msgpack_round_trips_nested_json_value_on_both_transports() {
             "array": [null, true, -7, 3.5, {"deep": "value"}],
             "unicode": "سلام"
         }
-    });
+    })
+    .into();
     let frame = WireFrame::Event {
         attachment_id: AttachmentId::new("attachment-msgpack"),
         session_id: SessionId::new("session-1"),

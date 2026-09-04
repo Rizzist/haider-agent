@@ -164,29 +164,49 @@ impl ItemBlock {
 
 const LARGE_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
 
-pub(crate) fn index_agent_text(text: &str) -> Vec<u32> {
-    if text.len() <= LARGE_AGENT_MESSAGE_BYTES || text.len() > u32::MAX as usize {
-        return Vec::new();
-    }
-    let logical_lines = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
-    let mut starts = Vec::with_capacity(logical_lines);
-    starts.push(0);
-    starts.extend(
-        text.bytes()
-            .enumerate()
-            .filter(|(_, byte)| *byte == b'\n')
-            .map(|(index, _)| u32::try_from(index + 1).unwrap_or(u32::MAX)),
-    );
-    starts
-}
-
 fn index_agent_lines(item: &TurnItem) -> Vec<u32> {
     match item {
-        TurnItem::AgentMessage { text } => index_agent_text(text),
+        TurnItem::AgentMessage { text } => index_agent_reply(text),
         _ => Vec::new(),
     }
 }
 
+fn append_agent_line_starts(
+    starts: &mut Vec<u32>,
+    previous_len: usize,
+    delta: &haider_protocol::reply::ReplyText,
+) {
+    let mut base = previous_len;
+    delta.visit_strs(|segment| {
+        starts.extend(
+            segment
+                .bytes()
+                .enumerate()
+                .filter(|(_, byte)| *byte == b'\n')
+                .filter_map(|(index, _)| u32::try_from(base + index + 1).ok()),
+        );
+        base = base.saturating_add(segment.len());
+    });
+}
+
+pub(crate) fn index_agent_reply(text: &haider_protocol::reply::ReplyText) -> Vec<u32> {
+    if text.len() <= LARGE_AGENT_MESSAGE_BYTES || text.len() > u32::MAX as usize {
+        return Vec::new();
+    }
+    let mut starts = vec![0];
+    let mut base = 0_usize;
+    text.visit_strs(|segment| {
+        starts.extend(
+            segment
+                .bytes()
+                .enumerate()
+                .filter(|(_, byte)| *byte == b'\n')
+                .filter_map(|(index, _)| u32::try_from(base + index + 1).ok()),
+        );
+        base = base.saturating_add(segment.len());
+    });
+    starts
+}
 /// A hidden direct-user-shell provenance marker. Unknown, malformed, and
 /// non-item extensions are not display authority.
 #[must_use]
@@ -279,6 +299,26 @@ impl TodoPanel {
     }
 }
 
+fn item_reply_text(item: &TurnItem) -> Option<&haider_protocol::reply::ReplyText> {
+    match item {
+        TurnItem::AgentMessage { text } | TurnItem::IncompleteAgentMessage { text, .. } => {
+            Some(text)
+        }
+        TurnItem::Reasoning { summary } => Some(summary),
+        _ => None,
+    }
+}
+
+fn item_reply_text_mut(item: &mut TurnItem) -> Option<&mut haider_protocol::reply::ReplyText> {
+    match item {
+        TurnItem::AgentMessage { text } | TurnItem::IncompleteAgentMessage { text, .. } => {
+            Some(text)
+        }
+        TurnItem::Reasoning { summary } => Some(summary),
+        _ => None,
+    }
+}
+
 /// Session display state, reduced from the envelope stream.
 #[derive(Debug, Default)]
 pub struct SessionProjection {
@@ -310,6 +350,9 @@ pub struct SessionProjection {
     /// control banner reads this ingest-time index in O(1); it must never
     /// scan transcript history on the frame path.
     screen_control_items: std::collections::HashSet<ItemId>,
+    /// Unique append authorities for live assistant/reasoning rows. Completed
+    /// transcript items retain only their shared reply range.
+    reply_writers: std::collections::HashMap<ItemId, haider_protocol::reply::ReplyArenaWriter>,
     /// Item ids whose lifecycle has closed — a re-delivered `Completed` (or a
     /// stale `Started`) for one of these is idempotently ignored (replace
     /// semantics: one item, one block, ever).
@@ -1330,6 +1373,11 @@ impl SessionProjection {
                     if is_screen_control_item(item) {
                         self.screen_control_items.insert(item_id.clone());
                     }
+                    if let Some(text) = item_reply_text(item) {
+                        let mut writer = haider_protocol::reply::ReplyArenaWriter::new();
+                        let _ = writer.append_shared(text);
+                        self.reply_writers.insert(item_id.clone(), writer);
+                    }
                     self.entries
                         .push(TranscriptEntry::Item(ItemBlock::new_spoken(
                             item_id.clone(),
@@ -1363,7 +1411,16 @@ impl SessionProjection {
                         )));
                     }
                 } else {
-                    if is_screen_control_item(item) {
+                    let mut completed_item = item.clone();
+                    if let Some(writer) = self.reply_writers.get(item_id) {
+                        let canonical = writer.snapshot();
+                        if let Some(completed) = item_reply_text_mut(&mut completed_item)
+                            && *completed == canonical
+                        {
+                            *completed = canonical;
+                        }
+                    }
+                    if is_screen_control_item(&completed_item) {
                         self.screen_control_items.insert(item_id.clone());
                     } else {
                         self.screen_control_items.remove(item_id);
@@ -1371,8 +1428,8 @@ impl SessionProjection {
                     self.finished_items.insert(item_id.clone());
                     let replaced = if let Some(block) = self.open_block_mut(item_id) {
                         // Replace semantics: the final item is authoritative.
-                        block.agent_line_starts = index_agent_lines(item);
-                        block.item = item.clone();
+                        block.agent_line_starts = index_agent_lines(&completed_item);
+                        block.item = completed_item;
                         block.streaming = false;
                         // The completed item carries the parsed args; the raw
                         // fragment accumulation is a duplicate — release it
@@ -1385,7 +1442,7 @@ impl SessionProjection {
                         self.entries
                             .push(TranscriptEntry::Item(ItemBlock::new_spoken(
                                 item_id.clone(),
-                                item.clone(),
+                                completed_item,
                                 false,
                                 self.voice_live,
                             )));
@@ -1394,6 +1451,7 @@ impl SessionProjection {
                     if replaced {
                         self.entry_mutation_revision = self.entry_mutation_revision.wrapping_add(1);
                     }
+                    self.reply_writers.remove(item_id);
                 }
                 if let TurnItem::ToolCall {
                     call_id, status, ..
@@ -1418,6 +1476,16 @@ impl SessionProjection {
         // 2026-08-15). Command OUTPUT is tool-execution data, not generation,
         // and stays excluded.
         let mut output_chars = 0u64;
+        let reply_snapshot = match delta {
+            ItemDelta::Text { text } | ItemDelta::Reasoning { text } => {
+                output_chars = u64::try_from(text.char_count()).unwrap_or(u64::MAX);
+                self.reply_writers.get_mut(item_id).map(|writer| {
+                    let _ = writer.append_shared(text);
+                    writer.snapshot()
+                })
+            }
+            _ => None,
+        };
         let mut mutated = false;
         {
             let Some(block) = self.open_block_mut(item_id) else {
@@ -1427,30 +1495,33 @@ impl SessionProjection {
             match delta {
                 ItemDelta::Text { text } => {
                     if let TurnItem::AgentMessage { text: body } = &mut block.item {
-                        let old_len = body.len();
-                        body.push_str(text);
-                        if block.agent_line_starts.is_empty() {
-                            block.agent_line_starts = index_agent_text(body);
-                        } else if body.len() <= u32::MAX as usize {
-                            block.agent_line_starts.extend(
-                                text.bytes()
-                                    .enumerate()
-                                    .filter(|(_, byte)| *byte == b'\n')
-                                    .map(|(index, _)| {
-                                        u32::try_from(old_len + index + 1).unwrap_or(u32::MAX)
-                                    }),
-                            );
+                        let previous_len = body.len();
+                        if let Some(snapshot) = reply_snapshot.clone() {
+                            *body = snapshot;
                         } else {
-                            block.agent_line_starts.clear();
+                            *body = text.clone();
                         }
-                        output_chars = text.chars().count() as u64;
+                        if body.len() > LARGE_AGENT_MESSAGE_BYTES {
+                            if block.agent_line_starts.is_empty() {
+                                block.agent_line_starts = index_agent_reply(body);
+                            } else {
+                                append_agent_line_starts(
+                                    &mut block.agent_line_starts,
+                                    previous_len,
+                                    text,
+                                );
+                            }
+                        }
                         mutated = true;
                     }
                 }
                 ItemDelta::Reasoning { text } => {
                     if let TurnItem::Reasoning { summary } = &mut block.item {
-                        summary.push_str(text);
-                        output_chars = text.chars().count() as u64;
+                        if let Some(snapshot) = reply_snapshot {
+                            *summary = snapshot;
+                        } else {
+                            *summary = text.clone();
+                        }
                         mutated = true;
                     }
                 }
@@ -1724,7 +1795,7 @@ impl SessionProjection {
             SeedRow::Agent(text) => self.apply(&EventPayload::Item(ItemEvent::Completed {
                 item_id: id,
                 item: TurnItem::AgentMessage {
-                    text: (*text).to_owned(),
+                    text: (*text).into(),
                 },
             })),
             SeedRow::Tool { name, desc, meta } => {

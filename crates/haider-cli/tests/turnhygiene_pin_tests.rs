@@ -11,14 +11,14 @@
 //! Goldens live under `tests/fixtures/turnhygiene/`. Re-bless deliberately
 //! with `UPDATE_FIXTURES=1` after reviewing the diff the failing test prints.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PREBUILT_SIBLINGS_ENV: &str = "HAIDER_TEST_SIBLINGS_PREBUILT";
 const FIXTURE_DIR: &str = "tests/fixtures/turnhygiene";
@@ -26,8 +26,53 @@ const FIXTURE_DIR: &str = "tests/fixtures/turnhygiene";
 /// run spawned; `TestProfile::drop` stops it explicitly.
 const RESIDENT_IDLE_TTL_MS: &str = "120000";
 const PROCESS_DEADLINE: Duration = Duration::from_secs(60);
+const FILE_WAIT_DEADLINE: Duration = Duration::from_secs(20);
 const PROXY_PROVIDER: &str = "pinproxy";
 const PROXY_MODEL: &str = "pin-model";
+
+const TEXT_TURN_SCRIPT: &str = r#"[{"step":"emit_text","text":"golden text"},{"step":"emit_usage","usage":{"input":12,"output":3,"reasoning":0,"cached":0,"source":"locally_exact"}},{"step":"finish","reason":"end_turn"}]"#;
+
+#[cfg(unix)]
+const GOLDEN_EXEC_COMMAND: &str = "printf golden; exit 3";
+#[cfg(windows)]
+const GOLDEN_EXEC_COMMAND: &str = "[Console]::Out.Write('golden'); exit 3";
+
+fn tool_turn_script() -> String {
+    serde_json::json!([
+        {
+            "step": "emit_tool_call",
+            "call_id": "golden-exec",
+            "name": "process_exec",
+            "args": {"command": GOLDEN_EXEC_COMMAND}
+        },
+        {"step": "finish", "reason": "tool_use"},
+        {"step": "expect_tool_result", "call_id": "golden-exec"},
+        {"step": "emit_text", "text": "golden tool"},
+        {
+            "step": "emit_usage",
+            "usage": {"input": 40, "output": 5, "reasoning": 0, "cached": 0, "source": "locally_exact"}
+        },
+        {"step": "finish", "reason": "end_turn"}
+    ])
+    .to_string()
+}
+
+fn text_segments(count: usize) -> String {
+    let steps = (0..count)
+        .flat_map(|index| {
+            [
+                serde_json::json!({"step": "emit_text", "text": format!("segment-{index}")}),
+                serde_json::json!({"step": "finish", "reason": "end_turn"}),
+            ]
+        })
+        .collect::<Vec<_>>();
+    serde_json::Value::Array(steps).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Process harness
+// ---------------------------------------------------------------------------
+
 fn ensure_siblings_prebuilt() {
     assert_eq!(
         std::env::var(PREBUILT_SIBLINGS_ENV).as_deref(),
@@ -46,6 +91,7 @@ fn ensure_siblings_prebuilt() {
         sibling.display()
     );
 }
+
 /// One hermetic profile, machine home, and canonical workspace. Every command
 /// built from it shares the same daemon rendezvous, so sequential runs
 /// exercise one resident daemon; `Drop` stops that daemon.
@@ -277,6 +323,13 @@ fn accepted_and_envelopes(stdout: &[u8]) -> (serde_json::Value, Vec<serde_json::
         .count();
     assert_eq!(terminals, 1, "exactly one typed terminal");
     (accepted, records)
+}
+
+fn run_id_of(envelopes: &[serde_json::Value]) -> String {
+    envelopes
+        .iter()
+        .find_map(|envelope| envelope["run_id"].as_str().map(str::to_owned))
+        .expect("run-scoped envelope")
 }
 
 // ---------------------------------------------------------------------------
@@ -587,6 +640,206 @@ fn proxy_run(profile: &TestProfile, cwd: &Path, extra: &[&str], prompt: &str) ->
     output
 }
 
+fn wait_for_file_lines(path: &Path, count: usize) -> Vec<String> {
+    let started = Instant::now();
+    loop {
+        let lines = std::fs::read_to_string(path)
+            .map(|text| {
+                text.lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if lines.len() >= count {
+            return lines;
+        }
+        assert!(
+            started.elapsed() < FILE_WAIT_DEADLINE,
+            "{} never reached {count} lines (has {})",
+            path.display(),
+            lines.len()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pins: `haider run --jsonl` goldens
+// ---------------------------------------------------------------------------
+
+/// MUTATION CHECK: drop, reorder, rename, or retype any envelope or payload
+/// field on the one-request warm path (context footprint, cache attempt,
+/// usage scope, terminal augmentation). Expected RUNTIME failure: the
+/// normalized stream differs from the golden line by line.
+#[test]
+fn run_jsonl_text_turn_matches_the_normalized_golden() {
+    let profile = TestProfile::new();
+    let mut command = profile.command();
+    command
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "--jsonl",
+            "-p",
+            "golden prompt",
+        ])
+        .env("HAIDER_TEST_FAKE_PROVIDER", TEXT_TURN_SCRIPT)
+        .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0");
+    let output = output_with_boot_retry(&mut command);
+    assert_success(&output, "text turn");
+    assert!(output.stderr.is_empty(), "JSONL keeps stderr silent");
+    let (_, envelopes) = accepted_and_envelopes(&output.stdout);
+    assert_eq!(
+        envelopes.last().expect("terminal")["payload"]["terminal_kind"],
+        "success"
+    );
+    assert!(envelopes.iter().any(|envelope| {
+        envelope["payload"]["type"] == "item"
+            && envelope["payload"]["event"] == "completed"
+            && envelope["payload"]["item"]["item"] == "agent_message"
+            && envelope["payload"]["item"]["text"] == "golden text"
+    }));
+    // The estimated counters are normalized in the golden; pin their
+    // invariants directly so the placeholder never hides a zero or a mismatch.
+    let footprints = envelopes
+        .iter()
+        .filter(|envelope| envelope["payload"]["item"]["kind"] == "context_footprint_v1")
+        .map(|envelope| envelope["payload"]["item"]["data"]["input_tokens"].as_u64())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        footprints.len(),
+        4,
+        "one footprint pair before the request and one after the response"
+    );
+    assert!(
+        footprints
+            .iter()
+            .all(|tokens| tokens.is_some_and(|tokens| tokens > 0))
+    );
+    assert_eq!(footprints[0], footprints[1]);
+    assert_eq!(footprints[2], footprints[3]);
+
+    assert_golden(
+        "run_jsonl_text_turn.jsonl",
+        &normalize_jsonl(&output.stdout, &profile.workspace, &[]),
+    );
+}
+
+/// MUTATION CHECK: change how a tool round is journaled — effect phases,
+/// command-output deltas, the process signal, the bounded tool result, the
+/// node commit, or the second-request cache/footprint items. Expected RUNTIME
+/// failure: the normalized stream differs from the golden line by line.
+#[test]
+fn run_jsonl_tool_turn_matches_the_normalized_golden() {
+    let profile = TestProfile::new();
+    let mut command = profile.command();
+    command
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "--allow-exec",
+            "--jsonl",
+            "-p",
+            "golden tool prompt",
+        ])
+        .env("HAIDER_TEST_FAKE_PROVIDER", tool_turn_script())
+        .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0");
+    let output = output_with_boot_retry(&mut command);
+    assert_success(&output, "tool turn");
+    let (_, envelopes) = accepted_and_envelopes(&output.stdout);
+    let result = envelopes
+        .iter()
+        .find(|envelope| envelope["payload"]["type"] == "tool_result")
+        .expect("tool result");
+    assert_eq!(result["payload"]["call_id"], "golden-exec");
+    let preview: serde_json::Value = serde_json::from_str(
+        result["payload"]["result"]["preview"]
+            .as_str()
+            .expect("preview"),
+    )
+    .expect("preview JSON");
+    assert_eq!(preview["exit_code"], 3);
+    assert_eq!(preview["output"], "golden");
+    assert_eq!(preview["output_bytes"], 6);
+    assert_eq!(preview["status"], "failed");
+    assert_eq!(
+        envelopes
+            .iter()
+            .filter(|envelope| envelope["payload"]["type"] == "process_signal_recorded")
+            .count(),
+        1,
+        "one process signal per foreground tool call"
+    );
+    assert!(envelopes.iter().any(|envelope| {
+        envelope["payload"]["type"] == "effect"
+            && envelope["payload"]["phase"] == "outcome"
+            && envelope["payload"]["workspace_mutation"]["mutation_digest"].is_string()
+    }));
+
+    assert_golden(
+        "run_jsonl_tool_turn.jsonl",
+        &normalize_jsonl(
+            &output.stdout,
+            &profile.workspace,
+            &[(GOLDEN_EXEC_COMMAND, "<CMD>")],
+        ),
+    );
+}
+
+/// MUTATION CHECK: let the live stream and the durable journal diverge across
+/// a tool round (a skipped append, a reordered batch, a synthesized envelope,
+/// or a second terminal). Expected RUNTIME failure: the replay document's
+/// events are not exactly the run-scoped live envelopes.
+#[test]
+fn replay_of_a_tool_call_turn_equals_the_live_run_scoped_jsonl() {
+    let profile = TestProfile::new();
+    let mut live = profile.command();
+    live.args([
+        "run",
+        "--provider",
+        "fake",
+        "--allow-exec",
+        "--jsonl",
+        "-p",
+        "replay parity",
+    ])
+    .env("HAIDER_TEST_FAKE_PROVIDER", tool_turn_script());
+    let live = output_with_boot_retry(&mut live);
+    assert_success(&live, "live tool turn");
+    let (accepted, envelopes) = accepted_and_envelopes(&live.stdout);
+    let run_id = run_id_of(&envelopes);
+
+    let mut replay = profile.command();
+    replay.args(["run", "--replay", &run_id]);
+    let replay = output_with_boot_retry(&mut replay);
+    assert_success(&replay, "replay");
+    let replay: serde_json::Value = serde_json::from_slice(&replay.stdout).expect("replay JSON");
+    assert_eq!(replay["schema"], "haider.run.replay.v1");
+    assert_eq!(replay["provider_requests"], 0);
+    assert_eq!(replay["session_id"], accepted["session_id"]);
+    assert_eq!(replay["integrity"]["exactly_one_typed_terminal"], true);
+    assert_eq!(replay["equivalence"]["tool_trace_matches"], true);
+    assert_eq!(replay["response"], "golden tool");
+
+    let expected = envelopes
+        .iter()
+        .filter(|envelope| envelope["run_id"].as_str() == Some(run_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        expected.len() > 30,
+        "a tool round journals a rich run scope"
+    );
+    assert_eq!(
+        replay["events"].as_array().expect("replay events"),
+        &expected,
+        "durable replay must reproduce the run-scoped live stream exactly"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Pins: provider request body
 // ---------------------------------------------------------------------------
@@ -759,5 +1012,445 @@ fn resident_daemon_rediscovers_project_instructions_across_runs_and_cwds() {
     assert!(
         sixth.contains("other-delta"),
         "the other workspace is unaffected"
+    );
+}
+
+#[cfg(unix)]
+fn capture_hook_command(capture: &Path) -> String {
+    format!("(cat; printf '\\n') >> '{}'", capture.display())
+}
+
+#[cfg(windows)]
+fn capture_hook_command(capture: &Path) -> String {
+    let capture = capture.display().to_string().replace('\'', "''");
+    format!(
+        "$i=[Console]::OpenStandardInput();$f=[IO.File]::Open('{capture}',[IO.FileMode]::Append,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite);$i.CopyTo($f);$f.WriteByte(10);$f.Dispose()"
+    )
+}
+
+#[cfg(unix)]
+const CAPTURE_HOOK_TIMEOUT_MS: u64 = 2_000;
+#[cfg(windows)]
+const CAPTURE_HOOK_TIMEOUT_MS: u64 = 5_000;
+
+fn write_workspace_hook(workspace: &Path, name: &str, capture: &Path) {
+    std::fs::write(
+        workspace.join("hooks.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "haider.hooks.v1",
+            "hooks": {
+                name: {
+                    "matcher": {"event": "user_message"},
+                    "kind": "exec",
+                    "command": capture_hook_command(capture),
+                    "timeout_ms": CAPTURE_HOOK_TIMEOUT_MS,
+                }
+            }
+        }))
+        .expect("workspace hooks JSON"),
+    )
+    .expect("write workspace hooks");
+}
+
+fn fake_run(profile: &TestProfile, cwd: &Path, script: &str, prompt: &str) -> (String, String) {
+    let mut command = profile.command();
+    command
+        .current_dir(cwd)
+        .args(["run", "--provider", "fake", "--jsonl", "-p", prompt])
+        .env("HAIDER_TEST_FAKE_PROVIDER", script);
+    let output = output_with_boot_retry(&mut command);
+    assert_success(&output, "fake run");
+    let (accepted, envelopes) = accepted_and_envelopes(&output.stdout);
+    (
+        accepted["session_id"]
+            .as_str()
+            .expect("session id")
+            .to_owned(),
+        run_id_of(&envelopes),
+    )
+}
+
+/// MUTATION CHECK: snapshot hook discovery once per daemon instead of per
+/// run, key the snapshot on the wrong cwd, or drop the hook's JSON payload.
+/// Expected RUNTIME failure: the hook installed between runs never fires, a
+/// foreign workspace's hook fires, or the captured payload loses its
+/// session/run/text fields.
+#[test]
+fn resident_daemon_discovers_a_hook_installed_between_runs_and_scopes_it_by_cwd() {
+    let profile = TestProfile::new();
+    std::fs::write(
+        profile.profile.join("hooks.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "haider.hooks.v1",
+            "policy": "trust_workspace",
+            "hooks": {}
+        }))
+        .expect("profile hooks JSON"),
+    )
+    .expect("write profile hooks");
+    let script = text_segments(4);
+    let workspace_a = profile.workspace.clone();
+    let workspace_b = profile.sibling_workspace("workspace-b");
+    let capture_a = profile.root().join("capture-a.jsonl");
+    let capture_b = profile.root().join("capture-b.jsonl");
+
+    let (session_one, run_one) = fake_run(&profile, &workspace_a, &script, "no hook yet");
+    assert!(!capture_a.exists(), "no hook exists yet, so nothing fires");
+
+    // Installing a hook replays the retained (undecoded) facts of the hookless
+    // run first, then fires for the new run: two captured messages.
+    write_workspace_hook(&workspace_a, "capture_a", &capture_a);
+    let (session_two, run_two) = fake_run(&profile, &workspace_a, &script, "hook installed");
+    let lines = wait_for_file_lines(&capture_a, 2);
+    let payloads = lines
+        .iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("hook payload JSON"))
+        .collect::<Vec<_>>();
+    let payload_for = |payloads: &[serde_json::Value], session: &str| {
+        payloads
+            .iter()
+            .find(|payload| payload["session"] == session)
+            .cloned()
+            .unwrap_or_else(|| panic!("hook payload for {session} among {payloads:?}"))
+    };
+    let replayed = payload_for(&payloads, &session_one);
+    assert_eq!(replayed["event"], "user_message");
+    assert_eq!(replayed["run"], run_one);
+    assert!(lines.iter().any(|line| line.contains("no hook yet")));
+    let fired = payload_for(&payloads, &session_two);
+    assert_eq!(fired["event"], "user_message");
+    assert_eq!(fired["run"], run_two);
+    assert_eq!(fired["mode"], "queue");
+    assert!(lines.iter().any(|line| line.contains("hook installed")));
+
+    write_workspace_hook(&workspace_b, "capture_b", &capture_b);
+    let (session_three, run_three) = fake_run(&profile, &workspace_b, &script, "other workspace");
+    let lines_b = wait_for_file_lines(&capture_b, 1);
+    let payload_b: serde_json::Value =
+        serde_json::from_str(&lines_b[0]).expect("hook payload JSON");
+    assert_eq!(payload_b["session"], session_three);
+    assert_eq!(payload_b["run"], run_three);
+
+    let (session_four, run_four) = fake_run(&profile, &workspace_a, &script, "back in a");
+    let lines = wait_for_file_lines(&capture_a, 3);
+    assert_eq!(
+        lines.len(),
+        3,
+        "workspace A fired exactly for its own three runs"
+    );
+    let payloads = lines
+        .iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("hook payload JSON"))
+        .collect::<Vec<_>>();
+    let fired = payload_for(&payloads, &session_four);
+    assert_eq!(fired["run"], run_four);
+    assert!(
+        !lines.iter().any(|line| line.contains(&session_three)),
+        "workspace B's run never reached workspace A's hook"
+    );
+    let lines_b = wait_for_file_lines(&capture_b, 1);
+    assert_eq!(
+        lines_b.len(),
+        1,
+        "workspace A's runs never reached workspace B's hook"
+    );
+    assert!(!lines_b.iter().any(|line| line.contains(&session_four)));
+}
+
+// ---------------------------------------------------------------------------
+// Pins: profile / provider / model resolution
+// ---------------------------------------------------------------------------
+
+/// MUTATION CHECK: require a profile default before honouring explicit
+/// flags, stop splitting a `provider/model` selector, or stop applying the
+/// profile default when flags are absent. Expected RUNTIME failure: a run
+/// refuses, or the wire model/provider differs from the selection.
+#[test]
+fn custom_provider_binds_from_explicit_flags_a_model_selector_and_the_profile_default() {
+    let proxy = CompatProxy::spawn();
+    let profile = TestProfile::new();
+    profile.write_custom_provider(&proxy.origin);
+    assert!(!profile.profile.join("config.json").exists());
+
+    let configured_of = |output: &Output| {
+        let (_, envelopes) = accepted_and_envelopes(&output.stdout);
+        envelopes
+            .into_iter()
+            .find(|envelope| envelope["payload"]["type"] == "headless_run_configured")
+            .expect("configured fact")["payload"]
+            .clone()
+    };
+    let wire_model = |index: usize| {
+        let body: serde_json::Value =
+            serde_json::from_slice(&proxy.body(index)).expect("chat body JSON");
+        body["model"].as_str().expect("wire model").to_owned()
+    };
+
+    let explicit = proxy_run(&profile, &profile.workspace, &[], "explicit flags");
+    let configured = configured_of(&explicit);
+    assert_eq!(configured["provider"], PROXY_PROVIDER);
+    assert_eq!(configured["model"], PROXY_MODEL);
+    assert_eq!(wire_model(0), PROXY_MODEL);
+
+    let mut selector = profile.proxy_command();
+    selector.args([
+        "run",
+        "--model",
+        &format!("{PROXY_PROVIDER}/{PROXY_MODEL}"),
+        "--jsonl",
+        "-p",
+        "selector only",
+    ]);
+    let selector = output_with_boot_retry(&mut selector);
+    assert_success(&selector, "selector run");
+    let configured = configured_of(&selector);
+    assert_eq!(configured["provider"], PROXY_PROVIDER);
+    assert_eq!(configured["model"], PROXY_MODEL);
+    assert_eq!(wire_model(1), PROXY_MODEL);
+
+    std::fs::write(
+        profile.profile.join("config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "default_model": format!("{PROXY_PROVIDER}/{PROXY_MODEL}")
+        }))
+        .expect("profile config JSON"),
+    )
+    .expect("write profile config");
+    let mut flagless = profile.proxy_command();
+    flagless.args(["run", "--jsonl", "-p", "profile default"]);
+    let flagless = output_with_boot_retry(&mut flagless);
+    assert_success(&flagless, "flagless run");
+    let configured = configured_of(&flagless);
+    assert_eq!(configured["provider"], PROXY_PROVIDER);
+    assert_eq!(configured["model"], PROXY_MODEL);
+    assert_eq!(wire_model(2), PROXY_MODEL);
+    assert_eq!(proxy.bodies().len(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// Pins: stdout delivery latency and unattached journal parity
+// ---------------------------------------------------------------------------
+
+struct TimedLine {
+    at: Instant,
+    unix_ms: u128,
+    line: String,
+}
+
+/// MUTATION CHECK: hold committed envelopes in the client until the terminal
+/// (or a large batch) instead of flushing them as they arrive. Expected
+/// RUNTIME failure: the first text delta reaches stdout only together with
+/// the second one, so the observed gap collapses below the scripted delay.
+#[test]
+fn jsonl_envelopes_reach_stdout_before_a_later_provider_delay_elapses() {
+    const DELAY_MS: u64 = 1_500;
+    let script = serde_json::json!([
+        {"step": "emit_text", "text": "first"},
+        {"step": "delay", "ms": DELAY_MS},
+        {"step": "emit_text", "text": "second"},
+        {"step": "finish", "reason": "end_turn"}
+    ])
+    .to_string();
+    let profile = TestProfile::new();
+    let mut command = profile.command();
+    command
+        .args(["run", "--provider", "fake", "--jsonl", "-p", "latency"])
+        .env("HAIDER_TEST_FAKE_PROVIDER", script)
+        .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("latency child starts");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let reader = thread::spawn(move || {
+        let mut lines = Vec::new();
+        for line in BufReader::new(stdout).lines() {
+            let line = line.expect("read JSONL line");
+            lines.push(TimedLine {
+                at: Instant::now(),
+                unix_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock")
+                    .as_millis(),
+                line,
+            });
+        }
+        lines
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).expect("read stderr");
+        bytes
+    });
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll child") {
+            break status;
+        }
+        assert!(
+            started.elapsed() < PROCESS_DEADLINE,
+            "latency child deadline"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    let lines = reader.join().expect("reader");
+    let stderr = stderr_reader.join().expect("stderr reader");
+    assert!(
+        status.success(),
+        "exit {:?}; stderr: {}",
+        status.code(),
+        String::from_utf8_lossy(&stderr)
+    );
+
+    let delta_line = |text: &str| {
+        lines
+            .iter()
+            .find(|timed| {
+                serde_json::from_str::<serde_json::Value>(&timed.line).is_ok_and(|value| {
+                    value["payload"]["type"] == "item"
+                        && value["payload"]["event"] == "delta"
+                        && value["payload"]["delta"]["delta"] == "text"
+                        && value["payload"]["delta"]["text"] == text
+                })
+            })
+            .unwrap_or_else(|| panic!("text delta {text:?} reached stdout"))
+    };
+    let first = delta_line("first");
+    let second = delta_line("second");
+    let gap = second.at.saturating_duration_since(first.at);
+    assert!(
+        gap >= Duration::from_millis(DELAY_MS / 2),
+        "the first delta must reach stdout before the provider delay elapses (gap {gap:?})"
+    );
+    for timed in &lines {
+        let value: serde_json::Value = serde_json::from_str(&timed.line).expect("JSON line");
+        let Some(committed) = value["committed_at_ms"].as_u64() else {
+            continue;
+        };
+        let committed = u128::from(committed);
+        assert!(
+            timed.unix_ms + 1_000 >= committed,
+            "an envelope cannot reach stdout before it was committed"
+        );
+        assert!(
+            timed.unix_ms.saturating_sub(committed) < 10_000,
+            "envelope committed at {committed} reached stdout at {} (bounded delivery)",
+            timed.unix_ms
+        );
+    }
+}
+
+fn wait_for_terminal_status(profile: &TestProfile, run_id: &str) {
+    let started = Instant::now();
+    loop {
+        let mut status = profile.command();
+        status.args(["run", "--status", run_id, "--json"]);
+        let output = bounded_output(&mut status, PROCESS_DEADLINE);
+        assert_success(&output, "run status");
+        let status: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("status JSON");
+        assert_eq!(status["schema"], "haider.run.status.v1");
+        if status["result"]["terminal_seq"].is_u64() {
+            let state = &status["result"]["state"];
+            assert!(
+                state == "done" || state["state"] == "done",
+                "detached run ended in {state}"
+            );
+            return;
+        }
+        assert!(
+            started.elapsed() < PROCESS_DEADLINE,
+            "detached run {run_id} never became terminal"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn normalized_replay(profile: &TestProfile, run_id: &str) -> (String, String) {
+    let mut replay = profile.command();
+    replay.args(["run", "--replay", run_id]);
+    let output = output_with_boot_retry(&mut replay);
+    assert_success(&output, "replay");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).expect("replay JSON");
+    assert_eq!(document["integrity"]["exactly_one_typed_terminal"], true);
+    let mut text = String::new();
+    for event in document["events"].as_array().expect("replay events") {
+        let mut event = event.clone();
+        if event["payload"]["type"] == "headless_run_configured" {
+            // Detachment is the one declared difference between the runs.
+            event["payload"]
+                .as_object_mut()
+                .expect("configured payload")
+                .remove("detached");
+        }
+        text.push_str(&serde_json::to_string(&event).expect("event JSON"));
+        text.push('\n');
+    }
+    (
+        normalize_jsonl(text.as_bytes(), &profile.workspace, &[]),
+        document["response"].as_str().expect("response").to_owned(),
+    )
+}
+
+/// MUTATION CHECK: journal extra, fewer, or differently shaped envelopes when
+/// no client is attached during the turn (a projection or fan-out that only
+/// exists for listeners leaking into the durable record). Expected RUNTIME
+/// failure: the normalized durable replays of an attached and a detached run
+/// of the same script differ.
+#[test]
+fn detached_run_journals_the_same_envelopes_as_an_attached_run() {
+    let profile = TestProfile::new();
+    let script = text_segments(2);
+
+    let mut attached = profile.command();
+    attached
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "--jsonl",
+            "-p",
+            "journal parity",
+        ])
+        .env("HAIDER_TEST_FAKE_PROVIDER", &script);
+    let attached = output_with_boot_retry(&mut attached);
+    assert_success(&attached, "attached run");
+    let (_, envelopes) = accepted_and_envelopes(&attached.stdout);
+    let attached_run = run_id_of(&envelopes);
+
+    let mut detached = profile.command();
+    detached
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "--start",
+            "--json",
+            "-p",
+            "journal parity",
+        ])
+        .env("HAIDER_TEST_FAKE_PROVIDER", &script);
+    let detached = output_with_boot_retry(&mut detached);
+    assert_success(&detached, "detached start");
+    let started: serde_json::Value = serde_json::from_slice(&detached.stdout).expect("start JSON");
+    assert_eq!(started["outcome"], "started");
+    let detached_run = started["run_id"]
+        .as_str()
+        .expect("detached run id")
+        .to_owned();
+    wait_for_terminal_status(&profile, &detached_run);
+
+    let (attached_replay, attached_response) = normalized_replay(&profile, &attached_run);
+    let (detached_replay, detached_response) = normalized_replay(&profile, &detached_run);
+    assert_eq!(attached_response, "segment-0");
+    assert_eq!(detached_response, "segment-1");
+    let strip_response = |text: &str| {
+        text.replace("segment-0", "<TEXT>")
+            .replace("segment-1", "<TEXT>")
+    };
+    assert_eq!(
+        strip_response(&detached_replay),
+        strip_response(&attached_replay),
+        "an unattached turn must journal exactly what an attached one does"
     );
 }

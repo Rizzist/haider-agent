@@ -45,7 +45,7 @@ fn node_env(seq: u64, at_ms: u64, kind: NodeKind) -> RawEnvelope {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     }
 }
 
@@ -63,7 +63,7 @@ fn fixture_events() -> Vec<RawEnvelope> {
             3,
             CREATED_MS + 2_000,
             NodeKind::AssistantCommit {
-                text: "On it — deploying now.".to_owned(),
+                text: "On it — deploying now.".to_owned().into(),
                 verdict: VerifyVerdict::Unverified,
             },
         ),

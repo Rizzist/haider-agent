@@ -83,6 +83,7 @@ use haider_protocol::provider::{
     PROVIDER_OPAQUE_EXTENSION_KIND, PrefixDigests, PreviousCacheBreakpointV1, RequestUsage,
     StreamEvent, Usage, UsageRequestKind, UsageScope, WEB_SOURCES_EXTENSION_KIND, WebSource,
 };
+use haider_protocol::reply::{ReplyArenaWriter, ReplyText};
 use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::{
     BoundedResult, ImageBlockRef, TOOL_RESULT_IMAGE_MAX_BYTES,
@@ -1083,7 +1084,7 @@ pub struct PartialStreamCheckpoint {
     pub request_seq: u64,
     pub opening_generation: u64,
     pub item_id: ItemId,
-    pub text: String,
+    pub text: ReplyText,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1098,7 +1099,7 @@ pub struct SubmitPartialStreamTurn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteWaitTextCheckpoint {
     pub item_id: ItemId,
-    pub text: String,
+    pub text: ReplyText,
 }
 
 /// One provider-authored tool call whose streamed arguments were incomplete
@@ -1950,7 +1951,7 @@ impl HarnessHandle {
     /// edge is intentionally separate from the bounded command queue: one
     /// menu can have only one authoritative resolution.
     pub fn apply_committed_menu_event(&self, envelope: RawEnvelope) -> Result<(), HaiderError> {
-        if !serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(|payload| {
+        if !envelope.payload.decode_event().is_ok_and(|payload| {
             matches!(
                 payload,
                 EventPayload::MenuAnswered(_) | EventPayload::MenuClosed { .. }
@@ -2727,7 +2728,7 @@ impl HarnessActor {
             self.config.provider_tool_fallback_tools =
                 canonical_tool_definitions(&self.config.provider_tool_fallback_tools);
         }
-        let (run_id, mut messages, checkpoint, partial_stream, route_wait, child_wait) =
+        let (run_id, mut messages, checkpoint, partial_stream, mut route_wait, child_wait) =
             match submit {
                 TurnSubmission::Local(submit) => {
                     let run_id = self.next_run_id();
@@ -2838,33 +2839,24 @@ impl HarnessActor {
         let mut reasoning: Option<TextAccumulator> = None;
         let mut tools: Vec<ToolAccumulator> = Vec::new();
         let mut replay = ReplayPrefix::default();
-        if let Some(checkpoint) = route_wait.as_ref() {
+        let mut route_message_ranges = VecDeque::<ReplyText>::new();
+        if let Some(checkpoint) = route_wait.as_mut() {
             replay.response_epoch = checkpoint.response_epoch;
-            let has_message_events = checkpoint
-                .structured_events
-                .iter()
-                .any(|event| matches!(event, StreamEvent::TextDelta { .. }));
-            let has_reasoning_events = checkpoint
-                .structured_events
-                .iter()
-                .any(|event| matches!(event, StreamEvent::ReasoningDelta { .. }));
             if let Some(checkpoint) = checkpoint.message.as_ref() {
-                message = Some(TextAccumulator {
-                    item_id: checkpoint.item_id.clone(),
-                    text: checkpoint.text.clone(),
-                });
-                if !has_message_events {
-                    replay.message_applied.clone_from(&checkpoint.text);
-                }
+                message = Some(TextAccumulator::from_shared(
+                    checkpoint.item_id.clone(),
+                    &checkpoint.text,
+                    true,
+                ));
+                replay.message_applied = Some(checkpoint.text.clone());
             }
             if let Some(checkpoint) = checkpoint.reasoning.as_ref() {
-                reasoning = Some(TextAccumulator {
-                    item_id: checkpoint.item_id.clone(),
-                    text: checkpoint.text.clone(),
-                });
-                if !has_reasoning_events {
-                    replay.reasoning_applied.clone_from(&checkpoint.text);
-                }
+                reasoning = Some(TextAccumulator::from_shared(
+                    checkpoint.item_id.clone(),
+                    &checkpoint.text,
+                    false,
+                ));
+                replay.reasoning_applied = Some(checkpoint.text.clone());
             }
             for tool in &checkpoint.tools {
                 tools.push(ToolAccumulator {
@@ -2889,16 +2881,16 @@ impl HarnessActor {
                     }
                 }
             }
-            for event in &checkpoint.structured_events {
+            let mut replay_messages = ReplyArenaWriter::new().with_standard_provider_json_views();
+            let mut replay_reasoning = ReplyArenaWriter::new();
+            for event in &mut checkpoint.structured_events {
                 match event {
-                    StreamEvent::TextDelta { text } if has_message_events => {
-                        replay.message_applied.push_str(text);
+                    StreamEvent::TextDelta { text } => {
+                        route_message_ranges.push_back(replay_messages.append_shared(text));
                     }
-                    StreamEvent::TextDelta { .. } => {}
-                    StreamEvent::ReasoningDelta { text } if has_reasoning_events => {
-                        replay.reasoning_applied.push_str(text);
+                    StreamEvent::ReasoningDelta { text } => {
+                        let _ = replay_reasoning.append_shared(text);
                     }
-                    StreamEvent::ReasoningDelta { .. } => {}
                     StreamEvent::RefusalDelta { text } => {
                         replay.refusal_applied.push_str(text);
                     }
@@ -2907,6 +2899,12 @@ impl HarnessActor {
                     }
                     _ => {}
                 }
+            }
+            if !replay_messages.is_empty() {
+                replay.message_applied = Some(replay_messages.seal());
+            }
+            if !replay_reasoning.is_empty() {
+                replay.reasoning_applied = Some(replay_reasoning.seal());
             }
             replay.message.clone_from(&replay.message_applied);
             replay.reasoning.clone_from(&replay.reasoning_applied);
@@ -3201,18 +3199,13 @@ impl HarnessActor {
         // These are one logical provider response, not one physical transport
         // attempt. A reconnect keeps them alive while replay filtering skips
         // already-applied structured events and tool effects.
-        let route_has_message_events = route_wait.as_ref().is_some_and(|checkpoint| {
-            checkpoint
-                .structured_events
-                .iter()
-                .any(|event| matches!(event, StreamEvent::TextDelta { .. }))
-        });
+        let route_has_message_events = !route_message_ranges.is_empty();
         let mut assistant_blocks = if route_has_message_events {
             Vec::new()
         } else {
             message.as_ref().map_or_else(Vec::new, |message| {
                 vec![Block::Text {
-                    text: message.text.clone(),
+                    text: message.snapshot(),
                 }]
             })
         };
@@ -3226,8 +3219,10 @@ impl HarnessActor {
                 .collect::<HashMap<_, _>>();
             for event in &checkpoint.structured_events {
                 match event {
-                    StreamEvent::TextDelta { text } if route_has_message_events => {
-                        assistant_blocks.push(Block::Text { text: text.clone() });
+                    StreamEvent::TextDelta { .. } if route_has_message_events => {
+                        if let Some(text) = route_message_ranges.pop_front() {
+                            append_assistant_text_block(&mut assistant_blocks, text);
+                        }
                     }
                     StreamEvent::ProviderOpaque { provider, data } => {
                         assistant_blocks.push(Block::ProviderOpaque {
@@ -4247,10 +4242,9 @@ impl HarnessActor {
                 return self.errored_state_outcome(&run_id, error).await;
             }
 
-            let mut provider_content_seen =
-                message.as_ref().is_some_and(|item| !item.text.is_empty())
-                    || reasoning.as_ref().is_some_and(|item| !item.text.is_empty())
-                    || replay.has_applied_content();
+            let mut provider_content_seen = message.as_ref().is_some_and(|item| !item.is_empty())
+                || reasoning.as_ref().is_some_and(|item| !item.is_empty())
+                || replay.has_applied_content();
             let mut first_provider_event_seen = false;
             let provider_stream_started = self
                 .config
@@ -4735,10 +4729,7 @@ impl HarnessActor {
                                 )
                                 .await;
                         }
-                        if message
-                            .as_ref()
-                            .is_some_and(|partial| !partial.text.is_empty())
-                        {
+                        if message.as_ref().is_some_and(|partial| !partial.is_empty()) {
                             let presentation = stream_interruption_presentation(&error);
                             let (source_item, partial) = match self
                                 .complete_incomplete_message(
@@ -4990,10 +4981,18 @@ impl HarnessActor {
                         if text.is_empty() {
                             Ok(None)
                         } else {
-                            assistant_blocks.push(Block::Text { text: text.clone() });
-                            self.apply_text_delta(&run_id, &mut message, text, false)
+                            match self
+                                .apply_text_delta(&run_id, &mut message, text, false)
                                 .await
-                                .map(|()| None)
+                            {
+                                Ok(range) => {
+                                    append_assistant_text_block(&mut assistant_blocks, range);
+                                    replay.message_applied =
+                                        message.as_ref().map(TextAccumulator::snapshot);
+                                    Ok(None)
+                                }
+                                Err(error) => Err(error),
+                            }
                         }
                     }
                     StreamEvent::ReasoningDelta { text } => {
@@ -5003,9 +5002,17 @@ impl HarnessActor {
                         if text.is_empty() {
                             Ok(None)
                         } else {
-                            self.apply_text_delta(&run_id, &mut reasoning, text, true)
+                            match self
+                                .apply_text_delta(&run_id, &mut reasoning, text, true)
                                 .await
-                                .map(|()| None)
+                            {
+                                Ok(_) => {
+                                    replay.reasoning_applied =
+                                        reasoning.as_ref().map(TextAccumulator::snapshot);
+                                    Ok(None)
+                                }
+                                Err(error) => Err(error),
+                            }
                         }
                     }
                     StreamEvent::RefusalDelta { text } => {
@@ -6242,9 +6249,9 @@ impl HarnessActor {
         &mut self,
         run_id: &RunId,
         accumulator: &mut Option<TextAccumulator>,
-        text: String,
+        text: ReplyText,
         reasoning: bool,
-    ) -> Result<(), DriveError> {
+    ) -> Result<ReplyText, DriveError> {
         let open = match accumulator.take() {
             Some(open) => open,
             None => {
@@ -6257,11 +6264,11 @@ impl HarnessActor {
                 let item_id = self.next_item_id();
                 let empty = if reasoning {
                     TurnItem::Reasoning {
-                        summary: String::new(),
+                        summary: String::new().into(),
                     }
                 } else {
                     TurnItem::AgentMessage {
-                        text: String::new(),
+                        text: String::new().into(),
                     }
                 };
                 self.commit_item(
@@ -6273,19 +6280,17 @@ impl HarnessActor {
                 )
                 .await
                 .map_err(DriveError::Store)?;
-                TextAccumulator {
-                    item_id,
-                    text: String::new(),
-                }
+                TextAccumulator::new(item_id, !reasoning)
             }
         };
 
         let active = accumulator.insert(open);
-        active.text.push_str(&text);
+        let appended = active.append_shared(&text);
+        let accumulated = active.snapshot();
         let delta = if reasoning {
-            ItemDelta::Reasoning { text }
+            ItemDelta::Reasoning { text: appended }
         } else {
-            ItemDelta::Text { text }
+            ItemDelta::Text { text: appended }
         };
         self.commit_item(
             run_id,
@@ -6296,7 +6301,7 @@ impl HarnessActor {
         )
         .await
         .map_err(DriveError::Store)?;
-        Ok(())
+        Ok(accumulated)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7180,17 +7185,14 @@ impl HarnessActor {
         accumulator: &mut Option<TextAccumulator>,
         reasoning: bool,
     ) -> Result<(), DriveError> {
-        let Some(active) = accumulator.as_ref() else {
+        let Some(active) = accumulator.as_mut() else {
             return Ok(());
         };
+        let text = active.seal();
         let item = if reasoning {
-            TurnItem::Reasoning {
-                summary: active.text.clone(),
-            }
+            TurnItem::Reasoning { summary: text }
         } else {
-            TurnItem::AgentMessage {
-                text: active.text.clone(),
-            }
+            TurnItem::AgentMessage { text }
         };
         self.commit_item(
             run_id,
@@ -7214,14 +7216,14 @@ impl HarnessActor {
         run_id: &RunId,
         accumulator: &mut Option<TextAccumulator>,
         interruption: ErrorPresentation,
-    ) -> Result<(ItemId, String), DriveError> {
-        let active = accumulator.take().ok_or_else(|| {
+    ) -> Result<(ItemId, ReplyText), DriveError> {
+        let active = accumulator.as_mut().ok_or_else(|| {
             DriveError::Provider(provider_protocol_error(
                 "partial-stream recovery had no active assistant item",
             ))
         })?;
         let item_id = active.item_id.clone();
-        let text = active.text;
+        let text = active.seal();
         self.commit_item(
             run_id,
             ItemEvent::Completed {
@@ -7234,6 +7236,7 @@ impl HarnessActor {
         )
         .await
         .map_err(DriveError::Store)?;
+        *accumulator = None;
         Ok((item_id, text))
     }
 
@@ -7649,14 +7652,13 @@ impl HarnessActor {
                     return Err(DriveError::Cancelled);
                 }
                 MenuWake::Committed(envelope) => {
-                    let payload = serde_json::from_value::<EventPayload>(envelope.payload)
-                        .map_err(|error| {
-                            DriveError::Store(HaiderError::new(
-                                ErrorCode::InvalidArgument,
-                                format!("committed permission wake could not decode: {error}"),
-                                false,
-                            ))
-                        })?;
+                    let payload = envelope.payload.decode_event().map_err(|error| {
+                        DriveError::Store(HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("committed permission wake could not decode: {error}"),
+                            false,
+                        ))
+                    })?;
                     let EventPayload::MenuAnswered(answer) = payload else {
                         return Err(DriveError::Store(HaiderError::new(
                             ErrorCode::InvalidArgument,
@@ -7749,16 +7751,13 @@ impl HarnessActor {
                     continue;
                 }
                 MenuWake::Committed(envelope) => {
-                    let payload = serde_json::from_value::<EventPayload>(envelope.payload)
-                        .map_err(|error| {
-                            DriveError::Store(HaiderError::new(
-                                ErrorCode::InvalidArgument,
-                                format!(
-                                    "committed graph finalization wake could not decode: {error}"
-                                ),
-                                false,
-                            ))
-                        })?;
+                    let payload = envelope.payload.decode_event().map_err(|error| {
+                        DriveError::Store(HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("committed graph finalization wake could not decode: {error}"),
+                            false,
+                        ))
+                    })?;
                     match payload {
                         EventPayload::MenuAnswered(answer) => answer,
                         EventPayload::MenuClosed { menu: closed, .. } if closed == menu.id => {
@@ -8049,7 +8048,7 @@ impl HarnessActor {
                 .borrow_and_update()
                 .as_ref()
                 .is_some_and(|envelope| {
-                    serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                    envelope.payload.decode_event().is_ok_and(
                         |payload| {
                             matches!(payload, EventPayload::MenuAnswered(answer) if answer.menu == menu.id)
                         },
@@ -8366,14 +8365,13 @@ impl HarnessActor {
                     return Err(DriveError::Cancelled);
                 }
                 MenuWake::Committed(envelope) => {
-                    let payload = serde_json::from_value::<EventPayload>(envelope.payload)
-                        .map_err(|error| {
-                            DriveError::Store(HaiderError::new(
-                                ErrorCode::InvalidArgument,
-                                format!("committed recovery wake could not decode: {error}"),
-                                false,
-                            ))
-                        })?;
+                    let payload = envelope.payload.decode_event().map_err(|error| {
+                        DriveError::Store(HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("committed recovery wake could not decode: {error}"),
+                            false,
+                        ))
+                    })?;
                     let EventPayload::MenuAnswered(answer) = payload else {
                         return Err(DriveError::Store(HaiderError::new(
                             ErrorCode::InvalidArgument,
@@ -8487,14 +8485,13 @@ impl HarnessActor {
         let Some(envelope) = self.committed_menus.borrow_and_update().clone() else {
             return Ok(false);
         };
-        let payload =
-            serde_json::from_value::<EventPayload>(envelope.payload).map_err(|error| {
-                DriveError::Store(HaiderError::new(
-                    ErrorCode::StoreCorrupt,
-                    format!("recovered menu answer does not decode: {error}"),
-                    false,
-                ))
-            })?;
+        let payload = envelope.payload.decode_event().map_err(|error| {
+            DriveError::Store(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!("recovered menu answer does not decode: {error}"),
+                false,
+            ))
+        })?;
         let EventPayload::MenuAnswered(committed) = payload else {
             return Err(DriveError::Store(HaiderError::new(
                 ErrorCode::StoreCorrupt,
@@ -8600,14 +8597,13 @@ impl HarnessActor {
                     return Err(DriveError::Cancelled);
                 }
                 MenuWake::Committed(envelope) => {
-                    let payload = serde_json::from_value::<EventPayload>(envelope.payload)
-                        .map_err(|error| {
-                            DriveError::Store(HaiderError::new(
-                                ErrorCode::InvalidArgument,
-                                format!("committed menu wake could not decode: {error}"),
-                                false,
-                            ))
-                        })?;
+                    let payload = envelope.payload.decode_event().map_err(|error| {
+                        DriveError::Store(HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("committed menu wake could not decode: {error}"),
+                            false,
+                        ))
+                    })?;
                     let EventPayload::MenuAnswered(answer) = payload else {
                         return Err(DriveError::Store(HaiderError::new(
                             ErrorCode::InvalidArgument,
@@ -9561,7 +9557,7 @@ impl HarnessActor {
             kind: PROVIDER_OPAQUE_EXTENSION_KIND.into(),
             data: serde_json::json!({
                 "provider": provider,
-                "data": data,
+                "data": data.template(),
             }),
         };
         let render = hidden_prompt_verbatim_render();
@@ -9570,12 +9566,12 @@ impl HarnessActor {
             node: self.next_node_id(),
             parent,
             kind: NodeKind::AssistantCommit {
-                text: String::new(),
+                text: String::new().into(),
                 verdict: VerifyVerdict::NotApplicable,
             },
         };
-        let envelopes = [
-            self.uncommitted_envelope(
+        let mut started = self
+            .uncommitted_envelope(
                 run_id,
                 EventPayload::Item(ItemEvent::Started {
                     item_id: item_id.clone(),
@@ -9583,13 +9579,25 @@ impl HarnessActor {
                 }),
                 render,
             )
-            .map_err(DriveError::Store)?,
-            self.uncommitted_envelope(
+            .map_err(DriveError::Store)?;
+        let mut completed = self
+            .uncommitted_envelope(
                 run_id,
                 EventPayload::Item(ItemEvent::Completed { item_id, item }),
                 render,
             )
-            .map_err(DriveError::Store)?,
+            .map_err(DriveError::Store)?;
+        if let Some(text) = data.reply_text()
+            && (!started.payload.bind_provider_opaque_reply(text.clone())
+                || !completed.payload.bind_provider_opaque_reply(text.clone()))
+        {
+            return Err(DriveError::Provider(provider_protocol_error(
+                "provider-opaque reply template has no recognized native text field",
+            )));
+        }
+        let envelopes = [
+            started,
+            completed,
             self.uncommitted_envelope(
                 run_id,
                 EventPayload::NodeCommitted(node.clone()),
@@ -9945,12 +9953,13 @@ impl HarnessActor {
             usage_commit.usage.clone(),
         )?;
 
-        let message_node = if let Some(active) = message.as_ref() {
+        let message_node = if let Some(active) = message.as_mut() {
+            let text = active.seal();
             let node = TreeNode {
                 node: self.next_node_id(),
                 parent: message_parent,
                 kind: NodeKind::AssistantCommit {
-                    text: active.text.clone(),
+                    text: text.clone(),
                     verdict: VerifyVerdict::NotApplicable,
                 },
             };
@@ -9958,9 +9967,7 @@ impl HarnessActor {
                 run_id,
                 EventPayload::Item(ItemEvent::Completed {
                     item_id: active.item_id.clone(),
-                    item: TurnItem::AgentMessage {
-                        text: active.text.clone(),
-                    },
+                    item: TurnItem::AgentMessage { text },
                 }),
                 prompt_verbatim_render(),
             )?);
@@ -9973,14 +9980,13 @@ impl HarnessActor {
         } else {
             None
         };
-        if let Some(active) = reasoning.as_ref() {
+        if let Some(active) = reasoning.as_mut() {
+            let summary = active.seal();
             envelopes.push(self.uncommitted_envelope(
                 run_id,
                 EventPayload::Item(ItemEvent::Completed {
                     item_id: active.item_id.clone(),
-                    item: TurnItem::Reasoning {
-                        summary: active.text.clone(),
-                    },
+                    item: TurnItem::Reasoning { summary },
                 }),
                 prompt_verbatim_render(),
             )?);
@@ -10196,13 +10202,14 @@ impl HarnessActor {
         if let EventPayload::ToolResult { result, .. } = &mut payload {
             ensure_tool_result_presentation(result);
         }
-        let payload = serde_json::to_value(payload).map_err(|error| {
-            HaiderError::new(
-                ErrorCode::Internal,
-                format!("event payload could not serialize: {error}"),
-                false,
-            )
-        })?;
+        let payload =
+            haider_protocol::envelope::RawPayload::from_event(payload).map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("event payload could not serialize: {error}"),
+                    false,
+                )
+            })?;
         Ok(EventEnvelope {
             schema_version: SCHEMA_VERSION,
             event_id: self.next_event_id(),
@@ -10386,9 +10393,26 @@ fn poll_provider_stream_now(stream: &mut ProviderStream) -> Option<Option<Provid
 
 fn merge_contiguous_item_delta(existing: &mut ItemDelta, incoming: &ItemDelta) -> bool {
     match (existing, incoming) {
-        (ItemDelta::Text { text: accumulated }, ItemDelta::Text { text })
-        | (ItemDelta::Reasoning { text: accumulated }, ItemDelta::Reasoning { text }) => {
-            accumulated.push_str(text);
+        (ItemDelta::Text { text: accumulated }, ItemDelta::Text { text }) => {
+            if let Some(joined) = accumulated.try_join(text) {
+                *accumulated = joined;
+            } else {
+                let mut writer = ReplyArenaWriter::new().with_standard_provider_json_views();
+                let _ = writer.append_shared(accumulated);
+                let _ = writer.append_shared(text);
+                *accumulated = writer.seal();
+            }
+            true
+        }
+        (ItemDelta::Reasoning { text: accumulated }, ItemDelta::Reasoning { text }) => {
+            if let Some(joined) = accumulated.try_join(text) {
+                *accumulated = joined;
+            } else {
+                let mut writer = ReplyArenaWriter::new();
+                let _ = writer.append_shared(accumulated);
+                let _ = writer.append_shared(text);
+                *accumulated = writer.seal();
+            }
             true
         }
         (
@@ -10449,7 +10473,108 @@ struct ProviderRetryContext<'a> {
 #[derive(Debug)]
 struct TextAccumulator {
     item_id: ItemId,
-    text: String,
+    provider_text: bool,
+    writer: Option<ReplyArenaWriter>,
+    external: Option<ReplyText>,
+    sealed: Option<ReplyText>,
+}
+
+/// Keeps one logical assistant text block while the provider grows it through
+/// multiple deltas. Both the prefix replacement and adjacent-range cases are
+/// metadata-only operations over the shared reply arena.
+fn append_assistant_text_block(blocks: &mut Vec<Block>, text: ReplyText) {
+    if let Some(Block::Text { text: previous }) = blocks.last_mut() {
+        let previous_range = previous.byte_range();
+        let text_range = text.byte_range();
+        if previous.shares_arena_with(&text)
+            && previous_range.start == text_range.start
+            && previous.is_prefix_of(&text)
+        {
+            *previous = text;
+            return;
+        }
+        if let Some(joined) = previous.try_join(&text) {
+            *previous = joined;
+            return;
+        }
+    }
+    blocks.push(Block::Text { text });
+}
+
+impl TextAccumulator {
+    fn new(item_id: ItemId, provider_text: bool) -> Self {
+        Self {
+            item_id,
+            provider_text,
+            writer: None,
+            external: None,
+            sealed: None,
+        }
+    }
+
+    fn from_shared(item_id: ItemId, text: &ReplyText, provider_text: bool) -> Self {
+        Self {
+            item_id,
+            provider_text,
+            writer: None,
+            external: Some(text.clone()),
+            sealed: None,
+        }
+    }
+
+    fn append_shared(&mut self, text: &ReplyText) -> ReplyText {
+        assert!(
+            self.sealed.is_none(),
+            "sealed reply accumulator cannot accept another delta"
+        );
+        if let Some(writer) = self.writer.as_mut() {
+            return writer.append_shared(text);
+        }
+        if let Some(previous) = self.external.take() {
+            if let Some(joined) = previous.try_join(text) {
+                self.external = Some(joined);
+                return text.clone();
+            }
+            let mut writer = if self.provider_text {
+                ReplyArenaWriter::new().with_standard_provider_json_views()
+            } else {
+                ReplyArenaWriter::new()
+            };
+            let _ = writer.append_shared(&previous);
+            let appended = writer.append_shared(text);
+            self.writer = Some(writer);
+            return appended;
+        }
+        self.external = Some(text.clone());
+        text.clone()
+    }
+
+    fn snapshot(&self) -> ReplyText {
+        self.sealed.clone().unwrap_or_else(|| {
+            self.external.clone().unwrap_or_else(|| {
+                self.writer
+                    .as_ref()
+                    .map_or_else(ReplyText::default, ReplyArenaWriter::snapshot)
+            })
+        })
+    }
+
+    fn seal(&mut self) -> ReplyText {
+        if let Some(text) = &self.sealed {
+            return text.clone();
+        }
+        let text = self.external.take().unwrap_or_else(|| {
+            self.writer
+                .take()
+                .map_or_else(ReplyText::default, ReplyArenaWriter::seal)
+        });
+        self.sealed = Some(text.clone());
+        text
+    }
+
+    fn is_empty(&self) -> bool {
+        self.snapshot().is_empty()
+    }
 }
 
 /// Suppresses only the exact already-journaled prefix replayed by a resumed
@@ -10457,11 +10582,11 @@ struct TextAccumulator {
 /// novel suffix content without relying on provider chunk boundaries.
 #[derive(Debug, Default)]
 struct ReplayPrefix {
-    message: String,
-    reasoning: String,
+    message: Option<ReplyText>,
+    reasoning: Option<ReplyText>,
     refusal: String,
-    message_applied: String,
-    reasoning_applied: String,
+    message_applied: Option<ReplyText>,
+    reasoning_applied: Option<ReplyText>,
     refusal_applied: String,
     structured_applied: Vec<StreamEvent>,
     structured_expected: VecDeque<StreamEvent>,
@@ -10475,15 +10600,11 @@ impl ReplayPrefix {
         reasoning: &Option<TextAccumulator>,
         refusal: &str,
     ) {
-        if self.message_applied.is_empty() {
-            self.message_applied = message
-                .as_ref()
-                .map_or_else(String::new, |item| item.text.clone());
+        if let Some(message) = message {
+            self.message_applied = Some(message.snapshot());
         }
-        if self.reasoning_applied.is_empty() {
-            self.reasoning_applied = reasoning
-                .as_ref()
-                .map_or_else(String::new, |item| item.text.clone());
+        if let Some(reasoning) = reasoning {
+            self.reasoning_applied = Some(reasoning.snapshot());
         }
         if self.refusal_applied.is_empty() {
             self.refusal_applied = refusal.to_owned();
@@ -10494,16 +10615,12 @@ impl ReplayPrefix {
         self.structured_expected = normalized_structured_replay(&self.structured_applied);
     }
 
-    fn filter_message(&mut self, text: String) -> String {
-        let text = strip_replayed_prefix(&mut self.message, text);
-        self.message_applied.push_str(&text);
-        text
+    fn filter_message(&mut self, text: ReplyText) -> ReplyText {
+        strip_replayed_reply_prefix(&mut self.message, text)
     }
 
-    fn filter_reasoning(&mut self, text: String) -> String {
-        let text = strip_replayed_prefix(&mut self.reasoning, text);
-        self.reasoning_applied.push_str(&text);
-        text
+    fn filter_reasoning(&mut self, text: ReplyText) -> ReplyText {
+        strip_replayed_reply_prefix(&mut self.reasoning, text)
     }
 
     fn filter_refusal(&mut self, text: String) -> String {
@@ -10586,8 +10703,13 @@ impl ReplayPrefix {
     }
 
     fn has_applied_content(&self) -> bool {
-        !self.message_applied.is_empty()
-            || !self.reasoning_applied.is_empty()
+        self.message_applied
+            .as_ref()
+            .is_some_and(|text| !text.is_empty())
+            || self
+                .reasoning_applied
+                .as_ref()
+                .is_some_and(|text| !text.is_empty())
             || !self.refusal_applied.is_empty()
             || !self.structured_applied.is_empty()
     }
@@ -10610,11 +10732,11 @@ impl ReplayPrefix {
     }
 
     fn reset_for_next_request(&mut self) {
-        self.message.clear();
-        self.reasoning.clear();
+        self.message = None;
+        self.reasoning = None;
         self.refusal.clear();
-        self.message_applied.clear();
-        self.reasoning_applied.clear();
+        self.message_applied = None;
+        self.reasoning_applied = None;
         self.refusal_applied.clear();
         self.structured_applied.clear();
         self.structured_expected.clear();
@@ -10701,6 +10823,59 @@ fn strip_replayed_prefix(expected: &mut String, text: String) -> String {
         expected.clear();
         text[text_bytes..].to_owned()
     }
+}
+
+/// Removes the exact prefix already accepted into the canonical reply arena.
+/// The expected side is only a shrinking range handle; the incoming provider
+/// delta is returned in its original allocation after an in-place drain.
+fn strip_replayed_reply_prefix(expected: &mut Option<ReplyText>, text: ReplyText) -> ReplyText {
+    let Some(current) = expected.take() else {
+        return text;
+    };
+    if current.is_empty() {
+        return text;
+    }
+    if text.is_empty() {
+        *expected = Some(current);
+        return text;
+    }
+
+    let mut expected_bytes = current
+        .segments()
+        .into_iter()
+        .flat_map(IntoIterator::into_iter);
+    let mut incoming_bytes = text
+        .segments()
+        .into_iter()
+        .flat_map(IntoIterator::into_iter);
+    let mut common = 0_usize;
+    loop {
+        match (expected_bytes.next(), incoming_bytes.next()) {
+            (Some(left), Some(right)) if left == right => common = common.saturating_add(1),
+            _ => break,
+        }
+    }
+    while common > 0 && text.slice(0..common).is_none() {
+        common -= 1;
+    }
+
+    if common < current.len().min(text.len()) {
+        expected.take();
+        if let Some(suffix) = text.slice(common..text.len()) {
+            return suffix;
+        }
+        debug_assert!(false, "common reply prefix must end at a UTF-8 boundary");
+        return text;
+    }
+    if common < current.len() {
+        *expected = current.slice(common..current.len());
+        return ReplyText::default();
+    }
+    if let Some(suffix) = text.slice(common..text.len()) {
+        return suffix;
+    }
+    debug_assert!(false, "complete replay prefix must end at a UTF-8 boundary");
+    text
 }
 
 struct PendingUsageCommit {
@@ -12365,13 +12540,8 @@ fn estimate_provider_request_bytes_div_four_raw(
     system_prompt: &Option<String>,
     tools: &[ToolDefinition],
 ) -> u64 {
-    serde_json::to_vec(&(messages, system_prompt, tools))
-        .map(|encoded| {
-            u64::try_from(encoded.len())
-                .unwrap_or(u64::MAX)
-                .saturating_add(3)
-                / 4
-        })
+    provider_neutral_json_len(messages, system_prompt, tools)
+        .map(|bytes| bytes.saturating_add(3) / 4)
         .unwrap_or(u64::MAX)
 }
 
@@ -12390,9 +12560,8 @@ fn estimate_provider_request_input_measure_raw(
     tools: &[ToolDefinition],
     attachments: &[ResolvedAttachment],
 ) -> RequestInputMeasure {
-    let textual_bytes = serde_json::to_vec(&(messages, system_prompt, tools))
-        .map(|encoded| u64::try_from(encoded.len()).unwrap_or(u64::MAX))
-        .unwrap_or(u64::MAX);
+    let textual_bytes =
+        provider_neutral_json_len(messages, system_prompt, tools).unwrap_or(u64::MAX);
     let native_pdf_bytes = messages
         .iter()
         .flat_map(|message| &message.blocks)
@@ -12432,6 +12601,68 @@ fn estimate_provider_request_input_measure_raw(
         bytes,
         tokens: (bytes.saturating_add(3) / 4).saturating_add(image_tokens),
     }
+}
+
+/// Counts the exact provider-neutral JSON projection while replacing reply
+/// ranges with tiny placeholders. The correction is computed from JSON escape
+/// widths, so this is byte-identical to serde_json without allocating a
+/// prompt-sized buffer or flattening a segmented reply.
+fn provider_neutral_json_len(
+    messages: &[Message],
+    system_prompt: &Option<String>,
+    tools: &[ToolDefinition],
+) -> Option<u64> {
+    const MARKER: &str = "__haider_reply_range__";
+
+    #[derive(Default)]
+    struct CountingWriter(u64);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                .ok_or_else(|| std::io::Error::other("request size overflow"))?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn json_string_len(text: &ReplyText) -> u64 {
+        let mut len = 2_u64;
+        text.visit_strs(|segment| {
+            for byte in segment.bytes() {
+                let width = match byte {
+                    b'"' | b'\\' | b'\x08' | b'\t' | b'\n' | b'\x0c' | b'\r' => 2,
+                    0x00..=0x1f => 6,
+                    _ => 1,
+                };
+                len = len.saturating_add(width);
+            }
+        });
+        len
+    }
+
+    let marker_len = u64::try_from(MARKER.len()).ok()?.checked_add(2)?;
+    let marker_text = ReplyText::from(MARKER);
+    let mut adjusted = messages.to_vec();
+    let mut correction = 0_i128;
+    for message in &mut adjusted {
+        for block in &mut message.blocks {
+            if let Block::Text { text } = block {
+                correction = correction
+                    .checked_add(i128::from(json_string_len(text)))?
+                    .checked_sub(i128::from(marker_len))?;
+                *text = marker_text.clone();
+            }
+        }
+    }
+    let mut counter = CountingWriter::default();
+    serde_json::to_writer(&mut counter, &(&adjusted, system_prompt, tools)).ok()?;
+    let total = i128::from(counter.0).checked_add(correction)?;
+    u64::try_from(total).ok()
 }
 
 /// Evaluates the request-local budget projection only when the caller has a

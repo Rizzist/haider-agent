@@ -83,7 +83,8 @@ pub fn raw_envelope(seq: u64) -> RawEnvelope {
         payload: serde_json::json!({
             "type": "future_event",
             "detail": "kept raw"
-        }),
+        })
+        .into(),
     }
 }
 

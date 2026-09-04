@@ -207,7 +207,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
             if events.iter().any(|event| {
                 event.run_id.as_ref() == Some(&main_run)
                     && matches!(
-                        serde_json::from_value::<EventPayload>(event.payload.clone()),
+                        event.payload.decode_event(),
                         Ok(EventPayload::RunState(RunState::Done))
                     )
             }) {
@@ -224,7 +224,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
         .filter(|event| event.run_id.as_ref() == Some(&main_run))
         .filter_map(|event| {
             let EventPayload::NodeCommitted(node) =
-                serde_json::from_value(event.payload.clone()).ok()?
+                serde_json::from_value(event.payload.clone().into()).ok()?
             else {
                 return None;
             };
@@ -283,7 +283,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
                 .iter()
                 .filter(|event| event.run_id.as_ref() == Some(&branch_run))
             {
-                match serde_json::from_value::<EventPayload>(event.payload.clone()) {
+                match event.payload.decode_event() {
                     Ok(EventPayload::RunFailed { code, message, .. }) => {
                         failure = Some((code, message));
                     }
@@ -317,8 +317,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
         .iter()
         .filter(|event| event.run_id.as_ref() == Some(&branch_run))
     {
-        let payload = serde_json::from_value::<EventPayload>(event.payload.clone())
-            .expect("typed branch event");
+        let payload = event.payload.decode_event().expect("typed branch event");
         if matches!(&payload, EventPayload::SessionState(_)) {
             assert_eq!(event.branch_id, None);
             continue;
@@ -394,7 +393,9 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("recovered payload"),
+        payload: serde_json::to_value(payload)
+            .expect("recovered payload")
+            .into(),
     };
     let mut recovered_batch = vec![
         recovered_envelope(
@@ -467,7 +468,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
         event.run_id.as_ref() == Some(&compacted.run_id)
             && event.branch_id.as_ref() == Some(&branch_id)
             && matches!(
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                event.payload.decode_event(),
                 Ok(EventPayload::NodeCommitted(ref node))
                     if matches!(node.kind, NodeKind::Compaction { .. })
             )
@@ -490,7 +491,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
             .iter()
             .flat_map(|message| &message.blocks)
             .filter_map(|block| match block {
-                Block::Text { text } => Some(text.as_str()),
+                Block::Text { text } => Some(text.to_owned_string()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -595,9 +596,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
         .into_iter()
         .rev()
         .find_map(|event| {
-            let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(event.payload).ok()?
-            else {
+            let EventPayload::NodeCommitted(node) = event.payload.decode_event().ok()? else {
                 return None;
             };
             (event.run_id.as_ref() == Some(&source_run)).then_some(node.node)
@@ -630,7 +629,9 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
                     durable: true,
                     prompt,
                 },
-                payload: serde_json::to_value(payload).expect("fixture payload"),
+                payload: serde_json::to_value(payload)
+                    .expect("fixture payload")
+                    .into(),
             };
         let mut recent_turn = vec![
             fixture(
@@ -659,7 +660,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
                 EventPayload::Item(ItemEvent::Completed {
                     item_id,
                     item: TurnItem::AgentMessage {
-                        text: format!("recent answer {ordinal}"),
+                        text: format!("recent answer {ordinal}").into(),
                     },
                 }),
                 PromptRender::Verbatim,
@@ -670,7 +671,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
                     node: assistant_node.clone(),
                     parent: Some(user_node),
                     kind: NodeKind::AssistantCommit {
-                        text: format!("recent answer {ordinal}"),
+                        text: format!("recent answer {ordinal}").into(),
                         verdict: haider_protocol::verify::VerifyVerdict::NotApplicable,
                     },
                 }),
@@ -702,7 +703,8 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
-            .expect("done payload"),
+            .expect("done payload")
+            .into(),
     }];
     hub.append(&mut source_done)
         .await
@@ -712,9 +714,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
         .iter()
         .rev()
         .find_map(|event| {
-            let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
-            else {
+            let EventPayload::NodeCommitted(node) = event.payload.decode_event().ok()? else {
                 return None;
             };
             (event.run_id.as_ref() == Some(&source_run)).then_some((node.node, event.seq))
@@ -764,9 +764,9 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
             let events = store.read(&session_id, 0, 256).await.expect("read events");
             if events.iter().any(|event| {
                 event.run_id.as_ref() == Some(&branch_run)
-                    && serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(
-                        |payload| matches!(payload, EventPayload::RunState(RunState::Done)),
-                    )
+                    && event.payload.decode_event().is_ok_and(|payload| {
+                        matches!(payload, EventPayload::RunState(RunState::Done))
+                    })
             }) {
                 break;
             }
@@ -780,9 +780,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
     let compactions = events
         .iter()
         .filter_map(|event| {
-            let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?
-            else {
+            let EventPayload::NodeCommitted(node) = event.payload.decode_event().ok()? else {
                 return None;
             };
             matches!(
@@ -805,7 +803,7 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
         .iter()
         .flat_map(|message| &message.blocks)
         .filter_map(|block| match block {
-            Block::Text { text } => Some(text.as_str()),
+            Block::Text { text } => Some(text.to_owned_string()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -949,7 +947,9 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
         loop {
             let events = store.read(&session_id, 0, 512).await.expect("read events");
             if events.iter().any(|event| {
-                serde_json::from_value::<EventPayload>(event.payload.clone())
+                event
+                    .payload
+                    .decode_event()
                     .is_ok_and(|payload| matches!(payload, EventPayload::RunState(RunState::Done)))
             }) {
                 break;
@@ -1019,7 +1019,9 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
     let payloads = journal
         .into_iter()
         .filter_map(|event| {
-            serde_json::from_value::<EventPayload>(event.payload)
+            event
+                .payload
+                .decode_event()
                 .ok()
                 .map(|payload| (event.seq, payload))
         })
@@ -1276,7 +1278,7 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("payload"),
+        payload: serde_json::to_value(payload).expect("payload").into(),
     };
     let mut source_done = [envelope(
         "compaction-source-done",
@@ -1294,9 +1296,7 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
         .expect("read source node")
         .into_iter()
         .find_map(|event| {
-            let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(event.payload).ok()?
-            else {
+            let EventPayload::NodeCommitted(node) = event.payload.decode_event().ok()? else {
                 return None;
             };
             (node.node == source_node).then_some(event.seq)
@@ -1402,7 +1402,7 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
         .expect("read recovered journal");
     let payloads = recovered_events
         .iter()
-        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.clone()).ok())
+        .filter_map(|event| event.payload.decode_event().ok())
         .collect::<Vec<_>>();
     assert!(payloads.iter().any(|payload| matches!(
         payload,
@@ -1424,13 +1424,13 @@ async fn crash_after_compaction_intent_abandons_without_changing_the_prompt() {
         event.run_id.as_ref() == Some(&compaction_run)
             && event.branch_id.as_ref() == Some(&branch_id)
             && matches!(
-                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                event.payload.decode_event(),
                 Ok(EventPayload::RunState(RunState::Errored))
             )
     }));
     assert!(recovered_events.iter().all(|event| {
         !matches!(
-            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            event.payload.decode_event(),
             Ok(EventPayload::SessionState(_))
         ) || event.branch_id.is_none()
     }));

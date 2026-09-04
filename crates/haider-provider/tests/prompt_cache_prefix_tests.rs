@@ -241,7 +241,9 @@ fn anthropic_prefix_detector_reports_early_message_divergence() {
     let Block::Text { text } = &mut mutated_next_request.messages[0].blocks[0] else {
         panic!("early message is text")
     };
-    text.replace_range(..1, "s");
+    let mut mutated = text.to_owned_string();
+    mutated.replace_range(..1, "s");
+    *text = mutated.into();
 
     let first = provider
         .request_payload(&first_request)

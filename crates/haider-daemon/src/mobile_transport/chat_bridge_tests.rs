@@ -36,7 +36,8 @@ async fn mobile_transport_text_durably_activates_mobile_use() {
             attachments: Vec::new(),
             mode: DeliveryMode::Queue,
         })
-        .expect("mobile activation payload"),
+        .expect("mobile activation payload")
+        .into(),
     };
     store
         .append(&mut [envelope])
@@ -222,6 +223,8 @@ fn raw_event(seq: u64, run_id: &RunId, payload: EventPayload) -> RawEnvelope {
             durable: true,
             prompt: PromptRender::Verbatim,
         },
-        payload: serde_json::to_value(payload).expect("projection payload"),
+        payload: serde_json::to_value(payload)
+            .expect("projection payload")
+            .into(),
     }
 }

@@ -27,6 +27,7 @@ use haider_protocol::EventPayload;
 use haider_protocol::agent::ChipState;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::effect::{EffectClass, EffectIntent, EffectPhase};
+use haider_protocol::envelope::write_payload_json;
 use haider_protocol::ids::AgentId;
 use haider_protocol::item::ItemEvent;
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
@@ -243,11 +244,13 @@ fn checkpoint_effect_envelopes(
                     durable: true,
                     prompt: haider_protocol::envelope::PromptRender::Omit,
                 },
-                payload: serde_json::to_value(payload).map_err(|error| {
-                    SessionHubError::Task(format!(
-                        "cannot encode checkpoint effect envelope: {error}"
-                    ))
-                })?,
+                payload: haider_protocol::envelope::RawPayload::from_event(payload).map_err(
+                    |error| {
+                        SessionHubError::Task(format!(
+                            "cannot encode checkpoint effect envelope: {error}"
+                        ))
+                    },
+                )?,
             })
         })
         .collect()
@@ -621,8 +624,7 @@ async fn fleet_child_truth(
             since_seq = envelope.seq;
             advanced = true;
             if envelope.run_id.as_ref() == Some(&record.child_run_id)
-                && let Ok(EventPayload::RunState(state)) =
-                    serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                && let Ok(EventPayload::RunState(state)) = envelope.payload.decode_event()
             {
                 latest_state = Some(state);
             }
@@ -1151,14 +1153,12 @@ impl ObserveFold {
     fn apply(&mut self, envelope: RawEnvelope) {
         self.head_seq = self.head_seq.max(envelope.seq);
         if envelope.agent_id.is_none()
-            && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
-                |payload| {
-                    matches!(
-                        payload,
-                        EventPayload::UserMessage { .. } | EventPayload::PeerMessage(_)
-                    )
-                },
-            )
+            && envelope.payload.decode_event().is_ok_and(|payload| {
+                matches!(
+                    payload,
+                    EventPayload::UserMessage { .. } | EventPayload::PeerMessage(_)
+                )
+            })
         {
             self.turns = self.turns.saturating_add(1);
         }
@@ -1768,7 +1768,7 @@ mod observe_cache_retention_tests {
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload: serde_json::json!({"type":"observe_retention_probe"}),
+            payload: serde_json::json!({"type":"observe_retention_probe"}).into(),
         });
         fold
     }
@@ -2564,7 +2564,7 @@ impl ObserveProjection {
                 .insert(created.branch.branch_id.clone(), created.branch);
             return;
         }
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+        let Ok(payload) = envelope.payload.decode_event() else {
             return;
         };
         match payload {
@@ -2941,7 +2941,7 @@ impl SessionHub {
                     continue;
                 }
                 if let Ok(EventPayload::Effect(EffectPhase::Intent(candidate))) =
-                    serde_json::from_value(envelope.payload)
+                    envelope.payload.decode_event()
                     && candidate.effect == effect
                 {
                     intent = Some(candidate);
@@ -3012,13 +3012,15 @@ impl SessionHub {
                     durable: true,
                     prompt: haider_protocol::envelope::PromptRender::Pruned,
                 },
-                payload: serde_json::to_value(payload).map_err(|error| {
-                    HaiderError::new(
-                        ErrorCode::Internal,
-                        format!("effect probe payload could not serialize: {error}"),
-                        false,
-                    )
-                })?,
+                payload: haider_protocol::envelope::RawPayload::from_event(payload).map_err(
+                    |error| {
+                        HaiderError::new(
+                            ErrorCode::Internal,
+                            format!("effect probe payload could not serialize: {error}"),
+                            false,
+                        )
+                    },
+                )?,
             });
         }
         self.append(&mut envelopes).await?;
@@ -7553,8 +7555,7 @@ impl HubConnection {
                 break;
             }
             for envelope in &page {
-                let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
-                else {
+                let Ok(payload) = envelope.payload.decode_event() else {
                     continue;
                 };
                 match payload {
@@ -7775,13 +7776,12 @@ impl HubConnection {
                 durable: true,
                 prompt: haider_protocol::envelope::PromptRender::Omit,
             },
-            payload: serde_json::to_value(EventPayload::MenuOpened(menu.clone())).map_err(
-                |error| {
-                    SessionHubError::Task(format!(
-                        "cannot encode command cache confirmation: {error}"
-                    ))
-                },
-            )?,
+            payload: haider_protocol::envelope::RawPayload::from_event(EventPayload::MenuOpened(
+                menu.clone(),
+            ))
+            .map_err(|error| {
+                SessionHubError::Task(format!("cannot encode command cache confirmation: {error}"))
+            })?,
         }];
         if let Err(error) = self.hub.append(&mut envelopes).await {
             if let StoredCommandMenuLookup::Found(stored) = self
@@ -8008,7 +8008,10 @@ impl HubConnection {
                 durable: true,
                 prompt: haider_protocol::envelope::PromptRender::Omit,
             },
-            payload: serde_json::to_value(EventPayload::MenuOpened(menu)).map_err(|error| {
+            payload: haider_protocol::envelope::RawPayload::from_event(EventPayload::MenuOpened(
+                menu,
+            ))
+            .map_err(|error| {
                 SessionHubError::Task(format!("cannot encode command menu: {error}"))
             })?,
         }];
@@ -8025,10 +8028,9 @@ impl HubConnection {
             return self.respond_turn_error(request_id, error);
         }
         let opened = &envelopes[0];
-        let EventPayload::MenuOpened(menu) = serde_json::from_value(opened.payload.clone())
-            .map_err(|error| {
-                SessionHubError::Task(format!("cannot decode committed command menu: {error}"))
-            })?
+        let EventPayload::MenuOpened(menu) = opened.payload.decode_event().map_err(|error| {
+            SessionHubError::Task(format!("cannot decode committed command menu: {error}"))
+        })?
         else {
             return Err(SessionHubError::Task(
                 "committed command menu changed payload kind".into(),
@@ -9205,14 +9207,14 @@ impl HubConnection {
         tool: &str,
         reason: &str,
     ) -> Result<(), SessionHubError> {
-        let payload = serde_json::to_value(EventPayload::LockdownRefused(
-            haider_protocol::lockdown::LockdownRefused {
+        let payload = haider_protocol::envelope::RawPayload::from_event(
+            EventPayload::LockdownRefused(haider_protocol::lockdown::LockdownRefused {
                 provider: envelope.provider.clone(),
                 tool: tool.to_owned(),
                 reason: reason.to_owned(),
                 tools_allowed: envelope.tools_allowed.clone(),
-            },
-        ))
+            }),
+        )
         .map_err(|error| SessionHubError::Task(error.to_string()))?;
         let event_id = EventId::new(format!("lockdown-refusal-{command_id}-{tool}"));
         let mut cursor = 0_u64;
@@ -9343,13 +9345,13 @@ impl HubConnection {
                     .collect::<BTreeSet<_>>()
             })
             .unwrap_or_default();
-        let payload = serde_json::to_value(EventPayload::LockdownQuota(
-            haider_protocol::lockdown::LockdownQuota {
+        let payload = haider_protocol::envelope::RawPayload::from_event(
+            EventPayload::LockdownQuota(haider_protocol::lockdown::LockdownQuota {
                 provider: None,
                 used: status.quota_used,
                 limit: status.quota_limit,
-            },
-        ))
+            }),
+        )
         .map_err(|error| SessionHubError::Task(error.to_string()))?;
         let event_id = EventId::new(format!("lockdown-quota-{command_id}"));
         for session_id in self.hub.inner.store.session_ids().await? {
@@ -10851,16 +10853,40 @@ impl HubConnection {
                     .get("type")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown");
-                let payload = serde_json::to_string(&envelope.payload).map_err(|error| {
+                struct PreviewWriter {
+                    bytes: Vec<u8>,
+                    total: usize,
+                }
+                impl std::io::Write for PreviewWriter {
+                    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                        self.total = self.total.saturating_add(bytes.len());
+                        let remaining = 384_usize.saturating_sub(self.bytes.len());
+                        self.bytes
+                            .extend_from_slice(&bytes[..remaining.min(bytes.len())]);
+                        Ok(bytes.len())
+                    }
+
+                    fn flush(&mut self) -> std::io::Result<()> {
+                        Ok(())
+                    }
+                }
+                let mut preview = PreviewWriter {
+                    bytes: Vec::with_capacity(384),
+                    total: 0,
+                };
+                write_payload_json(&mut preview, &envelope.payload).map_err(|error| {
                     SessionHubError::Task(format!("cannot render metafork review preview: {error}"))
                 })?;
-                let mut excerpt = String::new();
-                append_bounded_review_text(&mut excerpt, &payload, 384);
+                while std::str::from_utf8(&preview.bytes).is_err() {
+                    preview.bytes.pop();
+                }
+                let excerpt_truncated = preview.bytes.len() < preview.total;
+                let excerpt = String::from_utf8(preview.bytes).unwrap_or_default();
                 reviewed_events.push(haider_protocol::session_fork::SessionMetaforkReviewEvent {
                     source_seq: envelope.seq,
                     source_event_id: envelope.event_id.clone(),
                     payload_kind: kind.to_owned(),
-                    excerpt_truncated: excerpt.len() < payload.len(),
+                    excerpt_truncated,
                     excerpt,
                 });
             }
@@ -14524,7 +14550,7 @@ impl HubConnection {
             }
             cursor = page.last().map_or(cursor, |event| event.seq);
             for event in page {
-                match PermissionEventPayload::from_payload_value(event.payload) {
+                match PermissionEventPayload::from_payload_value(event.payload.to_json_value()) {
                     Ok(PermissionEventPayload::PermissionGrantNeeded(needed))
                         if needed.request_id == permission_request_id
                             && needed.permission == permission =>
@@ -14725,9 +14751,7 @@ impl HubConnection {
                         ) => {}
                         None => {}
                     }
-                    if let Ok(EventPayload::RunState(run_state)) =
-                        serde_json::from_value::<EventPayload>(envelope.payload.clone())
-                    {
+                    if let Ok(EventPayload::RunState(run_state)) = envelope.payload.decode_event() {
                         state = Some((run_state, envelope.seq));
                     }
                 }
@@ -16742,7 +16766,7 @@ impl HubConnection {
                     command_id: existing,
                     code: existing_code,
                     message: existing_message,
-                }) = serde_json::from_value(envelope.payload.clone())
+                }) = envelope.payload.decode_event()
                     && existing == command_id.as_str()
                 {
                     if existing_code != code || existing_message != message {
@@ -16800,9 +16824,9 @@ impl HubConnection {
                 durable: true,
                 prompt: haider_protocol::envelope::PromptRender::Omit,
             },
-            payload: serde_json::to_value(payload).map_err(|error| {
-                SessionHubError::Task(format!("cannot encode session diagnostic: {error}"))
-            })?,
+            payload: haider_protocol::envelope::RawPayload::from_event(payload).map_err(
+                |error| SessionHubError::Task(format!("cannot encode session diagnostic: {error}")),
+            )?,
         }];
         let recorded = match self.hub.append(&mut envelopes).await {
             Ok(_) => envelopes[0].seq,
@@ -17042,9 +17066,7 @@ impl HubConnection {
         let Some(opening) = opening else {
             return Ok(CommandMenuLookup::Ordinary);
         };
-        let Ok(EventPayload::MenuOpened(menu)) =
-            serde_json::from_value::<EventPayload>(opening.payload.clone())
-        else {
+        let Ok(EventPayload::MenuOpened(menu)) = opening.payload.decode_event() else {
             return Ok(CommandMenuLookup::Ordinary);
         };
         if menu.id != *menu_id {
@@ -17160,9 +17182,7 @@ impl HubConnection {
         let Some(opening) = opening else {
             return Ok(false);
         };
-        let Ok(EventPayload::MenuOpened(menu)) =
-            serde_json::from_value::<EventPayload>(opening.payload.clone())
-        else {
+        let Ok(EventPayload::MenuOpened(menu)) = opening.payload.decode_event() else {
             return Ok(false);
         };
         let MenuScope::Subagent { agent } = &menu.scope else {
@@ -18525,22 +18545,6 @@ fn validate_metafork_review_shape(
     Ok(())
 }
 
-fn append_bounded_review_text(target: &mut String, text: &str, limit: usize) {
-    let remaining = limit.saturating_sub(target.len());
-    if remaining == 0 {
-        return;
-    }
-    if text.len() <= remaining {
-        target.push_str(text);
-        return;
-    }
-    let mut end = remaining.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    target.push_str(&text[..end]);
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod roster_wave_tests {
@@ -19131,7 +19135,9 @@ mod run_identity_tests {
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload: serde_json::to_value(EventPayload::RunState(state)).expect("state serializes"),
+            payload: serde_json::to_value(EventPayload::RunState(state))
+                .expect("state serializes")
+                .into(),
         }
     }
 
@@ -19184,7 +19190,9 @@ mod run_identity_tests {
                 durable: true,
                 prompt: PromptRender::Omit,
             },
-            payload: serde_json::to_value(payload).expect("graph fact serializes"),
+            payload: serde_json::to_value(payload)
+                .expect("graph fact serializes")
+                .into(),
         }
     }
 

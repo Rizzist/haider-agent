@@ -884,7 +884,9 @@ async fn image_tool_ref_reaches_provider_request_without_journal_bytes() {
             let events = store.read(&session_id, 0, 2048).await.expect("journal");
             if events.iter().any(|event| {
                 event.run_id.as_ref() == Some(&run_id)
-                    && serde_json::from_value::<EventPayload>(event.payload.clone())
+                    && event
+                        .payload
+                        .decode_event()
                         .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Done))
             }) {
                 break;
@@ -899,7 +901,7 @@ async fn image_tool_ref_reaches_provider_request_without_journal_bytes() {
     let (journal_json, image) = events
         .iter()
         .find_map(|event| {
-            let payload = serde_json::from_value::<EventPayload>(event.payload.clone()).ok()?;
+            let payload = event.payload.decode_event().ok()?;
             match payload {
                 EventPayload::ToolResult { result, .. } if !result.images.is_empty() => {
                     Some((event.payload.to_string(), result.images[0].clone()))

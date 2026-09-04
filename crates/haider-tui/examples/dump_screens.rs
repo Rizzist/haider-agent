@@ -277,7 +277,9 @@ fn main() {
         haider_protocol::EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
             item_id: haider_protocol::ids::ItemId::new("spoken-1"),
             item: haider_protocol::item::TurnItem::AgentMessage {
-                text: "Starting at the run loop — the harness owns every state write.".to_owned(),
+                text: "Starting at the run loop — the harness owns every state write."
+                    .to_owned()
+                    .into(),
             },
         }),
     )));
@@ -515,7 +517,9 @@ fn main() {
             haider_protocol::item::ItemEvent::Completed {
                 item_id: haider_protocol::ids::ItemId::new("aura-r1-done"),
                 item: haider_protocol::item::TurnItem::AgentMessage {
-                    text: "Done — auth is live locally and its tests are green. Open it, or spin up another?".to_owned(),
+                    text: "Done — auth is live locally and its tests are green. Open it, or spin up another?"
+                        .to_owned()
+                        .into(),
                 },
             },
         ));

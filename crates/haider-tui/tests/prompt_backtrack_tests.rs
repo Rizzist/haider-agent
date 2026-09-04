@@ -45,7 +45,8 @@ fn raw(session: &SessionId, seq: u64, text: &str) -> RawEnvelope {
             attachments: vec![],
             mode: haider_protocol::DeliveryMode::Steer,
         })
-        .expect("user message serializes"),
+        .expect("user message serializes")
+        .into(),
     }
 }
 

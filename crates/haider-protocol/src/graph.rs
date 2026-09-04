@@ -3383,7 +3383,7 @@ impl GraphTelemetryAccumulator {
             .or_default()
             .apply_envelope_unprojected(envelope);
         self.tool_selection.apply(envelope);
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        let Ok(payload) = envelope.payload.decode_event() else {
             return;
         };
         let session_id = envelope.session_id.clone();
@@ -3771,7 +3771,7 @@ impl ToolSelectionAccumulator {
             run_id: envelope.run_id.clone(),
             agent_id: envelope.agent_id.clone(),
         };
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        let Ok(payload) = envelope.payload.decode_event() else {
             return;
         };
         match payload {
@@ -5053,7 +5053,7 @@ mod tests {
                 durable: true,
                 prompt: crate::envelope::PromptRender::Omit,
             },
-            payload: serde_json::to_value(payload).expect("graph payload"),
+            payload: crate::envelope::RawPayload::from_event(payload).expect("graph payload"),
         }
     }
 
@@ -6678,7 +6678,7 @@ mod tests {
 
     fn activation_fact(seq: u64, event: WorkflowGraphJournalEvent) -> RawEnvelope {
         let mut envelope = graph_fact(seq, EventPayload::IdleDecayed);
-        envelope.payload = event.to_payload_value().expect("activation payload");
+        envelope.payload = event.to_payload_value().expect("activation payload").into();
         envelope
     }
 

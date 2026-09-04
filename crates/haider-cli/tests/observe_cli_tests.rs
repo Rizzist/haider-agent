@@ -860,7 +860,8 @@ fn watch_streams_are_lf_framed_raw_envelopes_and_tolerate_additive_kinds() {
         payload: serde_json::json!({
             "type": "future_observe_kind_v99",
             "additive": {"field": true}
-        }),
+        })
+        .into(),
     };
     let mut output = Vec::new();
     write_raw_envelope_jsonl(&mut output, &envelope).expect("write raw JSONL");

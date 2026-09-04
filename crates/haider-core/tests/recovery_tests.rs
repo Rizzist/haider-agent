@@ -37,7 +37,9 @@ fn envelope(
             durable: true,
             prompt: PromptRender::Pruned,
         },
-        payload: serde_json::to_value(payload).expect("payload serializes"),
+        payload: serde_json::to_value(payload)
+            .expect("payload serializes")
+            .into(),
     }
 }
 
@@ -73,7 +75,9 @@ async fn startup_reconciliation_is_durable_and_idempotent() {
     let events = store.read(&session, 0, 100).await.expect("read journal");
     let unknowns = events
         .iter()
-        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.clone()).ok())
+        .filter_map(|event| {
+            serde_json::from_value::<EventPayload>(event.payload.clone().into()).ok()
+        })
         .filter(|payload| {
             matches!(
                 payload,
@@ -173,7 +177,9 @@ async fn e6a_crash_mid_effect_journals_unknown_and_exact_four_choice_card() {
     let events = store.read(&session, 0, 100).await.expect("journal");
     let payloads = events
         .iter()
-        .map(|event| serde_json::from_value::<EventPayload>(event.payload.clone()).expect("typed"))
+        .map(|event| {
+            serde_json::from_value::<EventPayload>(event.payload.clone().into()).expect("typed")
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         payloads

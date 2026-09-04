@@ -29,7 +29,8 @@ fn state_envelope(session_id: &SessionId, ordinal: u64) -> RawEnvelope {
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(EventPayload::RunState(RunState::Streaming))
-            .expect("run state serializes"),
+            .expect("run state serializes")
+            .into(),
     }
 }
 
@@ -87,7 +88,7 @@ async fn hot_batch_uses_stamped_head_unless_the_sidecar_cursor_trails() {
 fn projected_envelope(session_id: &SessionId, ordinal: u64, payload: EventPayload) -> RawEnvelope {
     let mut envelope = state_envelope(session_id, ordinal);
     envelope.seq = ordinal;
-    envelope.payload = serde_json::to_value(payload).expect("payload serializes");
+    *envelope.payload = serde_json::to_value(payload).expect("payload serializes");
     envelope
 }
 

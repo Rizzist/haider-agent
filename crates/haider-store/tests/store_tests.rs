@@ -51,7 +51,7 @@ fn envelope(session: &SessionId, event_id: &str, payload: Value) -> RawEnvelope 
             durable: true,
             prompt: PromptRender::Pruned,
         },
-        payload,
+        payload: payload.into(),
     }
 }
 
@@ -860,7 +860,7 @@ fn raw_envelope_preserves_unknown_payload_kinds() {
 
     must(store.append(&mut batch));
     let read = must(store.read(&session, 0, 10));
-    assert_eq!(read[0].payload, unknown_payload);
+    assert_eq!(read[0].payload.to_json_value(), unknown_payload);
     assert_eq!(
         must(serde_json::to_vec(&read[0])),
         must(serde_json::to_vec(&batch[0]))
@@ -1021,7 +1021,7 @@ fn reducer_payload_filters_match_full_scan_for_every_declared_kind_set() {
     must(store.append(&mut batch));
     let connection = must(Connection::open(store.database_path()));
     for (envelope, payload) in batch.iter_mut().zip(payloads) {
-        envelope.payload = payload;
+        envelope.payload = payload.into();
         let kind = test_payload_kind(envelope).to_owned();
         let encoded = must(rmp_serde::to_vec_named(envelope));
         must(connection.execute(

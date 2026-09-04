@@ -97,7 +97,9 @@ fn raw(seq: u64, agent: Option<&str>, at_ms: u64, payload: &EventPayload) -> Raw
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("payload serializes"),
+        payload: serde_json::to_value(payload)
+            .expect("payload serializes")
+            .into(),
     }
 }
 
@@ -108,7 +110,7 @@ fn raw_metrics(seq: u64, at_ms: u64, snapshot: &AgentMetricsSnapshot) -> RawEnve
         at_ms,
         &EventPayload::RunState(haider_protocol::state::RunState::Thinking),
     );
-    envelope.payload = snapshot.to_payload_value().expect("metrics payload");
+    envelope.payload = snapshot.to_payload_value().expect("metrics payload").into();
     envelope
 }
 

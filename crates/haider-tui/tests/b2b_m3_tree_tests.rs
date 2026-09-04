@@ -64,7 +64,9 @@ fn raw(seq: u64, payload: &EventPayload) -> RawEnvelope {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).expect("payload serializes"),
+        payload: serde_json::to_value(payload)
+            .expect("payload serializes")
+            .into(),
     }
 }
 
@@ -117,7 +119,7 @@ fn branch_created(
         },
     };
     let mut envelope = raw(seq, &EventPayload::IdleDecayed);
-    envelope.payload = created.to_payload_value().expect("fact serializes");
+    envelope.payload = created.to_payload_value().expect("fact serializes").into();
     envelope
 }
 

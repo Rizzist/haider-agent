@@ -1020,7 +1020,7 @@ struct DurableReplayDocument<'a> {
     provider_requests: u8,
     provider: &'a str,
     model: &'a str,
-    response: Option<String>,
+    response: Option<haider_protocol::reply::ReplyText>,
     events: &'a HeadlessRunEvents,
     integrity: DurableReplayIntegrity,
     equivalence: DurableReplayEquivalence,
@@ -1185,7 +1185,7 @@ fn replay_legacy_terminal_projection(
                 adjacent_failure = None;
             }
             Some("run_failed") => {
-                adjacent_failure = match serde_json::from_value::<EventPayload>(envelope.payload) {
+                adjacent_failure = match envelope.payload.decode_event() {
                     Ok(EventPayload::RunFailed { code, .. }) => Some((envelope.seq, code)),
                     _ => None,
                 };
@@ -1194,8 +1194,7 @@ fn replay_legacy_terminal_projection(
                 if !deadline_exceeded
                     && cancellation_intent_at_ms.is_none()
                     && blocking_error_code.is_none()
-                    && let Ok(EventPayload::MenuOpened(menu)) =
-                        serde_json::from_value::<EventPayload>(envelope.payload)
+                    && let Ok(EventPayload::MenuOpened(menu)) = envelope.payload.decode_event()
                 {
                     if let MenuKind::Permission { .. } = menu.kind {
                         let reject_once = menu
@@ -1221,8 +1220,7 @@ fn replay_legacy_terminal_projection(
                 adjacent_failure = None;
             }
             Some("menu_answered") => {
-                if let Ok(EventPayload::MenuAnswered(answer)) =
-                    serde_json::from_value::<EventPayload>(envelope.payload)
+                if let Ok(EventPayload::MenuAnswered(answer)) = envelope.payload.decode_event()
                     && let Some((option_key, option_index)) =
                         pending_permission_rejects.remove(answer.menu.as_str())
                     && !deadline_exceeded
@@ -1236,8 +1234,7 @@ fn replay_legacy_terminal_projection(
                 adjacent_failure = None;
             }
             Some("menu_closed") => {
-                if let Ok(EventPayload::MenuClosed { menu, .. }) =
-                    serde_json::from_value::<EventPayload>(envelope.payload)
+                if let Ok(EventPayload::MenuClosed { menu, .. }) = envelope.payload.decode_event()
                     && pending_permission_rejects.remove(menu.as_str()).is_some()
                     && !deadline_exceeded
                     && cancellation_intent_at_ms.is_none()
@@ -1248,7 +1245,7 @@ fn replay_legacy_terminal_projection(
                 adjacent_failure = None;
             }
             Some("run_state") => {
-                let state = serde_json::from_value::<EventPayload>(envelope.payload.clone());
+                let state = envelope.payload.decode_event();
                 let Ok(EventPayload::RunState(state)) = state else {
                     adjacent_failure = None;
                     return Ok(());
@@ -1388,7 +1385,9 @@ fn terminal_kind_name(kind: HeadlessTerminalKind) -> &'static str {
     }
 }
 
-fn replay_final_text(events: &HeadlessRunEvents) -> io::Result<Option<String>> {
+fn replay_final_text(
+    events: &HeadlessRunEvents,
+) -> io::Result<Option<haider_protocol::reply::ReplyText>> {
     let mut final_text = None;
     events.try_for_each(|envelope| {
         let payload = envelope.payload;
@@ -1397,7 +1396,7 @@ fn replay_final_text(events: &HeadlessRunEvents) -> io::Result<Option<String>> {
                 haider_protocol::item::TurnItem::AgentMessage { text }
                 | haider_protocol::item::TurnItem::IncompleteAgentMessage { text, .. },
             ..
-        })) = serde_json::from_value::<EventPayload>(payload)
+        })) = payload.decode_event()
         {
             final_text = Some(text);
         }
@@ -1658,8 +1657,7 @@ fn adapt_events_to(
             }
             HeadlessEvent::Envelope(envelope) => {
                 if output == RunOutput::Jsonl {
-                    serde_json::to_writer(&mut stdout, envelope.as_ref())
-                        .map_err(io::Error::other)?;
+                    haider_protocol::envelope::write_envelope_json(&mut stdout, envelope.as_ref())?;
                     stdout.write_all(b"\n")?;
                     stdout_dirty = true;
                     stdout_unflushed_envelopes = stdout_unflushed_envelopes.saturating_add(1);
@@ -1691,7 +1689,7 @@ fn adapt_events_to(
                         terminal_kind_name(terminal.kind),
                         terminal.error_code.as_deref(),
                     )?;
-                    serde_json::to_writer(&mut stdout, &envelope).map_err(io::Error::other)?;
+                    haider_protocol::envelope::write_envelope_json(&mut stdout, &envelope)?;
                     stdout.write_all(b"\n")?;
                     stdout.flush()?;
                 }
@@ -1824,7 +1822,7 @@ pub(crate) fn write_final(
                 output.write_all(result.run_id.as_str().as_bytes())?;
                 output.write_all(b"\n")?;
             } else if let Some(response) = &result.response {
-                output.write_all(response.as_bytes())?;
+                response.write_to(&mut output)?;
                 output.write_all(b"\n")?;
             }
         }
@@ -1867,7 +1865,7 @@ struct RunJson<'a> {
     model: &'a str,
     attachments: RunJsonAttachments<'a>,
     outcome: HeadlessOutcome,
-    response: &'a Option<String>,
+    response: &'a Option<haider_protocol::reply::ReplyText>,
     events: &'a HeadlessRunEvents,
     usage: &'a Option<haider_protocol::provider::Usage>,
     budget_exhausted: &'a Option<haider_protocol::headless::RunBudgetExhaustedV1>,

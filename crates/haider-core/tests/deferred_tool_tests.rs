@@ -43,7 +43,7 @@ fn manifest(agent: &str, task: &str) -> AgentManifest {
 }
 
 fn typed(envelope: &RawEnvelope) -> EventPayload {
-    serde_json::from_value(envelope.payload.clone()).expect("known payload")
+    serde_json::from_value(envelope.payload.clone().into()).expect("known payload")
 }
 
 struct DeferredDispatcher {

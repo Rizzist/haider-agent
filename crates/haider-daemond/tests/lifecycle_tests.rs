@@ -476,14 +476,18 @@ fn raw_event(
             durable: true,
             prompt: PromptRender::Pruned,
         },
-        payload: serde_json::to_value(payload).expect("payload serializes"),
+        payload: serde_json::to_value(payload)
+            .expect("payload serializes")
+            .into(),
     }
 }
 
 fn unknown_outcomes(events: &[RawEnvelope], effect: &EffectId) -> usize {
     events
         .iter()
-        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.clone()).ok())
+        .filter_map(|event| {
+            serde_json::from_value::<EventPayload>(event.payload.clone().into()).ok()
+        })
         .filter(|payload| {
             matches!(
                 payload,
@@ -2279,7 +2283,9 @@ async fn reconcile_before_ready_marks_unknown_exactly_once_and_never_retries_eff
     assert_eq!(unknown_outcomes(&events, &completed), 0);
     let pending_nonterminal_phases = events
         .iter()
-        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.clone()).ok())
+        .filter_map(|event| {
+            serde_json::from_value::<EventPayload>(event.payload.clone().into()).ok()
+        })
         .filter(|payload| match payload {
             EventPayload::Effect(EffectPhase::Intent(intent)) => {
                 intent.effect.as_str() == pending.as_str()

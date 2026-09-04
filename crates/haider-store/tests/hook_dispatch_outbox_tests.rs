@@ -38,7 +38,7 @@ fn event(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     }
 }
 

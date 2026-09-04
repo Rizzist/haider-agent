@@ -138,7 +138,7 @@ fn envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     }
 }
 

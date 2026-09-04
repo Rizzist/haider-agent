@@ -353,13 +353,13 @@ fn same_run_steer_commits_one_message_without_minting_a_new_turn() {
     assert_eq!(envelopes.len(), 2);
     assert_eq!(accepted.accepted_seq, envelopes[0].seq);
     assert!(matches!(
-        serde_json::from_value::<haider_protocol::EventPayload>(envelopes[0].payload.clone())
+        serde_json::from_value::<haider_protocol::EventPayload>(envelopes[0].payload.clone().into())
             .expect("payload"),
         haider_protocol::EventPayload::UserMessage { text, mode, .. }
             if text == "report your status or conclude" && mode == DeliveryMode::Steer
     ));
     assert!(matches!(
-        serde_json::from_value::<haider_protocol::EventPayload>(envelopes[1].payload.clone())
+        serde_json::from_value::<haider_protocol::EventPayload>(envelopes[1].payload.clone().into())
             .expect("tree payload"),
         haider_protocol::EventPayload::NodeCommitted(node)
             if matches!(node.kind, haider_protocol::history::NodeKind::UserTurn { ref text, .. }
@@ -409,7 +409,8 @@ fn subturn_binds_to_the_active_run_with_a_distinct_durable_disposition() {
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(haider_protocol::EventPayload::RunState(RunState::Streaming))
-            .expect("streaming payload"),
+            .expect("streaming payload")
+            .into(),
     }];
     store.append(&mut streaming).expect("streaming append");
 
@@ -444,7 +445,7 @@ fn subturn_binds_to_the_active_run_with_a_distinct_durable_disposition() {
     );
     assert_eq!(envelopes.len(), 2, "same-run delivery has no Queued prefix");
     assert!(matches!(
-        serde_json::from_value::<haider_protocol::EventPayload>(envelopes[0].payload.clone())
+        serde_json::from_value::<haider_protocol::EventPayload>(envelopes[0].payload.clone().into())
             .expect("subturn payload"),
         haider_protocol::EventPayload::UserMessage { text, mode, .. }
             if text == "use narrow args" && mode == DeliveryMode::Subturn
@@ -478,7 +479,8 @@ fn legacy_session_without_typed_metadata_is_rejected_before_acceptance() {
         payload: serde_json::to_value(haider_protocol::EventPayload::SessionState(
             SessionState::Idle { interrupted: false },
         ))
-        .expect("payload"),
+        .expect("payload")
+        .into(),
     }];
     store.append(&mut legacy).expect("legacy session seed");
     let command = submit(&store, "legacy-submit", &session_id, "legacy-run");
@@ -560,7 +562,7 @@ fn pdf_page_count_and_delivery_survive_journal_and_receipt_replay() {
     );
     let journaled = envelopes.iter().any(|envelope| {
         matches!(
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            serde_json::from_value::<EventPayload>(envelope.payload.clone().into()),
             Ok(EventPayload::UserMessage { attachments, .. }) if attachments == vec![attachment.clone()]
         )
     });
@@ -701,7 +703,8 @@ fn cancel_records_intent_and_reports_already_terminal() {
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(haider_protocol::EventPayload::RunState(RunState::Cancelled))
-            .expect("payload"),
+            .expect("payload")
+            .into(),
     }];
     store.append(&mut terminal).expect("terminal append");
     let terminal_seq = terminal[0].seq;
@@ -806,7 +809,8 @@ fn aggregate_idle_is_skipped_when_a_new_run_is_durably_active() {
             prompt: PromptRender::Omit,
         },
         payload: serde_json::to_value(haider_protocol::EventPayload::RunState(RunState::Done))
-            .expect("payload"),
+            .expect("payload")
+            .into(),
     }];
     store.append(&mut done).expect("first terminal");
     store
@@ -835,14 +839,16 @@ fn aggregate_idle_is_skipped_when_a_new_run_is_durably_active() {
         payload: serde_json::to_value(haider_protocol::EventPayload::SessionState(
             SessionState::Idle { interrupted: false },
         ))
-        .expect("payload"),
+        .expect("payload")
+        .into(),
     };
     assert!(!store.settle_session_idle(&mut idle).expect("settle"));
     assert_eq!(idle.seq, 0);
     let durable = store.read(&session_id, 0, 64).expect("read");
     assert!(matches!(
         durable.last().and_then(|envelope| {
-            serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload.clone()).ok()
+            serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload.clone().into())
+                .ok()
         }),
         Some(haider_protocol::EventPayload::SessionState(
             SessionState::ActiveRun

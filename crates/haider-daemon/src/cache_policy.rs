@@ -164,9 +164,7 @@ pub(crate) async fn latest_main_cache_scope(
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
         for envelope in page {
-            let Ok(EventPayload::Usage(usage)) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
-            else {
+            let Ok(EventPayload::Usage(usage)) = envelope.payload.decode_event() else {
                 continue;
             };
             let Some(scope) = usage.scope else {

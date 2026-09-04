@@ -21,6 +21,7 @@ use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, TurnItem, UserCo
 use haider_protocol::menu::{ErrorRecoveryCardKind, MenuKind};
 use haider_protocol::pipe::TranscriptProjector;
 use haider_protocol::provider::{Block, PROVIDER_OPAQUE_EXTENSION_KIND};
+use haider_protocol::reply::{ReplyArenaWriter, ReplyText};
 use haider_protocol::state::RunState;
 use haider_protocol::task::{TASK_TAIL_BYTES, TaskEventPayload, TaskTerminalState};
 use haider_protocol::tool::{AttachmentBlock, BoundedResult};
@@ -132,7 +133,13 @@ struct CachedPromptSession {
     boundary_projector: TranscriptProjector,
     boundaries: HashMap<PromptTimelineKey, PromptBoundary>,
     saved_boundaries: HashMap<PromptTimelineKey, u64>,
+    active_reply_arenas: HashMap<ReplyActiveKey, (u8, ReplyArenaWriter)>,
+    completed_reply_arenas: HashMap<ReplyCompletedKey, (u64, ReplyText)>,
 }
+
+type ReplyScope = (Option<RunId>, Option<BranchId>, Option<AgentId>);
+type ReplyActiveKey = (ReplyScope, ItemId);
+type ReplyCompletedKey = (ReplyScope, u8, usize, blake3::Hash);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PromptProjectionKey {
@@ -261,7 +268,7 @@ impl PromptHistoryCompiler {
         let mut last_output = None;
         for envelope in envelopes {
             let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
+                envelope.payload.decode_event()
             else {
                 continue;
             };
@@ -626,7 +633,7 @@ impl PromptHistoryCompiler {
             .iter()
             .filter_map(|envelope| {
                 let EventPayload::ToolResult { result, .. } =
-                    serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
+                    envelope.payload.decode_event().ok()?
                 else {
                     return None;
                 };
@@ -832,7 +839,7 @@ impl PromptHistoryCompiler {
             .iter()
             .filter_map(|envelope| {
                 let EventPayload::ToolResult { result, .. } =
-                    serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
+                    envelope.payload.decode_event().ok()?
                 else {
                     return None;
                 };
@@ -1381,6 +1388,100 @@ async fn replay_cached_session(
     Ok(cached)
 }
 
+/// Rebinds independently decoded reply facts to one arena while any replay
+/// loop advances across store pages. Callers retain the resulting ranges;
+/// these maps only carry append authority and the short completed-to-node
+/// handoff.
+fn canonicalize_reply_envelope(
+    envelope: &mut RawEnvelope,
+    active_reply_arenas: &mut HashMap<ReplyActiveKey, (u8, ReplyArenaWriter)>,
+    completed_reply_arenas: &mut HashMap<ReplyCompletedKey, (u64, ReplyText)>,
+) {
+    fn lane(item: &TurnItem) -> Option<(u8, &ReplyText)> {
+        match item {
+            TurnItem::AgentMessage { text } | TurnItem::IncompleteAgentMessage { text, .. } => {
+                Some((0, text))
+            }
+            TurnItem::Reasoning { summary } => Some((1, summary)),
+            _ => None,
+        }
+    }
+
+    fn content_key(scope: &ReplyScope, lane: u8, text: &ReplyText) -> Option<ReplyCompletedKey> {
+        Some((scope.clone(), lane, text.len(), text.arena_digest()?))
+    }
+
+    fn writer_for(lane: u8) -> ReplyArenaWriter {
+        if lane == 0 {
+            ReplyArenaWriter::new().with_standard_provider_json_views()
+        } else {
+            ReplyArenaWriter::new()
+        }
+    }
+
+    let scope = (
+        envelope.run_id.clone(),
+        envelope.branch_id.clone(),
+        envelope.agent_id.clone(),
+    );
+    let Ok(event) = envelope.payload.decode_event() else {
+        return;
+    };
+    let replacement = match event {
+        EventPayload::Item(ItemEvent::Started { item_id, item }) => {
+            let Some((item_lane, text)) = lane(&item) else {
+                return;
+            };
+            let mut writer = writer_for(item_lane);
+            let range = writer.append_shared(text);
+            active_reply_arenas.insert((scope, item_id), (item_lane, writer));
+            Some(range)
+        }
+        EventPayload::Item(ItemEvent::Delta { item_id, delta }) => {
+            let (inferred_lane, text) = match &delta {
+                ItemDelta::Text { text } => (0, text),
+                ItemDelta::Reasoning { text } => (1, text),
+                _ => return,
+            };
+            let (_, writer) = active_reply_arenas
+                .entry((scope, item_id))
+                .or_insert_with(|| (inferred_lane, writer_for(inferred_lane)));
+            Some(writer.append_shared(text))
+        }
+        EventPayload::Item(ItemEvent::Completed { item_id, item }) => {
+            let Some((item_lane, stored)) = lane(&item) else {
+                return;
+            };
+            let canonical = active_reply_arenas
+                .remove(&(scope.clone(), item_id))
+                .map(|(_, writer)| writer.seal())
+                .filter(|candidate| candidate == stored)
+                .unwrap_or_else(|| stored.clone());
+            if item_lane == 0
+                && let Some(key) = content_key(&scope, item_lane, &canonical)
+            {
+                completed_reply_arenas.insert(key, (envelope.seq, canonical.clone()));
+            }
+            Some(canonical)
+        }
+        EventPayload::NodeCommitted(node) => {
+            let NodeKind::AssistantCommit { text, .. } = node.kind else {
+                return;
+            };
+            content_key(&scope, 0, &text)
+                .and_then(|key| completed_reply_arenas.remove(&key))
+                .map(|(_, canonical)| canonical)
+                .filter(|canonical| canonical == &text)
+        }
+        _ => None,
+    };
+    if let Some(text) = replacement {
+        let _ = envelope.payload.replace_reply_text(text);
+    }
+    let oldest_handoff = envelope.seq.saturating_sub(64);
+    completed_reply_arenas.retain(|_, (completed_seq, _)| *completed_seq >= oldest_handoff);
+}
+
 impl CachedPromptSession {
     fn retained_envelope_allocation_bytes(&self) -> usize {
         if self.bodies_evicted {
@@ -1444,6 +1545,8 @@ impl CachedPromptSession {
         self.checkpoint_node_collision = false;
         self.boundary_projector = TranscriptProjector::default();
         self.boundaries.clear();
+        self.active_reply_arenas.clear();
+        self.completed_reply_arenas.clear();
     }
 
     fn compact_to_append_prefixes(&mut self) {
@@ -1484,7 +1587,7 @@ impl CachedPromptSession {
                 // fork, retry, and compaction lineage remains independently
                 // checkable without retaining tool/event bodies.
                 matches!(
-                    EventPayload::deserialize(&envelope.payload),
+                    envelope.payload.decode_event(),
                     Ok(EventPayload::NodeCommitted(_))
                 )
             })
@@ -1508,6 +1611,8 @@ impl CachedPromptSession {
         self.boundary_projector = boundary_projector;
         self.boundaries.clear();
         self.note_boundary_rows(boundary_rows);
+        self.active_reply_arenas.clear();
+        self.completed_reply_arenas.clear();
         self.bodies_evicted = false;
     }
 
@@ -1527,12 +1632,13 @@ impl CachedPromptSession {
 
     /// Advances every session-wide index from one decoded journal envelope.
     /// Returns whether the envelope starts a new compaction epoch.
-    fn push_envelope(&mut self, envelope: RawEnvelope) -> bool {
+    fn push_envelope(&mut self, mut envelope: RawEnvelope) -> bool {
+        self.canonicalize_reply_envelope(&mut envelope);
         self.retained_envelope_bytes = self
             .retained_envelope_bytes
             .saturating_add(envelope_weight_bytes(&envelope));
         let envelope_index = self.envelopes.len();
-        let payload = EventPayload::deserialize(&envelope.payload).ok();
+        let payload = envelope.payload.decode_event().ok();
         let checkpoint_node_collision = self
             .checkpoint_base
             .as_ref()
@@ -1589,6 +1695,18 @@ impl CachedPromptSession {
         self.envelopes.push(envelope);
         self.note_boundary_rows(rows);
         is_compaction || is_context_savings
+    }
+
+    /// Keeps reply ranges canonical while prompt history crosses its 256-event
+    /// read boundary. Store pages are independently decoded; this small fold
+    /// carries only the active append authority and the short completed-to-node
+    /// handoff, so the cached journal never retains one string per delta.
+    fn canonicalize_reply_envelope(&mut self, envelope: &mut RawEnvelope) {
+        canonicalize_reply_envelope(
+            envelope,
+            &mut self.active_reply_arenas,
+            &mut self.completed_reply_arenas,
+        );
     }
 
     fn indexed_ancestry_for_run(
@@ -1652,14 +1770,12 @@ impl CachedPromptSession {
             envelope.seq <= head_seq
                 && envelope.run_id.as_ref() == Some(current_run)
                 && scoped(envelope, branch_id, agent_id)
-                && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
-                    |payload| {
-                        matches!(
-                            payload,
-                            EventPayload::Item(_) | EventPayload::ToolResult { .. }
-                        )
-                    },
-                )
+                && envelope.payload.decode_event().is_ok_and(|payload| {
+                    matches!(
+                        payload,
+                        EventPayload::Item(_) | EventPayload::ToolResult { .. }
+                    )
+                })
         })
     }
 
@@ -1801,9 +1917,7 @@ async fn load_prompt_checkpoint(
     {
         return None;
     }
-    let Ok(EventPayload::RunState(boundary_state)) =
-        serde_json::from_value::<EventPayload>(boundary.payload.clone())
-    else {
+    let Ok(EventPayload::RunState(boundary_state)) = boundary.payload.decode_event() else {
         return None;
     };
     if !boundary_state.is_terminal() {
@@ -1836,9 +1950,7 @@ async fn load_prompt_checkpoint(
             if envelope.branch_id != decoded.branch_id || envelope.agent_id != decoded.agent_id {
                 continue;
             }
-            let Ok(EventPayload::NodeCommitted(node)) =
-                serde_json::from_value::<EventPayload>(envelope.payload.clone())
-            else {
+            let Ok(EventPayload::NodeCommitted(node)) = envelope.payload.decode_event() else {
                 continue;
             };
             if envelope.seq == decoded.compaction_epoch {
@@ -1944,10 +2056,10 @@ async fn build_prompt_checkpoint(
             "prompt checkpoint boundary identity disagrees with the journal",
         ));
     }
-    let EventPayload::RunState(boundary_state) = serde_json::from_value::<EventPayload>(
-        boundary_envelope.payload.clone(),
-    )
-    .map_err(|error| corrupt(format!("prompt checkpoint boundary is malformed: {error}")))?
+    let EventPayload::RunState(boundary_state) = boundary_envelope
+        .payload
+        .decode_event()
+        .map_err(|error| corrupt(format!("prompt checkpoint boundary is malformed: {error}")))?
     else {
         return Err(corrupt(
             "prompt checkpoint boundary is not a run-state event",
@@ -1964,7 +2076,9 @@ async fn build_prompt_checkpoint(
             envelope.branch_id == timeline.branch_id && envelope.agent_id == timeline.agent_id
         })
         .filter_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            envelope
+                .payload
+                .decode_event()
                 .is_ok_and(|payload| {
                     matches!(
                         payload,
@@ -1994,9 +2108,7 @@ async fn build_prompt_checkpoint(
         {
             prefix_run_ids.push(run_id.clone());
         }
-        let Ok(EventPayload::NodeCommitted(node)) =
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
-        else {
+        let Ok(EventPayload::NodeCommitted(node)) = envelope.payload.decode_event() else {
             continue;
         };
         if !seen_node_ids.insert(node.node.clone()) {
@@ -2431,7 +2543,7 @@ fn suffix_revises_prior_facts(
         if !scoped(envelope, branch_id, agent_id) {
             continue;
         }
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        let Ok(payload) = envelope.payload.decode_event() else {
             continue;
         };
         match payload {
@@ -2491,7 +2603,7 @@ fn suffix_revises_prior_facts(
         if !scoped(envelope, branch_id, agent_id) {
             continue;
         }
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        let Ok(payload) = envelope.payload.decode_event() else {
             continue;
         };
         match payload {
@@ -2539,7 +2651,7 @@ fn contains_scoped_item(
         if !scoped(envelope, branch_id, agent_id) {
             return false;
         }
-        serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(|payload| {
+        envelope.payload.decode_event().is_ok_and(|payload| {
             matches!(
                 payload,
                 EventPayload::Item(ItemEvent::Delta { item_id: candidate, .. })
@@ -2643,9 +2755,7 @@ async fn compile_idle_projection_at_prefix(
             if envelope.branch_id.as_ref() != branch_id || envelope.agent_id.as_ref() != agent_id {
                 return None;
             }
-            let EventPayload::NodeCommitted(node) =
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
-            else {
+            let EventPayload::NodeCommitted(node) = envelope.payload.decode_event().ok()? else {
                 return None;
             };
             Some((node.node, envelope.seq))
@@ -2934,7 +3044,7 @@ impl TreeProjection {
     fn build(envelopes: &[RawEnvelope]) -> Self {
         let mut tree = Self::default();
         for (envelope_index, envelope) in envelopes.iter().enumerate() {
-            let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok();
+            let payload = envelope.payload.decode_event().ok();
             tree.push(envelope_index, envelope, payload.as_ref());
         }
         tree
@@ -3208,9 +3318,10 @@ impl TreeProjection {
 }
 
 fn decode_tree_node(envelope: &RawEnvelope) -> Result<TreeNode, HaiderError> {
-    let EventPayload::NodeCommitted(node) =
-        serde_json::from_value::<EventPayload>(envelope.payload.clone())
-            .map_err(|error| corrupt(format!("indexed history node is malformed: {error}")))?
+    let EventPayload::NodeCommitted(node) = envelope
+        .payload
+        .decode_event()
+        .map_err(|error| corrupt(format!("indexed history node is malformed: {error}")))?
     else {
         return Err(corrupt("history tree index points to a non-node event"));
     };
@@ -3754,7 +3865,7 @@ fn apply_structural_trim_events(
                 continue;
             }
             let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
-                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                envelope.payload.decode_event()
             else {
                 continue;
             };
@@ -3783,7 +3894,7 @@ fn apply_structural_trim_events(
                 continue;
             }
             let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
-                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                envelope.payload.decode_event()
             else {
                 continue;
             };
@@ -3955,7 +4066,7 @@ impl JournalFactsIndex {
     }
 
     fn push(&mut self, envelope: &RawEnvelope) {
-        let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok();
+        let payload = envelope.payload.decode_event().ok();
         self.push_decoded(envelope, payload.as_ref());
     }
 
@@ -4000,7 +4111,7 @@ impl JournalFacts {
         let mut facts = Self::default();
         for envelope in envelopes {
             if scoped(envelope, branch_id, agent_id) {
-                let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok();
+                let payload = envelope.payload.decode_event().ok();
                 facts.push(envelope, payload.as_ref())?;
             }
         }
@@ -4177,7 +4288,17 @@ fn render_journal_with_facts(
         if !ordinary_visible {
             continue;
         }
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        if envelope.render.prompt != PromptRender::Omit
+            && !is_current
+            && let Some((provider, data)) = envelope.payload.provider_opaque_data()
+        {
+            messages.push(Message::assistant(vec![Block::ProviderOpaque {
+                provider,
+                data,
+            }]));
+            continue;
+        }
+        let Ok(payload) = envelope.payload.decode_event() else {
             continue;
         };
         // Direct-shell chunks are raw durable/UI facts with prompt=omit. The
@@ -4207,7 +4328,7 @@ fn render_journal_with_facts(
             EventPayload::UserMessage {
                 text, attachments, ..
             } => {
-                let mut blocks = vec![Block::Text { text }];
+                let mut blocks = vec![Block::Text { text: text.into() }];
                 blocks.extend(attachments.into_iter().map(Block::Attachment));
                 messages.push(Message {
                     role: MessageRole::User,
@@ -4326,13 +4447,22 @@ async fn read_all(
     session_id: &SessionId,
 ) -> Result<Vec<RawEnvelope>, HaiderError> {
     let mut envelopes = Vec::new();
+    let mut active_reply_arenas = HashMap::new();
+    let mut completed_reply_arenas = HashMap::new();
     let mut cursor = 0;
     loop {
-        let page = store.read(session_id, cursor, HISTORY_PAGE).await?;
+        let mut page = store.read(session_id, cursor, HISTORY_PAGE).await?;
         if page.is_empty() {
             break;
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        for envelope in &mut page {
+            canonicalize_reply_envelope(
+                envelope,
+                &mut active_reply_arenas,
+                &mut completed_reply_arenas,
+            );
+        }
         envelopes.extend(page);
     }
     Ok(envelopes)
@@ -4352,7 +4482,7 @@ fn legacy_journal_only(
             has_registry_fact = true;
             continue;
         }
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        let Ok(payload) = envelope.payload.decode_event() else {
             continue;
         };
         match payload {
@@ -4451,15 +4581,108 @@ fn provider_opaque_extension(data: serde_json::Value) -> Option<Block> {
     let object = data.as_object()?;
     let provider = object.get("provider")?.as_str()?.to_owned();
     let data = object.get("data")?.clone();
-    Some(Block::ProviderOpaque { provider, data })
+    Some(Block::ProviderOpaque {
+        provider,
+        data: data.into(),
+    })
 }
 
 fn corrupt(message: impl Into<String>) -> HaiderError {
     HaiderError::new(ErrorCode::StoreCorrupt, message, false)
 }
 
-fn serialized_body_bytes(value: &(impl Serialize + ?Sized)) -> usize {
-    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+/// Conservative resident-body charge for a compiled provider projection.
+/// This deliberately walks arena ranges and owned fields instead of invoking
+/// generic serde, whose `ReplyText` compatibility serializer would allocate a
+/// full String and then a second JSON buffer merely to count them.
+fn serialized_body_bytes(messages: &[Message]) -> usize {
+    fn json_bytes(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+                std::mem::size_of::<serde_json::Value>()
+            }
+            serde_json::Value::String(text) => text.len(),
+            serde_json::Value::Array(values) => values.iter().fold(
+                values
+                    .len()
+                    .saturating_mul(std::mem::size_of::<serde_json::Value>()),
+                |total, value| total.saturating_add(json_bytes(value)),
+            ),
+            serde_json::Value::Object(fields) => {
+                fields
+                    .iter()
+                    .fold(fields.len().saturating_mul(128), |total, (key, value)| {
+                        total
+                            .saturating_add(key.len())
+                            .saturating_add(json_bytes(value))
+                    })
+            }
+        }
+    }
+
+    fn attachment_bytes(attachment: &AttachmentBlock) -> usize {
+        match attachment {
+            AttachmentBlock::Image { artifact, mime, .. } => {
+                artifact.as_str().len().saturating_add(mime.len())
+            }
+            AttachmentBlock::PastedText { artifact, .. } => artifact.as_str().len(),
+            AttachmentBlock::File { artifact, name, .. }
+            | AttachmentBlock::Pdf { artifact, name, .. } => {
+                artifact.as_str().len().saturating_add(name.len())
+            }
+            AttachmentBlock::Skill { name, version_hash } => {
+                name.len().saturating_add(version_hash.len())
+            }
+        }
+    }
+
+    messages.iter().fold(
+        messages
+            .len()
+            .saturating_mul(std::mem::size_of::<Message>()),
+        |total, message| {
+            message.blocks.iter().fold(
+                total.saturating_add(
+                    message
+                        .blocks
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Block>()),
+                ),
+                |total, block| {
+                    total.saturating_add(match block {
+                        Block::Text { text } => text.len(),
+                        Block::Reasoning { summary } => summary.len(),
+                        Block::ToolCall {
+                            call_id,
+                            name,
+                            args,
+                        } => call_id
+                            .len()
+                            .saturating_add(name.len())
+                            .saturating_add(json_bytes(args)),
+                        Block::ToolResult {
+                            call_id,
+                            preview,
+                            images,
+                            ..
+                        } => images.iter().fold(
+                            call_id.len().saturating_add(preview.len()),
+                            |total, image| {
+                                total
+                                    .saturating_add(image.artifact.as_str().len())
+                                    .saturating_add(image.media_type.len())
+                            },
+                        ),
+                        Block::Attachment(attachment) => attachment_bytes(attachment),
+                        Block::ProviderOpaque { provider, data } => provider
+                            .len()
+                            .saturating_add(json_bytes(data.template()))
+                            .saturating_add(data.reply_text().map_or(0, ReplyText::len)),
+                    })
+                },
+            )
+        },
+    )
 }
 
 #[cfg(test)]

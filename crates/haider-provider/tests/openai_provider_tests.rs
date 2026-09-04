@@ -868,6 +868,17 @@ fn encrypted_reasoning_continuation_reconstructs_exact_next_responses_input() {
             _ => None,
         })
         .expect("encrypted reasoning continuation event");
+    assert!(
+        opaque
+            .1
+            .reply_text()
+            .is_some_and(|text| text == "Synthetic summary.")
+    );
+    assert_ne!(
+        opaque.1.template()["summary"][0]["text"],
+        "Synthetic summary.",
+        "the native template must not retain a second reasoning String"
+    );
     let provider = native_provider("gpt-5-test");
     let request = TurnRequest {
         messages: vec![
@@ -897,7 +908,7 @@ fn encrypted_reasoning_continuation_reconstructs_exact_next_responses_input() {
         payload["include"],
         serde_json::json!(["reasoning.encrypted_content"])
     );
-    assert_eq!(payload["input"][1], opaque.1);
+    assert_eq!(payload["input"][1], opaque.1.to_json_value());
 }
 
 #[tokio::test]
@@ -1186,7 +1197,7 @@ fn hosted_web_search_call_captures_verbatim_and_citations_surface_as_sources() {
         vec![
             Ok(StreamEvent::ProviderOpaque {
                 provider: "openai".into(),
-                data: search_item,
+                data: search_item.into(),
             }),
             Ok(StreamEvent::ServerToolUse {
                 call_id: "ws_abc123".into(),

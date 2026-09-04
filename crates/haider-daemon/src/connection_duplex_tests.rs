@@ -265,7 +265,7 @@ async fn shell_cancel_settles_and_keeps_the_duplex_connection_open() {
                         ..
                     } => accepted = Some((run_id, item_id)),
                     WireFrame::Event { envelope, .. }
-                        if serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                        if envelope.payload.decode_event().is_ok_and(
                             |payload| {
                                 matches!(
                                     payload,
@@ -321,8 +321,7 @@ async fn shell_cancel_settles_and_keeps_the_duplex_connection_open() {
                     ..
                 } if cancelled == run_id => response = true,
                 WireFrame::Event { envelope, .. } => {
-                    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload)
-                    else {
+                    let Ok(payload) = envelope.payload.decode_event() else {
                         continue;
                     };
                     completed |= matches!(

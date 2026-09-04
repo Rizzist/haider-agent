@@ -100,7 +100,9 @@ fn provider_attempt_envelopes(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(EventPayload::Item(item)).expect("item payload"),
+        payload: serde_json::to_value(EventPayload::Item(item))
+            .expect("item payload")
+            .into(),
     })
     .collect()
 }
@@ -154,7 +156,9 @@ fn cache_attempt_envelopes(session_id: &SessionId) -> Vec<RawEnvelope> {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(EventPayload::Item(item)).expect("item payload"),
+        payload: serde_json::to_value(EventPayload::Item(item))
+            .expect("item payload")
+            .into(),
     })
     .collect()
 }

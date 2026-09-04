@@ -433,8 +433,7 @@ async fn descendant_child_state(
                 break;
             }
             if envelope.run_id.as_ref() == Some(&record.child_run_id)
-                && let Ok(EventPayload::RunState(state)) =
-                    serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                && let Ok(EventPayload::RunState(state)) = envelope.payload.decode_event()
             {
                 latest_state = Some(state);
             }
@@ -512,7 +511,7 @@ async fn descendant_parent_anchors(
             }
             let same_parent_turn = envelope.run_id.as_ref() == Some(&record.parent_run_id)
                 && envelope.branch_id.as_ref() == record.parent_branch_id.as_ref();
-            if let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+            if let Ok(payload) = envelope.payload.decode_event() {
                 match payload {
                     EventPayload::AgentSpawned(manifest)
                         if same_parent_turn

@@ -37,7 +37,7 @@ fn workspace_unavailable_notice_jsonl_golden() {
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload,
+        payload: payload.into(),
     };
     let actual = format!("{}\n", serde_json::to_string(&envelope).expect("JSONL"));
     assert_eq!(

@@ -114,7 +114,9 @@ async fn live_anthropic_second_turn_reads_cached_prompt_prefix() {
     );
 
     first_request.messages.extend([
-        Message::assistant(vec![Block::Text { text: first_reply }]),
+        Message::assistant(vec![Block::Text {
+            text: first_reply.into(),
+        }]),
         Message::user_text("Reply with exactly: cache-turn-two"),
     ]);
     let metadata = first_request
@@ -202,7 +204,9 @@ async fn run_live_cache_turn(
     let mut saw_finish = false;
     while let Some(item) = stream.recv().await {
         match item.expect("live cache stream item") {
-            StreamEvent::TextDelta { text: delta } => text.push_str(&delta),
+            StreamEvent::TextDelta { text: delta } => {
+                delta.visit_strs(|segment| text.push_str(segment));
+            }
             StreamEvent::UsageUpdate(update) => usage = Some(update),
             StreamEvent::Finish { .. } => {
                 saw_finish = true;

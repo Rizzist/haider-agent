@@ -97,7 +97,7 @@ async fn image_output_context_commits_self_contained_omitted_prompt_extension() 
     let event = events
         .iter()
         .find(|event| {
-            serde_json::from_value::<EventPayload>(event.payload.clone()).is_ok_and(|payload| {
+            event.payload.decode_event().is_ok_and(|payload| {
                 matches!(
                     payload,
                     EventPayload::Item(ItemEvent::Completed {
@@ -112,7 +112,7 @@ async fn image_output_context_commits_self_contained_omitted_prompt_extension() 
     let EventPayload::Item(ItemEvent::Completed {
         item: TurnItem::Extension { data, .. },
         ..
-    }) = serde_json::from_value(event.payload.clone()).expect("decode event")
+    }) = serde_json::from_value(event.payload.clone().into()).expect("decode event")
     else {
         panic!("expected completed image extension");
     };

@@ -25,7 +25,7 @@ use crate::origin::{FixedOriginGuard, SystemFixedDnsResolver};
 pub use crate::wire::ANTHROPIC_OAUTH_SYSTEM_IDENTITY;
 use crate::wire::{
     AnthropicSystemShape, SseDecoder, WireApiError, is_anthropic_context_error, provider_kind_name,
-    request_json,
+    request_json, request_json_with_reply_bindings,
 };
 use crate::{
     Provider, ProviderError, ProviderErrorKind, ProviderStream, ProviderStreamItem, TurnRequest,
@@ -639,21 +639,47 @@ impl AnthropicProvider {
         tools: &[crate::ToolDefinition],
         cache_ttl: Option<AnthropicCacheTtl>,
     ) -> Result<serde_json::Value, ProviderError> {
+        self.render_payload_inner(request, tools, cache_ttl, false)
+            .map(|(payload, _)| payload)
+    }
+
+    fn render_payload_inner(
+        &self,
+        request: &TurnRequest,
+        tools: &[crate::ToolDefinition],
+        cache_ttl: Option<AnthropicCacheTtl>,
+        bind_large_replies: bool,
+    ) -> Result<(serde_json::Value, Vec<crate::PreparedReplyBinding>), ProviderError> {
         let system_shape = match self.auth_mode {
             AnthropicAuthMode::ApiKey
             | AnthropicAuthMode::None
             | AnthropicAuthMode::CloudBearer => AnthropicSystemShape::ApiKey,
             AnthropicAuthMode::OAuthBearer => AnthropicSystemShape::OAuthClaudeCode,
         };
-        let mut payload = request_json(
-            request,
-            tools,
-            system_shape,
-            self.effort.as_deref(),
-            self.fast,
-            self.web_tools,
-            None,
-        )?;
+        let (mut payload, reply_bindings) = if bind_large_replies {
+            request_json_with_reply_bindings(
+                request,
+                tools,
+                system_shape,
+                self.effort.as_deref(),
+                self.fast,
+                self.web_tools,
+                None,
+            )?
+        } else {
+            (
+                request_json(
+                    request,
+                    tools,
+                    system_shape,
+                    self.effort.as_deref(),
+                    self.fast,
+                    self.web_tools,
+                    None,
+                )?,
+                Vec::new(),
+            )
+        };
         if let Some(cache_ttl) = cache_ttl {
             apply_anthropic_cache_controls(
                 request,
@@ -679,7 +705,7 @@ impl AnthropicProvider {
                 serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.into()),
             );
         }
-        Ok(payload)
+        Ok((payload, reply_bindings))
     }
 
     /// Builds the secret-free JSON body. Capture tools use this to record the
@@ -855,12 +881,25 @@ impl AnthropicProvider {
         Ok(value)
     }
 
+    #[cfg(test)]
     pub(crate) async fn request_body(
         &self,
         payload: serde_json::Value,
     ) -> Result<reqwest::Request, ProviderError> {
-        let request = self.request_builder(&payload).await?;
-        let body = crate::serialize_json_body(payload)?;
+        self.request_body_prepared(crate::PreparedWire {
+            payload,
+            history_boundary: None,
+            reply_bindings: Vec::new(),
+        })
+        .await
+    }
+
+    async fn request_body_prepared(
+        &self,
+        prepared: crate::PreparedWire,
+    ) -> Result<reqwest::Request, ProviderError> {
+        let request = self.request_builder(&prepared.payload).await?;
+        let body = crate::serialize_prepared_json_body(prepared)?;
         request.body(body).build().map_err(transport_error)
     }
 
@@ -956,11 +995,15 @@ impl AnthropicProvider {
         &self,
         request: &TurnRequest,
     ) -> Result<reqwest::Response, ProviderError> {
-        let payload = match crate::take_prepared_wire_payload() {
-            Some(prepared) => prepared.payload,
-            None => self.request_payload(request)?,
+        let prepared = match crate::take_prepared_wire_payload() {
+            Some(prepared) => prepared,
+            None => crate::PreparedWire {
+                payload: self.request_payload(request)?,
+                history_boundary: None,
+                reply_bindings: Vec::new(),
+            },
         };
-        let request = self.request_body(payload).await?;
+        let request = self.request_body_prepared(prepared).await?;
         let route_gating = self.route_gating();
         let opening = self.client.execute(request);
         crate::route_gated_timeout(
@@ -1283,7 +1326,8 @@ impl AnthropicProvider {
     ) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.cacheable_history_end();
         self.validate_model(request).ok()?;
-        let rendered_payload = self.render_payload(request, tools, None).ok()?;
+        let (rendered_payload, reply_bindings) =
+            self.render_payload_inner(request, tools, None, true).ok()?;
         let mut full_payload =
             crate::AttachmentMovePayload::new(rendered_payload, attachment_moves);
         let metadata = request.cache_metadata.as_ref()?;
@@ -1326,6 +1370,7 @@ impl AnthropicProvider {
                 0,
                 boundary,
                 metadata.previous_stable_history_end,
+                &reply_bindings,
             )?;
         let mut provider_view = crate::cachemaxxing::prepared_serialized_provider_view(
             request,
@@ -1347,7 +1392,12 @@ impl AnthropicProvider {
             previous_immutable_history_digest = metadata
                 .previous_stable_history_end
                 .filter(|previous| *previous <= messages.len())
-                .map(|previous| crate::exact_optional_wire_digest(Some(&messages[..previous])));
+                .and_then(|previous| {
+                    crate::exact_json_digest_with_replies(
+                        &Some(&messages[..previous]),
+                        &reply_bindings,
+                    )
+                });
         }
         let emitted = cache_ttl.is_some_and(|ttl| {
             apply_anthropic_cache_controls(
@@ -1377,6 +1427,7 @@ impl AnthropicProvider {
             wire: Some(crate::PreparedWire {
                 payload: full_payload.commit(),
                 history_boundary: None,
+                reply_bindings,
             }),
             turn_trace: None,
         })
