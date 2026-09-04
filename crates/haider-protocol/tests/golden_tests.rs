@@ -719,6 +719,30 @@ fn structured_search_result_wire_is_additive_and_legacy_decodes() {
     assert!(legacy.data.is_none());
 }
 
+#[test]
+fn invalid_tool_call_data_has_a_typed_round_trip_without_changing_legacy_results() {
+    let data = ToolResultData::InvalidToolCall {
+        tool: "edit".into(),
+        message: "expected a JSON object".into(),
+    };
+    let wire = serde_json::json!({
+        "kind": "invalid_tool_call",
+        "tool": "edit",
+        "message": "expected a JSON object",
+    });
+    assert_eq!(
+        serde_json::to_value(&data).expect("encode invalid call"),
+        wire
+    );
+    assert_eq!(
+        serde_json::from_value::<ToolResultData>(wire).expect("decode invalid call"),
+        data
+    );
+    let legacy = serde_json::json!({"preview": "legacy", "truncated": false});
+    let result: BoundedResult = serde_json::from_value(legacy.clone()).expect("decode legacy");
+    assert_eq!(serde_json::to_value(result).expect("encode legacy"), legacy);
+}
+
 /// MUTATION CHECK: rename `run_retried` or omit any source coordinate.
 /// Expected runtime failure: restart recovery and transcript clients can no
 /// longer bind a fresh run to its failed run and original committed user turn.

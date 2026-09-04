@@ -756,6 +756,8 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             "fs_search",
             "fs_write",
             "fs_edit",
+            "write",
+            "edit",
             "fs_path",
             "process_exec",
             "spawn_subagent",
@@ -917,6 +919,7 @@ fn c1_freshness_and_anchor_errors_are_typed_for_the_model() {
         path: PathBuf::from("anchor.txt"),
         matches: 7,
         replace_all: false,
+        nearest_candidate: None,
     }))
     .expect("typed anchor result");
     let anchor: serde_json::Value = serde_json::from_str(&anchor.preview).expect("anchor JSON");
@@ -1203,7 +1206,7 @@ fn every_advertised_tool_is_manual_described_and_native_prose_is_scoped() {
         );
         let should_have_native_prose = matches!(
             tool.name.as_str(),
-            "fs_glob" | "fs_search" | "fs_write" | "fs_edit" | "fs_path"
+            "fs_glob" | "fs_search" | "fs_write" | "fs_edit" | "write" | "edit" | "fs_path"
         );
         assert_eq!(
             !tool.description.is_empty(),
@@ -1293,24 +1296,25 @@ fn search_and_mutation_tool_schema_descriptions_are_pinned() {
 /// instruct pipe stops being a material (at least 30%) net reduction.
 #[test]
 fn instruct_pipe_shrinks_the_advertised_wire_pack() {
-    const EXPECTED_REGISTERED_TOOLS: usize = 27;
-    const EXPECTED_ADVERTISED_TOOLS: usize = 24;
+    const EXPECTED_REGISTERED_TOOLS: usize = 29;
+    const EXPECTED_ADVERTISED_TOOLS: usize = 26;
     // The full-prefix comparison deliberately includes the platform-specific
     // computer manifest description. Linux documents X11/Wayland (+49 bytes
     // over macOS), while Windows is one byte shorter than macOS.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_254;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_418;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_205;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_369;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_204;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_368;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_199;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_363;
     // v0.0.969 pinned 11_246 bytes. Before actbias, merged monitor/list_models
     // inventory additions had already moved this wave-970 baseline to 12_122.
-    // The lane delta below is exactly the five restored native descriptions.
-    const PRE_ACTBIAS_INSTRUCT_PIPE_BYTES: usize = 12_122;
-    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 12_621;
+    // The toolrepair delta adds two flat schemas/manual entries and preserves
+    // the original selective-description accounting and 30% reduction floor.
+    const PRE_ACTBIAS_INSTRUCT_PIPE_BYTES: usize = 12_719;
+    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 13_409;
 
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let stubbed =
@@ -1355,7 +1359,7 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     assert_eq!(
         new_total - native_description_bytes,
         PRE_ACTBIAS_INSTRUCT_PIPE_BYTES,
-        "only the five native descriptions may explain the actbias pipe delta"
+        "only the seven native descriptions may explain the pipe delta"
     );
     assert!(full_prefix > 0 && new_total < full_prefix);
     assert!(
