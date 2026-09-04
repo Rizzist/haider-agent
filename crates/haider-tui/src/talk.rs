@@ -9,7 +9,10 @@
 //! Contract (T-wave brief, T2):
 //! - press/⏎ on the TalkChip or `/talk` starts listening (live mode only);
 //! - Esc CANCELS (discards — nothing lands anywhere);
-//! - Enter COMMITS the transcript into the composer and SUBMITS;
+//! - the listening toggle (or Enter) STOPS and commits the transcript
+//!   into the composer at the cursor, editable — the user sends it with
+//!   ⏎. Owner 970: dictation NEVER auto-sends; the explicit, default-off
+//!   `transcription.auto_send` flag is the only way back to submit-on-stop;
 //! - typing a character COMMITS the partial transcript into the composer
 //!   and keeps editing (the engine's unseen tail is discarded — what you
 //!   saw is what you keep);
@@ -29,8 +32,14 @@ use haider_stt::{SttError, TranscriptFrame, TranscriptionResult};
 
 /// Wave width in terminal cells — also the ring's fixed capacity. One cell
 /// per envelope sample (~60 ms cadence), so the visible window spans
-/// roughly the last 1.4 s of signal.
-pub const WAVE_WIDTH: usize = 24;
+/// roughly the last 0.7 s of signal.
+///
+/// 970 owner requirement 4: HALVED from 24. The visualizer read as too
+/// wide on the status row — this is the fixed cell budget it may claim on
+/// the LEFT of that row, and the model/mode segment on the right keeps its
+/// alignment because the wave is laid out as `WAVE_WIDTH + 1` cells of
+/// right-aligned filler before the chip (see `render::composer_band`).
+pub const WAVE_WIDTH: usize = 12;
 /// Asymmetric smoothing: how fast the wave RISES toward a louder sample
 /// (the ADE voice-ring recipe, TerminalView.jsx).
 pub const WAVE_ATTACK: f32 = 0.5;
@@ -50,6 +59,41 @@ pub const WAVE_GLYPHS_BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '�
 /// toggles). Same 8 indices, same mapping law.
 pub const WAVE_GLYPHS_PLAIN: [char; 8] = ['_', '.', ':', '-', '=', '+', '#', '@'];
 
+/// The SAME two ramps as `&'static str`, so a rendered column borrows its
+/// symbol instead of minting a `String` per cell per frame (970 owner
+/// requirement 3: no allocation on the animation path — the wave redraws
+/// up to 30×/s while listening, and `char::to_string` would otherwise
+/// allocate `WAVE_WIDTH` times on every one of those frames).
+pub const WAVE_GLYPH_STRS_BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+/// Plain-ASCII twin of [`WAVE_GLYPH_STRS_BLOCKS`].
+pub const WAVE_GLYPH_STRS_PLAIN: [&str; 8] = ["_", ".", ":", "-", "=", "+", "#", "@"];
+
+/// The borrowed glyph for one cell in the chosen style — the allocation-free
+/// twin of [`wave_glyph`].
+#[must_use]
+pub fn wave_glyph_str(cell: WaveCell, plain: bool) -> &'static str {
+    let table = if plain {
+        &WAVE_GLYPH_STRS_PLAIN
+    } else {
+        &WAVE_GLYPH_STRS_BLOCKS
+    };
+    table[cell.glyph.min(7)]
+}
+
+/// The `◉ listening…` indicator's blink period. 970 owner requirement 2:
+/// the indicator blinks at its OWN steady ~1 Hz rate — one full on/off
+/// cycle per second — and is NOT coupled to audio frames. It is a pure
+/// function of the wall clock, so a silent mic blinks exactly like a loud
+/// one and a burst of envelopes cannot make it stutter.
+pub const LISTEN_BLINK_PERIOD_MS: u64 = 1_000;
+
+/// True on the LIT half of the listening blink. Deterministic in
+/// `clock_ms` alone — no envelope, no phase counter, no audio coupling.
+#[must_use]
+pub fn listening_blink_on(clock_ms: u64) -> bool {
+    clock_ms % LISTEN_BLINK_PERIOD_MS < LISTEN_BLINK_PERIOD_MS / 2
+}
+
 /// Perceptual glyph index for a stored level: `sqrt` mapping (small signals
 /// get visible motion), floored into 8 steps. Total on `[0, 1]`, monotone,
 /// `0.0 → 0`, `1.0 → 7`.
@@ -67,9 +111,14 @@ pub struct WaveCell {
     pub hot: bool,
 }
 
-/// A real ring whose peak sits below this reads as "no audio signal" (the
-/// capture path never fed a level, or true silence) — the render then shows
-/// the synthesized listening sweep so the state never looks dead.
+/// The level below which a column carries no meaningful signal.
+///
+/// 970 owner requirement 2: this is NO LONGER what routes real bars vs the
+/// synthesized sweep. It used to be — a ring whose peak dipped under it
+/// was treated as "no audio", which meant every pause between words threw
+/// the display back to the canned animation mid-sentence. That routing now
+/// asks `WaveRing::fed()` ("is a mic feeding me at all") instead, and this
+/// stays only as the shared notion of a floor-level column.
 pub const LISTENING_SIGNAL_MIN: f32 = 0.03;
 
 /// The synthesized "I'm listening" sweep: a gold crest travelling left→right
@@ -107,6 +156,16 @@ pub struct WaveRing {
     /// re-expressed as headroom above this floor, so ambient hum reads as
     /// a flat wave and speech stands out.
     floor: f32,
+    /// Has the capture path EVER handed this ring a sample?
+    ///
+    /// 970 owner requirement 2: the render used to compare the ring's peak
+    /// against a signal threshold and fall back to the synthesized sweep
+    /// whenever it dipped — which is every pause between words, so the
+    /// bars visibly SNAPPED from live audio to a slow canned animation
+    /// mid-sentence and read as "frozen/late". The honest question is not
+    /// "is it loud right now" but "is a mic feeding me at all": once fed,
+    /// the ring is the truth and a quiet passage is drawn quiet.
+    fed: bool,
 }
 
 impl Default for WaveRing {
@@ -122,6 +181,7 @@ impl WaveRing {
             slots: std::iter::repeat_n(0.0, WAVE_WIDTH).collect(),
             smoothed: 0.0,
             floor: 1.0,
+            fed: false,
         }
     }
 
@@ -134,6 +194,7 @@ impl WaveRing {
         } else {
             0.0
         };
+        self.fed = true;
         self.floor = self.floor.min(raw);
         let headroom = (1.0 - self.floor).max(WAVE_FLOOR_HEADROOM);
         let calibrated = ((raw - self.floor) / headroom).clamp(0.0, 1.0);
@@ -169,13 +230,32 @@ impl WaveRing {
     /// Renderable cells, left to right.
     #[must_use]
     pub fn cells(&self) -> Vec<WaveCell> {
-        self.slots
-            .iter()
-            .map(|&level| WaveCell {
-                glyph: wave_glyph_index(level),
-                hot: level >= WAVE_HOT_LEVEL,
-            })
-            .collect()
+        self.cells_iter().collect()
+    }
+
+    /// Renderable cells, left to right, WITHOUT the intermediate `Vec` —
+    /// the render path's accessor (970 owner requirement 3: the wave
+    /// redraws up to 30×/s, so the per-frame cell buffer is not minted).
+    pub fn cells_iter(&self) -> impl ExactSizeIterator<Item = WaveCell> + '_ {
+        self.slots.iter().map(|&level| WaveCell {
+            glyph: wave_glyph_index(level),
+            hot: level >= WAVE_HOT_LEVEL,
+        })
+    }
+
+    /// The loudest stored level, without materializing [`Self::levels`].
+    #[must_use]
+    pub fn max_level(&self) -> f32 {
+        self.slots.iter().copied().fold(0.0_f32, f32::max)
+    }
+
+    /// True once the capture path has handed this ring ANY sample — the
+    /// render's "is a mic feeding me" test. This replaces a LOUDNESS
+    /// threshold that made ordinary speech pauses snap the display over
+    /// to the synthesized sweep mid-sentence.
+    #[must_use]
+    pub fn fed(&self) -> bool {
+        self.fed
     }
 }
 

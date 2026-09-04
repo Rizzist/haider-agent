@@ -1076,7 +1076,6 @@ enum ObserveCacheEntry {
 struct ObserveFold {
     head_seq: u64,
     projection: ObserveProjection,
-    last_activity_ms: Option<u64>,
     turns: u64,
     metrics: crate::usage_report::SessionFolder,
 }
@@ -1096,7 +1095,6 @@ struct ObserveFoldSnapshot {
     pending_menus: Vec<haider_rpc::ObserveMenuWire>,
     subagents: Vec<haider_rpc::ObserveSubagentWire>,
     updated_at_ms: u64,
-    last_activity_ms: Option<u64>,
     event_kinds: Vec<String>,
     turns: u64,
     agent_metrics: Option<haider_protocol::agent::AgentMetricsSnapshot>,
@@ -1145,7 +1143,6 @@ impl ObserveFold {
         Self {
             head_seq: 0,
             projection: ObserveProjection::new(100),
-            last_activity_ms: None,
             turns: 0,
             metrics: crate::usage_report::SessionFolder::new(initial_model),
         }
@@ -1153,13 +1150,6 @@ impl ObserveFold {
 
     fn apply(&mut self, envelope: RawEnvelope) {
         self.head_seq = self.head_seq.max(envelope.seq);
-        if is_meaningful_activity(&envelope) {
-            self.last_activity_ms = Some(
-                self.last_activity_ms
-                    .unwrap_or(0)
-                    .max(envelope.committed_at_ms),
-            );
-        }
         if envelope.agent_id.is_none()
             && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
                 |payload| {
@@ -1203,7 +1193,6 @@ impl ObserveFold {
             pending_menus: self.projection.menus.values().cloned().collect(),
             subagents: self.projection.subagents.values().cloned().collect(),
             updated_at_ms: self.projection.updated_at_ms,
-            last_activity_ms: self.last_activity_ms,
             event_kinds: self.projection.event_kinds.iter().cloned().collect(),
             turns: self.turns,
             agent_metrics: self
@@ -1403,25 +1392,6 @@ fn ready_entry_deep_bytes(session_id: &SessionId, fold: &ObserveFold) -> usize {
         .saturating_add(session_id.as_str().len())
         .saturating_add(std::mem::size_of::<ObserveCacheEntry>())
         .saturating_add(fold.deep_owned_bytes())
-}
-
-/// Attention is derived only from committed facts a human would reasonably
-/// return to: any visible assistant/item lifecycle, a menu/parked-for-human
-/// transition, or a completed turn. UserMessage input echoes, config facts
-/// (including `session_seen` itself), usage, graph telemetry, and all other
-/// bookkeeping are deliberately excluded so telemetry cannot create an
-/// unseen dot.
-fn is_meaningful_activity(envelope: &RawEnvelope) -> bool {
-    matches!(
-        serde_json::from_value::<EventPayload>(envelope.payload.clone()),
-        Ok(EventPayload::Item(_))
-            | Ok(EventPayload::MenuOpened(_))
-            | Ok(EventPayload::RunState(
-                RunState::PermissionRequired { .. }
-                    | RunState::InputRequired { .. }
-                    | RunState::Done,
-            ))
-    )
 }
 
 impl ObserveFoldSnapshot {
@@ -3540,7 +3510,11 @@ impl HubConnection {
                 )
                 .await
             }
-            RequestBody::SessionList { cursor, limit } => {
+            RequestBody::SessionList {
+                cursor,
+                limit,
+                order,
+            } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
                         request_id,
@@ -3550,7 +3524,7 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.session_list(request_id, cursor, limit).await
+                self.session_list(request_id, cursor, limit, order).await
             }
             RequestBody::StatusSnapshot {} => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
@@ -15589,19 +15563,8 @@ impl HubConnection {
         request_id: RequestId,
         cursor: Option<String>,
         limit: u32,
+        order: haider_rpc::SessionListOrderWire,
     ) -> Result<(), SessionHubError> {
-        let after = match cursor.as_deref().map(decode_cursor).transpose() {
-            Ok(after) => after,
-            Err(()) => {
-                return self.respond_error(
-                    request_id,
-                    ERROR_CODE_INVALID_CURSOR,
-                    "session-list cursor is invalid",
-                    false,
-                    None,
-                );
-            }
-        };
         let limit = usize::try_from(limit)
             .unwrap_or(usize::MAX)
             .min(MAX_LIST_PAGE);
@@ -15614,24 +15577,101 @@ impl HubConnection {
                 None,
             );
         }
-        let ids = self.hub.roster_session_ids().await?;
-        let mut selected = ids
-            .into_iter()
-            .filter(|session_id| {
-                after
-                    .as_ref()
-                    .is_none_or(|after| session_id.as_str() > after.as_str())
-            })
-            .take(limit.saturating_add(1))
-            .collect::<Vec<_>>();
-        let has_more = selected.len() > limit;
-        if has_more {
-            selected.truncate(limit);
-        }
-        let sessions = session_summaries(&self.hub, &selected).await?;
-        let next_cursor = has_more
-            .then(|| selected.last().map(encode_cursor))
-            .flatten();
+        let (sessions, next_cursor) = match order {
+            haider_rpc::SessionListOrderWire::IdAsc => {
+                let after = match cursor.as_deref().map(decode_cursor).transpose() {
+                    Ok(after) => after,
+                    Err(()) => {
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_INVALID_CURSOR,
+                            "session-list cursor is invalid",
+                            false,
+                            None,
+                        );
+                    }
+                };
+                let ids = self.hub.roster_session_ids().await?;
+                let mut selected = ids
+                    .into_iter()
+                    .filter(|session_id| {
+                        after
+                            .as_ref()
+                            .is_none_or(|after| session_id.as_str() > after.as_str())
+                    })
+                    .take(limit.saturating_add(1))
+                    .collect::<Vec<_>>();
+                let has_more = selected.len() > limit;
+                if has_more {
+                    selected.truncate(limit);
+                }
+                let sessions = session_summaries(&self.hub, &selected).await?;
+                let next_cursor = has_more
+                    .then(|| selected.last().map(encode_cursor))
+                    .flatten();
+                (sessions, next_cursor)
+            }
+            haider_rpc::SessionListOrderWire::RecencyDesc => {
+                let mut after = match cursor.as_deref().map(decode_recency_cursor).transpose() {
+                    Ok(after) => after,
+                    Err(()) => {
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_INVALID_CURSOR,
+                            "session-list cursor is invalid",
+                            false,
+                            None,
+                        );
+                    }
+                };
+                let target = limit.saturating_add(1);
+                let mut selected = Vec::with_capacity(target);
+                while selected.len() < target {
+                    let fetch_limit = target.saturating_sub(selected.len());
+                    let page = self
+                        .hub
+                        .inner
+                        .store
+                        .session_recency_page(after.clone(), fetch_limit)
+                        .await?;
+                    if page.is_empty() {
+                        break;
+                    }
+                    let page_was_full = page.len() == fetch_limit;
+                    for row in page {
+                        after = Some(row.key.clone());
+                        if self.hub.is_roster_visible(&row.key.session_id)? {
+                            selected.push(row);
+                        }
+                    }
+                    if !page_was_full {
+                        break;
+                    }
+                }
+                let has_more = selected.len() > limit;
+                if has_more {
+                    selected.truncate(limit);
+                }
+                let ids = selected
+                    .iter()
+                    .map(|row| row.key.session_id.clone())
+                    .collect::<Vec<_>>();
+                let recencies = selected
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.key.session_id.as_str().to_owned(),
+                            row.key.last_activity_ms,
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let sessions = session_summaries_with_recency(&self.hub, &ids, &recencies).await?;
+                let next_cursor = has_more
+                    .then(|| selected.last().map(|row| encode_recency_cursor(&row.key)))
+                    .flatten();
+                (sessions, next_cursor)
+            }
+        };
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::SessionList {
@@ -18111,6 +18151,28 @@ pub(crate) async fn session_summaries(
     hub: &SessionHub,
     session_ids: &[SessionId],
 ) -> Result<Vec<SessionSummary>, SessionHubError> {
+    let recencies = hub
+        .inner
+        .store
+        .session_recencies(session_ids.to_vec())
+        .await?;
+    let recencies = recencies
+        .into_iter()
+        .map(|row| {
+            (
+                row.key.session_id.as_str().to_owned(),
+                row.key.last_activity_ms,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    session_summaries_with_recency(hub, session_ids, &recencies).await
+}
+
+async fn session_summaries_with_recency(
+    hub: &SessionHub,
+    session_ids: &[SessionId],
+    durable_recencies: &BTreeMap<String, u64>,
+) -> Result<Vec<SessionSummary>, SessionHubError> {
     let mut sessions = Vec::with_capacity(session_ids.len());
     for session_id in session_ids {
         if !hub.is_roster_visible(session_id)? {
@@ -18138,7 +18200,11 @@ pub(crate) async fn session_summaries(
         let run_state = snapshot.run_state;
         // Same selection as `run_state` — the pair is one observation.
         let run_id = snapshot.run_id.clone();
-        let last_activity_ms = snapshot.last_activity_ms;
+        // This is the exact key used by recency pagination. Every committed
+        // live event already advances the durable journal head, so one
+        // store-derived value keeps summaries and cursors consistent even
+        // when historical timestamps regress.
+        let last_activity_ms = durable_recencies.get(session_id.as_str()).copied();
         let waiting_why = waiting_why(run_state, &snapshot.pending_menus);
         let needs_input = needs_input(run_state, &snapshot.pending_menus);
         let (footprint_tokens, footprint_truth) =

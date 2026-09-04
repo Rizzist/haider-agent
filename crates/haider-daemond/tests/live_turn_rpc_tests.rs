@@ -2099,6 +2099,7 @@ async fn current_generation(
         RequestBody::SessionList {
             cursor: None,
             limit: 128,
+            order: Default::default(),
         },
     )
     .await;
@@ -5829,6 +5830,7 @@ async fn metadata_less_live_submit_is_correlated_invalid_argument_without_accept
         RequestBody::SessionList {
             cursor: None,
             limit: 10,
+            order: Default::default(),
         },
     )
     .await;
@@ -6895,6 +6897,7 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
         RequestBody::SessionList {
             cursor: None,
             limit: 10,
+            order: Default::default(),
         },
     )
     .await;
@@ -6914,7 +6917,9 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             run_state: Some(haider_rpc::ObserveRunStateWire::Idle),
             run_id: None,
             seen_at_ms: None,
-            last_activity_ms: None,
+            // Session-list recency is durable from creation onward; a fresh
+            // session's activity coordinate is its creation timestamp.
+            last_activity_ms: Some(metadata.created_at_ms),
             waiting_why: None,
             needs_input: None,
             metadata: Some(metadata.clone()),
@@ -7031,6 +7036,7 @@ async fn session_create_lost_response_retry_survives_removed_cwd_and_rejects_cha
             RequestBody::SessionList {
                 cursor: None,
                 limit: 10,
+                order: Default::default(),
             },
         )
         .await;
@@ -7164,6 +7170,7 @@ async fn session_create_permission_overrides_are_digest_bound_and_persisted() {
         RequestBody::SessionList {
             cursor: None,
             limit: 10,
+            order: Default::default(),
         },
     )
     .await;
@@ -7247,6 +7254,7 @@ async fn session_create_requires_control_and_ready_welcome_advertises_implemente
         RequestBody::SessionList {
             cursor: None,
             limit: 1,
+            order: Default::default(),
         },
     )
     .await;

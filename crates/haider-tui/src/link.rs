@@ -921,6 +921,11 @@ pub fn request_body_for_features(
         LiveCommand::List { cursor } => RequestBody::SessionList {
             cursor,
             limit: crate::live::LIST_PAGE,
+            order: if daemon_features.contains(haider_rpc::FEATURE_SESSION_LIST_RECENCY_V1) {
+                haider_rpc::SessionListOrderWire::RecencyDesc
+            } else {
+                haider_rpc::SessionListOrderWire::IdAsc
+            },
         },
         LiveCommand::Attach { session, after_seq } => RequestBody::SessionAttach {
             session_id: session,

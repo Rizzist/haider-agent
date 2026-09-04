@@ -8030,6 +8030,28 @@ fn decode_cursor(cursor: &str) -> Result<SessionId, ()> {
     String::from_utf8(bytes).map(SessionId::new).map_err(|_| ())
 }
 
+fn encode_recency_cursor(key: &haider_store::SessionRecencyKey) -> String {
+    format!(
+        "hr1.{:016x}.{}",
+        key.last_activity_ms,
+        encode_cursor(&key.session_id).trim_start_matches("hs1.")
+    )
+}
+
+fn decode_recency_cursor(cursor: &str) -> Result<haider_store::SessionRecencyKey, ()> {
+    let encoded = cursor.strip_prefix("hr1.").ok_or(())?;
+    let (timestamp, session_id) = encoded.split_once('.').ok_or(())?;
+    if timestamp.len() != 16 || session_id.is_empty() || session_id.contains('.') {
+        return Err(());
+    }
+    let last_activity_ms = u64::from_str_radix(timestamp, 16).map_err(|_| ())?;
+    let session_id = decode_cursor(&format!("hs1.{session_id}"))?;
+    Ok(haider_store::SessionRecencyKey {
+        last_activity_ms,
+        session_id,
+    })
+}
+
 fn random_id(prefix: &str) -> Result<String, SessionHubError> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(|error| {

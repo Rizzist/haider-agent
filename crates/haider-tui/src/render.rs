@@ -1511,7 +1511,15 @@ fn render_launcher(
     // TUI4c: rows derive from the LIVE session map — seeds and user
     // sessions alike; a busy background session shows its liveness HERE
     // (gold pulsing-dot semantics), never in the global badge (item 12).
-    let running = model.sessions.iter().filter(|s| s.busy()).count();
+    let launcher_session_ids = model.launcher_session_ids();
+    let running = model
+        .sessions
+        .iter()
+        .filter(|session| {
+            model.session_kinds.get(&session.id) != Some(&haider_rpc::SessionKindWire::Subagent)
+        })
+        .filter(|session| session.busy())
+        .count();
     // TUI4d item 14 — every row of the block leads with ONE rail cell so
     // the sim's `.rail` sliver has a home (tui.js:4370-4394: absolute in
     // the row's left padding, transparent unless running). Idle rows and
@@ -1535,7 +1543,14 @@ fn render_launcher(
     // three in demo, the reachable digit span live (see
     // `AppModel::launcher_rows`). Render stays source-agnostic: it asks.
     let mut recent: Vec<(Vec<Span<'_>>, Option<Hit>)> = vec![(rhead, None)];
-    for entry in model.sessions.iter().take(model.launcher_rows()) {
+    for session_id in launcher_session_ids.iter().take(model.launcher_rows()) {
+        let Some(entry) = model
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+        else {
+            continue;
+        };
         // Sim row anatomy (tui.js:3252-3277): rail · dot (ok; gold
         // PULSING when running, tui.js:4392-4394) · name BRIGHT bold ·
         // `▸ head hon` DIM (.hd) · meta DIM ellipsized. No digit prefix
@@ -1650,7 +1665,7 @@ fn render_launcher(
             fmt_tok(tokens),
             entry.model_short,
             entry.device,
-            entry.ago
+            model.session_display_age(&entry.id, &entry.ago)
         );
         // Sim `.meta`: ellipsized into the column, never clipped.
         let meta_budget = area_cap.saturating_sub(Line::from(spans.clone()).width());
@@ -5885,11 +5900,22 @@ fn render_sessions(
                 theme.maroon_style(),
             ),
         ]),
-        Line::raw(""),
+        Line::styled(
+            if model.session_browser_query.is_empty() {
+                "  search: type title / dir / model / id".to_owned()
+            } else {
+                format!("  search: {}▏  ·  esc clears", model.session_browser_query)
+            },
+            theme.dim_style(),
+        ),
     ];
     if rows.is_empty() {
         lines.push(Line::styled(
-            "  no sessions yet — start one from the launcher",
+            if model.session_browser_query.is_empty() {
+                "  no sessions yet — start one from the launcher"
+            } else {
+                "  no sessions match"
+            },
             theme.dim_style(),
         ));
     }
@@ -10995,28 +11021,50 @@ fn talk_ghost_line(model: &AppModel, theme: &Theme, width: u16) -> Line<'static>
 /// faint slot — theme tokens only (the mechanical no-raw-color law covers
 /// this seam like every other).
 fn talk_wave_spans(model: &AppModel, theme: &Theme) -> Vec<Span<'static>> {
-    // Prefer real captured amplitude; when the ring carries no signal (a
-    // capture path that never fed levels, or true silence), show the
-    // synthesized listening sweep so the state animates instead of sitting
-    // as a dead flat line (owner: "have the animation for audio working").
-    let real_peak = model.talk.wave.levels().into_iter().fold(0.0_f32, f32::max);
-    let cells = if real_peak >= crate::talk::LISTENING_SIGNAL_MIN {
-        model.talk.wave.cells()
-    } else {
-        crate::talk::listening_pulse_cells(model.clock_ms)
+    // 970 owner requirement 2 — REAL amplitude wins whenever a mic is
+    // feeding us. The old test compared the ring's peak against
+    // `LISTENING_SIGNAL_MIN` and fell back to the synthesized sweep
+    // whenever it dipped, so every pause between words snapped the bars
+    // from live audio to a canned animation that only advanced on the
+    // 600 ms phase tick — which is exactly the "frozen/late" the owner
+    // saw. Once fed, the ring IS the display: a quiet passage draws
+    // quiet, and the bars track the voice at the capture cadence.
+    //
+    // The synthesized sweep now means one honest thing: no capture path
+    // has fed a level at all, so the row animates rather than sitting as
+    // a dead flat line while the engine opens the mic.
+    let plain = model.talk.wave_plain;
+    let style_for = |hot: bool| {
+        if hot {
+            theme.gold_style()
+        } else {
+            theme.faint_style()
+        }
     };
-    cells
-        .into_iter()
-        .map(|cell| {
-            let glyph = crate::talk::wave_glyph(cell, model.talk.wave_plain);
-            let style = if cell.hot {
-                theme.gold_style()
-            } else {
-                theme.faint_style()
-            };
-            Span::styled(glyph.to_string(), style)
-        })
-        .collect()
+    // Allocation: ONE `Vec<Span>` of `WAVE_WIDTH` borrowed `&'static str`
+    // symbols. No per-cell `String`, no intermediate cell buffer — this
+    // runs on every listening frame (up to 30/s).
+    let mut spans = Vec::with_capacity(crate::talk::WAVE_WIDTH);
+    if model.talk.wave.fed() {
+        spans.extend(model.talk.wave.cells_iter().map(|cell| {
+            Span::styled(
+                crate::talk::wave_glyph_str(cell, plain),
+                style_for(cell.hot),
+            )
+        }));
+    } else {
+        spans.extend(
+            crate::talk::listening_pulse_cells(model.clock_ms)
+                .into_iter()
+                .map(|cell| {
+                    Span::styled(
+                        crate::talk::wave_glyph_str(cell, plain),
+                        style_for(cell.hot),
+                    )
+                }),
+        );
+    }
+    spans
 }
 
 /// T2 — the `/talk` setup card's band lines. Handed STATES, never the
@@ -11366,7 +11414,17 @@ fn composer_lines<'a>(
     // chrome, pulsing (tui.js:5484-5489, 1.1s); otherwise frame chrome,
     // gold on hover.
     let (talk_chrome, talk_ink) = if model.listening {
-        let live = theme.pulse_ink(theme.maroon, model.anim_phase);
+        // 970 owner requirement 2: the `◉ listening…` indicator blinks at
+        // its OWN steady ~1 Hz, decoupled from the audio frames. The
+        // shared `anim_phase` counter is a 600 ms COUNTER (a 1.2 s cycle
+        // that drifts with whatever else armed the tick), so the blink
+        // reads the wall clock directly instead — a burst of envelopes or
+        // a silent mic leaves the cadence identical.
+        let live = if crate::talk::listening_blink_on(model.clock_ms) {
+            theme.pulse_ink(theme.maroon, 0)
+        } else {
+            theme.pulse_ink(theme.maroon, 1)
+        };
         (live, live)
     } else if model.hovered == Some(Hit::TalkChip) {
         (theme.gold_style(), theme.gold_style())

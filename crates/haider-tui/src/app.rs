@@ -2749,12 +2749,11 @@ impl LoginCard {
 /// | subagent submit | `ChipSubmit` (scripted beat) | `ChipSubmit` → `agent.message` (S3); feature-gated honest flash |
 /// | subagent destroy | `ChipClose` | `AgentCancel` → `agent.cancel`; feature-gated honest flash |
 /// | shell builtins (`ls` · `cd` …) | the demo VFS | honest flash |
-/// | `/sessions` | honest stub (the sim's screen is unbuilt) | real listing + open |
+/// | `/sessions` | honest daemon-truth refusal | full listing + search + open |
 ///
 /// The last row is the one INVERSION: demo refuses and live acts, because
-/// what demo refuses there is a sim surface this port has not built, not a
-/// fabrication. Every row above it is the same shape — demo may invent
-/// local state, live may not.
+/// the roster is daemon truth that demo cannot fabricate. Every row above it
+/// is the same shape — demo may invent local state, live may not.
 ///
 /// Menu ANSWER coordinates are deliberately absent: they are not a reducer
 /// decision. The reducer emits one source-neutral [`OutboundAnswer`] and
@@ -3758,9 +3757,9 @@ pub enum AppRequest {
     Quit,
 }
 
-/// Daemon-summarized attention state for one roster row. The TUI never
-/// derives this from its transcript: a mark seen here must clear the dot for
-/// ADE and every other connected surface too.
+/// Daemon-summarized attention state for one roster row. Applied live event
+/// timestamps may advance recency before the first list summary arrives, but
+/// seen/input truth remains daemon-authored so every connected surface agrees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionAttention {
     pub seen_at_ms: Option<u64>,
@@ -3795,6 +3794,7 @@ pub struct SessionBrowserRow {
     pub unseen: bool,
     pub needs_input: Option<haider_rpc::NeedsInputWire>,
     pub last_activity_ms: Option<u64>,
+    pub created_at_ms: Option<u64>,
 }
 
 impl SessionAttention {
@@ -3802,6 +3802,28 @@ impl SessionAttention {
     pub fn unseen(&self) -> bool {
         self.last_activity_ms
             .is_some_and(|activity| self.seen_at_ms.is_none_or(|seen| activity > seen))
+    }
+}
+
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Human-readable age for durable roster activity. Future timestamps clamp
+/// to `now` so clock skew never produces a negative-looking age.
+#[must_use]
+pub fn format_session_age_at(now_ms: u64, activity_ms: u64) -> String {
+    let seconds = now_ms.saturating_sub(activity_ms) / 1_000;
+    match seconds {
+        0..=4 => "now".to_owned(),
+        5..=59 => format!("{seconds}s ago"),
+        60..=3_599 => format!("{}m ago", seconds / 60),
+        3_600..=86_399 => format!("{}h ago", seconds / 3_600),
+        _ => format!("{}d ago", seconds / 86_400),
     }
 }
 
@@ -4910,6 +4932,19 @@ pub struct AppModel {
     /// Attention state is roster-only daemon truth. It is kept outside the
     /// checked-in session slots so a summary can update an active session.
     pub session_attention: std::collections::HashMap<SessionId, SessionAttention>,
+    /// Durable creation timestamps used only as the recency tie-breaker.
+    /// Kept beside roster attention because the active session is checked
+    /// out of its ordinary row.
+    pub session_created_at_ms: std::collections::HashMap<SessionId, u64>,
+    /// Durable last-model aliases retained outside checked-out rows so the
+    /// all-sessions search can match the active session before/without a
+    /// live model-selection repaint.
+    pub session_last_models: std::collections::HashMap<SessionId, String>,
+    /// Typed daemon lineage. Missing means an older daemon and remains
+    /// top-level for compatibility; an explicit subagent is hidden from the
+    /// launcher/browser while its row and metrics remain available to nested
+    /// chip surfaces and direct `--session` attachment.
+    pub session_kinds: std::collections::HashMap<SessionId, haider_rpc::SessionKindWire>,
     /// Which runtime drives this model (W3c3 M2). Demo by default.
     pub mode: RuntimeMode,
     /// The masked `/login … api` card, while it is open (W3c3 M3).
@@ -5198,6 +5233,8 @@ pub struct AppModel {
     /// [`AppModel::session_browser_rows`], and the screen to return to on
     /// esc (the browser is reachable from the launcher AND a session).
     pub session_browser_sel: usize,
+    /// Search-as-you-type query for the all-sessions browser.
+    pub session_browser_query: String,
     pub session_browser_return: Option<Screen>,
     /// W-G: the live token-throughput sampler for the ACTIVE session. Fed on
     /// the existing frame clock (`note_throughput`) while a turn streams,
@@ -5311,6 +5348,9 @@ impl Default for AppModel {
             session_metrics: std::collections::HashMap::new(),
             session_cache_rates: std::collections::HashMap::new(),
             session_attention: std::collections::HashMap::new(),
+            session_created_at_ms: std::collections::HashMap::new(),
+            session_last_models: std::collections::HashMap::new(),
+            session_kinds: std::collections::HashMap::new(),
             active_session: None,
             custom_commands: Vec::new(),
             custom_command_warnings: Vec::new(),
@@ -5402,6 +5442,7 @@ impl Default for AppModel {
             hook_facts: crate::hooks::HookFactsLog::default(),
             tasks: crate::taskrows::TaskPanel::default(),
             session_browser_sel: 0,
+            session_browser_query: String::new(),
             session_browser_return: None,
             throughput: crate::throughput::ThroughputTracker::new(),
             usage: UsageState::default(),
@@ -6629,6 +6670,18 @@ impl AppModel {
             }
             AppEvent::Envelope(payload) => {
                 self.dirty = true;
+                if let Some(session_id) = self.active_session.clone() {
+                    let activity_ms = wall_clock_ms();
+                    self.note_session_activity_at(&session_id, activity_ms);
+                    // Bare payloads are the local demo/mock twin and are
+                    // reduced while this surface is visibly attached. Keep
+                    // its local seen marker level with that activity; live
+                    // daemon streams still receive authoritative seen truth
+                    // through session.seen summaries.
+                    if let Some(attention) = self.session_attention.get_mut(&session_id) {
+                        attention.seen_at_ms = Some(activity_ms);
+                    }
+                }
                 if let EventPayload::UserMessage { text, .. } = payload.as_ref() {
                     // A bare payload carries no envelope: this path is the
                     // demo/mock twin, whose prompts have no durable
@@ -7410,10 +7463,6 @@ impl AppModel {
             self.handle_hooks_key(key.code);
             return;
         }
-        if self.screen == Screen::Sessions {
-            self.handle_sessions_key(key.code);
-            return;
-        }
         if self.screen == Screen::Tree {
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -7551,6 +7600,10 @@ impl AppModel {
                 }
                 _ => {}
             }
+            return;
+        }
+        if self.screen == Screen::Sessions {
+            self.handle_sessions_key(key);
             return;
         }
         // Boot renders no composer — hidden input must not accumulate or
@@ -9157,8 +9210,9 @@ impl AppModel {
 
     /// The one talk entry point (TalkChip press and bare `/talk` share
     /// it): toggle-to-talk. Idle starts a session; a press while
-    /// listening COMMITS AND SUBMITS (the Enter gesture); a press while
-    /// starting aborts.
+    /// listening STOPS and commits the transcript into the composer for
+    /// editing (owner 970: never an auto-send — see
+    /// [`Self::talk_commit_stop`]); a press while starting aborts.
     pub fn talk_toggle(&mut self) {
         if self.mode.fabricates_locally() {
             // Demo keeps its canned ◉ hold on the chip; `/talk` says so.
@@ -9179,7 +9233,7 @@ impl AppModel {
                 self.talk_cancel();
                 self.flash = Some("· ◉ talk cancelled".to_owned());
             }
-            crate::talk::TalkPhase::Listening => self.talk_commit_submit(),
+            crate::talk::TalkPhase::Listening => self.talk_commit_stop(),
             crate::talk::TalkPhase::Finishing => {}
         }
     }
@@ -9243,15 +9297,28 @@ impl AppModel {
         ));
     }
 
-    /// Enter law: COMMIT + SUBMIT. Input stops now; the engine assembles
-    /// the definitive transcript and [`Self::handle_talk`]'s `Finished`
-    /// arm realizes it into the composer and submits.
-    fn talk_commit_submit(&mut self) {
+    /// Stop law: COMMIT INTO THE COMPOSER. Input stops now; the engine
+    /// assembles the definitive transcript and [`Self::handle_talk`]'s
+    /// `Finished` arm realizes it into the composer AT THE CURSOR, where
+    /// it is editable and the user sends it with ⏎.
+    ///
+    /// 970 owner requirement 1: dictation does NOT auto-send. The ONLY
+    /// thing that makes this stop submit a turn is the explicit,
+    /// default-off `transcription.auto_send` profile flag — so the
+    /// gesture that ends listening hands you text to read, never a turn
+    /// you never saw. Both stop gestures (the listening toggle and ⏎
+    /// while listening) route here, because "must not auto-send" is a
+    /// property of the transcript, not of which key ended it.
+    fn talk_commit_stop(&mut self) {
         if self.talk.phase != crate::talk::TalkPhase::Listening {
             return;
         }
         self.talk.phase = crate::talk::TalkPhase::Finishing;
-        self.talk.intent = crate::talk::CommitIntent::Submit;
+        self.talk.intent = if self.talk_config.auto_send {
+            crate::talk::CommitIntent::Submit
+        } else {
+            crate::talk::CommitIntent::Insert
+        };
         self.dirty = true;
         self.requests.push(AppRequest::TalkShell(
             crate::talk::TalkShellCommand::Finish {
@@ -9302,7 +9369,7 @@ impl AppModel {
                 true
             }
             KeyCode::Enter => {
-                self.talk_commit_submit();
+                self.talk_commit_stop();
                 true
             }
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => c != 'c',
@@ -9468,7 +9535,16 @@ impl AppModel {
                         if text.is_empty() {
                             self.flash = Some("· ◉ heard nothing".to_owned());
                         } else {
-                            self.composer.insert_str(crate::talk::clamp_realized(&text));
+                            // Owner 970: the transcript lands AT THE CURSOR
+                            // with one separating space, the same shape the
+                            // typing-commit path uses. With insert now the
+                            // DEFAULT (no auto-send), dictating twice is the
+                            // ordinary flow and the two transcripts must not
+                            // fuse into one word. `submit_composer` trims, so
+                            // the space costs the auto-send path nothing.
+                            let mut realized = crate::talk::clamp_realized(&text).to_owned();
+                            realized.push(' ');
+                            self.composer.insert_str(&realized);
                             match intent {
                                 CommitIntent::Submit => self.submit_composer(),
                                 CommitIntent::Insert => {
@@ -12106,6 +12182,7 @@ impl AppModel {
             self.session_browser_return = Some(self.screen);
         }
         self.session_browser_sel = 0;
+        self.session_browser_query.clear();
         self.screen = Screen::Sessions;
     }
 
@@ -12115,28 +12192,123 @@ impl AppModel {
     /// a user most likely wants is always at the top of the list.
     #[must_use]
     pub fn session_browser_rows(&self) -> Vec<SessionBrowserRow> {
+        self.session_rows_for_query(&self.session_browser_query)
+    }
+
+    /// Top-level rows in launch/browser order, independent of the browser's
+    /// transient filter. The launcher, digit bindings, and `/sessions <n>`
+    /// all consume these exact identities so paint and action cannot drift.
+    #[must_use]
+    pub fn launcher_session_ids(&self) -> Vec<SessionId> {
+        self.session_rows_for_query("")
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
+    }
+
+    /// Durable age text shared by launcher and browser rows.
+    #[must_use]
+    pub fn session_display_age(&self, session_id: &SessionId, fallback: &str) -> String {
+        self.session_attention
+            .get(session_id)
+            .and_then(|attention| attention.last_activity_ms)
+            .map(|activity| format_session_age_at(wall_clock_ms(), activity))
+            .unwrap_or_else(|| fallback.to_owned())
+    }
+
+    fn session_rows_for_query(&self, query: &str) -> Vec<SessionBrowserRow> {
+        let now_ms = wall_clock_ms();
+        let needles = query
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>();
         let mut rows: Vec<SessionBrowserRow> = self
             .sessions
             .iter()
-            .map(|entry| {
-                let attention = self.session_attention.get(&entry.id);
-                SessionBrowserRow {
-                    id: entry.id.clone(),
-                    title: entry
-                        .title
-                        .clone()
-                        .or_else(|| entry.name.clone())
-                        .unwrap_or_else(|| entry.id.as_str().to_owned()),
-                    dir: entry.dir.clone(),
-                    model_short: entry.model_short.clone(),
-                    agent_type: entry.agent_type.clone(),
-                    ago: entry.ago.clone(),
-                    busy: entry.busy(),
-                    unseen: attention.is_some_and(SessionAttention::unseen),
-                    needs_input: attention.and_then(|a| a.needs_input.clone()),
-                    last_activity_ms: attention.and_then(|a| a.last_activity_ms),
-                }
+            .filter(|entry| {
+                self.session_kinds.get(&entry.id) != Some(&haider_rpc::SessionKindWire::Subagent)
             })
+            .map(|entry| {
+                let active = self.active_session.as_ref() == Some(&entry.id);
+                let attention = self.session_attention.get(&entry.id);
+                let last_activity_ms = attention.and_then(|a| a.last_activity_ms);
+                let name = if active {
+                    self.session_name.clone()
+                } else {
+                    entry.name.clone()
+                };
+                let blurb = if active {
+                    self.session_title.clone()
+                } else {
+                    entry.title.clone()
+                };
+                let title = name
+                    .clone()
+                    .or_else(|| blurb.clone())
+                    .unwrap_or_else(|| entry.id.as_str().to_owned());
+                let dir = if active {
+                    self.session_workspace_cwd
+                        .clone()
+                        .unwrap_or_else(|| self.session_dir.clone())
+                } else {
+                    entry
+                        .workspace_cwd
+                        .clone()
+                        .unwrap_or_else(|| entry.dir.clone())
+                };
+                let model_short = if active {
+                    self.identity.model_short.clone()
+                } else {
+                    entry.model_short.clone()
+                };
+                let search_aliases = format!(
+                    "{}\n{}\n{}",
+                    name.unwrap_or_default(),
+                    blurb.unwrap_or_default(),
+                    self.session_last_models
+                        .get(&entry.id)
+                        .cloned()
+                        .unwrap_or_default()
+                );
+                (
+                    SessionBrowserRow {
+                        id: entry.id.clone(),
+                        title,
+                        dir,
+                        model_short,
+                        agent_type: entry.agent_type.clone(),
+                        ago: last_activity_ms
+                            .map(|activity| format_session_age_at(now_ms, activity))
+                            .unwrap_or_else(|| entry.ago.clone()),
+                        busy: if active {
+                            self.session_busy()
+                        } else {
+                            entry.busy()
+                        },
+                        unseen: attention.is_some_and(SessionAttention::unseen),
+                        needs_input: attention.and_then(|a| a.needs_input.clone()),
+                        last_activity_ms,
+                        created_at_ms: self.session_created_at_ms.get(&entry.id).copied(),
+                    },
+                    search_aliases,
+                )
+            })
+            .filter(|(row, search_aliases)| {
+                if needles.is_empty() {
+                    return true;
+                }
+                let haystack = format!(
+                    "{}\n{}\n{}\n{}\n{}",
+                    row.title,
+                    row.dir,
+                    row.model_short,
+                    row.id.as_str(),
+                    search_aliases
+                )
+                .to_lowercase();
+                needles.iter().all(|needle| haystack.contains(needle))
+            })
+            .map(|(row, _)| row)
             .collect();
         rows.sort_by(|a, b| {
             let tier = |row: &SessionBrowserRow| {
@@ -12151,23 +12323,27 @@ impl AppModel {
             tier(a)
                 .cmp(&tier(b))
                 .then(b.last_activity_ms.cmp(&a.last_activity_ms))
-                .then(a.title.cmp(&b.title))
+                .then(b.created_at_ms.cmp(&a.created_at_ms))
         });
         rows
     }
 
-    fn handle_sessions_key(&mut self, code: KeyCode) {
+    fn handle_sessions_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            return;
+        }
+        let code = key.code;
         let rows = self.session_browser_rows();
         let last = rows.len().saturating_sub(1);
         // One keypress-page. The render window is height-derived, so this is
         // a fixed, predictable jump rather than a guess at the frame.
         const PAGE: usize = 10;
         match code {
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 self.session_browser_sel = self.session_browser_sel.saturating_sub(1);
                 self.dirty = true;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 self.session_browser_sel = (self.session_browser_sel + 1).min(last);
                 self.dirty = true;
             }
@@ -12179,11 +12355,11 @@ impl AppModel {
                 self.session_browser_sel = (self.session_browser_sel + PAGE).min(last);
                 self.dirty = true;
             }
-            KeyCode::Home | KeyCode::Char('g') => {
+            KeyCode::Home => {
                 self.session_browser_sel = 0;
                 self.dirty = true;
             }
-            KeyCode::End | KeyCode::Char('G') => {
+            KeyCode::End => {
                 self.session_browser_sel = last;
                 self.dirty = true;
             }
@@ -12196,10 +12372,25 @@ impl AppModel {
                 }
             }
             KeyCode::Esc => {
-                self.screen = self
-                    .session_browser_return
-                    .take()
-                    .unwrap_or(Screen::Launcher);
+                if self.session_browser_query.is_empty() {
+                    self.screen = self
+                        .session_browser_return
+                        .take()
+                        .unwrap_or(Screen::Launcher);
+                } else {
+                    self.session_browser_query.clear();
+                    self.session_browser_sel = 0;
+                }
+                self.dirty = true;
+            }
+            KeyCode::Backspace => {
+                self.session_browser_query.pop();
+                self.session_browser_sel = 0;
+                self.dirty = true;
+            }
+            KeyCode::Char(character) if !character.is_control() => {
+                self.session_browser_query.push(character);
+                self.session_browser_sel = 0;
                 self.dirty = true;
             }
             _ => {}
@@ -13610,15 +13801,11 @@ impl AppModel {
             // the ONLY way to see — and OPEN — the rest (review P1-6: the
             // cold list the driver already tracks had no surface at all).
             //
-            // DEMO keeps the honest stub: the sim implements `/sessions` as
-            // a full screen with selection (tui.js:1753-1755, :3485-3492),
-            // which this port has not built, and the demo world has three
-            // sessions the launcher already paints. Inventing a text
-            // listing there would be a divergence from the sim for no gain
-            // (W3c3.1 r2, P3-H).
+            // DEMO keeps its honest daemon-truth refusal; live mode opens
+            // the full selectable browser and can reach every listed row.
             "sessions" if !self.mode.fabricates_locally() => {
                 if remainder.is_empty() {
-                    self.list_sessions();
+                    self.enter_sessions();
                 } else {
                     self.open_listed_session(&remainder);
                 }
@@ -14520,6 +14707,23 @@ impl AppModel {
         self.throughput.readout()
     }
 
+    fn note_session_activity_at(&mut self, session_id: &SessionId, activity_ms: u64) {
+        let attention = self
+            .session_attention
+            .entry(session_id.clone())
+            .or_insert_with(|| SessionAttention {
+                seen_at_ms: None,
+                last_activity_ms: None,
+                waiting_why: None,
+                needs_input: None,
+            });
+        attention.last_activity_ms = attention
+            .last_activity_ms
+            .into_iter()
+            .chain(Some(activity_ms))
+            .max();
+    }
+
     /// Route one RAW envelope to whichever session owns it (W3c3, report
     /// R11 cut 2) — the single live entry point for the event stream.
     ///
@@ -14563,6 +14767,7 @@ impl AppModel {
                 // the first paint after a spawn reads a clock already
                 // inside the journal's own time base, tick or no tick.
                 self.clock_ms = self.clock_ms.max(envelope.committed_at_ms);
+                self.note_session_activity_at(&envelope.session_id, envelope.committed_at_ms);
                 // M10: a BACKGROUND session's terminal/park transition also
                 // warrants a desktop notification. The attached reducer
                 // (`handle_envelope`) only ever evaluated the ACTIVE session, so
@@ -15393,56 +15598,6 @@ impl AppModel {
         self.dirty = true;
     }
 
-    /// `/sessions` — EVERY session the model knows, not just the rows the
-    /// launcher has room to paint (review P1-6).
-    ///
-    /// The listing is a read of state already held: `session.list` has
-    /// already populated the row for every session the daemon has, hot or
-    /// cold. Each line names the row's digit when it has one, its id, its
-    /// status and its head — the id because that is the coordinate, and
-    /// the digit because that is how the user reaches it.
-    fn list_sessions(&mut self) {
-        let rows = self.launcher_rows();
-        let lines: Vec<String> = if self.sessions.is_empty() {
-            vec!["no sessions yet — type to start one".to_owned()]
-        } else {
-            self.sessions
-                .iter()
-                .enumerate()
-                .map(|(index, entry)| {
-                    // The number is the ROW's coordinate either way: a
-                    // digit for the rows the launcher paints, and the
-                    // `/sessions <n>` argument for the rest.
-                    let reach = if index < rows {
-                        format!("{:>2}", index + 1)
-                    } else {
-                        format!("/{}", index + 1)
-                    };
-                    let status = if entry.busy() {
-                        "running"
-                    } else if entry.errored() {
-                        "errored"
-                    } else {
-                        "idle"
-                    };
-                    let name = entry.name.as_deref().unwrap_or("—");
-                    format!(
-                        "{reach}  {}  {name}  {status}  {} turns",
-                        entry.id.as_str(),
-                        entry.turns()
-                    )
-                })
-                .collect()
-        };
-        let out = lines.join("\n");
-        if self.screen == Screen::Session {
-            self.projection.push_shell("sessions".to_owned(), out);
-        } else {
-            self.launcher_shellout = Some(("sessions".to_owned(), out));
-        }
-        self.dirty = true;
-    }
-
     /// `/sessions <n|id>` — open ANY listed session, including the ones
     /// past the launcher's painted rows (W3c3.1 r2, P2-D).
     ///
@@ -15452,17 +15607,17 @@ impl AppModel {
     /// defect rather than closing it. The read itself is the attach's own
     /// replay, so opening is all that was missing.
     fn open_listed_session(&mut self, arg: &str) {
+        let rows = self.session_rows_for_query("");
         let by_ordinal = arg
             .parse::<usize>()
             .ok()
             .filter(|n| *n >= 1)
-            .and_then(|n| self.sessions.get(n - 1))
-            .map(|entry| entry.id.clone());
+            .and_then(|n| rows.get(n - 1))
+            .map(|row| row.id.clone());
         let target = by_ordinal.or_else(|| {
-            self.sessions
-                .iter()
-                .find(|entry| entry.id.as_str() == arg)
-                .map(|entry| entry.id.clone())
+            rows.iter()
+                .find(|row| row.id.as_str() == arg)
+                .map(|row| row.id.clone())
         });
         match target {
             Some(id) => self.open_session(&id),
@@ -15508,7 +15663,7 @@ impl AppModel {
     /// one-turn-at-a-time flash guarded a single shared projection that no
     /// longer exists.
     fn attach_sample(&mut self, index: usize) {
-        if let Some(id) = self.sessions.get(index).map(|entry| entry.id.clone()) {
+        if let Some(id) = self.launcher_session_ids().get(index).cloned() {
             self.open_session(&id);
         }
     }
@@ -15894,10 +16049,38 @@ impl AppModel {
     ///   ([`crate::session::SessionState::turns`] / `row_tokens`), so a
     ///   checkin AFTER this call still beats a stale summary.
     pub fn note_summary_counts(&mut self, summary: &haider_rpc::SessionSummary) {
+        if let Some(metadata) = &summary.metadata {
+            let prior = self
+                .session_created_at_ms
+                .insert(summary.session_id.clone(), metadata.created_at_ms);
+            if prior != Some(metadata.created_at_ms) {
+                self.dirty = true;
+            }
+        }
+        if let Some(kind) = summary.kind {
+            let prior = self.session_kinds.insert(summary.session_id.clone(), kind);
+            if prior != Some(kind) {
+                self.dirty = true;
+            }
+        }
+        if let Some(last_model) = &summary.last_model {
+            let prior = self
+                .session_last_models
+                .insert(summary.session_id.clone(), last_model.clone());
+            if prior.as_ref() != Some(last_model) {
+                self.dirty = true;
+            }
+        }
         if self.daemon_serves(haider_rpc::FEATURE_SESSION_SEEN_V1) {
             let attention = SessionAttention {
                 seen_at_ms: summary.seen_at_ms,
-                last_activity_ms: summary.last_activity_ms,
+                last_activity_ms: self
+                    .session_attention
+                    .get(&summary.session_id)
+                    .and_then(|held| held.last_activity_ms)
+                    .into_iter()
+                    .chain(summary.last_activity_ms)
+                    .max(),
                 waiting_why: summary.waiting_why.clone(),
                 needs_input: summary.needs_input.clone(),
             };

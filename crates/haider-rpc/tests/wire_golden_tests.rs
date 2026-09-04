@@ -2405,6 +2405,40 @@ fn session_create_ignores_unknown_additive_fields() {
     ));
 }
 
+#[test]
+fn session_list_recency_order_is_additive_and_legacy_omission_is_unchanged() {
+    let legacy: RequestBody =
+        serde_json::from_str(r#"{"method":"session.list","cursor":"hs1.00","limit":50}"#)
+            .expect("legacy session.list decodes");
+    assert!(matches!(
+        legacy,
+        RequestBody::SessionList {
+            order: haider_rpc::SessionListOrderWire::IdAsc,
+            ..
+        }
+    ));
+    assert_eq!(legacy.additive_shape_feature(), None);
+    let legacy_value = serde_json::to_value(&legacy).expect("legacy list encodes");
+    assert!(
+        legacy_value.get("order").is_none(),
+        "default id ordering stays byte-shape compatible"
+    );
+
+    let recency = RequestBody::SessionList {
+        cursor: None,
+        limit: 100,
+        order: haider_rpc::SessionListOrderWire::RecencyDesc,
+    };
+    assert_eq!(
+        recency.additive_shape_feature(),
+        Some(haider_rpc::FEATURE_SESSION_LIST_RECENCY_V1)
+    );
+    assert_eq!(
+        serde_json::to_value(&recency).expect("recency list encodes")["order"],
+        "recency_desc"
+    );
+}
+
 /// Older-client tolerance for the session.list roster-truth fields, both
 /// directions: an OLDER daemon's summary (no turn/footprint fields) must
 /// decode with every roster field `None` — absence is "unknown", never
