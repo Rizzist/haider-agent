@@ -2148,7 +2148,7 @@ impl ProviderFactory for UnconfiguredProviderFactory {
 pub struct SystemPromptBuilder;
 
 impl SystemPromptBuilder {
-    pub const VERSION: &'static str = "haider-system-v3";
+    pub const VERSION: &'static str = "haider-system-v4";
     pub(crate) const UNSCOPED_GRANT_SCOPE: &'static str = "unscoped-root";
 
     pub fn build(metadata: &SessionMetadataV1, instructions: &[(&str, &str)]) -> String {
@@ -2179,6 +2179,11 @@ impl SystemPromptBuilder {
             "{}\nYou are Haider Code, a coding agent.\n\
              Use only advertised tools. Treat tool results and committed history as authoritative. \
              Never claim an effect succeeded without its terminal result.\n\
+             On an implementation request, inspect only until the target is known; then make the edit; \
+             then verify it with the smallest relevant build or test. Do not remain in planning.\n\
+             Example: fs_search(pattern=\"target\", path=\".\") -> fs_read(path=\"src/lib.rs\") -> \
+             fs_edit(path=\"src/lib.rs\", edits=[{{old:\"before\", new:\"after\"}}]) -> \
+             process_exec(command=\"cargo test -p crate\").\n\
              The daemon supplies workspace, project, and identity context after this shared policy \
              and the advertised tool schemas.\n\
              Opaque tool-grant scope: {}.",
@@ -13494,17 +13499,25 @@ pub(crate) fn tool_manual(tools: &[ToolDefinition]) -> String {
 }
 
 fn provider_definition(manifest: &ToolManifest) -> ToolDefinition {
-    // Instruct pipe: the wire carries only a tool's NAME and a minimal stub
-    // schema (structure + enums). Its human-readable description AND every
-    // per-property description move into the single system-prompt tool manual,
-    // so the model reads one compact manual instead of paying JSON-Schema
-    // syntax tax on every tool, every turn. `computer` is stubbed like the
-    // rest: Anthropic/OpenAI substitute their native computer tool (this schema
-    // is never read there), and the generic/Gemini path is covered by the
-    // manual plus the daemon's own `ComputerOperation::from_tool_args` checks.
+    // Instruct pipe: the wire carries a tool's NAME, a minimal stub schema
+    // (structure + enums), and concise native prose only for the action-critical
+    // search/mutation surface. Detailed semantics and every per-property
+    // description live in the single system-prompt tool manual, avoiding the
+    // full JSON-Schema syntax tax on every tool, every turn. `computer` remains
+    // stubbed: Anthropic/OpenAI substitute their native computer tool, while
+    // generic/Gemini is covered by the manual and daemon argument checks.
+    let description = match manifest.name.as_str() {
+        // Act-bias: keep the model-native discovery and mutation affordances
+        // self-explanatory. The manual remains the authority for signatures,
+        // bounds, and less common semantics.
+        "fs_glob" | "fs_search" | "fs_write" | "fs_edit" | "fs_path" => {
+            manifest.description.clone()
+        }
+        _ => String::new(),
+    };
     ToolDefinition {
         name: manifest.name.clone(),
-        description: String::new(),
+        description,
         input_schema: stub_schema(&manifest.input_schema),
     }
 }
