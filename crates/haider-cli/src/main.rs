@@ -477,7 +477,7 @@ async fn dispatch(args: &[String]) -> ExitCode {
                  [--max-tokens <n>] [--max-cost <usd>] [--max-time <dur>] [--seed <n>] \
                  [--start] | run --status <run-id> | run --stop <run-id> | run --replay <run-id> \
                  [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] \
-                 [--allow-writes] [--allow-exec] [--trust-hooks] [--attach <path>]..., \
+                 [--read-only] [--allow-writes] [--allow-exec] [--auto-allow] [--trust-hooks] [--attach <path>]..., \
                  status [--json] [--no-spawn], daemon stop [--json] [--timeout <duration>], \
                  sessions [--recovery] [--json] [--no-spawn], \
                  sessions wait-ready --count <n> [--session <id>]... [--timeout <dur>] --json [--no-spawn], \

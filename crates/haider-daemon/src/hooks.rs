@@ -77,6 +77,7 @@ type DirectoryOpenError = rustix::io::Errno;
 type DirectoryOpenError = std::io::Error;
 
 const HOOKS_FILE: &str = "hooks.json";
+const READ_ONLY_HOOK_DENIAL: &str = "hook execution denied: run is --read-only";
 const MAX_HOOK_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_HOOK_ANCESTORS: usize = 256;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -2792,6 +2793,48 @@ async fn handle_committed(
             &tools_allowed,
         )
         .await;
+    }
+    if metadata
+        .permission_overrides
+        .is_some_and(|overrides| overrides.read_only)
+    {
+        // Hooks execute outside the model tool broker, so the session's
+        // explicit no-write policy must be enforced here as well. Keep the
+        // refusal durable and typed instead of silently skipping a trusted
+        // executable hook.
+        for notice in discovery.notices {
+            if !journal_notice_once(service, state, &envelope, notice).await {
+                return false;
+            }
+        }
+        for definition in discovery
+            .hooks
+            .values()
+            .filter(|definition| definition.matcher.matches(&envelope, &provider, &facts))
+        {
+            if !journal_notice_once(
+                service,
+                state,
+                &envelope,
+                HookNotice {
+                    hook: Some(definition.name.clone()),
+                    digest: Some(definition.digest.clone()),
+                    source: definition.source_path.display().to_string(),
+                    reason: READ_ONLY_HOOK_DENIAL.into(),
+                },
+            )
+            .await
+            {
+                return false;
+            }
+        }
+        if let Some(terminal_scope) = terminal_scope {
+            state
+                .subscribers
+                .retain(|_, handle| handle.run_scope.as_ref() != Some(&terminal_scope));
+            service.inner.servers.kill_scope(&terminal_scope);
+        }
+        return true;
     }
     service.prepare_workspace_trust(&discovery).await;
     if service.workspace_unavailable_for(&envelope.session_id, envelope.run_id.as_ref()) {

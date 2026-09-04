@@ -229,6 +229,9 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// MUTATION CHECK: remove `FEATURE_SESSION_PERMISSION_OVERRIDES_V1`.
 /// Expected RUNTIME failure: headless clients cannot discover the durable
 /// allow-writes/allow-exec create seam.
+/// MUTATION CHECK: remove `FEATURE_SESSION_READ_ONLY_V1`. Expected RUNTIME
+/// failure: a client cannot prove that an explicit read-only deny will be
+/// understood rather than ignored by an older daemon.
 ///
 /// MUTATION CHECK: remove `FEATURE_PROVIDER_REMOVE_V1`. Expected RUNTIME
 /// failure: discovery omits the served durable provider removal method.
@@ -355,8 +358,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        111,
-        "account source discovery and monitor mutation extend the prior 109-feature set"
+        112,
+        "read-only negotiation extends the prior 111-feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -441,6 +444,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_SESSION_DESCENDANT_STREAM_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_OBSERVE_V1.to_owned(),
             FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
+            FEATURE_SESSION_READ_ONLY_V1.to_owned(),
             haider_rpc::FEATURE_AUTONOMOUS_INTERACTION_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_ACCOUNT_SELECT_V1.to_owned(),
             haider_rpc::FEATURE_STATUS_SEGMENT_STRUCTURED_V1.to_owned(),
@@ -523,8 +527,8 @@ fn welcome_advertises_resident_session_binding_token_echo() {
 
 /// MUTATION CHECK: reverse the withholding order or omit the retained feature
 /// set. Expected runtime failure: a peer at a preceding Welcome limit no
-/// longer receives byte-identical pre-K1/pre-X1/v0.0.965 bytes, or the grant
-/// admits a shape that its Welcome did not advertise.
+/// longer receives byte-identical pre-runperm/pre-K1/pre-X1/v0.0.965 bytes,
+/// or the grant admits a shape that its Welcome did not advertise.
 ///
 /// MUTATION CHECK: replace `welcome.user_command_withheld = true` in the
 /// second fallback with `false`. Expected runtime failure: the older tight
@@ -566,7 +570,29 @@ fn tight_welcome_restores_each_pre_feature_frame_before_older_withholding() {
             if features == &welcome.features && !user_command_withheld
     ));
 
-    let mut pre_cancel_welcome = welcome.clone();
+    let mut pre_read_only_welcome = welcome.clone();
+    assert!(
+        pre_read_only_welcome
+            .features
+            .remove(FEATURE_SESSION_READ_ONLY_V1)
+    );
+    let pre_read_only = uds_codec::encode(
+        &WireFrame::Welcome(pre_read_only_welcome.clone()),
+        usize::MAX,
+    )
+    .expect("pre-read-only Welcome encodes");
+    let pre_read_only_body_len = pre_read_only.len() - 4;
+    let read_only_tight = encode_welcome_for_peer(welcome.clone(), full_body_len - 1)
+        .expect("tight peer retains the exact pre-read-only handshake");
+    assert_eq!(read_only_tight.bytes.as_slice(), pre_read_only.as_slice());
+    assert_eq!(read_only_tight.features, pre_read_only_welcome.features);
+    assert!(
+        !read_only_tight
+            .features
+            .contains(FEATURE_SESSION_READ_ONLY_V1)
+    );
+
+    let mut pre_cancel_welcome = pre_read_only_welcome.clone();
     assert!(
         pre_cancel_welcome
             .features
@@ -575,7 +601,7 @@ fn tight_welcome_restores_each_pre_feature_frame_before_older_withholding() {
     let pre_cancel = uds_codec::encode(&WireFrame::Welcome(pre_cancel_welcome.clone()), usize::MAX)
         .expect("pre-cancel Welcome encodes");
     let pre_cancel_body_len = pre_cancel.len() - 4;
-    let cancel_tight = encode_welcome_for_peer(welcome.clone(), full_body_len - 1)
+    let cancel_tight = encode_welcome_for_peer(welcome.clone(), pre_read_only_body_len - 1)
         .expect("tight peer retains the exact pre-cancel handshake");
     assert_eq!(cancel_tight.bytes.as_slice(), pre_cancel.as_slice());
     assert_eq!(cancel_tight.features, pre_cancel_welcome.features);
@@ -672,6 +698,11 @@ fn tight_welcome_restores_each_pre_feature_frame_before_older_withholding() {
     assert!(
         selected_unmarked
             .features
+            .remove(FEATURE_SESSION_READ_ONLY_V1)
+    );
+    assert!(
+        selected_unmarked
+            .features
             .remove(haider_rpc::FEATURE_AGENT_CANCEL_V1)
     );
     assert!(
@@ -688,6 +719,11 @@ fn tight_welcome_restores_each_pre_feature_frame_before_older_withholding() {
     let selected_unmarked = uds_codec::encode(&WireFrame::Welcome(selected_unmarked), usize::MAX)
         .expect("selected-encoding unmarked Welcome encodes");
     let mut selected_pre_prompt = selected_encoding.clone();
+    assert!(
+        selected_pre_prompt
+            .features
+            .remove(FEATURE_SESSION_READ_ONLY_V1)
+    );
     assert!(
         selected_pre_prompt
             .features

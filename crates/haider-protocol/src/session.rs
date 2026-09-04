@@ -22,14 +22,22 @@ impl SessionInteractionModeV1 {
     }
 }
 
-/// Optional, durable permissions granted when a session is created by a
-/// non-interactive client.
+/// Optional, durable permission policy selected when a session is created by
+/// a non-interactive client.
 ///
 /// These are ordinary policy overrides, not evidence that a human typed or
 /// approved a particular effect. The daemon therefore applies them as
 /// `AuthorizationVerdict::Allow`, never as `PreAuthorized(UserTyped)`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPermissionOverridesV1 {
+    /// Explicitly deny model-initiated filesystem writes and every execution
+    /// class that could write the workspace indirectly (local/remote process,
+    /// Git, desktop control, and writable-peer operations). This is the durable
+    /// representation of `haider run --read-only`; it takes precedence over
+    /// every allow field below. Automatic hooks are suppressed separately by
+    /// the daemon while this session policy is active.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
     /// Allow model-initiated filesystem writes and patches without a menu.
     #[serde(default)]
     pub allow_writes: bool,
@@ -63,7 +71,11 @@ impl SessionPermissionOverridesV1 {
     /// Whether this value grants no permissions and is equivalent to absence.
     #[must_use]
     pub fn is_empty(self) -> bool {
-        !self.allow_writes && !self.allow_exec && !self.allow_mobile && !self.auto_allow
+        !self.read_only
+            && !self.allow_writes
+            && !self.allow_exec
+            && !self.allow_mobile
+            && !self.auto_allow
     }
 }
 

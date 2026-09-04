@@ -2321,6 +2321,7 @@ async fn tool_calls_execute_and_continue_over_real_rpc() {
     )
     .await;
     let overrides = SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: true,
         allow_exec: true,
         allow_mobile: false,

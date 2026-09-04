@@ -1390,6 +1390,7 @@ async fn fork_resets_remembered_grants_but_keeps_creation_permission_policy() {
     let run_id = RunId::new("permission-fork-run");
     let mut create = create_command(&source, "permission-fork");
     create.permission_overrides = Some(haider_protocol::session::SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: true,
         allow_exec: false,
         allow_mobile: false,
@@ -1577,6 +1578,7 @@ async fn fork_resets_remembered_grants_but_keeps_creation_permission_policy() {
         "prompt-derived mobile consent must not cross the fork audit boundary"
     );
     let expected_overrides = haider_protocol::session::SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: true,
         allow_exec: false,
         allow_mobile: false,

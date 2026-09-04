@@ -21139,7 +21139,7 @@ struct DurableHeadlessRunFacts {
     request_deadline_unix_ms: Option<u64>,
     cancellation_intent_at_ms: Option<u64>,
     blocking_error_code: Option<&'static str>,
-    pending_permission_rejects: HashMap<MenuId, (String, u32)>,
+    pending_permission_allows: HashMap<MenuId, (String, u32)>,
 }
 
 fn record_headless_menu(facts: &mut DurableHeadlessRunFacts, menu: &Menu) {
@@ -21151,24 +21151,24 @@ fn record_headless_menu(facts: &mut DurableHeadlessRunFacts, menu: &Menu) {
         return;
     }
     if let MenuKind::Permission { .. } = menu.kind {
-        let reject_once = menu
+        let allow_once = menu
             .options
             .iter()
             .enumerate()
-            .find(|(_, option)| option.decision == Some(DecisionKind::RejectOnce))
+            .find(|(_, option)| option.decision == Some(DecisionKind::AllowOnce))
             .and_then(|(index, option)| {
                 u32::try_from(index)
                     .ok()
                     .map(|index| (option.key.clone(), index))
             });
-        if let Some(reject_once) = reject_once {
+        if let Some(allow_once) = allow_once {
             facts
-                .pending_permission_rejects
-                .insert(menu.id.clone(), reject_once);
+                .pending_permission_allows
+                .insert(menu.id.clone(), allow_once);
         } else {
             facts
                 .blocking_error_code
-                .get_or_insert("permission_reject_unavailable");
+                .get_or_insert("permission_allow_unavailable");
         }
     } else if menu.blocking {
         facts.blocking_error_code.get_or_insert("input_required");
@@ -21176,7 +21176,7 @@ fn record_headless_menu(facts: &mut DurableHeadlessRunFacts, menu: &Menu) {
 }
 
 fn record_headless_menu_answer(facts: &mut DurableHeadlessRunFacts, answer: &MenuAnswer) {
-    let Some((option_key, option_index)) = facts.pending_permission_rejects.remove(&answer.menu)
+    let Some((option_key, option_index)) = facts.pending_permission_allows.remove(&answer.menu)
     else {
         return;
     };
@@ -21193,7 +21193,7 @@ fn record_headless_menu_answer(facts: &mut DurableHeadlessRunFacts, answer: &Men
 }
 
 fn record_headless_menu_closed(facts: &mut DurableHeadlessRunFacts, menu: &MenuId) {
-    if facts.pending_permission_rejects.remove(menu).is_some()
+    if facts.pending_permission_allows.remove(menu).is_some()
         && !facts.deadline_exceeded
         && facts.cancellation_intent_at_ms.is_none()
         && facts.blocking_error_code.is_none()

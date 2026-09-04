@@ -3227,9 +3227,9 @@ fn run_jsonl_fragmented_tool_call_keeps_one_call_identity_and_cursor() {
     );
 }
 
-/// MUTATION CHECK: silently approve the default Ask, fail to persist/apply
-/// `--allow-writes`, or forge `PreAuthorized(UserTyped)`. Expected RUNTIME
-/// failure: the default run writes, the flagged run still asks, or its durable
+/// MUTATION CHECK: restore the old Ask-to-deny default, fail to persist/apply
+/// the autonomous policy, or forge `PreAuthorized(UserTyped)`. Expected
+/// RUNTIME failure: the unflagged write/exec does not happen or its durable
 /// authorization verdict is not ordinary Allow.
 #[test]
 fn run_write_and_exec_permission_flags_journal_ordinary_allow() {
@@ -3241,26 +3241,49 @@ fn run_write_and_exec_permission_flags_journal_ordinary_allow() {
         {"step":"finish","reason":"end_turn"}
     ]"#;
 
-    let denied_workspace = tempfile::tempdir().expect("denied workspace");
-    let denied = haider()
-        .current_dir(denied_workspace.path())
-        .args(["run", "--provider", "fake", "write", "--output", "json"])
+    let default_workspace = tempfile::tempdir().expect("default workspace");
+    let default_run = haider()
+        .current_dir(default_workspace.path())
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "-p",
+            "write",
+            "--output",
+            "json",
+        ])
         .env("HAIDER_TEST_FAKE_PROVIDER", script)
         .output()
-        .expect("denied run");
-    assert!(denied.status.success());
-    assert!(!denied_workspace.path().join("created.txt").exists());
-    let denied_json: serde_json::Value =
-        serde_json::from_slice(&denied.stdout).expect("denied JSON");
-    assert_eq!(denied_json["outcome"], "done");
+        .expect("default run");
+    assert!(default_run.status.success());
     assert_eq!(
-        denied_json["permission_denials"].as_array().map(Vec::len),
-        Some(1)
+        std::fs::read_to_string(default_workspace.path().join("created.txt"))
+            .expect("default write"),
+        "ok"
     );
-    assert!(denied_json["events"].as_array().is_some_and(|events| {
-        events
-            .iter()
-            .any(|event| event["payload"]["type"] == "tool_result")
+    let default_json: serde_json::Value =
+        serde_json::from_slice(&default_run.stdout).expect("default JSON");
+    assert_eq!(default_json["outcome"], "done");
+    assert_eq!(
+        default_json["permission_denials"].as_array().map(Vec::len),
+        Some(0)
+    );
+    assert!(default_json["events"].as_array().is_some_and(|events| {
+        events.iter().any(|event| {
+            serde_json::from_value::<RawEnvelope>(event.clone())
+                .ok()
+                .and_then(|envelope| envelope.payload.decode_event().ok())
+                .is_some_and(|payload| {
+                    matches!(
+                        payload,
+                        EventPayload::Effect(EffectPhase::Authorized {
+                            verdict: AuthorizationVerdict::Allow,
+                            ..
+                        })
+                    )
+                })
+        })
     }));
 
     let allowed_workspace = tempfile::tempdir().expect("allowed workspace");
@@ -3318,14 +3341,7 @@ fn run_write_and_exec_permission_flags_journal_ordinary_allow() {
     .to_string();
     let exec = haider()
         .current_dir(exec_workspace.path())
-        .args([
-            "run",
-            "--provider",
-            "fake",
-            "execute",
-            "--jsonl",
-            "--allow-exec",
-        ])
+        .args(["run", "--provider", "fake", "-p", "execute", "--jsonl"])
         .env("HAIDER_TEST_FAKE_PROVIDER", &exec_script)
         .output()
         .expect("allowed exec run");
@@ -3359,6 +3375,235 @@ fn run_write_and_exec_permission_flags_journal_ordinary_allow() {
             ..
         }))
     )));
+}
+
+/// `--read-only` is an explicit policy deny. The broker must journal its exact
+/// reason, return a typed denial to the model, and refuse to report Done after
+/// the model has observed that result.
+#[test]
+fn run_read_only_denial_is_typed_and_terminal() {
+    let script = r#"[
+        {"step":"emit_tool_call","call_id":"write-1","name":"fs_write","args":{"path":"created.txt","content":"no"}},
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"write-1"},
+        {"step":"emit_text","text":"write was refused"},
+        {"step":"finish","reason":"end_turn"}
+    ]"#;
+    let workspace = tempfile::tempdir().expect("read-only workspace");
+    let output = haider()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "-p",
+            "write",
+            "--read-only",
+            "--output",
+            "json",
+        ])
+        .env("HAIDER_TEST_FAKE_PROVIDER", script)
+        .output()
+        .expect("read-only run");
+    assert_eq!(output.status.code(), Some(i32::from(EX_BLOCKED)));
+    assert!(!workspace.path().join("created.txt").exists());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("read-only JSON");
+    assert_eq!(result["outcome"], "errored");
+    assert_eq!(result["error"]["code"], "permission_denied");
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("write denied: run is --read-only"))
+    );
+    assert_eq!(
+        result["permission_denials"][0]["notice"],
+        "write denied: run is --read-only"
+    );
+    let events = result["events"].as_array().expect("events");
+    assert!(events.iter().any(|event| {
+        event["payload"]["type"] == "tool_result"
+            && event["payload"]["result"]["reason"] == "write denied: run is --read-only"
+            && event["payload"]["result"]["status"] == "rejected"
+    }));
+    assert!(events.iter().any(|event| {
+        event["payload"]["type"] == "run_failed"
+            && event["payload"]["code"] == "permission_denied"
+            && event["payload"]["message"] == "write denied: run is --read-only"
+    }));
+    assert!(
+        events.iter().any(|event| {
+            event["payload"]["type"] == "item"
+                && event["payload"]["event"] == "completed"
+                && event["payload"]["item"]["item"] == "agent_message"
+                && event["payload"]["item"]["text"] == "write was refused"
+        }),
+        "the model must receive the typed denial in a second provider request before the run terminalizes"
+    );
+
+    let exec_script = serde_json::json!([
+        {
+            "step": "emit_tool_call",
+            "call_id": "exec-1",
+            "name": "exec",
+            "args": {
+                "command": EXEC_WRITE_COMMAND,
+                "cwd": workspace.path().to_str().expect("UTF-8 read-only workspace")
+            }
+        },
+        {"step": "finish", "reason": "tool_use"},
+        {"step": "expect_tool_result", "call_id": "exec-1"},
+        {"step": "finish", "reason": "end_turn"}
+    ])
+    .to_string();
+    let exec_output = haider()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "-p",
+            "execute",
+            "--read-only",
+            "--output",
+            "json",
+        ])
+        .env("HAIDER_TEST_FAKE_PROVIDER", exec_script)
+        .output()
+        .expect("read-only exec run");
+    assert_eq!(exec_output.status.code(), Some(i32::from(EX_BLOCKED)));
+    assert!(!workspace.path().join("exec-created.txt").exists());
+    let exec_result: serde_json::Value =
+        serde_json::from_slice(&exec_output.stdout).expect("read-only exec JSON");
+    assert_eq!(exec_result["outcome"], "errored");
+    assert_eq!(exec_result["error"]["code"], "permission_denied");
+    assert!(exec_result["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("process execution denied: run is --read-only")));
+    assert_eq!(
+        exec_result["permission_denials"][0]["notice"],
+        "process execution denied: run is --read-only"
+    );
+    assert!(
+        exec_result["events"]
+            .as_array()
+            .expect("exec events")
+            .iter()
+            .any(|event| {
+                event["payload"]["type"] == "tool_result"
+                    && event["payload"]["result"]["reason"]
+                        == "process execution denied: run is --read-only"
+                    && event["payload"]["result"]["status"] == "rejected"
+            })
+    );
+    assert!(
+        exec_result["events"]
+            .as_array()
+            .expect("exec events")
+            .iter()
+            .any(|event| {
+                event["payload"]["type"] == "run_failed"
+                    && event["payload"]["code"] == "permission_denied"
+                    && event["payload"]["message"] == "process execution denied: run is --read-only"
+            })
+    );
+
+    let registry_script = r#"[
+        {"step":"emit_tool_call","call_id":"register-1","name":"loom_register","args":{"kind":"agent_type"}},
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"register-1"},
+        {"step":"finish","reason":"end_turn"}
+    ]"#;
+    let registry_output = haider()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "-p",
+            "register",
+            "--read-only",
+            "--output",
+            "json",
+        ])
+        .env("HAIDER_TEST_FAKE_PROVIDER", registry_script)
+        .output()
+        .expect("read-only registry run");
+    assert_eq!(registry_output.status.code(), Some(i32::from(EX_BLOCKED)));
+    let registry_result: serde_json::Value =
+        serde_json::from_slice(&registry_output.stdout).expect("read-only registry JSON");
+    assert_eq!(registry_result["outcome"], "errored");
+    assert!(registry_result["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("registry mutation denied: run is --read-only")));
+    assert!(
+        registry_result["events"]
+            .as_array()
+            .expect("registry events")
+            .iter()
+            .any(|event| {
+                event["payload"]["type"] == "tool_result"
+                    && event["payload"]["result"]["reason"]
+                        == "registry mutation denied: run is --read-only"
+                    && event["payload"]["result"]["status"] == "rejected"
+            })
+    );
+    assert!(
+        registry_result["events"]
+            .as_array()
+            .expect("registry events")
+            .iter()
+            .any(|event| {
+                event["payload"]["type"] == "run_failed"
+                    && event["payload"]["code"] == "permission_denied"
+                    && event["payload"]["message"] == "registry mutation denied: run is --read-only"
+            })
+    );
+
+    let transport_after_denial_script = r#"[
+        {"step":"emit_tool_call","call_id":"write-transport","name":"fs_write","args":{"path":"transport-created.txt","content":"no"}},
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"write-transport"},
+        {"step":"error_with_retryability","kind":"transport","message":"provider failed after denial","retryable":false}
+    ]"#;
+    let transport_output = haider()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "-p",
+            "write then fail",
+            "--read-only",
+            "--output",
+            "json",
+        ])
+        .env("HAIDER_TEST_FAKE_PROVIDER", transport_after_denial_script)
+        .output()
+        .expect("read-only denial followed by provider failure");
+    assert_eq!(transport_output.status.code(), Some(i32::from(EX_BLOCKED)));
+    assert!(!workspace.path().join("transport-created.txt").exists());
+    let transport_result: serde_json::Value =
+        serde_json::from_slice(&transport_output.stdout).expect("read-only transport-failure JSON");
+    assert_eq!(transport_result["outcome"], "errored");
+    assert_eq!(transport_result["error"]["code"], "permission_denied");
+    assert!(
+        transport_result["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("write denied: run is --read-only"))
+    );
+    let transport_events = transport_result["events"]
+        .as_array()
+        .expect("transport events");
+    assert!(transport_events.iter().any(|event| {
+        event["payload"]["type"] == "run_failed"
+            && event["payload"]["code"] == "permission_denied"
+            && event["payload"]["message"] == "write denied: run is --read-only"
+    }));
+    assert!(
+        !transport_events
+            .iter()
+            .any(|event| event["payload"]["type"] == "menu_opened")
+    );
 }
 
 #[test]
@@ -3791,9 +4036,10 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
             action: RunAction::Execute,
             output: RunOutput::Print,
             timeout: None,
-            allow_writes: false,
-            allow_exec: false,
-            auto_allow: false,
+            read_only: false,
+            allow_writes: true,
+            allow_exec: true,
+            auto_allow: true,
             trust_hooks: false,
             provider: None,
             model: None,
@@ -3824,6 +4070,7 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
     .expect("full options");
     assert_eq!(parsed.output, RunOutput::Json);
     assert_eq!(parsed.timeout, Some(Duration::from_millis(1500)));
+    assert!(!parsed.read_only);
     assert!(parsed.allow_writes && parsed.allow_exec && parsed.auto_allow && parsed.trust_hooks);
     assert_eq!(
         parsed.provider.as_ref().map(ProviderSelection::as_str),
@@ -3861,6 +4108,24 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
             "{invalid} must be refused"
         );
     }
+    let read_only = parse_run_options(&[
+        "hello".into(),
+        "--read-only".into(),
+        "--allow-writes".into(),
+    ])
+    .expect("read-only takes policy precedence at dispatch");
+    assert!(read_only.read_only);
+    assert!(read_only.allow_writes);
+}
+
+#[test]
+fn run_help_states_autonomous_default_and_explicit_denies() {
+    let output = haider().args(["run", "--help"]).output().expect("run help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 help");
+    assert!(stdout.contains("Haider permission prompts are allowed automatically"));
+    assert!(stdout.contains("--read-only"));
+    assert!(stdout.contains("provider lockdown remain enforced"));
 }
 
 #[test]

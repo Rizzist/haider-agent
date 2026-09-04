@@ -1643,6 +1643,28 @@ pub trait ToolDispatcher: Send + Sync {
         Ok(None)
     }
 
+    /// Returns a latched terminal failure after any typed tool result that had
+    /// to be shown to the model first. This lets a dispatcher preserve both
+    /// model-readable refusal detail and an honest non-successful run outcome.
+    async fn terminal_failure_after_tool_results(
+        &self,
+    ) -> Result<Option<HaiderError>, HaiderError> {
+        Ok(None)
+    }
+
+    /// Observes a typed tool result only after its journal settlement is
+    /// durable. Dispatchers use this to arm a terminal policy cause without
+    /// masking a failure that occurred before the refusal itself committed.
+    async fn note_committed_tool_result(&self, _result: &BoundedResult) -> Result<(), HaiderError> {
+        Ok(())
+    }
+
+    /// Marks that a provider request carrying any previously committed tool
+    /// results has completed its open attempt. A dispatcher may use this to
+    /// make a pending terminal cause eligible only after the model-facing
+    /// request has actually been issued.
+    async fn note_provider_request_after_tool_results(&self) {}
+
     /// Activates work owned by a newly committed approval checkpoint.
     ///
     /// The menu and `PermissionRequired` state are durable before this hook is
@@ -4038,6 +4060,9 @@ impl HarnessActor {
                         .await;
                 }
                 drop(opening);
+                if let Some(dispatcher) = self.dispatcher.as_ref() {
+                    dispatcher.note_provider_request_after_tool_results().await;
+                }
                 let mut restored_messages = std::mem::take(&mut provider_request.messages);
                 if volatile_user_tail.is_some() && snapshot_insert_at < restored_messages.len() {
                     restored_messages.remove(snapshot_insert_at);
@@ -5422,36 +5447,6 @@ impl HarnessActor {
                                 )
                                 .await;
                         }
-                        if reason == FinishReason::Error {
-                            if let Err(error) = self
-                                .commit_pending_usage(&run_id, &mut pending_usage_commit)
-                                .await
-                            {
-                                return self
-                                    .drive_error_outcome_with_items(
-                                        &run_id,
-                                        &mut message,
-                                        &mut reasoning,
-                                        &mut tools,
-                                        DriveError::from(error),
-                                    )
-                                    .await;
-                            }
-                            let error = HaiderError::new(
-                                ErrorCode::ProviderError,
-                                "provider finished the turn with an error",
-                                false,
-                            );
-                            return self
-                                .errored_outcome_with_items(
-                                    &run_id,
-                                    &mut message,
-                                    &mut reasoning,
-                                    &mut tools,
-                                    error,
-                                )
-                                .await;
-                        }
                         let mut post_stream_batch = reason == FinishReason::EndTurn
                             && pending_usage_commit.is_some()
                             && message.is_some()
@@ -5547,6 +5542,69 @@ impl HarnessActor {
                                     &mut message,
                                     &mut reasoning,
                                     &mut tools,
+                                )
+                                .await;
+                        }
+                        // A dispatcher may have returned a typed denial to the
+                        // model on the preceding request while latching the
+                        // run's required terminal cause. Once the model has
+                        // observed it, that cause wins over provider refusal,
+                        // provider error, and continuation exhaustion. An
+                        // explicit cancellation above still wins immediately.
+                        if let Some(dispatcher) = self.dispatcher.as_ref() {
+                            let terminal_failure =
+                                match dispatcher.terminal_failure_after_tool_results().await {
+                                    Ok(failure) => failure,
+                                    Err(error) => {
+                                        return self
+                                            .errored_outcome_with_items(
+                                                &run_id,
+                                                &mut message,
+                                                &mut reasoning,
+                                                &mut tools,
+                                                error,
+                                            )
+                                            .await;
+                                    }
+                                };
+                            if let Some(error) = terminal_failure {
+                                if let Err(usage_error) =
+                                    finalize_request_usage(&mut completed_usage, &mut request_usage)
+                                {
+                                    return self
+                                        .drive_error_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            usage_error,
+                                        )
+                                        .await;
+                                }
+                                return self
+                                    .errored_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
+                            }
+                        }
+                        if reason == FinishReason::Error {
+                            let error = HaiderError::new(
+                                ErrorCode::ProviderError,
+                                "provider finished the turn with an error",
+                                false,
+                            );
+                            return self
+                                .errored_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    error,
                                 )
                                 .await;
                         }
@@ -7469,6 +7527,10 @@ impl HarnessActor {
             let call_id = tools[index].call_id.clone();
             self.commit_tool_settlement_and_streaming(run_id, &tools[index], &result)
                 .await?;
+            dispatcher
+                .note_committed_tool_result(&result)
+                .await
+                .map_err(DriveError::Store)?;
             let projection = model_tool_result_projection(&tools[index].name, &result);
             tools.remove(index);
             return Ok(Some(Message::tool_result_with_images(
@@ -9296,6 +9358,11 @@ impl HarnessActor {
         tools: &mut Vec<ToolAccumulator>,
         mut provider_error: ProviderError,
     ) -> TurnOutcome {
+        if let Some(error) = self.latched_terminal_failure().await {
+            return self
+                .errored_outcome_with_items(run_id, message, reasoning, tools, error)
+                .await;
+        }
         // This is the single deadline-to-terminal classifier. The durable
         // state wins over whichever timer happened to wake the actor: expiry
         // during provider backoff/admission is bounded retry exhaustion, while
@@ -9386,6 +9453,7 @@ impl HarnessActor {
         tools: &mut Vec<ToolAccumulator>,
         error: HaiderError,
     ) -> TurnOutcome {
+        let error = self.latched_terminal_failure().await.unwrap_or(error);
         if let Err(cleanup_error) = self
             .complete_open_items(run_id, message, reasoning, tools, ToolStatus::Failed)
             .await
@@ -9415,6 +9483,7 @@ impl HarnessActor {
 
     /// Commits `Errored` (best effort) and reports the original error.
     async fn errored_state_outcome(&mut self, run_id: &RunId, error: HaiderError) -> TurnOutcome {
+        let error = self.latched_terminal_failure().await.unwrap_or(error);
         if let Err(commit_error) = self.commit_terminal_error(run_id, &error).await {
             return errored_outcome(commit_error);
         }
@@ -9422,6 +9491,14 @@ impl HarnessActor {
             state: RunState::Errored,
             finish_reason: FinishReason::Error,
             error: Some(error),
+        }
+    }
+
+    async fn latched_terminal_failure(&self) -> Option<HaiderError> {
+        let dispatcher = self.dispatcher.as_ref()?;
+        match dispatcher.terminal_failure_after_tool_results().await {
+            Ok(failure) => failure,
+            Err(error) => Some(error),
         }
     }
 

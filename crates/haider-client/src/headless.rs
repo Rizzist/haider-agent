@@ -1,7 +1,8 @@
 //! Reusable daemon-backed one-shot transaction for non-interactive clients.
 //!
 //! This module owns execution ordering, durable command retries, cursor replay,
-//! fail-closed permission handling, and terminal reduction. A lossless hybrid
+//! automatic permission resolution, explicit-denial reporting, and terminal
+//! reduction. A lossless hybrid
 //! event ledger retains small runs in memory and spills larger runs without
 //! coupling control-plane progress to presentation formatting.
 
@@ -40,7 +41,8 @@ use haider_rpc::haider_protocol::tool::AttachmentBlock;
 use haider_rpc::{
     AttachMode, AttachmentId, CancelStatus, Capability, CapabilitySet, ClientKind, CommandId,
     ERROR_CODE_ALREADY_RESOLVED, FEATURE_ARTIFACT_PUT_V1, FEATURE_AUTONOMOUS_INTERACTION_V1,
-    FEATURE_SESSION_PERMISSION_OVERRIDES_V1, RequestBody, ResponseBody, SeqRange, WireFrame,
+    FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SESSION_READ_ONLY_V1, RequestBody,
+    ResponseBody, SeqRange, WireFrame,
 };
 use serde::ser::{Error as _, SerializeSeq as _};
 use serde::{Deserialize, Serialize};
@@ -462,7 +464,7 @@ pub enum HeadlessEvent {
     /// discriminator. This replaces, rather than duplicates, the ordinary
     /// envelope event at the same cursor.
     Terminal(HeadlessTerminalEvent),
-    /// Observable fail-closed decision for a permission-gated effect.
+    /// Observable explicit policy denial for a permission-gated effect.
     PermissionDenied(HeadlessPermissionDenial),
 }
 
@@ -531,7 +533,7 @@ impl HeadlessEventMode {
     }
 }
 
-/// Machine-readable permission denial made by the headless default policy.
+/// Machine-readable explicit permission denial observed by a headless run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadlessPermissionDenial {
     /// Permission-menu id for the interactive fallback, or the effect id when
@@ -558,7 +560,7 @@ pub enum HeadlessOutcome {
 pub enum HeadlessBlockingReason {
     InputRequired,
     EffectOutcomeUnknown,
-    PermissionRejectUnavailable,
+    PermissionAllowUnavailable,
     PermissionResolutionConflict,
 }
 
@@ -568,7 +570,7 @@ impl HeadlessBlockingReason {
         match self {
             Self::InputRequired => "input_required",
             Self::EffectOutcomeUnknown => "effect_outcome_unknown",
-            Self::PermissionRejectUnavailable => "permission_reject_unavailable",
+            Self::PermissionAllowUnavailable => "permission_allow_unavailable",
             Self::PermissionResolutionConflict => "permission_resolution_conflict",
         }
     }
@@ -579,11 +581,11 @@ impl HeadlessBlockingReason {
             Self::EffectOutcomeUnknown => {
                 "run requires interactive recovery for an unknown effect outcome"
             }
-            Self::PermissionRejectUnavailable => {
-                "permission menu did not enumerate a RejectOnce decision"
+            Self::PermissionAllowUnavailable => {
+                "permission menu did not enumerate an AllowOnce decision"
             }
             Self::PermissionResolutionConflict => {
-                "permission menu was resolved with a decision other than the selected RejectOnce"
+                "permission menu was resolved with a decision other than the selected AllowOnce"
             }
         }
     }
@@ -1143,7 +1145,7 @@ impl HeadlessConnection {
 
 #[derive(Debug, Clone)]
 enum ReducerAction {
-    RejectPermission {
+    AllowPermission {
         command_id: CommandId,
         menu_id: MenuId,
         request_seq: u64,
@@ -1805,7 +1807,7 @@ impl HeadlessReducer {
                 }
                 EventPayload::Effect(EffectPhase::Authorized {
                     effect,
-                    verdict: AuthorizationVerdict::Deny { .. },
+                    verdict: AuthorizationVerdict::Deny { reason },
                 }) => {
                     let denial = HeadlessPermissionDenial {
                         menu_id: effect.as_str().to_owned(),
@@ -1813,7 +1815,7 @@ impl HeadlessReducer {
                             .effect_summaries
                             .remove(effect.as_str())
                             .unwrap_or_else(|| effect.as_str().to_owned()),
-                        notice: "permission_denied_by_headless_default".into(),
+                        notice: reason,
                     };
                     self.permission_denials.push(denial.clone());
                     denial_to_emit = Some(denial);
@@ -1844,22 +1846,15 @@ impl HeadlessReducer {
                     is_terminal_envelope = self.reduce_run_state(state, envelope.seq);
                 }
                 EventPayload::MenuOpened(menu) => match menu.kind {
-                    MenuKind::Permission { effect_summary } => {
+                    MenuKind::Permission { .. } => {
                         let selected =
                             menu.options.iter().enumerate().find(|(_, option)| {
-                                option.decision == Some(DecisionKind::RejectOnce)
+                                option.decision == Some(DecisionKind::AllowOnce)
                             });
                         if let Some((index, option)) = selected
                             && let Ok(option_index) = u32::try_from(index)
                         {
-                            let denial = HeadlessPermissionDenial {
-                                menu_id: menu.id.as_str().to_owned(),
-                                effect_summary,
-                                notice: "permission_denied_by_headless_default".into(),
-                            };
-                            self.permission_denials.push(denial.clone());
-                            denial_to_emit = Some(denial);
-                            self.actions.push_back(ReducerAction::RejectPermission {
+                            self.actions.push_back(ReducerAction::AllowPermission {
                                 command_id: CommandId::new(command_id("headless-menu")),
                                 menu_id: menu.id,
                                 request_seq: envelope.seq,
@@ -1868,7 +1863,7 @@ impl HeadlessReducer {
                             });
                         } else {
                             self.actions.push_back(ReducerAction::Block(
-                                HeadlessBlockingReason::PermissionRejectUnavailable,
+                                HeadlessBlockingReason::PermissionAllowUnavailable,
                             ));
                         }
                     }
@@ -3549,6 +3544,11 @@ fn normalize_ensure_options(
             .required_features
             .insert(FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned());
     }
+    if permission_overrides.read_only {
+        options
+            .required_features
+            .insert(FEATURE_SESSION_READ_ONLY_V1.to_owned());
+    }
     if has_attachments {
         options
             .required_features
@@ -4261,10 +4261,10 @@ async fn handle_reducer_actions(
 ) -> Result<(), HeadlessRunError> {
     while let Some(action) = reducer.actions.front().cloned() {
         match action {
-            ReducerAction::RejectPermission { .. } if forced.is_some() => {
+            ReducerAction::AllowPermission { .. } if forced.is_some() => {
                 reducer.actions.pop_front();
             }
-            ReducerAction::RejectPermission {
+            ReducerAction::AllowPermission {
                 command_id: answer_command_id,
                 menu_id,
                 request_seq,
@@ -4859,6 +4859,9 @@ pub fn required_headless_features(
     features.insert(haider_rpc::FEATURE_SESSION_CREATE_ADMISSION_V1.to_owned());
     if !permission_overrides.is_empty() {
         features.insert(FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned());
+    }
+    if permission_overrides.read_only {
+        features.insert(FEATURE_SESSION_READ_ONLY_V1.to_owned());
     }
     features
 }

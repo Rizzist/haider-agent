@@ -24,6 +24,7 @@ pub enum InteractionGate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionResolution {
     AwaitHuman,
+    AutoApprove,
     UseDeclaredDefault,
     ReturnNoHumanAvailable,
     ContinuePartial,
@@ -83,9 +84,11 @@ impl InteractionResolutionPolicy {
                 Resolution::ReturnWorkflowUnfinished
             }
             (SessionInteractionModeV1::Autonomous, Gate::EffectBrokerAsk)
-            | (SessionInteractionModeV1::Autonomous, Gate::OsOrDesktopPermission)
+            | (SessionInteractionModeV1::Autonomous, Gate::MobileOrDeviceGrant) => {
+                Resolution::AutoApprove
+            }
+            (SessionInteractionModeV1::Autonomous, Gate::OsOrDesktopPermission)
             | (SessionInteractionModeV1::Autonomous, Gate::CredentialOrLogin)
-            | (SessionInteractionModeV1::Autonomous, Gate::MobileOrDeviceGrant)
             | (SessionInteractionModeV1::Autonomous, Gate::GraphHumanConfirm)
             | (SessionInteractionModeV1::Autonomous, Gate::UnknownEffectAfterCrash)
             | (SessionInteractionModeV1::Autonomous, Gate::DestructiveOrClobber)
@@ -133,13 +136,22 @@ mod tests {
     }
 
     #[test]
-    fn autonomous_policy_keeps_sensitive_gates_fail_closed() {
+    fn autonomous_policy_auto_approves_haider_permission_gates() {
         let policy = InteractionResolutionPolicy::new(SessionInteractionModeV1::Autonomous);
         for gate in [
             InteractionGate::EffectBrokerAsk,
+            InteractionGate::MobileOrDeviceGrant,
+        ] {
+            assert_eq!(policy.resolve(gate), InteractionResolution::AutoApprove);
+        }
+    }
+
+    #[test]
+    fn autonomous_policy_keeps_external_and_non_permission_gates_fail_closed() {
+        let policy = InteractionResolutionPolicy::new(SessionInteractionModeV1::Autonomous);
+        for gate in [
             InteractionGate::OsOrDesktopPermission,
             InteractionGate::CredentialOrLogin,
-            InteractionGate::MobileOrDeviceGrant,
             InteractionGate::GraphHumanConfirm,
             InteractionGate::UnknownEffectAfterCrash,
             InteractionGate::DestructiveOrClobber,

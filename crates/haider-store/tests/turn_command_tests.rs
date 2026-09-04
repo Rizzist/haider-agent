@@ -101,6 +101,7 @@ fn r2_09_admission_decisions_match_durable_receipt_replay() {
     let store = Store::open(root.path()).expect("store");
     let session_id = SessionId::new("session-admission-parity");
     let permissions = SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: true,
         allow_exec: true,
         allow_mobile: false,
