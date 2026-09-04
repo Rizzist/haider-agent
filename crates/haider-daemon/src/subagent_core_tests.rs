@@ -1286,6 +1286,9 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             },
             store: parent_lease,
             run_id: parent_run.clone(),
+            turn_ordinal: 1,
+            provider_request_ordinals: haider_provider::ProviderRequestOrdinal::new(0),
+            turn_trace: None,
             run_deadline: None,
             branch_id: None,
             device_id: DeviceId::new("message-idle-tool-device"),
@@ -1828,6 +1831,27 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
     assert!(child_events.iter().all(|event| {
         event.run_id.as_ref() != Some(&delegation.child_run_id)
             || event.agent_id.as_ref() == Some(&spawned.agent)
+    }));
+    let child_attempts = child_events
+        .iter()
+        .filter(|event| event.run_id.as_ref() == Some(&delegation.child_run_id))
+        .filter_map(|event| match event.payload.decode_event().ok()? {
+            EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                haider_protocol::cache::CacheRequestAttemptV1::from_extension_item(&item)
+                    .and_then(|attempt| attempt.correlation)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !child_attempts.is_empty(),
+        "delegated provider attempt is journaled"
+    );
+    assert!(child_attempts.iter().all(|attempt| {
+        attempt.session_id == delegation.child_session_id
+            && attempt.run_id == delegation.child_run_id
+            && attempt.turn_ordinal == 1
+            && attempt.request_kind == haider_protocol::cache::ProviderRequestKind::Side
     }));
 
     // OWNER DIRECTIVE (W6d): delegation is AUTOMATIC — the child is
@@ -3023,8 +3047,13 @@ async fn durable_parent_answer_replays_into_child_after_coordinator_restart() {
         match work {
             RecoveredWork::ChildWait(recovered) => {
                 recovered_parent = true;
+                assert_eq!(recovered.provider_request_ordinal, 1);
                 manager_handle
-                    .recover_child_wait(recovered.accepted, recovered.checkpoint)
+                    .recover_child_wait(
+                        recovered.accepted,
+                        recovered.checkpoint,
+                        recovered.provider_request_ordinal,
+                    )
                     .await
                     .expect("recover parent child wait");
             }
@@ -3037,16 +3066,17 @@ async fn durable_parent_answer_replays_into_child_after_coordinator_restart() {
                         recovered.accepted,
                         recovered.checkpoint,
                         recovered.committed_answer,
+                        recovered.provider_request_ordinal,
                     )
                     .await
                     .expect("recover child input checkpoint");
             }
-            RecoveredWork::Queued(accepted) => manager_handle
-                .recover_queued(accepted)
+            RecoveredWork::Queued(recovered) => manager_handle
+                .recover_queued(recovered.accepted, recovered.provider_request_ordinal)
                 .await
                 .expect("recover queued work"),
-            RecoveredWork::Retry(accepted) => manager_handle
-                .recover_retry(accepted)
+            RecoveredWork::Retry(recovered) => manager_handle
+                .recover_retry(recovered.accepted, recovered.provider_request_ordinal)
                 .await
                 .expect("recover retry work"),
             RecoveredWork::PartialStream(recovered) => manager_handle
@@ -3054,6 +3084,7 @@ async fn durable_parent_answer_replays_into_child_after_coordinator_restart() {
                     recovered.accepted,
                     recovered.checkpoint,
                     recovered.committed_answer,
+                    recovered.provider_request_ordinal,
                 )
                 .await
                 .expect("recover partial stream"),
@@ -4585,17 +4616,22 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
         match work {
             RecoveredWork::ChildWait(recovered) => {
                 resumed_parent = true;
+                assert_eq!(recovered.provider_request_ordinal, 1);
                 manager_handle
-                    .recover_child_wait(recovered.accepted, recovered.checkpoint)
+                    .recover_child_wait(
+                        recovered.accepted,
+                        recovered.checkpoint,
+                        recovered.provider_request_ordinal,
+                    )
                     .await
                     .expect("resume parent child wait");
             }
-            RecoveredWork::Queued(accepted) => manager_handle
-                .recover_queued(accepted)
+            RecoveredWork::Queued(recovered) => manager_handle
+                .recover_queued(recovered.accepted, recovered.provider_request_ordinal)
                 .await
                 .expect("recover queued work"),
-            RecoveredWork::Retry(accepted) => manager_handle
-                .recover_retry(accepted)
+            RecoveredWork::Retry(recovered) => manager_handle
+                .recover_retry(recovered.accepted, recovered.provider_request_ordinal)
                 .await
                 .expect("recover retry work"),
             RecoveredWork::Checkpoint(recovered) => manager_handle
@@ -4603,6 +4639,7 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
                     recovered.accepted,
                     recovered.checkpoint,
                     recovered.committed_answer,
+                    recovered.provider_request_ordinal,
                 )
                 .await
                 .expect("recover checkpoint"),
@@ -4611,6 +4648,7 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
                     recovered.accepted,
                     recovered.checkpoint,
                     recovered.committed_answer,
+                    recovered.provider_request_ordinal,
                 )
                 .await
                 .expect("recover partial stream"),

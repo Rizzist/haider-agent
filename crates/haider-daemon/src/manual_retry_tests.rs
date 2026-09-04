@@ -664,6 +664,35 @@ async fn run_retry_lost_handoff_recovers_once_after_restart() {
                 .flatten()
         })
         .expect("retry acceptance is durable before handoff");
+    let turn_ordinal = world
+        .store
+        .turn_ordinal(world.session_id.clone(), accepted_run.clone())
+        .await
+        .expect("read retry turn ordinal")
+        .expect("retry has a durable turn ordinal");
+    let attempt = haider_protocol::cache::ProviderRequestAttemptV1 {
+        session_id: world.session_id.clone(),
+        run_id: accepted_run.clone(),
+        turn_ordinal,
+        request_ordinal: 1,
+        request_kind: haider_protocol::cache::ProviderRequestKind::Side,
+    }
+    .extension_item()
+    .expect("standalone retry-side marker");
+    let mut marker = [envelope(
+        &world.session_id,
+        &accepted_run,
+        &DeviceId::new("retry-restart-attempt-device"),
+        world.store.worker_generation(),
+        "retry-restart-side-attempt".into(),
+        EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+            item_id: haider_protocol::ids::ItemId::new("retry-restart-side-attempt-item"),
+            item: attempt,
+        }),
+    )];
+    StoreHandle::append(&world.store, &mut marker)
+        .await
+        .expect("append retry-side marker before crash");
     drop(connection);
 
     let RetryWorld {
@@ -691,9 +720,15 @@ async fn run_retry_lost_handoff_recovers_once_after_restart() {
     .await
     .expect("reduce interrupted retry");
     assert_eq!(recovered.len(), 1, "one durable retry is recoverable");
-    let RecoveredWork::Retry(accepted) = recovered.pop().expect("recovered retry") else {
+    let RecoveredWork::Retry(recovered) = recovered.pop().expect("recovered retry") else {
         panic!("queued retry retains its retry-specific source coordinates")
     };
+    let provider_request_ordinal = recovered.provider_request_ordinal;
+    let accepted = recovered.accepted;
+    assert_eq!(
+        provider_request_ordinal, 1,
+        "queued retry recovery preserves the physical request maximum"
+    );
     assert_eq!(accepted.run_id, accepted_run);
     let restarted_hub =
         SessionHub::new(restarted_store.clone(), SessionHubConfig::default()).expect("restart hub");
@@ -715,13 +750,29 @@ async fn run_retry_lost_handoff_recovers_once_after_restart() {
         .install_worker_manager(restarted_handle.clone())
         .expect("install restarted manager");
     restarted_handle
-        .recover_retry(accepted)
+        .recover_retry(accepted, provider_request_ordinal)
         .await
         .expect("handoff recovered retry");
     wait_for_store_state(&restarted_store, &session_id, &accepted_run, RunState::Done).await;
     let requests = fake.requests();
     assert_eq!(requests.len(), 1, "recovery starts the retry exactly once");
     assert_retry_provider_messages(&requests[0].messages);
+    let events = restarted_store
+        .read(&session_id, 0, 512)
+        .await
+        .expect("recovered retry journal");
+    assert!(events.iter().any(|event| {
+        if event.run_id.as_ref() != Some(&accepted_run) {
+            return false;
+        }
+        let Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Completed { item, .. })) =
+            event.payload.decode_event()
+        else {
+            return false;
+        };
+        haider_protocol::cache::CacheRequestAttemptV1::try_from_extension_item(&item)
+            .is_ok_and(|attempt| attempt.is_some_and(|attempt| attempt.ordinal == 2))
+    }));
     restarted_manager
         .shutdown()
         .await

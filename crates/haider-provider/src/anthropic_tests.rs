@@ -38,6 +38,74 @@ struct StubFixedResolver {
     address: SocketAddr,
 }
 
+fn correlation_attempt() -> haider_protocol::cache::ProviderRequestAttemptV1 {
+    haider_protocol::cache::ProviderRequestAttemptV1 {
+        session_id: haider_protocol::ids::SessionId::new("session-anthropic"),
+        run_id: haider_protocol::ids::RunId::new("run-anthropic"),
+        turn_ordinal: 2,
+        request_ordinal: 3,
+        request_kind: haider_protocol::cache::ProviderRequestKind::Primary,
+    }
+}
+
+#[tokio::test]
+async fn anthropic_request_has_locked_correlation_headers_without_body_mutation() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("anthropic-turn-correlation");
+    vault.put(&alias, b"audit-key").expect("stores audit key");
+    let provider = AnthropicProvider::new(
+        vault.resolve(&alias).expect("resolves audit key"),
+        "claude-audit",
+    )
+    .expect("Anthropic provider");
+    let payload = serde_json::json!({"model":"claude-audit","messages":[]});
+    let baseline = provider
+        .request_body(payload.clone())
+        .await
+        .expect("baseline request");
+    let attempt = correlation_attempt();
+    let correlated = crate::scope_provider_request(
+        attempt.clone(),
+        crate::RequestMetadataBodySupport::Unsupported,
+        provider.request_body(payload),
+    )
+    .await
+    .expect("correlated request");
+    assert_eq!(
+        correlated.headers()[crate::HAIDER_TURN_HEADER],
+        "session-anthropic/run-anthropic/2/3"
+    );
+    assert_eq!(
+        correlated.headers()[crate::HAIDER_REQUEST_KIND_HEADER],
+        "primary"
+    );
+    let baseline_body = baseline
+        .body()
+        .expect("baseline request body")
+        .as_bytes()
+        .expect("baseline request byte body");
+    let correlated_body = correlated
+        .body()
+        .expect("correlated request body")
+        .as_bytes()
+        .expect("correlated request byte body");
+    assert_eq!(baseline_body, correlated_body);
+    let expected_body = correlated_body.to_vec();
+    let ledger = crate::capture_in_fake_proxy_ledger(correlated).await;
+    assert_eq!(
+        ledger.headers.get("x-haider-turn").map(String::as_str),
+        Some("session-anthropic/run-anthropic/2/3")
+    );
+    assert_eq!(
+        ledger
+            .headers
+            .get("x-haider-request-kind")
+            .map(String::as_str),
+        Some("primary")
+    );
+    assert_eq!(ledger.body, expected_body);
+}
+
 #[async_trait]
 impl FixedDnsResolver for StubFixedResolver {
     async fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {

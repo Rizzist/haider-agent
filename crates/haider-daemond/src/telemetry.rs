@@ -3,7 +3,7 @@
 //! The daemon has many tracing events whose fields include paths, errors, and
 //! other user-derived values. This subscriber deliberately enables only the
 //! three timing targets audited for release diagnostics and ignores every field
-//! outside their frozen numeric/phase allow-list.
+//! outside their frozen timing/correlation allow-list.
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
@@ -85,6 +85,10 @@ struct SafeFields<'a> {
     queue_wait_micros: Option<String>,
     operation_micros: Option<String>,
     phase: Option<String>,
+    session_id: Option<String>,
+    run_id: Option<String>,
+    turn_id: Option<String>,
+    request_kind: Option<String>,
     recovered_work: Option<String>,
     touched_sessions: Option<String>,
     turn_ordinal: Option<String>,
@@ -101,6 +105,10 @@ impl<'a> SafeFields<'a> {
             queue_wait_micros: None,
             operation_micros: None,
             phase: None,
+            session_id: None,
+            run_id: None,
+            turn_id: None,
+            request_kind: None,
             recovered_work: None,
             touched_sessions: None,
             turn_ordinal: None,
@@ -133,6 +141,10 @@ impl<'a> SafeFields<'a> {
         let mut rendered = String::new();
         for (name, value) in [
             ("phase", self.phase.as_deref()),
+            ("session_id", self.session_id.as_deref()),
+            ("run_id", self.run_id.as_deref()),
+            ("turn_id", self.turn_id.as_deref()),
+            ("request_kind", self.request_kind.as_deref()),
             ("queue_wait_micros", self.queue_wait_micros.as_deref()),
             ("operation_micros", self.operation_micros.as_deref()),
             ("recovered_work", self.recovered_work.as_deref()),
@@ -153,6 +165,27 @@ impl<'a> SafeFields<'a> {
 
 impl tracing::field::Visit for SafeFields<'_> {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if self.target == TURN_TARGET {
+            match field.name() {
+                "session_id" if safe_correlation_component(value) => {
+                    self.session_id = Some(value.to_owned());
+                    return;
+                }
+                "run_id" if safe_correlation_component(value) => {
+                    self.run_id = Some(value.to_owned());
+                    return;
+                }
+                "turn_id" if value.is_empty() || safe_turn_id(value) => {
+                    self.turn_id = Some(value.to_owned());
+                    return;
+                }
+                "request_kind" if matches!(value, "" | "primary" | "side" | "warmup") => {
+                    self.request_kind = Some(value.to_owned());
+                    return;
+                }
+                _ => {}
+            }
+        }
         if field.name() == "phase" {
             let allowed = match self.target {
                 RECOVERY_TARGET => matches!(value, "effects" | "turns" | "login_receipts"),
@@ -188,6 +221,42 @@ impl tracing::field::Visit for SafeFields<'_> {
             self.record_value(field, rendered);
         }
     }
+}
+
+fn safe_correlation_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'!'..=b'~') && byte != b'/')
+}
+
+fn safe_turn_id(value: &str) -> bool {
+    let mut parts = value.split('/');
+    let Some(session_id) = parts.next() else {
+        return false;
+    };
+    let Some(run_id) = parts.next() else {
+        return false;
+    };
+    let Some(turn_ordinal) = parts.next() else {
+        return false;
+    };
+    let Some(request_ordinal) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && safe_correlation_component(session_id)
+        && safe_correlation_component(run_id)
+        && unsigned_nonzero_decimal(turn_ordinal)
+        && unsigned_nonzero_decimal(request_ordinal)
+}
+
+fn unsigned_nonzero_decimal(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('0')
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u64>().is_ok_and(|value| value != 0)
 }
 
 fn safe_numeric_field(target: &str, field: &str) -> bool {
@@ -227,5 +296,9 @@ mod tests {
         assert!(safe_target(TURN_TARGET));
         assert!(safe_numeric_field(TURN_TARGET, "turn_ordinal"));
         assert!(!safe_numeric_field(TURN_TARGET, "run_id"));
+        assert!(safe_correlation_component("session-1"));
+        assert!(!safe_correlation_component("session/1"));
+        assert!(safe_turn_id("session-1/run-2/3/4"));
+        assert!(!safe_turn_id("session-1/run-2/03/4"));
     }
 }

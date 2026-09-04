@@ -525,6 +525,7 @@ async fn recoverable_workflow_continuation_blocks_daemon_idle_ttl_retirement() {
     .expect("headless configuration serializes");
     let request_attempt = CacheRequestAttemptV1 {
         ordinal: 1,
+        correlation: None,
         diagnostic: haider_protocol::provider::CacheRequestDiagnosticV1 {
             history_message_count: 1,
             stable_prefix_tokens: 8,
@@ -6733,6 +6734,7 @@ async fn recovery_terminalization_never_settles_idle_while_another_run_is_active
     let accepted = |run_id: &RunId, seq: u64| haider_store::AcceptedTurn {
         session_id: session_id.clone(),
         run_id: run_id.clone(),
+        turn_ordinal: 1,
         accepted_seq: seq,
         worker_generation: generation,
         branch_id: None,
@@ -6748,7 +6750,7 @@ async fn recovery_terminalization_never_settles_idle_while_another_run_is_active
     let handle = manager.handle();
 
     handle
-        .recover_queued(accepted(&run_b, queued[1].seq))
+        .recover_queued(accepted(&run_b, queued[1].seq), 0)
         .await
         .expect("feed failure degrades per-item, not fatally");
 
@@ -6796,7 +6798,7 @@ async fn recovery_terminalization_never_settles_idle_while_another_run_is_active
     // Positive control: terminalizing the last nonterminal run settles the
     // session — exactly one guarded Idle { interrupted: true } commits.
     handle
-        .recover_queued(accepted(&run_a, queued[0].seq))
+        .recover_queued(accepted(&run_a, queued[0].seq), 0)
         .await
         .expect("second degradation succeeds");
     let history = haider_core::StoreHandle::read(&store, &session_id, 0, 128)

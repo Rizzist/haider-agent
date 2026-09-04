@@ -27,9 +27,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use haider_accounts::SecretHandle;
+use haider_protocol::cache::ProviderRequestAttemptV1;
 use haider_provider::{
-    OPENAI_OAUTH_PROVIDER_NAME, codex_alpha_search_request_body, codex_alpha_search_response_text,
-    codex_alpha_search_url,
+    OPENAI_OAUTH_PROVIDER_NAME, apply_provider_request_headers_for,
+    codex_alpha_search_request_body, codex_alpha_search_response_text, codex_alpha_search_url,
 };
 
 use crate::oauth::CredentialBroker;
@@ -101,6 +102,7 @@ pub(crate) trait WebSearchHttp: Send + Sync {
         url: &str,
         bearer: &SecretHandle,
         body: &serde_json::Value,
+        attempt: &ProviderRequestAttemptV1,
     ) -> Result<(u16, Vec<u8>), String>;
 }
 
@@ -124,6 +126,7 @@ impl WebSearchHttp for ReqwestWebSearchHttp {
         url: &str,
         bearer: &SecretHandle,
         body: &serde_json::Value,
+        attempt: &ProviderRequestAttemptV1,
     ) -> Result<(u16, Vec<u8>), String> {
         let Some(client) = self.transport.client() else {
             return Err("search transport is unavailable".into());
@@ -133,11 +136,13 @@ impl WebSearchHttp for ReqwestWebSearchHttp {
         let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|_| "subscription credential is not header-safe".to_owned())?;
         authorization.set_sensitive(true);
-        let response = client
+        let request = client
             .post(url)
             .timeout(Duration::from_secs(45))
             .header(reqwest::header::AUTHORIZATION, authorization)
-            .json(body)
+            .json(body);
+        let response = apply_provider_request_headers_for(request, attempt)
+            .map_err(|error| error.to_string())?
             .send()
             .await
             .map_err(|error| {
@@ -193,6 +198,7 @@ impl WebSearchExecutor for SubscriptionWebSearch {
         model: &str,
         session_id: &str,
         query: &str,
+        attempt: &ProviderRequestAttemptV1,
     ) -> Result<String, WebSearchFailure> {
         let (base_url, bearer) =
             self.credentials
@@ -204,14 +210,14 @@ impl WebSearchExecutor for SubscriptionWebSearch {
                 })?;
         let url = codex_alpha_search_url(base_url.as_deref());
         let body = codex_alpha_search_request_body(session_id, model, query);
-        let (status, bytes) =
-            self.http
-                .post_json(&url, &bearer, &body)
-                .await
-                .map_err(|message| WebSearchFailure {
-                    message,
-                    degraded: false,
-                })?;
+        let (status, bytes) = self
+            .http
+            .post_json(&url, &bearer, &body, attempt)
+            .await
+            .map_err(|message| WebSearchFailure {
+                message,
+                degraded: false,
+            })?;
         match status {
             // Gone for good: latch the session capability off.
             404 | 410 => Err(WebSearchFailure {
@@ -246,6 +252,16 @@ mod web_search_tests {
         vault.resolve(&alias).expect("resolve")
     }
 
+    fn side_attempt() -> ProviderRequestAttemptV1 {
+        ProviderRequestAttemptV1 {
+            session_id: haider_protocol::ids::SessionId::new("session-9"),
+            run_id: haider_protocol::ids::RunId::new("run-1"),
+            turn_ordinal: 1,
+            request_ordinal: 2,
+            request_kind: haider_protocol::cache::ProviderRequestKind::Side,
+        }
+    }
+
     struct StubCredentials {
         base_url: Option<String>,
     }
@@ -266,9 +282,11 @@ mod web_search_tests {
         }
     }
 
+    type PostedRequest = (String, Vec<u8>, serde_json::Value, ProviderRequestAttemptV1);
+
     #[derive(Default)]
     struct StubHttp {
-        posts: Mutex<Vec<(String, Vec<u8>, serde_json::Value)>>,
+        posts: Mutex<Vec<PostedRequest>>,
         reply: Mutex<Option<(u16, Vec<u8>)>>,
     }
 
@@ -280,7 +298,7 @@ mod web_search_tests {
             })
         }
 
-        fn posts(&self) -> Vec<(String, Vec<u8>, serde_json::Value)> {
+        fn posts(&self) -> Vec<PostedRequest> {
             self.posts
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -295,6 +313,7 @@ mod web_search_tests {
             url: &str,
             bearer: &SecretHandle,
             body: &serde_json::Value,
+            attempt: &ProviderRequestAttemptV1,
         ) -> Result<(u16, Vec<u8>), String> {
             self.posts
                 .lock()
@@ -303,6 +322,7 @@ mod web_search_tests {
                     url.to_owned(),
                     bearer.expose_secret().to_vec(),
                     body.clone(),
+                    attempt.clone(),
                 ));
             Ok(self
                 .reply
@@ -332,7 +352,12 @@ mod web_search_tests {
             Arc::clone(&http) as Arc<dyn WebSearchHttp>,
         );
         let text = search
-            .search("gpt-5.6-sol", "session-9", "rust sse decoding")
+            .search(
+                "gpt-5.6-sol",
+                "session-9",
+                "rust sse decoding",
+                &side_attempt(),
+            )
             .await
             .expect("200 yields text");
         assert_eq!(text, "the answer");
@@ -349,6 +374,7 @@ mod web_search_tests {
                 "rust sse decoding"
             )
         );
+        assert_eq!(posts[0].3, side_attempt());
 
         // A credential that pins its own origin is honored.
         let proxied = StubHttp::replying(200, "{}");
@@ -359,7 +385,7 @@ mod web_search_tests {
             Arc::clone(&proxied) as Arc<dyn WebSearchHttp>,
         );
         search
-            .search("m", "s", "q")
+            .search("m", "s", "q", &side_attempt())
             .await
             .expect("proxied 200 yields text");
         assert_eq!(
@@ -381,7 +407,7 @@ mod web_search_tests {
                 StubHttp::replying(status, "not found"),
             );
             let failure = search
-                .search("m", "s", "q")
+                .search("m", "s", "q", &side_attempt())
                 .await
                 .expect_err("a gone endpoint fails");
             assert!(failure.degraded, "HTTP {status} is the GONE verdict");
@@ -397,7 +423,7 @@ mod web_search_tests {
                 StubHttp::replying(status, r#"{"error":{"message":"upstream said no"}}"#),
             );
             let failure = search
-                .search("m", "s", "q")
+                .search("m", "s", "q", &side_attempt())
                 .await
                 .expect_err("a non-2xx fails");
             assert!(
@@ -412,7 +438,7 @@ mod web_search_tests {
         }
         let search = executor(Arc::new(MissingCredentials), StubHttp::replying(200, "{}"));
         let failure = search
-            .search("m", "s", "q")
+            .search("m", "s", "q", &side_attempt())
             .await
             .expect_err("no credential, no search");
         assert!(!failure.degraded);
@@ -435,11 +461,14 @@ mod web_search_tests {
             .await
             .expect("binds loopback listener");
         let addr = listener.local_addr().expect("local addr");
+        let (request_head_tx, request_head_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             if let Ok((mut socket, _)) = listener.accept().await {
                 // Drain the (small) request head so the client's write unblocks.
                 let mut scratch = vec![0u8; 4096];
-                let _ = socket.read(&mut scratch).await;
+                let read = socket.read(&mut scratch).await.unwrap_or(0);
+                let _ =
+                    request_head_tx.send(String::from_utf8_lossy(&scratch[..read]).into_owned());
                 let body = "x".repeat(over);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -456,10 +485,15 @@ mod web_search_tests {
                 &format!("http://{addr}/alpha/search"),
                 &secret(b"TOKEN"),
                 &serde_json::json!({"q": "hi"}),
+                &side_attempt(),
             )
             .await
             .expect("loopback POST succeeds");
         assert_eq!(status, 200);
+        let request_head = request_head_rx.await.expect("captures request head");
+        let lowercase = request_head.to_ascii_lowercase();
+        assert!(lowercase.contains("x-haider-turn: session-9/run-1/1/2\r\n"));
+        assert!(lowercase.contains("x-haider-request-kind: side\r\n"));
         assert_eq!(
             bytes.len(),
             SEARCH_RESPONSE_CAP_BYTES,

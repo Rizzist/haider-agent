@@ -384,6 +384,7 @@ fn restart_detects_a_durable_provider_attempt_without_reconciled_usage() {
     let run_id = RunId::new("budget-restart-unresolved-run");
     let item = CacheRequestAttemptV1 {
         ordinal: 1,
+        correlation: None,
         diagnostic: CacheRequestDiagnosticV1 {
             history_message_count: 1,
             stable_prefix_tokens: 8,

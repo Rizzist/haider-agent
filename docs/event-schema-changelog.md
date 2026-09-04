@@ -226,6 +226,38 @@ surfaces.
   serialize that retained value. Other derived values belong outside the
   `RawEnvelope` on both paths.
 
+### v0.0.970 — provider request-attempt correlation
+
+- New prompt-omitted payload kind `payload:provider_operation_reserved`
+  records `request_kind` for session-owned provider inference that needs a
+  durable turn identity but is not a conversation run. It contributes to the
+  session-monotonic turn ordinal and is deliberately excluded from run-state
+  observation, user hooks, and agent-usage timing. v0.0.970 uses it for
+  `loom.author.draft` with `request_kind: side`. Session forks omit the entire
+  reserved operation run because its correlation facts remain parent-owned.
+- Additive optional field `cache_request_attempt_v1.correlation` records the
+  exact turn-owned HTTP attempt identity: `session_id`, `run_id`, nonzero
+  `turn_ordinal`, nonzero `request_ordinal`, and `request_kind` (`primary`,
+  `side`, or reserved explicit `warmup`). The enclosing legacy `ordinal` and
+  `correlation.request_ordinal` must agree. Older markers omit `correlation`
+  and continue to decode; new writers always include it.
+- New prompt-omitted `item:extension` subkind
+  `provider_request_attempt_v1` carries the same five fields for turn-owned
+  provider HTTP calls that have no prompt-cache diagnostic, including
+  subscription `web_search`, session-owned `loom.author.draft`, Gemini
+  cache-resource operations, and explicit connection prewarm. It commits
+  before network I/O and shares the operation's physical request-ordinal
+  allocator. Prewarm uses `warmup`; Loom, cache, and tool support use `side`.
+- These markers are durable correlation metadata, not provider request-body
+  content. `RawEnvelope.schema_version` remains 1. Readers must preserve an
+  unknown extension subkind and may ignore it; recovery-aware readers that
+  interpret it must reject zero, ambiguous, mismatched, or reused correlated
+  coordinates as store corruption. Recovery tracks the first logical model
+  boundary separately from the maximum physical ordinal so a preceding
+  warmup/cache request cannot make an interrupted first model call reuse an
+  identity; queued retries and manual compaction likewise resume at the
+  validated maximum plus one.
+
 The following payload kinds were present in the AHRB v0.0.969 capture but had
 not all been called out together in this ledger. Their schema status is:
 

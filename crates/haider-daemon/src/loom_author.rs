@@ -13,13 +13,73 @@ use haider_protocol::loom::{
 };
 use haider_protocol::provider::StreamEvent;
 use haider_protocol::session::SessionMetadataV1;
-use haider_provider::{Message, TurnRequest};
+use haider_provider::{Message, ProviderRequestAttemptRecorder, TurnRequest, TurnTraceContext};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 const LOOM_AUTHOR_PROSE_MAX_BYTES: usize = 8 * 1024;
 
 const LOOM_AUTHOR_DRAFT_MAX_BYTES: usize = haider_protocol::loom::LOOM_AUTHOR_TEXT_MAX_BYTES;
 pub(crate) const LOOM_AUTHOR_SESSION_MAX: usize = 64;
+
+/// Durable transport identity allocated by the session actor before the Loom
+/// model request. The optional trace is copied into the prepared adapter wire
+/// so first-byte records use the same journal/header tuple.
+pub(crate) struct LoomProviderRequestContext {
+    pub(crate) attempt: haider_protocol::cache::ProviderRequestAttemptV1,
+    pub(crate) auxiliary_recorder: Arc<dyn ProviderRequestAttemptRecorder>,
+    pub(crate) turn_trace: Option<TurnTraceContext>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct LoomTestProviderRequestRecorder {
+    session_id: haider_protocol::ids::SessionId,
+    run_id: haider_protocol::ids::RunId,
+    next: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl ProviderRequestAttemptRecorder for LoomTestProviderRequestRecorder {
+    async fn record_auxiliary_attempt(
+        &self,
+        request_kind: haider_protocol::cache::ProviderRequestKind,
+    ) -> Result<haider_protocol::cache::ProviderRequestAttemptV1, haider_provider::ProviderError>
+    {
+        let request_ordinal = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(haider_protocol::cache::ProviderRequestAttemptV1 {
+            session_id: self.session_id.clone(),
+            run_id: self.run_id.clone(),
+            turn_ordinal: 1,
+            request_ordinal,
+            request_kind,
+        })
+    }
+}
+
+#[cfg(test)]
+impl LoomProviderRequestContext {
+    pub(crate) fn for_test() -> Self {
+        let session_id = haider_protocol::ids::SessionId::new("loom-author-test-session");
+        let run_id = haider_protocol::ids::RunId::new("loom-author-test-run");
+        Self {
+            attempt: haider_protocol::cache::ProviderRequestAttemptV1 {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                turn_ordinal: 1,
+                request_ordinal: 1,
+                request_kind: haider_protocol::cache::ProviderRequestKind::Side,
+            },
+            auxiliary_recorder: Arc::new(LoomTestProviderRequestRecorder {
+                session_id,
+                run_id,
+                next: std::sync::atomic::AtomicU64::new(2),
+            }),
+            turn_trace: None,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct LoomAuthorSession {
@@ -79,6 +139,7 @@ pub(crate) async fn draft_from_prose(
     agent_types: &[LoomAgentType],
     metadata: &SessionMetadataV1,
     provider_factory: &dyn ProviderFactory,
+    correlation: impl std::future::Future<Output = Result<LoomProviderRequestContext, HaiderError>>,
 ) -> Result<LoomAuthorDraft, HaiderError> {
     validate_prose(prose)?;
     let prose = prose.trim();
@@ -90,6 +151,10 @@ pub(crate) async fn draft_from_prose(
             false,
         ));
     }
+    // Resolve local provider/account state before recording a physical
+    // request attempt. Once the durable marker commits, the next fallible
+    // provider action is the correlated transport open itself.
+    let correlation = correlation.await?;
     let registry = agent_types
         .iter()
         .map(|record| {
@@ -123,11 +188,18 @@ pub(crate) async fn draft_from_prose(
         attachments: Vec::new(),
         cache_metadata: None,
     };
-    let mut stream = resolved
-        .provider
-        .stream_turn(request)
-        .await
-        .map_err(provider_draft_error)?;
+    let mut prepared = resolved.provider.prepare_turn(&request);
+    if let (Some(prepared), Some(trace)) = (prepared.as_mut(), correlation.turn_trace.as_ref()) {
+        prepared.set_turn_trace(trace.clone(), correlation.attempt.request_ordinal);
+    }
+    let mut stream = haider_provider::scope_provider_request_with_recorder(
+        correlation.attempt,
+        resolved.provider.request_metadata_body_support(),
+        correlation.auxiliary_recorder,
+        resolved.provider.stream_prepared_turn(request, prepared),
+    )
+    .await
+    .map_err(provider_draft_error)?;
     let mut output = String::new();
     let mut finished = false;
     while let Some(item) = stream.recv().await {

@@ -271,7 +271,7 @@ def _assert_no_duplicate_provider_request(
     allowed = {1} if shape == "single" else {1, 2}
     counts: dict[int, int] = {}
     for entry in ledger:
-        ordinal = entry.get("logical_ordinal")
+        ordinal = entry.get("request_ordinal")
         if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal not in allowed:
             raise ProofError(f"invalid physical provider ordinal {ordinal!r}")
         counts[ordinal] = counts.get(ordinal, 0) + 1

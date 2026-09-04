@@ -82,7 +82,8 @@ use haider_core::{
 use haider_protocol::agent::Grant;
 use haider_protocol::cache::{
     CacheEpochTransitionReason, CacheEpochTransitionV1, CacheRequestAttemptV1,
-    ProviderViewAttemptV1, ProviderViewBlobV1, ProviderViewLedgerV1,
+    ProviderRequestAttemptV1, ProviderRequestKind, ProviderViewAttemptV1, ProviderViewBlobV1,
+    ProviderViewLedgerV1,
 };
 use haider_protocol::context::{
     ContextCompactionTier, ContextFootprint, ContextFootprintTruth, OutputSavings,
@@ -141,9 +142,9 @@ use haider_protocol::workspace::{WorkspaceEventPayload, WorkspaceUnavailable};
 use haider_protocol::{DeliveryMode, EventPayload};
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, DEEPSEEK_PROVIDER_NAME, Message,
-    OPENAI_OAUTH_PROVIDER_NAME, PromptCacheMetadata, ProviderCredentialSurface, ResolvedAttachment,
-    apply_tool_result_image_budget, canonical_tool_definitions_digest,
-    degrade_tool_result_images_to_placeholders,
+    OPENAI_OAUTH_PROVIDER_NAME, PromptCacheMetadata, ProviderCredentialSurface,
+    ProviderRequestOrdinal, ResolvedAttachment, apply_tool_result_image_budget,
+    canonical_tool_definitions_digest, degrade_tool_result_images_to_placeholders,
 };
 use haider_provider::{Provider, ProviderError, ToolDefinition, TurnRequest};
 use haider_store::{MenuResolutionCommand, MenuResolutionOutcome};
@@ -302,6 +303,7 @@ pub(crate) trait WebSearchExecutor: Send + Sync {
         model: &str,
         session_id: &str,
         query: &str,
+        attempt: &ProviderRequestAttemptV1,
     ) -> Result<String, WebSearchFailure>;
 }
 
@@ -473,6 +475,130 @@ struct DaemonContextCompactor {
     branch_id: Option<BranchId>,
     usage_scope: UsageScope,
     usage_account: Option<haider_protocol::ids::CredentialAlias>,
+    turn_ordinal: u64,
+    request_ordinals: ProviderRequestOrdinal,
+    turn_trace: Option<TurnTraceContext>,
+}
+
+#[derive(Clone)]
+struct DaemonProviderRequestAttemptRecorder {
+    store: HubStoreHandle,
+    run_id: RunId,
+    turn_ordinal: u64,
+    request_ordinals: ProviderRequestOrdinal,
+    turn_trace: Option<TurnTraceContext>,
+    branch_id: Option<BranchId>,
+    agent_id: Option<AgentId>,
+    device_id: DeviceId,
+    event_ids: Arc<EventIdGenerator>,
+}
+
+impl std::fmt::Debug for DaemonProviderRequestAttemptRecorder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DaemonProviderRequestAttemptRecorder")
+            .field("session_id", self.store.session_id())
+            .field("run_id", &self.run_id)
+            .field("turn_ordinal", &self.turn_ordinal)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl haider_provider::ProviderRequestAttemptRecorder for DaemonProviderRequestAttemptRecorder {
+    async fn record_auxiliary_attempt(
+        &self,
+        request_kind: ProviderRequestKind,
+    ) -> Result<ProviderRequestAttemptV1, ProviderError> {
+        if request_kind == ProviderRequestKind::Primary {
+            return Err(ProviderError::new(
+                haider_provider::ProviderErrorKind::Internal,
+                "an auxiliary provider request cannot be classified as primary",
+            ));
+        }
+        let request_ordinal = self.request_ordinals.next()?;
+        let attempt = ProviderRequestAttemptV1 {
+            session_id: self.store.session_id().clone(),
+            run_id: self.run_id.clone(),
+            turn_ordinal: self.turn_ordinal,
+            request_ordinal,
+            request_kind,
+        };
+        if !attempt.coordinates_valid() {
+            return Err(ProviderError::new(
+                haider_provider::ProviderErrorKind::Internal,
+                "turn correlation coordinates are invalid or ambiguous",
+            ));
+        }
+        let item = attempt.extension_item().map_err(|error| {
+            ProviderError::new(
+                haider_provider::ProviderErrorKind::Internal,
+                format!("provider request attempt could not serialize: {error}"),
+            )
+        })?;
+        let item_id = ItemId::new(format!(
+            "provider-request-attempt-{}-{request_ordinal}",
+            self.event_ids.next()
+        ));
+        let mut envelopes = vec![
+            supervisor_envelope(
+                &self.store,
+                &self.device_id,
+                self.branch_id.clone(),
+                Some(self.run_id.clone()),
+                self.event_ids.next(),
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: item_id.clone(),
+                    item: item.clone(),
+                }),
+            ),
+            supervisor_envelope(
+                &self.store,
+                &self.device_id,
+                self.branch_id.clone(),
+                Some(self.run_id.clone()),
+                self.event_ids.next(),
+                EventPayload::Item(ItemEvent::Completed { item_id, item }),
+            ),
+        ]
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            ProviderError::new(
+                haider_provider::ProviderErrorKind::Internal,
+                format!("provider request attempt could not be journaled: {error}"),
+            )
+        })?;
+        for envelope in &mut envelopes {
+            envelope.agent_id = self.agent_id.clone();
+            envelope.render.ui = false;
+        }
+        let started = self
+            .turn_trace
+            .as_ref()
+            .map(TurnTraceContext::now_us_from_accept);
+        StoreHandle::append(&self.store, &mut envelopes)
+            .await
+            .map_err(|error| {
+                ProviderError::new(
+                    haider_provider::ProviderErrorKind::Internal,
+                    format!("provider request attempt could not be journaled: {error}"),
+                )
+            })?;
+        if let Some(trace) = self.turn_trace.as_ref() {
+            trace.register_request(&attempt);
+            if let Some(started) = started {
+                trace.emit(
+                    "request_attempt_commit",
+                    request_ordinal,
+                    0,
+                    started,
+                    trace.now_us_from_accept(),
+                );
+            }
+        }
+        Ok(attempt)
+    }
 }
 
 const COMPACTION_SUMMARY_INSTRUCTION: &str = "Summarize the preceding conversation for lossless continuation. Preserve decisions, constraints, exact identifiers, unresolved work, and tool outcomes. Return only the summary.";
@@ -488,6 +614,51 @@ impl std::fmt::Debug for DaemonContextCompactor {
 }
 
 impl DaemonContextCompactor {
+    fn auxiliary_request_recorder(
+        &self,
+        run_id: &RunId,
+    ) -> Arc<dyn haider_provider::ProviderRequestAttemptRecorder> {
+        Arc::new(DaemonProviderRequestAttemptRecorder {
+            store: self.store.clone(),
+            run_id: run_id.clone(),
+            turn_ordinal: self.turn_ordinal,
+            request_ordinals: self.request_ordinals.clone(),
+            turn_trace: self.turn_trace.clone(),
+            branch_id: self.branch_id.clone(),
+            agent_id: self.agent_id.clone(),
+            device_id: self.device_id.clone(),
+            event_ids: Arc::clone(&self.event_ids),
+        })
+    }
+
+    fn next_request_attempt(
+        &self,
+        run_id: &RunId,
+    ) -> Result<ProviderRequestAttemptV1, HaiderError> {
+        let request_ordinal = self
+            .request_ordinals
+            .next()
+            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+        let attempt = ProviderRequestAttemptV1 {
+            session_id: self.store.session_id().clone(),
+            run_id: run_id.clone(),
+            turn_ordinal: self.turn_ordinal,
+            request_ordinal,
+            request_kind: ProviderRequestKind::Side,
+        };
+        if !attempt.coordinates_valid() {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "turn correlation coordinates are invalid or ambiguous",
+                false,
+            ));
+        }
+        if let Some(trace) = self.turn_trace.as_ref() {
+            trace.register_request(&attempt);
+        }
+        Ok(attempt)
+    }
+
     async fn provider_phase_error(
         &self,
         run_id: &RunId,
@@ -616,11 +787,12 @@ impl DaemonContextCompactor {
     fn cache_request_attempt_envelopes(
         &self,
         run_id: &RunId,
-        ordinal: u64,
+        correlation: &ProviderRequestAttemptV1,
         diagnostic: &haider_protocol::provider::CacheRequestDiagnosticV1,
     ) -> Result<Vec<RawEnvelope>, HaiderError> {
         let item = CacheRequestAttemptV1 {
-            ordinal,
+            ordinal: correlation.request_ordinal,
+            correlation: Some(correlation.clone()),
             diagnostic: diagnostic.clone(),
         }
         .extension_item()
@@ -632,8 +804,9 @@ impl DaemonContextCompactor {
             )
         })?;
         let item_id = ItemId::new(format!(
-            "cache-request-attempt-{}-{ordinal}",
-            self.event_ids.next()
+            "cache-request-attempt-{}-{}",
+            self.event_ids.next(),
+            correlation.request_ordinal,
         ));
         let mut envelopes = vec![
             supervisor_envelope(
@@ -670,26 +843,27 @@ impl DaemonContextCompactor {
     async fn record_request_attempt(
         &self,
         run_id: &RunId,
-        ordinal: u64,
+        correlation: &ProviderRequestAttemptV1,
         provider_view: Option<(ProviderViewLedgerV1, Vec<ProviderViewBlobV1>)>,
         diagnostic: &haider_protocol::provider::CacheRequestDiagnosticV1,
     ) -> Result<(), HaiderError> {
         let Some((ledger, blobs)) = provider_view else {
             let mut envelopes =
-                self.cache_request_attempt_envelopes(run_id, ordinal, diagnostic)?;
+                self.cache_request_attempt_envelopes(run_id, correlation, diagnostic)?;
             return StoreHandle::append(&self.store, &mut envelopes)
                 .await
                 .map(|_| ());
         };
-        let mut envelopes = self.provider_view_attempt_envelopes(run_id, ordinal, &ledger)?;
-        envelopes.extend(self.cache_request_attempt_envelopes(run_id, ordinal, diagnostic)?);
+        let mut envelopes =
+            self.provider_view_attempt_envelopes(run_id, correlation.request_ordinal, &ledger)?;
+        envelopes.extend(self.cache_request_attempt_envelopes(run_id, correlation, diagnostic)?);
         StoreHandle::persist_provider_view_and_append_owned(
             &self.store,
             ProviderViewAppendRequest {
                 session_id: self.store.session_id().clone(),
                 ledger,
                 blobs,
-                attempt_ordinal: ordinal,
+                attempt_ordinal: correlation.request_ordinal,
                 envelopes,
             },
         )
@@ -1342,6 +1516,10 @@ impl ContextCompactor for DaemonContextCompactor {
                 .tools
                 .extend(self.post_compaction_tools.iter().cloned());
         }
+        let replay_correlation = self.next_request_attempt(run_id)?;
+        if let (Some(prepared), Some(trace)) = (prepared.as_mut(), self.turn_trace.as_ref()) {
+            prepared.set_turn_trace(trace.clone(), replay_correlation.request_ordinal);
+        }
         if let Some(rendered) = prepared.as_ref().map(|prepared| prepared.prefix_digests()) {
             prefix_digests = rendered.clone();
             previous_prefix_digests = prepared
@@ -1421,8 +1599,26 @@ impl ContextCompactor for DaemonContextCompactor {
         let mut budget_permit = self
             .admit_budget_request(run_id, &request, projected_input_tokens)
             .await?;
-        self.record_request_attempt(run_id, 1, pending_provider_view, &replay_cache_diagnostic)
-            .await?;
+        let attempt_commit_started = self
+            .turn_trace
+            .as_ref()
+            .map(TurnTraceContext::now_us_from_accept);
+        self.record_request_attempt(
+            run_id,
+            &replay_correlation,
+            pending_provider_view,
+            &replay_cache_diagnostic,
+        )
+        .await?;
+        if let (Some(trace), Some(started)) = (self.turn_trace.as_ref(), attempt_commit_started) {
+            trace.emit(
+                "request_attempt_commit",
+                replay_correlation.request_ordinal,
+                0,
+                started,
+                trace.now_us_from_accept(),
+            );
+        }
         let replay_request_messages = request.messages.clone();
         let (
             mut stream,
@@ -1432,14 +1628,19 @@ impl ContextCompactor for DaemonContextCompactor {
             request_cache_diagnostic,
         ) = match haider_provider::before_provider_request_deadline(
             self.provider_deadline,
-            self.provider.stream_prepared_turn(request, prepared),
+            haider_provider::scope_provider_request_with_recorder(
+                replay_correlation.clone(),
+                self.provider.request_metadata_body_support(),
+                self.auxiliary_request_recorder(run_id),
+                self.provider.stream_prepared_turn(request, prepared),
+            ),
         )
         .await
         {
             Ok(stream) => (
                 stream,
                 replay_request_messages,
-                1_u64,
+                replay_correlation.request_ordinal,
                 cache_metadata.cache_epoch.clone(),
                 replay_cache_diagnostic,
             ),
@@ -1552,11 +1753,37 @@ impl ContextCompactor for DaemonContextCompactor {
                 budget_permit = self
                     .admit_budget_request(run_id, &fallback, fallback_projected_input_tokens)
                     .await?;
-                self.record_request_attempt(run_id, 2, None, &fallback_cache_diagnostic)
-                    .await?;
+                let fallback_correlation = self.next_request_attempt(run_id)?;
+                let attempt_commit_started = self
+                    .turn_trace
+                    .as_ref()
+                    .map(TurnTraceContext::now_us_from_accept);
+                self.record_request_attempt(
+                    run_id,
+                    &fallback_correlation,
+                    None,
+                    &fallback_cache_diagnostic,
+                )
+                .await?;
+                if let (Some(trace), Some(started)) =
+                    (self.turn_trace.as_ref(), attempt_commit_started)
+                {
+                    trace.emit(
+                        "request_attempt_commit",
+                        fallback_correlation.request_ordinal,
+                        0,
+                        started,
+                        trace.now_us_from_accept(),
+                    );
+                }
                 let stream = match haider_provider::before_provider_request_deadline(
                     self.provider_deadline,
-                    self.provider.stream_turn(fallback),
+                    haider_provider::scope_provider_request_with_recorder(
+                        fallback_correlation.clone(),
+                        self.provider.request_metadata_body_support(),
+                        self.auxiliary_request_recorder(run_id),
+                        self.provider.stream_turn(fallback),
+                    ),
                 )
                 .await
                 {
@@ -1570,7 +1797,7 @@ impl ContextCompactor for DaemonContextCompactor {
                 (
                     stream,
                     request_messages,
-                    2_u64,
+                    fallback_correlation.request_ordinal,
                     fallback_cache_epoch,
                     fallback_cache_diagnostic,
                 )
@@ -1937,6 +2164,10 @@ pub struct WorkerToolContext {
     pub metadata: SessionMetadataV1,
     pub store: HubStoreHandle,
     pub run_id: RunId,
+    /// Stable identity allocator shared with primary and compaction requests.
+    pub(crate) turn_ordinal: u64,
+    pub(crate) provider_request_ordinals: ProviderRequestOrdinal,
+    pub(crate) turn_trace: Option<TurnTraceContext>,
     /// Absolute run deadline, derived once from the accepted parent run and
     /// retained across autonomous workflow hops and recovery. Delegation and
     /// remote-command waits only consume its remaining wall time; this clock
@@ -2477,6 +2708,7 @@ impl PendingTurn {
             accepted: AcceptedTurn {
                 session_id: accepted.session_id,
                 run_id: accepted.run_id,
+                turn_ordinal: accepted.turn_ordinal,
                 accepted_seq: accepted.accepted_seq,
                 worker_generation: accepted.worker_generation,
                 branch_id: None,
@@ -2806,6 +3038,7 @@ impl WorkerManagerHandle {
         accepted: AcceptedTurn,
         checkpoint: RequestInputCheckpoint,
         committed_answer: Option<haider_protocol::envelope::RawEnvelope>,
+        provider_request_ordinal_already_made: u64,
     ) -> Result<(), HaiderError> {
         let (completed, response) = oneshot::channel();
         self.send_recovery(PendingTurn {
@@ -2817,7 +3050,7 @@ impl WorkerManagerHandle {
             child_wait: None,
             committed_answer,
             provider_requests_already_made: 0,
-            provider_request_ordinal_already_made: 0,
+            provider_request_ordinal_already_made,
             workflow_continuation: false,
             admission_retry: false,
             recovery_ready: Some(completed),
@@ -2831,6 +3064,7 @@ impl WorkerManagerHandle {
         accepted: AcceptedTurn,
         partial_stream: PartialStreamCheckpoint,
         committed_answer: Option<haider_protocol::envelope::RawEnvelope>,
+        provider_request_ordinal_already_made: u64,
     ) -> Result<(), HaiderError> {
         let (completed, response) = oneshot::channel();
         self.send_recovery(PendingTurn {
@@ -2842,7 +3076,7 @@ impl WorkerManagerHandle {
             child_wait: None,
             committed_answer,
             provider_requests_already_made: 0,
-            provider_request_ordinal_already_made: 0,
+            provider_request_ordinal_already_made,
             workflow_continuation: false,
             admission_retry: false,
             recovery_ready: Some(completed),
@@ -2851,7 +3085,11 @@ impl WorkerManagerHandle {
         response.await.map_err(|_| manager_stopped())?
     }
 
-    pub(crate) async fn recover_queued(&self, accepted: AcceptedTurn) -> Result<(), HaiderError> {
+    pub(crate) async fn recover_queued(
+        &self,
+        accepted: AcceptedTurn,
+        provider_request_ordinal_already_made: u64,
+    ) -> Result<(), HaiderError> {
         let (completed, response) = oneshot::channel();
         self.send_recovery(PendingTurn {
             accepted,
@@ -2862,7 +3100,7 @@ impl WorkerManagerHandle {
             child_wait: None,
             committed_answer: None,
             provider_requests_already_made: 0,
-            provider_request_ordinal_already_made: 0,
+            provider_request_ordinal_already_made,
             workflow_continuation: false,
             admission_retry: false,
             recovery_ready: Some(completed),
@@ -2950,9 +3188,11 @@ impl WorkerManagerHandle {
     pub(crate) async fn recover_retry(
         &self,
         accepted: AcceptedRunRetry,
+        provider_request_ordinal_already_made: u64,
     ) -> Result<(), HaiderError> {
         let (completed, response) = oneshot::channel();
         let mut pending = PendingTurn::retry(accepted);
+        pending.provider_request_ordinal_already_made = provider_request_ordinal_already_made;
         pending.recovery_ready = Some(completed);
         pending.recovering = true;
         self.send_recovery(pending)?;
@@ -2963,6 +3203,7 @@ impl WorkerManagerHandle {
         &self,
         accepted: AcceptedTurn,
         child_wait: ChildWaitCheckpoint,
+        provider_request_ordinal_already_made: u64,
     ) -> Result<(), HaiderError> {
         let (completed, response) = oneshot::channel();
         self.send_recovery(PendingTurn {
@@ -2974,7 +3215,7 @@ impl WorkerManagerHandle {
             child_wait: Some(child_wait),
             committed_answer: None,
             provider_requests_already_made: 0,
-            provider_request_ordinal_already_made: 0,
+            provider_request_ordinal_already_made,
             workflow_continuation: false,
             admission_retry: false,
             recovery_ready: Some(completed),
@@ -5242,9 +5483,20 @@ async fn refill_queued_turns(
         let Some(accepted_seq) = accepted_seq else {
             continue;
         };
+        let turn_ordinal = match store.turn_ordinal(&run_id).await {
+            Ok(Some(turn_ordinal)) if turn_ordinal != 0 => turn_ordinal,
+            Ok(Some(_)) | Ok(None) | Err(_) => {
+                // Keep the durable queue entry eligible for a later repair
+                // scan; never invent an identity that can collide with a
+                // prior run in this session.
+                more = true;
+                continue;
+            }
+        };
         let mut pending = PendingTurn::accepted(AcceptedTurn {
             session_id: store.session_id().clone(),
             run_id,
+            turn_ordinal,
             accepted_seq,
             worker_generation: store.worker_generation(),
             branch_id,
@@ -6004,6 +6256,182 @@ struct DurableCompactionReceipt {
     intent: CompactionIntent,
     branch_id: Option<BranchId>,
     committed: bool,
+    provider_request_ordinal: u64,
+    provider_request_turn_ordinal: Option<u64>,
+}
+
+fn next_compaction_provider_request_ordinal(
+    envelope: &RawEnvelope,
+    item: &TurnItem,
+    run_id: &RunId,
+    previous: u64,
+    previous_turn_ordinal: Option<u64>,
+) -> Result<Option<(u64, Option<u64>)>, HaiderError> {
+    let standalone = ProviderRequestAttemptV1::try_from_extension_item(item).map_err(|error| {
+        HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            format!("manual compaction provider request marker is invalid: {error}"),
+            false,
+        )
+    })?;
+    let cache = CacheRequestAttemptV1::try_from_extension_item(item).map_err(|error| {
+        HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            format!("manual compaction cache request marker is invalid: {error}"),
+            false,
+        )
+    })?;
+    let (ordinal, correlation) = match (standalone, cache) {
+        (Some(attempt), None) => (attempt.request_ordinal, Some(attempt)),
+        (None, Some(attempt)) => (attempt.ordinal, attempt.correlation),
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "manual compaction item has conflicting provider request markers",
+                false,
+            ));
+        }
+    };
+    let invalid = ordinal == 0
+        || ordinal <= previous
+        || correlation.as_ref().is_some_and(|correlation| {
+            correlation.request_ordinal != ordinal
+                || !correlation.coordinates_valid()
+                || correlation.session_id != envelope.session_id
+                || &correlation.run_id != run_id
+                || envelope.run_id.as_ref() != Some(&correlation.run_id)
+                || previous_turn_ordinal
+                    .is_some_and(|turn_ordinal| turn_ordinal != correlation.turn_ordinal)
+        });
+    if invalid {
+        return Err(HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            format!(
+                "manual compaction provider request ordinal {ordinal} is invalid after {previous}"
+            ),
+            false,
+        ));
+    }
+    Ok(Some((
+        ordinal,
+        correlation
+            .map(|correlation| correlation.turn_ordinal)
+            .or(previous_turn_ordinal),
+    )))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod manual_compaction_turnid_tests {
+    use super::*;
+
+    #[test]
+    fn resume_seeds_above_standalone_attempt_after_model_marker() {
+        let session_id = SessionId::new("manual-compaction-turnid-session");
+        let run_id = RunId::new("manual-compaction-turnid-run");
+        let attempt = |request_ordinal, request_kind| ProviderRequestAttemptV1 {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn_ordinal: 4,
+            request_ordinal,
+            request_kind,
+        };
+        let model = CacheRequestAttemptV1 {
+            ordinal: 1,
+            correlation: Some(attempt(1, ProviderRequestKind::Side)),
+            diagnostic: haider_protocol::provider::CacheRequestDiagnosticV1 {
+                history_message_count: 1,
+                stable_prefix_tokens: 1,
+                breakpoint_hashes: Default::default(),
+                cache_domain_hash: None,
+                cache_domain_changed: None,
+                previous_breakpoint: None,
+                prefix_match: haider_protocol::provider::CachePrefixMatchV1::Unavailable,
+                control: haider_protocol::provider::CacheControlObservationV1::NotRequired,
+                cacheable_minimum_tokens: None,
+                reuse_gap_ms: None,
+                rewarm: None,
+                classification: None,
+            },
+        }
+        .extension_item()
+        .expect("model attempt marker");
+        let auxiliary = attempt(2, ProviderRequestKind::Side)
+            .extension_item()
+            .expect("standalone attempt marker");
+        let envelope = |event_id: &str, item: TurnItem| RawEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(event_id),
+            seq: 1,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: Some(run_id.clone()),
+            agent_id: None,
+            device_id: DeviceId::new("manual-compaction-turnid-device"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: false,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: haider_protocol::envelope::RawPayload::from_event(EventPayload::Item(
+                ItemEvent::Completed {
+                    item_id: ItemId::new(event_id),
+                    item,
+                },
+            ))
+            .expect("attempt envelope"),
+        };
+
+        let first = envelope("manual-compaction-model", model.clone());
+        let (seed, turn_ordinal) =
+            next_compaction_provider_request_ordinal(&first, &model, &run_id, 0, None)
+                .expect("valid model marker")
+                .expect("model ordinal");
+        let second = envelope("manual-compaction-auxiliary", auxiliary.clone());
+        let (seed, turn_ordinal) = next_compaction_provider_request_ordinal(
+            &second,
+            &auxiliary,
+            &run_id,
+            seed,
+            turn_ordinal,
+        )
+        .expect("valid standalone marker")
+        .expect("standalone ordinal");
+
+        assert_eq!(seed, 2);
+        assert_eq!(turn_ordinal, Some(4));
+        assert_eq!(
+            ProviderRequestOrdinal::new(seed)
+                .next()
+                .expect("next request ordinal"),
+            3
+        );
+
+        let wrong_turn = ProviderRequestAttemptV1 {
+            turn_ordinal: 5,
+            ..attempt(2, ProviderRequestKind::Side)
+        }
+        .extension_item()
+        .expect("wrong-turn marker");
+        let wrong_envelope = envelope("manual-compaction-wrong-turn", wrong_turn.clone());
+        assert!(
+            next_compaction_provider_request_ordinal(
+                &wrong_envelope,
+                &wrong_turn,
+                &run_id,
+                1,
+                Some(4),
+            )
+            .is_err(),
+            "one manual-compaction run cannot mix turn coordinates"
+        );
+    }
 }
 
 async fn find_compaction_receipt(
@@ -6015,6 +6443,8 @@ async fn find_compaction_receipt(
     let node_id = format!("compaction-node-{operation_id}");
     let mut receipt = None;
     let mut committed = false;
+    let mut provider_request_ordinal = 0_u64;
+    let mut provider_request_turn_ordinal = None;
     let mut cursor = 0;
     loop {
         let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
@@ -6063,6 +6493,22 @@ async fn find_compaction_receipt(
                 EventPayload::NodeCommitted(node) if node.node.as_str() == node_id => {
                     committed = true;
                 }
+                EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                    if let Some((run_id, ..)) = receipt.as_ref()
+                        && envelope.run_id.as_ref() == Some(run_id)
+                        && let Some((ordinal, turn_ordinal)) =
+                            next_compaction_provider_request_ordinal(
+                                &envelope,
+                                &item,
+                                run_id,
+                                provider_request_ordinal,
+                                provider_request_turn_ordinal,
+                            )?
+                    {
+                        provider_request_ordinal = ordinal;
+                        provider_request_turn_ordinal = turn_ordinal;
+                    }
+                }
                 _ => {}
             }
         }
@@ -6075,6 +6521,8 @@ async fn find_compaction_receipt(
             intent,
             branch_id,
             committed,
+            provider_request_ordinal,
+            provider_request_turn_ordinal,
         },
     ))
 }
@@ -6169,9 +6617,9 @@ async fn perform_manual_compaction(
     } else {
         None
     };
+    let durable_run_heads = durable_runs(lease).await?;
     if existing.is_none()
-        && durable_runs(lease)
-            .await?
+        && durable_run_heads
             .iter()
             .any(|(_, state, _, _, _)| !state.is_terminal())
     {
@@ -6264,10 +6712,6 @@ async fn perform_manual_compaction(
         .hub()
         .activate_lockdown_turn(lease.session_id(), &boundary_run_id)
         .map_err(hub_error)?;
-    dependencies
-        .provider_factory
-        .reconcile_cache_scope(lease.session_id(), &resolved.provider_name)
-        .await;
     let workspace_unavailable = crate::workspace::unavailable(Path::new(&metadata.cwd));
     if workspace_unavailable.is_some()
         && let Some(hooks) = lease.hub().hooks().map_err(hub_error)?
@@ -6355,6 +6799,12 @@ async fn perform_manual_compaction(
         )
         .await?;
     prepare_compaction_messages(lease, &mut messages).await?;
+    let provider_request_ordinal_seed = existing
+        .as_ref()
+        .map_or(0, |receipt| receipt.provider_request_ordinal);
+    let provider_request_turn_ordinal = existing
+        .as_ref()
+        .and_then(|receipt| receipt.provider_request_turn_ordinal);
     let (run_id, accepted_seq, intent, covered_message_count) = if let Some(existing) = existing {
         let planned = PromptHistoryCompiler::plan_idle_compaction(
             lease,
@@ -6444,6 +6894,47 @@ async fn perform_manual_compaction(
             planned.covered_message_count,
         )
     };
+    let turn_ordinal = lease.turn_ordinal(&run_id).await?.ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            "manual compaction run has no durable turn ordinal",
+            false,
+        )
+    })?;
+    if provider_request_turn_ordinal
+        .is_some_and(|provider_turn_ordinal| provider_turn_ordinal != turn_ordinal)
+    {
+        return Err(HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            "manual compaction request-attempt turn ordinal disagrees with its durable run",
+            false,
+        ));
+    }
+    let request_ordinals = ProviderRequestOrdinal::new(provider_request_ordinal_seed);
+    let turn_trace = turn_trace_enabled().then(|| {
+        let trace = TurnTraceContext::new(lease.session_id().clone(), run_id.clone(), turn_ordinal);
+        trace.emit("accept", 0, 0, 0, 0);
+        register_turn_trace(lease.session_id().clone(), run_id.clone(), trace.clone());
+        trace
+    });
+    let provider_request_attempt_recorder = Arc::new(DaemonProviderRequestAttemptRecorder {
+        store: lease.clone(),
+        run_id: run_id.clone(),
+        turn_ordinal,
+        request_ordinals: request_ordinals.clone(),
+        turn_trace: turn_trace.clone(),
+        branch_id: branch_id.clone(),
+        agent_id: agent_id.clone(),
+        device_id: device_id.clone(),
+        event_ids: Arc::clone(&event_ids),
+    });
+    haider_provider::scope_auxiliary_provider_request_recorder(
+        provider_request_attempt_recorder,
+        dependencies
+            .provider_factory
+            .reconcile_cache_scope(lease.session_id(), &resolved.provider_name),
+    )
+    .await;
     if covered_message_count == 0 || covered_message_count > messages.len() {
         return Err(HaiderError::new(
             ErrorCode::StoreCorrupt,
@@ -6494,6 +6985,9 @@ async fn perform_manual_compaction(
         branch_id: branch_id.clone(),
         usage_scope,
         usage_account,
+        turn_ordinal,
+        request_ordinals,
+        turn_trace,
     };
     if let Err(error) = compactor
         .compact(ContextCompactionRequest {
@@ -7273,19 +7767,25 @@ async fn start_turn(
         recovering: _,
     } = pending;
     let turn_trace = turn_trace_enabled().then(|| {
-        registered_turn_trace(&accepted.run_id).unwrap_or_else(|| {
+        registered_turn_trace(&accepted.session_id, &accepted.run_id).unwrap_or_else(|| {
             // Recovery and lost-response receipt paths can reach the worker
             // without the live AcceptTurn arm. Anchor them at worker pickup
             // while retaining the same accepted-sequence correlation.
-            let trace = TurnTraceContext::new(haider_core::turn_trace_ordinal(
-                &accepted.session_id,
-                accepted.accepted_seq,
-            ));
+            let trace = TurnTraceContext::new(
+                accepted.session_id.clone(),
+                accepted.run_id.clone(),
+                accepted.turn_ordinal,
+            );
             trace.emit("accept", 0, 0, 0, 0);
-            register_turn_trace(accepted.run_id.clone(), trace.clone());
+            register_turn_trace(
+                accepted.session_id.clone(),
+                accepted.run_id.clone(),
+                trace.clone(),
+            );
             trace
         })
     });
+    let request_ordinals = ProviderRequestOrdinal::new(provider_request_ordinal_already_made);
     let headless = headless_run_context(lease, &accepted.run_id).await?;
     let mut provider_deadline = headless.as_ref().and_then(provider_request_deadline);
     let mut pinned_metadata = metadata.clone();
@@ -7659,10 +8159,24 @@ async fn start_turn(
     // selected pair so switching away deletes the old paid resource before
     // any request is sent on the new provider. Implementations for providers
     // without explicit resources retain the additive no-op default.
-    dependencies
-        .provider_factory
-        .reconcile_cache_scope(lease.session_id(), &resolved.provider_name)
-        .await;
+    let provider_request_attempt_recorder = Arc::new(DaemonProviderRequestAttemptRecorder {
+        store: lease.clone(),
+        run_id: accepted.run_id.clone(),
+        turn_ordinal: accepted.turn_ordinal,
+        request_ordinals: request_ordinals.clone(),
+        turn_trace: turn_trace.clone(),
+        branch_id: accepted.branch_id.clone(),
+        agent_id: agent_id.clone(),
+        device_id: device_id.clone(),
+        event_ids: Arc::clone(&event_ids),
+    });
+    haider_provider::scope_auxiliary_provider_request_recorder(
+        provider_request_attempt_recorder.clone(),
+        dependencies
+            .provider_factory
+            .reconcile_cache_scope(lease.session_id(), &resolved.provider_name),
+    )
+    .await;
     // G1 (L5): a delegation-owned session is a child — its tool pack below
     // excludes the root-only planning surface.
     let handoff_dir = if workspace_unavailable.is_none() {
@@ -7722,14 +8236,88 @@ async fn start_turn(
         )
         .await?;
     }
-    let prewarm = (std::env::var_os("HAIDER_PROVIDER_PREWARM").as_deref()
-        == Some(std::ffi::OsStr::new("1")))
-    .then(|| {
+    let prewarm = if resolved.provider.claim_prewarm() {
+        let request_ordinal = request_ordinals
+            .next()
+            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+        let attempt = ProviderRequestAttemptV1 {
+            session_id: accepted.session_id.clone(),
+            run_id: accepted.run_id.clone(),
+            turn_ordinal: accepted.turn_ordinal,
+            request_ordinal,
+            request_kind: ProviderRequestKind::Warmup,
+        };
+        if !attempt.coordinates_valid() {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "turn correlation coordinates are invalid or ambiguous",
+                false,
+            ));
+        }
+        if let Some(trace) = turn_trace.as_ref() {
+            trace.register_request(&attempt);
+        }
+        let item = attempt.extension_item().map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("provider request attempt could not serialize: {error}"),
+                false,
+            )
+        })?;
+        let item_id = ItemId::new(format!(
+            "provider-request-attempt-{}-{request_ordinal}",
+            event_ids.next()
+        ));
+        let mut envelopes = vec![
+            supervisor_envelope(
+                lease,
+                device_id,
+                accepted.branch_id.clone(),
+                Some(accepted.run_id.clone()),
+                event_ids.next(),
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: item_id.clone(),
+                    item: item.clone(),
+                }),
+            )?,
+            supervisor_envelope(
+                lease,
+                device_id,
+                accepted.branch_id.clone(),
+                Some(accepted.run_id.clone()),
+                event_ids.next(),
+                EventPayload::Item(ItemEvent::Completed { item_id, item }),
+            )?,
+        ];
+        for envelope in &mut envelopes {
+            envelope.agent_id = agent_id.clone();
+            envelope.render.ui = false;
+        }
+        let started = turn_trace
+            .as_ref()
+            .map(TurnTraceContext::now_us_from_accept);
+        StoreHandle::append(lease, &mut envelopes).await?;
+        if let (Some(trace), Some(started)) = (turn_trace.as_ref(), started) {
+            trace.emit(
+                "request_attempt_commit",
+                request_ordinal,
+                0,
+                started,
+                trace.now_us_from_accept(),
+            );
+        }
         let provider = Arc::clone(&resolved.provider);
-        tokio::spawn(async move {
-            provider.prewarm().await;
-        })
-    });
+        Some(tokio::spawn(async move {
+            haider_provider::scope_provider_request(
+                attempt,
+                haider_provider::RequestMetadataBodySupport::Unsupported,
+                provider.prewarm(),
+            )
+            .await;
+        }))
+    } else {
+        None
+    };
     let prompt_compile_started = Instant::now();
     let prompt_run_id = prompt_run_id.as_ref().unwrap_or(&accepted.run_id);
     let mut compiled = lease
@@ -7902,6 +8490,9 @@ async fn start_turn(
                     metadata: metadata.clone(),
                     store: lease.clone(),
                     run_id: accepted.run_id.clone(),
+                    turn_ordinal: accepted.turn_ordinal,
+                    provider_request_ordinals: request_ordinals.clone(),
+                    turn_trace: turn_trace.clone(),
                     run_deadline: provider_deadline,
                     branch_id: accepted.branch_id.clone(),
                     device_id: device_id.clone(),
@@ -7980,7 +8571,7 @@ async fn start_turn(
         lease.worker_generation(),
     )
     .with_event_ids(Arc::clone(&event_ids));
-    config.turn_trace = turn_trace;
+    config.turn_trace = turn_trace.clone();
     config.provider_deadline = provider_deadline;
     let provider_request_state = provider_derived_request_state(
         &resolved.provider_name,
@@ -8002,6 +8593,9 @@ async fn start_turn(
         haider_core::InteractionResolutionPolicy::new(metadata.interaction_mode);
     config.provider_requests_already_made = provider_requests_already_made;
     config.provider_request_ordinal_already_made = provider_request_ordinal_already_made;
+    config.turn_ordinal = accepted.turn_ordinal;
+    config.provider_request_ordinals = Some(request_ordinals.clone());
+    config.provider_request_attempt_recorder = Some(provider_request_attempt_recorder.clone());
     config.recovery_request_local_usage = admission_retry;
     if let Some(limit) = dependencies
         .provider_factory
@@ -8175,6 +8769,9 @@ async fn start_turn(
         branch_id: accepted.branch_id.clone(),
         usage_scope: config.usage_scope.clone(),
         usage_account: config.usage_account.clone(),
+        turn_ordinal: accepted.turn_ordinal,
+        request_ordinals: request_ordinals.clone(),
+        turn_trace: turn_trace.clone(),
     }));
     config.finalization_guard = Some(run_boundary_guard.clone());
     config.provider_deadline_guard = Some(run_boundary_guard.clone());
@@ -11786,6 +12383,99 @@ mod manager_law_tests {
         assert_ne!(first, second);
     }
 
+    #[tokio::test]
+    async fn queued_refill_restores_the_durable_session_turn_ordinal() {
+        let root = tempfile::tempdir().expect("temp store");
+        let (store, hub) = crate::session_hub::open_retention_test_hub(root.path())
+            .await
+            .expect("store");
+        let session_id = SessionId::new("queued-turnid-session");
+        let device_id = DeviceId::new("queued-turnid-device");
+        hub.create_internal_session(haider_core::SessionCreateCommand {
+            command_id: "queued-turnid-create".into(),
+            request_digest: "queued-turnid-create-digest".into(),
+            request_json: "{}".into(),
+            session_id: session_id.clone(),
+            cwd: std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+                .expect("canonical cwd")
+                .to_string_lossy()
+                .into_owned(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new("queued-turnid-created"),
+            device_id: device_id.clone(),
+        })
+        .await
+        .expect("session");
+        let first = RunId::new("queued-turnid-run-1");
+        let second = RunId::new("queued-turnid-run-2");
+        store
+            .accept_turn(haider_core::TurnAcceptCommand {
+                command_id: "queued-turnid-accept-1".into(),
+                request_digest: "queued-turnid-accept-1-digest".into(),
+                request_json: r#"{"turn":1}"#.into(),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                run_id: first.clone(),
+                agent_id: None,
+                branch_id: None,
+                text: "first".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Queue,
+                queued_event_id: EventId::new("queued-turnid-queued-1"),
+                user_event_id: EventId::new("queued-turnid-user-1"),
+                active_event_id: EventId::new("queued-turnid-active-1"),
+                device_id: device_id.clone(),
+            })
+            .await
+            .expect("accept first turn");
+        let accepted = store
+            .accept_turn(haider_core::TurnAcceptCommand {
+                command_id: "queued-turnid-accept-2".into(),
+                request_digest: "queued-turnid-accept-2-digest".into(),
+                request_json: r#"{"turn":2}"#.into(),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                run_id: second.clone(),
+                agent_id: None,
+                branch_id: None,
+                text: "second".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Queue,
+                queued_event_id: EventId::new("queued-turnid-queued-2"),
+                user_event_id: EventId::new("queued-turnid-user-2"),
+                active_event_id: EventId::new("queued-turnid-active-2"),
+                device_id: device_id.clone(),
+            })
+            .await
+            .expect("accept second turn");
+        let accepted = match accepted {
+            haider_core::TurnAcceptOutcome::Committed { accepted, .. }
+            | haider_core::TurnAcceptOutcome::IdempotentReplay { accepted } => accepted,
+        };
+        assert_eq!(accepted.turn_ordinal, 2);
+        let lease = hub
+            .acquire_worker_lease(session_id.clone())
+            .await
+            .expect("worker lease");
+
+        let mut queue = VecDeque::new();
+        assert!(!refill_queued_turns(&lease, &mut queue, Some(&first)).await);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].accepted.run_id, second);
+        assert_eq!(queue[0].accepted.turn_ordinal, 2);
+
+        drop(lease);
+        hub.shutdown().await.expect("hub shutdown");
+        store.close().await.expect("store close");
+    }
+
     #[test]
     fn recurring_autonomous_workflow_maps_to_a_top_level_typed_error() {
         let error = workflow_unfinished_error(&GraphId::new("graph-typed"), "digest-typed");
@@ -11895,6 +12585,7 @@ mod manager_law_tests {
             .submit(AcceptedTurn {
                 session_id: SessionId::new("worker-retirement-recreation"),
                 run_id: RunId::new("worker-retirement-racing-submit"),
+                turn_ordinal: 1,
                 accepted_seq: 1,
                 worker_generation: store.worker_generation(),
                 branch_id: None,
@@ -14301,6 +14992,9 @@ async fn create_broker_tool_dispatcher(
     Ok(Some(Arc::new(BrokerToolDispatcher {
         broker: Mutex::new(Some(broker)),
         web_search: context.web_search.clone(),
+        turn_ordinal: context.turn_ordinal,
+        provider_request_ordinals: context.provider_request_ordinals,
+        turn_trace: context.turn_trace,
         computer,
         mobile,
         screenshot_redaction,
@@ -14403,6 +15097,9 @@ pub(crate) fn effective_permission_defaults(
 struct BrokerToolDispatcher {
     broker: Mutex<Option<EffectBroker>>,
     web_search: Option<Arc<dyn WebSearchExecutor>>,
+    turn_ordinal: u64,
+    provider_request_ordinals: ProviderRequestOrdinal,
+    turn_trace: Option<TurnTraceContext>,
     computer: Arc<dyn ComputerBackend>,
     mobile: Arc<dyn MobileBackend>,
     screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
@@ -14759,6 +15456,84 @@ fn typed_workflow_coordinates_match(
 mod typed_workflow_boundary_tests;
 
 impl BrokerToolDispatcher {
+    async fn record_side_request_attempt(
+        &self,
+        run_id: &RunId,
+    ) -> Result<ProviderRequestAttemptV1, HaiderError> {
+        let request_ordinal = self
+            .provider_request_ordinals
+            .next()
+            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+        let attempt = ProviderRequestAttemptV1 {
+            session_id: self.session_id.clone(),
+            run_id: run_id.clone(),
+            turn_ordinal: self.turn_ordinal,
+            request_ordinal,
+            request_kind: ProviderRequestKind::Side,
+        };
+        if !attempt.coordinates_valid() {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "turn correlation coordinates are invalid or ambiguous",
+                false,
+            ));
+        }
+        if let Some(trace) = self.turn_trace.as_ref() {
+            trace.register_request(&attempt);
+        }
+        let item = attempt.extension_item().map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("provider request attempt could not serialize: {error}"),
+                false,
+            )
+        })?;
+        let item_id = ItemId::new(format!(
+            "provider-request-attempt-{}-{request_ordinal}",
+            self.output.event_ids.next()
+        ));
+        let mut envelopes = vec![
+            supervisor_envelope(
+                &self.output.store,
+                &self.output.device_id,
+                self.branch_id.clone(),
+                Some(run_id.clone()),
+                self.output.event_ids.next(),
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: item_id.clone(),
+                    item: item.clone(),
+                }),
+            )?,
+            supervisor_envelope(
+                &self.output.store,
+                &self.output.device_id,
+                self.branch_id.clone(),
+                Some(run_id.clone()),
+                self.output.event_ids.next(),
+                EventPayload::Item(ItemEvent::Completed { item_id, item }),
+            )?,
+        ];
+        for envelope in &mut envelopes {
+            envelope.agent_id = self.parent_agent_id.clone();
+            envelope.render.ui = false;
+        }
+        let started = self
+            .turn_trace
+            .as_ref()
+            .map(TurnTraceContext::now_us_from_accept);
+        StoreHandle::append(&self.output.store, &mut envelopes).await?;
+        if let (Some(trace), Some(started)) = (self.turn_trace.as_ref(), started) {
+            trace.emit(
+                "request_attempt_commit",
+                request_ordinal,
+                0,
+                started,
+                trace.now_us_from_accept(),
+            );
+        }
+        Ok(attempt)
+    }
+
     async fn typed_workflow_binding_is_current(
         &self,
         binding: &TypedWorkflowExecutionBinding,
@@ -18178,8 +18953,14 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         presentation: None,
                     }),
                     Some(executor) => {
+                        let attempt = self.record_side_request_attempt(run_id).await?;
                         match executor
-                            .search(&self.metadata.model, self.session_id.as_str(), &query)
+                            .search(
+                                &self.metadata.model,
+                                self.session_id.as_str(),
+                                &query,
+                                &attempt,
+                            )
                             .await
                         {
                             Ok(text) => {

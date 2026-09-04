@@ -1128,7 +1128,7 @@ async fn recovery_rereads_and_journals_a_fresh_same_run_fact_on_digest_change() 
         .expect("recover work");
     assert_eq!(work.len(), 1);
     let accepted = match work.pop().expect("queued work") {
-        RecoveredWork::Queued(accepted) => accepted,
+        RecoveredWork::Queued(recovered) => recovered,
         RecoveredWork::Retry(_)
         | RecoveredWork::Checkpoint(_)
         | RecoveredWork::PartialStream(_)
@@ -1167,7 +1167,7 @@ async fn recovery_rereads_and_journals_a_fresh_same_run_fact_on_digest_change() 
     hub.install_worker_manager(handle.clone())
         .expect("install manager");
     handle
-        .recover_queued(accepted)
+        .recover_queued(accepted.accepted, accepted.provider_request_ordinal)
         .await
         .expect("resume recovery");
     wait_for_terminal(&recovered, &session_id, &run_id, Duration::from_secs(5)).await;
