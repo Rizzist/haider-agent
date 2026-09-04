@@ -33,7 +33,9 @@ use haider_protocol::session::{
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep, ProviderError};
 use haider_rpc::{
-    AttachMode, Capability, CommandId, RequestBody, RequestId, ResponseBody, WireFrame,
+    AttachMode, Capability, CommandId, ModelInventoryAuthorityWire, ProviderApiFamilyWire,
+    ProviderAvailabilityWire, ProviderSummaryWire, ProviderTrustWire, RequestBody, RequestId,
+    ResponseBody, WireFrame,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -170,6 +172,29 @@ impl PairSwitchWorld {
     /// session created on the (`fake-a`, `model-a`) pair.
     async fn boot(prefix: &str, fake_a: Arc<FakeProvider>, fake_b: Arc<FakeProvider>) -> Self {
         Self::boot_with_fallback(prefix, fake_a, fake_b, false).await
+    }
+
+    async fn boot_with_catalog(
+        prefix: &str,
+        fake_a: Arc<FakeProvider>,
+        fake_b: Arc<FakeProvider>,
+        providers: Vec<ProviderSummaryWire>,
+    ) -> Self {
+        let world = Self::boot(prefix, fake_a, fake_b).await;
+        world
+            .hub
+            .install_accounts(crate::accounts::AccountsFacade {
+                login: None,
+                oauth: None,
+                snapshot: Arc::new(Mutex::new(Vec::new())),
+                management: crate::accounts::ManagementSnapshot::new(1, Vec::new(), providers),
+                vault_supported: false,
+                discovery_disabled: true,
+                device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(true),
+                vault: None,
+            })
+            .expect("install fixture model catalog");
+        world
     }
 
     async fn boot_with_fallback(
@@ -492,6 +517,27 @@ fn text_turn(text: &str) -> Vec<FakeStep> {
             reason: FinishReason::EndTurn,
         },
     ]
+}
+
+fn model_summary(provider: &str, models: &[&str]) -> ProviderSummaryWire {
+    ProviderSummaryWire {
+        provider: provider.to_owned(),
+        api_family: ProviderApiFamilyWire::OpenAiResponses,
+        endpoint: None,
+        response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
+        models: models.iter().map(|model| (*model).to_owned()).collect(),
+        model_details: Vec::new(),
+        inventory_fetched_at_ms: None,
+        inventory_authority: ModelInventoryAuthorityWire::Authoritative,
+        auth_methods: Vec::new(),
+        availability: ProviderAvailabilityWire::Available,
+        availability_reason: None,
+        default_model: models.first().map(|model| (*model).to_owned()),
+        enabled: true,
+        trust: ProviderTrustWire::Full,
+    }
 }
 
 /// ITEM #3 strand regression: `start_turn` must resolve the immutable Loom
@@ -1063,6 +1109,93 @@ async fn explicit_selector_spawns_the_child_cross_provider() {
         .expect("parent typed metadata");
     assert_eq!(parent_metadata.provider, "fake-a", "the parent never moves");
     assert_eq!(parent_metadata.model, "model-a");
+
+    world.shutdown().await;
+}
+
+/// OWNER REGRESSION: a separator/case-fuzzy bare selector resolves against
+/// the fixture inventory before establishment, and every durable/runtime
+/// child coordinate receives the catalog's canonical slug.
+#[tokio::test]
+async fn fuzzy_bare_selector_spawns_on_the_single_canonical_catalog_row() {
+    let fake_a = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "fuzzy-spawn".into(),
+            name: "spawn_subagent".into(),
+            args: serde_json::json!({
+                "task": "fuzzy",
+                "prompt": "run on the catalog match",
+                "model": "GLM4.7 flashx",
+            }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "fuzzy-spawn".into(),
+        },
+        FakeStep::EmitText {
+            text: "parent merged".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let fake_b = Arc::new(FakeProvider::new(text_turn("child report")));
+    let world = PairSwitchWorld::boot_with_catalog(
+        "modelcat-fuzzy",
+        fake_a.clone(),
+        fake_b.clone(),
+        vec![
+            model_summary("fake-a", &["model-a"]),
+            model_summary("fake-b", &["glm-4.7-flashx"]),
+        ],
+    )
+    .await;
+
+    world.run_turn("modelcat-fuzzy-turn", "delegate").await;
+
+    let b_requests = fake_b.requests();
+    assert_eq!(b_requests.len(), 1, "exactly one child request uses B");
+    assert_eq!(b_requests[0].model, "glm-4.7-flashx");
+    assert!(
+        fake_a
+            .requests()
+            .iter()
+            .all(|request| request.model == "model-a")
+    );
+
+    let events = world
+        .store
+        .read(&world.session_id, 0, 1024)
+        .await
+        .expect("read parent journal");
+    let manifest = events
+        .iter()
+        .find_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::AgentSpawned(manifest)) => Some(manifest),
+            _ => None,
+        })
+        .expect("spawn manifest");
+    assert_eq!(manifest.model_profile, "glm-4.7-flashx");
+    assert_eq!(manifest.provider(), Some("fake-b"));
+    let child_session = manifest
+        .coordinates
+        .as_ref()
+        .and_then(|coordinates| coordinates.get("child_session_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(|id| SessionId::new(id.to_owned()))
+        .expect("child session coordinates");
+    let child = world
+        .store
+        .session_metadata(&child_session)
+        .await
+        .expect("child metadata read")
+        .expect("child metadata");
+    assert_eq!(
+        (child.provider.as_str(), child.model.as_str()),
+        ("fake-b", "glm-4.7-flashx")
+    );
 
     world.shutdown().await;
 }

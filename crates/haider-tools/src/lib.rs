@@ -15,6 +15,7 @@ mod error;
 mod filesystem;
 mod graph_evidence;
 mod ledger;
+mod list_models;
 mod message_subagent;
 mod mobile;
 mod monitor;
@@ -79,6 +80,9 @@ pub use haider_protocol::mobile::{
     SmsMessage,
 };
 pub use ledger::{ChangeLedger, ChangeLedgerSink, FsWriteRecord, TurnChanges};
+pub use list_models::{
+    LIST_MODELS_FILTER_MAX_BYTES, LIST_MODELS_ROW_CAP, ListModels, list_models_manifest,
+};
 pub use message_subagent::{MessageSubagent, message_subagent_manifest};
 pub use mobile::{
     FakeMobileBackend, MobileBackend, MobileCancelToken, MobileError, MobileOperation,

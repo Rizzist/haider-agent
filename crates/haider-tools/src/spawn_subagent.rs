@@ -138,7 +138,7 @@ pub fn spawn_subagent_manifest() -> ToolManifest {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_SELECTOR_BYTES,
-                    "description": "Optional model for the child; omitted, the child inherits this session's current model"
+                    "description": "Optional model for the child; omitted, the child inherits this session's current model. A bare selector matches case-insensitively and ignores '-', '_', '.', and whitespace; literal exact matches win. Call list_models to inspect valid model/provider pairs."
                 },
                 "provider": {
                     "type": "string",

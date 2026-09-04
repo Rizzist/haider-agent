@@ -11146,6 +11146,7 @@ impl HubConnection {
                 provider,
                 model,
                 inventory_age_ms,
+                ..
             } => (
                 haider_rpc::ERROR_CODE_MODEL_UNKNOWN,
                 Some(ErrorData::ModelUnknown {
