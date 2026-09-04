@@ -119,6 +119,7 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
     assert!(advertised.contains(&"computer"));
     assert!(advertised.contains(&"mobile"));
     assert!(advertised.contains(&"monitor"));
+    assert!(advertised.contains(&"list_models"));
     assert!(advertised.contains(&"peer_list"));
     assert!(advertised.contains(&"peer_send"));
     assert!(!advertised.contains(&"exec"));
@@ -163,6 +164,10 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
     assert_eq!(
         registered_tool_route("monitor"),
         Some(RegisteredToolRoute::Monitor)
+    );
+    assert_eq!(
+        registered_tool_route("list_models"),
+        Some(RegisteredToolRoute::ListModels)
     );
     assert_eq!(
         registered_tool_route("peer_list"),
@@ -761,6 +766,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             "web_search",
             "computer",
             "monitor",
+            "list_models",
             "peer_list",
             "peer_send",
             "ssh_list",
@@ -1208,6 +1214,7 @@ fn every_advertised_tool_is_manual_described_and_wire_is_description_free() {
         "computer(",
         "todo_write(",
         "monitor(",
+        "list_models(",
     ] {
         assert!(manual.contains(signature), "manual missing `{signature}`");
     }
@@ -1240,20 +1247,20 @@ fn every_advertised_tool_is_manual_described_and_wire_is_description_free() {
 /// instruct pipe stops being a material (at least 30%) net reduction.
 #[test]
 fn instruct_pipe_shrinks_the_advertised_wire_pack() {
-    const EXPECTED_REGISTERED_TOOLS: usize = 26;
-    const EXPECTED_ADVERTISED_TOOLS: usize = 23;
+    const EXPECTED_REGISTERED_TOOLS: usize = 27;
+    const EXPECTED_ADVERTISED_TOOLS: usize = 24;
     // The full-prefix comparison deliberately includes the platform-specific
     // computer manifest description. Linux documents X11/Wayland (+49 bytes
     // over macOS), while Windows is one byte shorter than macOS.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 17_565;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_105;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 17_516;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_056;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 17_515;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_055;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 17_510;
-    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 11_812;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_050;
+    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 12_122;
 
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let stubbed =
