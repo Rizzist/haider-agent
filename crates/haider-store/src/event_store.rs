@@ -13474,12 +13474,20 @@ fn validate_checkpoint_method(method: &str) -> StoreResult<()> {
 }
 
 fn validate_monitor_control_method(method: &str) -> StoreResult<()> {
-    if matches!(method, "monitor.register" | "monitor.remove") {
+    if matches!(
+        method,
+        "monitor.register"
+            | "monitor.update"
+            | "monitor.pause"
+            | "monitor.resume"
+            | "monitor.trigger"
+            | "monitor.remove"
+    ) {
         Ok(())
     } else {
         Err(store_error(
             ErrorCode::InvalidArgument,
-            "monitor control receipts accept only monitor.register or monitor.remove",
+            "unsupported monitor control receipt method",
             false,
         ))
     }

@@ -186,6 +186,22 @@ surfaces.
 
 ### v0.0.970 — retained terminal projection and replay law
 
+- New additive prompt-omitted monitor journal kinds:
+  `monitor_registered`, `monitor_removed`, `monitor_tool_receipt`,
+  `monitor_client_receipt`, `monitor_report_pending`, and
+  `monitor_report_delivered`. Registrations add daemon-owned
+  process/file/poll/timer/CLI source configuration and runtime fences; pending
+  reports retain bounded typed source events, occurrence, omission counts,
+  and the exact follow-up action. Raw-envelope readers must preserve unknown
+  monitor kinds even when they do not project the monitor subsystem.
+- Additive client wire surface: `monitor.mutate`, negotiated independently as
+  `monitor_mutate_v1`, supplies receipt-backed update/pause/resume/trigger
+  controls; monitor rows add defaulted state,
+  last-event/fire-count/next-fire fields and a source summary; process and CLI
+  delivery payloads add structured/terminal/exit-code detail; timer payloads
+  add a tick counter; and `cli` joins the source-kind and availability unions.
+  `SCHEMA_VERSION` remains 1 because these are additive kinds and fields.
+
 - Additive durable terminal fields: the terminal `payload:run_state` now
   retains `terminal_kind` in the journal. Failure, budget, timeout, and
   provider-error terminals also retain `error_code`; success and ordinary
@@ -270,3 +286,19 @@ not all been called out together in this ledger. Their schema status is:
 - No `RawEnvelope`, automation event kind, or `schema_version` changed. This
   entry records an additive RPC request field and the explicit summary-field
   semantic correction above.
+
+### v0.0.970 — model catalog and selector guidance
+
+- New effectless `list_models` agent tool. Its bounded result projects the
+  daemon's already-discovered provider summaries and model-detail rows; it
+  does not refresh inventory or perform a network request. The tool result is
+  retained and replayed under the existing `payload:tool_result` contract.
+- Additive `suggestions` array at
+  `payload:tool_result.preview.error.details.suggestions` for typed
+  `spawn_subagent` selector refusals. The daemon ranks and caps these catalog
+  rows before committing the tool result. Existing `kind`, `model`,
+  `provider`, `candidates`, and `inventory_age` fields keep their meanings;
+  the refusal error codes are unchanged.
+- Replay must emit the retained tool-result preview byte-for-byte. Suggestions
+  are never recomputed or decorated during replay. `SCHEMA_VERSION` remains 1
+  because this is an additive nested field on an existing payload kind.

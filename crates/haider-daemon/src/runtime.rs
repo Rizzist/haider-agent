@@ -1819,7 +1819,11 @@ impl ConnectionRuntime {
                     idle_linger_deadline = None;
                     let attached_clients = self.connections.len();
                     if attached_clients == 0 && !idle_waiting_for_durable_quiescence {
-                        match context.hub.daemon_is_durably_quiescent().await {
+                        match context
+                            .hub
+                            .daemon_is_durably_quiescent_with_monitors()
+                            .await
+                        {
                             Ok(true) => {
                                 eprintln!(
                                     "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_vanished attached_clients=0 durable_quiescent=true decision=shutdown"
@@ -1873,7 +1877,11 @@ impl ConnectionRuntime {
                         if tokio::time::Instant::now() >= deadline
                             && !idle_waiting_for_durable_quiescence
                         {
-                            match context.hub.daemon_is_durably_quiescent().await {
+                            match context
+                                .hub
+                                .daemon_is_durably_quiescent_with_monitors()
+                                .await
+                            {
                                 Ok(true) => {
                                     eprintln!(
                                         "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_vanished attached_clients=0 durable_quiescent=true decision=shutdown idle_linger_ms={}",

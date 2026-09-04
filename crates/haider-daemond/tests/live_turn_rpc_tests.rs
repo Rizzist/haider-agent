@@ -5552,6 +5552,8 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
             "computer",
             // §E: effect-free session monitor registry administration.
             "monitor",
+            // v0.0.970 modelcat: effect-free cached model/provider inventory.
+            "list_models",
             // 965: peer discovery/messaging and SSH inventory/execution are
             // canonical registry entries with their own typed effects.
             "peer_list",
@@ -6937,7 +6939,9 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             run_state: Some(haider_rpc::ObserveRunStateWire::Idle),
             run_id: None,
             seen_at_ms: None,
-            last_activity_ms: None,
+            // Session-list recency is durable from creation onward; a fresh
+            // session's activity coordinate is its creation timestamp.
+            last_activity_ms: Some(metadata.created_at_ms),
             waiting_why: None,
             needs_input: None,
             metadata: Some(metadata.clone()),

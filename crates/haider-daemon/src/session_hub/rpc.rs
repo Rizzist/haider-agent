@@ -5744,6 +5744,73 @@ impl HubConnection {
                 )
                 .await
             }
+            RequestBody::MonitorMutate {
+                command_id,
+                session_id,
+                worker_generation,
+                mutation,
+            } => {
+                if authorize(&self.capabilities, Operation::Control).is_err() {
+                    return self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::MonitorMutate {
+                            receipt: crate::monitor::monitor_mutate_rejected(
+                                command_id,
+                                session_id,
+                                self.hub.worker_generation(),
+                                haider_rpc::MonitorControlRejectionWire::CapabilityDenied {
+                                    required: Capability::Control,
+                                },
+                            ),
+                        },
+                    });
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::MonitorMutate {
+                            receipt: crate::monitor::monitor_mutate_rejected(
+                                command_id,
+                                session_id,
+                                self.hub.worker_generation(),
+                                haider_rpc::MonitorControlRejectionWire::ControlAttachmentRequired,
+                            ),
+                        },
+                    });
+                }
+                let operation = crate::monitor::monitor_mutation_name(&mutation);
+                if let Some(provider) = self.session_lockdown_provider(&session_id).await? {
+                    let reason = "monitor mutation is outside the fixed lockdown envelope";
+                    self.journal_session_lockdown_refusal(
+                        &session_id,
+                        command_id.as_str(),
+                        &provider,
+                        operation,
+                        reason,
+                    )
+                    .await?;
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_PERMISSION_DENIED,
+                        &format!(
+                            "RefusedByLockdown {{ tool: {operation}, reason: provider {provider} is in lockdown mode }}"
+                        ),
+                        false,
+                        Some(lockdown_refusal_error_data(&provider, operation, reason)),
+                    );
+                }
+                self.monitor_mutate(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    mutation,
+                )
+                .await
+            }
             RequestBody::MonitorWatch {
                 session_id,
                 after_cursor,
@@ -11253,6 +11320,7 @@ impl HubConnection {
                 provider,
                 model,
                 inventory_age_ms,
+                ..
             } => (
                 haider_rpc::ERROR_CODE_MODEL_UNKNOWN,
                 Some(ErrorData::ModelUnknown {
@@ -15938,6 +16006,31 @@ impl HubConnection {
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::MonitorRemove { receipt },
+        })
+    }
+
+    async fn monitor_mutate(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        mutation: haider_rpc::MonitorMutationWire,
+    ) -> Result<(), SessionHubError> {
+        let receipt = self
+            .hub
+            .inner_monitor()
+            .client_mutate(
+                &self.hub,
+                command_id,
+                session_id,
+                worker_generation,
+                mutation,
+            )
+            .await;
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::MonitorMutate { receipt },
         })
     }
 

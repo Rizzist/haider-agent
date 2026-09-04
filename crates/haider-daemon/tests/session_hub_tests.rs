@@ -6617,7 +6617,98 @@ async fn control_requires_a_control_attachment_to_the_target_session() {
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
 }
+#[tokio::test]
+async fn monitor_mutation_rpc_enforces_capability_and_control_attachment() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("monitor-rpc-control");
+    create_typed_session(&store, &session_id, "fake").await;
+    let generation = store.worker_generation();
 
+    let view_sink = Arc::new(CollectSink::default());
+    let view_connection = hub
+        .open_connection(
+            CapabilitySet::from([Capability::View]),
+            view_sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("view connection");
+    view_connection
+        .request(
+            RequestId::new("monitor-mutate-view-only"),
+            RequestBody::MonitorMutate {
+                command_id: CommandId::new("monitor-mutate-view-only"),
+                session_id: session_id.clone(),
+                worker_generation: generation,
+                mutation: haider_rpc::MonitorMutationWire::Pause {
+                    monitor_id: "monitor-not-authorized".into(),
+                },
+            },
+        )
+        .await
+        .expect("view-only monitor mutation routes");
+    assert!(matches!(
+        view_sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::MonitorMutate {
+                receipt: haider_rpc::MonitorMutateReceiptWire {
+                    outcome: haider_rpc::MonitorMutateOutcomeWire::Rejected {
+                        rejection: haider_rpc::MonitorControlRejectionWire::CapabilityDenied {
+                            required: Capability::Control
+                        }
+                    },
+                    ..
+                }
+            },
+            ..
+        }
+    ));
+    view_connection
+        .close()
+        .await
+        .expect("view connection closes");
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("control connection");
+    connection
+        .request(
+            RequestId::new("monitor-mutate-unattached"),
+            RequestBody::MonitorMutate {
+                command_id: CommandId::new("monitor-mutate-unattached"),
+                session_id: session_id.clone(),
+                worker_generation: generation,
+                mutation: haider_rpc::MonitorMutationWire::Pause {
+                    monitor_id: "monitor-not-attached".into(),
+                },
+            },
+        )
+        .await
+        .expect("unattached monitor mutation routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::MonitorMutate {
+                receipt: haider_rpc::MonitorMutateReceiptWire {
+                    outcome: haider_rpc::MonitorMutateOutcomeWire::Rejected {
+                        rejection:
+                            haider_rpc::MonitorControlRejectionWire::ControlAttachmentRequired
+                    },
+                    ..
+                }
+            },
+            ..
+        }
+    ));
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
 /// MUTATION CHECK: remove/no-op `SessionHub::begin_draining`'s atomic store.
 /// Expected failure: this already-open connection admits the list request
 /// instead of returning `draining`.

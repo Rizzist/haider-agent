@@ -59,8 +59,12 @@ fn status_text(model: &AppModel) -> String {
         .collect()
 }
 
+// 970 monitorui: the shells/monitors counts LEFT the status strip for the
+// band's task line, so this pin inverted — it now asserts the strip stays
+// silent about both at every count, and the pluralisation contract it used
+// to guard moved to `band_counts` (see `w970_monitorui_tests`).
 #[test]
-fn status_strip_omits_zero_and_pluralizes_one_and_many_separately() {
+fn status_strip_never_carries_a_shell_or_monitor_count() {
     let mut model = live_session();
     let empty = status_text(&model);
     assert!(!empty.contains("shell"));
@@ -71,10 +75,14 @@ fn status_strip_omits_zero_and_pluralizes_one_and_many_separately() {
         .push(shell("sh-one", haider_rpc::ShellKindWire::Local));
     model.monitor_count = 1;
     let one = status_text(&model);
-    assert!(one.contains("1 shell"));
-    assert!(!one.contains("1 shells"));
-    assert!(one.contains("1 monitor"));
-    assert!(!one.contains("1 monitors"));
+    assert!(
+        !one.contains("shell"),
+        "status strip regrew a shell count: {one}"
+    );
+    assert!(
+        !one.contains("monitor"),
+        "status strip regrew a monitor count: {one}"
+    );
 
     model.shells.push(shell(
         "sh-two",
@@ -84,8 +92,14 @@ fn status_strip_omits_zero_and_pluralizes_one_and_many_separately() {
     ));
     model.monitor_count = 3;
     let many = status_text(&model);
-    assert!(many.contains("2 shells"));
-    assert!(many.contains("3 monitors"));
+    assert!(
+        !many.contains("shell"),
+        "status strip regrew a shell count: {many}"
+    );
+    assert!(
+        !many.contains("monitor"),
+        "status strip regrew a monitor count: {many}"
+    );
 }
 
 #[test]

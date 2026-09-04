@@ -329,10 +329,11 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// `welcome_features`. Expected runtime failure: cold-history clients cannot
 /// discover the typed tool outcome and fall back to parsing summary prose.
 ///
-/// MUTATION CHECK: remove `FEATURE_MONITOR_CONTROL_V1` or
-/// `FEATURE_MONITOR_DELIVERY_V1`. Expected runtime failure: clients cannot
-/// distinguish the served typed control/replay surfaces from the private APK
-/// transport or from total client-surface absence.
+/// MUTATION CHECK: remove `FEATURE_MONITOR_CONTROL_V1`,
+/// `FEATURE_MONITOR_MUTATE_V1`, or `FEATURE_MONITOR_DELIVERY_V1`. Expected
+/// runtime failure: clients cannot distinguish the served typed base control,
+/// mutation, and replay surfaces from the private APK transport or from total
+/// client-surface absence.
 ///
 /// MUTATION CHECK: remove `FEATURE_WORKFLOW_CATALOG_V1` or
 /// `FEATURE_LOOM_PIPE_DAG_V1`. Expected runtime failure: clients cannot
@@ -354,8 +355,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        110,
-        "account source discovery extends the prior 109-feature set"
+        111,
+        "account source discovery and monitor mutation extend the prior 109-feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -459,6 +460,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_TOOL_INVENTORY_V1.to_owned(),
             haider_rpc::FEATURE_MONITOR_V1.to_owned(),
             haider_rpc::FEATURE_MONITOR_CONTROL_V1.to_owned(),
+            haider_rpc::FEATURE_MONITOR_MUTATE_V1.to_owned(),
             haider_rpc::FEATURE_MONITOR_DELIVERY_V1.to_owned(),
             haider_rpc::FEATURE_TRANSCRIPTION_V1.to_owned(),
             FEATURE_TURN_CONTROL_V1.to_owned(),

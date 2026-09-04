@@ -1,4 +1,6 @@
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 
 #[cfg(unix)]
 pub type WorkspaceDirectory = rustix::fd::OwnedFd;
@@ -158,6 +160,106 @@ pub fn open_workspace_subdirectory(
         path: current,
         anchors,
     })
+}
+
+/// Opens a regular file beneath an already anchored directory without
+/// following any directory symlink/reparse point or the final file link.
+///
+/// The returned file handle fixes the object identity before the retained
+/// directory chain is released, closing the authorization-to-open pathname
+/// race for callers that read through the returned handle.
+#[cfg(unix)]
+pub fn open_workspace_file(
+    mut directory: WorkspaceDirectory,
+    relative: &Path,
+) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let mut components = checked_relative_components(relative)?;
+    let leaf = components
+        .pop()
+        .ok_or_else(|| std::io::Error::other("workspace-relative file path has no leaf"))?;
+    for component in components {
+        directory = rustix::fs::openat(
+            &directory,
+            component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+    }
+    let file = std::fs::File::from(
+        rustix::fs::openat(
+            &directory,
+            leaf,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other(
+            "workspace-relative path is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+pub fn open_workspace_file(
+    directory: WorkspaceDirectory,
+    relative: &Path,
+) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    let mut components = checked_relative_components(relative)?;
+    let leaf = components
+        .pop()
+        .ok_or_else(|| std::io::Error::other("workspace-relative file path has no leaf"))?;
+    let parent = components.into_iter().collect::<PathBuf>();
+    let directory = open_workspace_subdirectory(directory, &parent, false)?;
+    let path = directory.path.join(leaf);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other(format!(
+            "{} is not a real regular file",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+fn checked_relative_components(relative: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+    if relative.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "workspace-relative file path is absolute",
+        ));
+    }
+    let mut components = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => components.push(name.to_os_string()),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "workspace-relative file path escaped its root",
+                ));
+            }
+        }
+    }
+    Ok(components)
 }
 
 #[cfg(windows)]

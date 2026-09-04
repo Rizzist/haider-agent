@@ -355,10 +355,12 @@ pub const FEATURE_TOOL_INVENTORY_V1: &str = "tool_inventory_v1";
 /// Daemon exposes the durable session-scoped monitor tool and source/delivery
 /// runtime needed to wake a session from matching external events.
 pub const FEATURE_MONITOR_V1: &str = "monitor_v1";
-/// Daemon exposes typed client `monitor.list`, `monitor.register`, and
-/// `monitor.remove` receipts. This is separate from the model-facing monitor
-/// tool and from every private mobile transport convention.
+/// Daemon exposes typed client monitor list/register/remove receipts. This is
+/// separate from the model-facing monitor tool and private mobile transports.
 pub const FEATURE_MONITOR_CONTROL_V1: &str = "monitor_control_v1";
+/// Daemon extends typed client monitor control with receipt-backed update,
+/// pause, resume, and manual-trigger mutations.
+pub const FEATURE_MONITOR_MUTATE_V1: &str = "monitor_mutate_v1";
 /// Daemon exposes the cursor-replayable `monitor.watch` report stream.
 /// Absence means there is no client delivery surface; clients must not infer
 /// one from a private transport.
@@ -2537,6 +2539,7 @@ pub enum MonitorSourceKindWire {
     File,
     Poll,
     Timer,
+    Cli,
     #[serde(other)]
     Unknown,
 }
@@ -2549,6 +2552,12 @@ pub enum MonitorSourceWire {
     Sms,
     Process {
         command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env_passthrough: Vec<String>,
+        #[serde(default)]
+        restart: MonitorProcessRestartWire,
     },
     File {
         path: String,
@@ -2556,10 +2565,68 @@ pub enum MonitorSourceWire {
     Poll {
         command: String,
         interval_ms: u64,
+        #[serde(default)]
+        until: MonitorPollUntilWire,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env_passthrough: Vec<String>,
     },
     Timer {
         interval_ms: u64,
     },
+    Cli {
+        preset: MonitorCliPresetWire,
+        #[serde(default)]
+        argv: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env_passthrough: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interval_ms: Option<u64>,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorProcessRestartWire {
+    #[default]
+    Never,
+    OnFailure,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MonitorPollUntilWire {
+    ExitCode {
+        #[serde(default)]
+        code: i32,
+    },
+    StdoutMatches {
+        pattern: String,
+        #[serde(default)]
+        case_sensitive: bool,
+    },
+    #[default]
+    StdoutChanged,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MonitorCliPresetWire {
+    Codex,
+    ClaudeCode,
+    Opencode,
+    Antigravity,
+    GhCi,
+    Custom,
     #[serde(other)]
     Unknown,
 }
@@ -2662,7 +2729,7 @@ pub enum MonitorSourceAvailabilityStateWire {
     Unknown,
 }
 
-/// One row of the exhaustive sms/process/file/poll/timer availability table.
+/// One row of the exhaustive sms/process/file/poll/timer/cli availability table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonitorSourceAvailabilityWire {
     pub source: MonitorSourceKindWire,
@@ -2678,7 +2745,43 @@ pub struct MonitorControlPolicyWire {
     pub register_requires_control_attachment: bool,
     pub remove: Capability,
     pub remove_requires_control_attachment: bool,
+    #[serde(default = "monitor_control_capability")]
+    pub update: Capability,
+    #[serde(default)]
+    pub update_requires_control_attachment: bool,
+    #[serde(default = "monitor_control_capability")]
+    pub pause: Capability,
+    #[serde(default)]
+    pub pause_requires_control_attachment: bool,
+    #[serde(default = "monitor_control_capability")]
+    pub resume: Capability,
+    #[serde(default)]
+    pub resume_requires_control_attachment: bool,
+    #[serde(default = "monitor_control_capability")]
+    pub trigger: Capability,
+    #[serde(default)]
+    pub trigger_requires_control_attachment: bool,
     pub watch: Capability,
+}
+
+fn monitor_control_capability() -> Capability {
+    Capability::Control
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorStateWire {
+    #[default]
+    Armed,
+    Paused,
+    Firing,
+    Exited,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorLastEventWire {
+    pub at_ms: u64,
+    pub summary: String,
 }
 
 /// Client-visible durable registry row.
@@ -2701,6 +2804,16 @@ pub struct MonitorRegistrationWire {
     pub start_source_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<u64>,
+    #[serde(default)]
+    pub state: MonitorStateWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event: Option<MonitorLastEventWire>,
+    #[serde(default)]
+    pub fire_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire_at_ms: Option<u64>,
+    #[serde(default)]
+    pub source_summary: String,
 }
 
 /// Structured refusal shared by the typed monitor control receipts.
@@ -2821,6 +2934,70 @@ pub struct MonitorRemoveReceiptWire {
     pub policy: MonitorControlPolicyWire,
     pub sources: Vec<MonitorSourceAvailabilityWire>,
     pub outcome: MonitorRemoveOutcomeWire,
+}
+
+/// One non-creation monitor control mutation. The nested operation keeps all
+/// edit/pause/resume/manual-fire retries under one receipt-backed RPC surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum MonitorMutationWire {
+    Update {
+        monitor_id: String,
+        source: MonitorSourceWire,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<MonitorFilterWire>,
+        action: MonitorActionWire,
+        #[serde(default)]
+        occurrence: MonitorOccurrenceWire,
+        #[serde(default)]
+        lifetime: MonitorLifetimeWire,
+    },
+    Pause {
+        monitor_id: String,
+    },
+    Resume {
+        monitor_id: String,
+    },
+    Trigger {
+        monitor_id: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Typed result of `monitor.mutate`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MonitorMutateOutcomeWire {
+    Updated {
+        monitor: MonitorRegistrationWire,
+    },
+    Paused {
+        monitor: MonitorRegistrationWire,
+    },
+    Resumed {
+        monitor: MonitorRegistrationWire,
+    },
+    Triggered {
+        monitor_id: String,
+    },
+    Rejected {
+        rejection: MonitorControlRejectionWire,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Typed, command-correlated receipt for update/pause/resume/trigger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorMutateReceiptWire {
+    pub command_id: CommandId,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub policy: MonitorControlPolicyWire,
+    pub sources: Vec<MonitorSourceAvailabilityWire>,
+    pub outcome: MonitorMutateOutcomeWire,
 }
 
 /// `monitor.watch` registration result.
@@ -2996,6 +3173,12 @@ pub enum MonitorEventPayloadWire {
     },
     Process {
         line: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured: Option<serde_json::Value>,
+        #[serde(default)]
+        terminal: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
     },
     File {
         payload: String,
@@ -3004,7 +3187,18 @@ pub enum MonitorEventPayloadWire {
         payload: String,
     },
     Timer {
+        #[serde(default)]
+        tick: u64,
         fired_at_ms: u64,
+    },
+    Cli {
+        line: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured: Option<serde_json::Value>,
+        #[serde(default)]
+        terminal: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
     },
     #[serde(other)]
     Unknown,
@@ -3968,6 +4162,14 @@ pub enum RequestBody {
         session_id: SessionId,
         worker_generation: u64,
         monitor_id: String,
+    },
+    /// Update, pause, resume, or manually trigger one existing monitor.
+    #[serde(rename = "monitor.mutate")]
+    MonitorMutate {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        mutation: MonitorMutationWire,
     },
     /// Start a session-scoped delivery replay strictly after the greatest
     /// journal cursor the client has fully applied.
@@ -4996,6 +5198,8 @@ pub enum ResponseBody {
     MonitorRegister { receipt: MonitorRegisterReceiptWire },
     #[serde(rename = "monitor.remove")]
     MonitorRemove { receipt: MonitorRemoveReceiptWire },
+    #[serde(rename = "monitor.mutate")]
+    MonitorMutate { receipt: MonitorMutateReceiptWire },
     #[serde(rename = "monitor.watch")]
     MonitorWatch { receipt: MonitorWatchReceiptWire },
     #[serde(rename = "loom.install.retry")]

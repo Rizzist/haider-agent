@@ -146,3 +146,34 @@ Read against the final uncommitted tree before verification. “checked: none”
 - #94 fixed — the test-only delay is capped at 10,000 ms and every process/poll wait retains an existing named deadline
 - #95 checked — status remains a one-shot RPC and adds no wait while a negotiated connection is retained
 - #96 checked — no TTL, warm-retention, or turn-performance policy changed
+
+## v0.0.970 monitorcore delta walk
+
+- #1-#18 checked: none — no affected dependency, packaging, or migration failure surface
+- #19 fixed — affected Rust crates are rustfmt-clean, `git diff --check` is clean, and strict scoped clippy passes; repository-wide format drift remains confined to untouched files
+- #20 fixed — twenty-three monitor/RPC regressions raise the reviewed Rust baseline from 4,464 to 4,487
+- #21-#28 checked: none — no affected surface
+- #29 fixed — monitor cancellation, shutdown, output-drain expiry, and ephemeral-daemon retirement retain background-work authority and sweep pipe-holding descendants
+- #30 fixed — named source, mutation, delivery, Ask/Allow/Deny approval, restart, and RPC authorization tests assert concrete receipts and reports
+- #31-#32 checked: none — no affected surface
+- #33 fixed — monitor control/delivery frames are additive, nested future discriminants remain decodable, and mutation support has its own negotiation bit
+- #34-#37 checked: none — no affected surface
+- #38 fixed — the registry is session-bounded, the outbox is two-slot/coalescing, source queues are bounded, anchored file reads are capped at 64 KiB, and output is AHRB-bounded
+- #39-#40 checked: none — no affected surface
+- #41 fixed — all filesystem/process/integration regressions use short isolated temporary roots
+- #42 fixed — current sibling `haider` and `haiderd` binaries are prebuilt before the daemon-heavy gate
+- #43 checked: none — no affected surface
+- #44 fixed — the real hub connection path proves rejection without Control/correct attachment; a black-box daemon connection proves successful attached pause/resume
+- #45-#63 checked: none — no affected surface
+- #64 checked — final `haiderd` is inspected and remains above the 10 MiB floor
+- #65-#70 checked: none — no affected surface
+- #71 checked — command-backed monitor execution uses the production command builder/process-group path; typed client control and lifecycle use the production daemon RPC path
+- #72 checked — native discovery is disabled by the required hermetic test environment
+- #73 fixed — every file poll uses no-follow component traversal and at most one 64 KiB tail read; command and report byte windows remain explicitly bounded
+- #74 checked — tests use temporary profiles/workspaces and never read host credentials
+- #75-#76 checked: none — no affected surface
+- #77 checked — no unsafe code was added; strict affected-crate clippy passes
+- #78-#93 checked: none — no affected surface
+- #94 fixed — pipe drain grace is exactly two 500 ms process batches (1,000 ms), with the arithmetic adjacent to the constant; other monitor deadlines retain named budgets
+- #95 checked — monitor runners wait outside negotiated connections, and control requests are one-shot; no retained RPC link gains an unserviced wait
+- #96 checked — no warm-retention or turn-performance policy changed

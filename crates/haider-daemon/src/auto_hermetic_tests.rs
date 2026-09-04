@@ -68,6 +68,7 @@ fn enabled_custom_no_auth_endpoint_activates_the_strict_envelope() {
         "peer_list",
         "ssh_list",
         "spawn_subagent",
+        "list_models",
     ] {
         assert!(!tools.iter().any(|tool| tool == egress), "{egress}");
     }
