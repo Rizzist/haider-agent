@@ -1,9 +1,9 @@
 $ErrorActionPreference = 'Stop'
 
-$version = '0.0.934'
+$version = '__HAIDER_VERSION__'
 $packageName = 'haider'
-$url64 = 'https://github.com/Rizzist/haider-agent/releases/download/v0.0.934/haider-v0.0.934-x86_64-pc-windows-msvc.zip'
-$checksum64 = '83dd105968ceb1fe9675a7de5bfc8b4edbb8d34a62d246c49361e098a93e5ca0'
+$url64 = '__HAIDER_WINDOWS_X64_URL__'
+$checksum64 = '__HAIDER_WINDOWS_X64_SHA256__'
 $toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $bundleDir = Join-Path $toolsDir "haider-v$version-x86_64-pc-windows-msvc"
 

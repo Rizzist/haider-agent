@@ -2,11 +2,12 @@
 <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
   <metadata>
     <id>haider</id>
-    <version>0.0.934</version>
+    <version>__HAIDER_VERSION__</version>
     <title>Haider Agent CLI</title>
     <authors>Rizzist</authors>
     <owners>Rizzist</owners>
     <projectUrl>https://github.com/Rizzist/haider-agent</projectUrl>
+    <iconUrl>https://cdn.jsdelivr.net/gh/Rizzist/haider-agent@v__HAIDER_ICON_VERSION__/packaging/chocolatey/icon.png</iconUrl>
     <packageSourceUrl>https://github.com/Rizzist/haider-agent</packageSourceUrl>
     <licenseUrl>https://github.com/Rizzist/haider-agent/blob/main/LICENSE.md</licenseUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>

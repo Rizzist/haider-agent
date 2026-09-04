@@ -522,8 +522,14 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
-          npm publish --access public
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          PACKAGE="$(npm pack --ignore-scripts --silent)"
+          python3 ../../scripts/release_packaging.py verify-npm \
+            --package "$PACKAGE" \
+            --version "$VERSION"
+          npm publish "$PACKAGE" --access public
 
   repin-packages:
     name: Re-pin Homebrew and Scoop manifests
@@ -569,67 +575,14 @@ jobs:
           SHA_LINUX_X64=$(sha_file "haider-v${VERSION}-x86_64-unknown-linux-gnu.tar.xz")
           SHA_WIN_X64=$(sha_file "haider-v${VERSION}-x86_64-pc-windows-msvc.zip")
 
-          python3 - <<'PY'
-          import json
-          import os
-          import pathlib
-          import re
-
-          version = os.environ["VERSION"]
-          formula_path = pathlib.Path("packaging/homebrew/haider.rb")
-          formula = formula_path.read_text()
-          formula, count = re.subn(
-              r'(?m)^  version "[^"]+"$',
-              f'  version "{version}"',
-              formula,
-              count=1,
-          )
-          if count != 1:
-              raise SystemExit("could not update Homebrew version")
-
-          targets = {
-              "aarch64-apple-darwin": os.environ["SHA_DARWIN_ARM"],
-              "x86_64-apple-darwin": os.environ["SHA_DARWIN_X64"],
-              "aarch64-unknown-linux-gnu": os.environ["SHA_LINUX_ARM64"],
-              "x86_64-unknown-linux-gnu": os.environ["SHA_LINUX_X64"],
-          }
-          for target, digest in targets.items():
-              pattern = re.compile(
-                  rf'(?m)^(?P<indent>\s*)url "[^"]*haider-v[^"]*-{re.escape(target)}\.tar\.xz"\n'
-                  rf'(?P=indent)sha256 "[^"]+"'
-              )
-              url = (
-                  "https://github.com/Rizzist/haider-agent/releases/download/"
-                  f"v{version}/haider-v{version}-{target}.tar.xz"
-              )
-              formula, count = pattern.subn(
-                  lambda match: (
-                      f'{match.group("indent")}url "{url}"\n'
-                      f'{match.group("indent")}sha256 "{digest}"'
-                  ),
-                  formula,
-                  count=1,
-              )
-              if count != 1:
-                  raise SystemExit(f"could not update Homebrew target {target}")
-          formula_path.write_text(formula)
-
-          scoop_path = pathlib.Path("packaging/scoop/haider.json")
-          scoop = json.loads(scoop_path.read_text())
-          target = "x86_64-pc-windows-msvc"
-          scoop["version"] = version
-          scoop["architecture"]["64bit"].update(
-              {
-                  "url": (
-                      "https://github.com/Rizzist/haider-agent/releases/download/"
-                      f"v{version}/haider-v{version}-{target}.zip"
-                  ),
-                  "hash": os.environ["SHA_WIN_X64"],
-                  "extract_dir": f"haider-v{version}-{target}",
-              }
-          )
-          scoop_path.write_text(json.dumps(scoop, indent=2) + "\n")
-          PY
+          python3 scripts/release_packaging.py repin-manifests \
+            --packaging-root packaging \
+            --version "$VERSION" \
+            --sha-darwin-arm64 "$SHA_DARWIN_ARM" \
+            --sha-darwin-x64 "$SHA_DARWIN_X64" \
+            --sha-linux-arm64 "$SHA_LINUX_ARM64" \
+            --sha-linux-x64 "$SHA_LINUX_X64" \
+            --sha-windows-x64 "$SHA_WIN_X64"
 
       - name: Commit manifests to the default branch
         env:
@@ -732,33 +685,36 @@ jobs:
         env:
           CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
         run: |
+          $ErrorActionPreference = 'Stop'
           $Version = $env:GITHUB_REF_NAME.TrimStart('v')
           $Target = 'x86_64-pc-windows-msvc'
           $Zip = "haider-v$Version-$Target.zip"
-          $Url = "https://github.com/Rizzist/haider-agent/releases/download/v$Version/$Zip"
-          $Sha = (Get-FileHash -Algorithm SHA256 -Path "artifacts\$Zip").Hash.ToLowerInvariant()
-          Copy-Item packaging\chocolatey dist-choco -Recurse
+          $ArtifactPath = "artifacts\$Zip"
+          python scripts\release_packaging.py render-chocolatey `
+            --source packaging\chocolatey `
+            --output dist-choco `
+            --version $Version `
+            --artifact $ArtifactPath
+          if ($LASTEXITCODE -ne 0) {
+            throw "Chocolatey template rendering failed with exit code $LASTEXITCODE"
+          }
 
           $NuspecPath = 'dist-choco\haider.nuspec'
-          $Nuspec = Get-Content $NuspecPath -Raw
-          $Nuspec = $Nuspec -replace '<version>[^<]+</version>', "<version>$Version</version>"
-          Set-Content $NuspecPath $Nuspec
-
-          $InstallPath = 'dist-choco\tools\chocolateyinstall.ps1'
-          $Install = Get-Content $InstallPath -Raw
-          $Install = $Install -replace '(?m)^\$version = ''[^'']+''$', "`$version = '$Version'"
-          $Install = $Install -replace '(?m)^\$url64 = ''[^'']+''$', "`$url64 = '$Url'"
-          $Install = $Install -replace '(?m)^\$checksum64 = ''[^'']+''$', "`$checksum64 = '$Sha'"
-          Set-Content $InstallPath $Install
-
-          $VerificationPath = 'dist-choco\tools\VERIFICATION.txt'
-          $Verification = Get-Content $VerificationPath -Raw
-          $Verification = $Verification -replace 'releases/tag/v[^\s]+', "releases/tag/v$Version"
-          $Verification = $Verification -replace '(?m)^(?:[a-fA-F0-9]{64}|__SHA_WIN_X64__)$', $Sha
-          Set-Content $VerificationPath $Verification
-
           choco pack $NuspecPath --outputdirectory dist-choco
-          $PushOutput = choco push "dist-choco\haider.$Version.nupkg" --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            throw "choco pack failed with exit code $LASTEXITCODE"
+          }
+
+          $NupkgPath = "dist-choco\haider.$Version.nupkg"
+          python scripts\release_packaging.py verify-chocolatey `
+            --nupkg $NupkgPath `
+            --version $Version `
+            --artifact $ArtifactPath
+          if ($LASTEXITCODE -ne 0) {
+            throw "Chocolatey post-pack verification failed with exit code $LASTEXITCODE"
+          }
+
+          $PushOutput = choco push $NupkgPath --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY 2>&1
           $PushExit = $LASTEXITCODE
           $PushOutput | Write-Output
           if ($PushExit -ne 0) {
