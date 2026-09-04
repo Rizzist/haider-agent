@@ -22,6 +22,10 @@ fn is_false(value: &bool) -> bool {
 /// zero is rejected at admission rather than being interpreted as absence.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunBudgetV1 {
+    /// Logical provider requests per turn; transport retries do not consume
+    /// this budget. Absence selects the ordinary 32/64 request policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_budget: Option<crate::request_budget::RequestBudgetV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
     /// Maximum estimated provider cost in millionths of one US dollar.
@@ -35,7 +39,15 @@ pub struct RunBudgetV1 {
 impl RunBudgetV1 {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.max_tokens.is_none() && self.max_cost_microusd.is_none() && self.max_time_ms.is_none()
+        self.request_budget.is_none() && !self.has_shared_limits()
+    }
+
+    /// Token, cost, and time limits use the shared run/child coordinator.
+    /// Request tranches are enforced independently by each turn's actor and
+    /// must not create a polling usage monitor when these limits are absent.
+    #[must_use]
+    pub const fn has_shared_limits(&self) -> bool {
+        self.max_tokens.is_some() || self.max_cost_microusd.is_some() || self.max_time_ms.is_some()
     }
 }
 
@@ -70,6 +82,10 @@ pub struct HeadlessRunSpecV1 {
     pub request_deadline_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_of: Option<RunId>,
+    /// Explicit same-session continuation of the latest terminal budget
+    /// checkpoint. Admission consumes this handle atomically with the new turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_of: Option<RunId>,
 }
 
 /// The exact limit which ended a run.

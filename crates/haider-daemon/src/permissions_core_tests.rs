@@ -1298,19 +1298,22 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // The full-prefix comparison deliberately includes the platform-specific
     // computer manifest description. Linux documents X11/Wayland (+49 bytes
     // over macOS), while Windows is one byte shorter than macOS.
+    // v0.0.970 adds spawn_subagent.request_budget: +367 full-schema bytes and
+    // +143 stub-schema bytes. Tool inventory and the 30% savings law stay fixed.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_254;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_621;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_205;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_572;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_204;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_571;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_199;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_566;
     // v0.0.969 pinned 11_246 bytes. Before actbias, merged monitor/list_models
     // inventory additions had already moved this wave-970 baseline to 12_122.
-    // The lane delta below is exactly the five restored native descriptions.
-    const PRE_ACTBIAS_INSTRUCT_PIPE_BYTES: usize = 12_122;
-    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 12_621;
+    // Turnbudget adds 143 stub-schema bytes: 12_122 + 143 = 12_265.
+    // Actbias restores five native descriptions: 12_265 + 499 = 12_764.
+    const PRE_ACTBIAS_INSTRUCT_PIPE_BYTES: usize = 12_265;
+    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 12_764;
 
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let stubbed =

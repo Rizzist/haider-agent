@@ -84,6 +84,10 @@ use haider_protocol::provider::{
     StreamEvent, Usage, UsageRequestKind, UsageScope, WEB_SOURCES_EXTENSION_KIND, WebSource,
 };
 use haider_protocol::reply::{ReplyArenaWriter, ReplyText};
+use haider_protocol::request_budget::{
+    PROVIDER_REQUEST_BUDGET_EXTENSION_KIND, RequestBudgetContinuationV1, RequestBudgetPhaseV1,
+    RequestBudgetStatusV1, RequestBudgetV1,
+};
 use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::{
     BoundedResult, ImageBlockRef, TOOL_RESULT_IMAGE_MAX_BYTES,
@@ -336,7 +340,9 @@ mod actor_tool_result_tests;
 #[path = "actor_context_economy_tests.rs"]
 mod actor_context_economy_tests;
 
-const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 32;
+// Two soft tranches cover the reported 53-round solved benchmark with 11
+// requests of headroom, while preserving a finite guard against runaway work.
+const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 64;
 
 /// Profile-scoped secret used only for diagnostic prefix fingerprints.
 /// Custom debug output is deliberately redacted so a config dump cannot
@@ -666,6 +672,9 @@ pub struct HarnessConfig {
     pub broadcast_capacity: usize,
     /// Hard ceiling on provider requests made by one logical turn.
     pub max_provider_requests_per_turn: usize,
+    /// Warn the model once after this many logical requests. Transport retries
+    /// do not spend another request. A fresh continuation turn resets the budget.
+    pub provider_request_tranche: usize,
     /// Logical requests already spent before a restart-safe continuation was
     /// reconstructed. Ordinary accepted turns start at zero.
     pub provider_requests_already_made: usize,
@@ -788,6 +797,7 @@ impl HarnessConfig {
             command_capacity: 8,
             broadcast_capacity: 128,
             max_provider_requests_per_turn: DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN,
+            provider_request_tranche: 32,
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             turn_ordinal: 1,
@@ -2825,6 +2835,12 @@ impl HarnessActor {
                     )
                 }
             };
+        let restore_budget = checkpoint.is_some()
+            || partial_stream.is_some()
+            || route_wait.is_some()
+            || child_wait.is_some()
+            || self.config.provider_requests_already_made > 0
+            || self.config.provider_request_ordinal_already_made > 0;
         // The compiler always places the accepted current user message last.
         // Everything before it is the only prefix eligible for mid-turn
         // forced compaction; current-run content remains a verbatim suffix.
@@ -3150,6 +3166,23 @@ impl HarnessActor {
             .config
             .provider_requests_already_made
             .max(resumed_logical_request_count);
+        // Recovery reuses the durable warning, including its exact prompt text.
+        // Only recovery pays for a journal scan; fresh turns start with no note.
+        let mut soft_bound_emitted = false;
+        if restore_budget {
+            match self.restore_request_budget(&run_id).await {
+                Ok((used, note)) => {
+                    provider_request_count = provider_request_count.max(used);
+                    if let Some(note) = note {
+                        if !messages.contains(&Message::user_text(note.clone())) {
+                            messages.push(Message::user_text(note));
+                        }
+                        soft_bound_emitted = true;
+                    }
+                }
+                Err(error) => return self.errored_state_outcome(&run_id, error).await,
+            }
+        }
         let mut continuation_count = 0usize;
         let mut forced_compaction_used = false;
         // Once an ineffective compaction promotes this turn, later request
@@ -3162,7 +3195,10 @@ impl HarnessActor {
         // retry of the same logical request. Starting above zero preserves
         // the restored logical count and freezes wfcont's volatile provider
         // view; the durable physical attempt ordinal still advances below.
-        let mut provider_attempt = usize::from(route_wait.is_some());
+        let mut provider_attempt = usize::from(
+            route_wait.is_some()
+                || (self.config.recovery_request_local_usage && provider_request_count > 0),
+        );
         // Freeze the cacheable boundary for every physical retry of one
         // logical provider request. Advancing or retreating this boundary on
         // a transport retry would change the wire body underneath an exact
@@ -3299,6 +3335,43 @@ impl HarnessActor {
         }
         'requests: loop {
             if provider_attempt == 0 {
+                let budget = self.request_budget();
+                if !soft_bound_emitted && provider_request_count >= budget.tranche {
+                    let status = self.request_budget_status(
+                        &run_id,
+                        provider_request_count,
+                        RequestBudgetPhaseV1::SoftBound,
+                    );
+                    if let Err(error) = self.commit_request_budget_note(&run_id, &status).await {
+                        return self.errored_state_outcome(&run_id, error).await;
+                    }
+                    messages.push(Message::user_text(status.model_note()));
+                    soft_bound_emitted = true;
+                }
+                if provider_request_count >= budget.hard_cap {
+                    if let Err(error) = self
+                        .commit_pending_thinking(&run_id, &mut thinking_pending)
+                        .await
+                    {
+                        return self.errored_state_outcome(&run_id, error).await;
+                    }
+                    let status = self.request_budget_status(
+                        &run_id,
+                        provider_request_count,
+                        RequestBudgetPhaseV1::HardBound,
+                    );
+                    return self
+                        .errored_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                            request_budget_error(&status),
+                        )
+                        .await;
+                }
+            }
+            if provider_attempt == 0 {
                 if let Some(dispatcher) = self.dispatcher.as_ref() {
                     match dispatcher.refresh_volatile_context_tail().await {
                         Ok(Some(tail)) => volatile_user_tail = (!tail.is_empty()).then_some(tail),
@@ -3394,26 +3467,6 @@ impl HarnessActor {
             let cacheable_history_end = logical_request_cacheable_history_end;
             if provider_attempt == 0 {
                 provider_request_count = provider_request_count.saturating_add(1);
-            }
-            if provider_request_count > self.config.max_provider_requests_per_turn {
-                if let Err(error) = self
-                    .commit_pending_thinking(&run_id, &mut thinking_pending)
-                    .await
-                {
-                    return self.errored_state_outcome(&run_id, error).await;
-                }
-                return self
-                    .errored_outcome_with_items(
-                        &run_id,
-                        &mut message,
-                        &mut reasoning,
-                        &mut tools,
-                        loop_limit_error(
-                            provider_request_count,
-                            self.config.max_provider_requests_per_turn,
-                        ),
-                    )
-                    .await;
             }
             provider_attempt = provider_attempt.saturating_add(1);
             provider_request_ordinal = match request_ordinals.next() {
@@ -3884,6 +3937,13 @@ impl HarnessActor {
                         provider_view: provider_view_attempt_data,
                         cache: request_attempt_data,
                         response_epoch: replay.response_epoch,
+                        request_budget: (provider_attempt == 1).then(|| {
+                            self.request_budget_status(
+                                &run_id,
+                                provider_request_count,
+                                RequestBudgetPhaseV1::Progress,
+                            )
+                        }),
                     },
                     &mut thinking_pending,
                 )
@@ -9522,7 +9582,25 @@ impl HarnessActor {
         run_id: &RunId,
         error: &HaiderError,
     ) -> Result<(), HaiderError> {
-        let envelopes = [
+        let mut envelopes = Vec::new();
+        // The hard checkpoint and the named terminal share the same append:
+        // recovery never sees a hard-bound handle without its terminal state.
+        if error.code == ErrorCode::RequestBudgetExceeded {
+            let data = error.details.clone().ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    "request budget terminal is missing its checkpoint",
+                    false,
+                )
+            })?;
+            envelopes.extend(self.uncommitted_extension_marker(
+                run_id,
+                PROVIDER_REQUEST_BUDGET_EXTENSION_KIND,
+                data,
+                prompt_verbatim_render(),
+            )?);
+        }
+        envelopes.extend([
             self.uncommitted_envelope(
                 run_id,
                 EventPayload::RunFailed {
@@ -9538,9 +9616,9 @@ impl HarnessActor {
                 EventPayload::RunState(RunState::Errored),
                 prompt_omit_render(),
             )?,
-        ];
+        ]);
         self.flush_pending_item_delta().await?;
-        self.append_and_publish_owned(Vec::from(envelopes)).await?;
+        self.append_and_publish_owned(envelopes).await?;
         self.state.send_replace(Some(RunState::Errored));
         Ok(())
     }
@@ -9770,6 +9848,88 @@ impl HarnessActor {
         Ok(())
     }
 
+    fn request_budget(&self) -> RequestBudgetV1 {
+        RequestBudgetV1 {
+            // Preserve embedders that only override the old hard-cap field.
+            tranche: self
+                .config
+                .provider_request_tranche
+                .min(self.config.max_provider_requests_per_turn),
+            hard_cap: self.config.max_provider_requests_per_turn,
+        }
+    }
+
+    fn request_budget_status(
+        &self,
+        run_id: &RunId,
+        used: usize,
+        phase: RequestBudgetPhaseV1,
+    ) -> RequestBudgetStatusV1 {
+        RequestBudgetStatusV1 {
+            used,
+            budget: self.request_budget(),
+            phase,
+            continuation: RequestBudgetContinuationV1 {
+                session_id: self.config.session_id.clone(),
+                run_id: run_id.clone(),
+                branch_id: self.config.branch_id.clone(),
+                agent_id: self.config.agent_id.clone(),
+            },
+        }
+    }
+
+    async fn commit_request_budget_note(
+        &mut self,
+        run_id: &RunId,
+        status: &RequestBudgetStatusV1,
+    ) -> Result<(), HaiderError> {
+        let data = serde_json::to_value(status).map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("cannot encode request budget: {error}"),
+                false,
+            )
+        })?;
+        self.commit_extension_marker(
+            run_id,
+            PROVIDER_REQUEST_BUDGET_EXTENSION_KIND,
+            data,
+            prompt_verbatim_render(),
+        )
+        .await
+    }
+
+    async fn restore_request_budget(
+        &self,
+        run_id: &RunId,
+    ) -> Result<(usize, Option<String>), HaiderError> {
+        let mut cursor = 0;
+        let mut used = 0;
+        let mut note = None;
+        loop {
+            let page = self
+                .store
+                .read(&self.config.session_id, cursor, 256)
+                .await?;
+            if page.is_empty() {
+                return Ok((used, note));
+            }
+            for envelope in &page {
+                if envelope.run_id.as_ref() == Some(run_id)
+                    && let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
+                        envelope.payload.decode_event()
+                    && let Some(status) = RequestBudgetStatusV1::from_extension_item(&item)
+                {
+                    used = used.max(status.used);
+                    if status.phase == RequestBudgetPhaseV1::SoftBound {
+                        note = Some(status.model_note());
+                    }
+                }
+            }
+            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        }
+    }
+
     async fn commit_hidden_extension_marker(
         &mut self,
         run_id: &RunId,
@@ -9796,6 +9956,7 @@ impl HarnessActor {
             provider_view: provider_view_data,
             cache: cache_attempt_data,
             response_epoch,
+            request_budget,
         } = markers;
         self.flush_pending_item_delta().await?;
         let mut envelopes = Vec::with_capacity(
@@ -9832,6 +9993,20 @@ impl HarnessActor {
                 ROUTE_REPLAY_ATTEMPT_EXTENSION_KIND,
                 serde_json::json!({ "response_epoch": response_epoch }),
                 hidden_prompt_omit_render(),
+            )?);
+        }
+        if let Some(status) = request_budget {
+            envelopes.extend(self.uncommitted_extension_marker(
+                run_id,
+                PROVIDER_REQUEST_BUDGET_EXTENSION_KIND,
+                serde_json::to_value(status).map_err(|error| {
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        format!("cannot encode request budget: {error}"),
+                        false,
+                    )
+                })?,
+                prompt_omit_render(),
             )?);
         }
         let (persisted_provider_view, committed) = match provider_view {
@@ -10973,6 +11148,7 @@ struct RequestAttemptMarkers {
     provider_view: Option<serde_json::Value>,
     cache: serde_json::Value,
     response_epoch: u64,
+    request_budget: Option<RequestBudgetStatusV1>,
 }
 
 /// One as-yet-uncommitted provider-stream delta. It is intentionally limited
@@ -11203,16 +11379,26 @@ fn compaction_guard_repeat_error(used: u64, input_budget: u64) -> DriveError {
     ))
 }
 
-fn loop_limit_error(count: usize, limit: usize) -> HaiderError {
+fn request_budget_error(status: &RequestBudgetStatusV1) -> HaiderError {
+    let continuation = if let Some(agent) = &status.continuation.agent_id {
+        format!("continue with message_subagent for agent {agent}")
+    } else if let Some(branch) = &status.continuation.branch_id {
+        format!(
+            "continue with a new turn on branch {branch} in session {}",
+            status.continuation.session_id
+        )
+    } else {
+        format!(
+            "continue in this session or run `haider run --resume {}`",
+            status.continuation.run_id
+        )
+    };
     let mut error = HaiderError::new(
-        ErrorCode::LoopLimit,
-        format!("provider request loop limit exceeded at request {count} (limit {limit})"),
+        ErrorCode::RequestBudgetExceeded,
+        format!("{}; {continuation}", status.summary()),
         false,
     );
-    error.details = Some(serde_json::json!({
-        "provider_request_count": count,
-        "provider_request_limit": limit,
-    }));
+    error.details = Some(serde_json::json!(status));
     error
 }
 

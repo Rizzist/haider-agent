@@ -427,3 +427,86 @@ fn pdf_loader_page_and_byte_caps_are_typed_presentations() {
             if code == "pdf-too-large" && presentation.subcode.as_str() == "pdf-too-large"
     ));
 }
+
+fn resumable_source() -> (
+    super::HeadlessRunStatus,
+    haider_rpc::haider_protocol::request_budget::RequestBudgetStatusV1,
+) {
+    use haider_rpc::haider_protocol::request_budget::{
+        RequestBudgetContinuationV1, RequestBudgetPhaseV1, RequestBudgetStatusV1, RequestBudgetV1,
+    };
+    let source: super::HeadlessRunStatus = serde_json::from_value(serde_json::json!({
+        "session_id": "resume-session", "run_id": "resume-source", "worker_generation": 7,
+        "state": {"state": "errored"}, "head_seq": 2, "terminal_seq": 2, "budget_exhausted": null,
+        "spec": {"cwd": "/tmp", "provider": "fake", "model": "fake-model", "max_output_tokens": 4096,
+            "permission_overrides": {}, "budget": {"max_time_ms": 30000}}
+    })).expect("source status");
+    let checkpoint = RequestBudgetStatusV1 {
+        used: 64,
+        budget: RequestBudgetV1::default(),
+        phase: RequestBudgetPhaseV1::HardBound,
+        continuation: RequestBudgetContinuationV1 {
+            session_id: source.session_id.clone(),
+            run_id: source.run_id.clone(),
+            branch_id: None,
+            agent_id: None,
+        },
+    };
+    (source, checkpoint)
+}
+
+#[test]
+fn resume_rejects_active_and_nonbudget_sources() {
+    let (mut source, checkpoint) = resumable_source();
+    assert!(
+        matches!(super::validate_resume_checkpoint(&source, None), Err(HeadlessRunError::Rpc { code, .. }) if code == "continuation_unavailable")
+    );
+    source.state = RunState::Streaming;
+    source.terminal_seq = None;
+    assert!(
+        matches!(super::validate_resume_checkpoint(&source, Some(&checkpoint)), Err(HeadlessRunError::Rpc { code, .. }) if code == "continuation_active")
+    );
+}
+
+#[test]
+fn resume_accepts_terminal_soft_and_hard_checkpoints_and_checks_scope() {
+    use haider_rpc::haider_protocol::request_budget::RequestBudgetPhaseV1;
+    let (mut source, mut checkpoint) = resumable_source();
+    super::validate_resume_checkpoint(&source, Some(&checkpoint)).expect("hard-bound continuation");
+    source.state = RunState::Done;
+    checkpoint.phase = RequestBudgetPhaseV1::SoftBound;
+    checkpoint.used = 32;
+    super::validate_resume_checkpoint(&source, Some(&checkpoint)).expect("soft checkpoint finish");
+    checkpoint.continuation.run_id = RunId::new("another-run");
+    assert!(super::validate_resume_checkpoint(&source, Some(&checkpoint)).is_err());
+    checkpoint.continuation.run_id = source.run_id.clone();
+    checkpoint.continuation.agent_id =
+        Some(haider_rpc::haider_protocol::ids::AgentId::new("child"));
+    assert!(
+        matches!(super::validate_resume_checkpoint(&source, Some(&checkpoint)), Err(HeadlessRunError::Rpc { code, .. }) if code == "continuation_scope_unsupported")
+    );
+}
+
+#[test]
+fn resume_inherits_budgets_and_applies_only_explicit_new_caps() {
+    use haider_rpc::haider_protocol::headless::RunBudgetV1;
+    use haider_rpc::haider_protocol::request_budget::RequestBudgetV1;
+    let mut original = RunBudgetV1 {
+        max_time_ms: Some(30_000),
+        max_tokens: Some(8000),
+        max_cost_microusd: Some(90_000),
+        request_budget: Some(RequestBudgetV1::default()),
+    };
+    let overrides = RunBudgetV1 {
+        request_budget: Some(RequestBudgetV1 {
+            tranche: 48,
+            hard_cap: 96,
+        }),
+        ..RunBudgetV1::default()
+    };
+    super::merge_resume_budget(&mut original, &overrides);
+    assert_eq!(original.max_time_ms, Some(30_000));
+    assert_eq!(original.max_tokens, Some(8000));
+    assert_eq!(original.max_cost_microusd, Some(90_000));
+    assert_eq!(original.request_budget, overrides.request_budget);
+}

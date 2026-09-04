@@ -22,6 +22,9 @@ const MAX_SELECTOR_BYTES: usize = 128;
 pub struct SpawnSubagent {
     pub task: String,
     pub prompt: String,
+    /// Per-turn request tranche and hard ceiling pinned for this child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_budget: Option<haider_protocol::request_budget::RequestBudgetV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,9 +85,13 @@ impl SpawnSubagent {
         }
         let parent_slot = selector(request.parent_slot, "parent_slot")?;
         let agent_type = selector(request.agent_type, "agent_type")?;
+        if let Some(budget) = request.request_budget {
+            budget.validate().map_err(ToolError::invalid_argument)?;
+        }
         Ok(Self {
             task: task.to_owned(),
             prompt: prompt.to_owned(),
+            request_budget: request.request_budget,
             model,
             provider,
             workflow: request.workflow,
@@ -122,6 +129,16 @@ pub fn spawn_subagent_manifest() -> ToolManifest {
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
+                "request_budget": {
+                    "type": "object",
+                    "description": "Optional child per-turn provider request budget; defaults to tranche 32 and hard cap 64. Transport retries are excluded. Must satisfy tranche <= hard_cap.",
+                    "properties": {
+                        "tranche": {"type": "integer", "minimum": 1},
+                        "hard_cap": {"type": "integer", "minimum": 1}
+                    },
+                    "required": ["tranche", "hard_cap"],
+                    "additionalProperties": false
+                },
                 "task": {
                     "type": "string",
                     "minLength": 1,
