@@ -3,6 +3,9 @@
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
+use haider_protocol::cache::{
+    ProviderOperationEventPayload, ProviderRequestAttemptV1, ProviderRequestKind,
+};
 use haider_protocol::context::{ContextCompactionTier, ContextEconomy};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
@@ -145,6 +148,71 @@ fn source_bytes(store: &Store, session_id: &SessionId) -> Vec<Vec<u8>> {
         .iter()
         .map(|envelope| rmp_serde::to_vec_named(envelope).expect("encode source envelope"))
         .collect()
+}
+
+fn append_provider_operation(store: &Store, session_id: &SessionId) -> RunId {
+    let run_id = RunId::new(format!("loom-operation-{session_id}"));
+    let item_id = ItemId::new(format!("loom-attempt-{session_id}"));
+    let attempt = ProviderRequestAttemptV1 {
+        session_id: session_id.clone(),
+        run_id: run_id.clone(),
+        turn_ordinal: 1,
+        request_ordinal: 1,
+        request_kind: ProviderRequestKind::Side,
+    };
+    let item = attempt.extension_item().expect("request-attempt item");
+    let hidden = RenderTargets {
+        ui: false,
+        durable: true,
+        prompt: PromptRender::Omit,
+    };
+    let envelope = |id: &str, payload| EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(format!("{id}-{session_id}")),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: Some(run_id.clone()),
+        agent_id: None,
+        device_id: DeviceId::new("session-fork-test-device"),
+        authority_epoch: 0,
+        worker_generation: store.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: hidden.clone(),
+        payload,
+    };
+    let mut envelopes = [
+        envelope(
+            "loom-operation-reserved",
+            ProviderOperationEventPayload::ProviderOperationReserved {
+                request_kind: ProviderRequestKind::Side,
+            }
+            .to_payload_value()
+            .expect("operation reservation")
+            .into(),
+        ),
+        envelope(
+            "loom-attempt-started",
+            serde_json::to_value(EventPayload::Item(ItemEvent::Started {
+                item_id: item_id.clone(),
+                item: item.clone(),
+            }))
+            .expect("attempt started")
+            .into(),
+        ),
+        envelope(
+            "loom-attempt-completed",
+            serde_json::to_value(EventPayload::Item(ItemEvent::Completed { item_id, item }))
+                .expect("attempt completed")
+                .into(),
+        ),
+    ];
+    store
+        .append_owned(&mut envelopes)
+        .expect("append provider operation");
+    run_id
 }
 
 /// Raw SQLite storage snapshot for every source-owned durable byte surface.
@@ -731,6 +799,72 @@ fn session_fork_keeps_parent_byte_identical_and_replays_idempotently() {
             .expect("fork receipt lookup after restart"),
         Some(created),
         "the original response remains recoverable after restart"
+    );
+}
+
+/// Provider-support audit coordinates belong to the source session. Copying
+/// them would rewrite the envelope session while retaining the parent session
+/// inside `provider_request_attempt_v1`, poisoning child startup recovery.
+#[test]
+fn fork_after_provider_operation_omits_parent_correlation_before_child_restart() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("provider-operation-fork-parent");
+    create_session(&store, &source);
+    let operation_run = append_provider_operation(&store, &source);
+    let (_, node, seq, _) = source_turn(&store, &source, "conversation after Loom");
+
+    let command = fork_command(
+        &store,
+        "provider-operation-fork-command",
+        &source,
+        "provider-operation-fork-child",
+        node,
+        seq,
+        None,
+    );
+    let SessionForkOutcome::Committed { created, .. } =
+        store.fork_session(&command).expect("fork after Loom")
+    else {
+        panic!("fresh fork commits");
+    };
+    assert!(
+        store
+            .journal_replay(&source)
+            .expect("parent replay")
+            .iter()
+            .any(|envelope| {
+                envelope
+                    .payload
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("provider_operation_reserved")
+            }),
+        "the parent retains its provider-operation audit fact"
+    );
+    let child = store
+        .journal_replay(&created.session_id)
+        .expect("child replay");
+    assert!(
+        child.iter().all(|envelope| {
+            envelope.run_id.as_ref() != Some(&operation_run)
+                && envelope
+                    .payload
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("provider_operation_reserved")
+        }),
+        "the child must omit the reservation and every marker on its run"
+    );
+
+    drop(store);
+    let reopened = Store::open(root.path()).expect("child restart");
+    assert_eq!(
+        reopened
+            .turn_ordinal(&created.session_id, &operation_run)
+            .expect("child ordinal projection after restart"),
+        None,
+        "restart must not reconstruct the parent's provider operation"
     );
 }
 

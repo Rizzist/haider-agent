@@ -572,6 +572,9 @@ async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
             ..UsageScope::default()
         },
         usage_account: None,
+        turn_ordinal: 1,
+        request_ordinals: haider_provider::ProviderRequestOrdinal::new(0),
+        turn_trace: None,
     };
     let intent = CompactionIntent {
         operation_id: "cu1-compaction".into(),
@@ -714,6 +717,9 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
             ..UsageScope::default()
         },
         usage_account: None,
+        turn_ordinal: 1,
+        request_ordinals: haider_provider::ProviderRequestOrdinal::new(0),
+        turn_trace: None,
     };
     let intent = CompactionIntent {
         operation_id: "cu1-compaction-fallback".into(),

@@ -1905,9 +1905,21 @@ impl DelegationHandle {
             .cloned()
             .unwrap_or(RunState::Done);
         if !child_run_state.is_terminal() && child_run_state != RunState::Cancelling {
+            let turn_ordinal = self
+                .hub
+                .turn_ordinal(&record.child_session_id, &message.run_id)
+                .await?
+                .ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        "live delegated run is missing its durable turn ordinal",
+                        false,
+                    )
+                })?;
             let accepted = AcceptedTurn {
                 session_id: record.child_session_id.clone(),
                 run_id: message.run_id.clone(),
+                turn_ordinal,
                 accepted_seq: message.seq,
                 worker_generation: self.hub.worker_generation(),
                 branch_id: None,

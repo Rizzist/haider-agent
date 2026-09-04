@@ -1067,6 +1067,7 @@ async fn screen_recording_flip_parks_then_fresh_daemon_resumes_the_exact_call() 
         recovered.checkpoint.menu.origin,
         super::COMPUTER_PERMISSION_MENU_ORIGIN
     );
+    assert_eq!(recovered.provider_request_ordinal, 1);
 
     let fresh_backend = Arc::new(PermissionFlipBackend {
         screenshot: inspect_png_fixture(),
@@ -1102,6 +1103,7 @@ async fn screen_recording_flip_parks_then_fresh_daemon_resumes_the_exact_call() 
             recovered.accepted,
             recovered.checkpoint,
             recovered.committed_answer,
+            recovered.provider_request_ordinal,
         )
         .await
         .expect("resume parked permission");

@@ -158,6 +158,7 @@ async fn daemon_restart_preserves_route_wait_with_partial_and_completed_tool_eff
     };
     let request_attempt = CacheRequestAttemptV1 {
         ordinal: 11,
+        correlation: None,
         diagnostic: haider_protocol::provider::CacheRequestDiagnosticV1 {
             history_message_count: 1,
             stable_prefix_tokens: 8,

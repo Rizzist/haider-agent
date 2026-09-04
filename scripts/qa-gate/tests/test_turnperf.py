@@ -52,9 +52,27 @@ class TurnPerformanceHarnessTests(unittest.TestCase):
                 state.begin_case("single")
             state.leave()
             state.begin_case("single")
-            state.record({"model": "turnperf-model", "messages": []}, "/v1/chat")
+            state.record(
+                {"model": "turnperf-model", "messages": []},
+                "/v1/chat",
+                {
+                    "X-Haider-Turn": "session-test/run-test/1/1",
+                    "X-Haider-Request-Kind": "primary",
+                },
+                b'{"model":"turnperf-model","messages":[]}',
+            )
             assert_provider_ledger(state.snapshot_case(), "single")
             self.assertEqual(state.read_disk_ledger(), state.snapshot_all())
+
+    def test_proxy_ledger_rejects_prompt_sniffing_without_declared_headers(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            state = ProxyState(Path(directory) / "ledger.jsonl")
+            state.begin_case("tool")
+            body = {"model": "turnperf-model", "messages": [{"role": "tool"}]}
+            state.record(body, "/v1/chat")
+            state.record(body, "/v1/chat")
+            with self.assertRaisesRegex(ProofError, "missing X-Haider-Turn"):
+                assert_provider_ledger(state.snapshot_case(), "tool")
 
     def test_absent_provider_ledger_is_an_empty_external_log(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:

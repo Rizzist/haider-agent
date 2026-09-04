@@ -136,7 +136,7 @@ use haider_core::{
     SessionWorkspaceSetOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
     StoreHandle, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
     TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus, TurnTraceContext,
-    envelopes_contain_terminal, register_turn_trace, turn_trace_for_envelopes, turn_trace_ordinal,
+    envelopes_contain_terminal, register_turn_trace, turn_trace_for_envelopes,
     unregister_turn_trace_for_envelopes,
 };
 use haider_protocol::EventPayload;
@@ -145,7 +145,7 @@ use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{
-    BranchId, CredentialAlias, DeviceId, EventId, GraphId, ItemId, MenuId, RunId, SessionId,
+    BranchId, CredentialAlias, DeviceId, EventId, GraphId, MenuId, RunId, SessionId,
 };
 use haider_protocol::menu::{
     AnswerVia, EffectRecoveryAction, Menu, MenuAnswer as DurableMenuAnswer, MenuKind, MenuScope,
@@ -2233,6 +2233,17 @@ impl From<SessionHubError> for DaemonError {
 // ──────────── hub: append seam, attachment lifecycle, shutdown ──────────────
 
 impl SessionHub {
+    pub(crate) async fn turn_ordinal(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+    ) -> Result<Option<u64>, HaiderError> {
+        self.inner
+            .store
+            .turn_ordinal(session_id.clone(), run_id.clone())
+            .await
+    }
+
     async fn trace_retention_snapshot(&self, session_id: &SessionId, head_seq: u64, phase: &str) {
         if !retention_trace_enabled() {
             return;
@@ -7771,6 +7782,14 @@ impl haider_core::ArtifactReader for HubStoreHandle {
 impl HubStoreHandle {
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    pub(crate) async fn turn_ordinal(&self, run_id: &RunId) -> Result<Option<u64>, HaiderError> {
+        self.hub
+            .inner
+            .store
+            .turn_ordinal(self.session_id.clone(), run_id.clone())
+            .await
     }
 
     /// The owning hub — used by the worker to build hub-backed facades

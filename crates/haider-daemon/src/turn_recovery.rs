@@ -55,7 +55,7 @@ use haider_core::{
     SessionProjectionCheckpoint, SqliteStoreHandle, StoreHandle, TurnAdmissionDisposition,
 };
 use haider_protocol::EventPayload;
-use haider_protocol::cache::CacheRequestAttemptV1;
+use haider_protocol::cache::{CacheRequestAttemptV1, ProviderRequestAttemptV1};
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase,
 };
@@ -110,11 +110,14 @@ const CHECKPOINT_SHAPE_VERSION: u32 = 1;
 // needed to distinguish a recoverable active-workflow admission from ordinary
 // ambiguous provider delivery. Reject either older cursor and perform one
 // complete ordered journal reduction.
-const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v7";
+// v8 separates the first logical model boundary from the physical request
+// ordinal, because a turn-owned warmup or cache-resource request may consume
+// ordinal 1 before the first model request.
+const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v8";
 
 pub(crate) enum RecoveredWork {
-    Queued(AcceptedTurn),
-    Retry(AcceptedRunRetry),
+    Queued(RecoveredQueued),
+    Retry(RecoveredRetry),
     Checkpoint(Box<RecoveredCheckpoint>),
     PartialStream(Box<RecoveredPartialStream>),
     RouteWait(Box<RecoveredRouteWait>),
@@ -122,6 +125,16 @@ pub(crate) enum RecoveredWork {
     AdmissionRetry(Box<RecoveredAdmissionRetry>),
     WorkflowContinuation(Box<RecoveredWorkflowContinuation>),
     DelegationMirror(Box<RecoveredDelegationMirror>),
+}
+
+pub(crate) struct RecoveredQueued {
+    pub(crate) accepted: AcceptedTurn,
+    pub(crate) provider_request_ordinal: u64,
+}
+
+pub(crate) struct RecoveredRetry {
+    pub(crate) accepted: AcceptedRunRetry,
+    pub(crate) provider_request_ordinal: u64,
 }
 
 pub(crate) struct RecoveredAdmissionRetry {
@@ -152,17 +165,20 @@ pub(crate) struct RecoveredPartialStream {
     pub(crate) accepted: AcceptedTurn,
     pub(crate) checkpoint: PartialStreamCheckpoint,
     pub(crate) committed_answer: Option<RawEnvelope>,
+    pub(crate) provider_request_ordinal: u64,
 }
 
 pub(crate) struct RecoveredChildWait {
     pub(crate) accepted: AcceptedTurn,
     pub(crate) checkpoint: ChildWaitCheckpoint,
+    pub(crate) provider_request_ordinal: u64,
 }
 
 pub(crate) struct RecoveredCheckpoint {
     pub(crate) accepted: AcceptedTurn,
     pub(crate) checkpoint: RequestInputCheckpoint,
     pub(crate) committed_answer: Option<RawEnvelope>,
+    pub(crate) provider_request_ordinal: u64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -194,6 +210,19 @@ struct RunReduction {
     workflow_deferral: Option<(GraphFinalizationDeferred, u64)>,
     #[serde(default)]
     latest_provider_request_attempt: Option<(u64, u64)>,
+    /// Number of durable model-boundary attempts. Auxiliary physical HTTP
+    /// calls do not make an admitted model request a continuation.
+    #[serde(default)]
+    provider_model_request_attempt_count: u64,
+    /// Highest physical request identity across model and auxiliary
+    /// turn-owned HTTP calls. The sequence-bearing field above remains the
+    /// model-response recovery boundary.
+    #[serde(default)]
+    provider_request_ordinal_max: u64,
+    #[serde(default)]
+    provider_request_attempt_corrupt: bool,
+    #[serde(default)]
+    provider_request_turn_ordinal: Option<u64>,
     #[serde(default)]
     latest_provider_response_seq: Option<u64>,
     #[serde(default)]
@@ -440,6 +469,13 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                     false,
                 ));
             }
+            if reduction.provider_request_attempt_corrupt {
+                return Err(HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!("run {run_id} has a malformed provider request-attempt marker"),
+                    false,
+                ));
+            }
             let Some((state, _)) = reduction.state.clone() else {
                 continue;
             };
@@ -536,20 +572,47 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                 touched = true;
                 continue;
             }
+            let turn_ordinal = store
+                .turn_ordinal(session_id.clone(), run_id.clone())
+                .await?
+                .ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!("run {run_id} has no durable turn ordinal"),
+                        false,
+                    )
+                })?;
+            if reduction
+                .provider_request_turn_ordinal
+                .is_some_and(|journal_ordinal| journal_ordinal != turn_ordinal)
+            {
+                return Err(HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!(
+                        "run {run_id} request-attempt turn ordinal disagrees with its durable run"
+                    ),
+                    false,
+                ));
+            }
             if state == RunState::Queued {
+                let provider_request_ordinal = recovered_provider_request_ordinal(&reduction);
                 if let Some(accepted_seq) = reduction.user_seq {
                     if !activated_recovered_queue {
                         append_recovered_active(store, device_id, &session_id, &run_id).await?;
                         touched = true;
                         activated_recovered_queue = true;
                     }
-                    recovered.push(RecoveredWork::Queued(recovered_acceptance(
-                        &session_id,
-                        &run_id,
-                        accepted_seq,
-                        store.worker_generation(),
-                        reduction.branch_id.clone(),
-                    )));
+                    recovered.push(RecoveredWork::Queued(RecoveredQueued {
+                        accepted: recovered_acceptance(
+                            &session_id,
+                            &run_id,
+                            turn_ordinal,
+                            accepted_seq,
+                            store.worker_generation(),
+                            reduction.branch_id.clone(),
+                        ),
+                        provider_request_ordinal,
+                    }));
                 } else if let Some((failed_run_id, prompt_run_id, user_seq, accepted_seq)) =
                     reduction.retry_source
                 {
@@ -558,22 +621,31 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                         touched = true;
                         activated_recovered_queue = true;
                     }
-                    recovered.push(RecoveredWork::Retry(AcceptedRunRetry {
-                        session_id: session_id.clone(),
-                        run_id,
-                        failed_run_id,
-                        prompt_run_id,
-                        user_seq,
-                        accepted_seq,
-                        worker_generation: store.worker_generation(),
-                        backoff_event_id: None,
+                    recovered.push(RecoveredWork::Retry(RecoveredRetry {
+                        accepted: AcceptedRunRetry {
+                            session_id: session_id.clone(),
+                            run_id,
+                            turn_ordinal,
+                            failed_run_id,
+                            prompt_run_id,
+                            user_seq,
+                            accepted_seq,
+                            worker_generation: store.worker_generation(),
+                            backoff_event_id: None,
+                        },
+                        provider_request_ordinal,
                     }));
                 }
                 continue;
             }
-            if let Some(retry) =
-                pending_admission_retry(store, &session_id, &run_id, &state, &reduction)?
-            {
+            if let Some(retry) = pending_admission_retry(
+                store,
+                &session_id,
+                &run_id,
+                turn_ordinal,
+                &state,
+                &reduction,
+            )? {
                 let graph_phase = store
                     .graph_status(&session_id)
                     .await?
@@ -586,9 +658,15 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                 }
                 continue;
             }
-            if let Some(continuation) =
-                pending_workflow_continuation(store, &session_id, &run_id, &state, &reduction)
-                    .await?
+            if let Some(continuation) = pending_workflow_continuation(
+                store,
+                &session_id,
+                &run_id,
+                turn_ordinal,
+                &state,
+                &reduction,
+            )
+            .await?
             {
                 recovered.push(RecoveredWork::WorkflowContinuation(Box::new(continuation)));
                 continue;
@@ -608,12 +686,14 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                     accepted: recovered_acceptance(
                         &session_id,
                         &run_id,
+                        turn_ordinal,
                         accepted_seq,
                         store.worker_generation(),
                         reduction.branch_id.clone(),
                     ),
                     checkpoint,
                     committed_answer,
+                    provider_request_ordinal: recovered_provider_request_ordinal(&reduction),
                 })));
                 continue;
             }
@@ -633,12 +713,14 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                         accepted: recovered_acceptance(
                             &session_id,
                             &run_id,
+                            turn_ordinal,
                             accepted_seq,
                             store.worker_generation(),
                             reduction.branch_id.clone(),
                         ),
                         checkpoint,
                         committed_answer,
+                        provider_request_ordinal: recovered_provider_request_ordinal(&reduction),
                     },
                 )));
                 continue;
@@ -668,9 +750,9 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                             false,
                         )
                     })?;
-                let provider_request_ordinal = reduction
-                    .latest_provider_request_attempt
-                    .map(|(_, ordinal)| ordinal)
+                let provider_request_ordinal = recovered_provider_request_ordinal(&reduction);
+                let provider_request_ordinal = (provider_request_ordinal != 0)
+                    .then_some(provider_request_ordinal)
                     .ok_or_else(|| {
                         HaiderError::new(
                             ErrorCode::StoreCorrupt,
@@ -682,6 +764,7 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                     accepted: recovered_acceptance(
                         &session_id,
                         &run_id,
+                        turn_ordinal,
                         accepted_seq,
                         store.worker_generation(),
                         reduction.branch_id.clone(),
@@ -711,11 +794,13 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                     accepted: recovered_acceptance(
                         &session_id,
                         &run_id,
+                        turn_ordinal,
                         accepted_seq,
                         store.worker_generation(),
                         reduction.branch_id.clone(),
                     ),
                     checkpoint,
+                    provider_request_ordinal: recovered_provider_request_ordinal(&reduction),
                 })));
                 continue;
             }
@@ -856,6 +941,7 @@ fn pending_admission_retry(
     store: &SqliteStoreHandle,
     session_id: &SessionId,
     run_id: &RunId,
+    turn_ordinal: u64,
     state: &RunState,
     reduction: &RunReduction,
 ) -> Result<Option<RecoveredAdmissionRetry>, HaiderError> {
@@ -869,20 +955,18 @@ fn pending_admission_retry(
             false,
         )
     })?;
-    let provider_request_ordinal = reduction
-        .latest_provider_request_attempt
-        .map_or(0, |(_, ordinal)| ordinal.saturating_sub(1));
+    let provider_request_ordinal = recovered_provider_request_ordinal(reduction);
     Ok(Some(RecoveredAdmissionRetry {
         accepted: recovered_acceptance(
             session_id,
             run_id,
+            turn_ordinal,
             accepted_seq,
             store.worker_generation(),
             reduction.branch_id.clone(),
         ),
-        // This exact shape is the first logical request. Its durable marker
-        // proves admission, not completion, so recovery re-enters request one
-        // with the ordinal seed rewound from 1 to 0.
+        // The durable marker consumed one physical identity. A recovery
+        // reissue is a new attempt and must therefore allocate N+1.
         provider_requests_consumed: 0,
         provider_request_ordinal,
     }))
@@ -942,7 +1026,7 @@ async fn park_ambiguous_admission_retry(
 }
 
 fn admitted_first_request_has_no_response(state: &RunState, reduction: &RunReduction) -> bool {
-    let Some((attempt_seq, ordinal)) = reduction.latest_provider_request_attempt else {
+    let Some((attempt_seq, _ordinal)) = reduction.latest_provider_request_attempt else {
         return false;
     };
     let state_matches_attempt = match reduction.state.as_ref() {
@@ -954,7 +1038,7 @@ fn admitted_first_request_has_no_response(state: &RunState, reduction: &RunReduc
         }
         _ => false,
     };
-    ordinal == 1
+    reduction.provider_model_request_attempt_count == 1
         && reduction.workflow_deferral.is_none()
         && state_matches_attempt
         && reduction.headless_configured
@@ -980,6 +1064,7 @@ async fn pending_workflow_continuation(
     store: &SqliteStoreHandle,
     session_id: &SessionId,
     run_id: &RunId,
+    turn_ordinal: u64,
     state: &RunState,
     reduction: &RunReduction,
 ) -> Result<Option<RecoveredWorkflowContinuation>, HaiderError> {
@@ -1032,14 +1117,13 @@ async fn pending_workflow_continuation(
         accepted: recovered_acceptance(
             session_id,
             run_id,
+            turn_ordinal,
             accepted_seq,
             store.worker_generation(),
             reduction.branch_id.clone(),
         ),
         provider_requests_consumed,
-        provider_request_ordinal: reduction
-            .latest_provider_request_attempt
-            .map_or(0, |(_, ordinal)| ordinal),
+        provider_request_ordinal: recovered_provider_request_ordinal(reduction),
     }))
 }
 
@@ -1303,8 +1387,31 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
             if provider_response_item(&item) {
                 reduction.latest_provider_response_seq = Some(envelope.seq);
             }
-            if let Some(attempt) = CacheRequestAttemptV1::from_extension_item(&item) {
-                reduction.latest_provider_request_attempt = Some((envelope.seq, attempt.ordinal));
+            match ProviderRequestAttemptV1::try_from_extension_item(&item) {
+                Ok(Some(attempt)) => {
+                    reduce_provider_request_attempt(
+                        reduction,
+                        envelope,
+                        attempt.request_ordinal,
+                        Some(attempt),
+                        false,
+                    );
+                }
+                Ok(None) => {}
+                Err(_) => reduction.provider_request_attempt_corrupt = true,
+            }
+            match CacheRequestAttemptV1::try_from_extension_item(&item) {
+                Ok(Some(attempt)) => {
+                    reduce_provider_request_attempt(
+                        reduction,
+                        envelope,
+                        attempt.ordinal,
+                        attempt.correlation,
+                        true,
+                    );
+                }
+                Ok(None) => {}
+                Err(_) => reduction.provider_request_attempt_corrupt = true,
             }
             if let Some(handoff) = DelegationMirrorHandoff::from_item(&item) {
                 match handoff.phase {
@@ -1414,6 +1521,54 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
         }
         _ => {}
     }
+}
+
+fn reduce_provider_request_attempt(
+    reduction: &mut RunReduction,
+    envelope: &RawEnvelope,
+    ordinal: u64,
+    correlation: Option<ProviderRequestAttemptV1>,
+    model_boundary: bool,
+) {
+    let invalid = ordinal == 0
+        || correlation.as_ref().is_some_and(|correlation| {
+            correlation.request_ordinal != ordinal
+                || correlation.session_id != envelope.session_id
+                || envelope.run_id.as_ref() != Some(&correlation.run_id)
+                || !correlation.coordinates_valid()
+                || reduction
+                    .provider_request_turn_ordinal
+                    .is_some_and(|turn_ordinal| turn_ordinal != correlation.turn_ordinal)
+                || recovered_provider_request_ordinal(reduction) >= ordinal
+        });
+    if invalid {
+        reduction.provider_request_attempt_corrupt = true;
+        return;
+    }
+    reduction.provider_request_ordinal_max = reduction.provider_request_ordinal_max.max(ordinal);
+    if model_boundary {
+        reduction.provider_model_request_attempt_count = reduction
+            .provider_model_request_attempt_count
+            .saturating_add(1);
+    }
+    if model_boundary
+        && reduction
+            .latest_provider_request_attempt
+            .is_none_or(|(_, latest)| ordinal > latest)
+    {
+        reduction.latest_provider_request_attempt = Some((envelope.seq, ordinal));
+    }
+    if let Some(correlation) = correlation {
+        reduction.provider_request_turn_ordinal = Some(correlation.turn_ordinal);
+    }
+}
+
+fn recovered_provider_request_ordinal(reduction: &RunReduction) -> u64 {
+    reduction.provider_request_ordinal_max.max(
+        reduction
+            .latest_provider_request_attempt
+            .map_or(0, |(_, ordinal)| ordinal),
+    )
 }
 
 fn provider_response_item(item: &TurnItem) -> bool {
@@ -1636,6 +1791,7 @@ async fn pending_child_wait(
 fn recovered_acceptance(
     session_id: &SessionId,
     run_id: &RunId,
+    turn_ordinal: u64,
     accepted_seq: u64,
     worker_generation: u64,
     branch_id: Option<BranchId>,
@@ -1643,6 +1799,7 @@ fn recovered_acceptance(
     AcceptedTurn {
         session_id: session_id.clone(),
         run_id: run_id.clone(),
+        turn_ordinal,
         accepted_seq,
         worker_generation,
         branch_id,
@@ -1968,6 +2125,100 @@ mod streaming_checkpoint_tests;
 mod composite_recovery_tests {
     use super::*;
 
+    #[test]
+    fn auxiliary_attempt_advances_identity_without_moving_model_boundary() {
+        let session_id = SessionId::new("turnid-session");
+        let run_id = RunId::new("turnid-run");
+        let mut envelopes = recovery_envelopes(
+            1,
+            &DeviceId::new("turnid-device"),
+            &session_id,
+            &run_id,
+            None,
+            vec![EventPayload::RunState(RunState::Thinking)],
+        )
+        .expect("recovery envelope");
+        let envelope = envelopes.first_mut().expect("one envelope");
+        envelope.seq = 7;
+
+        let attempt = |request_ordinal, request_kind| ProviderRequestAttemptV1 {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn_ordinal: 1,
+            request_ordinal,
+            request_kind,
+        };
+        let mut reduction = RunReduction::default();
+        reduce_provider_request_attempt(
+            &mut reduction,
+            envelope,
+            1,
+            Some(attempt(
+                1,
+                haider_protocol::cache::ProviderRequestKind::Primary,
+            )),
+            true,
+        );
+        envelope.seq = 8;
+        reduce_provider_request_attempt(
+            &mut reduction,
+            envelope,
+            2,
+            Some(attempt(
+                2,
+                haider_protocol::cache::ProviderRequestKind::Side,
+            )),
+            false,
+        );
+
+        assert_eq!(reduction.latest_provider_request_attempt, Some((7, 1)));
+        assert_eq!(recovered_provider_request_ordinal(&reduction), 2);
+        assert!(!reduction.provider_request_attempt_corrupt);
+
+        // A physical warmup may be the first HTTP request without being the
+        // first model boundary. Admission recovery must still recognize the
+        // primary request and resume from the physical maximum.
+        let mut admission = RunReduction {
+            state: Some((RunState::Thinking, 5)),
+            user_seq: Some(1),
+            headless_configured: true,
+            ..RunReduction::default()
+        };
+        envelope.seq = 6;
+        reduce_provider_request_attempt(
+            &mut admission,
+            envelope,
+            1,
+            Some(attempt(
+                1,
+                haider_protocol::cache::ProviderRequestKind::Warmup,
+            )),
+            false,
+        );
+        envelope.seq = 7;
+        reduce_provider_request_attempt(
+            &mut admission,
+            envelope,
+            2,
+            Some(attempt(
+                2,
+                haider_protocol::cache::ProviderRequestKind::Primary,
+            )),
+            true,
+        );
+        assert_eq!(admission.latest_provider_request_attempt, Some((7, 2)));
+        assert_eq!(admission.provider_model_request_attempt_count, 1);
+        assert_eq!(recovered_provider_request_ordinal(&admission), 2);
+        assert!(admitted_first_request_has_no_response(
+            &RunState::Thinking,
+            &admission
+        ));
+        assert_eq!(
+            recovered_provider_request_ordinal(&admission).checked_add(1),
+            Some(3)
+        );
+    }
+
     /// MUTATION CHECK: omit the response coordinate or accept a later
     /// response fact and the final assertion flips true, allowing a daemon
     /// restart to replay provider work after response delivery began.
@@ -1978,6 +2229,7 @@ mod composite_recovery_tests {
             user_seq: Some(1),
             headless_configured: true,
             latest_provider_request_attempt: Some((6, 1)),
+            provider_model_request_attempt_count: 1,
             ..RunReduction::default()
         };
         assert!(admitted_first_request_has_no_response(

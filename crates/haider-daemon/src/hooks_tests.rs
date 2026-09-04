@@ -1750,6 +1750,29 @@ fn matcher_filters_use_fact_specific_provider_outcome_and_parked_kind() {
     );
 }
 
+#[test]
+fn provider_operation_reservation_is_not_a_hook_event() {
+    let mut reservation = raw_event(
+        &SessionId::new("loom-session"),
+        &RunId::new("loom-authoring"),
+        1,
+        "loom-provider-operation-reserved",
+        EventPayload::IdleDecayed,
+    );
+    reservation.payload =
+        haider_protocol::cache::ProviderOperationEventPayload::ProviderOperationReserved {
+            request_kind: haider_protocol::cache::ProviderRequestKind::Side,
+        }
+        .to_payload_value()
+        .expect("provider operation reservation")
+        .into();
+
+    assert!(
+        classify(&reservation).is_none(),
+        "provider-support ordinal reservation must not fire a user hook"
+    );
+}
+
 /// MUTATION CHECK: dispatch from a surface callback, add surface identity to
 /// hook JSON, or bypass the committed UserMessage classifier. Expected
 /// RUNTIME failure: one marker is absent/duplicated or the two captured JSON

@@ -353,22 +353,36 @@ class ProxyState:
             self._active_handlers -= 1
             self._condition.notify_all()
 
-    def record(self, body: Mapping[str, Any], path: str) -> tuple[int, str, int]:
+    def record(
+        self,
+        body: Mapping[str, Any],
+        path: str,
+        headers: Mapping[str, str] | None = None,
+        raw_body: bytes | None = None,
+    ) -> tuple[int, str, int]:
         with self._condition:
             request_number = len(self._case_requests) + 1
-            messages = body.get("messages", [])
-            logical_ordinal = 2 if isinstance(messages, list) and any(
-                isinstance(message, Mapping) and message.get("role") == "tool"
-                for message in messages
-            ) else 1
+            normalized_headers = {
+                str(name).lower(): str(value) for name, value in (headers or {}).items()
+            }
+            turn_id = normalized_headers.get("x-haider-turn")
+            request_kind = normalized_headers.get("x-haider-request-kind")
+            request_ordinal: int | None = None
+            if isinstance(turn_id, str):
+                parts = turn_id.split("/")
+                if len(parts) == 4 and parts[3].isdigit():
+                    request_ordinal = int(parts[3])
             entry = {
                 "case_id": self._case_id,
                 "shape": self._shape,
                 "request_number": request_number,
-                "logical_ordinal": logical_ordinal,
+                "turn_id": turn_id,
+                "request_kind": request_kind,
+                "request_ordinal": request_ordinal,
                 "path": path,
                 "model": body.get("model"),
                 "tool_names": [str(spec.get("name", "")) for spec in _tool_specifications(body)],
+                "body_sha256": hashlib.sha256(raw_body or b"").hexdigest(),
                 "recorded_monotonic_ns": time.monotonic_ns(),
             }
             self._case_requests.append(entry)
@@ -443,7 +457,12 @@ class _Handler(BaseHTTPRequestHandler):
             except (UnicodeDecodeError, json.JSONDecodeError):
                 decoded = {}
             body = decoded if isinstance(decoded, Mapping) else {}
-            request_number, shape, case_id = self.state.record(body, self.path)
+            request_number, shape, case_id = self.state.record(
+                body,
+                self.path,
+                dict(self.headers.items()),
+                raw,
+            )
             self.state.gate(request_number, "after_post")
             chunks = (
                 _tool_response(MODEL_ID, body, f"turnperf-effect-{case_id}")
@@ -1030,7 +1049,27 @@ def assert_provider_ledger(entries: Sequence[Mapping[str, Any]], shape: str) -> 
     expected = 1 if shape == "single" else 2
     if len(entries) != expected:
         raise ProofError(f"{shape} provider requests expected={expected} actual={len(entries)}")
-    ordinals = [entry.get("logical_ordinal") for entry in entries]
+    prefixes: set[tuple[str, str, int]] = set()
+    for entry in entries:
+        turn_id = entry.get("turn_id")
+        if not isinstance(turn_id, str):
+            raise ProofError(f"{shape} provider request is missing X-Haider-Turn")
+        parts = turn_id.split("/")
+        if len(parts) != 4 or not parts[0] or not parts[1]:
+            raise ProofError(f"{shape} provider turn id has invalid shape {turn_id!r}")
+        numeric = parts[2:]
+        if any(not value.isdigit() or value.startswith("0") for value in numeric):
+            raise ProofError(f"{shape} provider turn id has invalid ordinals {turn_id!r}")
+        if int(parts[2]) < 1 or int(parts[3]) < 1:
+            raise ProofError(f"{shape} provider turn id ordinals must be nonzero {turn_id!r}")
+        prefixes.add((parts[0], parts[1], int(parts[2])))
+        if entry.get("request_kind") != "primary":
+            raise ProofError(
+                f"{shape} turn model request must be primary actual={entry.get('request_kind')!r}"
+            )
+    if len(prefixes) != 1:
+        raise ProofError(f"{shape} provider requests do not share one turn prefix: {prefixes!r}")
+    ordinals = [entry.get("request_ordinal") for entry in entries]
     if ordinals != list(range(1, expected + 1)):
         raise ProofError(f"{shape} physical request ordinals expected=1..{expected} actual={ordinals}")
 

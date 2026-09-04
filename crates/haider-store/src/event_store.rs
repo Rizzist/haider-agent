@@ -24,6 +24,7 @@ use crate::usage_ledger::{
 use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer, validate_image_block};
 use haider_protocol::agent::{AgentManifest, ChildReport, ReportVerification};
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
+use haider_protocol::cache::ProviderOperationEventPayload;
 use haider_protocol::cache::{
     PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND, ProviderViewAttemptV1, ProviderViewBlobV1,
     ProviderViewBlockRefV1, ProviderViewLedgerV1,
@@ -1373,6 +1374,10 @@ pub enum TurnAdmissionDisposition {
 pub struct AcceptedTurn {
     pub session_id: SessionId,
     pub run_id: RunId,
+    /// Stable 1-based ordinal of this run/turn within its session. Legacy
+    /// receipts decode as zero and are resolved from the run-head projection.
+    #[serde(default)]
+    pub turn_ordinal: u64,
     pub accepted_seq: u64,
     pub worker_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1423,6 +1428,8 @@ pub struct RunRetryCommand {
 pub struct AcceptedRunRetry {
     pub session_id: SessionId,
     pub run_id: RunId,
+    #[serde(default)]
+    pub turn_ordinal: u64,
     pub failed_run_id: RunId,
     pub prompt_run_id: RunId,
     pub user_seq: u64,
@@ -8627,10 +8634,24 @@ impl Store {
             resolved_cut.fork_seq,
             &scopes,
         )?;
-        // Checkpoints are session-owned workspace mutation facts. A session
-        // fork copies conversational history, but must not manufacture child
-        // ownership of a source session's restore coordinates or CAS roots.
-        source_envelopes.retain(|envelope| payload_kind(envelope) != "checkpoint_recorded");
+        // Checkpoints and provider-support operations are parent-owned audit
+        // facts. A fork copies conversational history, but must not
+        // manufacture child ownership of source restore coordinates, CAS
+        // roots, or request-attempt identities whose embedded session remains
+        // the parent. Remove the whole explicitly reserved operation run so
+        // its later standalone attempt markers cannot enter child recovery.
+        let provider_operation_runs = source_envelopes
+            .iter()
+            .filter(|envelope| payload_kind(envelope) == "provider_operation_reserved")
+            .filter_map(|envelope| envelope.run_id.clone())
+            .collect::<HashSet<_>>();
+        source_envelopes.retain(|envelope| {
+            payload_kind(envelope) != "checkpoint_recorded"
+                && envelope
+                    .run_id
+                    .as_ref()
+                    .is_none_or(|run_id| !provider_operation_runs.contains(run_id))
+        });
         if source_envelopes.is_empty() || source_envelopes[0].seq != 1 {
             return Err(corrupt(
                 "fork source lineage does not contain its created envelope",
@@ -10246,6 +10267,14 @@ impl Store {
         lookup_turn_accept_receipt(&connection, command_id, request_digest, request_json)
     }
 
+    /// Returns the stable 1-based ordinal of an existing durable run. This is
+    /// used only by recovery and same-run receipt paths; fresh acceptance uses
+    /// the run-head count already loaded inside its transaction.
+    pub fn turn_ordinal(&self, session_id: &SessionId, run_id: &RunId) -> StoreResult<Option<u64>> {
+        let connection = self.connection()?;
+        projected_turn_ordinal(&connection, session_id, run_id)
+    }
+
     /// Looks up a committed `run.retry` response before generation/state
     /// validation so response-loss replay remains safe across restarts.
     pub fn run_retry_receipt(
@@ -10256,14 +10285,7 @@ impl Store {
     ) -> StoreResult<Option<AcceptedRunRetry>> {
         validate_command_identity(command_id, request_digest, request_json)?;
         let connection = self.connection()?;
-        lookup_command_response(
-            &connection,
-            command_id,
-            "run.retry",
-            request_digest,
-            request_json,
-            "run-retry",
-        )
+        lookup_run_retry_receipt(&connection, command_id, request_digest, request_json)
     }
 
     /// Atomically accepts a fresh run from the latest failed main-timeline
@@ -10288,13 +10310,11 @@ impl Store {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
-        if let Some(accepted) = lookup_command_response(
+        if let Some(accepted) = lookup_run_retry_receipt(
             &transaction,
             &command.command_id,
-            "run.retry",
             &command.request_digest,
             &command.request_json,
-            "run-retry",
         )? {
             transaction.commit().map_err(map_sqlite_error)?;
             return Ok(RunRetryOutcome::IdempotentReplay { accepted });
@@ -10357,6 +10377,8 @@ impl Store {
             let accepted = AcceptedRunRetry {
                 session_id: command.session_id.clone(),
                 run_id: run_id.clone(),
+                turn_ordinal: projected_turn_ordinal(&transaction, &command.session_id, &run_id)?
+                    .ok_or_else(|| corrupt("retrying run has no durable turn ordinal"))?,
                 failed_run_id: run_id,
                 prompt_run_id,
                 user_seq,
@@ -10460,6 +10482,10 @@ impl Store {
         let accepted = AcceptedRunRetry {
             session_id: command.session_id.clone(),
             run_id: command.run_id.clone(),
+            turn_ordinal: u64::try_from(states.len())
+                .ok()
+                .and_then(|ordinal| ordinal.checked_add(1))
+                .ok_or_else(|| corrupt("session turn ordinal space is exhausted"))?,
             failed_run_id,
             prompt_run_id,
             user_seq,
@@ -11196,6 +11222,15 @@ impl Store {
         let accepted = AcceptedTurn {
             session_id: command.session_id.clone(),
             run_id: command.run_id.clone(),
+            turn_ordinal: if same_run_delivery {
+                projected_turn_ordinal(transaction, &command.session_id, &command.run_id)?
+                    .ok_or_else(|| corrupt("same-run delivery has no durable turn ordinal"))?
+            } else {
+                u64::try_from(states.len())
+                    .ok()
+                    .and_then(|ordinal| ordinal.checked_add(1))
+                    .ok_or_else(|| corrupt("session turn ordinal space is exhausted"))?
+            },
             accepted_seq,
             worker_generation: self.worker_generation,
             branch_id: command.branch_id.clone(),
@@ -13721,14 +13756,48 @@ fn lookup_turn_accept_receipt(
     request_digest: &str,
     request_json: &str,
 ) -> StoreResult<Option<AcceptedTurn>> {
-    lookup_command_response(
+    let mut accepted: Option<AcceptedTurn> = lookup_command_response(
         connection,
         command_id,
         "turn.submit",
         request_digest,
         request_json,
         "turn-submit",
-    )
+    )?;
+    if let Some(accepted) = accepted.as_mut()
+        && accepted.turn_ordinal == 0
+    {
+        accepted.turn_ordinal =
+            projected_turn_ordinal(connection, &accepted.session_id, &accepted.run_id)?
+                .ok_or_else(|| corrupt("legacy turn receipt names a run without a turn ordinal"))?;
+    }
+    Ok(accepted)
+}
+
+fn lookup_run_retry_receipt(
+    connection: &Connection,
+    command_id: &str,
+    request_digest: &str,
+    request_json: &str,
+) -> StoreResult<Option<AcceptedRunRetry>> {
+    let mut accepted: Option<AcceptedRunRetry> = lookup_command_response(
+        connection,
+        command_id,
+        "run.retry",
+        request_digest,
+        request_json,
+        "run-retry",
+    )?;
+    if let Some(accepted) = accepted.as_mut()
+        && accepted.turn_ordinal == 0
+    {
+        accepted.turn_ordinal =
+            projected_turn_ordinal(connection, &accepted.session_id, &accepted.run_id)?
+                .ok_or_else(|| {
+                    corrupt("legacy retry receipt names a run without a turn ordinal")
+                })?;
+    }
+    Ok(accepted)
 }
 
 fn lookup_turn_cancel_receipt(
@@ -16845,6 +16914,51 @@ fn latest_run_states(
         .collect())
 }
 
+fn projected_turn_ordinal(
+    connection: &Connection,
+    session_id: &SessionId,
+    run_id: &RunId,
+) -> StoreResult<Option<u64>> {
+    // Run-head `accepted_seq` advances on same-run steer/subturn delivery, so
+    // it cannot define immutable order. The first durable envelope for each
+    // run is append-only and therefore remains a stable legacy/recovery key.
+    let heads = load_projected_run_heads(connection, session_id)?;
+    if !heads.contains_key(run_id) {
+        return Ok(None);
+    }
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT envelope_json FROM events
+             WHERE session_id = ?1 ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    let mut seen = HashSet::<RunId>::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let envelope = decode_envelope_column(row, 0).map_err(|error| {
+            corrupt(format!(
+                "invalid envelope while resolving turn ordinal for session {session_id}: {error}"
+            ))
+        })?;
+        let Some(observed_run_id) = envelope.run_id else {
+            continue;
+        };
+        if !heads.contains_key(&observed_run_id) || !seen.insert(observed_run_id.clone()) {
+            continue;
+        }
+        let ordinal = u64::try_from(seen.len())
+            .map_err(|_| corrupt("session turn ordinal space is exhausted"))?;
+        if observed_run_id == *run_id {
+            return Ok(Some(ordinal));
+        }
+    }
+    Err(corrupt(format!(
+        "run-head projection names {run_id} without a durable envelope"
+    )))
+}
+
 fn journal_latest_seq(connection: &Connection, session_id: &SessionId) -> StoreResult<u64> {
     let latest = connection
         .query_row(
@@ -17269,6 +17383,31 @@ fn apply_run_head_envelope(
         head.prompt_run_id = Some(prompt_run_id);
         return Ok(());
     }
+    if kind == "provider_operation_reserved" {
+        let Ok(ProviderOperationEventPayload::ProviderOperationReserved { .. }) =
+            decode_payload::<ProviderOperationEventPayload>(&envelope.payload)
+        else {
+            return Ok(());
+        };
+        let head = heads
+            .entry(run_id.clone())
+            .or_insert_with(|| ProjectedRunHead {
+                state: RunState::Done,
+                state_seq: None,
+                accepted_seq: None,
+                branch_id: envelope.branch_id.clone(),
+                prompt_run_id: None,
+            });
+        if head.branch_id != envelope.branch_id {
+            return Err(corrupt(format!(
+                "provider operation {run_id} crosses branch scopes in durable history"
+            )));
+        }
+        head.state = RunState::Done;
+        head.state_seq = Some(envelope.seq);
+        head.accepted_seq = Some(envelope.seq);
+        return Ok(());
+    }
     if !matches!(kind, "run_state" | "user_message") {
         return Ok(());
     }
@@ -17487,7 +17626,7 @@ fn update_run_head_projection_after_append(
                 .payload
                 .get("type")
                 .and_then(serde_json::Value::as_str),
-            Some("run_retried" | "run_state" | "user_message")
+            Some("run_retried" | "run_state" | "user_message" | "provider_operation_reserved")
         );
         if !changes_projection {
             continue;

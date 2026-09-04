@@ -1326,6 +1326,7 @@ pub(crate) struct SessionFolder {
     tool_attempts: HashMap<String, HashSet<String>>,
     timings: HashMap<String, AgentTiming>,
     run_agents: HashMap<String, Option<String>>,
+    provider_operation_runs: HashSet<String>,
     root_run_seen: bool,
     primary_agent: Option<AgentId>,
 }
@@ -1339,6 +1340,7 @@ impl SessionFolder {
             tool_attempts: HashMap::new(),
             timings: HashMap::new(),
             run_agents: HashMap::new(),
+            provider_operation_runs: HashSet::new(),
             root_run_seen: false,
             primary_agent: None,
         }
@@ -1423,6 +1425,14 @@ impl SessionFolder {
                 total = total.saturating_add(agent.capacity());
             }
         }
+        total = total.saturating_add(
+            self.provider_operation_runs
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>().saturating_add(1)),
+        );
+        for run in &self.provider_operation_runs {
+            total = total.saturating_add(run.capacity());
+        }
         if let Some(agent) = &self.primary_agent {
             total = total.saturating_add(agent.0.capacity());
         }
@@ -1430,6 +1440,20 @@ impl SessionFolder {
     }
 
     pub(crate) fn push(&mut self, envelope: &RawEnvelope) {
+        if let Some(run) = envelope.run_id.as_ref() {
+            if envelope.payload.get("type").and_then(|kind| kind.as_str())
+                == Some("provider_operation_reserved")
+            {
+                self.provider_operation_runs.insert(run.as_str().to_owned());
+            }
+            if self.provider_operation_runs.contains(run.as_str()) {
+                // Provider-support operations share the durable session
+                // ordinal space but are not agent/conversation work. Their
+                // reservation and request-attempt markers must not create or
+                // settle an agent timing bucket.
+                return;
+            }
+        }
         // Delegated sessions begin with an unscoped SessionCreated fact, then
         // name their durable agent on the accepted turn. Remember that first
         // actual agent, while `root_run_seen` below keeps root sessions in the

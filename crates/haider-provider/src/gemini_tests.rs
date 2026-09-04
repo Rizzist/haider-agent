@@ -53,6 +53,56 @@ fn provider_with_resolver(address: SocketAddr) -> GeminiProvider {
     .expect("constructs Gemini provider")
 }
 
+#[tokio::test]
+async fn gemini_request_has_locked_correlation_headers_without_body_mutation() {
+    let provider = provider_with_resolver(SocketAddr::from(([93, 184, 216, 34], 443)));
+    let payload = serde_json::json!({"contents":[]});
+    let baseline = provider
+        .request_body(payload.clone())
+        .await
+        .expect("baseline request");
+    let attempt = haider_protocol::cache::ProviderRequestAttemptV1 {
+        session_id: haider_protocol::ids::SessionId::new("session-gemini"),
+        run_id: haider_protocol::ids::RunId::new("run-gemini"),
+        turn_ordinal: 5,
+        request_ordinal: 1,
+        request_kind: haider_protocol::cache::ProviderRequestKind::Primary,
+    };
+    let correlated = crate::scope_provider_request(
+        attempt,
+        crate::RequestMetadataBodySupport::Unsupported,
+        provider.request_body(payload),
+    )
+    .await
+    .expect("correlated request");
+    assert_eq!(
+        correlated.headers()[crate::HAIDER_TURN_HEADER],
+        "session-gemini/run-gemini/5/1"
+    );
+    assert_eq!(
+        correlated.headers()[crate::HAIDER_REQUEST_KIND_HEADER],
+        "primary"
+    );
+    assert_eq!(
+        baseline.body().unwrap().as_bytes(),
+        correlated.body().unwrap().as_bytes()
+    );
+    let expected_body = correlated.body().unwrap().as_bytes().unwrap().to_vec();
+    let ledger = crate::capture_in_fake_proxy_ledger(correlated).await;
+    assert_eq!(
+        ledger.headers.get("x-haider-turn").map(String::as_str),
+        Some("session-gemini/run-gemini/5/1")
+    );
+    assert_eq!(
+        ledger
+            .headers
+            .get("x-haider-request-kind")
+            .map(String::as_str),
+        Some("primary")
+    );
+    assert_eq!(ledger.body, expected_body);
+}
+
 #[test]
 fn constructor_transport_config_disables_retries_and_pins_all_timeouts() {
     let config = GeminiProvider::transport_config();

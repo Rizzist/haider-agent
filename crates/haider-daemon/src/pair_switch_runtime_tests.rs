@@ -1881,7 +1881,7 @@ async fn consumed_before_start_recovers_and_delivers_after_the_crash_boundary() 
         .expect("install manager");
     manager
         .handle()
-        .recover_queued(queued)
+        .recover_queued(queued, 0)
         .await
         .expect("recovery handoff");
     timeout(Duration::from_secs(10), async {

@@ -38,8 +38,9 @@ mod webfetch_tests;
 mod wire;
 
 use async_trait::async_trait;
+use haider_protocol::cache::{ProviderRequestAttemptV1, ProviderRequestKind};
 use haider_protocol::error::{ErrorAction, ErrorPresentation, ErrorScope};
-use haider_protocol::ids::ArtifactRef;
+use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_protocol::item::ToolStatus;
 use haider_protocol::provider::{
     Block, CapabilityDoc, FeatureResolve, FinishReason, PrefixDigests, StreamEvent, Usage,
@@ -50,7 +51,7 @@ use haider_protocol::tool::{
 };
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error as _;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,6 +66,46 @@ use tokio::time::{Duration, Instant, sleep};
 /// clocks and is never sampled, moved, or suspended here.
 pub const ROUTE_STATE_POLL_INTERVAL: Duration = haider_platform::ROUTE_STATUS_CACHE_TTL;
 
+/// Locked AHRB request-correlation header names.
+pub const HAIDER_TURN_HEADER: &str = "X-Haider-Turn";
+pub const HAIDER_REQUEST_KIND_HEADER: &str = "X-Haider-Request-Kind";
+
+/// Shared physical-attempt allocator for every provider request owned by one
+/// durable turn. Compaction and auxiliary tool-support paths clone the same
+/// instance, so their ordinals cannot collide with the main actor loop.
+#[derive(Debug, Clone)]
+pub struct ProviderRequestOrdinal {
+    current: Arc<AtomicU64>,
+}
+
+impl ProviderRequestOrdinal {
+    #[must_use]
+    pub fn new(already_made: u64) -> Self {
+        Self {
+            current: Arc::new(AtomicU64::new(already_made)),
+        }
+    }
+
+    pub fn next(&self) -> Result<u64, ProviderError> {
+        self.current
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map(|previous| previous + 1)
+            .map_err(|_| {
+                ProviderError::new(
+                    ProviderErrorKind::Internal,
+                    "provider request ordinal space is exhausted",
+                )
+            })
+    }
+
+    #[must_use]
+    pub fn current(&self) -> u64 {
+        self.current.load(Ordering::Relaxed)
+    }
+}
+
 /// Process-local opt-in gate shared by every instrumentation layer. Keeping
 /// this one cached branch ahead of task-local, registry, and batch scans makes
 /// the normal trace-off path allocation- and clock-free.
@@ -78,8 +119,7 @@ pub fn turn_trace_enabled() -> bool {
 
 /// Content-free timing identity shared by one accepted turn and its provider
 /// decoder tasks. The context exists only when the daemon's audited
-/// `haider.turn` subscriber is enabled; request bodies, run IDs, and session
-/// IDs never enter the trace record.
+/// `haider.turn` subscriber is enabled.
 #[derive(Debug, Clone)]
 pub struct TurnTraceContext {
     inner: Arc<TurnTraceInner>,
@@ -87,23 +127,29 @@ pub struct TurnTraceContext {
 
 #[derive(Debug)]
 struct TurnTraceInner {
+    session_id: SessionId,
+    run_id: RunId,
     turn_ordinal: u64,
     accepted_at: Instant,
     next_txn_ordinal: AtomicU64,
     txn_ordinals: Mutex<HashMap<String, u64>>,
-    first_byte_requests: AtomicU64,
+    request_kinds: Mutex<HashMap<u64, ProviderRequestKind>>,
+    first_byte_requests: Mutex<HashSet<u64>>,
 }
 
 impl TurnTraceContext {
     #[must_use]
-    pub fn new(turn_ordinal: u64) -> Self {
+    pub fn new(session_id: SessionId, run_id: RunId, turn_ordinal: u64) -> Self {
         Self {
             inner: Arc::new(TurnTraceInner {
+                session_id,
+                run_id,
                 turn_ordinal,
                 accepted_at: Instant::now(),
                 next_txn_ordinal: AtomicU64::new(1),
                 txn_ordinals: Mutex::new(HashMap::new()),
-                first_byte_requests: AtomicU64::new(0),
+                request_kinds: Mutex::new(HashMap::new()),
+                first_byte_requests: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -133,6 +179,19 @@ impl TurnTraceContext {
         ordinal
     }
 
+    /// Registers the exact request identity before its durable attempt marker
+    /// and transport open. Trace records then reuse the same kind and tuple.
+    pub fn register_request(&self, request: &ProviderRequestAttemptV1) {
+        debug_assert_eq!(self.inner.session_id, request.session_id);
+        debug_assert_eq!(self.inner.run_id, request.run_id);
+        debug_assert_eq!(self.inner.turn_ordinal, request.turn_ordinal);
+        self.inner
+            .request_kinds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(request.request_ordinal, request.request_kind);
+    }
+
     pub fn emit(
         &self,
         phase: &'static str,
@@ -141,9 +200,27 @@ impl TurnTraceContext {
         start_us_from_accept: u64,
         end_us_from_accept: u64,
     ) {
+        let request_kind = self
+            .inner
+            .request_kinds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&request_ordinal)
+            .copied()
+            .map_or("", ProviderRequestKind::as_str);
+        let turn_id = (request_ordinal != 0).then(|| {
+            format!(
+                "{}/{}/{}/{}",
+                self.inner.session_id, self.inner.run_id, self.inner.turn_ordinal, request_ordinal
+            )
+        });
         tracing::trace!(
             target: "haider.turn",
             phase,
+            session_id = self.inner.session_id.as_str(),
+            run_id = self.inner.run_id.as_str(),
+            turn_id = turn_id.as_deref().unwrap_or(""),
+            request_kind,
             turn_ordinal = self.inner.turn_ordinal,
             request_ordinal,
             txn_ordinal,
@@ -158,17 +235,12 @@ impl TurnTraceContext {
     /// HTTP adapters call this before decoding; core calls the same method as
     /// the compatibility fallback for injected providers.
     pub fn emit_first_byte(&self, request_ordinal: u64) {
-        let bit = request_ordinal
-            .checked_sub(1)
-            .filter(|ordinal| *ordinal < u64::BITS.into())
-            .map(|ordinal| 1_u64 << ordinal);
-        if let Some(bit) = bit
-            && self
-                .inner
-                .first_byte_requests
-                .fetch_or(bit, Ordering::Relaxed)
-                & bit
-                != 0
+        if !self
+            .inner
+            .first_byte_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(request_ordinal)
         {
             return;
         }
@@ -2210,6 +2282,36 @@ tokio::task_local! {
     static TURN_TRACE_CONTEXT: Option<(TurnTraceContext, u64)>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestMetadataBodySupport {
+    Unsupported,
+    Supported,
+}
+
+#[async_trait]
+pub trait ProviderRequestAttemptRecorder: Send + Sync + fmt::Debug {
+    /// Durably allocates an auxiliary physical request before its HTTP send.
+    async fn record_auxiliary_attempt(
+        &self,
+        request_kind: ProviderRequestKind,
+    ) -> Result<ProviderRequestAttemptV1, ProviderError>;
+}
+
+#[derive(Clone)]
+struct ProviderRequestContext {
+    attempt: ProviderRequestAttemptV1,
+    mirror_body: bool,
+    auxiliary_recorder: Option<Arc<dyn ProviderRequestAttemptRecorder>>,
+}
+
+tokio::task_local! {
+    static PROVIDER_REQUEST_CONTEXT: Option<ProviderRequestContext>;
+}
+
+tokio::task_local! {
+    static AUXILIARY_PROVIDER_REQUEST_RECORDER: Option<Arc<dyn ProviderRequestAttemptRecorder>>;
+}
+
 tokio::task_local! {
     static PROVIDER_REQUEST_DEADLINE: Option<Instant>;
 }
@@ -2223,6 +2325,183 @@ pub(crate) fn take_prepared_wire_payload() -> Option<PreparedWire> {
 
 pub(crate) fn current_turn_trace_context() -> Option<(TurnTraceContext, u64)> {
     TURN_TRACE_CONTEXT.try_with(Clone::clone).ok().flatten()
+}
+
+fn body_metadata_mirror_opted_in() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("HAIDER_PROVIDER_BODY_METADATA").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Runs one turn-owned provider open with its immutable transport identity.
+/// The scope is independent of optional timing trace state.
+#[doc(hidden)]
+pub async fn scope_provider_request<T>(
+    attempt: ProviderRequestAttemptV1,
+    body_support: RequestMetadataBodySupport,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    let mirror_body =
+        body_support == RequestMetadataBodySupport::Supported && body_metadata_mirror_opted_in();
+    scope_provider_request_inner(attempt, mirror_body, None, future).await
+}
+
+/// Runs a turn-owned provider open whose adapter may issue separately
+/// journaled auxiliary HTTP requests (for example Gemini cache resources).
+#[doc(hidden)]
+pub async fn scope_provider_request_with_recorder<T>(
+    attempt: ProviderRequestAttemptV1,
+    body_support: RequestMetadataBodySupport,
+    auxiliary_recorder: Arc<dyn ProviderRequestAttemptRecorder>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    let mirror_body =
+        body_support == RequestMetadataBodySupport::Supported && body_metadata_mirror_opted_in();
+    scope_provider_request_inner(attempt, mirror_body, Some(auxiliary_recorder), future).await
+}
+
+/// Supplies a durable auxiliary-attempt recorder to turn startup work that
+/// can conditionally issue provider HTTP without a surrounding model request.
+#[doc(hidden)]
+pub async fn scope_auxiliary_provider_request_recorder<T>(
+    auxiliary_recorder: Arc<dyn ProviderRequestAttemptRecorder>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    AUXILIARY_PROVIDER_REQUEST_RECORDER
+        .scope(Some(auxiliary_recorder), future)
+        .await
+}
+
+async fn scope_provider_request_inner<T>(
+    attempt: ProviderRequestAttemptV1,
+    mirror_body: bool,
+    auxiliary_recorder: Option<Arc<dyn ProviderRequestAttemptRecorder>>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    let context = ProviderRequestContext {
+        attempt,
+        mirror_body,
+        auxiliary_recorder,
+    };
+    PROVIDER_REQUEST_CONTEXT.scope(Some(context), future).await
+}
+
+#[cfg(test)]
+async fn scope_provider_request_with_explicit_mirror_for_test<T>(
+    attempt: ProviderRequestAttemptV1,
+    mirror_body: bool,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    scope_provider_request_inner(attempt, mirror_body, None, future).await
+}
+
+/// Allocates and journals a fresh identity for an auxiliary HTTP request made
+/// inside a provider adapter. Outside a daemon-owned turn there is no recorder
+/// and the operation remains an uncorrelated control-plane request.
+pub(crate) async fn record_auxiliary_provider_request(
+    request_kind: ProviderRequestKind,
+) -> Result<Option<ProviderRequestAttemptV1>, ProviderError> {
+    if request_kind == ProviderRequestKind::Primary {
+        return Err(ProviderError::new(
+            ProviderErrorKind::Internal,
+            "an auxiliary provider request cannot be classified as primary",
+        ));
+    }
+    let recorder = PROVIDER_REQUEST_CONTEXT
+        .try_with(|context| {
+            context
+                .as_ref()
+                .and_then(|context| context.auxiliary_recorder.clone())
+        })
+        .ok()
+        .flatten()
+        .or_else(|| {
+            AUXILIARY_PROVIDER_REQUEST_RECORDER
+                .try_with(Clone::clone)
+                .ok()
+                .flatten()
+        });
+    match recorder {
+        Some(recorder) => recorder
+            .record_auxiliary_attempt(request_kind)
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Applies the two locked correlation headers to the current turn-owned HTTP
+/// request. Control-plane requests outside a turn have no context and remain
+/// unchanged.
+pub(crate) fn apply_provider_request_headers(
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::RequestBuilder, ProviderError> {
+    let context = PROVIDER_REQUEST_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
+    let Some(context) = context else {
+        return Ok(request);
+    };
+    apply_provider_request_headers_for(request, &context.attempt)
+}
+
+/// Applies the locked headers for a turn-owned auxiliary HTTP request whose
+/// transport does not implement [`Provider`]. The caller must durably record
+/// this same attempt before sending.
+#[doc(hidden)]
+pub fn apply_provider_request_headers_for(
+    request: reqwest::RequestBuilder,
+    attempt: &ProviderRequestAttemptV1,
+) -> Result<reqwest::RequestBuilder, ProviderError> {
+    if !attempt.coordinates_valid() {
+        return Err(ProviderError::new(
+            ProviderErrorKind::Internal,
+            "turn correlation coordinates are invalid or ambiguous",
+        ));
+    }
+    let turn =
+        reqwest::header::HeaderValue::from_bytes(attempt.turn_id().as_bytes()).map_err(|_| {
+            ProviderError::new(
+                ProviderErrorKind::Internal,
+                "turn correlation is not a valid HTTP header value",
+            )
+        })?;
+    Ok(request
+        .header(HAIDER_TURN_HEADER, turn)
+        .header(HAIDER_REQUEST_KIND_HEADER, attempt.request_kind.as_str()))
+}
+
+/// Mirrors correlation into a declared-compatible JSON `metadata` object
+/// only when the operator explicitly opts in. Strict adapters never call
+/// this helper with support enabled.
+pub(crate) fn mirror_provider_request_metadata(payload: &mut serde_json::Value) {
+    let context = PROVIDER_REQUEST_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
+    let Some(context) = context.filter(|context| context.mirror_body) else {
+        return;
+    };
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    let metadata = object
+        .entry("metadata")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(metadata) = metadata.as_object_mut() else {
+        return;
+    };
+    metadata.insert(
+        "haider_turn".to_owned(),
+        serde_json::Value::String(context.attempt.turn_id()),
+    );
+    metadata.insert(
+        "haider_request_kind".to_owned(),
+        serde_json::Value::String(context.attempt.request_kind.as_str().to_owned()),
+    );
 }
 
 pub(crate) async fn scope_prepared_wire<T>(
@@ -2847,6 +3126,12 @@ pub trait Provider: Send + Sync {
         haider_protocol::provider::UsageLaneDimensions::default()
     }
 
+    /// Whether this exact adapter schema accepts the opt-in top-level
+    /// correlation `metadata` mirror. Headers remain enabled independently.
+    fn request_metadata_body_support(&self) -> RequestMetadataBodySupport {
+        RequestMetadataBodySupport::Unsupported
+    }
+
     /// Returns non-secret hashes of the exact adapter-rendered stable
     /// components. `None` retains the normalized CM1 hashes for injected or
     /// unknown providers.
@@ -2904,6 +3189,14 @@ pub trait Provider: Send + Sync {
     /// connection. Disabled unless `HAIDER_PROVIDER_PREWARM=1`; failures are
     /// deliberately advisory and cannot change turn admission or request
     /// bytes.
+    ///
+    /// The claim is process-wide per endpoint so the caller can durably
+    /// allocate and record a `warmup` physical-request identity only when an
+    /// HTTP request will actually be attempted.
+    fn claim_prewarm(&self) -> bool {
+        false
+    }
+
     async fn prewarm(&self) {}
 
     async fn capabilities(&self) -> CapabilityDoc;
@@ -2929,20 +3222,109 @@ pub trait Provider: Send + Sync {
     }
 }
 
-pub(crate) async fn optional_http_prewarm(client: &reqwest::Client, endpoint: &str) {
+pub(crate) fn claim_optional_http_prewarm(endpoint: &str) -> bool {
     static PREWARMED_ENDPOINTS: OnceLock<Mutex<std::collections::HashSet<String>>> =
         OnceLock::new();
     if std::env::var_os("HAIDER_PROVIDER_PREWARM").as_deref() != Some(std::ffi::OsStr::new("1")) {
-        return;
+        return false;
     }
-    let first = PREWARMED_ENDPOINTS
+    PREWARMED_ENDPOINTS
         .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
         .lock()
-        .is_ok_and(|mut endpoints| endpoints.insert(endpoint.to_owned()));
-    if !first {
+        .is_ok_and(|mut endpoints| endpoints.insert(endpoint.to_owned()))
+}
+
+pub(crate) async fn optional_http_prewarm(client: &reqwest::Client, endpoint: &str) {
+    let Ok(request) = apply_provider_request_headers(client.head(endpoint)) else {
         return;
-    }
-    let _ = tokio::time::timeout(Duration::from_secs(3), client.head(endpoint).send()).await;
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(3), request.send()).await;
+}
+
+#[cfg(test)]
+pub(crate) struct FakeProxyLedgerRow {
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) body: Vec<u8>,
+}
+
+/// Sends an adapter-built request through a real loopback HTTP listener and
+/// returns the proxy's wire ledger row. Only the destination URL is replaced;
+/// the adapter-authored method, headers, and body are sent unchanged.
+#[cfg(test)]
+pub(crate) async fn capture_in_fake_proxy_ledger(
+    mut request: reqwest::Request,
+) -> FakeProxyLedgerRow {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind fake provider proxy");
+    let address = listener.local_addr().expect("fake provider proxy address");
+    let path = request.url().path().to_owned();
+    let query = request
+        .url()
+        .query()
+        .map_or_else(String::new, |query| format!("?{query}"));
+    *request.url_mut() = format!("http://{address}{path}{query}")
+        .parse()
+        .expect("loopback proxy URL");
+    let ledger = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept provider request");
+        let mut bytes = Vec::with_capacity(8192);
+        let mut chunk = [0_u8; 4096];
+        let (header_end, content_length) = loop {
+            let read = socket
+                .read(&mut chunk)
+                .await
+                .expect("read provider request");
+            assert_ne!(read, 0, "provider request ended before headers");
+            bytes.extend_from_slice(&chunk[..read]);
+            if let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                let header_end = header_end + 4;
+                let header_text = String::from_utf8_lossy(&bytes[..header_end]);
+                let content_length = header_text
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                break (header_end, content_length);
+            }
+        };
+        while bytes.len() < header_end.saturating_add(content_length) {
+            let read = socket.read(&mut chunk).await.expect("read provider body");
+            assert_ne!(read, 0, "provider request body ended early");
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        socket
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("reply to provider request");
+        let header_text = String::from_utf8_lossy(&bytes[..header_end]);
+        let headers = header_text
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                Some((name.to_ascii_lowercase(), value.trim().to_owned()))
+            })
+            .collect();
+        FakeProxyLedgerRow {
+            headers,
+            body: bytes[header_end..header_end + content_length].to_vec(),
+        }
+    });
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("fake proxy client")
+        .execute(request)
+        .await
+        .expect("send request through fake proxy");
+    ledger.await.expect("fake proxy ledger task")
 }
 
 /// One deterministic operation in a [`FakeProvider`] fixture.
@@ -3610,10 +3992,106 @@ mod e2_contract_tests {
 
     #[test]
     fn turn_trace_transaction_ordinal_is_shared_by_batch_identity() {
-        let trace = TurnTraceContext::new(7);
+        let trace =
+            TurnTraceContext::new(SessionId::new("trace-session"), RunId::new("trace-run"), 7);
         assert_eq!(trace.txn_ordinal_for("event-a"), 1);
         assert_eq!(trace.txn_ordinal_for("event-a"), 1);
         assert_eq!(trace.txn_ordinal_for("event-b"), 2);
+    }
+
+    fn request_attempt(kind: ProviderRequestKind) -> ProviderRequestAttemptV1 {
+        ProviderRequestAttemptV1 {
+            session_id: SessionId::new("session-a"),
+            run_id: RunId::new("run-b"),
+            turn_ordinal: 3,
+            request_ordinal: 4,
+            request_kind: kind,
+        }
+    }
+
+    #[test]
+    fn provider_request_identity_has_locked_shape_and_rejects_ambiguous_coordinates() {
+        let attempt = request_attempt(ProviderRequestKind::Primary);
+        assert!(attempt.coordinates_valid());
+        assert_eq!(attempt.turn_id(), "session-a/run-b/3/4");
+        assert!(
+            !ProviderRequestAttemptV1 {
+                session_id: SessionId::new("session/a"),
+                ..attempt.clone()
+            }
+            .coordinates_valid()
+        );
+        assert!(
+            !ProviderRequestAttemptV1 {
+                turn_ordinal: 0,
+                ..attempt
+            }
+            .coordinates_valid()
+        );
+    }
+
+    #[tokio::test]
+    async fn body_metadata_mirror_is_explicit_and_keeps_default_body_unchanged() {
+        let attempt = request_attempt(ProviderRequestKind::Side);
+        let original = serde_json::json!({"model":"gpt-test","input":[]});
+        let mut default_body = original.clone();
+        scope_provider_request_with_explicit_mirror_for_test(attempt.clone(), false, async {
+            mirror_provider_request_metadata(&mut default_body)
+        })
+        .await;
+        assert_eq!(default_body, original);
+
+        let mut opted_in = original;
+        scope_provider_request_with_explicit_mirror_for_test(attempt, true, async {
+            mirror_provider_request_metadata(&mut opted_in);
+        })
+        .await;
+        assert_eq!(opted_in["metadata"]["haider_turn"], "session-a/run-b/3/4");
+        assert_eq!(opted_in["metadata"]["haider_request_kind"], "side");
+    }
+
+    #[tokio::test]
+    async fn explicit_prewarm_uses_a_warmup_wire_identity() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind prewarm ledger");
+        let address = listener.local_addr().expect("prewarm ledger address");
+        let ledger = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept prewarm request");
+            let mut bytes = vec![0_u8; 4096];
+            let read = socket.read(&mut bytes).await.expect("read prewarm request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("reply to prewarm request");
+            String::from_utf8(bytes[..read].to_vec()).expect("HTTP request is utf8")
+        });
+        let attempt = ProviderRequestAttemptV1 {
+            session_id: SessionId::new("session-warm"),
+            run_id: RunId::new("run-warm"),
+            turn_ordinal: 5,
+            request_ordinal: 1,
+            request_kind: ProviderRequestKind::Warmup,
+        };
+        scope_provider_request(
+            attempt,
+            RequestMetadataBodySupport::Unsupported,
+            optional_http_prewarm(
+                &reqwest::Client::new(),
+                &format!("http://{address}/v1/models"),
+            ),
+        )
+        .await;
+        let request = ledger
+            .await
+            .expect("prewarm ledger task")
+            .to_ascii_lowercase();
+        assert!(request.contains("x-haider-turn: session-warm/run-warm/5/1\r\n"));
+        assert!(request.contains("x-haider-request-kind: warmup\r\n"));
     }
 
     #[tokio::test]
