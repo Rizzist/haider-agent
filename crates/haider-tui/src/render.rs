@@ -2190,6 +2190,85 @@ fn push_account_add_buttons<'a>(
     }
 }
 
+fn account_source_health(source: &crate::app::AccountSourceRow) -> String {
+    match source.health.as_str() {
+        "ready" => "ready".to_owned(),
+        "source_gone" => "unlinked (source gone)".to_owned(),
+        "requires_origin_client" => format!(
+            "not readable without {}",
+            match source.refresh_owner.as_str() {
+                "codex" => "Codex",
+                "claude_code" => "Claude Code",
+                _ => "origin client",
+            }
+        ),
+        "unreadable" => "unreadable".to_owned(),
+        "invalid" => "invalid source".to_owned(),
+        "expired" => "expired · relogin required".to_owned(),
+        "revoked" => "revoked · relogin required".to_owned(),
+        other => other.replace('_', " "),
+    }
+}
+
+fn account_source_style(
+    theme: &Theme,
+    source: &crate::app::AccountSourceRow,
+) -> ratatui::style::Style {
+    match source.health.as_str() {
+        "ready" => theme.ok_style(),
+        "source_gone" | "expired" | "revoked" | "invalid" => theme.err_style(),
+        "requires_origin_client" | "unreadable" => theme.warn_style(),
+        _ => theme.dim_style(),
+    }
+}
+
+fn push_account_source_lines<'a>(
+    source: &'a crate::app::AccountSourceRow,
+    linked: bool,
+    theme: &Theme,
+    lines: &mut Vec<Line<'a>>,
+) {
+    let kind = source.kind.replace('_', " ");
+    let store = source.credential_store.replace('_', " ");
+    let owner = source.refresh_owner.replace('_', " ");
+    lines.push(Line::from(vec![
+        Span::styled(format!("    [{kind}] "), theme.gold_style()),
+        Span::styled(source.label.clone(), theme.bright_style()),
+        Span::styled(
+            format!(" · {store} · refresh: {owner} · "),
+            theme.dim_style(),
+        ),
+        Span::styled(
+            account_source_health(source),
+            account_source_style(theme, source),
+        ),
+    ]));
+    let identity = source
+        .masked_identity
+        .as_deref()
+        .unwrap_or("identity unknown");
+    let plan = source.plan.as_deref().unwrap_or("plan unknown");
+    let refreshed = source.last_refreshed_at_ms.map_or_else(
+        || "refreshed unknown".to_owned(),
+        |timestamp| format!("refreshed {}", calendar_instant(timestamp).1),
+    );
+    let expires = source.access_expires_at_ms.map_or_else(
+        || "expires unknown".to_owned(),
+        |timestamp| format!("expires {}", calendar_instant(timestamp).1),
+    );
+    let seen = source.last_seen_at_ms.map_or_else(
+        || "seen unknown".to_owned(),
+        |timestamp| format!("seen {}", calendar_instant(timestamp).1),
+    );
+    lines.push(Line::styled(
+        format!(
+            "      {identity} · {plan} · {refreshed} · {expires} · {seen}{}",
+            if linked { "" } else { " · account not linked" }
+        ),
+        theme.dim_style(),
+    ));
+}
+
 fn render_accounts(
     model: &AppModel,
     theme: &Theme,
@@ -2293,6 +2372,18 @@ fn render_accounts(
                         CredentialAttentionReason::KeychainUnavailable => {
                             "needs attention — keychain unavailable · retry refresh or re-link"
                         }
+                        CredentialAttentionReason::SourceGone => {
+                            "needs attention — source gone · re-link or remove"
+                        }
+                        CredentialAttentionReason::SourceUnreadable => {
+                            "needs attention — source unreadable · check permissions or re-link"
+                        }
+                        CredentialAttentionReason::OriginClientRequired => {
+                            "needs attention — origin client required · refresh in the origin client"
+                        }
+                        CredentialAttentionReason::PolicyBlocked => {
+                            "needs attention — policy blocked · use a supported credential"
+                        }
                     }
                     .to_owned()
                 }
@@ -2356,6 +2447,41 @@ fn render_accounts(
             }
             line_hits.push((lines.len(), row_hit));
             lines.push(line);
+            for source in model.accounts.sources.iter().filter(|source| {
+                source
+                    .account_alias
+                    .as_ref()
+                    .is_some_and(|alias| alias.as_str() == row.alias)
+            }) {
+                push_account_source_lines(source, true, theme, &mut lines);
+            }
+        }
+    }
+
+    let unlinked = model
+        .accounts
+        .sources
+        .iter()
+        .filter(|source| {
+            source.account_alias.as_ref().is_none_or(|alias| {
+                !model
+                    .accounts
+                    .rows
+                    .iter()
+                    .any(|row| row.alias == alias.as_str())
+            })
+        })
+        .collect::<Vec<_>>();
+    if !unlinked.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "ENROLLED SOURCES — without a linked account",
+            theme
+                .bright_style()
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ));
+        for source in unlinked {
+            push_account_source_lines(source, false, theme, &mut lines);
         }
     }
 
@@ -3224,6 +3350,460 @@ fn usage_bar_style(theme: &Theme, utilization: f64) -> ratatui::style::Style {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CalendarResetKind {
+    FiveHour,
+    Weekly,
+}
+
+impl CalendarResetKind {
+    const fn marker(self) -> char {
+        match self {
+            Self::FiveHour => '5',
+            Self::Weekly => 'W',
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::FiveHour => "5h",
+            Self::Weekly => "weekly",
+        }
+    }
+}
+
+/// Pick only provider-published windows whose names have a defined meaning.
+/// In particular, this never derives a reset by adding five hours or seven
+/// days: a missing canonical window/reset stays `reset unknown`.
+fn calendar_reset_window(
+    account: &haider_protocol::usage::AccountUsageReportV1,
+    kind: CalendarResetKind,
+) -> Option<&haider_protocol::usage::UsageWindowV1> {
+    let haider_protocol::usage::AccountMeterStateV1::Metered { windows } = &account.meter else {
+        return None;
+    };
+    let provider = account.provider.to_ascii_lowercase();
+    let names: &[&str] = match (provider.as_str(), kind) {
+        (provider, CalendarResetKind::FiveHour) if provider.starts_with("anthropic") => {
+            &["five_hour"]
+        }
+        (provider, CalendarResetKind::Weekly) if provider.starts_with("anthropic") => {
+            &["seven_day"]
+        }
+        (provider, CalendarResetKind::FiveHour)
+            if provider.starts_with("openai") || provider.contains("codex") =>
+        {
+            &["5h", "five_hour"]
+        }
+        (provider, CalendarResetKind::Weekly)
+            if provider.starts_with("openai") || provider.contains("codex") =>
+        {
+            &["weekly", "seven_day"]
+        }
+        _ => return None,
+    };
+    // OpenAI can publish identically sized named per-model windows. Only an
+    // unlabeled provider window is account-wide; even a lone labeled window
+    // is not a safe account reset and must stay unknown.
+    windows
+        .iter()
+        .find(|window| window.label.is_none() && names.contains(&window.window.as_str()))
+}
+
+fn calendar_account_marker(index: usize) -> String {
+    u8::try_from(index)
+        .ok()
+        .filter(|index| *index < 26)
+        .map_or_else(
+            || (index + 1).to_string(),
+            |index| char::from(b'a' + index).to_string(),
+        )
+}
+
+fn calendar_month_name(month: u32) -> &'static str {
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    month
+        .checked_sub(1)
+        .and_then(|month| usize::try_from(month).ok())
+        .and_then(|month| MONTHS.get(month))
+        .copied()
+        .unwrap_or("Unknown")
+}
+
+fn calendar_days_in_month(year: i64, month: u32) -> u32 {
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let first = crate::format::days_from_civil(year, month, 1);
+    let next = crate::format::days_from_civil(next_year, next_month, 1);
+    u32::try_from(next.saturating_sub(first)).unwrap_or(31)
+}
+
+fn calendar_instant(timestamp_ms: u64) -> (i64, String) {
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let seconds = timestamp_ms / 1_000;
+    let day = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX);
+    let seconds_in_day = seconds % 86_400;
+    let hour = seconds_in_day / 3_600;
+    let minute = (seconds_in_day % 3_600) / 60;
+    let (year, month, date) = crate::format::civil_from_days(day);
+    let weekday = WEEKDAYS[crate::format::weekday_from_days(day) as usize];
+    (
+        day,
+        format!(
+            "{weekday} {date:02} {} {year:04} · {hour:02}:{minute:02} UTC",
+            calendar_month_name(month)
+        ),
+    )
+}
+
+fn calendar_compact_instant(timestamp_ms: u64, calendar_year: i64) -> String {
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let seconds = timestamp_ms / 1_000;
+    let day = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX);
+    let seconds_in_day = seconds % 86_400;
+    let hour = seconds_in_day / 3_600;
+    let minute = (seconds_in_day % 3_600) / 60;
+    let (year, month, date) = crate::format::civil_from_days(day);
+    let weekday = WEEKDAYS[crate::format::weekday_from_days(day) as usize];
+    let year = if year == calendar_year {
+        String::new()
+    } else {
+        format!(" '{:02}", year.rem_euclid(100))
+    };
+    format!(
+        "{weekday} {date:02} {}{year} {hour:02}:{minute:02}",
+        &calendar_month_name(month)[..3]
+    )
+}
+
+/// Provider reset calendar. The report timestamp is the sole `today`
+/// authority, so a frozen RPC fixture produces byte-for-byte stable dates in
+/// every timezone. The grid includes the whole report month and at least the
+/// next fourteen UTC days even when today is at month end.
+fn render_usage_calendar(
+    model: &AppModel,
+    theme: &Theme,
+    area_width: u16,
+    lines: &mut Vec<Line<'_>>,
+    header_lines: &mut Vec<usize>,
+) {
+    use haider_protocol::usage::AccountMeterStateV1;
+
+    let Some(report) = &model.usage.report else {
+        if !model.usage.fetching && model.usage.error.is_none() {
+            lines.push(Line::styled(
+                "  no usage snapshot yet — reset calendar unavailable",
+                theme.dim_style(),
+            ));
+        }
+        return;
+    };
+
+    let groups = model.usage.groups();
+    let mut visible_slots = groups
+        .iter()
+        .flat_map(|group| group.accounts.iter().copied())
+        .collect::<Vec<_>>();
+    visible_slots.sort_unstable();
+    visible_slots.dedup();
+    if visible_slots.is_empty() {
+        lines.push(Line::styled(
+            if report.accounts.is_empty() {
+                "  no accounts known — /login adds one".to_owned()
+            } else {
+                format!(
+                    "  no accounts match \"{}\" — bare /usage clears the filter",
+                    model.usage.filter.as_deref().unwrap_or_default()
+                )
+            },
+            theme.dim_style(),
+        ));
+        return;
+    }
+
+    let generated_seconds = report.generated_at_ms / 1_000;
+    let today = i64::try_from(generated_seconds / 86_400).unwrap_or(i64::MAX);
+    let (year, month, today_date) = crate::format::civil_from_days(today);
+    let month_start = crate::format::days_from_civil(year, month, 1);
+    let grid_start = month_start - i64::from(crate::format::weekday_from_days(month_start));
+    let month_end = month_start + i64::from(calendar_days_in_month(year, month)) - 1;
+    let required_end = month_end.max(today.saturating_add(14));
+    let grid_end = required_end
+        + i64::from(6_u32.saturating_sub(crate::format::weekday_from_days(required_end)));
+
+    let selected_slot = groups
+        .get(model.usage.cursor.min(groups.len().saturating_sub(1)))
+        .and_then(|group| group.accounts.get(model.usage.selected_tab(group)))
+        .copied();
+    let mut events = Vec::new();
+    for &slot in &visible_slots {
+        let Some(account) = report.accounts.get(slot) else {
+            continue;
+        };
+        for kind in [CalendarResetKind::FiveHour, CalendarResetKind::Weekly] {
+            let Some(reset) =
+                calendar_reset_window(account, kind).and_then(|window| window.resets_at_ms)
+            else {
+                continue;
+            };
+            let (day, _) = calendar_instant(reset);
+            events.push((day, slot, kind));
+        }
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {} {year:04}", calendar_month_name(month)),
+            theme
+                .bright_style()
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::styled(
+            " · UTC reset calendar · provider timestamps only",
+            theme.dim_style(),
+        ),
+    ]));
+    lines.push(Line::styled(
+        format!(
+            "  [{today_date:02}] today · a5 five-hour · aW weekly · letters map to every account below"
+        ),
+        theme.dim_style(),
+    ));
+    lines.push(Line::raw(""));
+
+    let cell_width = usize::from(area_width.saturating_sub(2) / 7).max(7);
+    let mut weekday_line = vec![Span::raw("  ")];
+    for name in ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] {
+        weekday_line.push(Span::styled(
+            format!("{name:<cell_width$}"),
+            theme.dim_style(),
+        ));
+    }
+    lines.push(Line::from(weekday_line));
+
+    let mut week_start = grid_start;
+    while week_start <= grid_end {
+        let mut week = vec![Span::raw("  ")];
+        for offset in 0_i64..7 {
+            let day = week_start + offset;
+            let (_, cell_month, date) = crate::format::civil_from_days(day);
+            let markers = events
+                .iter()
+                .filter(|(event_day, _, _)| *event_day == day)
+                .filter_map(|(_, slot, kind)| {
+                    let visible_index = visible_slots
+                        .iter()
+                        .position(|candidate| candidate == slot)?;
+                    Some(format!(
+                        "{}{}",
+                        calendar_account_marker(visible_index),
+                        kind.marker()
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let date = if day == today {
+                format!("[{date:02}]")
+            } else {
+                format!(" {date:02} ")
+            };
+            let cell = ellipsize(
+                &if markers.is_empty() {
+                    date
+                } else {
+                    format!("{date} {markers}")
+                },
+                cell_width,
+            );
+            let style = if day == today {
+                theme
+                    .gold_style()
+                    .bg(theme.gold_soft.into())
+                    .add_modifier(ratatui::style::Modifier::BOLD)
+            } else if events.iter().any(|(event_day, _, _)| *event_day == day) {
+                theme.gold_style()
+            } else if cell_month == month {
+                theme.text_style()
+            } else {
+                theme.faint_style()
+            };
+            week.push(Span::styled(format!("{cell:<cell_width$}"), style));
+        }
+        lines.push(Line::from(week));
+        week_start += 7;
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  RESET MARKERS",
+            theme
+                .bright_style()
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::styled(
+            " — exact meter fields · unknown is never inferred",
+            theme.dim_style(),
+        ),
+    ]));
+    let mut account_lines = vec![None; report.accounts.len()];
+    if area_width < 100 {
+        for (visible_index, &slot) in visible_slots.iter().enumerate() {
+            let Some(account) = report.accounts.get(slot) else {
+                continue;
+            };
+            account_lines[slot] = Some(lines.len());
+            let marker = calendar_account_marker(visible_index);
+            let selected = selected_slot == Some(slot);
+            let reset = |kind: CalendarResetKind| {
+                calendar_reset_window(account, kind)
+                    .and_then(|window| window.resets_at_ms)
+                    .map_or_else(
+                        || "reset unknown".to_owned(),
+                        |timestamp| calendar_compact_instant(timestamp, year),
+                    )
+            };
+            let suffix = match &account.meter {
+                AccountMeterStateV1::Unavailable { reason } => format!(
+                    " · meter unavailable ({})",
+                    crate::format::fmt_meter_reason(reason)
+                ),
+                AccountMeterStateV1::LocalOnly => " · local only".to_owned(),
+                AccountMeterStateV1::Metered { .. } => String::new(),
+            };
+            lines.push(Line::styled(
+                format!(
+                    "  {} {marker} {} · 5h {} · W {} UTC{suffix}",
+                    if selected { ">" } else { " " },
+                    account.alias.as_str(),
+                    reset(CalendarResetKind::FiveHour),
+                    reset(CalendarResetKind::Weekly),
+                ),
+                if selected {
+                    theme
+                        .gold_style()
+                        .add_modifier(ratatui::style::Modifier::BOLD)
+                } else if matches!(account.meter, AccountMeterStateV1::Unavailable { .. }) {
+                    theme.warn_style()
+                } else {
+                    theme.bright_style()
+                },
+            ));
+        }
+        for group in &groups {
+            let selected = group
+                .accounts
+                .get(model.usage.selected_tab(group))
+                .copied()
+                .or_else(|| group.accounts.first().copied());
+            header_lines.push(
+                selected
+                    .and_then(|slot| account_lines.get(slot).copied().flatten())
+                    .unwrap_or(0),
+            );
+        }
+        return;
+    }
+    for (visible_index, &slot) in visible_slots.iter().enumerate() {
+        let Some(account) = report.accounts.get(slot) else {
+            continue;
+        };
+        account_lines[slot] = Some(lines.len());
+        let marker = calendar_account_marker(visible_index);
+        let selected = selected_slot == Some(slot);
+        let identity = account
+            .identity
+            .as_deref()
+            .map(crate::format::mask_identity)
+            .unwrap_or_else(|| "—".to_owned());
+        let plan = account.plan.as_deref().unwrap_or("plan unknown");
+        lines.push(Line::styled(
+            format!(
+                "  {} {marker}  {} · {} · {identity} · {plan}",
+                if selected { ">" } else { " " },
+                account.alias.as_str(),
+                account.provider,
+            ),
+            if selected {
+                theme
+                    .gold_style()
+                    .add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                theme.bright_style()
+            },
+        ));
+        match &account.meter {
+            AccountMeterStateV1::Unavailable { reason } => lines.push(Line::styled(
+                format!(
+                    "      5h reset unknown · weekly reset unknown · meter unavailable · {}",
+                    crate::format::fmt_meter_reason(reason)
+                ),
+                theme.warn_style(),
+            )),
+            AccountMeterStateV1::LocalOnly => lines.push(Line::styled(
+                "      5h reset unknown · weekly reset unknown · local only; no provider meter",
+                theme.dim_style(),
+            )),
+            AccountMeterStateV1::Metered { .. } => {
+                for kind in [CalendarResetKind::FiveHour, CalendarResetKind::Weekly] {
+                    let row = calendar_reset_window(account, kind).map_or_else(
+                        || {
+                            format!(
+                                "      {} reset unknown · exact window not published",
+                                kind.label()
+                            )
+                        },
+                        |window| {
+                            window.resets_at_ms.map_or_else(
+                                || {
+                                    format!(
+                                        "      {} reset unknown · {} published no reset",
+                                        kind.label(),
+                                        window.window
+                                    )
+                                },
+                                |reset| {
+                                    let (_, instant) = calendar_instant(reset);
+                                    format!("      {} {instant} · {}", kind.label(), window.window)
+                                },
+                            )
+                        },
+                    );
+                    lines.push(Line::styled(row, theme.dim_style()));
+                }
+            }
+        }
+    }
+    for group in &groups {
+        let selected = group
+            .accounts
+            .get(model.usage.selected_tab(group))
+            .copied()
+            .or_else(|| group.accounts.first().copied());
+        header_lines.push(
+            selected
+                .and_then(|slot| account_lines.get(slot).copied().flatten())
+                .unwrap_or(0),
+        );
+    }
+}
+
 /// U2 — the `/usage` screen: one block per provider group showing the
 /// SELECTED account (←/→ tabs), its meter state rendered per the wire's
 /// tag — `metered` limit bars with % + reset times, `unavailable` the
@@ -3250,6 +3830,7 @@ fn render_usage(
     let global = model.usage.scope == crate::app::UsageScope::Global;
     let history = model.usage.scope == crate::app::UsageScope::History;
     let models = model.usage.scope == crate::app::UsageScope::Models;
+    let calendar = model.usage.scope == crate::app::UsageScope::Calendar;
     lines.push(Line::from(vec![
         Span::styled(
             "USAGE",
@@ -3263,6 +3844,7 @@ fn render_usage(
                 crate::app::UsageScope::Global => " · global",
                 crate::app::UsageScope::History => " · history",
                 crate::app::UsageScope::Models => " · models",
+                crate::app::UsageScope::Calendar => " · calendar",
             },
             theme.gold_style(),
         ),
@@ -3276,6 +3858,7 @@ fn render_usage(
     let mut scope_column = 2_u16;
     for (index, scope) in [
         crate::app::UsageScope::Accounts,
+        crate::app::UsageScope::Calendar,
         crate::app::UsageScope::Global,
         crate::app::UsageScope::History,
         crate::app::UsageScope::Models,
@@ -3315,6 +3898,8 @@ fn render_usage(
                 format!(
                     "  filter: {filter}* — heatmap stays cross-provider · account/model rows filter"
                 )
+            } else if calendar {
+                format!("  filter: {filter}* — reset rows filter · bare /usage clears")
             } else {
                 format!("  filter: {filter}* — bare /usage clears")
             },
@@ -3344,8 +3929,11 @@ fn render_usage(
     if models {
         render_usage_models(model, theme, &mut lines);
     }
+    if calendar {
+        render_usage_calendar(model, theme, area.width, &mut lines, &mut header_lines);
+    }
 
-    if !history && !models && model.cache_usage.has_classified_usage() {
+    if !history && !models && !calendar && model.cache_usage.has_classified_usage() {
         let cache = model.cache_usage.totals();
         let all_input_share = cache
             .complete_hit_rate()
@@ -3620,6 +4208,7 @@ fn render_usage(
     let groups = model.usage.groups();
     if !history
         && !models
+        && !calendar
         && let Some(report) = &model.usage.report
     {
         if report.accounts.is_empty() {
@@ -4072,6 +4661,9 @@ fn render_usage(
             "↑↓/PgUp/PgDn scroll · r range · f refresh · s next scope · esc back"
         }
         crate::app::UsageScope::History => "PgUp/PgDn scroll · f refresh · s next scope · esc back",
+        crate::app::UsageScope::Calendar => {
+            "</> account · ↑↓ provider · PgUp/PgDn scroll · f refresh · s next scope · esc back"
+        }
         crate::app::UsageScope::Accounts | crate::app::UsageScope::Global => {
             "←/→ account · ↑↓ provider · r reveal · f refresh · s next scope · esc back"
         }
@@ -6970,8 +7562,8 @@ fn render_subtree(
     // A ≥2-cell gap: the counts must never kiss the subagent summary. When
     // the row cannot hold both, the counts yield — the panel's own state is
     // the more important half of the row.
-    let count_spans_fit = !counts.is_empty()
-        && header_width + 2 + counts_width <= area.width as usize;
+    let count_spans_fit =
+        !counts.is_empty() && header_width + 2 + counts_width <= area.width as usize;
     let mut count_hits: Vec<(u16, u16, Hit)> = Vec::new();
     if count_spans_fit {
         let pad = (area.width as usize)
@@ -12357,10 +12949,7 @@ fn render_monitors_overlay(
 
             // Detail row: fire count, last event, next fire — the facts the
             // daemon actually sent, never invented.
-            let mut detail = vec![format!(
-                "fired {}×",
-                monitor.fire_count
-            )];
+            let mut detail = vec![format!("fired {}×", monitor.fire_count)];
             if let Some(last) = monitor.last_event.as_ref() {
                 let when = monitor_when(model.clock_ms, last.at_ms, false);
                 if last.summary.trim().is_empty() {
@@ -12370,10 +12959,7 @@ fn render_monitors_overlay(
                 }
             }
             if let Some(next) = monitor.next_fire_at_ms {
-                detail.push(format!(
-                    "next {}",
-                    monitor_when(model.clock_ms, next, true)
-                ));
+                detail.push(format!("next {}", monitor_when(model.clock_ms, next, true)));
             }
             lines.push(Line::styled(
                 format!("     {}", detail.join(" · ")),
@@ -12389,17 +12975,12 @@ fn render_monitors_overlay(
                 } else {
                     "[pause]"
                 };
-                let armed = model.monitors_stop_armed.as_deref() == Some(monitor.monitor_id.as_str());
+                let armed =
+                    model.monitors_stop_armed.as_deref() == Some(monitor.monitor_id.as_str());
                 let stop_label = if armed { "[stop again]" } else { "[stop]" };
                 let actions: [(&str, Hit); 5] = [
-                    (
-                        stop_label,
-                        Hit::MonitorStop(monitor.monitor_id.clone()),
-                    ),
-                    (
-                        pause_label,
-                        Hit::MonitorPause(monitor.monitor_id.clone()),
-                    ),
+                    (stop_label, Hit::MonitorStop(monitor.monitor_id.clone())),
+                    (pause_label, Hit::MonitorPause(monitor.monitor_id.clone())),
                     (
                         "[trigger now]",
                         Hit::MonitorTrigger(monitor.monitor_id.clone()),
@@ -12408,10 +12989,7 @@ fn render_monitors_overlay(
                         "[edit with agent]",
                         Hit::MonitorEdit(monitor.monitor_id.clone()),
                     ),
-                    (
-                        "[copy id]",
-                        Hit::MonitorCopyId(monitor.monitor_id.clone()),
-                    ),
+                    ("[copy id]", Hit::MonitorCopyId(monitor.monitor_id.clone())),
                 ];
                 let mut spans = vec![Span::styled("     ", theme.dim_style())];
                 let mut cursor = 5_usize;

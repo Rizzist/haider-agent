@@ -113,7 +113,10 @@ fn submit(model: &mut AppModel, text: &str) {
 fn band_counts_omit_zero_and_pluralise_one_and_many_separately() {
     // The pluralisation contract the retired status segment used to own.
     assert!(band_counts(0, 0).is_empty());
-    assert_eq!(band_counts_text(&band_counts(1, 1)), "· 1 shell · 1 monitor");
+    assert_eq!(
+        band_counts_text(&band_counts(1, 1)),
+        "· 1 shell · 1 monitor"
+    );
     assert_eq!(
         band_counts_text(&band_counts(2, 3)),
         "· 2 shells · 3 monitors"

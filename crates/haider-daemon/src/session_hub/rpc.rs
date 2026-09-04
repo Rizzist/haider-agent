@@ -5191,6 +5191,62 @@ impl HubConnection {
                 }
                 self.account_device_candidates(request_id)
             }
+            RequestBody::AccountSourceList => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_source_list(request_id)
+            }
+            RequestBody::AccountSourceAdd {
+                command_id,
+                kind,
+                root,
+                label,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_source_add(request_id, command_id, kind, root, label)
+            }
+            RequestBody::AccountSourceRemove {
+                command_id,
+                source_id,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_source_remove(request_id, command_id, source_id)
+            }
+            RequestBody::AccountSourceScan => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_source_scan(request_id)
+            }
             RequestBody::AccountImportDevice {
                 command_id,
                 candidate,
@@ -8586,6 +8642,103 @@ impl HubConnection {
         )
     }
 
+    fn account_source_list(&self, request_id: RequestId) -> Result<(), SessionHubError> {
+        let Some(_facade) = self.device_surface_facade(&request_id)? else {
+            return Ok(());
+        };
+        self.send_management_command(
+            request_id.clone(),
+            crate::accounts::AccountCommand::SourceList {
+                completed: crate::accounts::LoginRoute {
+                    request_id,
+                    sink: Arc::clone(&self.sink),
+                },
+            },
+        )
+    }
+
+    fn account_source_add(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        kind: String,
+        root: String,
+        label: Option<String>,
+    ) -> Result<(), SessionHubError> {
+        let Some(_facade) = self.device_surface_facade(&request_id)? else {
+            return Ok(());
+        };
+        if command_id.as_str().trim().is_empty() || kind.trim().is_empty() || root.trim().is_empty()
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "account.source_add requires command id, kind, and root",
+                false,
+                None,
+            );
+        }
+        self.send_management_command(
+            request_id.clone(),
+            crate::accounts::AccountCommand::SourceAdd(Box::new(crate::accounts::SourceAddJob {
+                kind,
+                root,
+                label,
+                route: crate::accounts::LoginRoute {
+                    request_id,
+                    sink: Arc::clone(&self.sink),
+                },
+            })),
+        )
+    }
+
+    fn account_source_remove(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        source_id: String,
+    ) -> Result<(), SessionHubError> {
+        let Some(_facade) = self.device_surface_facade(&request_id)? else {
+            return Ok(());
+        };
+        if command_id.as_str().trim().is_empty() || source_id.trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "account.source_remove requires command id and source id",
+                false,
+                None,
+            );
+        }
+        self.send_management_command(
+            request_id.clone(),
+            crate::accounts::AccountCommand::SourceRemove(Box::new(
+                crate::accounts::SourceRemoveJob {
+                    source_id,
+                    route: crate::accounts::LoginRoute {
+                        request_id,
+                        sink: Arc::clone(&self.sink),
+                    },
+                },
+            )),
+        )
+    }
+
+    fn account_source_scan(&self, request_id: RequestId) -> Result<(), SessionHubError> {
+        let Some(_facade) = self.device_surface_facade(&request_id)? else {
+            return Ok(());
+        };
+        self.send_management_command(
+            request_id.clone(),
+            crate::accounts::AccountCommand::SourceScan {
+                completed: crate::accounts::LoginRoute {
+                    request_id,
+                    sink: Arc::clone(&self.sink),
+                },
+            },
+        )
+    }
+
     fn account_import_device(
         &self,
         request_id: RequestId,
@@ -9536,6 +9689,7 @@ impl HubConnection {
                 request_id,
                 body: ResponseBody::AccountList {
                     descriptors: Vec::new(),
+                    sources: Vec::new(),
                     revision: None,
                     provider_active: Vec::new(),
                     provider_defaults: Vec::new(),
@@ -9596,10 +9750,30 @@ impl HubConnection {
                     })
             })
             .collect();
+        let sources = facade
+            .sources
+            .lock()
+            .map(|sources| {
+                sources
+                    .iter()
+                    .filter(|source| {
+                        provider.as_deref().is_none_or(|provider| {
+                            source.account_alias.as_ref().is_some_and(|alias| {
+                                view.descriptors.iter().any(|descriptor| {
+                                    descriptor.alias == *alias && descriptor.provider == provider
+                                })
+                            })
+                        })
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::AccountList {
                 descriptors,
+                sources,
                 revision: Some(view.revision),
                 provider_active,
                 provider_defaults,

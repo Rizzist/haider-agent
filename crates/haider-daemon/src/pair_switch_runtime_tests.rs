@@ -192,6 +192,7 @@ impl PairSwitchWorld {
                 discovery_disabled: true,
                 device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(true),
                 vault: None,
+                sources: Arc::new(Mutex::new(Vec::new())),
             })
             .expect("install fixture model catalog");
         world

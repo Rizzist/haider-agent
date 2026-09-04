@@ -193,12 +193,8 @@ impl ClipboardSource for OsClipboard {
 fn clipboard_note(error: &arboard::Error) -> String {
     match error {
         arboard::Error::ContentNotAvailable => "the clipboard is empty".to_owned(),
-        arboard::Error::ClipboardNotSupported => {
-            "no clipboard on this display server".to_owned()
-        }
-        arboard::Error::ClipboardOccupied => {
-            "the clipboard is busy — try again".to_owned()
-        }
+        arboard::Error::ClipboardNotSupported => "no clipboard on this display server".to_owned(),
+        arboard::Error::ClipboardOccupied => "the clipboard is busy — try again".to_owned(),
         other => format!("clipboard unreadable — {other}"),
     }
 }
@@ -231,7 +227,9 @@ fn encode_rgba_png(
     let mut png = Vec::new();
     let encoder = image::codecs::png::PngEncoder::new(&mut png);
     image::ImageEncoder::write_image(encoder, rgba, w, h, image::ExtendedColorType::Rgba8)
-        .map_err(|error| ClipboardError(format!("clipboard image could not be encoded: {error}")))?;
+        .map_err(|error| {
+            ClipboardError(format!("clipboard image could not be encoded: {error}"))
+        })?;
     if png.len() > MAX_CLIPBOARD_IMAGE_BYTES {
         return Err(ClipboardError(format!(
             "clipboard image is {} MB — the limit is {} MB",
@@ -312,10 +310,7 @@ impl FakeClipboard {
     #[must_use]
     pub fn image(width: u32, height: u32) -> Self {
         let pixels = vec![0x40_u8; (width as usize) * (height as usize) * 4];
-        Self(
-            encode_rgba_png(width as usize, height as usize, &pixels)
-                .map(ClipboardContent::Image),
-        )
+        Self(encode_rgba_png(width as usize, height as usize, &pixels).map(ClipboardContent::Image))
     }
 
     #[must_use]

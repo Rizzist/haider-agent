@@ -101,6 +101,7 @@ fn an_unpinned_identity_follows_the_imported_active_account() {
         LiveReply::Accounts {
             descriptors: vec![oauth_descriptor("openai-oauth", "openai-oauth", true)],
             revision: Some(1),
+            sources: Vec::new(),
         },
     );
     // Account truth ALONE must not adopt: a half-identity (right provider,
@@ -167,6 +168,7 @@ fn a_pinned_choice_survives_every_later_snapshot() {
         LiveReply::Accounts {
             descriptors: vec![oauth_descriptor("anthropic-oauth", "anthropic-oauth", true)],
             revision: Some(2),
+            sources: Vec::new(),
         },
     );
     assert_eq!(
@@ -207,6 +209,7 @@ fn clicking_an_account_adopts_it_into_the_identity_and_pins() {
         LiveReply::Accounts {
             descriptors: vec![oauth_descriptor("openai-oauth", "openai-oauth", true)],
             revision: Some(3),
+            sources: Vec::new(),
         },
     );
     assert_eq!(
@@ -311,6 +314,7 @@ fn an_active_oauth_account_with_no_catalog_triggers_discovery() {
         Some(LiveReply::Accounts {
             descriptors: vec![oauth_descriptor("openai-oauth", "openai-oauth", true)],
             revision: Some(1),
+            sources: Vec::new(),
         }),
         std::time::Instant::now(),
     );
@@ -331,6 +335,7 @@ fn an_active_oauth_account_with_no_catalog_triggers_discovery() {
         Some(LiveReply::Accounts {
             descriptors: vec![oauth_descriptor("openai-oauth", "openai-oauth", true)],
             revision: Some(2),
+            sources: Vec::new(),
         }),
         std::time::Instant::now(),
     );
@@ -358,6 +363,7 @@ fn a_refreshed_catalog_completes_the_bootstrap() {
         Some(LiveReply::Accounts {
             descriptors: vec![oauth_descriptor("openai-oauth", "openai-oauth", true)],
             revision: Some(1),
+            sources: Vec::new(),
         }),
         std::time::Instant::now(),
     );

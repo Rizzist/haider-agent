@@ -289,6 +289,26 @@ impl AccountRow {
     }
 }
 
+/// Secret-free source metadata paired with an account descriptor by alias.
+/// This is a TUI projection rather than the wire type, matching `AccountRow`:
+/// rendering never depends on transport-only fields or credential material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSourceRow {
+    pub source_id: String,
+    pub account_alias: Option<haider_protocol::ids::CredentialAlias>,
+    pub kind: String,
+    pub label: String,
+    pub path: Option<String>,
+    pub credential_store: String,
+    pub refresh_owner: String,
+    pub health: String,
+    pub last_seen_at_ms: Option<u64>,
+    pub last_refreshed_at_ms: Option<u64>,
+    pub access_expires_at_ms: Option<u64>,
+    pub plan: Option<String>,
+    pub masked_identity: Option<String>,
+}
+
 /// Probe fixtures use only these whole-alias shapes: `probefix`,
 /// `probefix-api[-N]`, or `probe<PID>-api`. Keeping the match anchored avoids
 /// hiding legitimate aliases that merely contain the word `probe`.
@@ -320,6 +340,10 @@ fn canonical_positive_decimal(value: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct AccountsState {
     pub rows: Vec<AccountRow>,
+    /// Secret-free credential-source metadata from the same `account.list`
+    /// snapshot. Entries join to rows by stable alias; alias-less/unmatched
+    /// enrolled roots remain visible as sources without linked accounts.
+    pub sources: Vec<AccountSourceRow>,
     /// Management revision the rows were read at; an older reply is DROPPED.
     pub revision: Option<u64>,
     /// Last account action (sim `acctMsg`), shown under the head line.
@@ -634,6 +658,13 @@ impl AccountsState {
             self.cursor = self.rows.len().saturating_sub(1);
         }
         true
+    }
+
+    /// Installs the source half of an accepted `account.list` snapshot.
+    /// Kept separate from `apply_snapshot` so legacy/demo callers retain
+    /// their established account-row fixture seam.
+    pub fn apply_sources(&mut self, sources: Vec<AccountSourceRow>) {
+        self.sources = sources;
     }
 }
 
@@ -1242,6 +1273,8 @@ pub struct UsageGroup {
 /// and partially-priced cost sums say so instead of understating
 /// silently. `Models` is a range-selectable provider/model fold over the
 /// same usage-history ledger RPC; no dead tab ships before its data source.
+/// `Calendar` is a pure projection of the provider meter reset instants in
+/// the held `usage.report`: it reads no client clock and invents no cadence.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum UsageScope {
     #[default]
@@ -1252,6 +1285,8 @@ pub enum UsageScope {
     History,
     /// Per-model/provider rows folded over a selectable UTC ledger range.
     Models,
+    /// Month grid of exact provider-published five-hour and weekly resets.
+    Calendar,
 }
 
 impl UsageScope {
@@ -1262,6 +1297,7 @@ impl UsageScope {
             Self::Global => "global",
             Self::History => "history",
             Self::Models => "models",
+            Self::Calendar => "calendar",
         }
     }
 
@@ -1272,6 +1308,7 @@ impl UsageScope {
             "global" => Some(Self::Global),
             "history" => Some(Self::History),
             "models" => Some(Self::Models),
+            "calendar" => Some(Self::Calendar),
             _ => None,
         }
     }
@@ -1280,7 +1317,8 @@ impl UsageScope {
     #[must_use]
     pub fn next(self) -> Self {
         match self {
-            Self::Accounts => Self::Global,
+            Self::Accounts => Self::Calendar,
+            Self::Calendar => Self::Global,
             Self::Global => Self::History,
             Self::History => Self::Models,
             Self::Models => Self::Accounts,
@@ -2206,9 +2244,7 @@ fn monitor_rejection_note(rejection: &haider_rpc::MonitorControlRejectionWire) -
     match rejection {
         R::NotFound { monitor_id } => format!("· no monitor {monitor_id}"),
         R::CapabilityDenied { .. } => "· monitor control needs a control attachment".to_owned(),
-        R::ControlAttachmentRequired => {
-            "· monitor control needs a control attachment".to_owned()
-        }
+        R::ControlAttachmentRequired => "· monitor control needs a control attachment".to_owned(),
         R::SessionNotFound => "· that session is gone".to_owned(),
         R::InvalidRequest { detail, .. } => format!("· monitor refused — {detail}"),
         R::ServiceStopped => "· the monitor service is stopped".to_owned(),
@@ -10972,7 +11008,8 @@ impl AppModel {
             UsageScope::Accounts
             | UsageScope::Global
             | UsageScope::History
-            | UsageScope::Models => {}
+            | UsageScope::Models
+            | UsageScope::Calendar => {}
         }
     }
 
@@ -11029,7 +11066,12 @@ impl AppModel {
                 self.usage.follow_cursor.set(true);
                 self.dirty = true;
             }
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('<')
+            | KeyCode::Char('>') => {
                 let groups = self.usage.groups();
                 let Some(group) = groups.get(self.usage.cursor.min(groups.len().saturating_sub(1)))
                 else {
@@ -11040,7 +11082,7 @@ impl AppModel {
                     return;
                 }
                 let current = self.usage.selected_tab(group);
-                let next = if matches!(code, KeyCode::Right | KeyCode::Tab) {
+                let next = if matches!(code, KeyCode::Right | KeyCode::Tab | KeyCode::Char('>')) {
                     (current + 1) % len
                 } else {
                     (current + len - 1) % len
@@ -14114,7 +14156,7 @@ impl AppModel {
             // Owner 2026-08-16: manual retry of the failed turn — the
             // keyboard path to the ambient retry row's click.
             "retry" => self.issue_run_retry(),
-            // `/usage [history|models|global|accounts] [provider]`: a
+            // `/usage [history|models|calendar|global|accounts] [provider]`: a
             // leading scope lands directly; otherwise the first token keeps
             // the existing provider-prefix meaning.
             "usage" => {
@@ -14480,7 +14522,9 @@ impl AppModel {
             self.flash = Some("· reading existing monitor registry…".into());
             return;
         }
-        let (verb, id) = argument.split_once(char::is_whitespace).unwrap_or((argument, ""));
+        let (verb, id) = argument
+            .split_once(char::is_whitespace)
+            .unwrap_or((argument, ""));
         let id = id.trim();
         if id.is_empty() {
             self.flash = Some("· /monitors [stop|pause|resume <id>]".into());
@@ -14514,7 +14558,8 @@ impl AppModel {
 
     pub(crate) fn monitor_trigger(&mut self, monitor_id: String) {
         self.flash = Some(format!("· triggering monitor {monitor_id}…"));
-        self.requests.push(AppRequest::MonitorTrigger { monitor_id });
+        self.requests
+            .push(AppRequest::MonitorTrigger { monitor_id });
         self.dirty = true;
     }
 
@@ -14525,9 +14570,7 @@ impl AppModel {
             .monitors
             .iter()
             .find(|monitor| monitor.monitor_id == monitor_id)
-            .is_some_and(|monitor| {
-                matches!(monitor.state, haider_rpc::MonitorStateWire::Paused)
-            });
+            .is_some_and(|monitor| matches!(monitor.state, haider_rpc::MonitorStateWire::Paused));
         if paused {
             self.monitor_resume(monitor_id);
         } else {
@@ -14545,7 +14588,8 @@ impl AppModel {
 
     pub(crate) fn monitor_edit_with_agent(&mut self, monitor_id: &str) {
         self.monitors_open = false;
-        self.composer.set_text(Self::monitor_edit_prefill(monitor_id));
+        self.composer
+            .set_text(Self::monitor_edit_prefill(monitor_id));
         // The draft opens on a slash, but what follows is PROSE for the
         // agent — the palette must not sit over it offering commands.
         self.palette_dismissed = true;
@@ -14589,10 +14633,7 @@ impl AppModel {
     /// One monitor delivery reaching this session: an ambient transcript note
     /// and a `firing` chip that stands until the woken subturn completes.
     /// Never a modal — the fire is news, not a question.
-    pub fn apply_monitor_fired(
-        &mut self,
-        report: &haider_rpc::MonitorDeliveryReportWire,
-    ) {
+    pub fn apply_monitor_fired(&mut self, report: &haider_rpc::MonitorDeliveryReportWire) {
         self.monitors_firing.insert(report.monitor_id.clone());
         self.projection.push_note(monitor_fired_note(report));
         self.dirty = true;

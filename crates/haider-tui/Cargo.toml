@@ -26,6 +26,7 @@ ratatui-image = { version = "11", default-features = false, features = ["crosste
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
+haider-provider = { path = "../haider-provider" }
 zeroize.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

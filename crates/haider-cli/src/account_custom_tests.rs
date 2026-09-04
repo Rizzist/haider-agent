@@ -463,6 +463,7 @@ async fn update_to_no_auth_reuses_the_provider_and_removes_its_key() {
             revision: Some(31),
             provider_active: Vec::new(),
             provider_defaults: Vec::new(),
+            sources: Vec::new(),
             availability: Some(SnapshotAvailabilityWire::Available),
         },
         ResponseBody::AccountRemove {

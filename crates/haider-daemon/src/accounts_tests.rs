@@ -4,6 +4,7 @@
 //! reconciliation over every crash boundary.
 
 use super::*;
+use base64::Engine as _;
 use haider_core::SqliteStoreHandle;
 
 use crate::provider_registry::ProviderProfileV1;
@@ -13,7 +14,6 @@ use haider_core::ProviderAttemptResolver as _;
 use haider_rpc::{ModelDetailWire, ProviderApiFamilyWire, ProviderAuthRequirementWire};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
 
 use crate::oauth::{
     OAuthProviderRegistration, OAuthPublicError, OAuthRefreshExchange, OAuthTokenRequestEncoding,
@@ -34,6 +34,58 @@ fn test_store_dir() -> tempfile::TempDir {
             .prefix("hacct")
             .tempdir()
             .unwrap_or_else(|error| panic!("tempdir: {error}"))
+    }
+}
+
+fn empty_source_registry() -> Arc<StdMutex<CredentialSourceRegistry>> {
+    let dir = test_store_dir();
+    Arc::new(StdMutex::new(
+        CredentialSourceRegistry::load(dir.path())
+            .unwrap_or_else(|error| panic!("source registry: {error:?}")),
+    ))
+}
+
+fn empty_source_snapshot() -> AccountSourcesSnapshot {
+    Arc::new(StdMutex::new(Vec::new()))
+}
+
+#[test]
+fn linked_source_failure_health_states_remain_distinct() {
+    use crate::device_discovery::LinkedSourceReadFailure;
+
+    let cases = [
+        (
+            LinkedSourceReadFailure::SourceGone,
+            CredentialSourceHealth::SourceGone,
+        ),
+        (
+            LinkedSourceReadFailure::Unreadable,
+            CredentialSourceHealth::Unreadable,
+        ),
+        (
+            LinkedSourceReadFailure::SymlinkEscape,
+            CredentialSourceHealth::SymlinkEscape,
+        ),
+        (
+            LinkedSourceReadFailure::Oversized,
+            CredentialSourceHealth::Oversized,
+        ),
+        (
+            LinkedSourceReadFailure::PartialWrite,
+            CredentialSourceHealth::PartialWrite,
+        ),
+        (
+            LinkedSourceReadFailure::MissingFields,
+            CredentialSourceHealth::MissingFields,
+        ),
+        (
+            LinkedSourceReadFailure::InvalidJson,
+            CredentialSourceHealth::InvalidJson,
+        ),
+    ];
+
+    for (failure, expected) in cases {
+        assert_eq!(source_failure_health(failure), expected);
     }
 }
 
@@ -231,6 +283,87 @@ async fn startup_backfill_decodes_only_the_vaulted_id_token_without_network() {
     );
     assert_eq!(identity.account_id.as_deref(), Some("fake-account-id-1"));
     assert!(!identity.verified);
+}
+
+#[tokio::test]
+async fn startup_backfill_marks_missing_oauth_secret_as_source_gone() {
+    let mut accounts = memory_accounts();
+    let alias = CredentialAlias::new("legacy-missing-oauth");
+    accounts
+        .add(CredentialDescriptor {
+            alias: alias.clone(),
+            provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::OAuth,
+            identity: "legacy account".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+        })
+        .expect("seed descriptor");
+
+    assert!(backfill_oauth_identities(&mut accounts, &MemoryVault::new()).await);
+    assert_eq!(
+        accounts.get(&alias).expect("retained descriptor").status,
+        CredentialStatus::NeedsAttention {
+            reason: CredentialAttentionReason::SourceGone,
+        }
+    );
+}
+
+#[tokio::test]
+async fn startup_backfill_synthesizes_stable_anthropic_meter_identity() {
+    let mut accounts = memory_accounts();
+    let alias = CredentialAlias::new("legacy-anthropic-oauth");
+    accounts
+        .add(CredentialDescriptor {
+            alias: alias.clone(),
+            provider: ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::OAuth,
+            identity: "Claude Pro".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+        })
+        .expect("seed descriptor");
+    let bundle = haider_accounts::OAuthTokenBundleV1::new(
+        ANTHROPIC_OAUTH_PROVIDER_NAME.into(),
+        "https://claude.ai".into(),
+        "anthropic-client".into(),
+        None,
+        "Bearer".into(),
+        Zeroizing::new(b"ANTHROPIC_BACKFILL_ACCESS".to_vec()),
+        Some(Zeroizing::new(b"ANTHROPIC_BACKFILL_REFRESH".to_vec())),
+        u64::MAX,
+        None,
+        vec!["user:inference".into()],
+        haider_accounts::OAuthIdentityV1 {
+            subject_hash: "0123456789abcdefcafebabe".into(),
+            display_identity: "Claude Pro".into(),
+        },
+        1,
+    )
+    .expect("bundle");
+    let vault = MemoryVault::new();
+    vault
+        .put(&alias, &bundle.encode().expect("encode bundle"))
+        .expect("vault bundle");
+
+    assert!(backfill_oauth_identities(&mut accounts, &vault).await);
+    let identity = accounts
+        .get(&alias)
+        .and_then(|descriptor| descriptor.account_identity.as_ref())
+        .expect("synthetic identity");
+    assert_eq!(
+        identity.account_id.as_deref(),
+        Some("anthropic:0123456789abcdef")
+    );
+    assert_eq!(identity.display_name.as_deref(), Some("Claude Pro"));
 }
 
 #[derive(Default)]
@@ -1565,6 +1698,8 @@ async fn stale_oauth_fences_cannot_overwrite_or_expire_a_replaced_bundle() {
         provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let commands = actor.commands();
 
@@ -1665,6 +1800,8 @@ async fn reserved_alias_fences_login_and_oauth_add_until_remove_finalizes() {
         provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         reserved_aliases: HashSet::from(["work".to_owned(), "work-oauth".to_owned()]),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
 
     let (sink, mut frames) = channel_sink();
@@ -1814,6 +1951,8 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
         provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let broker = CredentialBroker::new(
         vault.clone() as Arc<dyn Vault>,
@@ -2148,6 +2287,8 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
         provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let broker = CredentialBroker::new(
         vault.clone() as Arc<dyn Vault>,
@@ -3144,7 +3285,6 @@ struct ImportRefreshServer {
     address: std::net::SocketAddr,
     calls: Arc<std::sync::atomic::AtomicUsize>,
     refresh_token_fingerprints: Arc<StdMutex<Vec<[u8; 32]>>>,
-    gate: Option<Arc<Semaphore>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -3155,17 +3295,15 @@ impl Drop for ImportRefreshServer {
 }
 
 impl ImportRefreshServer {
-    async fn start(mode: ImportRefreshMode, gated: bool) -> Self {
+    async fn start(mode: ImportRefreshMode) -> Self {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind import refresh server");
         let address = listener.local_addr().expect("import refresh address");
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refresh_token_fingerprints = Arc::new(StdMutex::new(Vec::new()));
-        let gate = gated.then(|| Arc::new(Semaphore::new(0)));
         let calls_for_task = Arc::clone(&calls);
         let refresh_token_fingerprints_for_task = Arc::clone(&refresh_token_fingerprints);
-        let gate_for_task = gate.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -3173,10 +3311,8 @@ impl ImportRefreshServer {
                 };
                 let calls = Arc::clone(&calls_for_task);
                 let refresh_token_fingerprints = Arc::clone(&refresh_token_fingerprints_for_task);
-                let gate = gate_for_task.clone();
                 tokio::spawn(async move {
-                    serve_import_refresh(stream, mode, calls, refresh_token_fingerprints, gate)
-                        .await;
+                    serve_import_refresh(stream, mode, calls, refresh_token_fingerprints).await;
                 });
             }
         });
@@ -3184,7 +3320,6 @@ impl ImportRefreshServer {
             address,
             calls,
             refresh_token_fingerprints,
-            gate,
             task,
         }
     }
@@ -3202,22 +3337,6 @@ impl ImportRefreshServer {
             .lock()
             .map(|fingerprints| fingerprints.clone())
             .unwrap_or_default()
-    }
-
-    async fn wait_for_calls(&self, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while self.calls() != expected {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("import refresh call count");
-    }
-
-    fn release(&self) {
-        if let Some(gate) = &self.gate {
-            gate.add_permits(8);
-        }
     }
 }
 
@@ -3263,7 +3382,6 @@ async fn serve_import_refresh(
     mode: ImportRefreshMode,
     calls: Arc<std::sync::atomic::AtomicUsize>,
     refresh_token_fingerprints: Arc<StdMutex<Vec<[u8; 32]>>>,
-    gate: Option<Arc<Semaphore>>,
 ) {
     let mut request = Vec::new();
     let body_start = loop {
@@ -3300,12 +3418,6 @@ async fn serve_import_refresh(
         fingerprints.push(*blake3::hash(refresh_token.as_bytes()).as_bytes());
     }
     calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    if let Some(gate) = gate {
-        gate.acquire()
-            .await
-            .expect("release gated import refresh")
-            .forget();
-    }
     let (status, body) = match mode {
         ImportRefreshMode::Success => (
             "200 OK",
@@ -3348,6 +3460,8 @@ fn start_oauth_import_test_actor(
         provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         reserved_aliases,
         refresh_fences,
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     (actor, snapshot, management)
 }
@@ -3406,6 +3520,8 @@ fn start_oauth_import_heal_test_actor_with_native(
             provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
             reserved_aliases: HashSet::new(),
             refresh_fences: refresh_fences.clone(),
+            source_registry: empty_source_registry(),
+            source_snapshot: empty_source_snapshot(),
         },
         |commands| {
             let broker = CredentialBroker::new_with_fences(
@@ -3555,6 +3671,8 @@ async fn login_publishes_only_after_receipt_and_revision_commit() {
         provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let (sink, mut frames) = channel_sink();
     actor
@@ -3723,6 +3841,8 @@ async fn account_actor_answers_restage_required_after_the_pending_ttl() {
         provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let commands = actor.commands();
     let (sink, mut frames) = channel_sink();
@@ -4271,6 +4391,8 @@ async fn oauth_account_add_never_exposes_initial_token_before_vault_persistence(
         provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let (sink, mut frames) = channel_sink();
     actor
@@ -4392,6 +4514,8 @@ async fn oauth_account_add_actor_crash_after_vault_put_reconciles_production_rec
         provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let (sink, mut frames) = channel_sink();
     actor
@@ -5277,6 +5401,8 @@ async fn durable_remove_fences_late_refresh_across_same_alias_readd() {
         provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         reserved_aliases: HashSet::new(),
         refresh_fences: refresh_fences.clone(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let commands = actor.commands();
     let (sink, mut frames) = channel_sink();
@@ -5514,6 +5640,8 @@ async fn omitted_api_alias_is_stable_command_derived_and_secret_free() {
         provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let commands = actor.commands();
     let (sink, mut frames) = channel_sink();
@@ -5668,6 +5796,8 @@ async fn api_login_rekeys_an_existing_alias_in_place() {
         provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let (sink, mut frames) = channel_sink();
     actor
@@ -5797,6 +5927,8 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
         }),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let commands = actor.commands();
     let (sink, mut frames) = channel_sink();
@@ -6045,6 +6177,8 @@ async fn provider_trust_toggle_is_receipted_persisted_and_journaled_raw() {
         provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let (sink, mut frames) = channel_sink();
     actor
@@ -6294,6 +6428,8 @@ async fn custom_provider_origin_repoint_updates_stored_origin_and_revision() {
         }),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let commands = actor.commands();
     let (sink, mut frames) = channel_sink();
@@ -6385,6 +6521,8 @@ async fn stale_expected_revision_refuses_origin_only_repoint() {
         }),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let commands = actor.commands();
     let (sink, mut frames) = channel_sink();
@@ -6493,6 +6631,8 @@ async fn custom_provider_origin_repoint_rejects_invalid_origin() {
         provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let commands = actor.commands();
     let (sink, mut frames) = channel_sink();
@@ -6593,6 +6733,8 @@ async fn custom_provider_origin_repoint_same_origin_is_revision_noop() {
         }),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let commands = actor.commands();
     let (sink, mut frames) = channel_sink();
@@ -6725,6 +6867,8 @@ async fn custom_provider_origin_create_semantics_remain_unchanged() {
         }),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let commands = actor.commands();
     let (sink, mut frames) = channel_sink();
@@ -7545,6 +7689,8 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
             provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
             reserved_aliases: HashSet::new(),
             refresh_fences: RefreshFenceRegistry::default(),
+            source_registry: empty_source_registry(),
+            source_snapshot: empty_source_snapshot(),
         },
         |commands| {
             CredentialBroker::new(
@@ -7785,6 +7931,8 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
             reserved_aliases: HashSet::new(),
             refresh_fences: RefreshFenceRegistry::default(),
+            source_registry: empty_source_registry(),
+            source_snapshot: empty_source_snapshot(),
         },
         |commands| {
             CredentialBroker::new(
@@ -8178,6 +8326,35 @@ async fn import_claude_for_heal(actor: &AccountActorHandle) -> CredentialDescrip
     }
 }
 
+async fn claude_subscription_import_is_policy_blocked(actor: &AccountActorHandle) -> bool {
+    let (sink, mut frames) = channel_sink();
+    send_oauth_import(
+        &actor.commands(),
+        sink,
+        "assert-claude-import-policy",
+        "claude-code",
+    )
+    .await;
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("Claude policy response deadline")
+        .expect("Claude policy response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::Error { code, message, .. },
+            ..
+        } => {
+            assert_eq!(code, haider_rpc::ERROR_CODE_PROVIDER_ERROR);
+            assert_eq!(
+                message,
+                "Claude Code subscription credentials remain owned by the official client"
+            );
+        }
+        other => panic!("Claude subscription import must be policy-blocked: {other:?}"),
+    }
+    true
+}
+
 /// Ages the STORED bundle past its expiry WITHOUT marking the account:
 /// the natural-expiry precondition (snapshot Current), where the refresh
 /// fallback stays legal (W5g-8 safety split: a snapshot-EXPIRED mark may
@@ -8369,6 +8546,18 @@ async fn expired_claude_snapshot_reads_through_live_owner_without_refresh_grant(
             native_service,
             Some(exchange_service),
         );
+    if claude_subscription_import_is_policy_blocked(&actor).await {
+        assert!(
+            native.events().is_empty(),
+            "policy refusal must not read Keychain"
+        );
+        assert_eq!(exchange.calls(), 0);
+        assert!(snapshot.lock().expect("snapshot").is_empty());
+        assert!(broker.shutdown().await);
+        actor.shutdown().await;
+        store.close().await.expect("close");
+        return;
+    }
     let descriptor = import_claude_for_heal(&actor).await;
     assert_eq!(native.events(), [ClaudeNativeReadEvent::Significant]);
     assert!(descriptor.identity.ends_with("Linked to Claude Code"));
@@ -8441,6 +8630,17 @@ async fn locked_store_waits_for_cached_expiry_then_significant_refresh_self_heal
             native_service,
             None,
         );
+    if claude_subscription_import_is_policy_blocked(&actor).await {
+        assert!(
+            native.events().is_empty(),
+            "policy refusal must not read Keychain"
+        );
+        assert!(snapshot.lock().expect("snapshot").is_empty());
+        assert!(broker.shutdown().await);
+        actor.shutdown().await;
+        store.close().await.expect("close");
+        return;
+    }
     let descriptor = import_claude_for_heal(&actor).await;
 
     set_import_bundle_expiry(
@@ -8561,6 +8761,17 @@ async fn success_after_denied_discovery_still_requires_explicit_import() {
             native_service,
             None,
         );
+    if claude_subscription_import_is_policy_blocked(&actor).await {
+        assert!(
+            native.events().is_empty(),
+            "policy refusal must not read Keychain"
+        );
+        assert!(snapshot.lock().expect("snapshot").is_empty());
+        assert!(broker.shutdown().await);
+        actor.shutdown().await;
+        store.close().await.expect("close");
+        return;
+    }
     let descriptor = import_claude_for_heal(&actor).await;
     age_import_bundle(vault.as_ref(), &descriptor);
     native.fail(ClaudeNativeCredentialFailure::Denied);
@@ -8629,7 +8840,7 @@ async fn successful_unchanged_owner_read_persists_fresh_snapshot() {
     let store = open_store(store_dir.path()).await;
     let vault = Arc::new(MemoryVault::new());
     let native = Arc::new(StubAccountClaudeNative::with_bytes(CLAUDE_IMPORT_FIXTURE));
-    let native_service: Arc<dyn ClaudeNativeCredentialStore> = native;
+    let native_service: Arc<dyn ClaudeNativeCredentialStore> = native.clone();
     let (mut actor, broker, snapshot, _refresh_fences) =
         start_oauth_import_heal_test_actor_with_native(
             &store,
@@ -8638,6 +8849,17 @@ async fn successful_unchanged_owner_read_persists_fresh_snapshot() {
             native_service,
             None,
         );
+    if claude_subscription_import_is_policy_blocked(&actor).await {
+        assert!(
+            native.events().is_empty(),
+            "policy refusal must not read Keychain"
+        );
+        assert!(snapshot.lock().expect("snapshot").is_empty());
+        assert!(broker.shutdown().await);
+        actor.shutdown().await;
+        store.close().await.expect("close");
+        return;
+    }
     let descriptor = import_claude_for_heal(&actor).await;
     set_import_bundle_expiry(
         vault.as_ref(),
@@ -8735,20 +8957,13 @@ async fn file_only_claude_import_uses_independent_refresh_grant_fallback() {
     .and_then(|broker| broker.with_refresh_exchange(exchange_service))
     .expect("file-owned Claude broker");
 
-    let access = broker
+    let error = broker
         .resolve(&descriptor)
         .await
-        .expect("file-only Claude import owns its refresh rotation");
-    assert_eq!(access.expose_secret(), b"fake-anthropic-grant-access-token");
-    assert_eq!(exchange.calls(), 1);
-    assert_eq!(
-        exchange.refresh_token_fingerprints(),
-        [*blake3::hash(b"fake-claude-refresh-token-1").as_bytes()]
-    );
-    assert_eq!(
-        snapshot.lock().expect("snapshot")[0].status,
-        CredentialStatus::Ok
-    );
+        .expect_err("Claude Code remains the sole refresh owner");
+    assert_eq!(error.code, ErrorCode::Unauthorized);
+    assert_eq!(exchange.calls(), 0);
+    assert!(exchange.refresh_token_fingerprints().is_empty());
 
     assert!(broker.shutdown().await);
 }
@@ -8826,7 +9041,7 @@ async fn expired_imported_bundle_refreshes_instead_of_terminal_exit70() {
     ) {
         return;
     }
-    let server = ImportRefreshServer::start(ImportRefreshMode::Success, false).await;
+    let server = ImportRefreshServer::start(ImportRefreshMode::Success).await;
     let store_dir = test_store_dir();
     let store = open_store(store_dir.path()).await;
     let vault = Arc::new(MemoryVault::new());
@@ -8842,10 +9057,26 @@ async fn expired_imported_bundle_refreshes_instead_of_terminal_exit70() {
     age_import_bundle(vault.as_ref(), &descriptor);
     reset_oauth_import_read_count();
 
-    let access = broker
-        .resolve(&descriptor)
-        .await
-        .expect("stale source falls back to refresh");
+    let resolved = broker.resolve(&descriptor).await;
+    if let Err(error) = resolved {
+        assert_eq!(error.code, ErrorCode::Unauthorized);
+        assert_eq!(oauth_import_read_count(), 1);
+        assert_eq!(server.calls(), 0, "Haider must not rotate a Codex token");
+        let stored = vault
+            .resolve(&descriptor.alias)
+            .and_then(|stored| haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()))
+            .expect("unchanged imported snapshot");
+        assert_eq!(stored.generation, 1);
+        assert_eq!(
+            stored.refresh_token(),
+            Some(b"fake-refresh-token-1".as_slice())
+        );
+        assert!(broker.shutdown().await);
+        actor.shutdown().await;
+        store.close().await.expect("close");
+        return;
+    }
+    let access = resolved.expect("legacy imported refresh path");
     assert_eq!(access.expose_secret(), b"fake-refreshed-access-token");
     assert_eq!(oauth_import_read_count(), 1);
     assert_eq!(server.calls(), 1);
@@ -8940,7 +9171,7 @@ async fn failed_import_healing_names_the_import_recovery_command() {
     ) {
         return;
     }
-    let server = ImportRefreshServer::start(ImportRefreshMode::InvalidGrant, false).await;
+    let server = ImportRefreshServer::start(ImportRefreshMode::InvalidGrant).await;
     let store_dir = test_store_dir();
     let store = open_store(store_dir.path()).await;
     let vault = Arc::new(MemoryVault::new());
@@ -8984,7 +9215,7 @@ async fn concurrent_import_healing_reads_source_and_refreshes_once() {
     ) {
         return;
     }
-    let server = ImportRefreshServer::start(ImportRefreshMode::Success, true).await;
+    let server = ImportRefreshServer::start(ImportRefreshMode::Success).await;
     let store_dir = test_store_dir();
     let store = open_store(store_dir.path()).await;
     let vault = Arc::new(MemoryVault::new());
@@ -9005,19 +9236,15 @@ async fn concurrent_import_healing_reads_source_and_refreshes_once() {
         let descriptor = descriptor.clone();
         async move { broker.resolve(&descriptor).await }
     });
-    server.wait_for_calls(1).await;
-    assert_eq!(oauth_import_read_count(), 1);
-    assert_eq!(server.calls(), 1);
-    server.release();
     for task in [first, second] {
-        let access = task
+        let error = task
             .await
             .expect("resolve joins")
-            .expect("resolve succeeds");
-        assert_eq!(access.expose_secret(), b"fake-refreshed-access-token");
+            .expect_err("source-owned token cannot be rotated by Haider");
+        assert_eq!(error.code, ErrorCode::Unauthorized);
     }
     assert_eq!(oauth_import_read_count(), 1);
-    assert_eq!(server.calls(), 1);
+    assert_eq!(server.calls(), 0);
 
     assert!(broker.shutdown().await);
     actor.shutdown().await;
@@ -9218,8 +9445,18 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
     let candidate =
         crate::device_discovery::discover_device_candidates_with_native(false, native.as_ref())
             .into_iter()
-            .find(|candidate| candidate.wire.provider == ANTHROPIC_OAUTH_PROVIDER_NAME)
-            .expect("same-provider Claude candidate remains surfaced");
+            .find(|candidate| candidate.wire.provider == ANTHROPIC_OAUTH_PROVIDER_NAME);
+    if candidate.is_none() {
+        assert!(
+            native.events().is_empty(),
+            "strict discovery must not touch the native credential store"
+        );
+        assert_eq!(accounts.list().len(), 1);
+        assert!(vault.list().expect("vault list").is_empty());
+        store.close().await.expect("close");
+        return;
+    }
+    let candidate = candidate.expect("legacy explicit native opt-in candidate");
     assert_eq!(candidate.wire.source_label, "Linked to Claude Code");
 
     let (sink, mut frames) = channel_sink();
@@ -9461,49 +9698,26 @@ async fn claude_code_import_honors_expiry_and_anthropic_registration() {
     );
     let (sink, mut frames) = channel_sink();
     send_oauth_import(&actor.commands(), sink, "import-claude-1", "claude-code").await;
-    let descriptor = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
         .await
         .expect("Claude import response deadline")
         .expect("Claude import response")
     {
         WireFrame::Response {
-            body:
-                ResponseBody::AccountOAuthImport {
-                    descriptor,
-                    revision: 1,
-                },
+            body: ResponseBody::Error { code, message, .. },
             ..
-        } => descriptor,
-        other => panic!("unexpected Claude import response: {other:?}"),
-    };
-    assert_eq!(descriptor.alias.as_str(), ANTHROPIC_OAUTH_PROVIDER_NAME);
-    assert_eq!(descriptor.provider, ANTHROPIC_OAUTH_PROVIDER_NAME);
-    assert_eq!(
-        descriptor.identity,
-        "Claude Max subscription · independently imported"
-    );
-    assert!(descriptor.active);
-    assert_eq!(snapshot.lock().expect("snapshot").len(), 1);
-    assert_eq!(management.read().expect("management").revision, 1);
-    let stored = vault
-        .resolve(&CredentialAlias::new(ANTHROPIC_OAUTH_PROVIDER_NAME))
-        .expect("stored Claude bundle");
-    let bundle = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret())
-        .expect("decode Claude bundle");
-    assert_eq!(bundle.provider_id, ANTHROPIC_OAUTH_PROVIDER_NAME);
-    assert_eq!(bundle.issuer, "https://claude.ai");
-    assert_eq!(bundle.audience, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
-    assert_eq!(bundle.expires_at_unix_ms, 4_102_444_800_123);
-    assert_eq!(bundle.access_token(), b"fake-claude-access-token-1");
-    assert_eq!(
-        bundle.import_source_access_fingerprint(),
-        Some(*blake3::hash(b"fake-claude-access-token-1").as_bytes())
-    );
-    assert_eq!(
-        bundle.refresh_token(),
-        Some(b"fake-claude-refresh-token-1".as_slice())
-    );
-    assert_eq!(bundle.granted_scopes, ["user:inference"]);
+        } => {
+            assert_eq!(code, haider_rpc::ERROR_CODE_PROVIDER_ERROR);
+            assert_eq!(
+                message,
+                "Claude Code subscription credentials remain owned by the official client"
+            );
+        }
+        other => panic!("Claude subscription import must be refused: {other:?}"),
+    }
+    assert!(snapshot.lock().expect("snapshot").is_empty());
+    assert_eq!(management.read().expect("management").revision, 0);
+    assert!(vault.list().expect("vault list").is_empty());
 
     actor.shutdown().await;
     store.close().await.expect("close");
@@ -9556,7 +9770,7 @@ async fn claude_code_import_without_inference_scope_is_refused() {
         WireFrame::Response {
             body: ResponseBody::Error { code, .. },
             ..
-        } => assert_eq!(code, ERROR_CODE_INVALID_ARGUMENT),
+        } => assert_eq!(code, haider_rpc::ERROR_CODE_PROVIDER_ERROR),
         other => panic!("an inference-less grant must be refused: {other:?}"),
     }
     assert_eq!(snapshot.lock().expect("snapshot").len(), 0, "nothing lands");
@@ -9587,10 +9801,6 @@ async fn malformed_and_missing_imports_name_paths_and_commit_nothing() {
     let malformed_path = std::path::PathBuf::from(
         std::env::var_os("HAIDER_CODEX_AUTH_PATH").expect("isolated Codex path"),
     );
-    let missing_path = std::path::PathBuf::from(
-        std::env::var_os("HAIDER_CLAUDE_CREDS_PATH").expect("isolated Claude path"),
-    );
-
     let store_dir = test_store_dir();
     let store = open_store(store_dir.path()).await;
     let vault = Arc::new(MemoryVault::new());
@@ -9633,7 +9843,10 @@ async fn malformed_and_missing_imports_name_paths_and_commit_nothing() {
         } => message,
         other => panic!("missing import unexpectedly succeeded: {other:?}"),
     };
-    assert!(missing_message.contains(&missing_path.display().to_string()));
+    assert_eq!(
+        missing_message,
+        "Claude Code subscription credentials remain owned by the official client"
+    );
     assert!(snapshot.lock().expect("snapshot").is_empty());
     assert!(vault.list().expect("vault list").is_empty());
     assert_eq!(management.read().expect("management").revision, 0);
@@ -10092,6 +10305,8 @@ async fn provider_remove_commits_replays_fences_and_beats_restart_resurrection()
         provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let commands = actor.commands();
     let (sink, mut frames) = channel_sink();
@@ -10292,6 +10507,8 @@ async fn provider_remove_refuses_release_owned_and_account_referenced_profiles()
         provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
         reserved_aliases: HashSet::new(),
         refresh_fences: RefreshFenceRegistry::default(),
+        source_registry: empty_source_registry(),
+        source_snapshot: empty_source_snapshot(),
     });
     let commands = actor.commands();
     let (sink, mut frames) = channel_sink();
@@ -10632,6 +10849,8 @@ async fn explicit_discovery_detects_codex_but_never_auto_imports() {
             provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
             reserved_aliases: HashSet::new(),
             refresh_fences,
+            source_registry: empty_source_registry(),
+            source_snapshot: empty_source_snapshot(),
         },
         |commands| {
             CredentialBroker::new_with_fences(
@@ -10694,11 +10913,8 @@ async fn explicit_discovery_detects_codex_but_never_auto_imports() {
     );
     assert_eq!(
         native.events(),
-        [
-            ClaudeNativeReadEvent::AdoptionDiscovery,
-            ClaudeNativeReadEvent::AdoptionDiscovery,
-        ],
-        "startup is lazy and every explicit discovery remains metadata-only"
+        [],
+        "strict discovery never touches the native credential store"
     );
 
     assert!(broker.shutdown().await);
@@ -12267,4 +12483,270 @@ async fn each_turn_resolves_the_currently_active_account() {
         Some(second.as_str()),
         "the NEXT turn already uses the newly active account — no restart"
     );
+}
+
+fn linked_source_jwt(payload: &serde_json::Value) -> String {
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header = engine.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let body = engine.encode(payload.to_string().as_bytes());
+    let signature = engine.encode(b"fixture-signature");
+    format!("{header}.{body}.{signature}")
+}
+
+fn write_linked_codex_source(root: &std::path::Path, account_id: &str, email: &str) {
+    std::fs::create_dir_all(root).expect("create Codex root");
+    let access = linked_source_jwt(&serde_json::json!({
+        "exp": 4_102_444_800u64,
+        "https://api.openai.com/auth": { "chatgpt_account_id": account_id }
+    }));
+    let id = linked_source_jwt(&serde_json::json!({
+        "email": email,
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account_id,
+            "chatgpt_plan_type": "pro"
+        }
+    }));
+    let document = serde_json::json!({
+        "account_id": account_id,
+        "last_refresh": "2026-09-03T12:34:56Z",
+        "tokens": {
+            "access_token": access,
+            "id_token": id,
+            "refresh_token": "REFRESH_THIS_MUST_NEVER_ENTER_A_LINKED_BUNDLE"
+        }
+    });
+    std::fs::write(
+        root.join("auth.json"),
+        serde_json::to_vec(&document).expect("encode Codex source"),
+    )
+    .expect("write Codex source");
+}
+
+#[test]
+fn source_reconciliation_links_every_codex_root_without_owning_refresh_rotation() {
+    let profile = test_store_dir();
+    let first_root = profile.path().join("codex-one");
+    let second_root = profile.path().join("codex-two");
+    let third_root = profile.path().join("codex-three-same-identity");
+    let claude_one = profile.path().join("claude-one");
+    let claude_two = profile.path().join("claude-two");
+    let keyring_root = profile.path().join("codex-keyring");
+    let auto_root = profile.path().join("codex-auto");
+    let ephemeral_root = profile.path().join("codex-ephemeral");
+    write_linked_codex_source(&first_root, "acct-source-one", "one@example.test");
+    write_linked_codex_source(&second_root, "acct-source-two", "two@example.test");
+    write_linked_codex_source(&third_root, "acct-source-one", "one@example.test");
+    for root in [&claude_one, &claude_two] {
+        std::fs::create_dir_all(root).expect("create Claude root");
+        std::fs::write(root.join(".credentials.json"), CLAUDE_IMPORT_FIXTURE)
+            .expect("write Claude source");
+    }
+    for (root, mode) in [
+        (&keyring_root, "keyring"),
+        (&auto_root, "auto"),
+        (&ephemeral_root, "ephemeral"),
+    ] {
+        std::fs::create_dir_all(root).expect("create non-file root");
+        std::fs::write(
+            root.join("config.toml"),
+            format!("cli_auth_credentials_store = \"{mode}\"\n"),
+        )
+        .expect("write store mode");
+    }
+
+    let mut registry = CredentialSourceRegistry::load(profile.path()).expect("source registry");
+    for (root, label) in [
+        (&first_root, "Codex one"),
+        (&second_root, "Codex two"),
+        (&third_root, "Codex same identity"),
+        (&keyring_root, "Codex keyring"),
+        (&auto_root, "Codex auto"),
+        (&ephemeral_root, "Codex ephemeral"),
+    ] {
+        registry
+            .enroll(CredentialSourceKind::CodexHome, root, Some(label))
+            .expect("enroll Codex source");
+    }
+    for (root, label) in [(&claude_one, "Claude one"), (&claude_two, "Claude two")] {
+        registry
+            .enroll(CredentialSourceKind::ClaudeFile, root, Some(label))
+            .expect("enroll Claude source");
+    }
+    let mut accounts = memory_accounts();
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("reconcile sources");
+
+    assert_eq!(registry.records().len(), 8);
+    assert_eq!(accounts.list().len(), 5);
+    assert_eq!(
+        accounts
+            .list()
+            .iter()
+            .filter(|descriptor| descriptor.active)
+            .count(),
+        2,
+        "each provider retains exactly one active account"
+    );
+    let active = accounts
+        .active_for_provider(OPENAI_OAUTH_PROVIDER_NAME)
+        .expect("active linked account")
+        .alias
+        .clone();
+    let first_generation = accounts.list().to_vec();
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("repeat reconcile");
+    assert_eq!(
+        accounts.list(),
+        first_generation,
+        "an unchanged scan must not synthesize a newer descriptor generation"
+    );
+    assert_eq!(
+        accounts
+            .active_for_provider(OPENAI_OAUTH_PROVIDER_NAME)
+            .expect("stable active linked account")
+            .alias,
+        active,
+        "periodic scans must not oscillate the selected account"
+    );
+
+    let first_record = registry
+        .records()
+        .iter()
+        .find(|record| record.root == std::fs::canonicalize(&first_root).expect("canonical root"))
+        .cloned()
+        .expect("first source record");
+    let before_rollback = accounts
+        .get(&CredentialAlias::new(
+            first_record.account_alias.as_deref().expect("source alias"),
+        ))
+        .cloned()
+        .expect("linked descriptor");
+    let auth_path = first_root.join("auth.json");
+    let mut restored: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&auth_path).expect("read source for rollback fixture"),
+    )
+    .expect("decode rollback fixture");
+    restored["last_refresh"] = serde_json::Value::String("2025-01-01T00:00:00Z".into());
+    std::fs::write(
+        &auth_path,
+        serde_json::to_vec(&restored).expect("encode rollback fixture"),
+    )
+    .expect("write rollback fixture");
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("reject older generation");
+    assert_eq!(
+        accounts
+            .get(&before_rollback.alias)
+            .expect("descriptor after older source"),
+        &before_rollback,
+        "an older source generation must never roll the account backward"
+    );
+    assert_eq!(
+        registry
+            .records()
+            .iter()
+            .find(|record| record.id == first_record.id)
+            .and_then(|record| record.last_refreshed_at_ms),
+        first_record.last_refreshed_at_ms
+    );
+
+    for record in registry.records().iter().filter(|record| {
+        record.kind == CredentialSourceKind::CodexHome
+            && record.store_mode == haider_accounts::CredentialStoreMode::File
+    }) {
+        let material =
+            crate::device_discovery::read_linked_source(record).expect("read linked Codex source");
+        let encoded = material.encoded_bundle.expect("access-only bundle");
+        let bundle = haider_accounts::OAuthTokenBundleV1::decode(&encoded)
+            .expect("decode access-only bundle");
+        assert!(
+            bundle.refresh_token().is_none(),
+            "linked sources never copy the origin refresh token"
+        );
+        assert_eq!(
+            record.last_refreshed_at_ms,
+            Some(1_788_438_896_000),
+            "source-declared last_refresh wins over filesystem mtime"
+        );
+    }
+    assert_eq!(
+        registry
+            .records()
+            .iter()
+            .filter(|record| record.kind == CredentialSourceKind::ClaudeFile)
+            .filter(|record| record.health == CredentialSourceHealth::RequiresOriginClient)
+            .count(),
+        2,
+        "each Claude file root remains a distinct read-only account"
+    );
+    let keyring_root = std::fs::canonicalize(&keyring_root).expect("canonical keyring root");
+    let keyring = registry
+        .records()
+        .iter()
+        .find(|record| record.root == keyring_root)
+        .expect("keyring source");
+    assert_eq!(
+        keyring.store_mode,
+        haider_accounts::CredentialStoreMode::Keyring
+    );
+    assert_eq!(keyring.health, CredentialSourceHealth::RequiresOriginClient);
+    assert!(keyring.account_alias.is_none());
+    for mode in [
+        haider_accounts::CredentialStoreMode::Auto,
+        haider_accounts::CredentialStoreMode::Ephemeral,
+    ] {
+        let record = registry
+            .records()
+            .iter()
+            .find(|record| record.store_mode == mode)
+            .expect("non-file source");
+        assert_eq!(record.health, CredentialSourceHealth::RequiresOriginClient);
+        assert!(record.account_alias.is_none());
+    }
+
+    let first_alias = registry
+        .records()
+        .iter()
+        .find(|record| record.root == std::fs::canonicalize(&first_root).expect("canonical root"))
+        .and_then(|record| record.account_alias.as_deref())
+        .map(CredentialAlias::new)
+        .expect("first linked alias");
+    std::fs::remove_file(first_root.join("auth.json")).expect("remove source credential");
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("source-gone reconcile");
+    assert_eq!(
+        accounts.get(&first_alias).expect("retained account").status,
+        CredentialStatus::NeedsAttention {
+            reason: CredentialAttentionReason::SourceGone,
+        },
+        "a vanished credential remains visible as source-gone"
+    );
+}
+
+#[tokio::test]
+async fn credential_source_watcher_observes_atomic_origin_rotation() {
+    let period = source_reconcile_period("watch-profile");
+    assert_eq!(period, source_reconcile_period("watch-profile"));
+    assert!(period >= SOURCE_RECONCILE_BASE);
+    assert!(
+        period <= SOURCE_RECONCILE_BASE + Duration::from_millis(SOURCE_RECONCILE_JITTER_MAX_MS)
+    );
+
+    let profile = test_store_dir();
+    let root = profile.path().join("watched-codex");
+    write_linked_codex_source(&root, "acct-watch", "watch@example.test");
+    let mut registry = CredentialSourceRegistry::load(profile.path()).expect("source registry");
+    registry
+        .enroll(CredentialSourceKind::CodexHome, &root, Some("watched"))
+        .expect("enroll source");
+    let registry = Arc::new(StdMutex::new(registry));
+    let (changed_tx, mut changed_rx) = watch::channel(0_u64);
+    let _watcher = CredentialSourceWatcher::new(&registry, changed_tx);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    write_linked_codex_source(&root, "acct-watch", "rotated@example.test");
+    // 3s = twelve 250ms watcher cadences; this is a test-only scheduling
+    // allowance, not a product timeout.
+    tokio::time::timeout(Duration::from_secs(3), changed_rx.changed())
+        .await
+        .expect("watch deadline")
+        .expect("watch signal");
+    assert!(*changed_rx.borrow_and_update() > 0);
 }

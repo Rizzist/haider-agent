@@ -63,9 +63,6 @@ const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
 /// wait for desktop authorization forever. Every call therefore runs on its
 /// own OS thread and only this bounded result is admitted back into discovery.
 const NATIVE_CREDENTIAL_STORE_TIMEOUT: Duration = Duration::from_secs(2);
-/// Explicit import is the only event allowed to present platform credential
-/// UI. It remains bounded, but has enough room for an intentional response.
-const NATIVE_CREDENTIAL_SIGNIFICANT_TIMEOUT: Duration = Duration::from_secs(30);
 const OAUTH_REFRESH_SKEW: Duration = Duration::from_secs(30);
 const KIMI_REFRESH_REJECTED_TTL: Duration = Duration::from_secs(300);
 pub(crate) const KIMI_DEVICE_ALIAS: &str = "_kimi_oauth_device_id_v1";
@@ -1230,30 +1227,28 @@ pub(crate) enum ClaudeNativeCredentialFailure {
     TimedOut,
 }
 
-/// Explicit-import reads may retry a previously failed no-UI probe and, on
-/// macOS, request protected data interactively. Ordinary provider read-throughs
-/// and adoption discovery never permit credential UI; the latter remains a
-/// distinct event so one successful no-UI read can feed candidate lookup.
+/// Explicit-import reads may retry a previously failed no-UI probe. Every
+/// event remains prompt-free: the daemon never turns an import into a macOS
+/// Keychain authorization interaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClaudeNativeReadEvent {
     Ordinary,
-    /// Explicit user-issued import. This is the only event permitted to ask
-    /// macOS Keychain for protected credential data.
+    /// Explicit user-issued import. It permits a fresh no-UI attempt after a
+    /// cached failure, but never an interactive data read.
     Significant,
     AdoptionDiscovery,
 }
 
 #[cfg(any(test, target_os = "macos"))]
 impl ClaudeNativeReadEvent {
+    #[cfg(test)]
     #[must_use]
     const fn credential_interaction_resolution(self) -> haider_core::InteractionResolution {
-        let mode = if matches!(self, Self::Significant) {
-            haider_protocol::session::SessionInteractionModeV1::Interactive
-        } else {
-            haider_protocol::session::SessionInteractionModeV1::Autonomous
-        };
-        haider_core::InteractionResolutionPolicy::new(mode)
-            .resolve(haider_core::InteractionGate::CredentialOrLogin)
+        let _ = self;
+        haider_core::InteractionResolutionPolicy::new(
+            haider_protocol::session::SessionInteractionModeV1::Autonomous,
+        )
+        .resolve(haider_core::InteractionGate::CredentialOrLogin)
     }
 
     #[must_use]
@@ -1261,17 +1256,13 @@ impl ClaudeNativeReadEvent {
         MacosKeychainQueryPlan {
             skip_authenticated_attribute_items: true,
             skip_authenticated_data_items: true,
-            allow_interactive_data_fallback: matches!(
-                self.credential_interaction_resolution(),
-                haider_core::InteractionResolution::AwaitHuman
-            ),
+            allow_interactive_data_fallback: false,
         }
     }
 }
 
 /// Mechanically testable Keychain query contract. Every discovery/preflight
-/// query skips protected items; only an explicit import may perform the later
-/// interactive data read.
+/// query skips protected items and no event may perform an interactive read.
 #[cfg(any(test, target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MacosKeychainQueryPlan {
@@ -1293,16 +1284,9 @@ pub(crate) trait ClaudeNativeCredentialStore: Send + Sync {
     }
 }
 
-/// Raw platform store. The macOS implementation performs a no-UI query first
-/// and permits at most one interactive Keychain read for this object (one
-/// object is constructed per daemon boot).
+/// Raw platform store. The macOS implementation performs only no-UI queries.
 #[derive(Default)]
-pub(crate) struct PlatformClaudeNativeCredentialStore {
-    #[cfg(all(target_os = "macos", not(test)))]
-    interactive_attempted: AtomicBool,
-    #[cfg(all(target_os = "macos", not(test)))]
-    last_failure: Mutex<Option<ClaudeNativeCredentialFailure>>,
-}
+pub(crate) struct PlatformClaudeNativeCredentialStore {}
 
 impl ClaudeNativeCredentialStore for PlatformClaudeNativeCredentialStore {
     fn read(
@@ -1382,12 +1366,7 @@ impl ClaudeNativeCredentialAccess {
         {
             return Err(ClaudeNativeCredentialFailure::Unavailable);
         }
-        let timeout = if event == ClaudeNativeReadEvent::Significant {
-            NATIVE_CREDENTIAL_SIGNIFICANT_TIMEOUT
-        } else {
-            self.timeout
-        };
-        match completion.recv_timeout(timeout) {
+        match completion.recv_timeout(self.timeout) {
             Ok(result) => result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 Err(ClaudeNativeCredentialFailure::TimedOut)
@@ -1554,7 +1533,7 @@ fn platform_claude_credential_probe(
 
 #[cfg(all(target_os = "macos", not(test)))]
 fn platform_claude_credential(
-    store: &PlatformClaudeNativeCredentialStore,
+    _store: &PlatformClaudeNativeCredentialStore,
     event: ClaudeNativeReadEvent,
 ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
     use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
@@ -1589,59 +1568,13 @@ fn platform_claude_credential(
             _ => None,
         })
     {
-        *store
-            .last_failure
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         return native_claude_input("macOS Keychain", Zeroizing::new(bytes));
     }
 
-    if !plan.allow_interactive_data_fallback {
-        return Err(no_ui_failure
-            .or(attribute_no_ui_failure)
-            .unwrap_or(ClaudeNativeCredentialFailure::Denied));
-    }
-
-    // Protected data needs UI. Only an explicit import may reach this branch,
-    // and only the first attempt in this daemon boot is allowed to ask.
-    if store.interactive_attempted.swap(true, Ordering::AcqRel) {
-        return Err(store
-            .last_failure
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .unwrap_or(ClaudeNativeCredentialFailure::Denied));
-    }
-    let result = ItemSearchOptions::new()
-        .class(ItemClass::generic_password())
-        .service(CLAUDE_CODE_CREDENTIAL_SERVICE)
-        .load_data(true)
-        .search()
-        .and_then(|items| {
-            items
-                .into_iter()
-                .find_map(|item| match item {
-                    SearchResult::Data(bytes) => Some(bytes),
-                    _ => None,
-                })
-                .ok_or_else(|| security_framework::base::Error::from_code(-25300))
-        });
-    match result {
-        Ok(bytes) => {
-            *store
-                .last_failure
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-            native_claude_input("macOS Keychain", Zeroizing::new(bytes))
-        }
-        Err(error) => {
-            let failure = classify_macos_keychain_status(error.code());
-            *store
-                .last_failure
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(failure);
-            Err(failure)
-        }
-    }
+    debug_assert!(!plan.allow_interactive_data_fallback);
+    Err(no_ui_failure
+        .or(attribute_no_ui_failure)
+        .unwrap_or(ClaudeNativeCredentialFailure::Denied))
 }
 
 #[cfg(all(target_os = "macos", not(test)))]
@@ -1813,24 +1746,29 @@ pub(crate) fn load_claude_credential_input(
     native: &dyn ClaudeNativeCredentialStore,
     event: ClaudeNativeReadEvent,
 ) -> Result<ClaudeCredentialInput, HaiderError> {
-    match native.read(event) {
+    let native_failure = match native.read(event) {
         Ok(mut input) => {
             input.native_owner = true;
             return Ok(input);
         }
-        Err(ClaudeNativeCredentialFailure::Missing) => {}
-        Err(failure) => return Err(claude_native_access_error(failure)),
-    }
+        Err(failure) => failure,
+    };
     match std::fs::File::open(file_path) {
         Ok(file) => read_oauth_import_reader(file_path, "claude-code", file),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(HaiderError::new(
-            ErrorCode::CredentialMissing,
-            format!(
-                "cannot find Claude Code credentials at `{}` or in the native secure store",
-                file_path.display()
-            ),
-            false,
-        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if native_failure == ClaudeNativeCredentialFailure::Missing {
+                Err(HaiderError::new(
+                    ErrorCode::CredentialMissing,
+                    format!(
+                        "cannot find Claude Code credentials at `{}` or in the native secure store",
+                        file_path.display()
+                    ),
+                    false,
+                ))
+            } else {
+                Err(claude_native_access_error(native_failure))
+            }
+        }
         Err(error) => Err(oauth_import_read_error(file_path, "claude-code", &error)),
     }
 }
@@ -4667,6 +4605,24 @@ async fn token_bundle_from_response(
         // because the flow independently verified this exact ID token.
         account_identity.verified = true;
     }
+    if account_identity.is_none()
+        && registration.provider_id == haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME
+    {
+        // Anthropic's token response has no ID token/account coordinate. Pin
+        // one synthetic identity to the login's initial grant identity; the
+        // refresh path preserves this AccountIdentity byte-for-byte, so token
+        // rotation cannot rename the account or break its meter association.
+        let stable_suffix = identity.subject_hash.chars().take(16).collect::<String>();
+        account_identity = Some(AccountIdentity {
+            email: None,
+            display_name: Some(identity.display_identity.clone()),
+            account_id: Some(format!("anthropic:{stable_suffix}")),
+            plan: None,
+            issuer: Some(registration.issuer.clone()),
+            captured_at: now,
+            verified: false,
+        });
+    }
     let expires_at = now
         .checked_add(response.expires_in.saturating_mul(1000))
         .ok_or_else(|| OAuthPublicError::new("invalid_token_response", false))?;
@@ -5688,25 +5644,11 @@ impl CredentialBroker {
                     return Ok(RefreshFlightOutcome::Imported(expected));
                 }
                 crate::accounts::OAuthImportHealResult::RefreshFallback { source } => {
-                    // Under an UNCERTAIN mark (forced shutdown mid-refresh)
-                    // the rotating refresh token must not be replayed — the
-                    // stale source cannot heal, so the account stays down
-                    // with its named remedy.
-                    if !refresh_allowed {
-                        return Err(imported_credential_expired(descriptor, &source));
-                    }
-                    let imported_codex = source == "codex"
-                        && descriptor.provider == haider_provider::OPENAI_OAUTH_PROVIDER_NAME;
-                    return Self::refresh(
-                        inner,
-                        &refresh_descriptor,
-                        bundle,
-                        expected_fence,
-                        imported_codex,
-                    )
-                    .await
-                    .map(|_| RefreshFlightOutcome::Refreshed)
-                    .map_err(|error| imported_refresh_error(error, descriptor, &source));
+                    // An external CLI remains the sole refresh owner. A stale
+                    // snapshot is never a license for Haider to spend the
+                    // copied rotating refresh token, even after explicit
+                    // import and even when expiry was observed locally.
+                    return Err(imported_credential_expired(descriptor, &source));
                 }
                 crate::accounts::OAuthImportHealResult::LiveOwnerStore { source } => {
                     // The external app owns this rotating credential. The
@@ -6789,25 +6731,6 @@ fn imported_credential_expired(descriptor: &CredentialDescriptor, source: &str) 
         ],
     ));
     error
-}
-
-fn imported_refresh_error(
-    error: HaiderError,
-    descriptor: &CredentialDescriptor,
-    source: &str,
-) -> HaiderError {
-    if error.retryable
-        || error
-            .details
-            .as_ref()
-            .and_then(|details| details.get("kind"))
-            .and_then(serde_json::Value::as_str)
-            == Some("oauth_relogin_required")
-    {
-        error
-    } else {
-        imported_credential_expired(descriptor, source)
-    }
 }
 
 fn imported_credential_expired_for_provider(

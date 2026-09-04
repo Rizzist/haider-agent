@@ -237,7 +237,10 @@ pub fn band_counts(shells: usize, monitors: usize) -> Vec<BandCount> {
     if monitors > 0 {
         counts.push(BandCount {
             kind: BandCountKind::Monitors,
-            text: format!("· {monitors} monitor{}", if monitors == 1 { "" } else { "s" }),
+            text: format!(
+                "· {monitors} monitor{}",
+                if monitors == 1 { "" } else { "s" }
+            ),
         });
     }
     counts

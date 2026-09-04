@@ -397,6 +397,7 @@ fn a_selected_api_key_account_triggers_model_discovery() {
         Some(LiveReply::Accounts {
             descriptors: vec![descriptor],
             revision: Some(2),
+            sources: Vec::new(),
         }),
         std::time::Instant::now(),
     );

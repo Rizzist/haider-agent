@@ -67,7 +67,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /ssh [scope …]       saved remote machines — remote output is untrusted",
     "  /shells           local + SSH terminal registry — close from the list",
     "  /monitors          existing session monitor details",
-    "  /usage [history|models|global|accounts] [provider] — cross-provider usage; s cycles scopes",
+    "  /usage [history|models|calendar|global|accounts] [provider] — cross-provider usage; s cycles scopes",
     "  /accounts          provider credentials — OAuth / API / HuggingFace / OpenCode Zen+Go / custom, pick the active",
     "  /account <alias>   switch the active account for its provider (tab-completes aliases)",
     "  /login <prov> <oauth|api>  add a provider account (OAuth loopback, API key, or custom URL)",

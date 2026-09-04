@@ -2529,6 +2529,7 @@ async fn keyless_resolution_survives_management_mutation_before_hook_binding() {
             vault_supported: false,
             discovery_disabled: true,
             device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(true),
+            sources: Arc::new(std::sync::Mutex::new(Vec::new())),
             vault: None,
         })
         .expect("install mutated account projection");

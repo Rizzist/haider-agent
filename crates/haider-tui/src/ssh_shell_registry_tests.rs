@@ -75,7 +75,10 @@ fn status_strip_never_carries_a_shell_or_monitor_count() {
         .push(shell("sh-one", haider_rpc::ShellKindWire::Local));
     model.monitor_count = 1;
     let one = status_text(&model);
-    assert!(!one.contains("shell"), "status strip regrew a shell count: {one}");
+    assert!(
+        !one.contains("shell"),
+        "status strip regrew a shell count: {one}"
+    );
     assert!(
         !one.contains("monitor"),
         "status strip regrew a monitor count: {one}"
@@ -89,7 +92,10 @@ fn status_strip_never_carries_a_shell_or_monitor_count() {
     ));
     model.monitor_count = 3;
     let many = status_text(&model);
-    assert!(!many.contains("shell"), "status strip regrew a shell count: {many}");
+    assert!(
+        !many.contains("shell"),
+        "status strip regrew a shell count: {many}"
+    );
     assert!(
         !many.contains("monitor"),
         "status strip regrew a monitor count: {many}"
