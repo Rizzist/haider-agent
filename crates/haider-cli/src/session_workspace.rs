@@ -122,6 +122,7 @@ async fn resolve_implicit_session(
         .request(RequestBody::SessionList {
             cursor: None,
             limit: 2,
+            order: Default::default(),
         })
         .await
         .map_err(WorkspaceError::Client)?

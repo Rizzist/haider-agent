@@ -338,6 +338,7 @@ impl ObserveClient {
                 .request(RequestBody::SessionList {
                     cursor,
                     limit: LIST_PAGE,
+                    order: Default::default(),
                 })
                 .await?;
             match response {

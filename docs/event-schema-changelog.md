@@ -250,3 +250,23 @@ not all been called out together in this ledger. Their schema status is:
   refusals separately from provider failures.
 - Raw-envelope and JSONL readers must preserve these additive facts. Existing
   valid-workspace streams and `schema_version = 1` remain byte-stable.
+
+### v0.0.970 — session-list durable recency (RPC only)
+
+- Additive `session.list.order` request field with values `id_asc` and
+  `recency_desc`. Omission retains the original id-ascending behavior and is
+  still omitted when encoded, so existing request bytes and meaning do not
+  change. Daemons advertise support through `session_list_recency_v1`.
+- In `recency_desc` mode, the opaque cursor represents the total durable key
+  `(last_activity_ms DESC, session_id ASC)`. Clients pass it back verbatim.
+  `SessionSummary.last_activity_ms` is the maximum of the indexed durable
+  journal-head timestamp, shared `seen_at_ms`, and creation time. The value in
+  each summary is exactly the value used for ordering and its cursor.
+- Owner-approved semantic correction: `SessionSummary.last_activity_ms`
+  previously meant only daemon-reduced user-relevant activity and could be
+  absent for a cold session. From 0.0.970 it is the durable roster-recency
+  scalar above and is populated for cold rows; older clients already tolerate
+  the optional field and may continue treating it as a recency hint.
+- No `RawEnvelope`, automation event kind, or `schema_version` changed. This
+  entry records an additive RPC request field and the explicit summary-field
+  semantic correction above.

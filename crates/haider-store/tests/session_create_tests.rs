@@ -8,6 +8,7 @@ use haider_protocol::state::SessionState;
 use haider_store::{EventStore, SessionCreateCommand, SessionCreateOutcome, Store};
 use serde_json::json;
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 fn command(command_id: &str, session_id: &str, event_id: &str) -> SessionCreateCommand {
     SessionCreateCommand {
@@ -28,6 +29,181 @@ fn command(command_id: &str, session_id: &str, event_id: &str) -> SessionCreateC
         event_id: EventId::new(event_id),
         device_id: DeviceId::new("daemon-test"),
     }
+}
+
+fn seed_recency_sessions(connection: &mut rusqlite::Connection, range: std::ops::Range<u64>) {
+    let transaction = connection.transaction().expect("begin seed transaction");
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO sessions(id, created_at_ms, meta_json, seen_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .expect("prepare session seed");
+        for index in range {
+            let session_id = format!("session-{index:04}");
+            let created_at_ms = 1_000_u64 + index;
+            let seen_at_ms = (index % 10 == 0).then_some(10_000_u64 + index);
+            let meta_json = if index % 2 == 0 {
+                r#"{"title":"zzz"}"#
+            } else {
+                r#"{"title":"aaa"}"#
+            };
+            insert
+                .execute(rusqlite::params![
+                    session_id,
+                    i64::try_from(created_at_ms).expect("created fits"),
+                    meta_json,
+                    seen_at_ms.map(|value| i64::try_from(value).expect("seen fits")),
+                ])
+                .expect("seed session");
+        }
+    }
+    transaction.commit().expect("commit seed transaction");
+}
+
+fn seed_recency_events(
+    connection: &mut rusqlite::Connection,
+    range: std::ops::Range<u64>,
+    events_per_session: u64,
+) {
+    let transaction = connection.transaction().expect("begin event seed");
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO events( \
+                     session_id, seq, envelope_json, event_id, committed_at_ms \
+                 ) VALUES (?1, ?2, '{}', ?3, ?4)",
+            )
+            .expect("prepare event seed");
+        for index in range {
+            for seq in 1..=events_per_session {
+                insert
+                    .execute(rusqlite::params![
+                        format!("session-{index:04}"),
+                        i64::try_from(seq).expect("seq fits"),
+                        format!("event-{index:04}-{seq:02}"),
+                        i64::try_from(5_000 + index + seq).expect("timestamp fits"),
+                    ])
+                    .expect("seed event");
+            }
+        }
+    }
+    transaction.commit().expect("commit event seed");
+}
+
+/// Cost pin for the P0 launcher path. The timed region is only the production
+/// indexed recency query; fixture creation is deliberately outside it.
+#[test]
+fn recency_page_of_5000_sessions_is_indexed_and_under_500_ms() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open");
+    let mut connection = rusqlite::Connection::open(store.database_path()).expect("open sqlite");
+    seed_recency_sessions(&mut connection, 0..400);
+    seed_recency_events(&mut connection, 0..400, 10);
+    let started_400 = Instant::now();
+    let page_400 = store
+        .session_recency_page(None, 100)
+        .expect("400-session recency page");
+    let elapsed_400 = started_400.elapsed();
+    assert_eq!(page_400.len(), 100);
+    assert!(
+        elapsed_400 < Duration::from_millis(100),
+        "400-session recency page exceeded 100 ms: {elapsed_400:?}"
+    );
+
+    seed_recency_sessions(&mut connection, 400..5_000);
+    seed_recency_events(&mut connection, 400..5_000, 10);
+    let transaction = connection.transaction().expect("begin head transaction");
+    transaction
+        .execute(
+            "INSERT INTO events( \
+                 session_id, seq, envelope_json, event_id, committed_at_ms \
+             ) VALUES ('session-4998', 11, '{}', 'head-wins', 80000),
+                    ('session-4999', 11, '{}', 'latest-head', 90000)",
+            [],
+        )
+        .expect("seed latest head");
+    transaction
+        .execute(
+            "UPDATE sessions SET created_at_ms = 60000 WHERE id = 'session-4996'",
+            [],
+        )
+        .expect("seed created winner");
+    transaction
+        .execute(
+            "UPDATE sessions SET seen_at_ms = 70000 WHERE id = 'session-4997'",
+            [],
+        )
+        .expect("seed seen winner");
+    transaction
+        .execute(
+            "UPDATE sessions SET seen_at_ms = 100000 \
+             WHERE id IN ('session-0003', 'session-0004')",
+            [],
+        )
+        .expect("seed equal-recency tie");
+    transaction.commit().expect("commit seed transaction");
+
+    let query_plan = {
+        let mut statement = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN \
+                 WITH roster AS ( \
+                     SELECT s.id, max( \
+                         s.created_at_ms, coalesce(s.seen_at_ms, 0), \
+                         coalesce(head.committed_at_ms, 0) \
+                     ) AS last_activity_ms \
+                     FROM sessions AS s \
+                     LEFT JOIN events AS head ON head.rowid = ( \
+                         SELECT rowid FROM events \
+                         WHERE session_id = s.id ORDER BY seq DESC LIMIT 1 \
+                     ) \
+                 ) \
+                 SELECT id, last_activity_ms FROM roster \
+                 ORDER BY last_activity_ms DESC, id ASC LIMIT 100",
+            )
+            .expect("prepare query plan");
+        statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect query plan")
+    };
+    assert!(
+        query_plan.iter().any(|detail| {
+            detail.contains("SEARCH events USING COVERING INDEX sqlite_autoindex_events_")
+                && detail.contains("session_id")
+        }),
+        "head lookup must use the (session_id, seq) primary-key index: {query_plan:?}"
+    );
+    drop(connection);
+
+    let started = Instant::now();
+    let page = store.session_recency_page(None, 100).expect("recency page");
+    let elapsed = started.elapsed();
+
+    assert_eq!(page.len(), 100);
+    assert_eq!(page[0].key.session_id.as_str(), "session-0003");
+    assert_eq!(page[0].key.last_activity_ms, 100_000);
+    assert_eq!(page[1].key.session_id.as_str(), "session-0004");
+    assert_eq!(page[1].key.last_activity_ms, 100_000);
+    assert_eq!(page[2].key.session_id.as_str(), "session-4999");
+    assert_eq!(page[2].key.last_activity_ms, 90_000);
+    assert_eq!(page[3].key.session_id.as_str(), "session-4998");
+    assert_eq!(page[3].key.last_activity_ms, 80_000);
+    assert_eq!(page[4].key.session_id.as_str(), "session-4997");
+    assert_eq!(page[4].key.last_activity_ms, 70_000);
+    assert_eq!(page[5].key.session_id.as_str(), "session-4996");
+    assert_eq!(page[5].key.last_activity_ms, 60_000);
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "5,000-session recency page exceeded 500 ms: {elapsed:?}"
+    );
+    eprintln!(
+        "recency page: 400 sessions {elapsed_400:?} (budget 100ms); \
+         5,000 sessions {elapsed:?} (budget 500ms)"
+    );
 }
 
 /// MUTATION CHECK: remove the same-command committed-receipt lookup from

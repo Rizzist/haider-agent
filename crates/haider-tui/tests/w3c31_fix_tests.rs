@@ -30,6 +30,9 @@ fn live_model() -> AppModel {
     model.mode = RuntimeMode::Live;
     model.sessions.clear();
     model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_SESSION_SEEN_V1.to_owned());
+    model
 }
 
 fn sid(n: usize) -> SessionId {
@@ -48,7 +51,7 @@ fn summary(n: usize, head_seq: u64) -> SessionSummary {
         run_state: None,
         run_id: None,
         seen_at_ms: None,
-        last_activity_ms: None,
+        last_activity_ms: Some(u64::try_from(n).expect("index fits")),
         waiting_why: None,
         needs_input: None,
         metadata: None,
@@ -1005,19 +1008,16 @@ fn sessions_lists_every_session_including_the_ones_past_the_launcher() {
         }),
     );
     common::run_slash(&mut model, "/sessions");
-    let (cmd, out) = model
-        .launcher_shellout
-        .as_ref()
-        .expect("the listing lands in the launcher's shellout block");
-    assert_eq!(cmd, "sessions");
+    assert_eq!(model.screen, Screen::Sessions);
+    let rows = model.session_browser_rows();
     assert_eq!(
-        out.lines().count(),
+        rows.len(),
         12,
         "every session is listed, not just the painted rows"
     );
     for n in 0..12 {
         assert!(
-            out.contains(sid(n).as_str()),
+            rows.iter().any(|row| row.id == sid(n)),
             "session {n} appears by its wire id"
         );
     }

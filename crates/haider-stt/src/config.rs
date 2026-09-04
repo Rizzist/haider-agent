@@ -43,6 +43,13 @@ pub struct TranscriptionConfig {
     pub deepgram_model: Option<String>,
     #[serde(default = "default_language")]
     pub language: String,
+    /// 970 owner requirement 1: dictation NEVER auto-sends. A finished
+    /// transcript lands in the composer AT THE CURSOR, editable, and the
+    /// user presses ⏎ themselves. This is the ONE explicit opt-in that
+    /// restores submit-on-stop; it is off unless the profile says
+    /// otherwise, and an absent key reads as off (`serde(default)`).
+    #[serde(default)]
+    pub auto_send: bool,
 }
 
 fn default_language() -> String {
@@ -56,6 +63,8 @@ impl Default for TranscriptionConfig {
             whisper_model_id: None,
             deepgram_model: None,
             language: default_language(),
+            // Owner 970: off. Transcription lands in the composer.
+            auto_send: false,
         }
     }
 }

@@ -8,7 +8,8 @@
 use base64::Engine as _;
 use haider_core::{
     DelegationRecord, DelegationState, HarnessActor, HarnessConfig, SessionCreateCommand,
-    SqliteStoreHandle, StoreHandle, SubmitCommittedTurn,
+    SessionRenameCommand, SessionSeenCommand, SessionSelectAgentTypeCommand, SqliteStoreHandle,
+    StoreHandle, SubmitCommittedTurn,
 };
 use haider_daemon::ConnectionTransport;
 use haider_daemon::{
@@ -33,6 +34,7 @@ use haider_protocol::ids::{
     MenuId, NodeId, RunId, SessionId,
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
+use haider_protocol::loom::LoomAgentType;
 use haider_protocol::menu::{
     DecisionKind, EffectRecoveryAction, Menu, MenuKind, MenuOption, MenuScope,
 };
@@ -3905,6 +3907,7 @@ async fn list_uses_opaque_stable_order_cursor_and_read_does_not_subscribe() {
             RequestBody::SessionList {
                 cursor: None,
                 limit: 2,
+                order: Default::default(),
             },
         )
         .await
@@ -3934,6 +3937,7 @@ async fn list_uses_opaque_stable_order_cursor_and_read_does_not_subscribe() {
             RequestBody::SessionList {
                 cursor: Some(cursor),
                 limit: 2,
+                order: Default::default(),
             },
         )
         .await
@@ -3975,6 +3979,294 @@ async fn list_uses_opaque_stable_order_cursor_and_read_does_not_subscribe() {
     assert!(
         sink.snapshot().is_empty(),
         "list/read created no subscription"
+    );
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// P0 session-loss regression: a cold 400-session profile is listed newest
+/// first on page one, independent of ids/titles, with durable metadata and
+/// lineage present. Exactly 40 rows are marked seen; the other 360 exercise
+/// the production `NULL seen_at_ms` shape.
+#[tokio::test]
+async fn recency_list_puts_the_latest_cold_session_first_in_a_400_row_profile() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let generation = store.worker_generation();
+    let latest = SessionId::new("session-000");
+    let child = SessionId::new("session-001");
+
+    for index in 0..400_u16 {
+        let session_id = SessionId::new(format!("session-{index:03}"));
+        create_typed_session(&store, &session_id, "fake").await;
+        if index < 40 {
+            store
+                .mark_session_seen(SessionSeenCommand {
+                    command_id: format!("seen-{index:03}"),
+                    request_digest: format!("seen-digest-{index:03}"),
+                    request_json: "{}".into(),
+                    session_id,
+                    worker_generation: generation,
+                    event_id: EventId::new(format!("seen-event-{index:03}")),
+                    device_id: DeviceId::new("hub-test"),
+                })
+                .await
+                .expect("seen marker commits");
+        }
+    }
+
+    store
+        .rename_session(SessionRenameCommand {
+            command_id: "rename-child".into(),
+            request_digest: "rename-child-digest".into(),
+            request_json: "{}".into(),
+            session_id: child.clone(),
+            worker_generation: generation,
+            title: Some("aaa alphabetically first".into()),
+            only_if_untitled: false,
+            event_id: EventId::new("rename-child-event"),
+            device_id: DeviceId::new("hub-test"),
+        })
+        .await
+        .expect("child title commits");
+    store
+        .loom_register_agent_type(LoomAgentType {
+            id: "researcher".into(),
+            name: "Researcher".into(),
+            job: "Research durable session ordering.".into(),
+            in_type: "Task".into(),
+            out_type: "Report".into(),
+            clis: Vec::new(),
+            apis: Vec::new(),
+            denials: Vec::new(),
+            skills: Vec::new(),
+            scripts: Vec::new(),
+            color: "#c2701c".into(),
+            glyph: "▲".into(),
+            rev: 1,
+        })
+        .await
+        .expect("agent type registers");
+    store
+        .select_session_agent_type(SessionSelectAgentTypeCommand {
+            command_id: "select-latest-agent-type".into(),
+            request_digest: "select-latest-agent-type-digest".into(),
+            request_json: "{}".into(),
+            session_id: latest.clone(),
+            worker_generation: generation,
+            agent_type: Some("researcher".into()),
+            event_id: EventId::new("select-latest-agent-type-event"),
+            device_id: DeviceId::new("hub-test"),
+        })
+        .await
+        .expect("agent type commits");
+    store
+        .rename_session(SessionRenameCommand {
+            command_id: "rename-latest".into(),
+            request_digest: "rename-latest-digest".into(),
+            request_json: "{}".into(),
+            session_id: latest.clone(),
+            worker_generation: generation,
+            title: Some("zzz alphabetically last".into()),
+            only_if_untitled: false,
+            event_id: EventId::new("rename-latest-event"),
+            device_id: DeviceId::new("hub-test"),
+        })
+        .await
+        .expect("latest title commits");
+    store
+        .create_delegation(fleet_delegation(
+            &latest,
+            &latest,
+            &child,
+            "recency-child",
+            None,
+            1,
+        ))
+        .await
+        .expect("child lineage commits");
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    let list_400_started = std::time::Instant::now();
+    connection
+        .request(
+            RequestId::new("recency-list-400"),
+            RequestBody::SessionList {
+                cursor: None,
+                limit: 100,
+                order: haider_rpc::SessionListOrderWire::RecencyDesc,
+            },
+        )
+        .await
+        .expect("recency list routes");
+    let WireFrame::Response {
+        body:
+            ResponseBody::SessionList {
+                sessions,
+                next_cursor: Some(cursor),
+            },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected first recency page");
+    };
+    let list_400_elapsed = list_400_started.elapsed();
+    assert!(
+        list_400_elapsed < Duration::from_millis(500),
+        "full cold session.list at 400 sessions exceeded 500 ms: {list_400_elapsed:?}"
+    );
+    assert_eq!(sessions.len(), 100, "MAX_LIST_PAGE remains the page cap");
+    assert!(
+        cursor.starts_with("hr1."),
+        "recency cursor is opaque and typed"
+    );
+    assert_eq!(sessions[0].session_id, latest);
+    let latest_summary = &sessions[0];
+    assert_eq!(
+        latest_summary.title.as_deref(),
+        Some("zzz alphabetically last")
+    );
+    assert_eq!(latest_summary.agent_type.as_deref(), Some("researcher"));
+    assert_eq!(latest_summary.kind, Some(haider_rpc::SessionKindWire::Root));
+    assert!(latest_summary.parent_session_id.is_none());
+    assert!(
+        latest_summary.last_activity_ms.is_some_and(|activity| {
+            latest_summary
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| activity >= metadata.created_at_ms)
+        }),
+        "cold summary recency covers creation and the durable head"
+    );
+    let child_summary = sessions
+        .iter()
+        .find(|summary| summary.session_id == child)
+        .expect("recent child is on page one");
+    assert_eq!(
+        child_summary.title.as_deref(),
+        Some("aaa alphabetically first")
+    );
+    assert_eq!(
+        child_summary.kind,
+        Some(haider_rpc::SessionKindWire::Subagent)
+    );
+    assert_eq!(child_summary.parent_session_id.as_ref(), Some(&latest));
+
+    let mut all_ids = std::collections::HashSet::new();
+    let mut previous_key: Option<(u64, String)> = None;
+    for summary in &sessions {
+        let key = (
+            summary
+                .last_activity_ms
+                .expect("page rows carry durable recency"),
+            summary.session_id.as_str().to_owned(),
+        );
+        if let Some((previous_activity, previous_id)) = &previous_key {
+            assert!(
+                *previous_activity > key.0 || (*previous_activity == key.0 && previous_id < &key.1),
+                "page is ordered by recency descending then id ascending"
+            );
+        }
+        assert!(all_ids.insert(summary.session_id.clone()));
+        previous_key = Some(key);
+    }
+    let mut next_cursor = Some(cursor);
+    let mut page_number = 2_u8;
+    while let Some(cursor) = next_cursor.take() {
+        connection
+            .request(
+                RequestId::new(format!("recency-list-400-page-{page_number}")),
+                RequestBody::SessionList {
+                    cursor: Some(cursor),
+                    limit: 100,
+                    order: haider_rpc::SessionListOrderWire::RecencyDesc,
+                },
+            )
+            .await
+            .expect("next recency page routes");
+        let WireFrame::Response {
+            body:
+                ResponseBody::SessionList {
+                    sessions: page,
+                    next_cursor: following,
+                },
+            ..
+        } = sink.next().await
+        else {
+            panic!("expected recency page {page_number}");
+        };
+        assert!(!page.is_empty(), "non-terminal cursor yields a page");
+        for summary in page {
+            let key = (
+                summary
+                    .last_activity_ms
+                    .expect("page rows carry durable recency"),
+                summary.session_id.as_str().to_owned(),
+            );
+            if let Some((previous_activity, previous_id)) = &previous_key {
+                assert!(
+                    *previous_activity > key.0
+                        || (*previous_activity == key.0 && previous_id < &key.1),
+                    "cursor preserves recency-desc/id-asc order"
+                );
+            }
+            assert!(
+                all_ids.insert(summary.session_id.clone()),
+                "stable cursor never repeats a row"
+            );
+            previous_key = Some(key);
+        }
+        next_cursor = following;
+        page_number = page_number.saturating_add(1);
+    }
+    assert_eq!(all_ids.len(), 400, "all four pages have no skips");
+
+    // Scale the same cold-list path without warming the new rows' observe
+    // folds. Fixture creation is intentionally outside the timed region.
+    for index in 400..5_000_u16 {
+        create_typed_session(
+            &store,
+            &SessionId::new(format!("scale-session-{index:04}")),
+            "fake",
+        )
+        .await;
+    }
+    let list_5000_started = std::time::Instant::now();
+    connection
+        .request(
+            RequestId::new("recency-list-5000"),
+            RequestBody::SessionList {
+                cursor: None,
+                limit: 100,
+                order: haider_rpc::SessionListOrderWire::RecencyDesc,
+            },
+        )
+        .await
+        .expect("5,000-session recency list routes");
+    let WireFrame::Response {
+        body: ResponseBody::SessionList { sessions, .. },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected 5,000-session recency page");
+    };
+    let list_5000_elapsed = list_5000_started.elapsed();
+    assert_eq!(sessions.len(), 100);
+    assert!(
+        list_5000_elapsed < Duration::from_millis(500),
+        "full cold session.list at 5,000 sessions exceeded 500 ms: {list_5000_elapsed:?}"
+    );
+    eprintln!(
+        "full cold session.list page: 400 sessions {list_400_elapsed:?}; \
+         5,000 sessions {list_5000_elapsed:?} (500ms budget each)"
     );
 
     connection.close().await.expect("connection closes");
@@ -4095,6 +4387,7 @@ async fn list_summaries(hub: &SessionHub) -> Vec<SessionSummary> {
             RequestBody::SessionList {
                 cursor: None,
                 limit: 10,
+                order: Default::default(),
             },
         )
         .await
@@ -5043,6 +5336,7 @@ async fn metadata_only_observe_shares_authoritative_fields_and_roster_truth() {
             RequestBody::SessionList {
                 cursor: None,
                 limit: 16,
+                order: Default::default(),
             },
         )
         .await
@@ -6348,6 +6642,7 @@ async fn begin_draining_synchronously_rejects_new_connection_work() {
             RequestBody::SessionList {
                 cursor: None,
                 limit: 10,
+                order: Default::default(),
             },
         )
         .await
@@ -9904,16 +10199,14 @@ async fn native_pipe_io_failure_never_fails_the_journal_append() {
     );
 }
 
-/// v0.0.936 attention state, roster half: `last_activity_ms` moves ONLY on
-/// meaningful committed activity (assistant items — never telemetry, config,
-/// or unknown bookkeeping), `session.seen` is receipted+idempotent over the
-/// wire, and the scalars converge so a client's `last_activity > seen_at`
-/// unseen predicate flips exactly at the mark-seen boundary.
+/// v0.0.970 attention state, roster half: `last_activity_ms` is durable roster
+/// recency (journal head, seen, and creation maximum), `session.seen` remains
+/// receipted+idempotent over the wire, and the scalars converge so a client's
+/// `last_activity > seen_at` unseen predicate flips after later activity.
 ///
-/// MUTATION CHECK (executed): widen `is_meaningful_activity` to match every
-/// payload and the usage/bookkeeping assertions fail; narrow it to nothing
-/// and the item-activity assertion fails; drop the receipt replay lookup and
-/// the replay-equality assertion fails.
+/// MUTATION CHECK: omit the durable head from summary recency and the seed /
+/// bookkeeping assertions fail; drop the receipt replay lookup and the exact
+/// replay-equality assertion fails.
 #[tokio::test]
 async fn session_seen_rpc_and_activity_scalars_converge_on_the_roster() {
     let (_root, store, hub) = open_hub(None, 8).await;
@@ -9968,6 +10261,7 @@ async fn session_seen_rpc_and_activity_scalars_converge_on_the_roster() {
                     RequestBody::SessionList {
                         cursor: None,
                         limit: 64,
+                        order: Default::default(),
                     },
                 )
                 .await
@@ -9982,9 +10276,12 @@ async fn session_seen_rpc_and_activity_scalars_converge_on_the_roster() {
         }};
     }
 
-    // The seed payload is unknown bookkeeping: no meaningful activity yet.
+    // Even an unknown durable seed contributes its committed head timestamp
+    // to restart-safe recency.
     let summary = list_summary!("att-list-0");
-    assert_eq!(summary.last_activity_ms, None);
+    let seed_activity = summary
+        .last_activity_ms
+        .expect("durable head sets cold-list recency");
     assert_eq!(summary.seen_at_ms, None);
     assert_eq!(summary.waiting_why, None);
 
@@ -10000,6 +10297,7 @@ async fn session_seen_rpc_and_activity_scalars_converge_on_the_roster() {
     hub.append(&mut [item]).await.expect("item commits");
     let summary = list_summary!("att-list-1");
     let activity = summary.last_activity_ms.expect("item sets activity");
+    assert!(activity >= seed_activity, "durable recency never regresses");
     assert_eq!(
         summary.seen_at_ms, None,
         "unseen before any acknowledgement"
@@ -10053,14 +10351,14 @@ async fn session_seen_rpc_and_activity_scalars_converge_on_the_roster() {
     };
     assert_eq!((replay_at, replay_seq), (seen_at_ms, seen_seq));
 
-    // The seen fact and telemetry are non-meaningful: activity is unmoved.
+    // A seen receipt is durable and the public recency is the maximum of the
+    // journal head, seen timestamp, and creation timestamp.
     let summary = list_summary!("att-list-2");
     assert_eq!(summary.seen_at_ms, Some(seen_at_ms));
-    assert_eq!(
-        summary.last_activity_ms,
-        Some(activity),
-        "marking seen must never look like new activity"
-    );
+    let seen_activity = summary
+        .last_activity_ms
+        .expect("seen receipt preserves durable recency");
+    assert!(seen_activity >= seen_at_ms);
     let usage = footprint_envelope(&session, "attention-usage", generation, 1_000);
     let mut bookkeeping = envelope(&session, "attention-bookkeeping", generation);
     *bookkeeping.payload = serde_json::json!({"type": "graph_telemetry_probe"});
@@ -10068,11 +10366,10 @@ async fn session_seen_rpc_and_activity_scalars_converge_on_the_roster() {
         .await
         .expect("bookkeeping commits");
     let summary = list_summary!("att-list-3");
-    assert_eq!(
-        summary.last_activity_ms,
-        Some(activity),
-        "unknown bookkeeping must not move activity"
-    );
+    let bookkeeping_activity = summary
+        .last_activity_ms
+        .expect("bookkeeping advances the durable head");
+    assert!(bookkeeping_activity >= seen_activity);
     drop(usage);
 
     // New assistant activity AFTER seen: the unseen predicate flips back.
@@ -10088,7 +10385,7 @@ async fn session_seen_rpc_and_activity_scalars_converge_on_the_roster() {
     let summary = list_summary!("att-list-4");
     let renewed = summary.last_activity_ms.expect("activity again");
     assert!(
-        renewed > seen_at_ms || renewed >= activity,
+        renewed >= bookkeeping_activity,
         "fresh item is visible activity"
     );
     assert_eq!(summary.seen_at_ms, Some(seen_at_ms), "seen is unmoved");
@@ -10194,6 +10491,7 @@ async fn waiting_why_types_parked_states_with_menu_identity() {
             RequestBody::SessionList {
                 cursor: None,
                 limit: 64,
+                order: Default::default(),
             },
         )
         .await

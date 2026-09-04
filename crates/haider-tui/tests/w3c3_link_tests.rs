@@ -33,7 +33,9 @@ use haider_rpc::{
     DEFAULT_FRAME_LIMIT, LifecyclePhase, ProtocolError, RequestBody, ResponseBody,
     SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
 };
-use haider_tui::link::{CommandContext, Link, map_frame, map_response, request_body};
+use haider_tui::link::{
+    CommandContext, Link, map_frame, map_response, request_body, request_body_for_features,
+};
 use haider_tui::live::{LiveCommand, LiveReply};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -656,7 +658,18 @@ fn request_body_round_trips_the_attachment_commands() {
         RequestBody::SessionList {
             cursor: None,
             limit: haider_tui::live::LIST_PAGE,
+            order: Default::default(),
         }
+    );
+    let recency_features = BTreeSet::from([haider_rpc::FEATURE_SESSION_LIST_RECENCY_V1.to_owned()]);
+    assert_eq!(
+        request_body_for_features(LiveCommand::List { cursor: None }, &recency_features),
+        RequestBody::SessionList {
+            cursor: None,
+            limit: haider_tui::live::LIST_PAGE,
+            order: haider_rpc::SessionListOrderWire::RecencyDesc,
+        },
+        "a feature-serving daemon gets newest-first list requests"
     );
     assert_eq!(
         request_body(LiveCommand::Cancel {

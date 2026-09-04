@@ -409,7 +409,7 @@ fn streaming_tail_frames() {
         EventPayload::Item(ItemEvent::Started {
             item_id: ItemId::new("stream-1"),
             item: TurnItem::AgentMessage {
-                text: String::new().into(),
+                text: String::new(),
             },
         }),
     );
@@ -418,9 +418,7 @@ fn streaming_tail_frames() {
         EventPayload::Item(ItemEvent::Delta {
             item_id: ItemId::new("stream-1"),
             delta: ItemDelta::Text {
-                text: "Streaming a partial reply with an **unterminated bold span"
-                    .to_owned()
-                    .into(),
+                text: "Streaming a partial reply with an **unterminated bold span".to_owned(),
             },
         }),
     );
@@ -504,9 +502,7 @@ fn composer_image_notice_frames() {
     // draft it deliberately kept.
     let mut model = session_model();
     push_agent(&mut model, "notice-1", "Ready when you are.");
-    model
-        .composer
-        .set_text("what is in this screenshot?".to_owned());
+    model.composer.set_text("what is in this screenshot?".to_owned());
     model.composer_notice = Some(haider_tui::app::ImageNotice::NoVision {
         model: "deepseek-v4".to_owned(),
     });

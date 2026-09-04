@@ -851,6 +851,13 @@ pub const IDLE_DECAY: Duration = Duration::from_secs(30);
 /// (two phases) and, via `% 3`, the shimmer's 1.8 s exactly.
 pub const ANIM_PHASE_MS: u64 = 600;
 
+/// The listening animation cadence (970 owner requirement 2/3): the wave
+/// and the 1 Hz blink advance the render clock at 30 fps while `/talk` is
+/// capturing, matching the frame tick's own 33 ms coalescing window so the
+/// smoothest possible animation still costs at most ONE frame per window.
+/// Armed only while `TalkState::wave_active()` holds.
+pub const TALK_ANIM_MS: u64 = 33;
+
 /// One status-surface snapshot held by the W-INP publisher's dedup cache.
 /// The connection epoch, session id, display line, and additive structured
 /// fields all move under one cache/revision fence.
@@ -3683,6 +3690,21 @@ pub async fn run_live(
     frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut anim_tick = tokio::time::interval(Duration::from_millis(ANIM_PHASE_MS));
     anim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // 970 owner requirement 2/3 — the LISTENING clock. The wave and the
+    // 1 Hz blink are the only chrome that has to move while nothing else
+    // in the session does, and the shared 600 ms `anim_tick` is far too
+    // coarse for either (it is what made the bars read as frozen). This
+    // advances the render clock at the SAME 30 fps the frame tick
+    // coalesces to, so the animation is smooth and still can never draw
+    // more than one frame per 33 ms.
+    //
+    // The cost is bounded by construction: the branch is disabled unless
+    // a talk session is actually capturing (`wave_active()` holds only in
+    // `TalkPhase::Listening`), so an idle terminal takes ZERO extra
+    // wakeups — the same efficiency-rider law the guarded `frame_tick`
+    // already follows.
+    let mut talk_tick = tokio::time::interval(Duration::from_millis(TALK_ANIM_MS));
+    talk_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut hit_map: Vec<(ratatui::layout::Rect, crate::app::Hit)> = Vec::new();
     // The last pointer cell, for post-draw hover settling (W5g-7).
     let mut pointer: Option<(u16, u16)> = None;
@@ -3843,6 +3865,17 @@ pub async fn run_live(
                 // breathing (and honestly dips) while a tool runs mid-turn or
                 // deltas pause, with no timer of its own.
                 model.note_throughput();
+                model.dirty = true;
+            }
+            // The listening clock (970 owner requirement 2): advances the
+            // render clock at 30 fps ONLY while the mic is capturing, so
+            // the level bars and the 1 Hz blink move in real time instead
+            // of stepping at the 600 ms phase tick. It marks the model
+            // dirty and nothing else — the guarded `frame_tick` below
+            // still owns every actual draw, so this can never present
+            // more than one frame per 33 ms window.
+            _ = talk_tick.tick(), if model.talk.wave_active() => {
+                model.clock_ms = model.clock_ms.max(now_epoch_ms());
                 model.dirty = true;
             }
             () = wait_until(deadline) => {}

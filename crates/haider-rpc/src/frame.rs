@@ -511,6 +511,9 @@ pub const FEATURE_SESSION_RUN_ID_V1: &str = "session_run_id_v1";
 /// Daemon can push changed/new session summaries after a read-only roster
 /// watch is accepted.
 pub const FEATURE_SESSION_LIST_WATCH_V1: &str = "session_list_watch_v1";
+/// `session.list` accepts feature-signalled durable-recency ordering and an
+/// opaque `(last_activity_ms, session_id)` continuation cursor.
+pub const FEATURE_SESSION_LIST_RECENCY_V1: &str = "session_list_recency_v1";
 /// Daemon-owned volatile composer mirroring, watching, and input injection.
 pub const FEATURE_INPUT_MIRROR_V1: &str = "input_mirror_v1";
 /// Input mirrors carry metadata-only refs for ready composer attachments.
@@ -1745,9 +1748,10 @@ pub struct SessionSummary {
     /// activity. `None` means no acknowledgement has ever committed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seen_at_ms: Option<u64>,
-    /// Latest meaningful committed activity, reduced by the daemon. It is
-    /// absent for a session with no user-relevant activity, never a client
-    /// replay obligation.
+    /// Durable roster recency: the maximum of the session's indexed journal
+    /// head timestamp, shared `seen_at_ms`, and creation timestamp. Current
+    /// producers populate it even for cold sessions; absence is tolerated
+    /// only for older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_ms: Option<u64>,
     /// Why the session currently needs a human. This is absent unless its
@@ -1870,6 +1874,18 @@ pub struct SessionSummary {
     /// user prompt returned as a draft, not the child's copied-history head.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<SessionForkProvenance>,
+}
+
+/// Ordering requested from the non-subscribing `session.list` door.
+///
+/// The default is the original wire-v1 order, so adding this field does not
+/// change an older client's request meaning.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionListOrderWire {
+    #[default]
+    IdAsc,
+    RecencyDesc,
 }
 
 /// Typed session lineage kind (`session_lineage_v1`), from the durable
@@ -3102,7 +3118,10 @@ pub enum RequestBody {
     },
     /// Cursor-paginated, non-subscribing session listing.
     ///
-    /// v0.1 ordering is the immutable `session_id` in ascending byte order.
+    /// Omitted `order` retains the v0.1 immutable `session_id` ascending
+    /// order. A daemon advertising `session_list_recency_v1` also accepts
+    /// `recency_desc`, ordered by durable activity descending then id
+    /// ascending.
     /// `cursor` is an opaque server token positioned after the last emitted
     /// ordering key; clients must return it verbatim and never parse it as an
     /// array offset.
@@ -3113,6 +3132,10 @@ pub enum RequestBody {
         cursor: Option<String>,
         /// Maximum number of summaries to return.
         limit: u32,
+        /// Additive ordering mode. Omission preserves the original v0.1
+        /// behavior for older clients.
+        #[serde(default, skip_serializing_if = "is_default")]
+        order: SessionListOrderWire,
     },
     /// Reads only the scalar facts needed by the one-shot CLI status view.
     /// The daemon remains the authorization/redaction boundary; this never
@@ -4152,14 +4175,18 @@ pub enum RequestBody {
 
 impl RequestBody {
     /// Returns the additive feature required before this particular request
-    /// shape may be sent. Legacy exact-node `session.fork` requests require
-    /// only their already-shipped `session_fork_v1` method token.
+    /// shape may be sent. Legacy/default variants return `None` so their
+    /// already-shipped method contract is unchanged.
     #[must_use]
     pub const fn additive_shape_feature(&self) -> Option<&'static str> {
         match self {
             Self::SessionFork {
                 prompt: Some(_), ..
             } => Some(FEATURE_SESSION_PROMPT_FORK_V1),
+            Self::SessionList {
+                order: SessionListOrderWire::RecencyDesc,
+                ..
+            } => Some(FEATURE_SESSION_LIST_RECENCY_V1),
             _ => None,
         }
     }
@@ -4193,7 +4220,8 @@ pub enum ResponseBody {
         worker_generation: u64,
         metadata: SessionMetadataV1,
     },
-    /// One page in the fixed `session_id` ascending order.
+    /// One page in the request's selected stable order. Omitted request
+    /// `order` retains fixed `session_id` ascending behavior.
     #[serde(rename = "session.list")]
     SessionList {
         #[serde(default)]

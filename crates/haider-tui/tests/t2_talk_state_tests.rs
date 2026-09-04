@@ -167,11 +167,16 @@ fn esc_cancels_and_discards_everything() {
     );
 }
 
-/// MUTATION CHECK: make Enter realize the GHOST instead of waiting for
-/// the engine's definitive result. Expected failure: the submit below
-/// carries the partial text, not the engine's assembled transcript.
+/// 970 owner requirement 1 — DICTATION NEVER AUTO-SENDS. Ending the
+/// session commits the engine's DEFINITIVE transcript into the composer
+/// at the cursor, editable, and submits nothing: the user sends with ⏎.
+///
+/// MUTATION CHECK: restore `CommitIntent::Submit` in `talk_commit_stop`.
+/// Expected failure: a `SubmitText` request rides out of a gesture that
+/// only meant "stop listening", and the composer is left empty instead of
+/// holding the text for review.
 #[test]
-fn enter_commits_the_engine_result_and_submits() {
+fn ending_the_session_commits_the_engine_result_without_sending() {
     let mut model = listening();
     let generation = model.talk.generation;
     model.handle_talk(TalkEvent::Partial {
@@ -180,7 +185,11 @@ fn enter_commits_the_engine_result_and_submits() {
     });
     model.handle(key(KeyCode::Enter));
     assert_eq!(model.talk.phase, TalkPhase::Finishing);
-    assert_eq!(model.talk.intent, CommitIntent::Submit);
+    assert_eq!(
+        model.talk.intent,
+        CommitIntent::Insert,
+        "the default intent is INSERT — auto-send is opt-in only"
+    );
     assert_eq!(
         talk_shell(&model.requests),
         vec![&TalkShellCommand::Finish { generation }]
@@ -196,14 +205,94 @@ fn enter_commits_the_engine_result_and_submits() {
     });
     assert_eq!(model.talk.phase, TalkPhase::Idle);
     assert!(!model.listening);
+    assert!(
+        !model
+            .requests
+            .iter()
+            .any(|request| matches!(request, AppRequest::SubmitText { .. })),
+        "stopping dictation must NEVER submit a turn on its own"
+    );
+    assert_eq!(
+        model.composer.text(),
+        "the full assembled transcript ",
+        "the engine's definitive text lands in the composer, editable, \
+         with one separating space for whatever comes next"
+    );
+}
+
+/// The listening TOGGLE — the gesture the owner actually described
+/// ("presses the listening toggle after speaking") — takes the same law
+/// as ⏎: text into the composer, nothing sent.
+///
+/// MUTATION CHECK: route `TalkPhase::Listening` in `talk_toggle` back to
+/// a submitting commit. Expected failure: pressing the chip to stop
+/// speaking fires a turn.
+#[test]
+fn the_listening_toggle_stops_into_the_composer_and_sends_nothing() {
+    let mut model = listening();
+    let generation = model.talk.generation;
+    // Press the toggle again — the "I am done speaking" gesture.
+    model.talk_toggle();
+    assert_eq!(model.talk.phase, TalkPhase::Finishing);
+    assert_eq!(model.talk.intent, CommitIntent::Insert);
+    model.requests.clear();
+    model.handle_talk(TalkEvent::Finished {
+        generation,
+        result: Ok(TranscriptionResult {
+            text: "toggle stopped me".to_owned(),
+            segments: 1,
+            duration_ms: 1200,
+        }),
+    });
+    assert_eq!(model.composer.text(), "toggle stopped me ");
+    assert!(
+        !model
+            .requests
+            .iter()
+            .any(|request| matches!(request, AppRequest::SubmitText { .. })),
+        "the listening toggle never submits"
+    );
+    assert_eq!(
+        model.flash.as_deref(),
+        Some("· ◉ transcribed — ⏎ to send"),
+        "the row says what happened and what to do next"
+    );
+}
+
+/// The ONE explicit opt-in: `transcription.auto_send` restores
+/// submit-on-stop. It is off in `TranscriptionConfig::default`, so this
+/// is the only route back to the pre-970 behaviour.
+///
+/// MUTATION CHECK: ignore `talk_config.auto_send` in `talk_commit_stop`.
+/// Expected failure: the opt-in does nothing and no turn is submitted.
+#[test]
+fn the_explicit_auto_send_opt_in_still_submits() {
+    let mut model = listening();
+    assert!(
+        !haider_stt::config::TranscriptionConfig::default().auto_send,
+        "auto-send must ship OFF"
+    );
+    model.talk_config.auto_send = true;
+    let generation = model.talk.generation;
+    model.talk_toggle();
+    assert_eq!(model.talk.intent, CommitIntent::Submit);
+    model.requests.clear();
+    model.handle_talk(TalkEvent::Finished {
+        generation,
+        result: Ok(TranscriptionResult {
+            text: "send it for me".to_owned(),
+            segments: 1,
+            duration_ms: 1200,
+        }),
+    });
     let submitted = model.requests.iter().find_map(|request| match request {
         AppRequest::SubmitText { text, .. } => Some(text.clone()),
         _ => None,
     });
     assert_eq!(
         submitted.as_deref(),
-        Some("the full assembled transcript"),
-        "commit + submit rides the ONE composer submit path"
+        Some("send it for me"),
+        "the opt-in rides the ONE composer submit path (and trims)"
     );
     assert!(
         model.composer.is_empty(),
@@ -307,7 +396,9 @@ fn the_capture_cap_finishes_into_the_composer_without_submitting() {
             duration_ms: 900_000,
         }),
     });
-    assert_eq!(model.composer.text(), "capped speech");
+    // 970: every realized transcript carries one separating space, so a
+    // second dictation cannot fuse onto the first.
+    assert_eq!(model.composer.text(), "capped speech ");
     assert!(
         !model
             .requests

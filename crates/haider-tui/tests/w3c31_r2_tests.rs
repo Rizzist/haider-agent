@@ -30,6 +30,9 @@ fn live_model() -> AppModel {
     model.mode = RuntimeMode::Live;
     model.sessions.clear();
     model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_SESSION_SEEN_V1.to_owned());
+    model
 }
 
 fn sid(n: usize) -> SessionId {
@@ -100,7 +103,7 @@ fn listed(n: usize) -> LiveReply {
                 run_state: None,
                 run_id: None,
                 seen_at_ms: None,
-                last_activity_ms: None,
+                last_activity_ms: Some(u64::try_from(index).expect("index fits")),
                 waiting_why: None,
                 needs_input: None,
                 metadata: None,
