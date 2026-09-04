@@ -6732,7 +6732,12 @@ fn waiting_for_agents(model: &AppModel) -> Option<String> {
 /// the subagent screen.
 fn subtree_needed(model: &AppModel, on_subagent: bool) -> u16 {
     if model.chips.is_empty() {
-        return 0;
+        // 970 owner item 1: with no subagents the panel still owes ONE row
+        // whenever background work is running, because that row is now the
+        // only place the shells/monitors counts appear (the status-bar
+        // segments are gone). With nothing running at all it collapses
+        // entirely, exactly as before.
+        return u16::from(!model.band_counts().is_empty());
     }
     if model.subtree_collapsed {
         return 1;
@@ -6939,17 +6944,82 @@ fn render_subtree(
     if area.height == 0 {
         return;
     }
+    let has_chips = !model.chips.is_empty();
     let arrow = if model.subtree_collapsed {
         "▸"
     } else {
         "▾"
     };
-    let mut lines = vec![Line::from(vec![
-        Span::styled(format!("{arrow} subagents"), theme.gold_style()),
-        Span::styled(format!(" — {}", subtree_counts(model)), theme.dim_style()),
-    ])];
-    let mut row_hits: Vec<(usize, Hit)> = vec![(0, Hit::SubTreeToggle)];
-    if !model.subtree_collapsed {
+    // 970 owner item 1: Claude Code's task line — the band's header row
+    // carries the background counts RIGHT-ALIGNED (`· 2 shells · 1 monitor`),
+    // each one its own click target. With no subagents the left half is
+    // simply absent and the counts stand alone on the row.
+    let mut header: Vec<Span<'static>> = if has_chips {
+        vec![
+            Span::styled(format!("{arrow} subagents"), theme.gold_style()),
+            Span::styled(format!(" — {}", subtree_counts(model)), theme.dim_style()),
+        ]
+    } else {
+        Vec::new()
+    };
+    let counts = model.band_counts();
+    // Measured BEFORE the pad so the hit rects land on the glyphs the
+    // reader actually sees, not on the gap.
+    let counts_width = crate::taskrows::band_counts_text(&counts).chars().count();
+    let header_width = Line::from(header.clone()).width();
+    // A ≥2-cell gap: the counts must never kiss the subagent summary. When
+    // the row cannot hold both, the counts yield — the panel's own state is
+    // the more important half of the row.
+    let count_spans_fit = !counts.is_empty()
+        && header_width + 2 + counts_width <= area.width as usize;
+    let mut count_hits: Vec<(u16, u16, Hit)> = Vec::new();
+    if count_spans_fit {
+        let pad = (area.width as usize)
+            .saturating_sub(header_width)
+            .saturating_sub(counts_width);
+        header.push(Span::raw(" ".repeat(pad)));
+        let mut cursor = header_width + pad;
+        for (index, count) in counts.iter().enumerate() {
+            if index > 0 {
+                header.push(Span::raw(" "));
+                cursor += 1;
+            }
+            let width = count.text.chars().count();
+            let hit = match count.kind {
+                crate::taskrows::BandCountKind::Shells => Hit::ShellStatus,
+                crate::taskrows::BandCountKind::Monitors => Hit::MonitorStatus,
+            };
+            if let (Ok(x), Ok(width_u16)) = (u16::try_from(cursor), u16::try_from(width)) {
+                count_hits.push((x, width_u16, hit));
+            }
+            header.push(Span::styled(count.text.clone(), theme.dim_style()));
+            cursor += width;
+        }
+    }
+    let mut lines = vec![Line::from(header)];
+    // The counts are pushed FIRST: `hit_rect_at` takes the FIRST rect that
+    // contains the pointer, and the toggle's row-wide rect would otherwise
+    // swallow every click on them.
+    for (x, width, hit) in count_hits {
+        let x = area.x.saturating_add(x);
+        let end = area.x.saturating_add(area.width);
+        if x < end {
+            hits.push((
+                Rect::new(x, area.y, width.min(end.saturating_sub(x)), 1),
+                hit,
+            ));
+        }
+    }
+    // With no subagents there is no panel to collapse — the row is counts
+    // only, so it carries no toggle.
+    let mut row_hits: Vec<(usize, Hit)> = if has_chips {
+        vec![(0, Hit::SubTreeToggle)]
+    } else {
+        Vec::new()
+    };
+    // No chips means no map to draw — the counts-only row stands alone and
+    // owes neither the ⌂ home row nor a tree.
+    if has_chips && !model.subtree_collapsed {
         if let Some(summary) = subtree_metrics_summary(model) {
             lines.push(Line::styled(format!("  {summary}"), theme.dim_style()));
         }
@@ -12196,8 +12266,41 @@ fn sanitize_terminal_text(input: &str) -> String {
     output
 }
 
-/// Read-only details for the existing monitor primitive. This is deliberately
-/// separate from the terminal registry and reuses the same body-overlay layer.
+/// The ink one monitor state chip wears. `firing` pulses on the shared
+/// clock — it is the one transient state, and the row should read as live.
+fn monitor_state_style(
+    theme: &Theme,
+    state: haider_rpc::MonitorStateWire,
+    anim_phase: u8,
+) -> ratatui::style::Style {
+    match state {
+        haider_rpc::MonitorStateWire::Armed => theme.ok_style(),
+        haider_rpc::MonitorStateWire::Paused => theme.dim_style(),
+        haider_rpc::MonitorStateWire::Firing => theme.pulse_ink(theme.maroon, anim_phase),
+        haider_rpc::MonitorStateWire::Exited => theme.faint_style(),
+    }
+}
+
+/// `2m 5s ago` / `in 45s` against the model clock. A timestamp the clock has
+/// not reached yet reads as `now` rather than underflowing into nonsense.
+fn monitor_when(clock_ms: u64, at_ms: u64, future: bool) -> String {
+    if future {
+        if at_ms <= clock_ms {
+            "now".to_owned()
+        } else {
+            format!("in {}", fmt_elapsed(at_ms - clock_ms))
+        }
+    } else if at_ms >= clock_ms {
+        "now".to_owned()
+    } else {
+        format!("{} ago", fmt_elapsed(clock_ms - at_ms))
+    }
+}
+
+/// `/monitors` — the existing monitor registry as ACTIONABLE rows (970
+/// owner item 2). Each row states what it watches, what state it is in,
+/// what it last saw and when it fires next; the SELECTED row also carries
+/// its action strip. Reuses the shared body-overlay layer.
 fn render_monitors_overlay(
     model: &AppModel,
     theme: &Theme,
@@ -12206,26 +12309,126 @@ fn render_monitors_overlay(
     hits: &mut Vec<(Rect, Hit)>,
 ) {
     hits.clear();
+    // Row-relative click targets, resolved to absolute coordinates once the
+    // panel's own rect is known (the `render_shells_overlay` discipline).
+    let mut row_targets: Vec<(usize, usize, usize, Hit)> = Vec::new();
     let mut lines = vec![Line::from(vec![
         Span::styled("monitors", theme.gold_style()),
-        Span::styled("  existing monitor details · esc", theme.faint_style()),
+        Span::styled(
+            "  ↑↓/jk select · x stop · p pause · t trigger · e edit · y copy id · esc",
+            theme.faint_style(),
+        ),
     ])];
-    lines.push(Line::styled(
-        "  use /monitors to refresh daemon truth",
-        theme.faint_style(),
-    ));
     if model.monitors.is_empty() {
         lines.push(Line::styled("  no active monitors", theme.dim_style()));
     } else {
-        for monitor in &model.monitors {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {} · ", monitor.monitor_id), theme.dim_style()),
-                Span::styled(format!("{:?}", monitor.source), theme.text_style()),
+        for (index, monitor) in model.monitors.iter().enumerate() {
+            let selected = index == model.monitors_cursor;
+            let marker = if selected { "›" } else { " " };
+            let state = model.monitor_row_state(monitor);
+            let chip = crate::app::monitor_state_chip(state);
+            let head = format!(" {marker} {} · ", monitor.monitor_id);
+            let source = crate::app::monitor_source_summary(monitor);
+            let mut spans = vec![
+                Span::styled(head.clone(), theme.dim_style()),
+                Span::styled(source.clone(), theme.text_style()),
+                Span::styled("  ", theme.dim_style()),
                 Span::styled(
-                    format!(" · created {}", monitor.created_at_ms),
-                    theme.faint_style(),
+                    format!("[{chip}]"),
+                    monitor_state_style(theme, state, model.anim_phase),
                 ),
-            ]));
+            ];
+            // The whole row is the select target — the id travels in the
+            // hit, never the ordinal.
+            let row_width = Line::from(spans.clone()).width();
+            row_targets.push((
+                lines.len(),
+                0,
+                row_width.max(1),
+                Hit::MonitorRow(monitor.monitor_id.clone()),
+            ));
+            if selected {
+                spans = spans
+                    .into_iter()
+                    .map(|span| span.patch_style(theme.hover_style()))
+                    .collect();
+            }
+            lines.push(Line::from(spans));
+
+            // Detail row: fire count, last event, next fire — the facts the
+            // daemon actually sent, never invented.
+            let mut detail = vec![format!(
+                "fired {}×",
+                monitor.fire_count
+            )];
+            if let Some(last) = monitor.last_event.as_ref() {
+                let when = monitor_when(model.clock_ms, last.at_ms, false);
+                if last.summary.trim().is_empty() {
+                    detail.push(format!("last {when}"));
+                } else {
+                    detail.push(format!("last {when} — {}", last.summary));
+                }
+            }
+            if let Some(next) = monitor.next_fire_at_ms {
+                detail.push(format!(
+                    "next {}",
+                    monitor_when(model.clock_ms, next, true)
+                ));
+            }
+            lines.push(Line::styled(
+                format!("     {}", detail.join(" · ")),
+                theme.faint_style(),
+            ));
+
+            // The action strip belongs to the SELECTED row only — five
+            // targets, each a separate rect so a click can never mean two
+            // things at once.
+            if selected {
+                let pause_label = if matches!(state, haider_rpc::MonitorStateWire::Paused) {
+                    "[resume]"
+                } else {
+                    "[pause]"
+                };
+                let armed = model.monitors_stop_armed.as_deref() == Some(monitor.monitor_id.as_str());
+                let stop_label = if armed { "[stop again]" } else { "[stop]" };
+                let actions: [(&str, Hit); 5] = [
+                    (
+                        stop_label,
+                        Hit::MonitorStop(monitor.monitor_id.clone()),
+                    ),
+                    (
+                        pause_label,
+                        Hit::MonitorPause(monitor.monitor_id.clone()),
+                    ),
+                    (
+                        "[trigger now]",
+                        Hit::MonitorTrigger(monitor.monitor_id.clone()),
+                    ),
+                    (
+                        "[edit with agent]",
+                        Hit::MonitorEdit(monitor.monitor_id.clone()),
+                    ),
+                    (
+                        "[copy id]",
+                        Hit::MonitorCopyId(monitor.monitor_id.clone()),
+                    ),
+                ];
+                let mut spans = vec![Span::styled("     ", theme.dim_style())];
+                let mut cursor = 5_usize;
+                for (label, hit) in actions {
+                    let width = label.chars().count();
+                    row_targets.push((lines.len(), cursor, width, hit.clone()));
+                    let style = if matches!(hit, Hit::MonitorStop(_)) {
+                        theme.maroon_style()
+                    } else {
+                        theme.gold_style()
+                    };
+                    spans.push(Span::styled(label.to_owned(), style));
+                    spans.push(Span::raw(" "));
+                    cursor += width + 1;
+                }
+                lines.push(Line::from(spans));
+            }
         }
     }
     let height = u16::try_from(lines.len() + 1).unwrap_or(area.height);
@@ -12234,10 +12437,40 @@ fn render_monitors_overlay(
         Constraint::Length(height.min(area.height)),
     ])
     .areas(area);
+    // The overlay OWNS its rows. A `Paragraph`'s style only recolours the
+    // cells underneath, so without this the composer band beneath showed
+    // THROUGH every row shorter than the panel — the taller a monitor list
+    // grew, the more of the band it wore.
+    frame.render_widget(ratatui::widgets::Clear, panel);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
         panel,
     );
+    // Row-relative targets become absolute now that the panel is placed.
+    // Action targets are pushed BEFORE the row-select rect that contains
+    // them: `hit_rect_at` takes the FIRST containing rect, so a click on
+    // `[stop]` must meet the stop rect before the row's own.
+    let panel_end_x = panel.x.saturating_add(panel.width);
+    let panel_end_y = panel.y.saturating_add(panel.height);
+    let mut ordered = row_targets;
+    ordered.sort_by_key(|(_, _, _, hit)| u8::from(matches!(hit, Hit::MonitorRow(_))));
+    for (row, offset, width, hit) in ordered {
+        let (Ok(row), Ok(offset), Ok(width)) = (
+            u16::try_from(row),
+            u16::try_from(offset),
+            u16::try_from(width),
+        ) else {
+            continue;
+        };
+        let y = panel.y.saturating_add(row);
+        let x = panel.x.saturating_add(offset);
+        if y < panel_end_y && x < panel_end_x {
+            hits.push((
+                Rect::new(x, y, width.min(panel_end_x.saturating_sub(x)), 1),
+                hit,
+            ));
+        }
+    }
 }
 
 fn fmt_bytes(bytes: u64) -> String {
@@ -12266,13 +12499,6 @@ pub struct StatusSegment {
     /// the one clients should render instead of parsing display text.
     pub state: Option<String>,
     pub detail: Option<String>,
-    action: Option<StatusSegmentAction>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StatusSegmentAction {
-    Shells,
-    Monitors,
 }
 
 /// The strip's style vocabulary — resolved to real styles only inside
@@ -12350,28 +12576,24 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             tone: StatusSegmentTone::Text,
             state: None,
             detail: None,
-            action: None,
         },
         StatusSegment {
             text: "[ ".to_owned(),
             tone: StatusSegmentTone::BadgeChrome,
             state: None,
             detail: None,
-            action: None,
         },
         StatusSegment {
             text: badge.clone(),
             tone: StatusSegmentTone::Badge,
             state: Some(state),
             detail,
-            action: None,
         },
         StatusSegment {
             text: " ]".to_owned(),
             tone: StatusSegmentTone::BadgeChrome,
             state: None,
             detail: None,
-            action: None,
         },
     ];
     if let Some(provider) = model.active_lockdown_provider() {
@@ -12382,7 +12604,6 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             tone: StatusSegmentTone::Hook,
             state: None,
             detail: Some("read/search/web/text/plan plus quota-limited sandbox writes".to_owned()),
-            action: None,
         });
     }
     if let Some(progress) = model.provider_wait_progress()
@@ -12394,7 +12615,6 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             tone: StatusSegmentTone::Dim,
             state: None,
             detail: None,
-            action: None,
         });
     }
     let meter_shown = badge_cells + 2 + meter.chars().count() <= width as usize;
@@ -12404,7 +12624,6 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             tone: StatusSegmentTone::Dim,
             state: None,
             detail: None,
-            action: None,
         });
     }
     if meter_shown && !model.cache_usage.is_empty() {
@@ -12425,7 +12644,6 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
                 tone: StatusSegmentTone::Dim,
                 state: None,
                 detail: None,
-                action: None,
             });
         } else if medium.chars().count() + 2 <= available {
             segments.push(StatusSegment {
@@ -12433,7 +12651,6 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
                 tone: StatusSegmentTone::Dim,
                 state: None,
                 detail: None,
-                action: None,
             });
         }
     }
@@ -12453,44 +12670,12 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             tone: StatusSegmentTone::Text,
             state: None,
             detail: None,
-            action: None,
         });
     }
-    let shell_count = model
-        .shells
-        .iter()
-        .filter(|shell| {
-            matches!(
-                &shell.status,
-                haider_rpc::ShellStatusWire::Starting | haider_rpc::ShellStatusWire::Running
-            )
-        })
-        .count();
-    if shell_count > 0 {
-        segments.push(StatusSegment {
-            text: format!(
-                "· {shell_count} shell{}  ",
-                if shell_count == 1 { "" } else { "s" }
-            ),
-            tone: StatusSegmentTone::Dim,
-            state: None,
-            detail: None,
-            action: Some(StatusSegmentAction::Shells),
-        });
-    }
-    if model.monitor_count > 0 {
-        segments.push(StatusSegment {
-            text: format!(
-                "· {} monitor{}  ",
-                model.monitor_count,
-                if model.monitor_count == 1 { "" } else { "s" }
-            ),
-            tone: StatusSegmentTone::Dim,
-            state: None,
-            detail: None,
-            action: Some(StatusSegmentAction::Monitors),
-        });
-    }
+    // 970 owner item 1: the shell and monitor counts LEFT this strip for
+    // the band's task line (`▾ subagents — … · 2 shells · 1 monitor`, see
+    // `render_subtree`). Counting them in both places WAS the owner's
+    // double count, so nothing may reintroduce a segment here.
     // The voice/dictation chip moved to the TOP-RIGHT header (see
     // `voice_header_pill`), so the status bar no longer carries it.
     // H4: the decision-hook chip — visible exactly while the CURRENT run's
@@ -12508,21 +12693,18 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             tone: StatusSegmentTone::HookChrome,
             state: None,
             detail: None,
-            action: None,
         });
         segments.push(StatusSegment {
             text: "⚙ hook·decided".to_owned(),
             tone: StatusSegmentTone::Hook,
             state: None,
             detail: None,
-            action: None,
         });
         segments.push(StatusSegment {
             text: " ]".to_owned(),
             tone: StatusSegmentTone::HookChrome,
             state: None,
             detail: None,
-            action: None,
         });
     }
     segments
@@ -12643,26 +12825,8 @@ fn render_status_bar(
     let right_width = u16::try_from(right.chars().count()).unwrap_or(0);
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(right_width)]).areas(area);
-    let mut segment_x = left_area.x;
-    let left_end = left_area.x.saturating_add(left_area.width);
-    for segment in &left_segments {
-        let width = u16::try_from(segment.text.chars().count()).unwrap_or(u16::MAX);
-        let visible_width = width.min(left_end.saturating_sub(segment_x));
-        if visible_width > 0 {
-            let hit = match segment.action {
-                Some(StatusSegmentAction::Shells) => Some(Hit::ShellStatus),
-                Some(StatusSegmentAction::Monitors) => Some(Hit::MonitorStatus),
-                None => None,
-            };
-            if let Some(hit) = hit {
-                hits.push((Rect::new(segment_x, area.y, visible_width, 1), hit));
-            }
-        }
-        segment_x = segment_x.saturating_add(width);
-        if segment_x >= left_end {
-            break;
-        }
-    }
+    // 970 owner item 1: this strip carries NO clickable segment any more —
+    // the shells/monitors counts (its only two) moved to the band task row.
     // Sim StatusBar (tui.js:5492-5499): TRANSPARENT ground (its frame
     // border-top has no row budget here; the dim ink carries the bar) —
     // the owner's "tan band" was our former bar_bg tint. No tinted rows
