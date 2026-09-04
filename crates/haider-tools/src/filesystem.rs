@@ -405,8 +405,7 @@ pub fn fs_read_manifest() -> ToolManifest {
 pub fn fs_glob_manifest() -> ToolManifest {
     ToolManifest {
         name: "fs_glob".into(),
-        description: "List redacted workspace files matching a bounded repository-aware glob"
-            .into(),
+        description: "List workspace paths matching a repository-aware glob; use it to find files by name or extension before reading them".into(),
         effects: vec![EffectClass::FsRead],
         dispatch: DispatchMode::Await,
         input_schema: json!({
@@ -426,7 +425,7 @@ pub fn fs_glob_manifest() -> ToolManifest {
 pub fn fs_search_manifest() -> ToolManifest {
     ToolManifest {
         name: "fs_search".into(),
-        description: "Search redacted, bounded repository file contents with literal, simple, or safe Rust-regex matching".into(),
+        description: "Search workspace file contents; use it to locate symbols or text before reading or editing a file".into(),
         effects: vec![EffectClass::FsRead],
         dispatch: DispatchMode::Await,
         input_schema: json!({
@@ -481,7 +480,8 @@ pub fn fs_search_manifest() -> ToolManifest {
 pub fn fs_write_manifest() -> ToolManifest {
     ToolManifest {
         name: "fs_write".into(),
-        description: "Create or replace one UTF-8 file, creating parent directories".into(),
+        description:
+            "Create or replace one UTF-8 file; use it for a new file or a complete rewrite".into(),
         effects: vec![EffectClass::FsWrite],
         dispatch: DispatchMode::Await,
         input_schema: json!({
@@ -499,8 +499,7 @@ pub fn fs_write_manifest() -> ToolManifest {
 pub fn fs_edit_manifest() -> ToolManifest {
     ToolManifest {
         name: "fs_edit".into(),
-        description: "Atomically apply one or more anchored replacements to a fresh UTF-8 file"
-            .into(),
+        description: "Apply anchored replacements to one UTF-8 file; use it for focused changes after reading the current contents".into(),
         effects: vec![EffectClass::FsWrite],
         dispatch: DispatchMode::Await,
         input_schema: json!({
@@ -531,7 +530,7 @@ pub fn fs_edit_manifest() -> ToolManifest {
 pub fn fs_path_manifest() -> ToolManifest {
     ToolManifest {
         name: "fs_path".into(),
-        description: "Move, delete, or copy an existing workspace path".into(),
+        description: "Move, copy, or delete a workspace path; use it when the requested change affects filesystem structure".into(),
         effects: vec![EffectClass::FsWrite],
         dispatch: DispatchMode::Await,
         input_schema: json!({

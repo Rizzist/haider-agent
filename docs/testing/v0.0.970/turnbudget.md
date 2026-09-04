@@ -338,3 +338,120 @@ the sibling repository's Git metadata. All changes remain in
 the 51 intended paths in `/tmp/turnbudget-stage-paths`. Supplied lane briefs and
 lens evidence are excluded. No commit or push occurred. Benchmark success-rate
 and non-macOS runtime claims remain outside the verified result.
+
+## Merge-forward continuation (2026-09-05)
+
+This continuation supersedes the delivery disposition above: the orchestrator
+has committed the implementation, and this task requires an **uncommitted**
+resolved merge tree. Actual starting HEAD was `702ae92c`, whose parent is
+`53dc49f7`; its only change removes the 24 supplied brief/lens documents from
+tracking. Those documents remain present and untracked. The incoming ref is
+`origin/wave-970` at `e1aca96c6f0a292859b5e69338f9649c563454df`.
+Turnid was already in the starting ancestry through `05d00b48`.
+
+The requested fetch failed while opening `FETCH_HEAD`, and the direct merge
+failed while locking `ORIG_HEAD`, because the worktree Git directory is outside
+the writable sandbox. The current local remote ref was therefore used. A
+temporary Git directory with read-only access to the existing object database
+performed the real three-way `git merge --no-commit origin/wave-970` against
+this worktree. It reproduced exactly the six reported conflicts. Its location
+and parent IDs are recorded in `/tmp/turnbudget-merge-state.json`; the directory
+is `/var/folders/y2/zrvhkfz54lj3gsw2czwxdmsh0000gn/T/turnbudget-merge-o3ytxyvo/git`.
+All six paths are resolved in that temporary index. Original HEAD and original
+Git metadata remain unchanged; the orchestrator must record the merge parents
+and stage the resolved files. No commit or push was attempted after resolution.
+
+### Resolution and complete fixture review
+
+No fixture was hand-merged or copied from either parent. The conflicted files
+were overwritten by their existing test regeneration paths, using the freshly
+built merged daemon/client. The oneshot test used
+`HAIDER_ONESHOT_GOLDEN_UPDATE=1`; the turnhygiene suite used
+`UPDATE_FIXTURES=1`. Nine turnhygiene tests and the selected oneshot test passed.
+
+| Conflicted file | Resolution and review |
+|---|---|
+| `crates/haider-daemon/src/permissions_core_tests.rs` | Retained actbias's scoped native-description checks and exact description-content test, plus turnbudget's schema byte growth. Full-prefix pins are Linux 18,621, macOS 18,572, Windows 18,571, other 18,566. Instruct pipe is `12,122 + 143 + 499 = 12,764`; subtracting the five descriptions still pins 12,265. Tool counts and the minimum 30% reduction assertion remain unchanged. Non-macOS values are by inspection. |
+| `crates/haider-cli/tests/fixtures/oneshot_run_golden.jsonl` | Regenerated all 24 lines. Against starting HEAD, only line 21 changes `haider-system-v3` to `haider-system-v4`. Both correlation payloads and both budget progress events remain byte-identical. |
+| `crates/haider-cli/tests/fixtures/turnhygiene/provider_request_no_budget.json` | Regenerated its single complete request line. Against starting HEAD, exactly six JSON paths change: shared policy +366 bytes and the five native descriptions totaling +499 bytes. Against wave, the only addition is the exact retained `spawn_subagent.request_budget` schema. No correlation field is added to the provider HTTP body; correlation belongs to the durable attempt records in the JSONL fixtures. |
+| `crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_text_turn.jsonl` | Regenerated all 24 lines. Only line 21 changes the system-version identity. Both correlation payloads and both budget events remain byte-identical. |
+| `crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_tool_turn.jsonl` | Regenerated all 53 lines. Only line 50 changes the system-version identity. All four correlation payloads (request ordinals 1, 1, 2, 2) and four budget events remain byte-identical. |
+| `test-baseline.txt` | Replaced the conflict through `cargo run -p xtask --locked -- test-count --update`, then checked without `--update`: 4,788/4,788. This is +2 over starting HEAD's 4,786 and +22 over wave's 4,766. |
+
+The JSONL line review includes every unchanged line, its sequence, acceptance,
+tool output, effect, and terminal. The audit is saved at
+`/tmp/turnbudget-merge-fixture-audit.log`; independent verification repeated the
+comparison directly from both Git parents. No normalization was added to the
+repository's tests. Existing identity/hash/estimate normalization remains the
+only volatile-field handling. The real HTTP request ledger independently pins
+the complete prompt bytes.
+
+Clean auto-merges retain the incoming prompt/version and selective-description
+changes in `worker.rs`, exact policy checks in `project_instructions_tests.rs`,
+and five filesystem manifest descriptions in `filesystem.rs`. Incoming
+`actbias.md` and `CI_REGISTRY_WALK_QAGATE3.md` are preserved. Recovery remains
+`startup-turn-recovery-v8`, including its exact pin; correlation validation and
+the logical-budget/physical-retry distinction remain intact. No OAuth file
+was changed.
+
+All 22 supplied lens documents were read again. Their historical line numbers
+were checked for the mechanisms relevant to this merge: SQLite NORMAL is now
+`event_store.rs:193`–`:200`; the attempt commit remains before dispatch at
+`actor.rs:3932` and `:3983`; budget progress uses that same append transaction;
+recovery v8 is at `turn_recovery.rs:116` with its pin at `:2341`. The JSONL
+cursor citation at contract line 15 remains correct; the terminal discussion
+has drifted to lines 98–143. The round-2 unconditional-estimator claim is stale
+for current code, which already gates estimation. No latency, CPU, memory,
+benchmark success-rate, or cross-platform runtime improvement is claimed.
+
+### Continuation CI error-registry walk
+
+The full registry and the per-class walk above were reread for this merge.
+The unchanged classes retain their scope assessment; this table records the
+merge-specific updates, including the newly appended class 87.
+
+| Class | Continuation audit |
+|---|---|
+| 1–6, 8, 39 | checked: both source intents remain; no field/constructor/import was removed to resolve the merge. |
+| 7 | checked: none — manifests and lockfile are unchanged. |
+| 9–18, 87 | checked: the required gate includes test code, using exactly `cargo clippy --workspace --tests -- -D warnings`. Incoming policy constant assertions retain the `const` form. |
+| 19 | checked: changed Rust files pass rustfmt; resolved diff has no whitespace errors. |
+| 20 | fixed: regenerated `test-baseline.txt` to 4,788 through xtask, then checked it. |
+| 21, 33, 54 | checked: ENV LAW retained, including 8 MiB stacks; no tests ignored, skipped, or platform-gated for this continuation. |
+| 42, 64, 67, 81 | checked: fresh siblings were built before setting the prebuilt flag. `haiderd` is Mach-O arm64, 198,060,144 bytes; `haider` is 109,139,568 bytes. Disk was checked before each Cargo build/test command against the 700 MiB stop floor. |
+| 50 | fixed: `permissions_core_tests.rs` retains the platform-specific full-prefix offsets, both additive byte deltas, and the common 30% law. |
+| 61, 71, 72 | checked: no release-binary, discovery-enabled, performance, or non-macOS execution claim. |
+| 77 | checked: unsafe-count gate passes, production 189 / test 20. |
+| 82–84 | checked: no changes to OAuth, hook timing, or native-pipe coverage tests. Any gate failure is recorded by its actual test name. |
+| 85–86 | checked: the required verification is the full workspace test, with fixture update flags absent; a compile/check result cannot substitute for it. |
+| 94–95 | checked: none — this merge adds no deadlines, external waits, or transport behavior. |
+
+### Completed continuation gates
+
+Every Cargo command ran with
+`RUST_MIN_STACK=8388608 HAIDER_DISCOVERY_DISABLED=1 HAIDER_TEST_DEVICE_NAME=test-mac CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`.
+After the fresh sibling build, tests, Clippy, and guards additionally used
+`HAIDER_TEST_SIBLINGS_PREBUILT=1`. The full-gate runner explicitly asserted that
+both fixture-update environment variables were absent. Commands, exits, and
+durations are recorded in `/tmp/turnbudget-merge-gate-results.json`.
+
+| Gate | Final result and evidence |
+|---|---|
+| `cargo test -q --workspace --no-fail-fast` | **PASS, exit 0**: 5,183 passed, 0 failed, 13 existing ignores, 0 measured across 329 result records. These are emitted aggregate totals, including doctests and subprocess reruns, rather than unique source definitions. The nested harness output also records 1,373 filtered tests; the outer command applies no filter or skip. Log: `/tmp/turnbudget-merge-workspace.log`; counts: `/tmp/turnbudget-merge-test-totals.json`. |
+| `cargo clippy --workspace --tests -- -D warnings` | **PASS, exit 0**, with test code included and no warning allowance added. Log: `/tmp/turnbudget-merge-clippy.log`. |
+| `cargo run -p xtask --locked -- check` | **PASS, exit 0**: baseline 4,788/4,788; nine pre-existing soft LOC warnings. Log: `/tmp/turnbudget-merge-guards.log`. |
+| Fixture regeneration | **PASS**: nine turnhygiene tests and the selected oneshot golden test. All four regenerated files were subsequently verified again by the full gate with no update flags. Logs: `/tmp/turnbudget-merge-turnhygiene-regenerate.log`, `/tmp/turnbudget-merge-oneshot-regenerate.log`. |
+| Format, unsafe guard, resolved diff | **PASS**: rustfmt on all four merged Rust files; unsafe counts 189 production / 20 test; `git diff --check`; no remaining conflict markers or unmerged entries in the temporary merge index. |
+| Gate/tree parity | **PASS**: all 11 merge-input hashes in `/tmp/turnbudget-merge-verified-inputs.json` remained unchanged through both gates. Only this testing report was appended afterward. |
+
+The continuation patch and its exact path list are saved at
+`/tmp/turnbudget-merge.patch` and `/tmp/turnbudget-merge-paths.txt`. The supplied
+`LANE-COMMON.md`, `LANE-BRIEF-turnbudget.md`, `turnperf/`, and `turnperf2/` remain
+untracked and excluded. Original HEAD stays `702ae92c`; merge parent remains
+`e1aca96c`. The resolved working tree is left uncommitted for the orchestrator.
+
+Final independent verification returned **SHIP** after reviewing both parent
+diffs, every regenerated fixture, completed gate logs/totals, baseline, and
+unchanged gate-input hashes.
+
+`VERIFIER: findings=0 real=0 noise=0 — no findings.`

@@ -229,3 +229,25 @@ Read against the final uncommitted tree before verification. “checked: none”
 - #77 checked — no unsafe code was added and workspace/tests Clippy passes with warnings denied; the standalone guard's existing four-test mismatch is confined to untouched `haider-tui` (`git diff --quiet -- crates/haider-tui` passes), so this lane does not rewrite that unrelated baseline
 - #78-#93 checked: none — no affected product surface
 - #94-#96 checked — no deadline, negotiated-connection wait, or turn-performance policy changed
+
+## v0.0.970 actbias delta walk
+
+- #1-#18 checked: none — no dependency, packaging, migration, or wire-version surface changed
+- #19 fixed — changed Rust is rustfmt-clean, `git diff --check` is clean, focused prompt/schema/golden tests pass, and the workspace suite is green
+- #20 fixed — two reviewed regression tests raise the Rust baseline from 4,748 to 4,750; `xtask test-count` confirms 4,750/4,750
+- #21-#40 checked: none — no affected lifecycle, storage, or compatibility surface
+- #41 checked — focused and golden tests use hermetic temporary roots and the fake provider
+- #42 checked — sibling `haider`/`haiderd` binaries were prebuilt before daemon-driven goldens
+- #43 checked: none — no affected installed-warmup surface
+- #44 checked — provider-request and run goldens exercise the real CLI/daemon UDS path with a fake loopback provider
+- #45-#63 checked: none — no affected surface
+- #64 checked — prebuilt `haiderd` is 197,290,544 bytes, above 10 MiB
+- #65-#70 checked: none — no affected surface
+- #71 fixed — exact provider request, text/tool turn ledgers, and one-shot ledger were regenerated deliberately and then passed without update flags
+- #72 checked — native discovery stayed disabled throughout the hermetic gate
+- #73 fixed — prompt/tool byte changes are explicit: policy 359 -> 725, instruct pipe 12,122 -> 12,621, and combined stable prefix 12,481 -> 13,346
+- #74 checked — tests use throwaway profiles and do not read host credentials
+- #75-#76 checked: none — no affected surface
+- #77 checked — no unsafe code was added; `cargo clippy --workspace -- -D warnings` passes
+- #78-#93 checked: none — no affected surface
+- #94-#96 checked — no deadline, negotiated-connection wait, or turn-performance policy changed
