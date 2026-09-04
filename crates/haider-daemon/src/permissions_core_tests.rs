@@ -1252,15 +1252,17 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // The full-prefix comparison deliberately includes the platform-specific
     // computer manifest description. Linux documents X11/Wayland (+49 bytes
     // over macOS), while Windows is one byte shorter than macOS.
+    // v0.0.970 adds spawn_subagent.request_budget: +367 full-schema bytes and
+    // +143 stub-schema bytes. Tool inventory and the 30% savings law stay fixed.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_105;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_472;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_056;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_423;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_055;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_422;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_050;
-    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 12_122;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_417;
+    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 12_265;
 
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let stubbed =

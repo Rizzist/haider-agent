@@ -346,6 +346,9 @@ pub enum ErrorCode {
     Busy,
     RevisionConflict,
     LoopLimit,
+    /// Logical request hard cap reached; the durable budget marker supplies
+    /// a same-session continuation handle instead of a fresh retry.
+    RequestBudgetExceeded,
     WorkflowUnfinished,
     GraphAlreadyActive,
     GraphNotActive,
@@ -395,6 +398,7 @@ impl ErrorCode {
             Self::Busy => "busy",
             Self::RevisionConflict => "revision_conflict",
             Self::LoopLimit => "loop_limit",
+            Self::RequestBudgetExceeded => "request_budget_exceeded",
             Self::WorkflowUnfinished => "workflow_unfinished",
             Self::GraphAlreadyActive => "graph_already_active",
             Self::GraphNotActive => "graph_not_active",
@@ -435,6 +439,7 @@ impl ErrorCode {
             Self::Busy => "busy",
             Self::RevisionConflict => "revision-conflict",
             Self::LoopLimit => "loop-limit",
+            Self::RequestBudgetExceeded => "request-budget-exceeded",
             Self::WorkflowUnfinished => "workflow-unfinished",
             Self::GraphAlreadyActive => "graph-already-active",
             Self::GraphNotActive => "graph-not-active",

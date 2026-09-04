@@ -631,7 +631,7 @@ async fn committed_menu_event_wakes_waiter_without_reappending_resolution() {
 }
 
 #[tokio::test]
-async fn provider_request_ceiling_ends_the_same_turn_with_typed_loop_limit() {
+async fn provider_request_ceiling_preserves_a_typed_budget_continuation() {
     let mut config = HarnessConfig::for_session(
         SessionId::new(SESSION),
         DeviceId::new("request-input-device"),
@@ -640,6 +640,7 @@ async fn provider_request_ceiling_ends_the_same_turn_with_typed_loop_limit() {
     )
     .with_started_at_ms(1_700_000_000_000);
     config.max_provider_requests_per_turn = 1;
+    config.provider_request_tranche = 1;
     let store = Arc::new(MemoryStore::new());
     let provider = Arc::new(FakeProvider::new(vec![
         FakeStep::EmitRequestInput {
@@ -680,14 +681,18 @@ async fn provider_request_ceiling_ends_the_same_turn_with_typed_loop_limit() {
 
     let outcome = turn.wait().await.expect("typed turn outcome");
     assert_eq!(outcome.state, RunState::Errored);
-    let error = outcome.error.expect("loop-limit error");
-    assert_eq!(error.code, ErrorCode::LoopLimit);
+    // The cap now reports requests actually consumed (one), rather than
+    // counting the rejected candidate as request two. A typed checkpoint
+    // replaces the generic non-resumable loop-limit cause.
+    let error = outcome.error.expect("budget error");
+    assert_eq!(error.code, ErrorCode::RequestBudgetExceeded);
+    let status: haider_protocol::request_budget::RequestBudgetStatusV1 =
+        serde_json::from_value(error.details.expect("checkpoint details")).expect("typed status");
+    assert_eq!(status.used, 1);
+    assert_eq!(status.budget.hard_cap, 1);
     assert_eq!(
-        error.details.expect("loop-limit details"),
-        serde_json::json!({
-            "provider_request_count": 2,
-            "provider_request_limit": 1,
-        })
+        status.phase,
+        haider_protocol::request_budget::RequestBudgetPhaseV1::HardBound
     );
     assert_eq!(
         provider.requests().len(),

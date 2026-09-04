@@ -32,6 +32,7 @@ use haider_rpc::haider_protocol::item::{ItemEvent, TurnItem};
 use haider_rpc::haider_protocol::menu::{DecisionKind, MenuKind};
 use haider_rpc::haider_protocol::provider::Usage;
 use haider_rpc::haider_protocol::reply::ReplyText;
+use haider_rpc::haider_protocol::request_budget::{RequestBudgetPhaseV1, RequestBudgetStatusV1};
 use haider_rpc::haider_protocol::session::{
     SessionInteractionModeV1, SessionPermissionOverridesV1,
 };
@@ -2102,6 +2103,56 @@ pub async fn run_headless_with_session_config_event_mode_and_interrupts(
     event_mode: HeadlessEventMode,
     interrupts: Option<mpsc::UnboundedReceiver<HeadlessInterrupt>>,
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
+    run_headless_with_start(
+        profile,
+        ensure,
+        request,
+        HeadlessStart::New(session_config),
+        output,
+        event_mode,
+        interrupts,
+    )
+    .await
+}
+
+/// Continues a terminal request-budget checkpoint in its original session.
+/// A fresh turn preserves completed tool history and receives a fresh request
+/// allowance. The daemon atomically validates the continuation handle.
+pub async fn resume_headless_with_event_mode_and_interrupts(
+    profile: &ResolvedProfile,
+    ensure: EnsureOptions,
+    request: HeadlessRunRequest,
+    source_run_id: RunId,
+    output: mpsc::Sender<HeadlessEvent>,
+    event_mode: HeadlessEventMode,
+    interrupts: Option<mpsc::UnboundedReceiver<HeadlessInterrupt>>,
+) -> Result<HeadlessRunResult, HeadlessRunError> {
+    run_headless_with_start(
+        profile,
+        ensure,
+        request,
+        HeadlessStart::Resume(source_run_id),
+        output,
+        event_mode,
+        interrupts,
+    )
+    .await
+}
+
+enum HeadlessStart {
+    New(HeadlessSessionConfig),
+    Resume(RunId),
+}
+
+async fn run_headless_with_start(
+    profile: &ResolvedProfile,
+    ensure: EnsureOptions,
+    request: HeadlessRunRequest,
+    start: HeadlessStart,
+    output: mpsc::Sender<HeadlessEvent>,
+    event_mode: HeadlessEventMode,
+    interrupts: Option<mpsc::UnboundedReceiver<HeadlessInterrupt>>,
+) -> Result<HeadlessRunResult, HeadlessRunError> {
     let daemon_lifetime = ensure.daemon_lifetime;
     let daemon_ownership = Arc::new(Mutex::new(None));
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
@@ -2112,7 +2163,7 @@ pub async fn run_headless_with_session_config_event_mode_and_interrupts(
         profile,
         ensure,
         request,
-        session_config,
+        start,
         reducer_output,
         Arc::clone(&daemon_ownership),
         interrupts,
@@ -2604,15 +2655,205 @@ fn teardown_protocol(message: impl Into<String>) -> HeadlessRunError {
     }
 }
 
+fn continuation_prompt(run_id: &RunId, additional_instruction: &str) -> String {
+    let mut prompt = format!(
+        "Resume request-budget continuation {run_id}. Continue from the committed work and tool results in the preceding turn. Do not restart completed work. Finish the task or checkpoint the remaining steps."
+    );
+    if !additional_instruction.trim().is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(additional_instruction);
+    }
+    prompt
+}
+
+fn merge_resume_budget(original: &mut RunBudgetV1, overrides: &RunBudgetV1) {
+    if overrides.max_tokens.is_some() {
+        original.max_tokens = overrides.max_tokens;
+    }
+    if overrides.max_cost_microusd.is_some() {
+        original.max_cost_microusd = overrides.max_cost_microusd;
+    }
+    if overrides.max_time_ms.is_some() {
+        original.max_time_ms = overrides.max_time_ms;
+    }
+    if overrides.request_budget.is_some() {
+        original.request_budget = overrides.request_budget;
+    }
+}
+
+fn validate_resume_checkpoint(
+    source: &HeadlessRunStatus,
+    checkpoint: Option<&RequestBudgetStatusV1>,
+) -> Result<(), HeadlessRunError> {
+    if !source.state.is_terminal() || source.terminal_seq.is_none() {
+        return Err(rpc_error(
+            "headless resume",
+            "continuation_active".into(),
+            "the source run is still active; finish or checkpoint it before resuming".into(),
+            false,
+        ));
+    }
+    let Some(checkpoint) = checkpoint else {
+        return Err(rpc_error(
+            "headless resume",
+            "continuation_unavailable".into(),
+            "the source run has no durable request-budget continuation".into(),
+            false,
+        ));
+    };
+    let continuation = &checkpoint.continuation;
+    if continuation.session_id != source.session_id
+        || continuation.run_id != source.run_id
+        || !matches!(
+            checkpoint.phase,
+            RequestBudgetPhaseV1::SoftBound | RequestBudgetPhaseV1::HardBound
+        )
+        || checkpoint.used < checkpoint.budget.tranche
+    {
+        return Err(protocol_error(
+            "headless resume",
+            "request-budget continuation coordinates do not match the source run",
+        ));
+    }
+    if continuation.branch_id.is_some() || continuation.agent_id.is_some() {
+        return Err(rpc_error(
+            "headless resume",
+            "continuation_scope_unsupported".into(),
+            "resume this branch or agent checkpoint in its owning session interface".into(),
+            false,
+        ));
+    }
+    Ok(())
+}
+
+async fn read_resume_source(
+    connection: &mut HeadlessConnection,
+    run_id: RunId,
+) -> Result<HeadlessRunStatus, HeadlessRunError> {
+    let response = connection
+        .client
+        .request(RequestBody::HeadlessRunStatus {
+            run_id: run_id.clone(),
+        })
+        .await
+        .map_err(|error| client_error_as_headless("headless resume status", error))?;
+    let source = match response {
+        ResponseBody::HeadlessRunStatus {
+            session_id,
+            run_id: found,
+            worker_generation,
+            state,
+            head_seq,
+            terminal_seq,
+            budget_exhausted,
+            spec,
+        } if found == run_id => HeadlessRunStatus {
+            session_id,
+            run_id: found,
+            worker_generation,
+            state,
+            head_seq,
+            terminal_seq,
+            budget_exhausted,
+            spec,
+        },
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            ..
+        } => {
+            return Err(rpc_error(
+                "headless resume status",
+                code,
+                message,
+                retryable,
+            ));
+        }
+        _ => {
+            return Err(protocol_error(
+                "headless resume status",
+                "response coordinates do not match the requested run",
+            ));
+        }
+    };
+    // Refuse an active soft tranche before reading its potentially growing
+    // journal. Acceptance repeats the terminal/source check transactionally.
+    if !source.state.is_terminal() || source.terminal_seq.is_none() {
+        validate_resume_checkpoint(&source, None)?;
+    }
+    let mut checkpoint = None;
+    let mut start_seq = 1;
+    while start_seq <= source.head_seq {
+        let end_seq = start_seq.saturating_add(1023).min(source.head_seq);
+        let response = connection
+            .client
+            .request(RequestBody::SessionRead {
+                session_id: source.session_id.clone(),
+                range: SeqRange { start_seq, end_seq },
+            })
+            .await
+            .map_err(|error| client_error_as_headless("headless resume checkpoint", error))?;
+        match response {
+            ResponseBody::SessionRead { result } if result.session_id == source.session_id => {
+                for envelope in result.envelopes {
+                    if envelope.run_id.as_ref() != Some(&source.run_id) {
+                        continue;
+                    }
+                    if let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
+                        envelope.payload.decode_event()
+                        && let Some(status) = RequestBudgetStatusV1::from_extension_item(&item)
+                        && matches!(
+                            status.phase,
+                            RequestBudgetPhaseV1::SoftBound | RequestBudgetPhaseV1::HardBound
+                        )
+                    {
+                        checkpoint = Some(status);
+                    }
+                }
+            }
+            ResponseBody::Error {
+                code,
+                message,
+                retryable,
+                ..
+            } => {
+                return Err(rpc_error(
+                    "headless resume checkpoint",
+                    code,
+                    message,
+                    retryable,
+                ));
+            }
+            _ => {
+                return Err(protocol_error(
+                    "headless resume checkpoint",
+                    "response coordinates do not match the source session",
+                ));
+            }
+        }
+        if end_seq == source.head_seq {
+            break;
+        }
+        start_seq = end_seq.saturating_add(1);
+    }
+    validate_resume_checkpoint(&source, checkpoint.as_ref())?;
+    Ok(source)
+}
+
 async fn run_headless_inner(
     profile: &ResolvedProfile,
     mut ensure: EnsureOptions,
-    request: HeadlessRunRequest,
-    session_config: HeadlessSessionConfig,
+    mut request: HeadlessRunRequest,
+    start: HeadlessStart,
     output: HeadlessEventOutput,
     daemon_ownership: Arc<Mutex<Option<DaemonOwnershipToken>>>,
     mut interrupts: Option<mpsc::UnboundedReceiver<HeadlessInterrupt>>,
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
+    let (session_config, resume_run_id) = match start {
+        HeadlessStart::New(config) => (config, None),
+        HeadlessStart::Resume(run_id) => (HeadlessSessionConfig::default(), Some(run_id)),
+    };
     if request.attachments.len() > MAX_HEADLESS_ATTACHMENTS {
         return Err(attachment_error(
             "too_many_attachments",
@@ -2629,7 +2870,8 @@ async fn run_headless_inner(
         !request.attachments.is_empty(),
         request.trust_hooks,
     );
-    let pinned_headless = request.journal_pin
+    let pinned_headless = resume_run_id.is_some()
+        || request.journal_pin
         || request.detached
         || request.seed.is_some()
         || request.replay_of.is_some()
@@ -2639,10 +2881,15 @@ async fn run_headless_inner(
             .required_features
             .insert(haider_rpc::FEATURE_HEADLESS_RUN_V1.to_owned());
     }
-    if !request.budget.is_empty() {
+    if !request.budget.is_empty() || resume_run_id.is_some() {
         ensure
             .required_features
             .insert(haider_rpc::FEATURE_RUN_BUDGET_V1.to_owned());
+    }
+    if resume_run_id.is_some() || request.budget.request_budget.is_some() {
+        ensure
+            .required_features
+            .insert(haider_rpc::FEATURE_REQUEST_BUDGET_V1.to_owned());
     }
     normalize_session_config_features(&mut ensure, &session_config)?;
     let timeout_deadline = request.timeout.map(|timeout| Instant::now() + timeout);
@@ -2654,21 +2901,26 @@ async fn run_headless_inner(
         HeadlessConnection::open(profile, ensure.clone(), Arc::clone(&daemon_ownership)),
     )
     .await?;
-    let (create_provider, create_model, resolve_provider, resolve_model) =
-        before_acceptance_deadline(
-            timeout_deadline,
-            "model selector bootstrap",
-            resolve_create_identity(
-                profile,
-                &ensure,
-                &mut connection,
-                &mut reconnects,
-                request.provider.clone(),
-                request.model.clone(),
-                session_config.model.as_deref().or(request.model.as_deref()),
-            ),
+    let create_identity = if resume_run_id.is_none() {
+        Some(
+            before_acceptance_deadline(
+                timeout_deadline,
+                "model selector bootstrap",
+                resolve_create_identity(
+                    profile,
+                    &ensure,
+                    &mut connection,
+                    &mut reconnects,
+                    request.provider.clone(),
+                    request.model.clone(),
+                    session_config.model.as_deref().or(request.model.as_deref()),
+                ),
+            )
+            .await?,
         )
-        .await?;
+    } else {
+        None
+    };
     let (submit_attachments, attachment_refs) = before_acceptance_deadline(
         timeout_deadline,
         "artifact.put",
@@ -2696,28 +2948,71 @@ async fn run_headless_inner(
         }
     }
     submit_attachments.extend(request.durable_attachments.clone());
-    let create_body = RequestBody::SessionCreateWithPermissionOverrides {
-        command_id: CommandId::new(command_id("headless-create")),
-        cwd: request.cwd.clone(),
-        provider: create_provider.clone(),
-        model: create_model.clone(),
-        max_tokens: request.max_tokens,
-        permission_overrides: (!request.permission_overrides.is_empty())
-            .then_some(request.permission_overrides),
-        cache_policy: None,
-        interaction_mode: SessionInteractionModeV1::Autonomous,
-        ssh_scope: session_config.ssh_scope.clone(),
-        account_alias: session_config
-            .account
-            .as_deref()
-            .map(haider_rpc::haider_protocol::ids::CredentialAlias::new),
-        resolve_provider,
-        resolve_model,
-        effort: session_config.effort.clone(),
-        fast: session_config.fast,
-    };
+    let (session_id, created_generation, created_seq, submit_spec, provider, model) = if let Some(
+        run_id,
+    ) =
+        resume_run_id
+    {
+        let source = before_acceptance_deadline(timeout_deadline, "headless resume", async {
+            read_resume_source(&mut connection, run_id).await
+        })
+        .await?;
+        let mut spec = source.spec;
+        // Keep the original identity and permissions. Only explicit new run
+        // budgets replace their corresponding original caps.
+        merge_resume_budget(&mut spec.budget, &request.budget);
+        request.budget = spec.budget.clone();
+        request.trust_hooks = spec.trust_hooks;
+        spec.request_deadline_unix_ms = timeout_deadline.map(deadline_unix_ms);
+        spec.replay_of = None;
+        spec.continuation_of = Some(source.run_id.clone());
+        if let Some(seed) = request.seed {
+            spec.seed = Some(seed);
+        }
+        request.prompt = continuation_prompt(&source.run_id, &request.prompt);
+        {
+            let provider = spec.provider.clone();
+            let model = spec.model.clone();
+            (
+                source.session_id,
+                source.worker_generation,
+                source.head_seq,
+                Some(spec),
+                provider,
+                model,
+            )
+        }
+    } else {
+        let Some((create_provider, create_model, resolve_provider, resolve_model)) =
+            create_identity
+        else {
+            return Err(protocol_error(
+                "session.create",
+                "new session identity is unavailable",
+            ));
+        };
+        let create_body = RequestBody::SessionCreateWithPermissionOverrides {
+            command_id: CommandId::new(command_id("headless-create")),
+            cwd: request.cwd.clone(),
+            provider: create_provider.clone(),
+            model: create_model.clone(),
+            max_tokens: request.max_tokens,
+            permission_overrides: (!request.permission_overrides.is_empty())
+                .then_some(request.permission_overrides),
+            cache_policy: None,
+            interaction_mode: SessionInteractionModeV1::Autonomous,
+            ssh_scope: session_config.ssh_scope.clone(),
+            account_alias: session_config
+                .account
+                .as_deref()
+                .map(haider_rpc::haider_protocol::ids::CredentialAlias::new),
+            resolve_provider,
+            resolve_model,
+            effort: session_config.effort.clone(),
+            fast: session_config.fast,
+        };
 
-    let (session_id, created_generation, created_seq, created_metadata) =
+        let (session_id, created_generation, created_seq, created_metadata) =
         before_acceptance_deadline(timeout_deadline, "session.create", async {
             loop {
                 match connection.client.request(create_body.clone()).await {
@@ -2788,6 +3083,36 @@ async fn run_headless_inner(
         })
         .await?;
 
+        let provider = created_metadata.provider.clone();
+        let model = created_metadata.model.clone();
+
+        // This body is immutable across response-loss retries. In particular, its
+        // original generation remains part of the durable command identity even if
+        // reconnecting observes a newer worker generation.
+        let spec = HeadlessRunSpecV1 {
+            cwd: created_metadata.cwd.clone(),
+            provider: provider.clone(),
+            model: model.clone(),
+            max_output_tokens: request.max_tokens,
+            effort: session_config.effort.clone(),
+            fast: session_config.fast.unwrap_or(false),
+            seed: request.seed,
+            permission_overrides: created_metadata.permission_overrides.unwrap_or_default(),
+            trust_hooks: request.trust_hooks,
+            budget: request.budget.clone(),
+            request_deadline_unix_ms: timeout_deadline.map(deadline_unix_ms),
+            replay_of: request.replay_of.clone(),
+            continuation_of: None,
+        };
+        (
+            session_id,
+            created_generation,
+            created_seq,
+            pinned_headless.then_some(spec),
+            provider,
+            model,
+        )
+    };
     let mut reducer = HeadlessReducer::new(session_id.clone(), output);
     // The announcement fires at session RESOLUTION — before the attach —
     // because replay envelopes legitimately race (and win against) the
@@ -2812,26 +3137,6 @@ async fn run_headless_inner(
     )
     .await?;
 
-    let provider = created_metadata.provider.clone();
-    let model = created_metadata.model.clone();
-
-    // This body is immutable across response-loss retries. In particular, its
-    // original generation remains part of the durable command identity even if
-    // reconnecting observes a newer worker generation.
-    let submit_spec = pinned_headless.then(|| HeadlessRunSpecV1 {
-        cwd: created_metadata.cwd.clone(),
-        provider: provider.clone(),
-        model: model.clone(),
-        max_output_tokens: request.max_tokens,
-        effort: session_config.effort.clone(),
-        fast: session_config.fast.unwrap_or(false),
-        seed: request.seed,
-        permission_overrides: created_metadata.permission_overrides.unwrap_or_default(),
-        trust_hooks: request.trust_hooks,
-        budget: request.budget.clone(),
-        request_deadline_unix_ms: timeout_deadline.map(deadline_unix_ms),
-        replay_of: request.replay_of.clone(),
-    });
     let submit_body = headless_submit_body_with_spec(
         request.trust_hooks,
         submit_command_id,

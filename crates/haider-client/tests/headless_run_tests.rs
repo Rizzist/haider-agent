@@ -3013,3 +3013,224 @@ fn override_feature_is_required_only_when_a_flag_is_present() {
         BTreeSet::from([haider_rpc::FEATURE_ARTIFACT_PUT_V1.to_owned()])
     );
 }
+
+/// The continuation handle selects the original session; it must never enter
+/// session.create or run.retry, which would respectively lose or omit its tools.
+#[tokio::test]
+async fn resume_budget_checkpoint_submits_new_turn_in_original_session() {
+    use haider_rpc::haider_protocol::headless::{HeadlessRunSpecV1, RunBudgetV1};
+    use haider_rpc::haider_protocol::request_budget::{
+        RequestBudgetContinuationV1, RequestBudgetPhaseV1, RequestBudgetStatusV1, RequestBudgetV1,
+    };
+    let (_root, profile) = profile();
+    let listener = UnixListener::bind(&profile.endpoint_path).expect("bind resume peer");
+    let mut advertised = welcome(&profile);
+    advertised
+        .features
+        .insert(haider_rpc::FEATURE_HEADLESS_RUN_V1.into());
+    advertised
+        .features
+        .insert(haider_rpc::FEATURE_RUN_BUDGET_V1.into());
+    advertised
+        .features
+        .insert(haider_rpc::FEATURE_REQUEST_BUDGET_V1.into());
+    let peer = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener, advertised).await;
+        let session_id = SessionId::new("resume-session");
+        let source_id = RunId::new("resume-source");
+        let (status_request, status) = peer.request().await;
+        assert!(matches!(status, RequestBody::HeadlessRunStatus { run_id } if run_id == source_id));
+        let checkpoint = RequestBudgetStatusV1 {
+            used: 64,
+            budget: RequestBudgetV1::default(),
+            phase: RequestBudgetPhaseV1::HardBound,
+            continuation: RequestBudgetContinuationV1 {
+                session_id: session_id.clone(),
+                run_id: source_id.clone(),
+                branch_id: None,
+                agent_id: None,
+            },
+        };
+        let source_events = vec![
+            envelope(
+                &session_id,
+                &source_id,
+                1,
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: ItemId::new("budget-checkpoint"),
+                    item: checkpoint.to_extension_item().expect("typed checkpoint"),
+                }),
+            ),
+            envelope(
+                &session_id,
+                &source_id,
+                2,
+                EventPayload::RunState(RunState::Errored),
+            ),
+        ];
+        peer.respond(
+            status_request,
+            ResponseBody::HeadlessRunStatus {
+                session_id: session_id.clone(),
+                run_id: source_id.clone(),
+                worker_generation: 7,
+                state: RunState::Errored,
+                head_seq: 2,
+                terminal_seq: Some(2),
+                budget_exhausted: None,
+                spec: HeadlessRunSpecV1 {
+                    cwd: "/original-workspace".into(),
+                    provider: "fake".into(),
+                    model: "original-model".into(),
+                    max_output_tokens: 1024,
+                    effort: None,
+                    fast: false,
+                    seed: Some(12),
+                    permission_overrides: SessionPermissionOverridesV1::default(),
+                    trust_hooks: false,
+                    budget: RunBudgetV1 {
+                        max_time_ms: Some(30_000),
+                        ..RunBudgetV1::default()
+                    },
+                    request_deadline_unix_ms: Some(1),
+                    replay_of: None,
+                    continuation_of: None,
+                },
+            },
+        )
+        .await;
+        let (read_request, read) = peer.request().await;
+        let RequestBody::SessionRead {
+            session_id: read_session,
+            range,
+        } = read
+        else {
+            panic!("read durable checkpoint");
+        };
+        assert_eq!(read_session, session_id);
+        peer.respond(
+            read_request,
+            ResponseBody::SessionRead {
+                result: haider_rpc::SessionReadResult {
+                    session_id: session_id.clone(),
+                    range,
+                    head_seq: 2,
+                    metadata: None,
+                    latest_context_footprint: None,
+                    envelopes: source_events.clone(),
+                },
+            },
+        )
+        .await;
+        let (attach_request, attach) = peer.request().await;
+        assert!(
+            matches!(attach, RequestBody::SessionAttach { session_id: attached, after_seq: 0, mode: AttachMode::Control, .. } if attached == session_id)
+        );
+        let attachment_id = AttachmentId::new("resume-attachment");
+        peer.respond(
+            attach_request,
+            ResponseBody::SessionAttach {
+                attachment_id: attachment_id.clone(),
+                attach_state: AttachState {
+                    session_id: session_id.clone(),
+                    requested_after_seq: 0,
+                    replay_through_seq: 2,
+                    worker_generation: 7,
+                    authority_epoch: 1,
+                },
+            },
+        )
+        .await;
+        for event in source_events {
+            send_event(&mut peer, &attachment_id, event).await;
+        }
+        peer.write(&WireFrame::AttachCaughtUp {
+            attachment_id: attachment_id.clone(),
+            high_water_seq: 2,
+        })
+        .await;
+        let (submit_request, submit) = peer.request().await;
+        let RequestBody::HeadlessRunStart {
+            session_id: submitted,
+            text,
+            spec,
+            ..
+        } = submit
+        else {
+            panic!("new same-session turn, not retry");
+        };
+        assert_eq!(submitted, session_id);
+        assert_eq!(spec.continuation_of, Some(source_id.clone()));
+        assert_eq!(spec.cwd, "/original-workspace");
+        assert_eq!(spec.model, "original-model");
+        assert_eq!(spec.max_output_tokens, 1024);
+        assert_eq!(spec.seed, Some(12));
+        assert_eq!(
+            spec.request_deadline_unix_ms, None,
+            "old absolute deadline must not poison continuation"
+        );
+        assert_eq!(spec.budget.max_time_ms, Some(30_000));
+        assert_eq!(
+            spec.budget.request_budget,
+            Some(RequestBudgetV1 {
+                tranche: 40,
+                hard_cap: 80
+            })
+        );
+        assert!(text.contains("committed work and tool results"));
+        assert!(text.contains("finish the remaining test"));
+        let resumed = RunId::new("resumed-run");
+        peer.respond(
+            submit_request,
+            ResponseBody::HeadlessRunStart {
+                session_id: session_id.clone(),
+                run_id: resumed.clone(),
+                accepted_seq: 3,
+                worker_generation: 7,
+                disposition: SubmitDisposition::Started,
+            },
+        )
+        .await;
+        send_event(
+            &mut peer,
+            &attachment_id,
+            envelope(
+                &session_id,
+                &resumed,
+                3,
+                EventPayload::RunState(RunState::Done),
+            ),
+        )
+        .await;
+    });
+    let (sender, mut receiver) = mpsc::channel(8);
+    let collector = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
+    let mut resumed = request(None);
+    resumed.prompt = "finish the remaining test".into();
+    resumed.budget.request_budget = Some(RequestBudgetV1 {
+        tranche: 40,
+        hard_cap: 80,
+    });
+    let result = tokio::time::timeout(
+        BOUND,
+        haider_client::resume_headless_with_event_mode_and_interrupts(
+            &profile,
+            EnsureOptions::default(),
+            resumed,
+            RunId::new("resume-source"),
+            sender,
+            haider_client::HeadlessEventMode::FullRecordSet,
+            None,
+        ),
+    )
+    .await
+    .expect("resume bound")
+    .expect("resume result");
+    peer.await.expect("peer");
+    collector.await.expect("collector");
+    assert_eq!(result.session_id, SessionId::new("resume-session"));
+    assert_eq!(result.run_id, RunId::new("resumed-run"));
+    assert_eq!(result.outcome, HeadlessOutcome::Done);
+    assert_eq!(result.provider, "fake");
+    assert_eq!(result.model, "original-model");
+}

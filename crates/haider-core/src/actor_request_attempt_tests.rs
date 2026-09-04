@@ -14,6 +14,7 @@ struct AppendRecordingStore {
     batch_sizes: Mutex<Vec<usize>>,
     batches: Mutex<Vec<Vec<EventPayload>>>,
     reject_request_boundary: bool,
+    reject_hard_budget_boundary: bool,
 }
 
 #[test]
@@ -42,12 +43,20 @@ impl AppendRecordingStore {
             batch_sizes: Mutex::new(Vec::new()),
             batches: Mutex::new(Vec::new()),
             reject_request_boundary: false,
+            reject_hard_budget_boundary: false,
         }
     }
 
     fn rejecting_request_boundary() -> Self {
         Self {
             reject_request_boundary: true,
+            ..Self::new()
+        }
+    }
+
+    fn rejecting_hard_budget_boundary() -> Self {
+        Self {
+            reject_hard_budget_boundary: true,
             ..Self::new()
         }
     }
@@ -75,7 +84,7 @@ impl StoreHandle for AppendRecordingStore {
                     .expect("recorded payload is typed")
             })
             .collect::<Vec<_>>();
-        let reject = self.reject_request_boundary
+        let reject_request = self.reject_request_boundary
             && batch.iter().any(|payload| {
                 matches!(
                     payload,
@@ -85,11 +94,17 @@ impl StoreHandle for AppendRecordingStore {
                     }) if kind == PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND
                 )
             });
+        let reject_budget = self.reject_hard_budget_boundary
+            && batch.iter().any(|payload| {
+                matches!(payload, EventPayload::Item(ItemEvent::Completed { item, .. })
+                    if RequestBudgetStatusV1::from_extension_item(item)
+                        .is_some_and(|status| status.phase == RequestBudgetPhaseV1::HardBound))
+            });
         self.batches
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(batch);
-        if reject {
+        if reject_request || reject_budget {
             return Err(HaiderError::new(
                 ErrorCode::Internal,
                 "reject combined request boundary",
@@ -452,7 +467,9 @@ fn reported_usage() -> Usage {
 
 /// MUTATION CHECK: move the provider-view marker back to a standalone append
 /// in the real request path. The production batch containing that marker is
-/// no longer the exact five-event pre-change journal sequence.
+/// no longer the exact five-event pre-change journal sequence followed by the
+/// new progress marker. Budget visibility shares this boundary rather than
+/// introducing an additional request-side append.
 #[tokio::test]
 async fn production_request_path_batches_provider_view_with_attempt_facts() {
     let session_id = SessionId::new("provider-view-production-batch");
@@ -494,7 +511,15 @@ async fn production_request_path_batches_provider_view_with_attempt_facts() {
         })
         .collect::<Vec<_>>();
     assert_eq!(request_batches.len(), 1);
-    assert_request_boundary_golden(&request_batches[0]);
+    assert_eq!(request_batches[0].len(), 7);
+    assert_request_boundary_golden(&request_batches[0][..5]);
+    let progress = RequestBudgetStatusV1::from_extension_item(completed_extension_item(
+        &request_batches[0][5..],
+        PROVIDER_REQUEST_BUDGET_EXTENSION_KIND,
+    ))
+    .expect("typed request budget shares the request boundary");
+    assert_eq!(progress.phase, RequestBudgetPhaseV1::Progress);
+    assert_eq!(progress.used, 1);
     let provider_attempt = ProviderViewAttemptV1::try_from_extension_item(
         completed_extension_item(&request_batches[0], PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND),
     )
@@ -607,6 +632,7 @@ async fn rejected_combined_append_does_not_publish_or_advance_state() {
                 provider_view: Some(serde_json::json!({"provider_view": "exact"})),
                 cache: serde_json::json!({"cache_attempt": "diagnostic"}),
                 response_epoch: 0,
+                request_budget: None,
             },
             &mut thinking_pending,
         )
@@ -646,6 +672,7 @@ async fn provider_view_and_request_attempt_share_one_ordered_append() {
                 provider_view: Some(serde_json::json!({"provider_view": "exact"})),
                 cache: serde_json::json!({"cache_attempt": "diagnostic"}),
                 response_epoch: 0,
+                request_budget: None,
             },
             &mut thinking_pending,
         )
@@ -827,4 +854,139 @@ async fn tool_call_response_does_not_batch_usage_with_done() {
                 .iter()
                 .any(|payload| matches!(payload, EventPayload::RunState(RunState::Done)))
     }));
+}
+
+/// MUTATION CHECK: split the hard checkpoint from RunFailed/Errored. The
+/// recorded production boundary then loses its exact four-event shape, even
+/// if an uninterrupted run still produces apparently correct final history.
+#[tokio::test]
+async fn hard_request_checkpoint_and_named_terminal_share_one_atomic_append() {
+    let session_id = SessionId::new("hard-budget-atomic");
+    let mut config = HarnessConfig::for_session(
+        session_id.clone(),
+        DeviceId::new("hard-budget-device"),
+        1,
+        1,
+    );
+    config.provider_request_tranche = 1;
+    config.max_provider_requests_per_turn = 2;
+    config.provider_requests_already_made = 2;
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let store = Arc::new(AppendRecordingStore::new());
+    let handle = HarnessActor::spawn(config, provider.clone(), store.clone());
+    let mut live_events = handle.subscribe();
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("continue exhausted work"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.expect("typed hard cap cause").code,
+        ErrorCode::RequestBudgetExceeded
+    );
+    assert!(provider.requests().is_empty());
+
+    let terminal_batches = store
+        .batches()
+        .into_iter()
+        .filter(|batch| {
+            batch.iter().any(
+                |payload| matches!(payload, EventPayload::RunState(state) if state.is_terminal()),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_batches.len(), 1);
+    assert!(matches!(
+        terminal_batches[0].as_slice(),
+        [
+            EventPayload::Item(ItemEvent::Started { item_id: started, item: started_item }),
+            EventPayload::Item(ItemEvent::Completed { item_id: completed, item: completed_item }),
+            EventPayload::RunFailed { code: ErrorCode::RequestBudgetExceeded, .. },
+            EventPayload::RunState(RunState::Errored),
+        ] if started == completed && started_item == completed_item
+    ));
+    let hard = RequestBudgetStatusV1::from_extension_item(completed_extension_item(
+        &terminal_batches[0],
+        PROVIDER_REQUEST_BUDGET_EXTENSION_KIND,
+    ))
+    .expect("typed hard checkpoint");
+    assert_eq!(hard.phase, RequestBudgetPhaseV1::HardBound);
+    assert_eq!(hard.used, hard.budget.hard_cap);
+    assert_eq!(hard.continuation.session_id, session_id);
+
+    let journal = store.inner.events(&session_id).await;
+    let terminal = &journal[journal.len() - 4..];
+    assert!(
+        terminal
+            .windows(2)
+            .all(|pair| pair[1].seq == pair[0].seq + 1)
+    );
+    for event in &terminal[..2] {
+        assert_eq!(event.render, prompt_verbatim_render());
+        assert_eq!(event.run_id.as_ref(), Some(&hard.continuation.run_id));
+    }
+    let terminal_ids = terminal
+        .iter()
+        .map(|event| event.event_id.clone())
+        .collect::<Vec<_>>();
+    let published_ids = std::iter::from_fn(|| live_events.try_recv().ok())
+        .filter(|event| terminal_ids.contains(&event.event_id))
+        .map(|event| event.event_id)
+        .collect::<Vec<_>>();
+    assert_eq!(published_ids, terminal_ids);
+}
+
+/// MUTATION CHECK: persist or publish the hard-bound note before the failed
+/// atomic append. A resumable handle would then survive without its terminal,
+/// incorrectly inviting a second turn while the original remains recoverable.
+#[tokio::test]
+async fn rejected_hard_request_checkpoint_exposes_neither_handle_nor_terminal() {
+    let session_id = SessionId::new("hard-budget-rejected");
+    let mut config = HarnessConfig::for_session(
+        session_id.clone(),
+        DeviceId::new("hard-budget-rejected-device"),
+        1,
+        1,
+    );
+    config.provider_request_tranche = 1;
+    config.max_provider_requests_per_turn = 2;
+    config.provider_requests_already_made = 2;
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let store = Arc::new(AppendRecordingStore::rejecting_hard_budget_boundary());
+    let handle = HarnessActor::spawn(config, provider.clone(), store.clone());
+    let mut live_events = handle.subscribe();
+    let state = handle.state_receiver();
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("reject exhausted work checkpoint"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(
+        outcome.error.expect("append failure").code,
+        ErrorCode::Internal
+    );
+    assert!(provider.requests().is_empty());
+    assert!(!state.borrow().as_ref().is_some_and(RunState::is_terminal));
+
+    let forbidden = |event: &RawEnvelope| match event.payload.decode_event() {
+        Ok(EventPayload::Item(
+            ItemEvent::Started { item, .. } | ItemEvent::Completed { item, .. },
+        )) => RequestBudgetStatusV1::from_extension_item(&item)
+            .is_some_and(|status| status.phase == RequestBudgetPhaseV1::HardBound),
+        Ok(EventPayload::RunFailed { .. }) => true,
+        Ok(EventPayload::RunState(state)) => state.is_terminal(),
+        _ => false,
+    };
+    let journal = store.inner.events(&session_id).await;
+    assert!(!journal.iter().any(&forbidden));
+    assert!(!std::iter::from_fn(|| live_events.try_recv().ok()).any(|event| forbidden(&event)));
 }

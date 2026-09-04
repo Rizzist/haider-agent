@@ -10911,6 +10911,13 @@ impl Store {
             })
             .transpose()?;
         let states = latest_run_states(transaction, &command.session_id)?;
+        if let Some(source) = headless_spec
+            .as_ref()
+            .and_then(|spec| spec.continuation_of.as_ref())
+        {
+            validate_request_budget_continuation(transaction, &command, source, &states)?;
+        }
+
         // RPC submit does not carry a run id. For Subturn only, bind the
         // daemon-minted candidate to the newest actually-running response on
         // the requested branch inside this serialized transaction. Queue
@@ -13928,6 +13935,71 @@ fn typed_session_metadata(
             false,
         )
     })
+}
+
+/// Consume a budget continuation at the same serialized admission boundary
+/// as the new receipt. Two clients cannot spend the same continuation twice.
+fn validate_request_budget_continuation(
+    transaction: &Connection,
+    command: &TurnAcceptCommand,
+    source: &RunId,
+    states: &HashMap<RunId, DurableRunHead>,
+) -> StoreResult<()> {
+    use haider_protocol::request_budget::{RequestBudgetPhaseV1, RequestBudgetStatusV1};
+    let invalid = || {
+        store_error(
+            ErrorCode::InvalidArgument,
+            "request budget continuation requires the latest terminal checkpoint on this timeline",
+            false,
+        )
+    };
+    if command.mode != DeliveryMode::Queue {
+        return Err(invalid());
+    }
+    if states
+        .values()
+        .any(|(state, _, branch)| branch == &command.branch_id && !state.is_terminal())
+    {
+        return Err(invalid());
+    }
+    let latest = states
+        .iter()
+        .filter(|(_, (_, _, branch))| branch == &command.branch_id)
+        .max_by_key(|(_, (_, seq, _))| *seq);
+    if !latest.is_some_and(|(run, (state, _, _))| run == source && state.is_terminal()) {
+        return Err(invalid());
+    }
+    let mut statement = transaction.prepare_cached(
+        "SELECT envelope_json FROM events WHERE session_id = ?1 AND payload_kind = 'item' ORDER BY seq DESC"
+    ).map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([command.session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let envelope = decode_envelope_column(row, 0)
+            .map_err(|error| corrupt(format!("invalid continuation envelope: {error}")))?;
+        if envelope.run_id.as_ref() != Some(source)
+            || envelope.branch_id != command.branch_id
+            || envelope.agent_id != command.agent_id
+        {
+            continue;
+        }
+        if let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
+            envelope.payload.decode_event()
+            && let Some(status) = RequestBudgetStatusV1::from_extension_item(&item)
+            && matches!(
+                status.phase,
+                RequestBudgetPhaseV1::SoftBound | RequestBudgetPhaseV1::HardBound
+            )
+            && status.continuation.session_id == command.session_id
+            && status.continuation.run_id == *source
+            && status.continuation.branch_id == command.branch_id
+            && status.continuation.agent_id == command.agent_id
+        {
+            return Ok(());
+        }
+    }
+    Err(invalid())
 }
 
 fn validate_headless_turn_admission(

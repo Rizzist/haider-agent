@@ -14454,6 +14454,17 @@ impl HubConnection {
             request.insert("trust_hooks".into(), serde_json::Value::Bool(true));
         }
         if let Some(spec) = headless_spec.as_ref() {
+            if let Some(budget) = spec.budget.request_budget
+                && let Err(message) = budget.validate()
+            {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    &message,
+                    false,
+                    None,
+                );
+            }
             if spec.cwd.trim().is_empty()
                 || spec.provider.trim().is_empty()
                 || spec.model.trim().is_empty()

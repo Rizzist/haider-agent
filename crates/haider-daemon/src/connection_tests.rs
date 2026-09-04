@@ -355,8 +355,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        111,
-        "account source discovery and monitor mutation extend the prior 109-feature set"
+        112,
+        "request-budget policy and continuation negotiation extend the prior 111-feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -426,6 +426,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_RESIDENT_SESSION_BINDING_TOKEN_V1.to_owned(),
             haider_rpc::FEATURE_RUN_RETRY_V1.to_owned(),
             haider_rpc::FEATURE_RUN_BUDGET_V1.to_owned(),
+            haider_rpc::FEATURE_REQUEST_BUDGET_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned(),

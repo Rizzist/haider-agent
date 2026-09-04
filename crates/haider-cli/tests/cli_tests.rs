@@ -3788,6 +3788,7 @@ fn run_parser_pins_outputs_timeouts_and_permission_flags() {
         Ok(RunOptions {
             prompt: "hello".into(),
             prompt_stdin: false,
+            resume_run_id: None,
             action: RunAction::Execute,
             output: RunOutput::Print,
             timeout: None,

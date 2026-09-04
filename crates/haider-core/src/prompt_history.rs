@@ -54,7 +54,7 @@ const PROMPT_CHECKPOINT_SHAPE_VERSION: u32 = 1;
 /// new reducer. Ordinary package releases do not invalidate checkpoints;
 /// payload layout changes are governed separately by
 /// `PROMPT_CHECKPOINT_SHAPE_VERSION`.
-const PROMPT_CHECKPOINT_REDUCER_VERSION: &str = "prompt-history-v1";
+const PROMPT_CHECKPOINT_REDUCER_VERSION: &str = "prompt-history-v2-request-budget";
 pub const USER_COMMAND_OUTPUT_PREVIEW_BYTES: usize = 8 * 1024;
 /// Recent provider-message budget retained verbatim across model summaries.
 /// The unit is the same honest provider-neutral bytes/4 estimate used by the
@@ -4414,6 +4414,13 @@ fn render_journal_with_facts(
                             truncated,
                             result.images,
                         ));
+                    }
+                }
+                TurnItem::Extension { ref kind, .. }
+                    if kind == haider_protocol::request_budget::PROVIDER_REQUEST_BUDGET_EXTENSION_KIND =>
+                {
+                    if let Some(status) = haider_protocol::request_budget::RequestBudgetStatusV1::from_extension_item(&item) {
+                        messages.push(Message::user_text(status.model_note()));
                     }
                 }
                 TurnItem::Extension { kind, data } if kind == PROVIDER_OPAQUE_EXTENSION_KIND => {

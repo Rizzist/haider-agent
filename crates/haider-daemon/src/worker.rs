@@ -7815,7 +7815,7 @@ async fn start_turn(
     let mut budget_check = None;
     if let Some(context) = headless
         .as_ref()
-        .filter(|context| !context.spec.budget.is_empty())
+        .filter(|context| context.spec.budget.has_shared_limits())
     {
         let coordinator = lease
             .hub()
@@ -7877,7 +7877,7 @@ async fn start_turn(
                 let context =
                     headless_run_context_for_session(lease.hub(), &root_session_id, &root_run_id)
                         .await?;
-                match context.filter(|context| !context.spec.budget.is_empty()) {
+                match context.filter(|context| context.spec.budget.has_shared_limits()) {
                     Some(context) => Some(
                         lease
                             .hub()
@@ -8592,6 +8592,25 @@ async fn start_turn(
     config.provider_request_ordinals = Some(request_ordinals.clone());
     config.provider_request_attempt_recorder = Some(provider_request_attempt_recorder.clone());
     config.recovery_request_local_usage = admission_retry;
+    // A run pin overrides the child's frozen policy; absent both, the core
+    // supplies its ordinary 32-request tranche and 64-request hard ceiling.
+    let child_request_budget = delegation_record
+        .as_ref()
+        .map(|record| record.manifest.request_budget())
+        .transpose()
+        .map_err(|message| HaiderError::new(ErrorCode::InvalidArgument, message, false))?
+        .flatten();
+    if let Some(budget) = headless
+        .as_ref()
+        .and_then(|context| context.spec.budget.request_budget)
+        .or(child_request_budget)
+    {
+        budget
+            .validate()
+            .map_err(|message| HaiderError::new(ErrorCode::InvalidArgument, message, false))?;
+        config.provider_request_tranche = budget.tranche;
+        config.max_provider_requests_per_turn = budget.hard_cap;
+    }
     if let Some(limit) = dependencies
         .provider_factory
         .max_provider_requests_per_turn_override()

@@ -2774,6 +2774,8 @@ async fn session_without_compaction_folds_from_zero_without_a_checkpoint() {
 /// typed duplicate-node corruption.
 #[tokio::test]
 async fn checkpoint_membership_detects_a_suffix_duplicate_node() {
+    // Fixtures below use the current reducer so membership/timeline failures
+    // cannot pass accidentally through an obsolete-version fallback.
     let store = MemoryStore::new();
     let artifacts = TestArtifacts(HashMap::new());
     let session_id = SessionId::new("checkpoint-duplicate-node-session");
@@ -2856,7 +2858,7 @@ async fn checkpoint_membership_detects_a_suffix_duplicate_node() {
         boundary_event_id: events[3].event_id.clone(),
         payload: serde_json::to_vec(&serde_json::json!({
             "shape_version": 1,
-            "reducer_version": "prompt-history-v1",
+            "reducer_version": "prompt-history-v2-request-budget",
             "through_seq": 4,
             "boundary_event_id": events[3].event_id,
             "boundary_run_id": prior,
@@ -3027,7 +3029,7 @@ async fn checkpoint_replays_a_late_envelope_for_a_covered_run() {
         boundary_event_id: events[5].event_id.clone(),
         payload: serde_json::to_vec(&serde_json::json!({
             "shape_version": 1,
-            "reducer_version": "prompt-history-v1",
+            "reducer_version": "prompt-history-v2-request-budget",
             "through_seq": 6,
             "boundary_event_id": events[5].event_id,
             "boundary_run_id": prior,
@@ -3284,7 +3286,7 @@ async fn checkpoint_from_another_branch_is_rejected() {
         boundary_event_id: events[5].event_id.clone(),
         payload: serde_json::to_vec(&serde_json::json!({
             "shape_version": 1,
-            "reducer_version": "prompt-history-v1",
+            "reducer_version": "prompt-history-v2-request-budget",
             "through_seq": 6,
             "boundary_event_id": events[5].event_id,
             "boundary_run_id": compacting,
@@ -3478,7 +3480,7 @@ async fn compaction_on_another_branch_does_not_invalidate_the_checkpoint() {
         boundary_event_id: events[5].event_id.clone(),
         payload: serde_json::to_vec(&serde_json::json!({
             "shape_version": 1,
-            "reducer_version": "prompt-history-v1",
+            "reducer_version": "prompt-history-v2-request-budget",
             "through_seq": 6,
             "boundary_event_id": events[5].event_id,
             "boundary_run_id": prior,
