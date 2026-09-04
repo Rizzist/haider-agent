@@ -12750,3 +12750,1069 @@ async fn credential_source_watcher_observes_atomic_origin_rotation() {
         .expect("watch signal");
     assert!(*changed_rx.borrow_and_update() > 0);
 }
+
+// ──────────── linked Grok CLI / Kimi Code roots (970, layer B) ─────────────
+
+/// The origin refresh token every fixture carries. Layer B must never copy
+/// it: `auth.x.ai` and the Kimi token endpoint both rotate with single-holder
+/// reuse detection, so a second spender breaks the origin CLI's next refresh.
+const ORIGIN_REFRESH_MARKER: &str = "REFRESH_THIS_MUST_NEVER_ENTER_A_LINKED_BUNDLE";
+
+fn write_linked_grok_source(root: &std::path::Path, user_id: &str, email: &str) {
+    std::fs::create_dir_all(root).expect("create Grok root");
+    let document = serde_json::json!({
+        "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {
+            "key": "grok-access-token-fixture",
+            "refresh_token": ORIGIN_REFRESH_MARKER,
+            "expires_at": "2099-01-01T00:00:00Z",
+            "create_time": "2026-09-01T00:00:00Z",
+            "auth_mode": "oidc",
+            "user_id": user_id,
+            "email": email,
+        },
+        "xai::api_key": {
+            "key": "grok-api-key-fixture",
+            "auth_mode": "api_key",
+            "user_id": "api-key-user",
+        }
+    });
+    std::fs::write(
+        root.join("auth.json"),
+        serde_json::to_vec(&document).expect("encode Grok source"),
+    )
+    .expect("write Grok source");
+}
+
+fn write_linked_kimi_source(root: &std::path::Path, access_token: &str, file_name: &str) {
+    let directory = root.join("credentials");
+    std::fs::create_dir_all(&directory).expect("create Kimi credentials dir");
+    let document = serde_json::json!({
+        "access_token": access_token,
+        "refresh_token": ORIGIN_REFRESH_MARKER,
+        "expires_at": 4_102_444_800u64,
+        "expires_in": 3_600u64,
+        "scope": "openid offline_access",
+        "token_type": "Bearer",
+    });
+    std::fs::write(
+        directory.join(file_name),
+        serde_json::to_vec(&document).expect("encode Kimi source"),
+    )
+    .expect("write Kimi source");
+}
+
+/// The operator vocabulary for `haider account source add`. Every durable
+/// kind name plus its short alias resolves; anything else is refused.
+#[test]
+fn source_kind_vocabulary_covers_every_enrolled_kind() {
+    for (input, expected) in [
+        ("codex", CredentialSourceKind::CodexHome),
+        ("codex_home", CredentialSourceKind::CodexHome),
+        ("claude", CredentialSourceKind::ClaudeFile),
+        ("claude_file", CredentialSourceKind::ClaudeFile),
+        ("grok", CredentialSourceKind::GrokHome),
+        ("grok_home", CredentialSourceKind::GrokHome),
+        ("kimi", CredentialSourceKind::KimiCodeHome),
+        ("kimi_code_home", CredentialSourceKind::KimiCodeHome),
+    ] {
+        assert_eq!(parse_source_kind(input), Some(expected), "{input}");
+        assert_eq!(source_provider(expected), source_provider(expected));
+    }
+    for rejected in ["", "keychain", "grok_cli", "kimi-code", "codexhome"] {
+        assert_eq!(parse_source_kind(rejected), None, "{rejected}");
+    }
+    assert_eq!(
+        source_provider(CredentialSourceKind::GrokHome),
+        GROK_OAUTH_PROVIDER_NAME
+    );
+    assert_eq!(
+        source_provider(CredentialSourceKind::KimiCodeHome),
+        KIMI_OAUTH_PROVIDER_NAME
+    );
+}
+
+/// LAW: three origin roots (Grok, current Kimi Code, legacy Kimi) link as
+/// three distinct accounts in ONE reconcile pass, keep their aliases across a
+/// rescan, never copy an origin refresh token, and do not perturb an
+/// already-linked Codex root. A legacy root with no readable credential
+/// stays honestly `requires_origin_client` instead of inventing an account.
+#[test]
+fn source_reconciliation_links_grok_and_both_kimi_roots_without_owning_refresh_rotation() {
+    let profile = test_store_dir();
+    let codex_root = profile.path().join("codex-home");
+    write_linked_codex_source(&codex_root, "acct-codex", "codex@example.test");
+
+    let mut registry = CredentialSourceRegistry::load(profile.path()).expect("source registry");
+    registry
+        .enroll(CredentialSourceKind::CodexHome, &codex_root, Some("Codex"))
+        .expect("enroll Codex root");
+    let mut accounts = memory_accounts();
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("codex-only reconcile");
+    let codex_before = accounts.list().to_vec();
+    assert_eq!(codex_before.len(), 1);
+
+    let grok_root = profile.path().join("grok-home");
+    let kimi_root = profile.path().join("kimi-code-home");
+    let kimi_legacy = profile.path().join("kimi-legacy");
+    let kimi_keyring_only = profile.path().join("kimi-keyring-only");
+    write_linked_grok_source(&grok_root, "user-grok", "pilot@example.test");
+    write_linked_kimi_source(&kimi_root, "kimi-access-current", "kimi-code.json");
+    write_linked_kimi_source(
+        &kimi_legacy,
+        "kimi-access-legacy",
+        "kimi-code-env-0123456789abcdef.json",
+    );
+    std::fs::create_dir_all(&kimi_keyring_only).expect("create keyring-only Kimi root");
+
+    registry
+        .enroll(CredentialSourceKind::GrokHome, &grok_root, Some("Grok CLI"))
+        .expect("enroll Grok root");
+    for (root, label) in [
+        (&kimi_root, "Kimi Code default"),
+        (&kimi_legacy, "Kimi Code legacy default"),
+        (&kimi_keyring_only, "Kimi Code keyring only"),
+    ] {
+        registry
+            .enroll(CredentialSourceKind::KimiCodeHome, root, Some(label))
+            .expect("enroll Kimi root");
+    }
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("reconcile every root");
+
+    assert_eq!(registry.records().len(), 5);
+    assert_eq!(
+        accounts.list().len(),
+        4,
+        "Codex + Grok + two readable Kimi roots"
+    );
+    assert_eq!(
+        accounts
+            .get(&codex_before[0].alias)
+            .expect("Codex descriptor survives the new kinds"),
+        &codex_before[0],
+        "adding Grok/Kimi roots must not perturb an existing linked account"
+    );
+
+    fn record_for(
+        registry: &CredentialSourceRegistry,
+        root: &std::path::Path,
+    ) -> CredentialSourceRecord {
+        let canonical = std::fs::canonicalize(root).expect("canonical root");
+        registry
+            .records()
+            .iter()
+            .find(|record| record.root == canonical)
+            .cloned()
+            .expect("enrolled record")
+    }
+
+    let grok = record_for(&registry, &grok_root);
+    assert_eq!(grok.health, CredentialSourceHealth::Ready);
+    assert_eq!(grok.store_mode, haider_accounts::CredentialStoreMode::File);
+    assert_eq!(grok.refresh_owner.as_str(), "grok_cli");
+    assert_eq!(grok.access_expires_at_ms, Some(4_070_908_800_000));
+    let grok_alias = grok.account_alias.clone().expect("Grok alias");
+    assert!(grok_alias.starts_with("grok-"), "{grok_alias}");
+    let grok_descriptor = accounts
+        .get(&CredentialAlias::new(&grok_alias))
+        .expect("Grok descriptor");
+    assert_eq!(grok_descriptor.provider, GROK_OAUTH_PROVIDER_NAME);
+    assert_eq!(grok_descriptor.auth_method, AuthMethod::OAuth);
+    assert_eq!(grok_descriptor.identity, "pilot@example.test");
+    assert_eq!(grok_descriptor.status, CredentialStatus::Ok);
+
+    for root in [&kimi_root, &kimi_legacy] {
+        let record = record_for(&registry, root);
+        assert_eq!(record.health, CredentialSourceHealth::Ready);
+        assert_eq!(record.refresh_owner.as_str(), "kimi_cli");
+        assert_eq!(record.access_expires_at_ms, Some(4_102_444_800_000));
+        let alias = record.account_alias.clone().expect("Kimi alias");
+        assert!(alias.starts_with("kimi-"), "{alias}");
+        let descriptor = accounts
+            .get(&CredentialAlias::new(&alias))
+            .expect("Kimi descriptor");
+        assert_eq!(descriptor.provider, KIMI_OAUTH_PROVIDER_NAME);
+    }
+    let current_identity = record_for(&registry, &kimi_root)
+        .account_alias
+        .and_then(|alias| accounts.get(&CredentialAlias::new(&alias)).cloned())
+        .and_then(|descriptor| descriptor.account_identity)
+        .and_then(|identity| identity.account_id)
+        .expect("current Kimi coordinate");
+    let legacy_identity = record_for(&registry, &kimi_legacy)
+        .account_alias
+        .and_then(|alias| accounts.get(&CredentialAlias::new(&alias)).cloned())
+        .and_then(|descriptor| descriptor.account_identity)
+        .and_then(|identity| identity.account_id)
+        .expect("legacy Kimi coordinate");
+    assert_ne!(
+        current_identity, legacy_identity,
+        "two Kimi roots are two accounts, never one merged login"
+    );
+
+    let keyring_only = record_for(&registry, &kimi_keyring_only);
+    assert_eq!(
+        keyring_only.health,
+        CredentialSourceHealth::RequiresOriginClient,
+        "a root whose login Haider cannot enumerate stays honest"
+    );
+    assert!(
+        keyring_only.account_alias.is_none(),
+        "an unreadable root must never invent an account"
+    );
+
+    // The load-bearing invariant, through the durable records.
+    for record in registry
+        .records()
+        .iter()
+        .filter(|record| record.health == CredentialSourceHealth::Ready)
+    {
+        let material =
+            crate::device_discovery::read_linked_source(record).expect("read linked source");
+        let encoded = material.encoded_bundle.expect("access-only bundle");
+        let bundle = haider_accounts::OAuthTokenBundleV1::decode(&encoded).expect("decode bundle");
+        assert!(
+            bundle.refresh_token().is_none(),
+            "{} must never own refresh rotation",
+            record.kind.as_str()
+        );
+        assert!(
+            !encoded
+                .windows(ORIGIN_REFRESH_MARKER.len())
+                .any(|window| window == ORIGIN_REFRESH_MARKER.as_bytes()),
+            "the origin refresh token must not survive into the bundle bytes"
+        );
+    }
+
+    // A rescan is idempotent: same aliases, same descriptor generation.
+    let generation = accounts.list().to_vec();
+    let aliases = registry
+        .records()
+        .iter()
+        .map(|record| (record.id.clone(), record.account_alias.clone()))
+        .collect::<Vec<_>>();
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("rescan");
+    assert_eq!(accounts.list(), generation);
+    assert_eq!(
+        registry
+            .records()
+            .iter()
+            .map(|record| (record.id.clone(), record.account_alias.clone()))
+            .collect::<Vec<_>>(),
+        aliases,
+        "aliases are stable across a rescan"
+    );
+
+    // A rotated Kimi token keeps ONE account with the same alias.
+    write_linked_kimi_source(&kimi_root, "kimi-access-rotated", "kimi-code.json");
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("rotation rescan");
+    assert_eq!(
+        record_for(&registry, &kimi_root).account_alias,
+        aliases
+            .iter()
+            .find(|(id, _)| *id == record_for(&registry, &kimi_root).id)
+            .and_then(|(_, alias)| alias.clone()),
+        "a token rotation must not re-alias the account"
+    );
+}
+
+/// LAW: a LINKED row and a Haider-NATIVE login for the same provider are two
+/// separate accounts. Read-through resolution of the linked alias yields an
+/// access-only bundle; the native alias keeps its own Haider-owned refresh
+/// credential, and neither touches the other's material.
+#[test]
+fn linked_and_native_grok_accounts_coexist_without_sharing_alias_or_credential() {
+    let profile = test_store_dir();
+    let grok_root = profile.path().join("grok-home");
+    write_linked_grok_source(&grok_root, "user-linked", "linked@example.test");
+
+    let inner = Arc::new(MemoryVault::new()) as Arc<dyn Vault>;
+    let native_alias = CredentialAlias::new("grok-oauth");
+    let native_bundle = haider_accounts::OAuthTokenBundleV1::new(
+        GROK_OAUTH_PROVIDER_NAME.to_owned(),
+        "https://auth.x.ai".to_owned(),
+        "b1a00492-073a-47ea-816f-4c329264a828".to_owned(),
+        None,
+        "Bearer".to_owned(),
+        zeroize::Zeroizing::new(b"native-access-token".to_vec()),
+        Some(zeroize::Zeroizing::new(
+            b"native-haider-owned-refresh".to_vec(),
+        )),
+        4_102_444_800_000,
+        None,
+        Vec::new(),
+        haider_accounts::OAuthIdentityV1 {
+            subject_hash: "native-subject".to_owned(),
+            display_identity: "SuperGrok/X Premium subscription".to_owned(),
+        },
+        7,
+    )
+    .expect("native bundle");
+    inner
+        .put(
+            &native_alias,
+            &native_bundle.encode().expect("encode native bundle"),
+        )
+        .expect("vault the native login");
+
+    let mut registry = CredentialSourceRegistry::load(profile.path()).expect("source registry");
+    registry
+        .enroll(CredentialSourceKind::GrokHome, &grok_root, Some("Grok CLI"))
+        .expect("enroll Grok root");
+    let mut accounts = memory_accounts();
+    accounts
+        .add(CredentialDescriptor {
+            alias: native_alias.clone(),
+            provider: GROK_OAUTH_PROVIDER_NAME.to_owned(),
+            base_url: None,
+            auth_method: AuthMethod::OAuth,
+            identity: "SuperGrok/X Premium subscription".to_owned(),
+            status: CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+        })
+        .expect("native descriptor");
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("reconcile beside native");
+
+    let linked_alias = registry.records()[0]
+        .account_alias
+        .clone()
+        .map(CredentialAlias::new)
+        .expect("linked alias");
+    assert_ne!(linked_alias, native_alias, "aliases never collide");
+    assert!(
+        accounts
+            .get(&native_alias)
+            .expect("native descriptor survives")
+            .active,
+        "the linked row must not steal the active selection"
+    );
+    assert!(
+        !accounts
+            .get(&linked_alias)
+            .expect("linked descriptor")
+            .active
+    );
+
+    let vault = SourceLinkedVault::new(Arc::clone(&inner), Arc::new(StdMutex::new(registry)));
+    let linked = haider_accounts::OAuthTokenBundleV1::decode(
+        vault
+            .resolve(&linked_alias)
+            .expect("resolve linked alias")
+            .expose_secret(),
+    )
+    .expect("decode linked bundle");
+    assert!(
+        linked.refresh_token().is_none(),
+        "the linked row never carries a refresh credential"
+    );
+    assert_eq!(linked.provider_id, GROK_OAUTH_PROVIDER_NAME);
+
+    let native = haider_accounts::OAuthTokenBundleV1::decode(
+        vault
+            .resolve(&native_alias)
+            .expect("resolve native alias")
+            .expose_secret(),
+    )
+    .expect("decode native bundle");
+    assert_eq!(
+        native.refresh_token(),
+        Some(b"native-haider-owned-refresh".as_slice()),
+        "the Haider-owned login keeps its own refresh credential"
+    );
+    assert_eq!(native.generation, 7);
+}
+
+/// LAW: `requires_origin_client` on a Kimi root routes to the origin-client
+/// attention reason (never Claude's policy block), and a revoked Kimi
+/// tombstone surfaces as a revoked account instead of a healthy one.
+#[test]
+fn linked_kimi_health_routes_to_origin_client_and_revoked_statuses() {
+    let profile = test_store_dir();
+    let unreadable = profile.path().join("kimi-unreadable");
+    let revoked = profile.path().join("kimi-revoked");
+    std::fs::create_dir_all(&unreadable).expect("create unreadable Kimi root");
+    std::fs::create_dir_all(revoked.join("credentials")).expect("create revoked Kimi root");
+    std::fs::write(
+        revoked.join("credentials").join("kimi-code.json"),
+        br#"{"access_token":"","refresh_token":"","expires_at":0,"scope":"openid","token_type":"Bearer"}"#,
+    )
+    .expect("write Kimi tombstone");
+
+    let mut registry = CredentialSourceRegistry::load(profile.path()).expect("source registry");
+    for root in [&unreadable, &revoked] {
+        registry
+            .enroll(CredentialSourceKind::KimiCodeHome, root, Some("Kimi"))
+            .expect("enroll Kimi root");
+    }
+    let mut accounts = memory_accounts();
+    reconcile_credential_sources(&mut registry, &mut accounts).expect("reconcile Kimi health");
+
+    let canonical_revoked = std::fs::canonicalize(&revoked).expect("canonical revoked root");
+    let revoked_record = registry
+        .records()
+        .iter()
+        .find(|record| record.root == canonical_revoked)
+        .expect("revoked record");
+    assert_eq!(revoked_record.health, CredentialSourceHealth::Revoked);
+    let revoked_alias = revoked_record
+        .account_alias
+        .clone()
+        .map(CredentialAlias::new)
+        .expect("revoked alias");
+    assert_eq!(
+        accounts
+            .get(&revoked_alias)
+            .expect("revoked account")
+            .status,
+        CredentialStatus::Revoked
+    );
+
+    let canonical_unreadable = std::fs::canonicalize(&unreadable).expect("canonical root");
+    let unreadable_record = registry
+        .records()
+        .iter()
+        .find(|record| record.root == canonical_unreadable)
+        .expect("unreadable record");
+    assert_eq!(
+        unreadable_record.health,
+        CredentialSourceHealth::RequiresOriginClient
+    );
+    assert_eq!(
+        source_attention(&unreadable_record.health),
+        CredentialAttentionReason::OriginClientRequired
+    );
+
+    let wires = account_source_wires(&registry, &accounts);
+    let revoked_wire = wires
+        .iter()
+        .find(|wire| wire.source_id == revoked_record.id)
+        .expect("revoked wire");
+    assert_eq!(revoked_wire.kind, "kimi_code_home");
+    assert_eq!(revoked_wire.refresh_owner, "kimi_cli");
+    assert_eq!(revoked_wire.health, "revoked");
+    assert!(
+        revoked_wire
+            .masked_identity
+            .as_deref()
+            .is_some_and(|masked| masked.starts_with('…')),
+        "the synthesized coordinate is masked on the way to the UI"
+    );
+}
+
+/// LAW: the 250 ms metadata watcher follows the document the READER resolves,
+/// so a Kimi Code endpoint slot — which does not sit at the kind's default
+/// relative path — still wakes reconciliation when the origin CLI rotates it.
+#[tokio::test]
+async fn credential_source_watcher_follows_a_kimi_endpoint_slot() {
+    let profile = test_store_dir();
+    let root = profile.path().join("kimi-watched");
+    write_linked_kimi_source(
+        &root,
+        "kimi-access-initial",
+        "kimi-code-env-0123456789abcdef.json",
+    );
+    let mut registry = CredentialSourceRegistry::load(profile.path()).expect("source registry");
+    let record = registry
+        .enroll(CredentialSourceKind::KimiCodeHome, &root, Some("watched"))
+        .expect("enroll Kimi root");
+    assert_eq!(
+        crate::device_discovery::linked_credential_path(&record).ok(),
+        Some(
+            std::fs::canonicalize(&root)
+                .expect("canonical root")
+                .join("credentials")
+                .join("kimi-code-env-0123456789abcdef.json")
+        ),
+        "the watcher and the reader resolve one document"
+    );
+    let registry = Arc::new(StdMutex::new(registry));
+    let (changed_tx, mut changed_rx) = watch::channel(0_u64);
+    let _watcher = CredentialSourceWatcher::new(&registry, changed_tx);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    write_linked_kimi_source(
+        &root,
+        "kimi-access-rotated",
+        "kimi-code-env-0123456789abcdef.json",
+    );
+    // 3s = twelve 250ms watcher cadences; a test-only scheduling allowance.
+    tokio::time::timeout(Duration::from_secs(3), changed_rx.changed())
+        .await
+        .expect("watch deadline")
+        .expect("watch signal");
+    assert!(*changed_rx.borrow_and_update() > 0);
+}
+
+// ---------------------------------------------------------------------------
+// v0.0.970: the supervised Google Antigravity account lane
+// ---------------------------------------------------------------------------
+
+/// Records every vault touch so a test can prove a lane never made one.
+struct VaultTouchCounter {
+    inner: MemoryVault,
+    resolves: std::sync::atomic::AtomicUsize,
+    puts: std::sync::atomic::AtomicUsize,
+}
+
+impl VaultTouchCounter {
+    fn new() -> Self {
+        Self {
+            inner: MemoryVault::default(),
+            resolves: std::sync::atomic::AtomicUsize::new(0),
+            puts: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn resolves(&self) -> usize {
+        self.resolves.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn puts(&self) -> usize {
+        self.puts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Vault for VaultTouchCounter {
+    fn put(&self, alias: &CredentialAlias, secret: &[u8]) -> haider_accounts::AccountsResult<()> {
+        self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.put(alias, secret)
+    }
+
+    fn resolve(
+        &self,
+        alias: &CredentialAlias,
+    ) -> haider_accounts::AccountsResult<haider_accounts::SecretHandle> {
+        self.resolves
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.resolve(alias)
+    }
+
+    fn delete(&self, alias: &CredentialAlias) -> haider_accounts::AccountsResult<()> {
+        self.inner.delete(alias)
+    }
+
+    fn list(&self) -> haider_accounts::AccountsResult<Vec<CredentialAlias>> {
+        self.inner.list()
+    }
+}
+
+fn antigravity_descriptor(alias: &str) -> CredentialDescriptor {
+    CredentialDescriptor {
+        alias: CredentialAlias::new(alias),
+        provider: GOOGLE_ANTIGRAVITY_PROVIDER_NAME.into(),
+        base_url: None,
+        auth_method: AuthMethod::OAuth,
+        identity: "Google account".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    }
+}
+
+fn antigravity_summary(models: &[&str], default_model: Option<&str>) -> ProviderSummaryWire {
+    ProviderSummaryWire {
+        provider: GOOGLE_ANTIGRAVITY_PROVIDER_NAME.into(),
+        api_family: ProviderApiFamilyWire::AcpAgent,
+        endpoint: None,
+        response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
+        models: models.iter().map(|slug| (*slug).to_owned()).collect(),
+        model_details: Vec::new(),
+        inventory_fetched_at_ms: None,
+        inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Authoritative,
+        auth_methods: vec![AuthMethod::OAuth],
+        availability: haider_rpc::ProviderAvailabilityWire::Available,
+        availability_reason: None,
+        default_model: default_model.map(str::to_owned),
+        enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
+    }
+}
+
+fn antigravity_metadata(model: &str) -> haider_protocol::session::SessionMetadataV1 {
+    haider_protocol::session::SessionMetadataV1 {
+        cwd: "/tmp/haider-antigravity-workspace".into(),
+        provider: GOOGLE_ANTIGRAVITY_PROVIDER_NAME.into(),
+        account_alias: None,
+        model: model.into(),
+        max_tokens: 64,
+        permission_overrides: None,
+        interaction_mode: Default::default(),
+        system_prompt_version: None,
+        title: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        context_economy: Default::default(),
+        created_at_ms: 1,
+        agent_type: None,
+    }
+}
+
+/// Builds the fixture install tree the HOST pin resolves, so the supervised
+/// lane can be exercised end to end without a real Google binary.
+fn install_antigravity_fixture(root: &crate::antigravity_session::AntigravityRuntimeRoot) {
+    let pin = crate::antigravity_install::pin_for_host().expect("this host has a release pin");
+    let install_root = root.install_root();
+    let version_dir = install_root
+        .join(crate::antigravity_install::VERSIONS_DIRECTORY)
+        .join(crate::antigravity_install::ANTIGRAVITY_VERSION);
+    std::fs::create_dir_all(&version_dir).expect("create the fixture version directory");
+    for directory in [
+        install_root.as_path(),
+        install_root
+            .join(crate::antigravity_install::VERSIONS_DIRECTORY)
+            .as_path(),
+        version_dir.as_path(),
+    ] {
+        haider_platform::set_mode(directory, 0o700).expect("secure the fixture directory");
+    }
+    for name in [pin.executable_name(), pin.helper_name()] {
+        let path = version_dir.join(name);
+        std::fs::write(&path, b"antigravity fixture, never executed").expect("write fixture");
+        haider_platform::set_mode(&path, 0o700).expect("secure the fixture file");
+    }
+    let pointer = install_root.join(crate::antigravity_install::ACTIVE_POINTER);
+    std::fs::write(&pointer, crate::antigravity_install::ANTIGRAVITY_VERSION)
+        .expect("write the active pointer");
+    haider_platform::set_mode(&pointer, 0o600).expect("secure the active pointer");
+}
+
+/// An ACP-backed account resolves a turn provider WITHOUT ever touching the
+/// vault and without any placeholder secret being minted.
+///
+/// The factory here has NO credential broker on purpose: every OAuth
+/// descriptor that reaches `resolve_secret` fails with "OAuth credential
+/// requires the auth-aware broker", so a successful resolution is positive
+/// proof the agent-owned branch ran BEFORE secret resolution — not merely that
+/// the counter happened to stay at zero.
+///
+/// MUTATION CHECK: move the `agent_owned_credential` branch in
+/// `resolve_provider` to AFTER `resolve_secret`. Expected runtime failure:
+/// resolution fails with the broker error, and the resolve counter is 1.
+#[tokio::test]
+async fn an_agent_owned_account_never_resolves_a_vault_secret_or_mints_a_placeholder() {
+    let temp = tempfile::tempdir().expect("temp antigravity root");
+    let root = crate::antigravity_session::AntigravityRuntimeRoot::new(temp.path());
+    install_antigravity_fixture(&root);
+
+    let vault = Arc::new(VaultTouchCounter::new());
+    let descriptor = antigravity_descriptor("google-antigravity-noresolve");
+    let snapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
+    let management = ManagementSnapshot::new(
+        1,
+        vec![descriptor.clone()],
+        vec![antigravity_summary(
+            &["gemini-3.8-flash-high", "gemini-3.7-flash-high"],
+            Some("gemini-3.7-flash-high"),
+        )],
+    );
+    let factory = AccountsProviderFactory::new_with_management(
+        snapshot,
+        management,
+        VaultProvision::Available(Arc::clone(&vault) as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder::with_antigravity_root(root)),
+    );
+
+    let (resolved, provider, fingerprint, keyless) = factory
+        .resolve_provider(
+            &antigravity_metadata("gemini-3.8-flash-high"),
+            &ProviderTuning::default(),
+        )
+        .await
+        .expect("the supervised account resolves without a secret");
+
+    assert_eq!(resolved.descriptor.alias, descriptor.alias);
+    assert_eq!(
+        fingerprint, None,
+        "there is no access token to fingerprint for an agent-owned account"
+    );
+    assert!(!keyless, "this is not the G4a keyless custom-profile lane");
+    assert_eq!(
+        provider.credential_surface(),
+        haider_provider::ProviderCredentialSurface::Opaque
+    );
+    assert_eq!(
+        provider.capabilities().await.provider,
+        GOOGLE_ANTIGRAVITY_PROVIDER_NAME
+    );
+    assert_eq!(
+        vault.resolves(),
+        0,
+        "no vault read may happen for this lane"
+    );
+    assert_eq!(
+        vault.puts(),
+        0,
+        "no placeholder secret may be created for this lane"
+    );
+    assert!(
+        vault.list().expect("list the vault").is_empty(),
+        "nothing was stored at all"
+    );
+}
+
+/// The same lane with NOTHING installed: a typed, actionable refusal, still
+/// without a single vault touch. A turn never triggers a download.
+///
+/// MUTATION CHECK: make the missing-install path fall through to the
+/// credential-bearing factory. Expected runtime failure: the resolve counter
+/// becomes 1 and the error stops naming the install remedy.
+#[tokio::test]
+async fn an_agent_owned_account_without_an_install_refuses_without_touching_the_vault() {
+    let temp = tempfile::tempdir().expect("temp antigravity root");
+    let root = crate::antigravity_session::AntigravityRuntimeRoot::new(temp.path());
+
+    let vault = Arc::new(VaultTouchCounter::new());
+    let descriptor = antigravity_descriptor("google-antigravity-noinstall");
+    let snapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
+    let management = ManagementSnapshot::new(
+        1,
+        vec![descriptor],
+        vec![antigravity_summary(
+            &["gemini-3.8-flash-high"],
+            Some("gemini-3.8-flash-high"),
+        )],
+    );
+    let factory = AccountsProviderFactory::new_with_management(
+        snapshot,
+        management,
+        VaultProvision::Available(Arc::clone(&vault) as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder::with_antigravity_root(root)),
+    );
+
+    let Err(error) = factory
+        .resolve_provider(
+            &antigravity_metadata("gemini-3.8-flash-high"),
+            &ProviderTuning::default(),
+        )
+        .await
+    else {
+        panic!("no install, no turn");
+    };
+    assert_eq!(error.code, ErrorCode::ProviderError);
+    assert!(
+        error.message.contains("not installed") && error.message.contains("install it"),
+        "the refusal must name the cause and the remedy: {}",
+        error.message
+    );
+    assert_eq!(vault.resolves(), 0);
+    assert_eq!(vault.puts(), 0);
+}
+
+/// A SECRET-BEARING construction for the supervised agent fails closed.
+///
+/// Reaching the credential-bearing factory for this provider means a caller
+/// resolved a secret for an account that has none, so the arm refuses instead
+/// of quietly wrapping a credential Haider does not hold.
+///
+/// MUTATION CHECK: make the `(GOOGLE_ANTIGRAVITY_PROVIDER_NAME,
+/// AuthMethod::OAuth)` arm construct an adapter around the handed credential.
+/// Expected runtime failure: the call returns `Ok` and both assertions below
+/// fail.
+#[test]
+fn a_secret_bearing_construction_for_the_supervised_agent_fails_closed() {
+    let vault = MemoryVault::default();
+    let alias = CredentialAlias::new("google-antigravity-crosswire");
+    vault
+        .put(&alias, b"NEVER_A_GOOGLE_SECRET_0c41")
+        .expect("stage a crosswired secret");
+    let Err(error) = build_account_provider(
+        GOOGLE_ANTIGRAVITY_PROVIDER_NAME,
+        None,
+        None,
+        AuthMethod::OAuth,
+        vault
+            .resolve(&alias)
+            .expect("resolve the crosswired secret"),
+        "gemini-3.8-flash-high",
+        &alias,
+        &ProviderTuning::default(),
+        None,
+        None,
+    ) else {
+        panic!("the supervised agent is never built from a resolved secret");
+    };
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert!(
+        error.message.contains("without a resolved secret"),
+        "the refusal states the law: {}",
+        error.message
+    );
+}
+
+/// `--account <alias>` pins exactly one Google alias, refuses an alias that
+/// belongs to another provider, and removing one Google alias leaves the other
+/// resolvable and bound to its own profile.
+///
+/// MUTATION CHECK: drop the provider comparison from
+/// `resolve_selected_account`. Expected runtime failure: the API-key `gemini`
+/// alias is accepted for a `google-antigravity` session.
+#[test]
+fn account_selection_pins_one_google_alias_and_refuses_another_providers_alias() {
+    let work = antigravity_descriptor("google-antigravity-work");
+    let personal = antigravity_descriptor("google-antigravity-personal");
+    let gemini_key = CredentialDescriptor {
+        alias: CredentialAlias::new("gemini-api-key"),
+        provider: GEMINI_PROVIDER_NAME.into(),
+        base_url: None,
+        auth_method: AuthMethod::ApiKey,
+        identity: "gemini api key".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let snapshot = Arc::new(StdMutex::new(vec![
+        work.clone(),
+        personal.clone(),
+        gemini_key.clone(),
+    ]));
+    let factory = AccountsProviderFactory::new(
+        Arc::clone(&snapshot),
+        VaultProvision::Available(Arc::new(MemoryVault::default()) as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder::default()),
+    );
+
+    for descriptor in [&work, &personal] {
+        let selected = factory
+            .resolve_selected_account(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, descriptor.alias.as_str())
+            .expect("an explicit Google alias selects deterministically");
+        assert_eq!(selected.descriptor.alias, descriptor.alias);
+        assert!(selected.rotation.is_none(), "an explicit pin never rotates");
+    }
+
+    // Another provider's alias is refused, in BOTH directions.
+    let error = factory
+        .resolve_selected_account(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, gemini_key.alias.as_str())
+        .expect_err("an API-key gemini alias is not a Google Antigravity account");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    let error = factory
+        .resolve_selected_account(GEMINI_PROVIDER_NAME, work.alias.as_str())
+        .expect_err("a Google Antigravity alias is not an API-key gemini account");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+
+    // Removing one Google alias leaves the other selectable and unmoved.
+    snapshot
+        .lock()
+        .expect("snapshot")
+        .retain(|descriptor| descriptor.alias != work.alias);
+    assert!(
+        factory
+            .resolve_selected_account(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, work.alias.as_str())
+            .is_err(),
+        "the removed alias is gone"
+    );
+    let survivor = factory
+        .resolve_selected_account(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, personal.alias.as_str())
+        .expect("the surviving Google alias is untouched");
+    assert_eq!(survivor.descriptor.alias, personal.alias);
+
+    // Their private profiles were never shared, so one logout cannot reach the
+    // other's sessions or auth state.
+    let root = crate::antigravity_session::AntigravityRuntimeRoot::from_home(std::path::Path::new(
+        "/home/golden",
+    ));
+    assert_ne!(
+        root.profile_dir(&work.alias),
+        root.profile_dir(&personal.alias)
+    );
+}
+
+/// `session.create` may name the supervised agent, and admitting it does not
+/// remove any provider that was creatable before.
+///
+/// MUTATION CHECK: replace the `gemini` roster entry with the Antigravity one
+/// instead of appending. Expected runtime failure: the `gemini` membership
+/// assertion below fails.
+#[test]
+fn google_antigravity_is_creatable_alongside_every_previous_provider() {
+    let creatable = crate::worker::ProviderFactoryConfig::Accounts.creatable_providers();
+    assert!(creatable.contains(GOOGLE_ANTIGRAVITY_PROVIDER_NAME));
+    for previous in [
+        ANTHROPIC_PROVIDER_NAME,
+        ANTHROPIC_OAUTH_PROVIDER_NAME,
+        OPENAI_PROVIDER_NAME,
+        OPENAI_OAUTH_PROVIDER_NAME,
+        OPENAI_COMPATIBLE_PROVIDER_NAME,
+        KIMI_OAUTH_PROVIDER_NAME,
+        GEMINI_PROVIDER_NAME,
+        BEDROCK_PROVIDER_NAME,
+        VERTEX_PROVIDER_NAME,
+        DEEPSEEK_PROVIDER_NAME,
+        XAI_PROVIDER_NAME,
+        GROK_OAUTH_PROVIDER_NAME,
+        HAIDER_CODE_PROVIDER_NAME,
+    ] {
+        assert!(
+            creatable.contains(previous),
+            "{previous} must stay creatable"
+        );
+    }
+    assert_eq!(creatable.len(), 14);
+    // The production builder advertises exactly the same roster.
+    assert_eq!(ProductionAccountBuilder::default().providers(), creatable);
+}
+
+/// REGRESSION: the API-key `gemini` provider is untouched by the supervised
+/// lane. Same adapter, same profile routing, same request bytes on the wire.
+///
+/// MUTATION CHECK: route `(GEMINI_PROVIDER_NAME, AuthMethod::ApiKey)` through
+/// the agent-owned arm, or reuse the `gemini` id for the supervised agent.
+/// Expected runtime failure: construction returns the refusal instead of the
+/// Gemini adapter, and the pinned request JSON never renders.
+#[test]
+fn the_api_key_gemini_request_shape_is_unchanged_by_the_supervised_agent() {
+    let vault = MemoryVault::default();
+    let alias = CredentialAlias::new("gemini-shape-regression");
+    vault
+        .put(&alias, b"GEMINI_SHAPE_REGRESSION_KEY_4f10")
+        .expect("stage the Gemini API key");
+    let adapter = build_account_provider(
+        GEMINI_PROVIDER_NAME,
+        None,
+        None,
+        AuthMethod::ApiKey,
+        vault.resolve(&alias).expect("resolve the Gemini API key"),
+        "gemini-2.5-flash",
+        &alias,
+        &ProviderTuning::default(),
+        None,
+        None,
+    )
+    .expect("the API-key Gemini lane still constructs its own adapter");
+    assert_eq!(
+        adapter.credential_surface(),
+        haider_provider::ProviderCredentialSurface::ApiKey,
+        "the API-key lane keeps a Haider-held credential"
+    );
+    assert_eq!(
+        adapter.usage_lane_dimensions().api_family.as_deref(),
+        Some("gemini_generate_content"),
+        "the API-key lane keeps its own usage lane, distinct from acp_antigravity"
+    );
+
+    // The GenerateContent request bytes are unchanged.
+    let provider = haider_provider::GeminiProvider::new(
+        vault.resolve(&alias).expect("resolve again"),
+        "gemini-2.5-flash",
+    )
+    .expect("the API-key Gemini adapter is unchanged");
+    let request = haider_provider::TurnRequest {
+        messages: vec![haider_provider::Message::user_text("hello")],
+        model: "gemini-2.5-flash".into(),
+        max_tokens: 64,
+        system_prompt: Some("you are a test".into()),
+        tools: Vec::new(),
+        attachments: Vec::new(),
+        cache_metadata: None,
+    };
+    let payload = provider
+        .request_payload(&request)
+        .expect("the Gemini request shape is unchanged");
+    assert_eq!(
+        payload,
+        serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "system_instruction": {"parts": [{"text": "you are a test"}]},
+            "generationConfig": {"maxOutputTokens": 64}
+        })
+    );
+}
+
+/// EVERY secondary construction path — compaction promotion, rotation after a
+/// health failure, and the cross-provider fallback chain — funnels through one
+/// seam, so the "an agent-owned account never reaches the vault" law holds
+/// there too, not only on the first resolution. The same seam still reads the
+/// vault for every credential-bearing provider.
+///
+/// MUTATION CHECK: drop the `agent_owned_credential` branch from
+/// `build_attempt_provider`. Expected runtime failure: the supervised
+/// construction records a vault resolve (and, with no broker, fails outright).
+#[tokio::test]
+async fn every_attempt_construction_path_keeps_an_agent_owned_account_off_the_vault() {
+    let temp = tempfile::tempdir().expect("temp antigravity root");
+    let root = crate::antigravity_session::AntigravityRuntimeRoot::new(temp.path());
+    install_antigravity_fixture(&root);
+
+    let vault = Arc::new(VaultTouchCounter::new());
+    let gemini_alias = CredentialAlias::new("gemini-attempt-key");
+    vault
+        .put(&gemini_alias, b"GEMINI_ATTEMPT_KEY_9b23")
+        .expect("stage the API key");
+    let staged_puts = vault.puts();
+
+    let supervised = antigravity_descriptor("google-antigravity-attempt");
+    let gemini = CredentialDescriptor {
+        alias: gemini_alias,
+        provider: GEMINI_PROVIDER_NAME.into(),
+        base_url: None,
+        auth_method: AuthMethod::ApiKey,
+        identity: "gemini api key".into(),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let management = ManagementSnapshot::new(
+        1,
+        vec![supervised.clone(), gemini.clone()],
+        vec![antigravity_summary(
+            &["gemini-3.8-flash-high"],
+            Some("gemini-3.8-flash-high"),
+        )],
+    );
+    let factory = AccountsProviderFactory::new_with_management(
+        Arc::new(StdMutex::new(vec![supervised.clone(), gemini.clone()])),
+        management,
+        VaultProvision::Available(Arc::clone(&vault) as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder::with_antigravity_root(root)),
+    );
+
+    let (provider, fingerprint) = factory
+        .build_attempt_provider(
+            &supervised,
+            &antigravity_metadata("gemini-3.8-flash-high"),
+            &ProviderTuning::default(),
+        )
+        .await
+        .expect("the supervised lane constructs without a secret");
+    assert_eq!(fingerprint, None);
+    assert_eq!(
+        provider.credential_surface(),
+        haider_provider::ProviderCredentialSurface::Opaque
+    );
+    assert_eq!(vault.resolves(), 0, "no vault read on this lane, ever");
+    assert_eq!(
+        vault.puts(),
+        staged_puts,
+        "no placeholder secret on this lane, ever"
+    );
+
+    // The very same seam still uses the vault for a credential-bearing lane,
+    // so the branch is a scoped exception rather than a hole.
+    let mut gemini_metadata = antigravity_metadata("gemini-2.5-flash");
+    gemini_metadata.provider = GEMINI_PROVIDER_NAME.into();
+    let (gemini_provider, gemini_fingerprint) = factory
+        .build_attempt_provider(&gemini, &gemini_metadata, &ProviderTuning::default())
+        .await
+        .expect("the API-key lane still resolves its secret");
+    assert_eq!(gemini_fingerprint, None, "only OAuth bearers fingerprint");
+    assert_eq!(
+        gemini_provider.credential_surface(),
+        haider_provider::ProviderCredentialSurface::ApiKey
+    );
+    assert_eq!(
+        vault.resolves(),
+        1,
+        "exactly the credential-bearing lane read"
+    );
+}

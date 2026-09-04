@@ -1318,11 +1318,13 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
     // 173-frame v0.0.965 prefix; prompt forking appends exactly 4, then X1
     // appends 3 manifest-identity frames, for the frozen 180-frame v0.0.966
     // prefix. K1 appends exactly one agent.cancel request/response pair:
-    // 180 + 2 = 182. The 17 moved method pairs remain absent from the
-    // supplemental fixture, so the two sources stay disjoint. K1 adds one
-    // request method: 123 + 1 = 124; the later status.snapshot and
-    // session.workspace.set methods make the exhaustive count 126.
-    assert_eq!(expected_frames.len(), 182);
+    // 180 + 2 = 182. v0.0.970 appends exactly one provider.list response
+    // carrying the new `acp_agent` execution family: 182 + 1 = 183. The 17
+    // moved method pairs remain absent from the supplemental fixture, so the
+    // two sources stay disjoint. K1 adds one request method: 123 + 1 = 124;
+    // the later status.snapshot and session.workspace.set methods make the
+    // exhaustive count 126.
+    assert_eq!(expected_frames.len(), 183);
     let expected_bytes: Vec<GoldenWireBytes> = expected_frames
         .iter()
         .map(|frame| {
@@ -1383,7 +1385,7 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
 #[test]
 fn monitor_delivery_stream_is_additive_replayable_and_explicitly_bounded() {
     let frames = transcript();
-    assert_eq!(frames.len(), 182);
+    assert_eq!(frames.len(), 183);
     let WireFrame::MonitorDelivery { watch_id, report } = &frames[129] else {
         panic!("monitor delivery must be the first appended stream frame");
     };
@@ -1416,7 +1418,7 @@ fn monitor_delivery_stream_is_additive_replayable_and_explicitly_bounded() {
 #[test]
 fn loom_registry_stream_is_tail_appended_and_exactly_addressed() {
     let frames = transcript();
-    assert_eq!(frames.len(), 182);
+    assert_eq!(frames.len(), 183);
     let WireFrame::LoomRegistryDelta { watch_id, delta } = &frames[131] else {
         panic!("Loom registry delta must follow every prior golden frame");
     };
@@ -1449,7 +1451,7 @@ fn loom_registry_stream_is_tail_appended_and_exactly_addressed() {
 #[test]
 fn peer_messaging_methods_and_events_are_tail_appended() {
     let frames = transcript();
-    assert_eq!(frames.len(), 182);
+    assert_eq!(frames.len(), 183);
     assert!(matches!(
         &frames[133],
         WireFrame::Request {
@@ -1550,8 +1552,8 @@ fn prompt_fork_frames_remain_the_exact_four_frame_block() {
     let frames = transcript();
     assert_eq!(
         frames.len(),
-        182,
-        "173 frozen + 4 prompt-fork + 3 fleet-identity + 2 agent-cancel frames"
+        183,
+        "173 frozen + 4 prompt-fork + 3 fleet-identity + 2 agent-cancel + 1 acp_agent frames"
     );
     assert!(matches!(
         &frames[173],
@@ -1650,7 +1652,11 @@ fn fleet_identity_is_the_exact_three_frame_tail_on_both_paths() {
         "session_fleet_identity_v1"
     );
     let frames = transcript();
-    assert_eq!(frames.len(), 182, "177 pre-X1 + 3 X1 + 2 K1 frames");
+    assert_eq!(
+        frames.len(),
+        183,
+        "177 pre-X1 + 3 X1 + 2 K1 frames + 1 acp_agent family frame"
+    );
     assert!(matches!(
         &frames[177],
         WireFrame::Welcome(Welcome { features, .. })
@@ -1694,7 +1700,11 @@ fn fleet_identity_is_the_exact_three_frame_tail_on_both_paths() {
 fn agent_cancel_is_the_exact_two_frame_tail() {
     assert_eq!(haider_rpc::FEATURE_AGENT_CANCEL_V1, "agent_cancel_v1");
     let frames = transcript();
-    assert_eq!(frames.len(), 182, "180 v0.0.966 + 2 agent.cancel");
+    assert_eq!(
+        frames.len(),
+        183,
+        "180 v0.0.966 + 2 agent.cancel + 1 acp_agent family frame"
+    );
     assert!(matches!(
         &frames[180],
         WireFrame::Request {
@@ -3582,6 +3592,99 @@ fn api_family_wire_addition_tolerated_by_older_clients() {
     );
 }
 
+/// v0.0.970 adds the SUPERVISED-AGENT execution kind. It is not a fourth HTTP
+/// dialect: the row it appears on carries no endpoint, no seeded inventory and
+/// no default model, because Haider launches the vendor's own executable and
+/// the authenticated agent's own catalog is the only inventory truth.
+///
+/// MUTATION CHECK: give `AcpAgent` an explicit `#[serde(rename = ...)]` other
+/// than `acp_agent`, or drop `#[serde(other)]` from the pre-970 decoder below.
+/// Expected RUNTIME failure: the exact discriminant string assertion fails, or
+/// the old-client decode errors instead of preserving the row as `Unknown`.
+#[test]
+fn acp_agent_family_is_the_exact_one_frame_tail_and_older_clients_tolerate_it() {
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Pre970ProviderApiFamilyWire {
+        AnthropicMessages,
+        #[serde(rename = "openai_responses")]
+        OpenAiResponses,
+        #[serde(rename = "openai_chat_completions")]
+        OpenAiChatCompletions,
+        #[serde(rename = "gemini_generate_content")]
+        GeminiGenerateContent,
+        #[serde(other)]
+        Unknown,
+    }
+
+    let encoded = serde_json::to_string(&haider_rpc::ProviderApiFamilyWire::AcpAgent)
+        .expect("ACP agent family encode");
+    assert_eq!(encoded, r#""acp_agent""#);
+    assert_eq!(
+        serde_json::from_str::<Pre970ProviderApiFamilyWire>(&encoded)
+            .expect("pre-970 tolerant decode"),
+        Pre970ProviderApiFamilyWire::Unknown
+    );
+    // Every PRE-EXISTING discriminant keeps its exact bytes: the addition is
+    // additive, not a re-spelling of the vocabulary.
+    for (family, expected) in [
+        (
+            haider_rpc::ProviderApiFamilyWire::AnthropicMessages,
+            r#""anthropic_messages""#,
+        ),
+        (
+            haider_rpc::ProviderApiFamilyWire::OpenAiResponses,
+            r#""openai_responses""#,
+        ),
+        (
+            haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
+            r#""openai_chat_completions""#,
+        ),
+        (
+            haider_rpc::ProviderApiFamilyWire::GeminiGenerateContent,
+            r#""gemini_generate_content""#,
+        ),
+        (haider_rpc::ProviderApiFamilyWire::Unknown, r#""unknown""#),
+    ] {
+        assert_eq!(
+            serde_json::to_string(&family).expect("family encode"),
+            expected
+        );
+    }
+
+    let frames = transcript();
+    let WireFrame::Response {
+        request_id,
+        body: ResponseBody::ProviderList { providers, .. },
+    } = &frames[182]
+    else {
+        panic!("the acp_agent family frame must be the exact transcript tail");
+    };
+    assert_eq!(request_id.0, "request-acp-agent-provider");
+    let [summary] = providers.as_slice() else {
+        panic!("one provider row");
+    };
+    assert_eq!(summary.provider, "google-antigravity");
+    assert_eq!(
+        summary.api_family,
+        haider_rpc::ProviderApiFamilyWire::AcpAgent
+    );
+    // A supervised agent has no HTTP origin Haider could publish, and seeding
+    // an inventory here would advertise a catalog nobody authenticated for.
+    assert_eq!(summary.endpoint, None);
+    assert!(summary.models.is_empty());
+    assert!(summary.model_details.is_empty());
+    assert_eq!(summary.default_model, None);
+    assert_eq!(
+        summary.auth_methods,
+        vec![haider_protocol::credential::AuthMethod::OAuth]
+    );
+
+    let value = serde_json::to_value(&frames[182]).expect("encode the acp_agent tail");
+    assert_eq!(value["body"]["providers"][0]["api_family"], "acp_agent");
+    assert!(value["body"]["providers"][0].get("endpoint").is_none());
+}
+
 /// The account enums remain the original closed v1 vocabulary.
 ///
 /// MUTATION CHECK: add `#[serde(alias = "passkey")]` to
@@ -3802,7 +3905,7 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
     // ends at the NEXT appended welcome and nothing before `d1_start` moved.
     assert_eq!(
         frames.len() - d1_start,
-        6 + 7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2,
+        6 + 7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2 + 1,
         "six D1 frames, then T1's seven transcription frames, then U1's \
          three usage frames, then G2's three session-rename frames, then \
          G3's four session-tuning frames, F1's three fleet frames, then \
@@ -4101,7 +4204,7 @@ fn session_rename_frames_are_additive_and_golden() {
         .expect("G2 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - g2_start,
-        3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2,
+        3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2 + 1,
         "G2's three frames, then G3's four tuning frames, F1's three fleet frames, \
          WIRE-GAPS' four read frames, Slice 2's folded response, then #6's two \
          monitor-delivery frames, L4's two loom-registry stream frames, then \
@@ -4257,7 +4360,7 @@ fn transcription_secret_frames_are_additive_and_redacted() {
         .expect("T1 first set request in the golden transcript");
     assert_eq!(
         frames.len() - t1_start,
-        7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2,
+        7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2 + 1,
         "T1's seven frames, U1's three usage frames, G2's three rename frames, \
          G3's four tuning frames, F1's three fleet frames, WIRE-GAPS' four read \
          frames, Slice 2's folded response, #6's two monitor-delivery frames, \
@@ -4393,7 +4496,7 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
         .expect("U1 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - u1_start,
-        3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2,
+        3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2 + 1,
         "three U1 frames, then G2's three session-rename frames, then G3's \
          four session-tuning frames, F1's three fleet frames, then \
          WIRE-GAPS' four read frames, Slice 2's folded response, then #6's two \
@@ -4823,7 +4926,7 @@ fn session_fleet_frames_are_additive_and_unknown_tolerant() {
         .expect("fleet feature welcome");
     assert_eq!(
         frames.len() - fleet_start,
-        3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2,
+        3 + 4 + 1 + 2 + 2 + 6 + 34 + 4 + 3 + 2 + 1,
         "three fleet frames, then WIRE-GAPS' four read frames, Slice 2's \
          folded response, #6's two monitor-delivery frames, and L4's two \
          loom-registry stream frames, then 965's six peer frames and 34 \

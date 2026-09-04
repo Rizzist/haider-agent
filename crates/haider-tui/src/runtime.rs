@@ -440,6 +440,41 @@ pub fn sync_model_persistence(
     }
 }
 
+/// 970 — persist a terms ACKNOWLEDGEMENT (mirrors the theme/notification
+/// syncs, keyed on the model's commit counter so a re-affirmation is never
+/// silently dropped). The journal itself is idempotent per subject, so a user
+/// who proceeds past the same warning twice still leaves exactly one record.
+///
+/// Only the subject, the instant and the warning text are written — the
+/// records are built from `crate::app` constants, so no URL, code or token can
+/// reach the file.
+pub fn sync_terms_persistence(
+    model: &crate::app::AppModel,
+    seen_commits: &mut u64,
+    journal: &Option<crate::terms_journal::TermsJournal>,
+) {
+    if model.terms_ack_commits == *seen_commits {
+        return;
+    }
+    *seen_commits = model.terms_ack_commits;
+    let Some(journal) = journal.as_ref() else {
+        return;
+    };
+    let now_ms = now_epoch_ms();
+    for subject in &model.acknowledged_terms {
+        let warning = match subject.as_str() {
+            crate::app::GOOGLE_ANTIGRAVITY_TERMS_SUBJECT => {
+                crate::app::GOOGLE_ANTIGRAVITY_TERMS_WARNING
+            }
+            // A subject with no warning text in this build is not written:
+            // an acknowledgement record whose evidence is missing is worse
+            // than no record at all.
+            _ => continue,
+        };
+        journal.record(subject, warning, now_ms);
+    }
+}
+
 /// W-C M2: emit each queued desktop notification as an OSC 9 sequence — but
 /// ONLY to a real terminal. A piped/redirected stdout receives NO escape
 /// bytes (the non-tty suppression law), so a captured run stays clean.
@@ -597,6 +632,15 @@ pub async fn run_demo(
     // every user COMMIT to the profile-dir settings file. Previews inside
     // the open picker move only the resolved theme, so they never write.
     let mut settings = crate::settings::SettingsStore::open_default();
+    // 970: the terms acknowledgements this profile already carries — read
+    // ONCE at boot so the first-login disclosure never reappears for a user
+    // who has already answered it.
+    let terms_journal = crate::terms_journal::TermsJournal::open_default();
+    model.acknowledged_terms = terms_journal
+        .as_ref()
+        .map(crate::terms_journal::TermsJournal::subjects)
+        .unwrap_or_default();
+    let mut seen_terms_commits = model.terms_ack_commits;
     let mut seen_theme_commits = model.theme_commits;
     let mut active_title = model.window_title();
 
@@ -767,6 +811,7 @@ pub async fn run_demo(
         }
         // Theme cycled: re-sync the emulator background.
         sync_theme_persistence(&model, &mut seen_theme_commits, &mut settings);
+        sync_terms_persistence(&model, &mut seen_terms_commits, &terms_journal);
         if model.theme != active_theme {
             active_theme = model.theme;
             sync_terminal_bg(active_theme);
@@ -1982,6 +2027,12 @@ impl DemoDriver {
                     // device-flow host (the daemon's sanctioned issuer).
                     "kimi-oauth" => "auth.kimi.com",
                     "grok-oauth" => "auth.x.ai",
+                    // 970: Google's flow is AGENT-owned — there is no
+                    // Haider-driven issuer to name here, and naming one would
+                    // claim a token exchange Haider never performs.
+                    crate::app::GOOGLE_ANTIGRAVITY_PROVIDER => {
+                        "Google's own antigravity-acp agent"
+                    }
                     _ => "claude.ai",
                 };
                 model.oauth_add_phase(
@@ -3650,6 +3701,13 @@ pub async fn run_live(
             store.set_last_model(Some((provider, model_short)));
         }
     }
+    // 970: see the demo loop — one boot read of the acknowledgement journal.
+    let terms_journal = crate::terms_journal::TermsJournal::open_default();
+    model.acknowledged_terms = terms_journal
+        .as_ref()
+        .map(crate::terms_journal::TermsJournal::subjects)
+        .unwrap_or_default();
+    let mut seen_terms_commits = model.terms_ack_commits;
     let mut seen_theme_commits = model.theme_commits;
     let mut seen_notification_commits = model.notification_commits;
     let mut seen_model_commits = model.model_commits;
@@ -3939,6 +3997,7 @@ pub async fn run_live(
             }
         }
         sync_theme_persistence(&model, &mut seen_theme_commits, &mut settings);
+        sync_terms_persistence(&model, &mut seen_terms_commits, &terms_journal);
         // W-C M2: persist a toggle change, then flush any queued desktop
         // notifications as OSC 9 to the terminal (tty-gated inside).
         sync_notification_persistence(&model, &mut seen_notification_commits, &mut settings);

@@ -57,12 +57,12 @@ use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, AnthropicProvider,
     AnthropicTransportConfig, BEDROCK_PROVIDER_NAME, BUILTIN_PROVIDER_NAMES, CatalogError,
     CatalogSource, DEEPSEEK_BASE_URL, DEEPSEEK_PROVIDER_NAME, DiscoveredCatalog, DiscoveredModel,
-    GEMINI_PROVIDER_NAME, GROK_OAUTH_PROVIDER_NAME, GeminiProvider, HAIDER_CODE_BASE_URL,
-    HAIDER_CODE_PROVIDER_NAME, KIMI_OAUTH_PROVIDER_NAME, Message, OPENAI_COMPATIBLE_PROVIDER_NAME,
-    OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider,
-    OpenAiTransportConfig, PreparedTurn, Provider, ProviderError, ProviderErrorKind,
-    ProviderStream, ToolDefinition, TurnRequest, VERTEX_PROVIDER_NAME, XAI_BASE_URL,
-    XAI_PROVIDER_NAME, azure_openai_origin, discover_models,
+    GEMINI_PROVIDER_NAME, GOOGLE_ANTIGRAVITY_PROVIDER_NAME, GROK_OAUTH_PROVIDER_NAME,
+    GeminiProvider, HAIDER_CODE_BASE_URL, HAIDER_CODE_PROVIDER_NAME, KIMI_OAUTH_PROVIDER_NAME,
+    Message, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
+    OpenAiCompatibleProvider, OpenAiProvider, OpenAiTransportConfig, PreparedTurn, Provider,
+    ProviderError, ProviderErrorKind, ProviderStream, ToolDefinition, TurnRequest,
+    VERTEX_PROVIDER_NAME, XAI_BASE_URL, XAI_PROVIDER_NAME, azure_openai_origin, discover_models,
 };
 use haider_rpc::{
     AccountSourceWire, ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
@@ -179,7 +179,13 @@ fn source_file_fingerprint(record: &CredentialSourceRecord) -> SourceFileFingerp
         Some((metadata.len(), modified.as_nanos()))
     }
     SourceFileFingerprint {
-        credential: stamp(&record.credential_path()),
+        // The watcher and the reader resolve the SAME document, so a kind
+        // whose credential does not live at the default relative path (a
+        // Kimi Code endpoint slot) still wakes reconciliation on rotation.
+        credential: crate::device_discovery::linked_credential_path(record)
+            .ok()
+            .as_deref()
+            .and_then(stamp),
         config: stamp(&record.root.join("config.toml")),
     }
 }
@@ -1844,20 +1850,16 @@ async fn run_account_actor(
                 respond(&completed, ResponseBody::AccountSourceList { sources });
             }
             AccountCommand::SourceAdd(job) => {
-                let kind = match job.kind.as_str() {
-                    "codex" | "codex_home" => CredentialSourceKind::CodexHome,
-                    "claude" | "claude_file" => CredentialSourceKind::ClaudeFile,
-                    _ => {
-                        respond_management_error(
-                            &job.route,
-                            &HaiderError::new(
-                                ErrorCode::InvalidArgument,
-                                "credential source kind must be codex or claude_file",
-                                false,
-                            ),
-                        );
-                        continue;
-                    }
+                let Some(kind) = parse_source_kind(job.kind.as_str()) else {
+                    respond_management_error(
+                        &job.route,
+                        &HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            "credential source kind must be codex_home, claude_file, grok_home, or kimi_code_home",
+                            false,
+                        ),
+                    );
+                    continue;
                 };
                 let result = source_registry
                     .lock()
@@ -2234,9 +2236,9 @@ async fn run_account_actor(
                 let linked_source = source_registry.lock().ok().and_then(|registry| {
                     registry.find_by_alias(descriptor.alias.as_str()).cloned()
                 });
-                let result = if let Some(linked_source) =
-                    linked_source.filter(|source| source.kind == CredentialSourceKind::CodexHome)
-                {
+                let result = if let Some(linked_source) = linked_source.filter(|source| {
+                    crate::device_discovery::linked_kind_yields_access(source.kind)
+                }) {
                     let source_id = linked_source.id;
                     source_registry
                         .lock()
@@ -7852,6 +7854,43 @@ pub trait AccountProviderBuilder: Send + Sync {
         self.build_profile_descriptor(profile, descriptor, credential, model)
     }
 
+    /// CREDENTIAL-FREE construction for a provider whose credential lives
+    /// inside an external agent process.
+    ///
+    /// Every other method on this trait takes a resolved
+    /// [`haider_accounts::SecretHandle`]. This one deliberately takes none:
+    /// Google's Antigravity agent owns its own OAuth material under a private
+    /// `GEMINI_HOME`, so there is no secret for Haider to resolve and minting
+    /// a placeholder would fabricate a credential the daemon does not hold.
+    /// `workspace` is the session cwd the ACP session is opened against.
+    ///
+    /// The default refuses: a builder that does not serve an agent-owned
+    /// provider must fail closed rather than silently fall back to a
+    /// credential-bearing lane.
+    fn build_agent_owned(
+        &self,
+        profile: Option<&ProviderSummaryWire>,
+        descriptor: &CredentialDescriptor,
+        model: &str,
+        workspace: &str,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        let _ = (profile, model, workspace);
+        Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "provider {} has no agent-owned construction path in this builder",
+                descriptor.provider
+            ),
+            false,
+        ))
+    }
+
+    /// Releases every retained agent-owned adapter whose alias is no longer
+    /// signed in. Builders that serve no agent-owned provider ignore it.
+    fn retain_agent_owned_aliases(&self, live: &std::collections::HashSet<CredentialAlias>) {
+        let _ = live;
+    }
+
     /// CM2 Gemini resource ownership. Injected builders remain source
     /// compatible and ignore the registry through this default.
     #[allow(clippy::too_many_arguments)]
@@ -8087,6 +8126,10 @@ impl AccountProviderAdapterCache {
 /// Production builder for every account-backed adapter shipped in this lane.
 pub(crate) struct ProductionAccountBuilder {
     adapters: StdMutex<AccountProviderAdapterCache>,
+    /// The supervised-agent lane. Kept in its OWN cache because its entries
+    /// are keyed without a credential fingerprint — there is no credential —
+    /// and because each entry pins an install lease and a ~225 MiB child.
+    antigravity: crate::antigravity_session::AntigravityAdapterFactory,
 }
 
 impl Default for ProductionAccountBuilder {
@@ -8095,6 +8138,7 @@ impl Default for ProductionAccountBuilder {
             adapters: StdMutex::new(AccountProviderAdapterCache::new(
                 ACCOUNT_PROVIDER_ADAPTER_CACHE_CAPACITY,
             )),
+            antigravity: crate::antigravity_session::AntigravityAdapterFactory::default(),
         }
     }
 }
@@ -8105,6 +8149,23 @@ impl ProductionAccountBuilder {
     fn with_cache_capacity(capacity: usize) -> Self {
         Self {
             adapters: StdMutex::new(AccountProviderAdapterCache::new(capacity)),
+            antigravity: crate::antigravity_session::AntigravityAdapterFactory::default(),
+        }
+    }
+
+    /// Binds the supervised-agent lane to an explicit runtime root instead of
+    /// the operator's home. An operator reaches the same seam in production
+    /// through `HAIDER_ANTIGRAVITY_HOME`; tests use this to stay hermetic
+    /// without mutating process environment shared by every other test.
+    #[cfg(test)]
+    pub(crate) fn with_antigravity_root(
+        root: crate::antigravity_session::AntigravityRuntimeRoot,
+    ) -> Self {
+        Self {
+            adapters: StdMutex::new(AccountProviderAdapterCache::new(
+                ACCOUNT_PROVIDER_ADAPTER_CACHE_CAPACITY,
+            )),
+            antigravity: crate::antigravity_session::AntigravityAdapterFactory::with_root(root),
         }
     }
 
@@ -8194,6 +8255,46 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
             None,
             None,
         )
+    }
+
+    /// The supervised-agent lane. No [`haider_accounts::SecretHandle`]
+    /// reaches this function and none is created inside it: Google's agent
+    /// owns the credential under the account's own private `GEMINI_HOME`.
+    ///
+    /// The catalog comes ONLY from the authenticated agent, projected onto the
+    /// provider summary by discovery. An absent or empty summary is a refusal,
+    /// never a fabricated model list.
+    fn build_agent_owned(
+        &self,
+        profile: Option<&ProviderSummaryWire>,
+        descriptor: &CredentialDescriptor,
+        model: &str,
+        workspace: &str,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        if descriptor.provider != GOOGLE_ANTIGRAVITY_PROVIDER_NAME
+            || descriptor.auth_method != AuthMethod::OAuth
+        {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "provider {} has no agent-owned construction path",
+                    descriptor.provider
+                ),
+                false,
+            ));
+        }
+        let offered = profile
+            .map(|profile| profile.models.clone())
+            .unwrap_or_default();
+        let agent_default = profile.and_then(|profile| profile.default_model.as_deref());
+        let adapter =
+            self.antigravity
+                .build(&descriptor.alias, &offered, agent_default, model, workspace)?;
+        Ok(adapter as Arc<dyn Provider>)
+    }
+
+    fn retain_agent_owned_aliases(&self, live: &std::collections::HashSet<CredentialAlias>) {
+        self.antigravity.retain_aliases(live);
     }
 
     fn build_tuned(
@@ -8371,6 +8472,23 @@ fn build_account_provider(
                 // lite request builder makes this structurally inert there.
                 .with_web_search(tuning.web_tools),
         ),
+        // v0.0.970: the supervised Google Antigravity agent. Unlike every
+        // other arm in this match, this pair is a REFUSAL, and deliberately.
+        // Google's agent owns the credential inside its own `GEMINI_HOME`,
+        // so an Antigravity adapter is built through the credential-free
+        // `AccountProviderBuilder::build_agent_owned` seam, which the
+        // resolution path takes BEFORE any secret is resolved. Reaching this
+        // arm therefore means a caller resolved a secret for an account that
+        // has none — a bug that must fail closed here rather than quietly
+        // construct an adapter around a credential Haider does not hold.
+        (GOOGLE_ANTIGRAVITY_PROVIDER_NAME, AuthMethod::OAuth) => {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "google-antigravity accounts are built without a resolved secret; \
+                 the supervised agent owns its own credential",
+                false,
+            ));
+        }
         (GEMINI_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             GeminiProvider::new(credential, model)
                 .map_err(|error| adapter_construction_error(provider, error))?
@@ -8783,6 +8901,17 @@ fn custom_compatible_adapter(
     .map_err(|error| adapter_construction_error(provider, error))
 }
 
+/// True when the account's credential lives inside an EXTERNAL agent process
+/// rather than Haider's vault.
+///
+/// Today that is exactly the supervised Google Antigravity agent: it holds its
+/// own OAuth material under the account's private `GEMINI_HOME`, so there is
+/// no `SecretHandle` to resolve and none may be fabricated.
+pub(crate) fn agent_owned_credential(descriptor: &CredentialDescriptor) -> bool {
+    descriptor.provider == GOOGLE_ANTIGRAVITY_PROVIDER_NAME
+        && descriptor.auth_method == AuthMethod::OAuth
+}
+
 /// Internal construction token for auth-None profiles (G4a). Provider
 /// adapters require a `SecretHandle` by type, but their no-auth constructors
 /// never place these bytes in a request header or body.
@@ -9023,17 +9152,12 @@ impl AccountsProviderFactory {
             return None;
         }
         let resolved = self.resolve_account(&target.provider, None).await.ok()?;
-        let credential = self.resolve_secret(&resolved.descriptor).await.ok()?;
-        let oauth_access_fingerprint = (matches!(
-            resolved.descriptor.provider.as_str(),
-            KIMI_OAUTH_PROVIDER_NAME | OPENAI_OAUTH_PROVIDER_NAME | GROK_OAUTH_PROVIDER_NAME
-        ) && resolved.descriptor.auth_method == AuthMethod::OAuth)
-            .then(|| *blake3::hash(credential.expose_secret()).as_bytes());
         let mut target_metadata = metadata.clone();
         target_metadata.model = model.clone();
         let tuning = provider_tuning_with_web_degrade(&target_metadata, web_degrade);
-        let provider = self
-            .build_provider(&resolved.descriptor, credential, &target_metadata, &tuning)
+        let (provider, oauth_access_fingerprint) = self
+            .build_attempt_provider(&resolved.descriptor, &target_metadata, &tuning)
+            .await
             .ok()?;
         let capabilities = provider.capabilities().await;
         let provider_request_state = crate::worker::provider_derived_request_state(
@@ -9286,6 +9410,62 @@ impl AccountsProviderFactory {
         })
     }
 
+    /// The per-turn adapter plus its OAuth access fingerprint, taking the
+    /// CREDENTIAL-FREE lane for an agent-owned account and the vault lane for
+    /// every other one.
+    ///
+    /// Every secondary construction path — compaction promotion, rotation
+    /// after a health failure, and the cross-provider fallback chain — funnels
+    /// through here, so "an ACP-backed account never reaches the vault" is a
+    /// property of the code rather than of one branch in `resolve_provider`.
+    async fn build_attempt_provider(
+        &self,
+        descriptor: &CredentialDescriptor,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+        tuning: &ProviderTuning,
+    ) -> Result<(Arc<dyn Provider>, Option<[u8; 32]>), HaiderError> {
+        if agent_owned_credential(descriptor) {
+            return Ok((self.build_agent_owned_provider(descriptor, metadata)?, None));
+        }
+        let credential = self.resolve_secret(descriptor).await?;
+        let oauth_access_fingerprint = (matches!(
+            descriptor.provider.as_str(),
+            KIMI_OAUTH_PROVIDER_NAME | OPENAI_OAUTH_PROVIDER_NAME | GROK_OAUTH_PROVIDER_NAME
+        ) && descriptor.auth_method == AuthMethod::OAuth)
+            .then(|| *blake3::hash(credential.expose_secret()).as_bytes());
+        Ok((
+            self.build_provider(descriptor, credential, metadata, tuning)?,
+            oauth_access_fingerprint,
+        ))
+    }
+
+    /// Builds the credential-free adapter for an agent-owned account.
+    ///
+    /// The catalog handed to the builder is the provider summary's — which is
+    /// the AUTHENTICATED agent's own published list, written there by
+    /// discovery. The session's workspace is part of the identity because the
+    /// ACP session is opened against exactly that `cwd`.
+    fn build_agent_owned_provider(
+        &self,
+        descriptor: &CredentialDescriptor,
+        metadata: &haider_protocol::session::SessionMetadataV1,
+    ) -> Result<Arc<dyn Provider>, HaiderError> {
+        // Releasing a removed alias's supervised child is scoped by the LIVE
+        // account list, so logging one Google account out drops exactly that
+        // account's agent and lease and leaves every other alias's session
+        // running.
+        if let Ok(descriptors) = self.snapshot.lock() {
+            let live = descriptors
+                .iter()
+                .map(|descriptor| descriptor.alias.clone())
+                .collect();
+            self.builder.retain_agent_owned_aliases(&live);
+        }
+        let profile = self.provider_profile(&descriptor.provider);
+        self.builder
+            .build_agent_owned(profile.as_ref(), descriptor, &metadata.model, &metadata.cwd)
+    }
+
     async fn resolve_secret(
         &self,
         descriptor: &CredentialDescriptor,
@@ -9338,6 +9518,16 @@ impl AccountsProviderFactory {
             }
             Err(error) => return Err(error),
         };
+        // AGENT-OWNED CREDENTIAL. Google's Antigravity agent stores its own
+        // OAuth material under this account's private `GEMINI_HOME`, so this
+        // branch is taken BEFORE `resolve_secret`: there is no vault read, no
+        // broker refresh, and no placeholder handle minted. Placing it after
+        // the resolve would make "Haider holds no Google credential" a comment
+        // instead of a property of the code path.
+        if agent_owned_credential(&resolved.descriptor) {
+            let provider = self.build_agent_owned_provider(&resolved.descriptor, metadata)?;
+            return Ok((resolved, provider, None, false));
+        }
         let credential = match self.resolve_secret(&resolved.descriptor).await {
             Ok(credential) => credential,
             Err(error) => {
@@ -9692,13 +9882,10 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
         let Some(rotation) = resolved.rotation else {
             return Ok(haider_core::ProviderAttemptDecision::Stop);
         };
-        let credential = self.factory.resolve_secret(&resolved.descriptor).await?;
-        let provider = self.factory.build_provider(
-            &resolved.descriptor,
-            credential,
-            &self.metadata,
-            &self.tuning,
-        )?;
+        let (provider, _) = self
+            .factory
+            .build_attempt_provider(&resolved.descriptor, &self.metadata, &self.tuning)
+            .await?;
         Ok(haider_core::ProviderAttemptDecision::Rotate(
             haider_core::ResolvedProviderAttempt {
                 provider,
@@ -9775,27 +9962,16 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
                 Ok(resolved) => resolved,
                 Err(_) => continue,
             };
-            let credential = match self.factory.resolve_secret(&resolved.descriptor).await {
-                Ok(credential) => credential,
-                Err(_) => continue,
-            };
-            let oauth_access_fingerprint = (matches!(
-                resolved.descriptor.provider.as_str(),
-                KIMI_OAUTH_PROVIDER_NAME | OPENAI_OAUTH_PROVIDER_NAME | GROK_OAUTH_PROVIDER_NAME
-            ) && resolved.descriptor.auth_method
-                == AuthMethod::OAuth)
-                .then(|| *blake3::hash(credential.expose_secret()).as_bytes());
             let mut metadata = self.metadata.clone();
             metadata.provider = entry.provider.clone();
             metadata.model = model.clone();
             let tuning = provider_tuning_with_web_degrade(&metadata, self.web_degrade);
-            let provider = match self.factory.build_provider(
-                &resolved.descriptor,
-                credential,
-                &metadata,
-                &tuning,
-            ) {
-                Ok(provider) => provider,
+            let (provider, oauth_access_fingerprint) = match self
+                .factory
+                .build_attempt_provider(&resolved.descriptor, &metadata, &tuning)
+                .await
+            {
+                Ok(built) => built,
                 Err(_) => continue,
             };
             let capabilities = provider.capabilities().await;
@@ -10902,8 +11078,34 @@ fn source_alias(record: &CredentialSourceRecord) -> CredentialAlias {
     let prefix = match record.kind {
         CredentialSourceKind::CodexHome => "codex",
         CredentialSourceKind::ClaudeFile => "claude",
+        CredentialSourceKind::GrokHome => "grok",
+        CredentialSourceKind::KimiCodeHome => "kimi",
     };
     CredentialAlias::new(format!("{prefix}-{suffix}"))
+}
+
+/// Operator-facing source-kind vocabulary for `haider account source add`.
+/// Each kind accepts its durable `as_str()` name plus one short alias.
+fn parse_source_kind(kind: &str) -> Option<CredentialSourceKind> {
+    match kind {
+        "codex" | "codex_home" => Some(CredentialSourceKind::CodexHome),
+        "claude" | "claude_file" => Some(CredentialSourceKind::ClaudeFile),
+        "grok" | "grok_home" => Some(CredentialSourceKind::GrokHome),
+        "kimi" | "kimi_code_home" => Some(CredentialSourceKind::KimiCodeHome),
+        _ => None,
+    }
+}
+
+/// The Haider provider a linked root's account belongs to. A linked row and
+/// a Haider-native login for the SAME provider are separate accounts with
+/// separate aliases and separate credentials.
+fn source_provider(kind: CredentialSourceKind) -> &'static str {
+    match kind {
+        CredentialSourceKind::CodexHome => OPENAI_OAUTH_PROVIDER_NAME,
+        CredentialSourceKind::ClaudeFile => ANTHROPIC_OAUTH_PROVIDER_NAME,
+        CredentialSourceKind::GrokHome => GROK_OAUTH_PROVIDER_NAME,
+        CredentialSourceKind::KimiCodeHome => KIMI_OAUTH_PROVIDER_NAME,
+    }
 }
 
 fn source_failure_health(
@@ -10992,28 +11194,16 @@ fn reconcile_credential_sources(
                         reason: source_attention(&material.health),
                     },
                 };
+                let provider = source_provider(record.kind);
                 let descriptor = CredentialDescriptor {
                     alias: alias.clone(),
-                    provider: match record.kind {
-                        CredentialSourceKind::CodexHome => OPENAI_OAUTH_PROVIDER_NAME,
-                        CredentialSourceKind::ClaudeFile => ANTHROPIC_OAUTH_PROVIDER_NAME,
-                    }
-                    .to_owned(),
+                    provider: provider.to_owned(),
                     base_url: None,
                     auth_method: AuthMethod::OAuth,
                     identity: material.display_identity,
                     status,
                     active: accounts.get(&alias).map_or_else(
-                        || {
-                            accounts
-                                .active_for_provider(match record.kind {
-                                    CredentialSourceKind::CodexHome => OPENAI_OAUTH_PROVIDER_NAME,
-                                    CredentialSourceKind::ClaudeFile => {
-                                        ANTHROPIC_OAUTH_PROVIDER_NAME
-                                    }
-                                })
-                                .is_none()
-                        },
+                        || accounts.active_for_provider(provider).is_none(),
                         |current| current.active,
                     ),
                     label: None,
@@ -11236,7 +11426,11 @@ impl Vault for SourceLinkedVault {
         let Some(encoded) = material.encoded_bundle else {
             return Err(HaiderError::new(
                 ErrorCode::Unauthorized,
-                "linked Claude Code credentials require the official origin client",
+                format!(
+                    "linked credential source `{}` exposes no usable access token; the {} client owns this login",
+                    source.id,
+                    source.refresh_owner.as_str().replace('_', "-")
+                ),
                 false,
             ));
         };
@@ -11371,15 +11565,52 @@ impl AccountsRuntime {
                     home.join(".claude"),
                     "Claude Code default",
                 )?;
+                source_registry.ensure_default(
+                    CredentialSourceKind::GrokHome,
+                    home.join(".grok"),
+                    "Grok CLI default",
+                )?;
+                source_registry.ensure_default(
+                    CredentialSourceKind::KimiCodeHome,
+                    home.join(".kimi-code"),
+                    "Kimi Code default",
+                )?;
+                source_registry.ensure_default(
+                    CredentialSourceKind::KimiCodeHome,
+                    home.join(".kimi"),
+                    "Kimi Code legacy default",
+                )?;
             }
-            if let Some(root) = std::env::var_os("CODEX_HOME").filter(|root| !root.is_empty()) {
-                let root = std::path::PathBuf::from(root);
-                if root.is_absolute() {
-                    source_registry.ensure_default(
-                        CredentialSourceKind::CodexHome,
-                        root,
-                        "Codex current environment",
-                    )?;
+            // Each origin CLI's own data-root override, honoured exactly as
+            // `CODEX_HOME` is: absolute paths only, never a relative or empty
+            // value. `XDG_CONFIG_HOME` is honoured by none of them.
+            for (variable, kind, label) in [
+                (
+                    "CODEX_HOME",
+                    CredentialSourceKind::CodexHome,
+                    "Codex current environment",
+                ),
+                (
+                    "GROK_HOME",
+                    CredentialSourceKind::GrokHome,
+                    "Grok CLI current environment",
+                ),
+                (
+                    "KIMI_CODE_HOME",
+                    CredentialSourceKind::KimiCodeHome,
+                    "Kimi Code current environment",
+                ),
+                (
+                    "KIMI_SHARE_DIR",
+                    CredentialSourceKind::KimiCodeHome,
+                    "Kimi Code legacy environment",
+                ),
+            ] {
+                if let Some(root) = std::env::var_os(variable).filter(|root| !root.is_empty()) {
+                    let root = std::path::PathBuf::from(root);
+                    if root.is_absolute() {
+                        source_registry.ensure_default(kind, root, label)?;
+                    }
                 }
             }
             #[cfg(not(target_os = "macos"))]

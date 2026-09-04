@@ -330,6 +330,10 @@ fn login_args(slot: usize, provider: &str, fragment: &str) -> Vec<PaletteItem> {
         "oauth",
         "browser sign-in — loopback PKCE (device code for kimi/grok)",
     )];
+    const AGENT_OAUTH: &[(&str, &str)] = &[(
+        "oauth",
+        "sign-in performed by Google's own Antigravity agent (no Haider-held token)",
+    )];
     const API_AND_OAUTH: &[(&str, &str)] = &[
         (
             "api",
@@ -350,6 +354,10 @@ fn login_args(slot: usize, provider: &str, fragment: &str) -> Vec<PaletteItem> {
             ("anthropic", "Anthropic — Claude (oauth · api)"),
             ("openai", "OpenAI — ChatGPT (oauth · api)"),
             ("gemini", "Google — Gemini (api)"),
+            (
+                "google",
+                "Google — Antigravity/Gemini subscription (oauth, Google's own agent)",
+            ),
             ("kimi", "Moonshot — Kimi (oauth, device code)"),
             ("grok", "xAI — Grok (oauth, device code)"),
             ("xai", "xAI — Grok (api)"),
@@ -361,6 +369,11 @@ fn login_args(slot: usize, provider: &str, fragment: &str) -> Vec<PaletteItem> {
         ],
         (1, "anthropic" | "openai") => API_AND_OAUTH,
         (1, "kimi" | "grok") => OAUTH,
+        // 970: agent-owned OAuth only — Google's `antigravity-acp` performs
+        // the sign-in. `/login google` needs no method word at all, and the
+        // API-key `gemini` provider is a separate account, never a method of
+        // this one.
+        (1, "google" | "google-antigravity") => AGENT_OAUTH,
         (1, "custom") => CUSTOM,
         // Named API-only builtins, plus configured custom providers typed
         // directly. OAuth is authoritative and finite; API providers can be

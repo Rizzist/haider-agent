@@ -1116,6 +1116,13 @@ pub enum ProviderApiFamilyWire {
     OpenAiChatCompletions,
     #[serde(rename = "gemini_generate_content")]
     GeminiGenerateContent,
+    /// A supervised agent spoken to over the Agent Client Protocol, not an
+    /// HTTP chat/completions dialect at all: Haider launches the vendor's own
+    /// executable and exchanges newline-delimited JSON-RPC with it over stdio.
+    /// It is a distinct EXECUTION KIND rather than another transport, so a
+    /// client must not assume a base URL, a request payload it could render,
+    /// or a tool loop it drives — the agent runs its own tools.
+    AcpAgent,
     #[serde(other)]
     Unknown,
 }

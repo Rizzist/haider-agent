@@ -1,0 +1,49 @@
+# tuivirt golden · antigravity_accounts_light · 80x24
+00|ACCOUNTS — auth is harness-owned · the ADE reads this list                      |
+   ~ Rgb(23, 23, 23)/Rgb(253, 253, 253)/BOLD×8; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×50; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×22
+01|  ⚠ google-antigravity (ACP) — terms warning                                    |
+   ~ Rgb(156, 78, 6)/Rgb(253, 253, 253)/NONE×4; Rgb(23, 23, 23)/Rgb(253, 253, 253)/BOLD×24; Rgb(156, 78, 6)/Rgb(253, 253, 253)/NONE×16; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×36
+02|    Google's published terms restrict third-party access to Gemini              |
+   ~ Rgb(156, 78, 6)/Rgb(253, 253, 253)/NONE×67; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×13
+03|    subscriptions/Antigravity; Google ships this ACP agent for editors and      |
+   ~ Rgb(156, 78, 6)/Rgb(253, 253, 253)/NONE×75; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×5
+04|    reportedly does not enforce the clause — use at your own risk.              |
+   ~ Rgb(156, 78, 6)/Rgb(253, 253, 253)/NONE×66; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×14
+05|                                                                                |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
+06|google-antigravity                                                              |
+   ~ Rgb(23, 23, 23)/Rgb(253, 253, 253)/BOLD×18; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×62
+07|  ● google-antigravity [oauth] · p****@e******.com · active · in use            |
+   ~ Rgb(54, 54, 54)/Rgb(232, 232, 232)/NONE×2; Rgb(125, 90, 5)/Rgb(232, 232, 232)/NONE×2; Rgb(23, 23, 23)/Rgb(232, 232, 232)/BOLD×18; Rgb(125, 90, 5)/Rgb(232, 232, 232)/NONE×8; Rgb(110, 110, 110)/Rgb(232, 232, 232)/NONE×29; Rgb(125, 90, 5)/Rgb(232, 232, 232)/NONE×9; Rgb(54, 54, 54)/Rgb(232, 232, 232)/NONE×12
+08|    [google-antigravity (ACP)] Google's antigravity-acp agent · google agent pro|
+   ~ Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×31; Rgb(23, 23, 23)/Rgb(253, 253, 253)/NONE×30; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×19
+09|      p****@e******.com · plan unknown · refreshed unknown · expires unknown · s|
+   ~ Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×80
+10|                                                                                |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
+11|                                                                                |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
+12|                                                                                |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
+13|[+ OpenAI (OAuth)]  [+ Anthropic (OAuth)]  [+ OpenAI (API)]                     |
+   ~ Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×18; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×21; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×16; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×21
+14|[+ Anthropic (API)]  [+ Kimi (OAuth)]  [+ Grok (OAuth)]  [+ Gemini (API)]       |
+   ~ Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×19; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×16; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×16; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×16; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×7
+15|[+ Google Antigravity (OAuth)]                                                  |
+   ~ Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×30; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×50
+16|[+ Haider Code (API)]  [+ DeepSeek (API)]  [+ xAI (API)]                        |
+   ~ Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×21; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×18; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×13; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×24
+17|[+ HuggingFace]  [+ OpenCode Zen]  [+ OpenCode Go]                              |
+   ~ Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×15; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×16; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×15; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×30
+18|[+ Ollama (local)]  [+ LM Studio (local)]                                       |
+   ~ Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×18; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×21; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×39
+19|[+ Azure OpenAI]  [+ Bedrock (Claude)]  [+ Vertex (Claude)]                     |
+   ~ Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×16; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×20; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×2; Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×19; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×21
+20|[+ Add custom server]                                                           |
+   ~ Rgb(125, 90, 5)/Rgb(253, 253, 253)/NONE×21; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×59
+21|                                                                                |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×80
+22|click an account to make it active · + adds via OAuth / API · x removes · r reve|
+   ~ Rgb(217, 217, 217)/Rgb(253, 253, 253)/NONE×80
+23| [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 200k                                        |
+   ~ Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×1; Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×2; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×4; Rgb(184, 184, 184)/Rgb(253, 253, 253)/NONE×2; Rgb(110, 110, 110)/Rgb(253, 253, 253)/NONE×33; Rgb(54, 54, 54)/Rgb(253, 253, 253)/NONE×38

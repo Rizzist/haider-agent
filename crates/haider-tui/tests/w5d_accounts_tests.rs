@@ -554,3 +554,73 @@ fn pending_select_renders_feedback_without_moving_the_dot() {
     assert!(frame.contains("○ billing-key [api key] · s******* · active …"));
     assert!(frame.contains("● work-chatgpt"));
 }
+
+/// 970 layer B: linked Grok CLI and Kimi Code rows render through the SAME
+/// generic source badge as Codex — no kind-specific rendering code exists.
+/// The Grok row shows the tier the live meter supplied; the Kimi row shows
+/// its synthesized coordinate because the Kimi store carries no identity;
+/// a Kimi root whose login Haider cannot enumerate names the origin CLI.
+#[test]
+fn accounts_screen_renders_linked_grok_and_kimi_source_rows() {
+    let mut model = accounts_model();
+    let rows = vec![
+        AccountRow::from_descriptor(&descriptor(
+            "grok-2f8c1d0a4b6e",
+            "grok-oauth",
+            AuthMethod::OAuth,
+        )),
+        AccountRow::from_descriptor(&descriptor(
+            "kimi-9a1b2c3d4e5f",
+            "kimi-oauth",
+            AuthMethod::OAuth,
+        )),
+    ];
+    model.accounts.apply_snapshot(rows, Some(11));
+
+    let mut grok = account_source(
+        Some("grok-2f8c1d0a4b6e"),
+        "grok_home",
+        "Grok CLI default",
+        "file",
+        "grok_cli",
+        "ready",
+    );
+    grok.plan = Some("SuperGrok".into());
+    grok.masked_identity = Some("p***@example.test".into());
+    let mut kimi = account_source(
+        Some("kimi-9a1b2c3d4e5f"),
+        "kimi_code_home",
+        "Kimi Code default",
+        "file",
+        "kimi_cli",
+        "ready",
+    );
+    kimi.plan = None;
+    kimi.masked_identity = Some("…4e5f90".into());
+    let mut legacy = account_source(
+        None,
+        "kimi_code_home",
+        "Kimi Code legacy default",
+        "file",
+        "kimi_cli",
+        "requires_origin_client",
+    );
+    legacy.plan = None;
+    legacy.masked_identity = None;
+    model.accounts.apply_sources(vec![grok, kimi, legacy]);
+
+    let frame = draw(&model, 180, 46);
+    assert!(frame.contains("[grok home] Grok CLI default · file · refresh: grok cli · ready"));
+    assert!(frame.contains("p***@example.test · SuperGrok"));
+    assert!(
+        frame.contains("[kimi code home] Kimi Code default · file · refresh: kimi cli · ready")
+    );
+    assert!(
+        frame.contains("…4e5f90"),
+        "the synthesized Kimi coordinate stands in for an absent identity"
+    );
+    assert!(frame.contains("ENROLLED SOURCES — without a linked account"));
+    assert!(frame.contains(
+        "[kimi code home] Kimi Code legacy default · file · refresh: kimi cli · not readable without kimi-cli"
+    ));
+}

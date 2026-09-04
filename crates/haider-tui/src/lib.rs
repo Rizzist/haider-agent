@@ -41,6 +41,7 @@ pub mod stt_runtime;
 pub mod style;
 pub mod talk;
 pub mod taskrows;
+pub mod terms_journal;
 pub mod theme;
 pub mod throughput;
 pub mod wordmark;

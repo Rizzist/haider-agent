@@ -21,6 +21,12 @@ const MAX_SOURCES: usize = 64;
 pub enum CredentialSourceKind {
     CodexHome,
     ClaudeFile,
+    /// `~/.grok` (or `GROK_HOME`) as written by the official Grok CLI.
+    GrokHome,
+    /// A Kimi Code data root: `~/.kimi-code` for the current CLI and
+    /// `~/.kimi` for the legacy Python one. Both lay the credential down at
+    /// the same relative path with the same fields, so one kind serves both.
+    KimiCodeHome,
 }
 
 impl CredentialSourceKind {
@@ -29,14 +35,32 @@ impl CredentialSourceKind {
         match self {
             Self::CodexHome => "codex_home",
             Self::ClaudeFile => "claude_file",
+            Self::GrokHome => "grok_home",
+            Self::KimiCodeHome => "kimi_code_home",
         }
     }
 
+    /// Path of the credential document relative to the enrolled root. Nested
+    /// paths are supported: the value is joined onto the root verbatim.
     #[must_use]
     pub const fn credential_relative_path(self) -> &'static str {
         match self {
             Self::CodexHome => "auth.json",
             Self::ClaudeFile => ".credentials.json",
+            Self::GrokHome => "auth.json",
+            Self::KimiCodeHome => "credentials/kimi-code.json",
+        }
+    }
+
+    /// The CLI that owns rotation of this kind's refresh credential. Haider
+    /// reads the access token through and never spends the refresh token.
+    #[must_use]
+    pub const fn refresh_owner(self) -> CredentialSourceRefreshOwner {
+        match self {
+            Self::CodexHome => CredentialSourceRefreshOwner::Codex,
+            Self::ClaudeFile => CredentialSourceRefreshOwner::ClaudeCode,
+            Self::GrokHome => CredentialSourceRefreshOwner::GrokCli,
+            Self::KimiCodeHome => CredentialSourceRefreshOwner::KimiCli,
         }
     }
 }
@@ -69,6 +93,12 @@ impl CredentialStoreMode {
 pub enum CredentialSourceRefreshOwner {
     Codex,
     ClaudeCode,
+    /// `auth.x.ai` rotates with reuse detection and the Grok CLI holds the
+    /// single-holder lock; a second spender breaks the CLI's next refresh.
+    GrokCli,
+    /// The Kimi token endpoint always returns a successor refresh token and
+    /// the origin CLI serializes rotation behind its own lockfile.
+    KimiCli,
 }
 
 impl CredentialSourceRefreshOwner {
@@ -77,6 +107,8 @@ impl CredentialSourceRefreshOwner {
         match self {
             Self::Codex => "codex",
             Self::ClaudeCode => "claude_code",
+            Self::GrokCli => "grok_cli",
+            Self::KimiCli => "kimi_cli",
         }
     }
 }
@@ -259,10 +291,7 @@ impl CredentialSourceRegistry {
             label: sanitized_label(label).unwrap_or_else(|| kind.as_str().replace('_', " ")),
             enabled: true,
             store_mode: CredentialStoreMode::Unknown,
-            refresh_owner: match kind {
-                CredentialSourceKind::CodexHome => CredentialSourceRefreshOwner::Codex,
-                CredentialSourceKind::ClaudeFile => CredentialSourceRefreshOwner::ClaudeCode,
-            },
+            refresh_owner: kind.refresh_owner(),
             account_alias: None,
             last_scanned_at_ms: None,
             last_refreshed_at_ms: None,

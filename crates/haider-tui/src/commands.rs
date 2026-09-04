@@ -70,7 +70,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /usage [history|models|calendar|global|accounts] [provider] — cross-provider usage; s cycles scopes",
     "  /accounts          provider credentials — OAuth / API / HuggingFace / OpenCode Zen+Go / custom, pick the active",
     "  /account <alias>   switch the active account for its provider (tab-completes aliases)",
-    "  /login <prov> <oauth|api>  add a provider account (OAuth loopback, API key, or custom URL)",
+    "  /login <prov> <oauth|api>  add a provider account (OAuth loopback, API key, or custom URL) — /login google signs in through Google's own Antigravity agent",
     "  /clear · /back     back to the main screen; typing there starts a fresh session",
     "  /compact           compact context now",
     "  /tokens            token panel — context by model (also ⌃G)",

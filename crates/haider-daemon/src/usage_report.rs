@@ -190,6 +190,72 @@ impl UsageMeterHttp for ReqwestUsageMeterHttp {
     }
 }
 
+/// Stable meter reason for a supervised-agent provider whose protocol exposes
+/// no quota at all.
+///
+/// Verified twice against the live 1.1.1 Google binary and against the
+/// published ACP v1 schema (`docs/testing/v0.0.970/_acp-wire-facts.md`): the
+/// only usage-shaped update ACP defines is `usage_update`, which carries
+/// CONTEXT-WINDOW OCCUPANCY (`used` tokens in a window of `size`), not
+/// subscription quota — and Antigravity never sends even that. Quota failures
+/// arrive as unstructured prose.
+///
+/// This is deliberately `Unavailable` rather than `LocalOnly`: `LocalOnly`
+/// asserts that Haider's own counters are the truth, and for a supervised
+/// agent that reports no token counts at all they would render as zero usage.
+pub(crate) const ACP_AGENT_NO_QUOTA_REASON: &str = "provider_exposes_no_quota";
+
+/// Window name published when — and only when — an upstream error supplied an
+/// EXACT retry instant. It is the provider's own timestamp being reported, not
+/// a cadence being turned into a guess.
+pub(crate) const ACP_AGENT_RETRY_WINDOW: &str = "retry_after";
+
+/// The meter state for an account whose provider publishes no structured
+/// quota over its protocol.
+///
+/// - A durable credential problem keeps its own typed reason: a revoked login
+///   is more actionable than "no quota surface", and reusing the existing
+///   vocabulary keeps one classification per cause.
+/// - `Limited { until_ms }` publishes that exact instant as a fully consumed
+///   window. The timestamp is PROVIDER-SUPPLIED — it reached the descriptor
+///   from an upstream error that named a retry instant — so publishing it is
+///   reporting, not synthesis. Google's documented five-hour/weekly cadence is
+///   never turned into a timestamp here.
+/// - Everything else is honest absence. Nothing infers a plan (`Pro`/`Ultra`)
+///   from which models happen to appear.
+pub(crate) fn agent_owned_meter_state(status: &CredentialStatus) -> AccountMeterStateV1 {
+    if let Some(reason) = credential_meter_unavailable_reason(status) {
+        return AccountMeterStateV1::Unavailable {
+            reason: reason.to_owned(),
+        };
+    }
+    match status {
+        CredentialStatus::Limited { until_ms } => AccountMeterStateV1::Metered {
+            windows: vec![UsageWindowV1 {
+                window: ACP_AGENT_RETRY_WINDOW.to_owned(),
+                // The account is rate-limited right now: that is what the
+                // upstream error said, not an extrapolation from usage.
+                utilization: 1.0,
+                resets_at_ms: Some(*until_ms),
+                label: None,
+            }],
+        },
+        CredentialStatus::Ok
+        | CredentialStatus::Expired
+        | CredentialStatus::Revoked
+        | CredentialStatus::NeedsAttention { .. } => AccountMeterStateV1::Unavailable {
+            reason: ACP_AGENT_NO_QUOTA_REASON.to_owned(),
+        },
+    }
+}
+
+/// True when the provider's credential and quota both live inside an external
+/// agent process rather than in an HTTP meter Haider could poll.
+pub(crate) fn agent_owned_meter(descriptor: &CredentialDescriptor) -> bool {
+    descriptor.auth_method == AuthMethod::OAuth
+        && descriptor.provider == haider_provider::GOOGLE_ANTIGRAVITY_PROVIDER_NAME
+}
+
 /// Which meter (if any) serves one descriptor. Only subscriptions with a
 /// documented server meter are probed; Grok OAuth, every API-key/custom, and
 /// unknown providers remain honest local-only accounting.
@@ -410,6 +476,11 @@ impl UsageReportService {
                     }
                     None => AccountMeterStateV1::LocalOnly,
                 }
+            } else if agent_owned_meter(&descriptor) {
+                // The plan stays ABSENT: the supervised agent never reports
+                // one, and a model appearing in its catalog is not evidence of
+                // a Pro or Ultra subscription.
+                agent_owned_meter_state(&descriptor.status)
             } else {
                 match meter_for(&descriptor) {
                     None => AccountMeterStateV1::LocalOnly,

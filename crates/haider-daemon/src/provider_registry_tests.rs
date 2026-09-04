@@ -429,6 +429,178 @@ fn gemini_is_a_builtin_generate_content_api_key_provider() {
     );
 }
 
+/// v0.0.970: the supervised Antigravity agent registers as its OWN execution
+/// kind — no HTTP endpoint, OAuth, and a deliberately EMPTY inventory so the
+/// authenticated agent's own catalog is the only truth and the auto-discovery
+/// trigger is not suppressed.
+///
+/// MUTATION CHECK: seed a model list on the `google-antigravity` arm (the
+/// DeepSeek/Bedrock shape) instead of leaving it empty. Expected runtime
+/// failure: `configured_models` is non-empty and the profile reports
+/// `Available` before any account has ever authenticated.
+#[test]
+fn google_antigravity_registers_as_an_acp_agent_with_no_endpoint_and_no_seeded_models() {
+    let profile = builtin_or_unknown(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, "unused");
+    assert_eq!(profile.api_family, ProviderApiFamilyWire::AcpAgent);
+    assert_eq!(
+        profile.base_url, None,
+        "a supervised agent has no HTTP origin to publish"
+    );
+    assert_eq!(profile.auth_requirement, ProviderAuthRequirementWire::OAuth);
+    assert!(profile.enabled);
+    assert!(matches!(profile.provenance, ProviderProvenance::BuiltIn));
+    assert!(
+        profile.configured_models.is_empty(),
+        "the agent's own catalog is the only inventory truth"
+    );
+    assert_eq!(profile.default_model, None);
+
+    // Empty inventory means the summary is honestly UNAVAILABLE until the
+    // first authenticated discovery fills it, which is what keeps the
+    // auto-discovery trigger armed.
+    let registry = ProviderRegistry::new(
+        MemoryProviderStore::default(),
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([GOOGLE_ANTIGRAVITY_PROVIDER_NAME.to_owned()]),
+            "unused",
+        ),
+        model_source([]),
+    )
+    .expect("Antigravity registry");
+    let summary = registry
+        .summary(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, &|_| false)
+        .expect("Antigravity summary");
+    assert_eq!(summary.api_family, ProviderApiFamilyWire::AcpAgent);
+    assert_eq!(summary.endpoint, None);
+    assert_eq!(summary.auth_methods, vec![AuthMethod::OAuth]);
+    assert!(summary.models.is_empty());
+    assert_eq!(summary.default_model, None);
+    assert_eq!(
+        summary.availability,
+        ProviderAvailabilityWire::Unavailable,
+        "nothing is offered until the authenticated agent publishes a catalog"
+    );
+
+    // Once discovery publishes the agent's catalog, every reasoning variant
+    // survives as its own row and the provider lights up.
+    let discovered = model_source([(
+        GOOGLE_ANTIGRAVITY_PROVIDER_NAME,
+        vec![
+            discovered("gemini-3.8-flash-high", true, None),
+            discovered("gemini-3.8-flash-medium", true, None),
+            discovered("gemini-pro-agent", true, None),
+        ],
+    )]);
+    let registry = ProviderRegistry::new(
+        MemoryProviderStore::default(),
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([GOOGLE_ANTIGRAVITY_PROVIDER_NAME.to_owned()]),
+            "unused",
+        ),
+        discovered,
+    )
+    .expect("Antigravity registry with a catalog");
+    let summary = registry
+        .summary(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, &|_| false)
+        .expect("Antigravity summary with a catalog");
+    assert_eq!(
+        summary.models,
+        vec![
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-medium",
+            "gemini-pro-agent"
+        ]
+    );
+    assert_eq!(summary.availability, ProviderAvailabilityWire::Available);
+    assert_eq!(
+        summary.inventory_authority,
+        haider_rpc::ModelInventoryAuthorityWire::Authoritative
+    );
+    assert!(
+        summary
+            .model_details
+            .iter()
+            .all(|detail| detail.supports_vision == Some(false)),
+        "the ACP turn builder sends text blocks only, so the row refuses a paste \
+         rather than silently dropping it"
+    );
+}
+
+/// REGRESSION: admitting `google-antigravity` must not disturb the API-key
+/// `gemini` provider. Its profile, family, endpoint, auth requirement and
+/// request shape are all unchanged, and the two classes never alias.
+///
+/// MUTATION CHECK: point the `gemini` arm at the ACP family (or reuse the
+/// `gemini` id for the supervised agent). Expected runtime failure: the family
+/// or endpoint assertion below, and the distinct-id assertion.
+#[test]
+fn admitting_the_supervised_agent_leaves_the_api_key_gemini_provider_unchanged() {
+    let gemini = builtin_or_unknown(GEMINI_PROVIDER_NAME, "unused");
+    assert_eq!(gemini.provider_id, "gemini");
+    assert_eq!(
+        gemini.api_family,
+        ProviderApiFamilyWire::GeminiGenerateContent
+    );
+    assert_eq!(gemini.base_url.as_deref(), Some(GEMINI_API_BASE_URL));
+    assert_eq!(gemini.auth_requirement, ProviderAuthRequirementWire::ApiKey);
+    assert!(gemini.enabled);
+    assert!(gemini.configured_models.is_empty());
+    assert_eq!(gemini.default_model, None);
+    assert!(matches!(gemini.provenance, ProviderProvenance::BuiltIn));
+
+    let antigravity = builtin_or_unknown(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, "unused");
+    assert_ne!(gemini.provider_id, antigravity.provider_id);
+    assert_ne!(gemini.api_family, antigravity.api_family);
+    assert_ne!(gemini.auth_requirement, antigravity.auth_requirement);
+    assert_ne!(gemini.base_url, antigravity.base_url);
+
+    // Its summary is unchanged too: same family, same endpoint, same
+    // API-key auth, and a discovered catalog that is still its own.
+    let registry = ProviderRegistry::new(
+        MemoryProviderStore::default(),
+        initial_provider_profiles(
+            &std::collections::BTreeSet::from([
+                GEMINI_PROVIDER_NAME.to_owned(),
+                GOOGLE_ANTIGRAVITY_PROVIDER_NAME.to_owned(),
+            ]),
+            "unused",
+        ),
+        model_source([
+            (
+                GEMINI_PROVIDER_NAME,
+                vec![discovered("gemini-2.5-flash", true, None)],
+            ),
+            (
+                GOOGLE_ANTIGRAVITY_PROVIDER_NAME,
+                vec![discovered("gemini-3.8-flash-high", true, None)],
+            ),
+        ]),
+    )
+    .expect("both Google lanes register side by side");
+    let gemini_summary = registry
+        .summary(GEMINI_PROVIDER_NAME, &|_| false)
+        .expect("Gemini summary");
+    assert_eq!(
+        gemini_summary.api_family,
+        ProviderApiFamilyWire::GeminiGenerateContent
+    );
+    assert_eq!(
+        gemini_summary.endpoint.as_deref(),
+        Some(GEMINI_API_BASE_URL)
+    );
+    assert_eq!(gemini_summary.auth_methods, vec![AuthMethod::ApiKey]);
+    assert_eq!(gemini_summary.models, vec!["gemini-2.5-flash"]);
+    assert_eq!(
+        gemini_summary.availability,
+        ProviderAvailabilityWire::Available
+    );
+    let antigravity_summary = registry
+        .summary(GOOGLE_ANTIGRAVITY_PROVIDER_NAME, &|_| false)
+        .expect("Antigravity summary");
+    assert_eq!(antigravity_summary.models, vec!["gemini-3.8-flash-high"]);
+    assert_ne!(gemini_summary.models, antigravity_summary.models);
+}
+
 /// MUTATION CHECK: pass `configured_models` instead of `discovered_models` to
 /// `validated_default` in `ProviderRegistry::configured_profiles`. Expected
 /// runtime failure: the configured-but-undiscovered default is accepted

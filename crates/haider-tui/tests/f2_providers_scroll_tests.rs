@@ -208,10 +208,11 @@ fn add_login_buttons_pin_at_the_bottom() {
     // split the key map into action + preset hint lines; G4b added the
     // enterprise row (Azure/Bedrock/Vertex) and its own hint line; 940 added
     // Haider Code, which did not fit on the six-button API row at 100 cols
-    // (~117 chars), so that row split 6 -> 4+3. Bottom band is now
-    // footer(7) + hints(3) + status = 11.
+    // (~117 chars), so that row split 6 -> 4+3. 970 gave Google Antigravity
+    // its own row (the label is too long to pair at 80 cols). Bottom band is
+    // now footer(8) + hints(3) + status = 12.
     assert!(
-        oauth_row >= rows.len() - 11,
+        oauth_row >= rows.len() - 12,
         "buttons pin at the bottom band (footer + status bar), not mid-page (row {oauth_row})"
     );
     // Scrolling the roster leaves the footer put.

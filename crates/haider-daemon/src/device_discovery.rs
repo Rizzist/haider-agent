@@ -4,6 +4,7 @@
 //! project only public metadata. Missing, oversized, and malformed stores are
 //! deliberately indistinguishable from absent stores to the discovery RPC.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -36,6 +37,15 @@ const CLAUDE_CUSTOM_CLIENT_REASON: &str =
 const KIMI_DEVICE_REASON: &str =
     "Kimi Code credential is missing its matching first-party device identity";
 const CLAUDE_UNVERIFIED_REASON: &str = "Claude OAuth path exists, but its credential shape is not verified by current first-party documentation";
+/// `auth_mode` the Grok CLI writes for a browser SuperGrok / X Premium
+/// login. Every other mode (`api_key`, `external`, `web_login`) is either not
+/// an OAuth login at all or not a subscription grant, and is never linked.
+const GROK_OIDC_AUTH_MODE: &str = "oidc";
+/// Grok keys each entry `"{issuer}::{client_id}"`. This is the consumer
+/// subscription authority and breaks a tie between several OIDC entries.
+const GROK_SUBSCRIPTION_SCOPE_PREFIX: &str = "https://auth.x.ai::";
+/// Non-default Kimi Code slots are `credentials/kimi-code-env-<digest>.json`.
+const KIMI_SLOT_PREFIX: &str = "kimi-code-env-";
 
 #[derive(Debug, Clone)]
 pub(crate) struct DeviceCandidate {
@@ -244,13 +254,80 @@ pub(crate) fn read_linked_source(
         CredentialSourceKind::ClaudeFile => {
             linked_claude_metadata(&path, &bytes, last_refreshed_at_ms, &source.id)
         }
+        CredentialSourceKind::GrokHome => {
+            linked_grok_material(bytes, store_mode, last_refreshed_at_ms)
+        }
+        CredentialSourceKind::KimiCodeHome => {
+            linked_kimi_material(bytes, store_mode, last_refreshed_at_ms, &source.id)
+        }
     }
+}
+
+/// Whether a linked kind yields a read-through access bundle at resolution
+/// time. Claude file sources are metadata-only and stay policy-blocked, so
+/// the broker must never be handed one.
+pub(crate) const fn linked_kind_yields_access(kind: CredentialSourceKind) -> bool {
+    match kind {
+        CredentialSourceKind::CodexHome
+        | CredentialSourceKind::GrokHome
+        | CredentialSourceKind::KimiCodeHome => true,
+        CredentialSourceKind::ClaudeFile => false,
+    }
+}
+
+/// Resolves the credential document inside one enrolled root. Kimi Code
+/// writes a per-endpoint slot file when the CLI is pointed away from the
+/// default region, so a missing default file falls back to a UNIQUE
+/// `credentials/kimi-code-env-*.json` rather than guessing among several.
+pub(crate) fn linked_credential_path(
+    source: &CredentialSourceRecord,
+) -> Result<PathBuf, LinkedSourceReadFailure> {
+    let default = source.credential_path();
+    if source.kind != CredentialSourceKind::KimiCodeHome || default.exists() {
+        return Ok(default);
+    }
+    kimi_slot_path(&source.root)
+}
+
+fn kimi_slot_path(root: &Path) -> Result<PathBuf, LinkedSourceReadFailure> {
+    let Ok(entries) = std::fs::read_dir(root.join("credentials")) else {
+        return Err(LinkedSourceReadFailure::RequiresOriginClient);
+    };
+    let mut candidates = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(KIMI_SLOT_PREFIX) && name.ends_with(".json"))
+        })
+        .collect::<Vec<_>>();
+    if candidates.len() > 1 {
+        // Several endpoint slots: Haider cannot tell which login the operator
+        // means, and picking one would silently link the wrong account.
+        return Err(LinkedSourceReadFailure::Invalid);
+    }
+    candidates.pop().ok_or(
+        // The root exists but exposes no readable credential document. The
+        // Kimi lineage keeps logins Haider cannot enumerate (the legacy
+        // Python CLI's deprecated `keyring` service), so absence here means
+        // "ask the origin client", never "there is no login".
+        LinkedSourceReadFailure::RequiresOriginClient,
+    )
 }
 
 pub(crate) fn linked_source_store_mode(source: &CredentialSourceRecord) -> CredentialStoreMode {
     match source.kind {
         CredentialSourceKind::CodexHome => codex_store_mode(&source.root),
         CredentialSourceKind::ClaudeFile => CredentialStoreMode::File,
+        // Neither shipping CLI has a keyring mode to select: the Grok CLI
+        // stores `auth.json` in plaintext behind file permissions only, and
+        // the current Kimi Code CLI writes a plain `0600` JSON document and
+        // actively migrates the legacy Python CLI's deprecated keyring
+        // entries out into that file.
+        CredentialSourceKind::GrokHome | CredentialSourceKind::KimiCodeHome => {
+            CredentialStoreMode::File
+        }
     }
 }
 
@@ -260,7 +337,7 @@ fn read_enrolled_file(
     if !source.root.exists() {
         return Err(LinkedSourceReadFailure::SourceGone);
     }
-    let path = source.credential_path();
+    let path = linked_credential_path(source)?;
     let canonical = std::fs::canonicalize(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             LinkedSourceReadFailure::SourceGone
@@ -294,13 +371,7 @@ fn linked_codex_material(
     store_mode: CredentialStoreMode,
     last_refreshed_at_ms: Option<u64>,
 ) -> Result<LinkedSourceMaterial, LinkedSourceReadFailure> {
-    let parsed: LinkedCodexFile = serde_json::from_slice(&bytes).map_err(|error| {
-        if error.is_eof() {
-            LinkedSourceReadFailure::PartialWrite
-        } else {
-            LinkedSourceReadFailure::InvalidJson
-        }
-    })?;
+    let parsed: LinkedCodexFile = serde_json::from_slice(&bytes).map_err(json_read_failure)?;
     let last_refreshed_at_ms = parsed
         .last_refresh
         .as_deref()
@@ -403,13 +474,7 @@ fn linked_claude_metadata(
     last_refreshed_at_ms: Option<u64>,
     source_id: &str,
 ) -> Result<LinkedSourceMaterial, LinkedSourceReadFailure> {
-    serde_json::from_slice::<serde::de::IgnoredAny>(bytes).map_err(|error| {
-        if error.is_eof() {
-            LinkedSourceReadFailure::PartialWrite
-        } else {
-            LinkedSourceReadFailure::InvalidJson
-        }
-    })?;
+    serde_json::from_slice::<serde::de::IgnoredAny>(bytes).map_err(json_read_failure)?;
     let parsed = parse_claude_credential_metadata(path, bytes)
         .map_err(|_| LinkedSourceReadFailure::MissingFields)?;
     if !parsed.has_inference_scope {
@@ -438,6 +503,294 @@ fn linked_claude_metadata(
         store_mode: CredentialStoreMode::File,
         encoded_bundle: None,
     })
+}
+
+/// Minimal read-through shape for ONE externally owned Grok CLI scope entry.
+/// There is deliberately no `refresh_token` field, so serde skips it and the
+/// origin refresh credential is never materialized into Haider-owned memory:
+/// `auth.x.ai` rotates that token with reuse detection behind the CLI's own
+/// advisory lock, and a second spender breaks the CLI's next refresh.
+#[derive(Deserialize)]
+struct LinkedGrokEntry {
+    /// The ACCESS token. The Grok CLI names this field `key`.
+    #[serde(default)]
+    key: Option<SecretJson>,
+    /// RFC3339 UTC access-token expiry.
+    #[serde(default)]
+    expires_at: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    auth_mode: Option<String>,
+    /// When the entry was first written. This is NOT a refresh clock, so it
+    /// only stands in when the filesystem cannot report a modification time.
+    #[serde(default)]
+    create_time: Option<String>,
+}
+
+/// Minimal read-through shape for an externally owned Kimi Code login. As
+/// with Grok there is no `refresh_token` field at all: the Kimi token
+/// endpoint always returns a successor refresh token and the origin CLI
+/// serializes rotation behind its own lockfile, so Haider must never spend
+/// it. Kimi stores no identity of any kind — no email, user id, or plan.
+#[derive(Deserialize)]
+struct LinkedKimiFile {
+    #[serde(default)]
+    access_token: Option<SecretJson>,
+    /// ABSOLUTE unix SECONDS (the record keeps milliseconds).
+    #[serde(default)]
+    expires_at: Option<f64>,
+    /// Relative lifetime; the fallback when no absolute expiry is present.
+    #[serde(default)]
+    expires_in: Option<u64>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    token_type: Option<String>,
+}
+
+/// Projects the one SuperGrok/X Premium OIDC login out of `auth.json`.
+///
+/// An `xai::api_key` entry is an API key, not an OAuth grant, and is never
+/// linked. Several OIDC entries are disambiguated by the consumer authority
+/// prefix; still-ambiguous stores are a typed failure rather than a guess.
+fn linked_grok_material(
+    bytes: Zeroizing<Vec<u8>>,
+    store_mode: CredentialStoreMode,
+    last_refreshed_at_ms: Option<u64>,
+) -> Result<LinkedSourceMaterial, LinkedSourceReadFailure> {
+    let entries: BTreeMap<String, LinkedGrokEntry> =
+        serde_json::from_slice(&bytes).map_err(json_read_failure)?;
+    let mut logins = entries
+        .into_iter()
+        .filter(|(_, entry)| entry.auth_mode.as_deref() == Some(GROK_OIDC_AUTH_MODE))
+        .collect::<Vec<_>>();
+    if logins.len() > 1 {
+        logins.retain(|(scope, _)| scope.starts_with(GROK_SUBSCRIPTION_SCOPE_PREFIX));
+    }
+    if logins.len() > 1 {
+        return Err(LinkedSourceReadFailure::Invalid);
+    }
+    let (scope, entry) = logins.pop().ok_or(LinkedSourceReadFailure::MissingFields)?;
+    let access_token = entry.key.ok_or(LinkedSourceReadFailure::MissingFields)?;
+    if access_token.0.is_empty() {
+        return Err(LinkedSourceReadFailure::MissingFields);
+    }
+    let user_id = entry
+        .user_id
+        .and_then(nonempty)
+        .ok_or(LinkedSourceReadFailure::MissingFields)?;
+    let expires_at_ms = entry
+        .expires_at
+        .as_deref()
+        .and_then(parse_rfc3339_millis)
+        .ok_or(LinkedSourceReadFailure::MissingFields)?;
+    // The filesystem is the refresh clock here: `create_time` records entry
+    // creation, not the last rotation, so it only fills a missing mtime.
+    let last_refreshed_at_ms = last_refreshed_at_ms
+        .or_else(|| entry.create_time.as_deref().and_then(parse_rfc3339_millis));
+    let email = entry.email.and_then(nonempty);
+    let account_id = format!("xai:{user_id}");
+    let display_identity = email.clone().unwrap_or_else(|| account_id.clone());
+    // `{issuer}::{client_id}` is the scope key's own shape; the release
+    // allowlist supplies both when a legacy key does not carry them.
+    let (issuer, audience) = scope
+        .split_once("::")
+        .filter(|(issuer, client)| !issuer.is_empty() && !client.is_empty())
+        .map_or_else(
+            || sanctioned_coordinates(haider_provider::GROK_OAUTH_PROVIDER_NAME),
+            |(issuer, client)| (issuer.to_owned(), client.to_owned()),
+        );
+    let identity = AccountIdentity {
+        email,
+        display_name: None,
+        account_id: Some(account_id.clone()),
+        // The subscription tier is not a stored field. It reaches Haider
+        // through the live `grok-oauth` meter, never a decoded access token.
+        plan: None,
+        issuer: Some(issuer.clone()),
+        captured_at: last_refreshed_at_ms.unwrap_or(0),
+        verified: false,
+    };
+    linked_access_material(
+        haider_provider::GROK_OAUTH_PROVIDER_NAME,
+        issuer,
+        audience,
+        access_token.0,
+        Vec::new(),
+        expires_at_ms,
+        &account_id,
+        display_identity,
+        identity,
+        store_mode,
+        last_refreshed_at_ms,
+    )
+}
+
+/// Projects an externally owned Kimi Code login.
+///
+/// The store carries no identity, so the account coordinate is synthesized
+/// from the durable source id exactly as the Anthropic path does: it is
+/// derived from the enrolled ROOT alone, which keeps one account stable
+/// across a token rotation while two roots stay two accounts.
+fn linked_kimi_material(
+    bytes: Zeroizing<Vec<u8>>,
+    store_mode: CredentialStoreMode,
+    last_refreshed_at_ms: Option<u64>,
+    source_id: &str,
+) -> Result<LinkedSourceMaterial, LinkedSourceReadFailure> {
+    let parsed: LinkedKimiFile = serde_json::from_slice(&bytes).map_err(json_read_failure)?;
+    let account_id = format!("kimi:{}", &source_id[source_id.len().saturating_sub(16)..]);
+    let access_token = parsed
+        .access_token
+        .ok_or(LinkedSourceReadFailure::MissingFields)?;
+    if access_token.0.is_empty() {
+        // Revocation tombstone: after a rejected refresh the CLI rewrites the
+        // file IN PLACE with empty tokens and `expires_at: 0`, keeping
+        // `scope`/`token_type`. A reader that only checks "file exists"
+        // would report a logged-out store as a usable credential.
+        return Ok(LinkedSourceMaterial {
+            identity: Some(kimi_identity(&account_id, last_refreshed_at_ms)),
+            display_identity: account_id,
+            last_refreshed_at_ms,
+            access_expires_at_ms: None,
+            health: CredentialSourceHealth::Revoked,
+            store_mode,
+            encoded_bundle: None,
+        });
+    }
+    let token_type = parsed.token_type.unwrap_or_else(|| "Bearer".to_owned());
+    if !token_type.eq_ignore_ascii_case("bearer") {
+        return Err(LinkedSourceReadFailure::Invalid);
+    }
+    let expires_at_ms = parsed
+        .expires_at
+        .and_then(seconds_to_millis)
+        .or_else(|| {
+            let lifetime = parsed.expires_in?.checked_mul(1000)?;
+            last_refreshed_at_ms?.checked_add(lifetime)
+        })
+        .ok_or(LinkedSourceReadFailure::MissingFields)?;
+    let granted_scopes = parsed
+        .scope
+        .as_deref()
+        .map(|scope| {
+            scope
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let (issuer, audience) = sanctioned_coordinates(haider_provider::KIMI_OAUTH_PROVIDER_NAME);
+    linked_access_material(
+        haider_provider::KIMI_OAUTH_PROVIDER_NAME,
+        issuer,
+        audience,
+        access_token.0,
+        granted_scopes,
+        expires_at_ms,
+        &account_id,
+        account_id.clone(),
+        kimi_identity(&account_id, last_refreshed_at_ms),
+        store_mode,
+        last_refreshed_at_ms,
+    )
+}
+
+fn kimi_identity(account_id: &str, last_refreshed_at_ms: Option<u64>) -> AccountIdentity {
+    AccountIdentity {
+        email: None,
+        display_name: Some("Kimi Code subscription".to_owned()),
+        account_id: Some(account_id.to_owned()),
+        plan: None,
+        issuer: Some(sanctioned_coordinates(haider_provider::KIMI_OAUTH_PROVIDER_NAME).0),
+        captured_at: last_refreshed_at_ms.unwrap_or(0),
+        verified: false,
+    }
+}
+
+/// Builds the ACCESS-ONLY broker input shared by every read-through kind.
+/// `refresh_token` is passed as `None` by construction: this is the single
+/// place a linked bundle is minted, so no kind can start owning rotation.
+#[allow(clippy::too_many_arguments)]
+fn linked_access_material(
+    provider_id: &str,
+    issuer: String,
+    audience: String,
+    access_token: Zeroizing<Vec<u8>>,
+    granted_scopes: Vec<String>,
+    expires_at_ms: u64,
+    subject: &str,
+    display_identity: String,
+    identity: AccountIdentity,
+    store_mode: CredentialStoreMode,
+    last_refreshed_at_ms: Option<u64>,
+) -> Result<LinkedSourceMaterial, LinkedSourceReadFailure> {
+    let observed_at_ms = now_ms().ok_or(LinkedSourceReadFailure::Invalid)?;
+    let bundle = OAuthTokenBundleV1::new(
+        provider_id.to_owned(),
+        issuer,
+        audience,
+        None,
+        "Bearer".to_owned(),
+        access_token,
+        None,
+        expires_at_ms,
+        None,
+        granted_scopes,
+        OAuthIdentityV1 {
+            subject_hash: blake3::hash(subject.as_bytes()).to_hex().to_string(),
+            display_identity: display_identity.clone(),
+        },
+        last_refreshed_at_ms.unwrap_or(1).max(1),
+    )
+    .map_err(|_| LinkedSourceReadFailure::Invalid)?
+    .with_account_identity(identity.clone());
+    let encoded_bundle = bundle
+        .encode()
+        .map_err(|_| LinkedSourceReadFailure::Invalid)?;
+    Ok(LinkedSourceMaterial {
+        identity: Some(identity),
+        display_identity,
+        last_refreshed_at_ms,
+        access_expires_at_ms: Some(expires_at_ms),
+        health: if expires_at_ms <= observed_at_ms {
+            CredentialSourceHealth::Expired
+        } else {
+            CredentialSourceHealth::Ready
+        },
+        store_mode,
+        encoded_bundle: Some(encoded_bundle),
+    })
+}
+
+/// The release OAuth allowlist is the single source of a provider's issuer
+/// and client id; discovery never re-declares them.
+fn sanctioned_coordinates(provider: &str) -> (String, String) {
+    crate::oauth::SANCTIONED_PROVIDER_REGISTRATIONS
+        .iter()
+        .find(|registration| registration.provider_id == provider)
+        .map_or_else(
+            || (provider.to_owned(), provider.to_owned()),
+            |registration| {
+                (
+                    registration.issuer.to_owned(),
+                    registration.audience.to_owned(),
+                )
+            },
+        )
+}
+
+/// A truncated document is a partial write by the origin client; anything
+/// else structurally wrong is malformed JSON.
+fn json_read_failure(error: serde_json::Error) -> LinkedSourceReadFailure {
+    if error.is_eof() {
+        LinkedSourceReadFailure::PartialWrite
+    } else {
+        LinkedSourceReadFailure::InvalidJson
+    }
 }
 
 fn codex_store_mode(root: &Path) -> CredentialStoreMode {

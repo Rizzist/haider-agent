@@ -344,8 +344,11 @@ fn provider_catalog_declares_the_vision_capability_split() {
         let expected = match provider {
             "anthropic" | "anthropic-oauth" | "bedrock" | "vertex" | "openai" | "openai-oauth"
             | "gemini" | "grok-oauth" => Some(FeatureResolve::Native),
-            // The one first-party, fixed, genuinely text-only seed catalog.
-            "deepseek" => Some(FeatureResolve::Unsupported),
+            // The one first-party, fixed, genuinely text-only seed catalog,
+            // plus the supervised ACP agent whose turn builder emits text
+            // content blocks only — an undeclared row there would let the
+            // composer accept an image the transport silently drops.
+            "deepseek" | "google-antigravity" => Some(FeatureResolve::Unsupported),
             // kimi-oauth answers per-model; openai-compatible / haider-code /
             // xai serve USER-CONTROLLED slugs. All undeclared.
             _ => None,

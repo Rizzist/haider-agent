@@ -163,6 +163,9 @@ fn palette_login_slots_name_the_real_roster() {
             "anthropic",
             "openai",
             "gemini",
+            // 970: agent-owned OAuth through Google's own `antigravity-acp`,
+            // beside — never instead of — the API-key `gemini` row above it.
+            "google",
             "kimi",
             "grok",
             "xai",
@@ -170,6 +173,13 @@ fn palette_login_slots_name_the_real_roster() {
             "custom",
         ]
     );
+    // ...and its ONLY method is the agent-owned sign-in: offering `api` here
+    // would advertise a route `/login google api` refuses.
+    let google_methods: Vec<String> = palette_items("login google ", true, &slots)
+        .iter()
+        .map(haider_tui::commands::PaletteItem::label)
+        .collect();
+    assert_eq!(google_methods, ["oauth"]);
     let methods = palette_items("login anthropic ", true, &slots);
     let oauth = methods
         .iter()
@@ -407,9 +417,24 @@ fn help_text_names_the_real_provider_roster() {
         provider_line.contains("gemini") && provider_line.contains("kimi"),
         "the real roster is named: {provider_line}"
     );
+    // 970: `google` stopped being a ghost — `/login google` is a real door
+    // (Google's own Antigravity agent performs the sign-in). The guard is
+    // therefore tighter than "never mentioned": exactly ONE help line may
+    // name it, and it is the `/login` line. The `/provider` roster still must
+    // not, because the registry class there is `gemini`.
+    let google_lines: Vec<&&str> = HELP_TEXT
+        .iter()
+        .filter(|line| line.contains("google"))
+        .collect();
+    assert_eq!(
+        google_lines.len(),
+        1,
+        "exactly one help line names google: {google_lines:?}"
+    );
     assert!(
-        !HELP_TEXT.iter().any(|line| line.contains("google")),
-        "no help line names the `google` ghost provider"
+        google_lines[0].contains("/login "),
+        "only the /login line names google: {}",
+        google_lines[0]
     );
 }
 

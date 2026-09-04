@@ -182,6 +182,23 @@
       "provider": "gemini"
     },
     {
+      "api_family": "acp_agent",
+      "auth_methods": [
+        "oauth"
+      ],
+      "auth_state": "missing",
+      "availability": "unavailable",
+      "availability_reason": "provider model inventory is unavailable",
+      "default_model": null,
+      "enabled": true,
+      "endpoint": null,
+      "fetched_at": "<volatile>",
+      "has_credential": false,
+      "inventory_age": "<volatile>",
+      "models": [],
+      "provider": "google-antigravity"
+    },
+    {
       "api_family": "openai_chat_completions",
       "auth_methods": [
         "oauth"

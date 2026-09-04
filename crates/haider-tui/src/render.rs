@@ -2119,7 +2119,7 @@ fn push_account_add_buttons<'a>(
     lines_out: &mut Vec<Line<'a>>,
     rects_out: &mut Vec<(usize, u16, u16, Hit)>,
 ) {
-    let rows: [&[(&str, crate::app::AccountAddKind)]; 7] = [
+    let rows: [&[(&str, crate::app::AccountAddKind)]; 8] = [
         &[
             ("+ OpenAI (OAuth)", crate::app::AccountAddKind::OpenAiOAuth),
             (
@@ -2137,6 +2137,12 @@ fn push_account_add_buttons<'a>(
             ("+ Grok (OAuth)", crate::app::AccountAddKind::GrokOAuth),
             ("+ Gemini (API)", crate::app::AccountAddKind::GeminiApi),
         ],
+        // 970: agent-owned OAuth on its own row — the label is long enough
+        // that pairing it would overflow the 80-column split.
+        &[(
+            "+ Google Antigravity (OAuth)",
+            crate::app::AccountAddKind::GoogleAntigravity,
+        )],
         &[
             (
                 "+ Haider Code (API)",
@@ -2190,6 +2196,60 @@ fn push_account_add_buttons<'a>(
     }
 }
 
+/// The Google Antigravity FIRST-LOGIN disclosure (970 owner decision). It
+/// states WHO performs the sign-in (Google's own agent, not Haider), WHAT that
+/// agent is (proprietary Google software under Google's terms), what it COSTS
+/// (the first-hand figures pinned in `crate::app`), and the terms warning
+/// verbatim — and only then offers a key. Nothing has been downloaded and no
+/// flow has started while this is on screen: `[1]` IS the install consent.
+///
+/// No OAuth URL, query, code or token can appear here — the card renders
+/// before any flow exists, and carries only constants.
+fn antigravity_consent_lines(theme: &Theme, width: u16) -> Vec<Line<'static>> {
+    // Four cells of indent plus slack: a produced row must never reach the
+    // pane edge, or ratatui re-wraps it and the verbatim text breaks apart.
+    let budget = usize::from(width).saturating_sub(6).max(1);
+    let mut lines = vec![Line::from(vec![
+        Span::styled("◉ ", theme.gold_style()),
+        Span::styled(
+            "Google Antigravity — the sign-in is Google's, not Haider's",
+            theme.warn_style(),
+        ),
+    ])];
+    for text in [
+        "Google's own official antigravity-acp agent performs the OAuth and keeps the token — no Google credential ever enters Haider's vault.",
+        "That agent is proprietary Google software, run under Google's terms (antigravity.google/terms).",
+    ] {
+        for row in wrap_body(text, budget) {
+            lines.push(Line::styled(format!("  {row}"), theme.dim_style()));
+        }
+    }
+    for cost in crate::app::GOOGLE_ANTIGRAVITY_COST_LINES {
+        lines.push(Line::styled(format!("  · {cost}"), theme.faint_style()));
+    }
+    lines.push(Line::styled("  ⚠ terms warning", theme.warn_style()));
+    for row in wrap_body(crate::app::GOOGLE_ANTIGRAVITY_TERMS_WARNING, budget) {
+        lines.push(Line::styled(format!("    {row}"), theme.warn_style()));
+    }
+    lines.push(Line::from(vec![Span::styled(
+        "  [1] install Google's agent and sign in · [2] cancel",
+        theme.gold_style(),
+    )]));
+    lines
+}
+
+/// Display name for one credential-source KIND. Every kind reads as its
+/// durable wire name with the underscores opened out — except the ones whose
+/// product name is not derivable that way. Google's agent is
+/// `google_antigravity` on the wire and `google-antigravity (ACP)` on screen,
+/// because the badge has to say which protocol the account is reached over.
+fn account_source_kind_label(kind: &str) -> String {
+    match kind {
+        crate::app::GOOGLE_ANTIGRAVITY_SOURCE_KIND => "google-antigravity (ACP)".to_owned(),
+        other => other.replace('_', " "),
+    }
+}
+
 fn account_source_health(source: &crate::app::AccountSourceRow) -> String {
     match source.health.as_str() {
         "ready" => "ready".to_owned(),
@@ -2199,6 +2259,8 @@ fn account_source_health(source: &crate::app::AccountSourceRow) -> String {
             match source.refresh_owner.as_str() {
                 "codex" => "Codex",
                 "claude_code" => "Claude Code",
+                "grok_cli" => "the Grok CLI",
+                "kimi_cli" => "kimi-cli",
                 _ => "origin client",
             }
         ),
@@ -2228,7 +2290,7 @@ fn push_account_source_lines<'a>(
     theme: &Theme,
     lines: &mut Vec<Line<'a>>,
 ) {
-    let kind = source.kind.replace('_', " ");
+    let kind = account_source_kind_label(&source.kind);
     let store = source.credential_store.replace('_', " ");
     let owner = source.refresh_owner.replace('_', " ");
     lines.push(Line::from(vec![
@@ -2269,6 +2331,45 @@ fn push_account_source_lines<'a>(
     ));
 }
 
+/// The source badge for one agent-owned Google account (970). Google's agent
+/// holds the credential in its OWN profile, so the daemon enrols no
+/// credential source for it and there is nothing to join by alias — the badge
+/// is derived from the account row instead, and rides the SAME
+/// [`push_account_source_lines`] renderer as every enrolled source. Nothing
+/// here is invented: the health is the daemon's own `CredentialStatus`, and
+/// every timestamp Haider cannot know (it never sees the token) stays `None`
+/// so the row says `unknown` rather than a fabricated instant.
+fn derived_antigravity_source(row: &crate::app::AccountRow) -> crate::app::AccountSourceRow {
+    crate::app::AccountSourceRow {
+        source_id: format!("antigravity:{}", row.alias),
+        account_alias: Some(haider_protocol::ids::CredentialAlias::new(
+            row.alias.clone(),
+        )),
+        kind: crate::app::GOOGLE_ANTIGRAVITY_SOURCE_KIND.to_owned(),
+        label: "Google's antigravity-acp agent".to_owned(),
+        path: None,
+        credential_store: "google agent profile".to_owned(),
+        refresh_owner: "antigravity_acp".to_owned(),
+        health: match row.status {
+            haider_protocol::credential::CredentialStatus::Ok => "ready",
+            haider_protocol::credential::CredentialStatus::Limited { .. } => "rate limited",
+            haider_protocol::credential::CredentialStatus::Expired => "expired",
+            haider_protocol::credential::CredentialStatus::Revoked => "revoked",
+            haider_protocol::credential::CredentialStatus::NeedsAttention { .. } => {
+                "needs attention"
+            }
+        }
+        .to_owned(),
+        last_seen_at_ms: None,
+        last_refreshed_at_ms: None,
+        access_expires_at_ms: None,
+        plan: None,
+        // P1 MASK LAW — one authority, exactly like every other identity the
+        // screen renders.
+        masked_identity: Some(crate::format::mask_identity(&row.identity)),
+    }
+}
+
 fn render_accounts(
     model: &AppModel,
     theme: &Theme,
@@ -2276,6 +2377,24 @@ fn render_accounts(
     area: Rect,
     hits: &mut Vec<(Rect, Hit)>,
 ) {
+    // Declared BEFORE `lines` so the derived rows outlive the frame that
+    // borrows them. A Google account that the daemon DID enrol a source for
+    // keeps that source and gets no second badge.
+    let derived_sources: Vec<crate::app::AccountSourceRow> = model
+        .accounts
+        .rows
+        .iter()
+        .filter(|row| row.provider == crate::app::GOOGLE_ANTIGRAVITY_PROVIDER)
+        .filter(|row| {
+            !model.accounts.sources.iter().any(|source| {
+                source
+                    .account_alias
+                    .as_ref()
+                    .is_some_and(|alias| alias.as_str() == row.alias)
+            })
+        })
+        .map(derived_antigravity_source)
+        .collect();
     let mut lines: Vec<Line<'_>> = Vec::new();
     // (line index, hit) pairs resolved to rects after layout.
     let mut line_hits: Vec<(usize, Hit)> = Vec::new();
@@ -2296,6 +2415,34 @@ fn render_accounts(
     ]));
     if let Some(message) = &model.accounts.message {
         lines.push(Line::styled(message.clone(), theme.gold_style()));
+    }
+    // 970 owner decision: `google-antigravity` ships ENABLED BY DEFAULT with
+    // no policy gate and carries this STANDING disclosure instead — one
+    // warning before the first login, then this line for as long as a Google
+    // account exists. The text is pinned verbatim in `crate::app`; this only
+    // wraps it.
+    if model
+        .accounts
+        .rows
+        .iter()
+        .any(|row| row.provider == crate::app::GOOGLE_ANTIGRAVITY_PROVIDER)
+    {
+        lines.push(Line::from(vec![
+            Span::styled("  ⚠ ", theme.warn_style()),
+            Span::styled(
+                "google-antigravity (ACP)",
+                theme
+                    .bright_style()
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Span::styled(" — terms warning", theme.warn_style()),
+        ]));
+        for row in wrap_body(
+            crate::app::GOOGLE_ANTIGRAVITY_TERMS_WARNING,
+            usize::from(area.width).saturating_sub(6).max(1),
+        ) {
+            lines.push(Line::styled(format!("    {row}"), theme.warn_style()));
+        }
     }
     lines.push(Line::raw(""));
 
@@ -2447,12 +2594,18 @@ fn render_accounts(
             }
             line_hits.push((lines.len(), row_hit));
             lines.push(line);
-            for source in model.accounts.sources.iter().filter(|source| {
-                source
-                    .account_alias
-                    .as_ref()
-                    .is_some_and(|alias| alias.as_str() == row.alias)
-            }) {
+            for source in model
+                .accounts
+                .sources
+                .iter()
+                .chain(derived_sources.iter())
+                .filter(|source| {
+                    source
+                        .account_alias
+                        .as_ref()
+                        .is_some_and(|alias| alias.as_str() == row.alias)
+                })
+            {
                 push_account_source_lines(source, true, theme, &mut lines);
             }
         }
@@ -2500,16 +2653,26 @@ fn render_accounts(
         footer_lines.extend(login_lines(card, theme, area.width));
         footer_lines.push(Line::raw(""));
     }
+    // 970 — the Google Antigravity disclosure sits where every other accounts
+    // card does, and owns the keyboard the same way (`[1]` / `[2]`).
+    if model.antigravity_consent.is_some() {
+        footer_lines.extend(antigravity_consent_lines(theme, area.width));
+        footer_lines.push(Line::raw(""));
+    }
     // The OAuth add card (W5e-1, sim authFlow MenuBox tui.js:3629-3682) —
     // rendered with the bottom chrome, above the add row.
     if let Some(card) = &model.oauth_add {
         // B6b: name the flow honestly — Kimi and Grok are device-code
         // grants, not loopback PKCE exchanges (the daemon owns both; the
         // card only reports).
-        let flow = if matches!(card.provider.as_str(), "kimi-oauth" | "grok-oauth") {
-            "OAuth (device code)"
-        } else {
-            "OAuth (loopback PKCE)"
+        let agent_owned = card.provider == crate::app::GOOGLE_ANTIGRAVITY_PROVIDER;
+        let flow = match card.provider.as_str() {
+            "kimi-oauth" | "grok-oauth" => "OAuth (device code)",
+            // 970: Haider drives no OAuth here at all — Google's agent owns
+            // the whole exchange, so naming a Haider-driven issuer would be
+            // a lie about who holds the token.
+            _ if agent_owned => "OAuth (Google's own agent)",
+            _ => "OAuth (loopback PKCE)",
         };
         footer_lines.push(Line::from(vec![
             Span::styled("◉ ", theme.gold_style()),
@@ -2521,20 +2684,41 @@ fn render_accounts(
         match &card.phase {
             crate::app::OAuthAddPhase::Starting => {
                 footer_lines.push(Line::styled(
-                    "  starting the loopback flow…",
+                    if agent_owned {
+                        // The install was consented on the disclosure card;
+                        // this is the honest report of what that consent set
+                        // in motion, never a silent background download.
+                        "  installing Google's agent if it is not present, then starting its sign-in…"
+                    } else {
+                        "  starting the loopback flow…"
+                    },
                     theme.dim_style(),
                 ));
             }
             crate::app::OAuthAddPhase::WaitingBrowser { origin, .. } => {
                 footer_lines.push(Line::styled(
-                    format!(
-                        "  your browser opened {} — approve there; tokens land in the vault",
-                        if origin.is_empty() {
-                            "the provider"
-                        } else {
-                            origin
-                        }
-                    ),
+                    if agent_owned {
+                        // SECURITY: the agent's sign-in URL, its query and the
+                        // authorization code never reach a rendered line — only
+                        // the FACT that a browser was opened.
+                        format!(
+                            "  {} performs the sign-in — approve in the browser it opens; the agent keeps the token, Haider never sees it",
+                            if origin.is_empty() {
+                                "Google's own antigravity-acp agent"
+                            } else {
+                                origin
+                            }
+                        )
+                    } else {
+                        format!(
+                            "  your browser opened {} — approve there; tokens land in the vault",
+                            if origin.is_empty() {
+                                "the provider"
+                            } else {
+                                origin
+                            }
+                        )
+                    },
                     theme.dim_style(),
                 ));
                 footer_lines.push(Line::styled(
@@ -2604,7 +2788,13 @@ fn render_accounts(
     // = the editable name/origin fields (the provider.configure front
     // door).
     push_custom_card_lines(model, theme, &mut footer_lines, &mut add_button_rects);
-    push_account_add_buttons(model, theme, &mut footer_lines, &mut add_button_rects);
+    // 970: the first-login disclosure is the safeguard that REPLACES a policy
+    // gate, so it has to stay readable at 80 columns. Its total modality
+    // already makes the add row dead while it is open, so the row yields to
+    // it rather than pushing the warning off a small terminal.
+    if model.antigravity_consent.is_none() {
+        push_account_add_buttons(model, theme, &mut footer_lines, &mut add_button_rects);
+    }
     footer_lines.push(Line::raw(""));
     footer_lines.push(Line::styled(
         "click an account to make it active · + adds via OAuth / API · x removes · r reveals · esc back",
