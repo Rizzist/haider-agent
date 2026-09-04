@@ -6,7 +6,7 @@
 //! supervises Google's official agent and speaks ACP to it over stdio.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use haider_protocol::provider::{CapabilityDoc, FeatureResolve, FinishReason, StreamEvent};
@@ -19,8 +19,9 @@ use crate::acp::client::{
     RefusingAcpClientHandler, rpc_error_is_cancellation,
 };
 use crate::acp::wire::{
-    ACP_ERROR_AUTH_REQUIRED, AuthMethod, AuthMethodType, ClientInfo, ContentBlock, SessionUpdate,
-    StopReason, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
+    ACP_ERROR_AUTH_REQUIRED, AcpModelCatalog, AuthMethod, AuthMethodType, ClientInfo, ContentBlock,
+    SessionConfigOption, SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallStatus,
+    ToolCallUpdate,
 };
 use crate::{
     Block, MessageRole, Provider, ProviderError, ProviderErrorKind, ProviderStream,
@@ -73,9 +74,13 @@ pub struct AntigravitySessionConfig {
     /// Extra roots the agent may touch, passed verbatim as
     /// `additionalDirectories`.
     pub additional_directories: Vec<String>,
-    /// Model slug recorded for capability reporting. Antigravity's list drifts
-    /// server-side and `gemini-pro-agent` is an irregular slug, so this is
-    /// carried opaquely and never parsed structurally.
+    /// The model the caller REQUESTS for this session — a request, not a
+    /// decision. The authoritative catalog arrives on `session/new` as a
+    /// configuration option, so this value is only the fallback recorded when
+    /// the agent published no model selector to report a current value from.
+    /// Antigravity's list drifts server-side and `gemini-pro-agent` is an
+    /// irregular slug, so it is carried opaquely and never parsed
+    /// structurally.
     pub model: String,
 }
 
@@ -84,7 +89,26 @@ pub struct AntigravitySessionConfig {
 pub struct AntigravityAcpProvider {
     connection: Arc<AcpConnection>,
     session_id: String,
+    models: Arc<Mutex<SessionModels>>,
+}
+
+/// The session's live model state.
+///
+/// Shared with the turn decoder rather than owned by the provider, because a
+/// `config_option_update` arrives mid-turn and must refresh the very cache the
+/// next selection reads.
+#[derive(Debug, Default)]
+struct SessionModels {
+    /// The slug the session is actually running on. Recorded from what the
+    /// agent reports, never from what Haider asked for.
     model: String,
+    /// The catalog the agent published. `None` means it published no model
+    /// selector at all — the ONE state that is genuinely "no catalog".
+    catalog: Option<AcpModelCatalog>,
+}
+
+fn lock_models(models: &Mutex<SessionModels>) -> MutexGuard<'_, SessionModels> {
+    models.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl AntigravityAcpProvider {
@@ -138,6 +162,18 @@ impl AntigravityAcpProvider {
             Err(error) => return Err(Self::provider_error(&connection, error)),
         };
 
+        // The model catalog is a session CONFIGURATION OPTION, resolved out of
+        // `configOptions`. Until this point in the exchange there is no model
+        // list to be had at all: ACP publishes no `models` field.
+        let catalog = AcpModelCatalog::resolve(&session.config_options);
+        // What the session runs on right now is the selector's own current
+        // value. The requested model is only a fallback for reporting, because
+        // a request is not yet a selection.
+        let model = catalog
+            .as_ref()
+            .and_then(|catalog| catalog.current_value.clone())
+            .unwrap_or_else(|| config.model.clone());
+
         tracing::debug!(
             target: "haider.provider.acp",
             agent = initialized
@@ -157,12 +193,13 @@ impl AntigravityAcpProvider {
                 .agent_capabilities
                 .as_ref()
                 .is_some_and(|capabilities| capabilities.prompt_capabilities.image),
+            offered_models = catalog.as_ref().map_or(0, |catalog| catalog.models.len()),
             "opened an ACP session with the supervised Antigravity agent"
         );
         Ok(Self {
             connection,
             session_id: session.session_id,
-            model: config.model.clone(),
+            models: Arc::new(Mutex::new(SessionModels { model, catalog })),
         })
     }
 
@@ -175,11 +212,73 @@ impl AntigravityAcpProvider {
         &self.session_id
     }
 
-    /// The model slug this session was opened for. Antigravity's catalog
-    /// drifts server-side and `gemini-pro-agent` is an irregular slug, so the
-    /// value is carried opaquely and never parsed structurally.
-    pub fn model(&self) -> &str {
-        &self.model
+    /// The model slug this session is RUNNING on: the selector's current
+    /// value, refreshed by every selection and every `config_option_update`.
+    /// Antigravity's catalog drifts server-side and `gemini-pro-agent` is an
+    /// irregular slug, so the value is carried opaquely and never parsed
+    /// structurally.
+    pub fn model(&self) -> String {
+        lock_models(&self.models).model.clone()
+    }
+
+    /// The catalog the agent published for this session, or `None` when it
+    /// published no model selector.
+    ///
+    /// A snapshot: the cache behind it is refreshed by a selection and by a
+    /// mid-turn `config_option_update`, and the caller's model policy runs
+    /// against one consistent view rather than a live borrow.
+    pub fn model_catalog(&self) -> Option<AcpModelCatalog> {
+        lock_models(&self.models).catalog.clone()
+    }
+
+    /// Puts this session on `model_id`.
+    ///
+    /// The catalog's `currentValue` is what the session is ALREADY on, so a
+    /// model that matches it is recorded without a round trip; anything else
+    /// is written with `session/set_config_option`, and the agent's answer —
+    /// the full option set — replaces the cache.
+    ///
+    /// Membership is the CALLER's policy, not this function's: the daemon
+    /// decides which offered model a session may run on, and re-deciding it
+    /// here would be a second, divergent policy.
+    pub async fn select_model(&self, model_id: &str) -> Result<(), ProviderError> {
+        let (config_id, already_current) = {
+            let state = lock_models(&self.models);
+            let Some(catalog) = state.catalog.as_ref() else {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    "the supervised Antigravity agent published no model selector for this \
+                     session, so no model can be set on it",
+                ));
+            };
+            (
+                catalog.config_id.clone(),
+                catalog.current_value.as_deref() == Some(model_id),
+            )
+        };
+        if already_current {
+            lock_models(&self.models).model = model_id.to_owned();
+            return Ok(());
+        }
+        let response = self
+            .connection
+            .set_config_option(&self.session_id, &config_id, model_id)
+            .await
+            .map_err(|error| Self::provider_error(&self.connection, error))?;
+        let refreshed = AcpModelCatalog::resolve(&response.config_options);
+        let mut state = lock_models(&self.models);
+        state.model = refreshed
+            .as_ref()
+            .and_then(|catalog| catalog.current_value.clone())
+            .unwrap_or_else(|| model_id.to_owned());
+        // A response that resolves no selector leaves the previous catalog
+        // standing: the schema lets the field be absent, and dropping a
+        // catalog the session demonstrably has would refuse the next
+        // selection on a session that can serve one.
+        if refreshed.is_some() {
+            state.catalog = refreshed;
+        }
+        Ok(())
     }
 
     pub fn connection(&self) -> &Arc<AcpConnection> {
@@ -283,8 +382,9 @@ impl Provider for AntigravityAcpProvider {
             .await
             .map_err(|error| Self::provider_error(&self.connection, error))?;
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
+        let models = Arc::clone(&self.models);
         let producer = tokio::spawn(async move {
-            drive_turn(stream, sender).await;
+            drive_turn(stream, sender, models).await;
         });
         Ok(ProviderStream::owned(receiver, producer))
     }
@@ -370,13 +470,17 @@ impl Drop for CancelOnDrop {
 /// Every exit path from this function emits either one `Finish` or one
 /// `ProviderError` and then returns, so a turn can never end with zero
 /// terminals or two.
-async fn drive_turn(mut stream: PromptStream, sender: mpsc::Sender<ProviderStreamItem>) {
+async fn drive_turn(
+    mut stream: PromptStream,
+    sender: mpsc::Sender<ProviderStreamItem>,
+    models: Arc<Mutex<SessionModels>>,
+) {
     let mut guard = CancelOnDrop {
         connection: Arc::clone(stream.connection()),
         session_id: stream.session_id().to_owned(),
         armed: true,
     };
-    let mut decoder = AcpTurnDecoder::default();
+    let mut decoder = AcpTurnDecoder::new(models);
     let mut opened = false;
     loop {
         let budget = if opened {
@@ -473,13 +577,23 @@ pub fn finish_reason(reason: StopReason) -> FinishReason {
 }
 
 /// Per-turn mapping state.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AcpTurnDecoder {
     /// Tool call id -> whether a result row has already been emitted.
     tool_calls: HashMap<String, bool>,
+    /// The session's model cache, refreshed in place by a mid-turn
+    /// `config_option_update`.
+    models: Arc<Mutex<SessionModels>>,
 }
 
 impl AcpTurnDecoder {
+    fn new(models: Arc<Mutex<SessionModels>>) -> Self {
+        Self {
+            tool_calls: HashMap::new(),
+            models,
+        }
+    }
+
     fn decode(&mut self, update: SessionUpdate) -> Vec<StreamEvent> {
         match update {
             SessionUpdate::AgentMessageChunk(chunk) => chunk
@@ -519,16 +633,39 @@ impl AcpTurnDecoder {
                 );
                 Vec::new()
             }
+            // Configuration options can change mid-session, and the model
+            // catalog is one of them. Nothing is rendered, but the cache the
+            // next selection reads is brought up to date.
+            SessionUpdate::ConfigOptionUpdate(update) => {
+                self.refresh_catalog(&update.config_options);
+                Vec::new()
+            }
             // `user_message_chunk` is the agent echoing Haider's own prompt.
             // Everything else here is agent UI state Haider does not render.
             SessionUpdate::UserMessageChunk(_)
             | SessionUpdate::Plan
             | SessionUpdate::AvailableCommandsUpdate
             | SessionUpdate::CurrentModeUpdate
-            | SessionUpdate::ConfigOptionUpdate
             | SessionUpdate::SessionInfoUpdate
             | SessionUpdate::Other => Vec::new(),
         }
+    }
+
+    /// A `config_option_update` carries the FULL option set with current
+    /// values, so a resolvable catalog REPLACES the cached one.
+    ///
+    /// An update that resolves no model selector is left alone: it is some
+    /// other option's state, and treating it as a withdrawal would refuse the
+    /// next selection on a session whose catalog never went away.
+    fn refresh_catalog(&self, options: &[SessionConfigOption]) {
+        let Some(catalog) = AcpModelCatalog::resolve(options) else {
+            return;
+        };
+        let mut state = lock_models(&self.models);
+        if let Some(current) = catalog.current_value.clone() {
+            state.model = current;
+        }
+        state.catalog = Some(catalog);
     }
 
     /// AGENT-EXECUTED tool calls surface as display-only server-tool rows.

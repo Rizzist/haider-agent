@@ -127,10 +127,16 @@ fn client_info() -> ClientInfo {
 }
 
 fn session_config() -> AntigravitySessionConfig {
+    session_config_requesting("gemini-3.7-flash-high")
+}
+
+/// The same config with an explicit REQUESTED model, so a test can tell what
+/// the session was asked for apart from what it ended up running on.
+fn session_config_requesting(model: &str) -> AntigravitySessionConfig {
     AntigravitySessionConfig {
         cwd: "/workspace".to_owned(),
         additional_directories: Vec::new(),
-        model: "gemini-3.7-flash-high".to_owned(),
+        model: model.to_owned(),
     }
 }
 
@@ -164,6 +170,24 @@ async fn serve_handshake(
     agent: &mut FakeAgent,
     auth_methods: Value,
     protocol_version: u16,
+) -> String {
+    serve_handshake_returning(
+        agent,
+        auth_methods,
+        protocol_version,
+        json!({ "sessionId": FIXTURE_SESSION_ID }),
+    )
+    .await
+}
+
+/// The same exchange, with the caller supplying the `session/new` RESULT — the
+/// frame that carries `modes` and `configOptions`, and therefore the model
+/// catalog.
+async fn serve_handshake_returning(
+    agent: &mut FakeAgent,
+    auth_methods: Value,
+    protocol_version: u16,
+    session_result: Value,
 ) -> String {
     let initialize = agent.next_request().await;
     assert_eq!(initialize["method"], "initialize");
@@ -213,7 +237,7 @@ async fn serve_handshake(
         .send(&json!({
             "jsonrpc": "2.0",
             "id": new_session["id"],
-            "result": { "sessionId": FIXTURE_SESSION_ID },
+            "result": session_result,
         }))
         .await;
     method_id
@@ -1452,4 +1476,574 @@ fn an_unknown_session_update_variant_decodes_to_the_catch_all() {
         serde_json::from_value(json!({ "sessionUpdate": "not_in_v1", "extra": 1 }))
             .expect("an unknown variant decodes rather than failing the stream");
     assert!(matches!(update, SessionUpdate::Other));
+}
+
+// ---------------------------------------------------------------------------
+// Model catalog (a session CONFIGURATION OPTION, not an ACP field)
+// ---------------------------------------------------------------------------
+
+/// The model selector as a FLAT `select` option carrying the reserved `model`
+/// category — the shape the schema documents first.
+fn flat_model_option(current: &str) -> Value {
+    json!({
+        "id": "model",
+        "name": "Model",
+        "category": "model",
+        "type": "select",
+        "currentValue": current,
+        "options": [
+            { "value": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (high)" },
+            { "value": "gemini-3.7-flash-high", "name": "Gemini 3.7 Flash (high)" },
+            { "value": "gemini-pro-agent", "name": "Gemini Pro Agent" },
+        ],
+    })
+}
+
+/// The same selector in the GROUPED shape the `anyOf` also permits.
+fn grouped_model_option(current: &str) -> Value {
+    json!({
+        "id": "model",
+        "name": "Model",
+        "category": "model",
+        "type": "select",
+        "currentValue": current,
+        "options": [
+            {
+                "group": "flash",
+                "name": "Flash",
+                "options": [
+                    { "value": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (high)" },
+                    { "value": "gemini-3.8-flash-low", "name": "Gemini 3.8 Flash (low)" },
+                ],
+            },
+            {
+                "group": "pro",
+                "name": "Pro",
+                "options": [{ "value": "gemini-pro-agent", "name": "Gemini Pro Agent" }],
+            },
+        ],
+    })
+}
+
+fn session_result(config_options: Value) -> Value {
+    json!({ "sessionId": FIXTURE_SESSION_ID, "configOptions": config_options })
+}
+
+/// Handshakes against a fixture that answers `session/new` with `result`, and
+/// hands the still-open fixture back so the test can keep serving.
+async fn handshake_with_session_result(
+    requested_model: &str,
+    result: Value,
+) -> (AntigravityAcpProvider, tokio::task::JoinHandle<FakeAgent>) {
+    let (connection, mut agent) = connect_pair(refusing());
+    let script = tokio::spawn(async move {
+        serve_handshake_returning(&mut agent, live_auth_methods(), 1, result).await;
+        agent
+    });
+    let provider =
+        AntigravityAcpProvider::handshake(connection, &session_config_requesting(requested_model))
+            .await
+            .expect("handshakes with the fixture agent");
+    (provider, script)
+}
+
+/// A flat model select publishes the catalog the daemon's policy consumes:
+/// ids, display names, the `configId` a selection must name, and the value the
+/// session is ALREADY on.
+///
+/// MUTATION CHECK: read the catalog off a `models`/`availableModels` field on
+/// `NewSessionResponse`. Expected runtime failure: no published ACP schema has
+/// one, the fixture sends none, and `model_catalog()` is `None`.
+#[tokio::test]
+async fn a_flat_model_select_option_publishes_the_session_catalog() {
+    let (provider, script) = handshake_with_session_result(
+        "gemini-3.8-flash-high",
+        session_result(json!([flat_model_option("gemini-3.7-flash-high")])),
+    )
+    .await;
+    let _agent = script.await.expect("the fixture script completes");
+
+    let catalog = provider
+        .model_catalog()
+        .expect("the agent published a model selector");
+    assert_eq!(catalog.config_id, "model");
+    assert_eq!(
+        catalog.current_value.as_deref(),
+        Some("gemini-3.7-flash-high")
+    );
+    assert_eq!(
+        catalog.model_ids(),
+        vec![
+            "gemini-3.8-flash-high".to_owned(),
+            "gemini-3.7-flash-high".to_owned(),
+            "gemini-pro-agent".to_owned(),
+        ]
+    );
+    assert_eq!(catalog.models[0].name, "Gemini 3.8 Flash (high)");
+    assert_eq!(
+        provider.model(),
+        "gemini-3.7-flash-high",
+        "the session reports the model it is RUNNING on, not the one requested"
+    );
+}
+
+/// The GROUPED `anyOf` shape flattens to the same catalog, in wire order.
+///
+/// MUTATION CHECK: decode only the flat variant. Expected runtime failure: the
+/// grouped array does not match `SessionConfigSelectOption`, the option
+/// publishes nothing, and `model_catalog()` is `None`.
+#[tokio::test]
+async fn a_grouped_model_select_option_is_flattened_in_wire_order() {
+    let (provider, script) = handshake_with_session_result(
+        "",
+        session_result(json!([grouped_model_option("gemini-3.8-flash-low")])),
+    )
+    .await;
+    let _agent = script.await.expect("the fixture script completes");
+
+    let catalog = provider.model_catalog().expect("a grouped selector");
+    assert_eq!(
+        catalog.model_ids(),
+        vec![
+            "gemini-3.8-flash-high".to_owned(),
+            "gemini-3.8-flash-low".to_owned(),
+            "gemini-pro-agent".to_owned(),
+        ],
+        "groups are flattened, and group order is wire order"
+    );
+    assert_eq!(
+        catalog.current_value.as_deref(),
+        Some("gemini-3.8-flash-low")
+    );
+}
+
+/// A session that publishes no model selector publishes no catalog. Two
+/// near-misses are present and neither is one: `modes` — whose
+/// `availableModes`/`currentModeId` are the fields most easily mistaken for a
+/// model list, so the fixture fills them with model-shaped ids — and a
+/// `boolean` option that is NAMED `model` and even carries an `options` array.
+///
+/// MUTATION CHECK 1: resolve the catalog from `modes.availableModes`. Expected
+/// runtime failure: `model_catalog()` becomes `Some` and the `is_none`
+/// assertion fails.
+///
+/// MUTATION CHECK 2: let `SessionConfigOptionType::Boolean` publish options.
+/// Expected runtime failure: `not-a-model` resolves as a catalog and the same
+/// assertion fails.
+#[tokio::test]
+async fn no_model_selector_means_no_catalog_and_modes_are_never_models() {
+    let (provider, script) = handshake_with_session_result(
+        "gemini-3.8-flash-high",
+        json!({
+            "sessionId": FIXTURE_SESSION_ID,
+            "modes": {
+                "currentModeId": "gemini-3.7-flash-high",
+                "availableModes": [
+                    { "id": "gemini-3.7-flash-high", "name": "Fast" },
+                    { "id": "gemini-pro-agent", "name": "Deep" },
+                ],
+            },
+            "configOptions": [
+                { "id": "yolo", "name": "Auto approve", "type": "boolean", "currentValue": true },
+                {
+                    "id": "model",
+                    "name": "Model preview",
+                    "type": "boolean",
+                    "currentValue": false,
+                    "options": [{ "value": "not-a-model", "name": "Not a model" }],
+                },
+            ],
+        }),
+    )
+    .await;
+    let _agent = script.await.expect("the fixture script completes");
+
+    assert!(
+        provider.model_catalog().is_none(),
+        "a mode list and a boolean option named `model` are not a model catalog"
+    );
+    assert_eq!(
+        provider.model(),
+        "gemini-3.8-flash-high",
+        "with no selector to report, the requested model is what is recorded"
+    );
+}
+
+/// A `session/new` response carrying unknown extra fields, an unknown
+/// `category` and an unknown config-option `type` decodes without failing, and
+/// the real selector is still found. ACP is explicitly extensible; a decode
+/// failure here would drop a catalog the agent did publish.
+///
+/// MUTATION CHECK: `#[serde(deny_unknown_fields)]` on `SessionConfigOption`.
+/// Expected runtime failure: the `session/new` result no longer decodes, the
+/// handshake returns a malformed-frame error and the test panics on `expect`.
+#[tokio::test]
+async fn unknown_fields_categories_and_option_types_never_fail_the_catalog() {
+    let (provider, script) = handshake_with_session_result(
+        "",
+        json!({
+            "sessionId": FIXTURE_SESSION_ID,
+            "_meta": { "vendor": "google" },
+            "somethingHaiderHasNeverHeardOf": [1, 2, 3],
+            "configOptions": [
+                {
+                    "id": "telemetry",
+                    "name": "Telemetry",
+                    "category": "diagnostics",
+                    "type": "slider",
+                    "currentValue": 3,
+                    "_meta": { "unit": "level" },
+                },
+                {
+                    "id": "reasoning",
+                    "name": "Show reasoning",
+                    "category": "presentation",
+                    "type": "boolean",
+                    "currentValue": false,
+                },
+                {
+                    "id": "engine",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "gemini-3.8-flash-high",
+                    "unknownOptionField": true,
+                    "options": [
+                        {
+                            "value": "gemini-3.8-flash-high",
+                            "name": "Gemini 3.8 Flash (high)",
+                            "_meta": { "badge": "new" },
+                        },
+                        { "value": "gemini-pro-agent" },
+                    ],
+                },
+            ],
+        }),
+    )
+    .await;
+    let _agent = script.await.expect("the fixture script completes");
+
+    let catalog = provider
+        .model_catalog()
+        .expect("the unknown neighbours did not take the catalog down");
+    assert_eq!(catalog.config_id, "engine");
+    assert_eq!(
+        catalog.model_ids(),
+        vec![
+            "gemini-3.8-flash-high".to_owned(),
+            "gemini-pro-agent".to_owned(),
+        ],
+        "the categorized selector is the catalog, unknown neighbours and all"
+    );
+    assert_eq!(
+        catalog.models[1].name, "gemini-pro-agent",
+        "an option that published no name displays as its own id"
+    );
+}
+
+/// The reserved `model` CATEGORY wins over an option merely named `model`.
+///
+/// MUTATION CHECK: try the id convention before the category. Expected runtime
+/// failure: the catalog resolves to `model`/`legacy-only` and both assertions
+/// below fail.
+#[tokio::test]
+async fn the_model_category_wins_over_an_option_merely_named_model() {
+    let (provider, script) = handshake_with_session_result(
+        "",
+        session_result(json!([
+            {
+                "id": "model",
+                "name": "Legacy",
+                "type": "select",
+                "currentValue": "legacy-only",
+                "options": [{ "value": "legacy-only", "name": "Legacy only" }],
+            },
+            {
+                "id": "engine",
+                "name": "Model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "gemini-3.8-flash-high",
+                "options": [
+                    { "value": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (high)" },
+                    { "value": "gemini-pro-agent", "name": "Gemini Pro Agent" },
+                ],
+            },
+        ])),
+    )
+    .await;
+    let _agent = script.await.expect("the fixture script completes");
+
+    let catalog = provider.model_catalog().expect("the categorized selector");
+    assert_eq!(catalog.config_id, "engine");
+    assert!(
+        !catalog.model_ids().contains(&"legacy-only".to_owned()),
+        "the option named `model` was not the selector: {:?}",
+        catalog.model_ids()
+    );
+}
+
+/// With no category published anywhere, the `model` id is the fallback. The
+/// schema forbids requiring a category for correctness, so a catalog must
+/// still be reachable without one.
+///
+/// MUTATION CHECK: drop the id fallback and resolve by category only. Expected
+/// runtime failure: `model_catalog()` is `None` and the `expect` panics.
+#[tokio::test]
+async fn the_model_id_is_the_fallback_when_no_category_is_published() {
+    let (provider, script) = handshake_with_session_result(
+        "",
+        session_result(json!([
+            {
+                "id": "verbosity",
+                "name": "Verbosity",
+                "type": "select",
+                "currentValue": "normal",
+                "options": [
+                    { "value": "normal", "name": "Normal" },
+                    { "value": "terse", "name": "Terse" },
+                ],
+            },
+            {
+                "id": "model",
+                "name": "Model",
+                "type": "select",
+                "currentValue": "gemini-3.7-flash-high",
+                "options": [
+                    { "value": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (high)" },
+                    { "value": "gemini-3.7-flash-high", "name": "Gemini 3.7 Flash (high)" },
+                ],
+            },
+        ])),
+    )
+    .await;
+    let _agent = script.await.expect("the fixture script completes");
+
+    let catalog = provider.model_catalog().expect("the id fallback");
+    assert_eq!(catalog.config_id, "model");
+    assert_eq!(
+        catalog.current_value.as_deref(),
+        Some("gemini-3.7-flash-high")
+    );
+    assert!(
+        !catalog.model_ids().contains(&"terse".to_owned()),
+        "an unrelated select is not a model catalog: {:?}",
+        catalog.model_ids()
+    );
+}
+
+/// Selecting a model that is not the one in force writes
+/// `session/set_config_option` naming the selector's own `configId`, carrying
+/// the STRING value variant (no `type` on the wire), and refreshes the cache
+/// from the full option set the agent answers with.
+///
+/// MUTATION CHECK: send `{"type":"boolean","value":...}` instead of the string
+/// variant. Expected runtime failure: the fixture's `type`-absent assertion
+/// fires.
+#[tokio::test]
+async fn selecting_a_non_current_model_writes_set_config_option_with_the_string_variant() {
+    let (connection, mut agent) = connect_pair(refusing());
+    let script = tokio::spawn(async move {
+        serve_handshake_returning(
+            &mut agent,
+            live_auth_methods(),
+            1,
+            session_result(json!([flat_model_option("gemini-3.7-flash-high")])),
+        )
+        .await;
+        let set = agent.next_request().await;
+        assert_eq!(set["method"], "session/set_config_option");
+        assert_eq!(set["params"]["sessionId"], FIXTURE_SESSION_ID);
+        assert_eq!(set["params"]["configId"], "model");
+        assert_eq!(set["params"]["value"], "gemini-3.8-flash-high");
+        assert!(
+            set["params"].get("type").is_none(),
+            "the string value variant carries no `type`: {}",
+            set["params"]
+        );
+        agent
+            .send(&json!({
+                "jsonrpc": "2.0",
+                "id": set["id"],
+                "result": { "configOptions": [flat_model_option("gemini-3.8-flash-high")] },
+            }))
+            .await;
+        agent
+    });
+
+    let provider = AntigravityAcpProvider::handshake(
+        connection,
+        &session_config_requesting("gemini-3.8-flash-high"),
+    )
+    .await
+    .expect("handshakes with the fixture agent");
+    provider
+        .select_model("gemini-3.8-flash-high")
+        .await
+        .expect("selects an offered model");
+    let _agent = script.await.expect("the fixture script completes");
+
+    assert_eq!(provider.model(), "gemini-3.8-flash-high");
+    assert_eq!(
+        provider
+            .model_catalog()
+            .expect("catalog")
+            .current_value
+            .as_deref(),
+        Some("gemini-3.8-flash-high"),
+        "the cache is refreshed from the agent's answer, not from the request"
+    );
+}
+
+/// Selecting the model already in force writes NO frame: `currentValue` is
+/// what the session is running on, and a round trip to set it to itself would
+/// spend a Google round trip per turn.
+///
+/// MUTATION CHECK: always write `session/set_config_option`. Expected runtime
+/// failure: the fixture's next request is `session/set_config_option` instead
+/// of `session/prompt` and its assertion fires.
+#[tokio::test]
+async fn selecting_the_model_already_in_force_writes_no_frame() {
+    let (connection, mut agent) = connect_pair(refusing());
+    let script = tokio::spawn(async move {
+        serve_handshake_returning(
+            &mut agent,
+            live_auth_methods(),
+            1,
+            session_result(json!([flat_model_option("gemini-3.7-flash-high")])),
+        )
+        .await;
+        let next = agent.next_request().await;
+        assert_eq!(
+            next["method"], "session/prompt",
+            "nothing was written between the handshake and the turn: {next}"
+        );
+        agent
+            .send(&json!({
+                "jsonrpc": "2.0",
+                "id": next["id"],
+                "result": { "stopReason": "end_turn" },
+            }))
+            .await;
+        agent
+    });
+
+    let provider = AntigravityAcpProvider::handshake(
+        connection,
+        &session_config_requesting("gemini-3.7-flash-high"),
+    )
+    .await
+    .expect("handshakes with the fixture agent");
+    provider
+        .select_model("gemini-3.7-flash-high")
+        .await
+        .expect("the model already in force");
+    let mut stream = provider
+        .stream_turn(turn_request("explain the diff"))
+        .await
+        .expect("opens a turn");
+    let items = drain(&mut stream).await;
+    let _agent = script.await.expect("the fixture script completes");
+
+    assert_eq!(rendered(&items), vec!["finish:EndTurn".to_owned()]);
+    assert_eq!(provider.model(), "gemini-3.7-flash-high");
+}
+
+/// A mid-turn `config_option_update` carries the FULL option set with current
+/// values, so it refreshes the cached catalog — and the recorded model with it.
+///
+/// MUTATION CHECK: keep ignoring `config_option_update`. Expected runtime
+/// failure: the catalog still reports `gemini-3.7-flash-high` and both
+/// post-turn assertions fail.
+#[tokio::test]
+async fn a_config_option_update_refreshes_the_cached_catalog() {
+    let (connection, mut agent) = connect_pair(refusing());
+    let script = tokio::spawn(async move {
+        serve_handshake_returning(
+            &mut agent,
+            live_auth_methods(),
+            1,
+            session_result(json!([flat_model_option("gemini-3.7-flash-high")])),
+        )
+        .await;
+        let prompt = agent.next_request().await;
+        assert_eq!(prompt["method"], "session/prompt");
+        agent
+            .send_update(json!({
+                "sessionUpdate": "config_option_update",
+                "configOptions": [{
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "gemini-pro-agent",
+                    "options": [
+                        { "value": "gemini-pro-agent", "name": "Gemini Pro Agent" },
+                        { "value": "gemini-3.9-flash-high", "name": "Gemini 3.9 Flash (high)" },
+                    ],
+                }],
+            }))
+            .await;
+        agent
+            .send(&json!({
+                "jsonrpc": "2.0",
+                "id": prompt["id"],
+                "result": { "stopReason": "end_turn" },
+            }))
+            .await;
+        agent
+    });
+
+    let provider = AntigravityAcpProvider::handshake(
+        connection,
+        &session_config_requesting("gemini-3.7-flash-high"),
+    )
+    .await
+    .expect("handshakes with the fixture agent");
+    let mut stream = provider
+        .stream_turn(turn_request("explain the diff"))
+        .await
+        .expect("opens a turn");
+    let items = drain(&mut stream).await;
+    let _agent = script.await.expect("the fixture script completes");
+
+    assert_eq!(
+        rendered(&items),
+        vec!["finish:EndTurn".to_owned()],
+        "a config-option update renders nothing"
+    );
+    let catalog = provider.model_catalog().expect("the refreshed catalog");
+    assert_eq!(catalog.current_value.as_deref(), Some("gemini-pro-agent"));
+    assert_eq!(
+        catalog.model_ids(),
+        vec![
+            "gemini-pro-agent".to_owned(),
+            "gemini-3.9-flash-high".to_owned(),
+        ],
+        "the update REPLACES the catalog; it is not a delta"
+    );
+    assert_eq!(provider.model(), "gemini-pro-agent");
+}
+
+/// A session with no selector cannot be put on a model at all, and says so
+/// instead of pretending the write happened.
+///
+/// MUTATION CHECK: return `Ok(())` from `select_model` when no catalog exists.
+/// Expected runtime failure: `expect_err` panics.
+#[tokio::test]
+async fn selecting_a_model_without_a_selector_is_refused_rather_than_faked() {
+    let (provider, script) =
+        handshake_with_session_result("gemini-3.8-flash-high", session_result(json!([]))).await;
+    let _agent = script.await.expect("the fixture script completes");
+
+    let error = provider
+        .select_model("gemini-3.8-flash-high")
+        .await
+        .expect_err("there is nothing to set");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    assert!(
+        error.message.contains("no model selector"),
+        "the refusal names what is missing: {}",
+        error.message
+    );
 }

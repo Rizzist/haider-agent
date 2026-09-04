@@ -2,7 +2,7 @@
 //! speaks to Google's supervised `antigravity-acp` agent.
 //!
 //! Every field name here was read out of the published v1 JSON schema and is
-//! recorded in `docs/testing/v0.0.970/_acp-wire-facts.md`; ACP is camelCase on
+//! recorded in `docs/testing/v0.0.970/googleoauth_acp-wire-facts.md`; ACP is camelCase on
 //! the wire and explicitly extensible through `_meta`, so every type in this
 //! file IGNORES unknown fields instead of rejecting them. `protocolVersion` is
 //! an integer (uint16), never a string.
@@ -34,6 +34,7 @@ pub const METHOD_AUTHENTICATE: &str = "authenticate";
 pub const METHOD_SESSION_NEW: &str = "session/new";
 pub const METHOD_SESSION_PROMPT: &str = "session/prompt";
 pub const METHOD_SESSION_CANCEL: &str = "session/cancel";
+pub const METHOD_SESSION_SET_CONFIG_OPTION: &str = "session/set_config_option";
 pub const METHOD_SESSION_UPDATE: &str = "session/update";
 pub const METHOD_SESSION_REQUEST_PERMISSION: &str = "session/request_permission";
 pub const METHOD_FS_READ_TEXT_FILE: &str = "fs/read_text_file";
@@ -340,6 +341,332 @@ pub struct NewSessionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct NewSessionResponse {
     pub session_id: String,
+    /// Session MODES. A different thing from the model catalog: see
+    /// [`SessionModeState`].
+    #[serde(default)]
+    pub modes: Option<SessionModeState>,
+    /// Session configuration options. The MODEL CATALOG is one of these —
+    /// there is no `models` field and no `session/set_model` method in any
+    /// published ACP schema, so [`AcpModelCatalog::resolve`] is how a model
+    /// list is obtained at all.
+    #[serde(default)]
+    pub config_options: Vec<SessionConfigOption>,
+}
+
+// ---------------------------------------------------------------------------
+// Session modes — NOT models
+// ---------------------------------------------------------------------------
+
+/// `SessionModeState`: the session's operating MODES.
+///
+/// `availableModes`/`currentModeId` are the two fields most easily mistaken
+/// for a model catalog, and they are not one — modes are switched with
+/// `session/set_mode`, and nothing decoded here ever reaches
+/// [`AcpModelCatalog`]. Haider does not drive modes in this slice; the block
+/// is decoded so it is visibly a different thing rather than an unknown one.
+///
+/// Every field is optional even where the schema requires it, because a
+/// partial or future-shaped `modes` block must not fail the whole
+/// [`NewSessionResponse`] — that would take the model catalog down with a
+/// value Haider does not even use.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModeState {
+    #[serde(default)]
+    pub current_mode_id: Option<String>,
+    #[serde(default)]
+    pub available_modes: Vec<SessionMode>,
+}
+
+/// One entry of [`SessionModeState::available_modes`]. Decode-only.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SessionMode {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Session configuration options — where the MODEL CATALOG lives
+// ---------------------------------------------------------------------------
+
+/// The option id Haider falls back to when no option declares the reserved
+/// `model` category.
+///
+/// This is an observed AGENT CONVENTION, not a spec guarantee, which is why it
+/// is only ever consulted after the category.
+pub const ACP_MODEL_CONFIG_OPTION_ID: &str = "model";
+
+/// One `SessionConfigOption`.
+///
+/// The schema models this as a `oneOf` discriminated by `type` — exactly the
+/// shape [`AuthMethod`] already has in this file — so it is decoded the same
+/// way: the shared fields are named, and the discriminator is a scalar enum
+/// with a catch-all. An option whose `type` is absent or unknown therefore
+/// stays a decodable option that is merely not readable as something it never
+/// declared itself to be, instead of a decode failure that would drop the
+/// whole catalog with it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionConfigOption {
+    /// `SessionConfigId`. This is the `configId` a
+    /// [`SetSessionConfigOptionRequest`] must name.
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// A UX HINT only. The schema states it "MUST NOT be required for
+    /// correctness" and that clients "MUST handle missing or unknown
+    /// categories gracefully", so an absent or unrecognized category decodes
+    /// to [`SessionConfigCategory::Other`] and resolution falls back to the
+    /// option id rather than failing.
+    #[serde(default)]
+    pub category: SessionConfigCategory,
+    #[serde(default, rename = "type")]
+    pub option_type: SessionConfigOptionType,
+    /// `select` carries a `SessionConfigValueId` string here; `boolean`
+    /// carries a bool. One wire field carries both variants, so it is kept as
+    /// raw JSON and a select's value is read through
+    /// [`Self::current_select_value`], which answers `None` for every
+    /// non-string payload.
+    #[serde(default)]
+    pub current_value: Option<Value>,
+    /// Published only by a `select`. `anyOf`: a FLAT option array or a GROUPED
+    /// one.
+    #[serde(default)]
+    pub options: Option<SessionConfigSelectOptions>,
+}
+
+impl SessionConfigOption {
+    /// The current value of a SELECT option, or `None` when the option
+    /// published a non-string value (a `boolean`'s bool) or none at all.
+    pub fn current_select_value(&self) -> Option<&str> {
+        self.current_value.as_ref().and_then(Value::as_str)
+    }
+}
+
+/// `SessionConfigOptionCategory`. The schema reserves `mode`, `model`
+/// ("Model selector") and `model_config`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionConfigCategory {
+    Mode,
+    /// The reserved "Model selector" category. The FIRST thing
+    /// [`AcpModelCatalog::resolve`] looks for.
+    Model,
+    ModelConfig,
+    /// Absent, or a category this version does not know. Both are the same
+    /// thing to a client the schema forbids from requiring the field.
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+/// The `type` discriminator of a [`SessionConfigOption`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionConfigOptionType {
+    Select,
+    Boolean,
+    /// Absent, or a type this version does not know.
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+impl SessionConfigOptionType {
+    /// Whether an option of this type may be READ as one that publishes a
+    /// value set.
+    ///
+    /// [`Self::Other`] is included deliberately: an unknown or absent `type`
+    /// alongside a published `options` array is precisely the case the schema
+    /// requires a client to degrade through, and reading it as a select is
+    /// what degrading means here. Only a declared `boolean` is excluded,
+    /// because it has declared a value that is not one of a set.
+    pub fn may_publish_options(self) -> bool {
+        !matches!(self, Self::Boolean)
+    }
+}
+
+/// `SessionConfigSelectOptions`: an `anyOf` of a FLAT option array and a
+/// GROUPED one. Both shapes are legal, so both are decoded and the grouped
+/// form is flattened at the point of use.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SessionConfigSelectOptions {
+    /// A flat array of [`SessionConfigSelectOption`].
+    Flat(Vec<SessionConfigSelectOption>),
+    /// An array of [`SessionConfigSelectGroup`].
+    Grouped(Vec<SessionConfigSelectGroup>),
+}
+
+impl SessionConfigSelectOptions {
+    /// Every published option in WIRE ORDER, with group structure flattened
+    /// away. A group's own name is display-only and selection names a value,
+    /// so nothing selection needs is lost by flattening.
+    pub fn flattened(&self) -> Vec<&SessionConfigSelectOption> {
+        match self {
+            Self::Flat(options) => options.iter().collect(),
+            Self::Grouped(groups) => groups
+                .iter()
+                .flat_map(|group| group.options.iter())
+                .collect(),
+        }
+    }
+}
+
+/// `SessionConfigSelectOption`.
+///
+/// `value` is the `SessionConfigValueId` a [`SetSessionConfigOptionRequest`]
+/// carries, and it is NEVER defaulted: its required-ness is what lets the
+/// untagged `anyOf` above tell a flat option from a group.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SessionConfigSelectOption {
+    pub value: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// `SessionConfigSelectGroup`. `group` and `options` are never defaulted for
+/// the same reason `value` is not.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SessionConfigSelectGroup {
+    pub group: String,
+    #[serde(default)]
+    pub name: String,
+    pub options: Vec<SessionConfigSelectOption>,
+}
+
+/// The model catalog resolved out of one session's configuration options.
+///
+/// ACP publishes no model list of its own — there is no `models` field, no
+/// `availableModels`, no `currentModelId` and no `session/set_model` method in
+/// any published schema. The catalog IS whichever [`SessionConfigOption`] the
+/// agent designated as its model selector, so this projection carries the
+/// `configId` needed to change it alongside the ids and names it offers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcpModelCatalog {
+    /// The `configId` `session/set_config_option` must name.
+    pub config_id: String,
+    /// The value the agent says the session is CURRENTLY on. `None` when the
+    /// selector published none, which a selection policy reads as "this agent
+    /// designated no default".
+    pub current_value: Option<String>,
+    /// Every offered model, in wire order.
+    pub models: Vec<AcpModelOption>,
+}
+
+/// One offered model: the id a selection names, and the name a UI shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpModelOption {
+    /// `SessionConfigValueId`. OPAQUE: `gemini-pro-agent` is a live slug that
+    /// no `<family>-<tier>` parse survives, so it is never parsed
+    /// structurally.
+    pub id: String,
+    /// Display name, falling back to the id when the agent published none.
+    pub name: String,
+}
+
+impl AcpModelCatalog {
+    /// Resolves the model selector out of a session's configuration options.
+    ///
+    /// Order: an option carrying the reserved
+    /// [`SessionConfigCategory::Model`], else one whose id is
+    /// [`ACP_MODEL_CONFIG_OPTION_ID`]. Each candidate is tried in turn, so a
+    /// categorized option that publishes nothing usable does not mask a
+    /// conventionally named one that does.
+    ///
+    /// `None` — and only `None` — means the agent published NO model catalog.
+    pub fn resolve(options: &[SessionConfigOption]) -> Option<Self> {
+        options
+            .iter()
+            .filter(|option| option.category == SessionConfigCategory::Model)
+            .find_map(Self::project)
+            .or_else(|| {
+                options
+                    .iter()
+                    .filter(|option| option.id == ACP_MODEL_CONFIG_OPTION_ID)
+                    .find_map(Self::project)
+            })
+    }
+
+    /// Projects ONE option, or `None` when it cannot serve as a model
+    /// selector: a declared `boolean`, an option publishing no `options`
+    /// array, or one publishing an empty set — a selector offering nothing is
+    /// no catalog.
+    fn project(option: &SessionConfigOption) -> Option<Self> {
+        if !option.option_type.may_publish_options() {
+            return None;
+        }
+        let models: Vec<AcpModelOption> = option
+            .options
+            .as_ref()?
+            .flattened()
+            .into_iter()
+            .map(|entry| AcpModelOption {
+                id: entry.value.clone(),
+                name: if entry.name.is_empty() {
+                    entry.value.clone()
+                } else {
+                    entry.name.clone()
+                },
+            })
+            .collect();
+        if models.is_empty() {
+            return None;
+        }
+        Some(Self {
+            config_id: option.id.clone(),
+            current_value: option.current_select_value().map(str::to_owned),
+            models,
+        })
+    }
+
+    /// The offered ids in wire order — the exact shape a selection policy
+    /// consumes.
+    pub fn model_ids(&self) -> Vec<String> {
+        self.models.iter().map(|model| model.id.clone()).collect()
+    }
+}
+
+/// `SetSessionConfigOptionRequest`.
+///
+/// The value is a `SessionConfigValueId` STRING, which the schema documents as
+/// the DEFAULT variant when `type` is absent on the wire, so no `type` is
+/// serialized. Haider never sends the boolean variant: the only configuration
+/// option it ever sets is the model selector.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionConfigOptionRequest {
+    pub session_id: String,
+    pub config_id: String,
+    pub value: String,
+}
+
+/// `SetSessionConfigOptionResponse`: the FULL option set again, with current
+/// values, so a caller refreshes its cache from the agent's answer instead of
+/// assuming its write took.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionConfigOptionResponse {
+    #[serde(default)]
+    pub config_options: Vec<SessionConfigOption>,
+}
+
+/// `ConfigOptionUpdate`, carried by the `config_option_update` session update:
+/// the FULL option set with current values, never a delta. What it carries
+/// REPLACES a cached catalog.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigOptionUpdate {
+    #[serde(default)]
+    pub config_options: Vec<SessionConfigOption>,
 }
 
 // ---------------------------------------------------------------------------
@@ -406,7 +733,7 @@ pub enum SessionUpdate {
     Plan,
     AvailableCommandsUpdate,
     CurrentModeUpdate,
-    ConfigOptionUpdate,
+    ConfigOptionUpdate(ConfigOptionUpdate),
     SessionInfoUpdate,
     UsageUpdate(UsageUpdate),
     #[serde(other)]

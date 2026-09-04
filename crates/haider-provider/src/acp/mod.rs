@@ -8,7 +8,7 @@
 //! 2.0, camelCase on the wire.
 //!
 //! Ground truth for every field name, method name, error code and framing rule
-//! in this module is `docs/testing/v0.0.970/_acp-wire-facts.md`, which was
+//! in this module is `docs/testing/v0.0.970/googleoauth_acp-wire-facts.md`, which was
 //! extracted from the published v1 JSON schema and from a live handshake
 //! against the real 1.1.1 binary.
 //!
@@ -36,3 +36,7 @@ pub const GOOGLE_ANTIGRAVITY_PROVIDER_NAME: &str = "google-antigravity";
 pub use antigravity::{
     ACP_OAUTH_PERSONAL_METHOD_ID, AntigravityAcpProvider, AntigravitySessionConfig,
 };
+/// The model catalog is a session CONFIGURATION OPTION, not an ACP field of
+/// its own, so its projection is re-exported here beside the adapter that
+/// resolves it.
+pub use wire::{ACP_MODEL_CONFIG_OPTION_ID, AcpModelCatalog, AcpModelOption};

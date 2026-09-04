@@ -28,10 +28,11 @@ use std::sync::Arc;
 use haider_accounts::CredentialAlias;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::provider::CapabilityDoc;
+use haider_provider::acp::AcpModelCatalog;
 use haider_provider::acp::client::AcpLaunchSpec;
 use haider_provider::{
-    AntigravityAcpProvider, AntigravitySessionConfig, Provider, ProviderError, ProviderStream,
-    TurnRequest,
+    AntigravityAcpProvider, AntigravitySessionConfig, Provider, ProviderError, ProviderErrorKind,
+    ProviderStream, TurnRequest,
 };
 
 use crate::antigravity_install::{
@@ -384,6 +385,37 @@ fn offers(offered: &[String], slug: &str) -> bool {
     offered.iter().any(|model| model == slug)
 }
 
+/// Runs [`resolve_session_model`] against the catalog the LIVE agent published
+/// on `session/new`.
+///
+/// The catalog is a session configuration option, so `None` here means the
+/// agent published no model selector at all — which is the only state the
+/// "published no model catalog" refusal may describe. The selector's own
+/// `currentValue` is the agent's designated default: it is what the session is
+/// already running on.
+pub(crate) fn resolve_catalog_model(
+    catalog: Option<&AcpModelCatalog>,
+    requested: &str,
+) -> Result<ModelChoice, HaiderError> {
+    let offered = catalog.map(AcpModelCatalog::model_ids).unwrap_or_default();
+    let agent_default = catalog.and_then(|catalog| catalog.current_value.as_deref());
+    resolve_session_model(&offered, agent_default, requested)
+}
+
+/// Carries a model-policy refusal into the provider stream's error vocabulary.
+///
+/// A pinned model the agent does not offer is an INVALID REQUEST; every other
+/// refusal here — no catalog, no designated default — is a permanent property
+/// of how the account and its agent are configured that retrying cannot
+/// repair, which is the same kind `AcpError::ProtocolVersion` already maps to.
+fn model_policy_error(error: HaiderError) -> ProviderError {
+    let kind = match error.code {
+        ErrorCode::InvalidArgument => ProviderErrorKind::InvalidRequest,
+        _ => ProviderErrorKind::ConnectionConfiguration,
+    };
+    ProviderError::new(kind, error.message)
+}
+
 // ---------------------------------------------------------------------------
 // The account-backed adapter
 // ---------------------------------------------------------------------------
@@ -407,7 +439,7 @@ impl std::fmt::Debug for AntigravityAccountProvider {
         formatter
             .debug_struct("AntigravityAccountProvider")
             .field("version", &self.version())
-            .field("model", &self.model())
+            .field("requested_model", &self.requested_model())
             .field("profile_dir", &self.profile_dir())
             .field("launched", &self.session.initialized())
             .finish_non_exhaustive()
@@ -428,8 +460,12 @@ impl AntigravityAccountProvider {
         }
     }
 
-    /// The model this account's session runs on.
-    pub(crate) fn model(&self) -> &str {
+    /// The model this account ASKED for. Empty means unpinned.
+    ///
+    /// What the session ends up running on is decided against the catalog the
+    /// agent publishes on `session/new`, which does not exist until the child
+    /// has been launched and authenticated.
+    pub(crate) fn requested_model(&self) -> &str {
         &self.config.model
     }
 
@@ -447,20 +483,40 @@ impl AntigravityAccountProvider {
     ///
     /// `get_or_try_init` deliberately does NOT cache a failure: a launch that
     /// failed because the operator had not finished the browser login must be
-    /// retryable on the next turn without rebuilding the account.
+    /// retryable on the next turn without rebuilding the account. The model
+    /// policy runs INSIDE the initializer for the same reason — a session left
+    /// cached on an unresolved model would serve every later turn on whatever
+    /// the agent happened to default to.
     async fn session(&self) -> Result<&Arc<AntigravityAcpProvider>, ProviderError> {
         self.session
             .get_or_try_init(|| async {
-                AntigravityAcpProvider::launch(
+                let session = AntigravityAcpProvider::launch(
                     &self.spec,
                     &self.config,
                     AntigravityAcpProvider::refusing_handler(),
                 )
-                .await
-                .map(Arc::new)
+                .await?;
+                apply_model_policy(&session, self.requested_model()).await?;
+                Ok(Arc::new(session))
             })
             .await
     }
+}
+
+/// Decides the session's model against the catalog the AUTHENTICATED agent
+/// just published, and selects it when it is not already the one in force.
+///
+/// This is the only place the catalog exists: discovery's projection is a
+/// stale hint, and the agent is the authority on its own inventory.
+pub(crate) async fn apply_model_policy(
+    session: &AntigravityAcpProvider,
+    requested: &str,
+) -> Result<(), ProviderError> {
+    let catalog = session.model_catalog();
+    let choice = resolve_catalog_model(catalog.as_ref(), requested).map_err(model_policy_error)?;
+    // `select_model` is a no-op round trip when the choice already equals the
+    // selector's current value; it still records what the session runs on.
+    session.select_model(choice.slug()).await
 }
 
 #[async_trait::async_trait]
@@ -524,6 +580,10 @@ const AGENT_OWNED_ADAPTER_CACHE_CAPACITY: usize = 4;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentOwnedAdapterKey {
     alias: CredentialAlias,
+    /// The model the caller REQUESTED, trimmed; empty for an unpinned
+    /// session. Keying on the request rather than on a resolution keeps the
+    /// key computable without the agent, which is the whole point of a cache
+    /// that exists to avoid launching one.
     model: String,
     workspace: String,
 }
@@ -582,8 +642,17 @@ impl AntigravityAdapterFactory {
 
     /// Builds the credential-free adapter for one account and workspace.
     ///
-    /// `offered` and `agent_default` are the AUTHENTICATED agent's own
-    /// published catalog, projected onto the provider summary by discovery.
+    /// `offered` and `agent_default` are discovery's PROJECTION of the agent's
+    /// catalog onto the provider summary — a hint that may predate the login
+    /// the turn will run under, never the authority. The catalog that decides
+    /// the model is the one the agent publishes on `session/new`, so the
+    /// projection is consulted here only to refuse a PINNED model it can
+    /// already prove withdrawn, sparing the operator a ~14.75 s cold start
+    /// before the same refusal. An ABSENT projection — exactly what an account
+    /// that has never authenticated publishes — defers instead of refusing,
+    /// and an UNPINNED request is not resolved here at all: resolving it would
+    /// freeze a stale default into the cache key.
+    ///
     /// Nothing here consults a vault, and no [`haider_accounts::SecretHandle`]
     /// is created: the agent owns the credential.
     pub(crate) fn build(
@@ -594,10 +663,13 @@ impl AntigravityAdapterFactory {
         requested_model: &str,
         workspace: &str,
     ) -> Result<Arc<AntigravityAccountProvider>, HaiderError> {
-        let choice = resolve_session_model(offered, agent_default, requested_model)?;
+        let requested = requested_model.trim();
+        if !requested.is_empty() && !offered.is_empty() {
+            resolve_session_model(offered, agent_default, requested)?;
+        }
         let key = AgentOwnedAdapterKey {
             alias: alias.clone(),
-            model: choice.slug().to_owned(),
+            model: requested.to_owned(),
             workspace: workspace.to_owned(),
         };
         if let Some(adapter) = self.cached(&key) {
@@ -620,6 +692,7 @@ impl AntigravityAdapterFactory {
             // slice: every additional directory would widen what the agent's
             // own filesystem tools may touch.
             additional_directories: Vec::new(),
+            // The REQUEST, resolved against the live catalog on launch.
             model: key.model.clone(),
         };
         let adapter = Arc::new(AntigravityAccountProvider::new(spec, config, installation));

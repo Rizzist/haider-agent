@@ -194,7 +194,7 @@ impl UsageMeterHttp for ReqwestUsageMeterHttp {
 /// no quota at all.
 ///
 /// Verified twice against the live 1.1.1 Google binary and against the
-/// published ACP v1 schema (`docs/testing/v0.0.970/_acp-wire-facts.md`): the
+/// published ACP v1 schema (`docs/testing/v0.0.970/googleoauth_acp-wire-facts.md`): the
 /// only usage-shaped update ACP defines is `usage_update`, which carries
 /// CONTEXT-WINDOW OCCUPANCY (`used` tokens in a window of `size`), not
 /// subscription quota — and Antigravity never sends even that. Quota failures

@@ -11099,9 +11099,9 @@ async fn import_device_is_receipted_and_lands_a_working_account() {
         .expect("decode Kimi bundle");
     assert_eq!(kimi_bundle.provider_id, KIMI_OAUTH_PROVIDER_NAME);
     assert_eq!(kimi_bundle.access_token(), b"fake-kimi-access-token-1");
-    assert_eq!(
-        kimi_bundle.refresh_token(),
-        Some(b"fake-kimi-refresh-token-1".as_slice())
+    assert!(
+        kimi_bundle.refresh_token().is_none(),
+        "the Kimi Code CLI owns rotation; the import stores no refresh token"
     );
     assert_eq!(kimi_bundle.expires_at_unix_ms, 4_102_444_800_000);
     assert_eq!(kimi_bundle.granted_scopes, ["all"]);

@@ -53,12 +53,24 @@ Haider has **two** discovery mechanisms, and both already name Grok and Kimi:
 
 Part B is a layer-B extension. This distinction matters for safety, not just tidiness: as
 Section 2 shows, both Grok and Kimi rotate their refresh tokens with reuse detection, so the
-**existing layer-A import path for `kimi-code` and `grok-cli` is a latent single-holder hazard** —
-using it takes over a rotating credential and will eventually log the origin CLI out. That is
-flagged here as a finding; layer A was left untouched in this lane.
+**layer-A import path for `kimi-code` and `grok-cli` was a latent single-holder hazard** — using it
+took over a rotating credential and would eventually log the origin CLI out.
 
-Layer A's `kimi-code` spec also points at `~/.kimi/credentials/kimi-code.json`, which is the
-**legacy** Python CLI's location. The current Kimi Code CLI uses `~/.kimi-code/` (Section 2.2).
+**That hazard is now fixed, in this lane.** `OAuthImportSourceSpec` gained a `refresh_owner` field
+(`OAuthImportRefreshOwner::{Haider, Source(CredentialSourceRefreshOwner)}`); `kimi-code` declares
+`Source(KimiCli)` and `grok-cli` declares `Source(GrokCli)` — the same owners layer B records for
+the same CLIs. Their parsers no longer declare a `refresh_token` field at all, and both mint through
+one shared constructor, `device_discovery::source_owned_refresh_bundle`, which layer B's
+`linked_access_material` also uses and which takes no refresh-token parameter. `codex` and
+`claude-code` keep `Haider` and are unchanged.
+
+Layer A's `kimi-code` spec also pointed at `~/.kimi/credentials/kimi-code.json`, which is the
+**legacy** Python CLI's location; the current Kimi Code CLI uses `~/.kimi-code/` (Section 2.2). The
+spec now carries both: `~/.kimi-code/credentials/kimi-code.json` is primary, and the legacy
+`~/.kimi/...` path is consulted only when the primary is absent. Not fixed: the Kimi first-party
+device identity is still resolved at `~/.kimi/device_id` only, so an import from a `~/.kimi-code`
+root still needs that file (or `HAIDER_KIMI_DEVICE_ID_PATH`); the current CLI's device-id location
+was not researched.
 
 ---
 
@@ -76,7 +88,7 @@ OAuth, any call to `cloudcode-pa.googleapis.com` / `daily-cloudcode-pa.googleapi
 
 Rather than implement from the analysis prose, the ACP v1 JSON schema (170 `$defs`) was read
 directly, and **Google's actual binary was downloaded, hashed, extracted and run** in an isolated
-sandbox with no credentials. `docs/testing/v0.0.970/_acp-wire-facts.md` records the result. The
+sandbox with no credentials. `docs/testing/v0.0.970/googleoauth_acp-wire-facts.md` records the result. The
 handshake the real agent returned:
 
 - `protocolVersion: 1` (an integer, not a string)
@@ -367,22 +379,40 @@ slot rotation wakes reconciliation instead of waiting for the 15-20 s fallback.
 
 Stated plainly, because several of these bear on whether this lane is shippable.
 
-### 4.1 The model catalog is not populated — a real functional gap
+### 4.1 The model catalog — CLOSED in the second pass
 
-Deliverable 5's model *policy* is implemented and tested (prefer `gemini-3.8-flash-high` only on an
-exact offer, otherwise the agent's declared default; reasoning variants stay distinct; a withdrawn
-model is refused with a selection remedy rather than silently substituted; slugs are never parsed
-structurally). What is missing is the **transport that fills the catalog**: the ACP
-`NewSessionResponse` type decodes only `sessionId`, and nothing yet decodes an `availableModels`
-list or the `model` select config option.
+This was the lane's one blocking functional gap and it is now fixed. Recorded because the
+diagnosis changed twice.
 
-The consequence is honest but real: an Antigravity turn currently refuses with "published no model
-catalog" rather than fabricating a list. That is the correct failure direction — the design forbids
-inventing models — but it means **no end-to-end turn can complete yet**.
+The catalog is **not** carried by a `models` field. There is no `models`, `availableModels`,
+`currentModelId` or `session/set_model` anywhere in the published ACP schema — verified by
+downloading v1 stable, v1 unstable and v2 directly (URLs and byte sizes in
+`googleoauth_acp-wire-facts.md`). `availableModes`/`currentModeId` do exist, but on
+`SessionModeState`, which is session **modes**, not models.
 
-This was not guessed at deliberately. My live probe only got as far as `initialize`; `session/new`
-requires authentication (it returns `-32000`), so the exact field name carrying the catalog was
-never observed first-hand. Closing this needs one authenticated `session/new` observation.
+The real mechanism is a **session configuration option**: `NewSessionResponse.configOptions`
+carries `SessionConfigOption`s, and a `select` option whose `category` is the spec-reserved
+`"model"` (falling back to `id == "model"`) holds the catalog in
+`SessionConfigSelect { currentValue, options }`. Selection is `session/set_config_option`.
+All of that is now decoded, tolerant of both the flat and grouped option shapes, and unknown
+categories/types degrade rather than fail — the schema is explicit that categories "MUST NOT be
+required for correctness".
+
+**The deeper bug was not the missing decode.** The "published no model catalog" refusal was being
+evaluated against *discovery's* model projection, which is necessarily empty for an account that has
+never authenticated — so it fired unconditionally and no turn could ever complete. That refusal now
+fires only against the live `session/new` response, and only when the session genuinely publishes no
+model selector. A pinned model that a non-empty projection can *prove* withdrawn is still refused up
+front.
+
+Three of the new tests drive a fixture ACP agent over duplex transports end to end, so the real
+refusal and the real `session/set_config_option` frame are exercised rather than just the pure
+resolver.
+
+What remains unverified here is narrow: whether Antigravity actually publishes a model selector,
+what its `id` is, whether it sets `category: "model"`, and whether its options are flat or grouped.
+Every documented shape is handled; one authenticated `session/new` would settle which one Google
+emits.
 
 ### 4.2 Nothing was executed against Google's live service
 
@@ -438,3 +468,54 @@ POSIX-specific facilities; no other test is platform-gated and nothing was gated
 - This machine is shared with the `memwindow` lane. Free disk fell from 16 GB to as low as 1 GB
   during the run, driven by two 13-16 GB `target/` trees. Nothing outside this lane's own tree was
   pruned or touched.
+
+## 5. Second pass (2026-09-04): the two follow-ups
+
+### 5.1 Model catalog closed
+
+See §4.1. The correction worth carrying forward is that the instruction which prompted this work
+described `NewSessionResponse.models { availableModels, currentModelId }` and a `session/set_model`
+method; **none of those exist in any published ACP schema.** The lane verified that directly rather
+than implementing to the description, and closed the gap through the construct that does exist
+(`configOptions` + `session/set_config_option`).
+
+### 5.2 Layer-A import hazard fixed
+
+The structural finding this lane raised in §0 is no longer just a note — it is repaired.
+`OAUTH_IMPORT_SOURCE_SPECS` now records a refresh **owner** per spec: `codex` and `claude-code` keep
+`Haider` (behaviour untouched), while `kimi-code` and `grok-cli` declare the origin CLI, matching the
+owners layer B already records for the same stores.
+
+- Both import parsers **lost their `refresh_token` field entirely** — `KimiCredentials` and
+  `GrokCredentials::Bundle` no longer declare it, so serde skips it exactly as the layer-B linked
+  shapes do. Haider can no longer become a second spender of a rotating credential by that path.
+- Both now mint through one shared constructor, `device_discovery::source_owned_refresh_bundle`,
+  which takes **no refresh-token parameter**; layer B's `linked_access_material` calls the same core,
+  so there is a single choke point rather than two minting paths.
+- A spec-authority guard fails the import if a bundle somehow still carries a refresh token: the
+  spec table, not a parser, is the authority.
+- Kimi's path is now the current CLI's `~/.kimi-code/credentials/kimi-code.json`, with the legacy
+  `~/.kimi/...` as a fallback and the current path kept as the honest "not found" answer. The same
+  resolver is used by discovery — without that the fix would have been cosmetic, since
+  `discover_kimi`/`discover_grok` resolved their own paths and would have kept looking only under
+  `~/.kimi`.
+- Two pre-existing tests that pinned the hazardous behaviour were **flipped** to assert
+  `refresh_token().is_none()`, rather than worked around.
+
+**Not fixed, deliberately:** the Kimi first-party device identity is still resolved only at
+`~/.kimi/device_id` (or `HAIDER_KIMI_DEVICE_ID_PATH`), and the import requires it, so an import from
+a `~/.kimi-code`-only install still fails on the missing device identity. No verified source for the
+current CLI's device-id location was found, and it was not guessed.
+
+**Also worth flagging for whoever owns the accounts surface:** the refresh owner is recorded in the
+spec table and cross-pinned against layer B's `CredentialSourceKind::refresh_owner()`, not on the
+account row — an imported account's descriptor carries no import provenance, so showing `grok_cli`
+rather than `haider` on the accounts screen would need a descriptor/wire/TUI-golden change beyond a
+minimal security diff.
+
+### 5.3 Process note
+
+`LANE-COMMON.md` forbids touching `crates/haider-daemon/src/oauth.rs`. The first pass honoured that
+(the file was byte-identical). The second pass changes it, because the coordinator explicitly
+directed this security correction and the change lives in that file. The diff there is confined to
+the refresh-ownership repair and the Kimi path; nothing else in the file was refactored.

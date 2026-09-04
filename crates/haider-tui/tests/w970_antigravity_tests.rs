@@ -33,7 +33,7 @@ use tuivirt_common::{SIZES, Snapshot, check_golden, draw, launcher_model};
 const GENERATED_AT_MS: u64 = 1_788_523_200_000;
 
 /// The machine-readable reason the daemon reports for a Google account: ACP
-/// exposes no structured quota at all (`_acp-wire-facts.md`), so there is
+/// exposes no structured quota at all (`googleoauth_acp-wire-facts.md`), so there is
 /// nothing to meter and nothing to guess a reset from.
 const NO_QUOTA_REASON: &str = "acp_agent_publishes_no_quota";
 

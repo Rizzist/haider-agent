@@ -1008,13 +1008,40 @@ impl OAuthProviderCatalog {
     }
 }
 
+/// Which client owns rotation of an import source's refresh credential.
+///
+/// This is the authority for the one decision that can log a user out of
+/// their own CLI: whether Haider may copy a refresh token at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OAuthImportRefreshOwner {
+    /// Haider copies the refresh credential and becomes its owner.
+    Haider,
+    /// The ORIGIN CLI keeps the refresh credential and rotates it with reuse
+    /// detection behind its own lock, so a second spender breaks that CLI's
+    /// next refresh. Only the access token is imported, and only through
+    /// [`crate::device_discovery::source_owned_refresh_bundle`].
+    Source(haider_accounts::CredentialSourceRefreshOwner),
+}
+
+impl OAuthImportRefreshOwner {
+    #[must_use]
+    const fn is_source_owned(self) -> bool {
+        matches!(self, Self::Source(_))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OAuthImportSourceSpec {
     pub source: &'static str,
     pub provider: &'static str,
     pub default_alias: &'static str,
+    /// Who may spend this source's refresh credential.
+    pub refresh_owner: OAuthImportRefreshOwner,
     env_override: &'static str,
     home_relative_path: &'static str,
+    /// A superseded location, consulted only when `home_relative_path` is
+    /// absent, so an install of the current CLI always wins.
+    legacy_home_relative_path: Option<&'static str>,
 }
 
 const OAUTH_IMPORT_SOURCE_SPECS: [OAuthImportSourceSpec; 4] = [
@@ -1022,29 +1049,49 @@ const OAUTH_IMPORT_SOURCE_SPECS: [OAuthImportSourceSpec; 4] = [
         source: "codex",
         provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
         default_alias: haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+        refresh_owner: OAuthImportRefreshOwner::Haider,
         env_override: "HAIDER_CODEX_AUTH_PATH",
         home_relative_path: ".codex/auth.json",
+        legacy_home_relative_path: None,
     },
     OAuthImportSourceSpec {
         source: "claude-code",
         provider: haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
         default_alias: haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
+        refresh_owner: OAuthImportRefreshOwner::Haider,
         env_override: "HAIDER_CLAUDE_CREDS_PATH",
         home_relative_path: ".claude/.credentials.json",
+        legacy_home_relative_path: None,
     },
     OAuthImportSourceSpec {
         source: "kimi-code",
         provider: haider_provider::KIMI_OAUTH_PROVIDER_NAME,
         default_alias: haider_provider::KIMI_OAUTH_PROVIDER_NAME,
+        // The Kimi token endpoint always answers with a SUCCESSOR refresh
+        // token and the origin CLI serializes rotation behind its own
+        // lockfile, so a copied refresh token is a logout hazard.
+        refresh_owner: OAuthImportRefreshOwner::Source(
+            haider_accounts::CredentialSourceRefreshOwner::KimiCli,
+        ),
         env_override: "HAIDER_KIMI_CREDS_PATH",
-        home_relative_path: ".kimi/credentials/kimi-code.json",
+        // `@moonshot-ai/kimi-code` writes `~/.kimi-code`; the superseded
+        // Python CLI wrote `~/.kimi` with the same relative path and fields.
+        home_relative_path: ".kimi-code/credentials/kimi-code.json",
+        legacy_home_relative_path: Some(".kimi/credentials/kimi-code.json"),
     },
     OAuthImportSourceSpec {
         source: "grok-cli",
         provider: haider_provider::GROK_OAUTH_PROVIDER_NAME,
         default_alias: haider_provider::GROK_OAUTH_PROVIDER_NAME,
+        // `auth.x.ai` rotates with reuse detection and the Grok CLI takes an
+        // advisory lock before the irreversible call; a second spender makes
+        // the CLI's own next refresh fail with `invalid_grant`.
+        refresh_owner: OAuthImportRefreshOwner::Source(
+            haider_accounts::CredentialSourceRefreshOwner::GrokCli,
+        ),
         env_override: "HAIDER_GROK_AUTH_PATH",
         home_relative_path: ".grok/auth.json",
+        legacy_home_relative_path: None,
     },
 ];
 
@@ -1081,7 +1128,25 @@ fn oauth_import_path_for_spec(spec: OAuthImportSourceSpec) -> Result<PathBuf, Ha
             false,
         ));
     };
-    Ok(PathBuf::from(home).join(spec.home_relative_path))
+    Ok(oauth_import_path_in_home(spec, Path::new(&home)))
+}
+
+/// Resolves a source's credential document under one home root.
+///
+/// The CURRENT client's location always wins; a superseded location is
+/// consulted only when the current one is absent, and the current one stays
+/// the honest answer — the path a "not found" reason names — when neither
+/// exists.
+fn oauth_import_path_in_home(spec: OAuthImportSourceSpec, home: &Path) -> PathBuf {
+    let current = home.join(spec.home_relative_path);
+    let Some(legacy) = spec.legacy_home_relative_path else {
+        return current;
+    };
+    if current.exists() {
+        return current;
+    }
+    let legacy = home.join(legacy);
+    if legacy.exists() { legacy } else { current }
 }
 
 /// Returns the complete daemon-owned import catalog. Availability is sampled
@@ -1894,6 +1959,12 @@ fn load_oauth_import_material_from_input(
         "grok-cli" => grok_import_bundle(&path, &bytes, &registration, generation),
         _ => unreachable!("source spec is closed"),
     }?;
+    // The SPEC, not a per-source parser, is the authority on who may spend a
+    // refresh credential. A source-owned entry can never leave this function
+    // holding one, whatever a future parser is edited to produce.
+    if spec.refresh_owner.is_source_owned() && bundle.refresh_token().is_some() {
+        return Err(invalid_import(&path, spec.source));
+    }
     match spec.source {
         "codex" => bundle.identity.display_identity.push_str(" · Codex"),
         "claude-code" => bundle
@@ -2280,10 +2351,15 @@ pub(crate) fn parse_claude_credential_metadata(
     })
 }
 
+/// Kimi Code's credential document, minus its refresh token.
+///
+/// There is deliberately no `refresh_token` field: serde skips it, so the
+/// origin CLI's rotating credential is never materialized into Haider-owned
+/// memory. The Kimi token endpoint always answers with a successor refresh
+/// token and the CLI serializes rotation behind its own lockfile.
 #[derive(Deserialize)]
 struct KimiCredentials {
     access_token: SecretJson,
-    refresh_token: SecretJson,
     expires_at: f64,
     #[serde(default)]
     expires_in: f64,
@@ -2299,8 +2375,9 @@ fn kimi_import_bundle(
 ) -> Result<OAuthTokenBundleV1, HaiderError> {
     let credentials: KimiCredentials = serde_json::from_slice(bytes)
         .map_err(|error| malformed_import(path, "kimi-code", &error))?;
+    // An empty access token is the CLI's revocation tombstone, which it
+    // writes in place after a rejected refresh; that is a logged-out store.
     if credentials.access_token.0.is_empty()
-        || credentials.refresh_token.0.is_empty()
         || !credentials.token_type.eq_ignore_ascii_case("bearer")
         || !credentials.expires_at.is_finite()
         || credentials.expires_at <= 0.0
@@ -2318,21 +2395,19 @@ fn kimi_import_bundle(
         300_u64.max(expires_in / 2)
     };
     let source_access_fingerprint = *blake3::hash(&credentials.access_token.0).as_bytes();
-    OAuthTokenBundleV1::new(
+    crate::device_discovery::source_owned_refresh_bundle(
         registration.provider_id.clone(),
         registration.issuer.clone(),
         registration.audience.clone(),
         registration.resource.clone(),
         credentials.token_type,
         credentials.access_token.0,
-        Some(credentials.refresh_token.0),
-        expires_at_unix_ms,
-        None,
         credentials
             .scope
             .split_ascii_whitespace()
             .map(str::to_owned)
             .collect(),
+        expires_at_unix_ms,
         OAuthIdentityV1 {
             subject_hash: blake3::Hash::from_bytes(source_access_fingerprint)
                 .to_hex()
@@ -2351,14 +2426,18 @@ fn kimi_import_bundle(
     .map_err(|_| invalid_import(path, "kimi-code"))
 }
 
+/// The official Grok CLI's auth-store shapes, minus their refresh token.
+///
+/// There is deliberately no `refresh_token` field: serde skips it, so the
+/// origin CLI's rotating credential is never materialized into Haider-owned
+/// memory. `auth.x.ai` treats a refresh token as single-use with reuse
+/// detection, and the CLI takes an advisory lock before spending it.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum GrokCredentials {
     Bare(SecretJson),
     Bundle {
         access_token: SecretJson,
-        #[serde(default)]
-        refresh_token: Option<SecretJson>,
         #[serde(default)]
         expires_in: Option<u64>,
         #[serde(default)]
@@ -2367,8 +2446,8 @@ enum GrokCredentials {
 }
 
 /// Converts both official Grok CLI auth-store shapes without retaining the
-/// source JSON. The bare-token legacy shape has no expiry metadata, so it is
-/// deliberately short-lived and cannot refresh; a 401 then drives re-login.
+/// source JSON. Neither shape can refresh: rotation belongs to the Grok CLI,
+/// so a 401 drives re-login instead of a second spend of its refresh token.
 fn grok_import_bundle(
     path: &Path,
     bytes: &[u8],
@@ -2377,22 +2456,15 @@ fn grok_import_bundle(
 ) -> Result<OAuthTokenBundleV1, HaiderError> {
     let credentials: GrokCredentials = serde_json::from_slice(bytes)
         .map_err(|error| malformed_import(path, "grok-cli", &error))?;
-    let (access_token, refresh_token, expires_in, issuer) = match credentials {
-        GrokCredentials::Bare(token) => (token.0, None, 15 * 60, None),
+    let (access_token, expires_in, issuer) = match credentials {
+        GrokCredentials::Bare(token) => (token.0, 15 * 60, None),
         GrokCredentials::Bundle {
             access_token,
-            refresh_token,
             expires_in,
             issuer,
-        } => (
-            access_token.0,
-            refresh_token.map(|token| token.0),
-            expires_in.unwrap_or(60 * 60),
-            issuer,
-        ),
+        } => (access_token.0, expires_in.unwrap_or(60 * 60), issuer),
     };
     if access_token.is_empty()
-        || refresh_token.as_ref().is_some_and(|token| token.is_empty())
         || expires_in == 0
         || expires_in > MAX_TOKEN_LIFETIME_SECS
         || issuer
@@ -2406,17 +2478,15 @@ fn grok_import_bundle(
         .checked_add(expires_in.saturating_mul(1000))
         .ok_or_else(|| invalid_import(path, "grok-cli"))?;
     let source_access_fingerprint = *blake3::hash(&access_token).as_bytes();
-    OAuthTokenBundleV1::new(
+    crate::device_discovery::source_owned_refresh_bundle(
         registration.provider_id.clone(),
         registration.issuer.clone(),
         registration.audience.clone(),
         registration.resource.clone(),
         "Bearer".to_owned(),
         access_token,
-        refresh_token,
-        expires_at_unix_ms,
-        None,
         registration.scopes.clone(),
+        expires_at_unix_ms,
         OAuthIdentityV1 {
             subject_hash: blake3::Hash::from_bytes(source_access_fingerprint)
                 .to_hex()

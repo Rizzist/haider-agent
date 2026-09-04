@@ -170,3 +170,75 @@ Then set only: `GEMINI_HOME=<per-account profile dir>` (0700), `AGY_ACP_FORCE_FI
 - **No structured quota/plan is exposed over ACP.** Antigravity never sends `usage_update`.
   Quota/subscription failures arrive as unstructured prose, and can appear inside a turn that
   still finishes with `end_turn` — a successful stop reason does not prove success.
+
+---
+
+## CORRECTION (2026-09-04, second pass): where the model catalog actually lives
+
+An earlier instruction to this lane stated that `NewSessionResponse` carries
+`models = { availableModels: [{ modelId, name, description? }], currentModelId }` and that a
+`session/set_model` method exists. **That is not in any published ACP schema.** Verified by
+downloading all three schemas directly:
+
+- `https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/main/schema/v1/schema.json` (246,569 bytes)
+- `https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/main/schema/v1/schema.unstable.json` (373,155 bytes)
+- `https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/main/schema/v2/schema.json` (288,134 bytes)
+
+(The directory listing comes from `https://api.github.com/repos/agentclientprotocol/agent-client-protocol/contents/schema`.
+Note the schema is under `schema/v1/`, not `schema/`.)
+
+In all three, the strings `models`, `availableModels`, `currentModelId`, `modelId` and
+`session/set_model` are **absent**:
+
+| schema | `NewSessionResponse` properties | `session/set_model` |
+| --- | --- | --- |
+| v1 stable | `sessionId`, `modes`, `configOptions`, `_meta` | absent |
+| v1 unstable | `sessionId`, `modes`, `configOptions`, `_meta` | absent |
+| v2 | `sessionId`, `configOptions`, `_meta` | absent |
+
+`availableModes` / `currentModeId` *do* exist, but on `SessionModeState` (the `modes` block) — these
+are session **modes**, not models, which is the likely source of the confusion.
+
+### The real mechanism (v1 stable, which is what Antigravity speaks — it answered `protocolVersion: 1`)
+
+The model catalog is a **session configuration option**:
+
+- `NewSessionResponse.configOptions`: array of `SessionConfigOption`.
+- `SessionConfigOption` = required `id` (`SessionConfigId`, a string) and `name`; optional
+  `description`, `category`, `_meta`. It is a `oneOf` discriminated by a `type` field:
+  - `type: "select"` -> `SessionConfigSelect` = required `currentValue` (`SessionConfigValueId`,
+    a string) and `options` (`SessionConfigSelectOptions`).
+  - `type: "boolean"` -> `SessionConfigBoolean` = required `currentValue` (bool).
+- `SessionConfigSelectOptions` is an `anyOf`: either a **flat** array of `SessionConfigSelectOption`,
+  or a **grouped** array of `SessionConfigSelectGroup` = required `group`, `name`, `options`.
+- `SessionConfigSelectOption` = required `value` (`SessionConfigValueId`) and `name`; optional
+  `description`, `_meta`.
+
+**Identifying which option is the model selector** is spec-supported via
+`SessionConfigOptionCategory`, whose reserved constants include `"mode"`, **`"model"`
+("Model selector")** and `"model_config"`. The schema is explicit that this is a UX hint:
+
+> "It MUST NOT be required for correctness. Clients MUST handle missing or unknown categories
+> gracefully."
+
+So the resolution order is: a `select` option with `category == "model"`, else a `select` option
+whose `id == "model"` (an observed agent convention, not a spec guarantee), else **no catalog**.
+
+**Selecting a model** is `session/set_config_option`:
+`SetSessionConfigOptionRequest` = required `sessionId` and `configId`, plus a value variant —
+`{ type: "boolean", value: <bool> }`, or the **default when `type` is absent on the wire**, a
+`SessionConfigValueId` string `value`. The schema notes unknown `type` values with string payloads
+also deserialize into that variant. The response, `SetSessionConfigOptionResponse`, returns the full
+`configOptions` set again.
+
+Config options can also change mid-session: the `config_option_update` session update carries
+`ConfigOptionUpdate { configOptions }` — the **full** set with current values.
+
+`session/set_mode` exists and is separate; modes are not models.
+
+### What remains genuinely unverifiable without an account
+
+Whether Antigravity actually publishes a model selector, what its `id` is, whether it sets
+`category: "model"`, and whether its options are flat or grouped. The decoding is written against
+the schema and tolerates every documented shape; a live authenticated `session/new` would confirm
+which one Google emits.

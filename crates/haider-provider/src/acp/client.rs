@@ -30,9 +30,10 @@ use crate::acp::wire::{
     InitializeResponse, JsonRpcError, JsonRpcErrorReply, JsonRpcId, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResultReply, METHOD_AUTHENTICATE, METHOD_FS_READ_TEXT_FILE,
     METHOD_FS_WRITE_TEXT_FILE, METHOD_INITIALIZE, METHOD_SESSION_CANCEL, METHOD_SESSION_NEW,
-    METHOD_SESSION_PROMPT, METHOD_SESSION_REQUEST_PERMISSION, METHOD_SESSION_UPDATE,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, RequestPermissionRequest,
-    RequestPermissionResponse, SessionNotification, SessionUpdate, StopReason,
+    METHOD_SESSION_PROMPT, METHOD_SESSION_REQUEST_PERMISSION, METHOD_SESSION_SET_CONFIG_OPTION,
+    METHOD_SESSION_UPDATE, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    RequestPermissionRequest, RequestPermissionResponse, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
 };
 use crate::{ProviderError, ProviderErrorKind};
 
@@ -98,6 +99,16 @@ pub const ACP_AUTHENTICATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// from Google over HTTP (`GeminiTransportConfig::response_open_timeout`);
 /// the same 30 s covers the identical round trip made one process hop away.
 pub const ACP_NEW_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Budget for `session/set_config_option`.
+///
+/// Derivation. Selecting a model is the same class of work as opening the
+/// session that published the selector: agent-local state plus at most one
+/// Google round trip to validate the value. It therefore takes the identical
+/// budget as [`ACP_NEW_SESSION_TIMEOUT`] — Haider's 30 s Gemini
+/// response-open bound (`GeminiTransportConfig::response_open_timeout`) —
+/// rather than a second number for the same round trip.
+pub const ACP_SET_CONFIG_OPTION_TIMEOUT: Duration = ACP_NEW_SESSION_TIMEOUT;
 
 /// Budget from `session/prompt` to the FIRST inbound frame for that session.
 ///
@@ -755,6 +766,31 @@ impl AcpConnection {
             .await
     }
 
+    /// Sets one session configuration option to a `SessionConfigValueId`.
+    ///
+    /// This is how a model is selected: ACP has no `session/set_model`. The
+    /// answer is the FULL configuration-option set with current values, so the
+    /// caller refreshes its cached catalog from what the agent reports rather
+    /// than from what it asked for.
+    pub async fn set_config_option(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<SetSessionConfigOptionResponse, AcpError> {
+        let request = SetSessionConfigOptionRequest {
+            session_id: session_id.to_owned(),
+            config_id: config_id.to_owned(),
+            value: value.to_owned(),
+        };
+        self.call(
+            METHOD_SESSION_SET_CONFIG_OPTION,
+            request,
+            ACP_SET_CONFIG_OPTION_TIMEOUT,
+        )
+        .await
+    }
+
     /// Opens one turn. The session subscription is registered BEFORE the
     /// request is written, so no `session/update` can arrive unrouted.
     pub async fn open_prompt(
@@ -990,6 +1026,7 @@ fn static_method_label(method: &str) -> &'static str {
         METHOD_AUTHENTICATE => "acp authenticate",
         METHOD_SESSION_NEW => "acp session/new",
         METHOD_SESSION_PROMPT => "acp session/prompt",
+        METHOD_SESSION_SET_CONFIG_OPTION => "acp session/set_config_option",
         _ => "acp request",
     }
 }

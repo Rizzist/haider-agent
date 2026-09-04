@@ -711,9 +711,47 @@ fn kimi_identity(account_id: &str, last_refreshed_at_ms: Option<u64>) -> Account
     }
 }
 
+/// Mints the ONE bundle shape Haider may hold for a credential whose refresh
+/// credential belongs to the origin CLI.
+///
+/// There is deliberately no refresh-token parameter: `None` is supplied here,
+/// by construction, so neither a read-through linked source nor a one-shot
+/// import can make Haider a second spender of a rotating refresh token. Every
+/// source-owned path — layer B discovery and the layer A import specs that
+/// declare `OAuthImportRefreshOwner::Source` — funnels through this seam.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn source_owned_refresh_bundle(
+    provider_id: String,
+    issuer: String,
+    audience: String,
+    resource: Option<String>,
+    token_type: String,
+    access_token: Zeroizing<Vec<u8>>,
+    granted_scopes: Vec<String>,
+    expires_at_unix_ms: u64,
+    identity: OAuthIdentityV1,
+    generation: u64,
+) -> haider_accounts::AccountsResult<OAuthTokenBundleV1> {
+    OAuthTokenBundleV1::new(
+        provider_id,
+        issuer,
+        audience,
+        resource,
+        token_type,
+        access_token,
+        // The origin CLI owns rotation. A refresh token never reaches here.
+        None,
+        expires_at_unix_ms,
+        None,
+        granted_scopes,
+        identity,
+        generation,
+    )
+}
+
 /// Builds the ACCESS-ONLY broker input shared by every read-through kind.
-/// `refresh_token` is passed as `None` by construction: this is the single
-/// place a linked bundle is minted, so no kind can start owning rotation.
+/// The bundle comes from [`source_owned_refresh_bundle`], so no kind can
+/// start owning rotation.
 #[allow(clippy::too_many_arguments)]
 fn linked_access_material(
     provider_id: &str,
@@ -729,17 +767,15 @@ fn linked_access_material(
     last_refreshed_at_ms: Option<u64>,
 ) -> Result<LinkedSourceMaterial, LinkedSourceReadFailure> {
     let observed_at_ms = now_ms().ok_or(LinkedSourceReadFailure::Invalid)?;
-    let bundle = OAuthTokenBundleV1::new(
+    let bundle = source_owned_refresh_bundle(
         provider_id.to_owned(),
         issuer,
         audience,
         None,
         "Bearer".to_owned(),
         access_token,
-        None,
-        expires_at_ms,
-        None,
         granted_scopes,
+        expires_at_ms,
         OAuthIdentityV1 {
             subject_hash: blake3::hash(subject.as_bytes()).to_hex().to_string(),
             display_identity: display_identity.clone(),
@@ -975,7 +1011,7 @@ struct KimiFile {
 }
 
 fn discover_kimi() -> Option<DeviceCandidate> {
-    let path = env_or_home("HAIDER_KIMI_CREDS_PATH", ".kimi/credentials/kimi-code.json")?;
+    let path = oauth_import_path("kimi-code").ok()?;
     let bytes = read_bounded(&path)?;
     let parsed: KimiFile = serde_json::from_slice(&bytes).ok()?;
     let expires_at_ms = seconds_to_millis(parsed.expires_at)?;
@@ -1021,7 +1057,7 @@ enum GrokFile {
 /// Discovers both auth.json layouts written by official Grok CLI releases.
 /// Only freshness and the public source label leave this parser.
 fn discover_grok() -> Option<DeviceCandidate> {
-    let path = env_or_home("HAIDER_GROK_AUTH_PATH", ".grok/auth.json")?;
+    let path = oauth_import_path("grok-cli").ok()?;
     let bytes = read_bounded(&path)?;
     let parsed: GrokFile = serde_json::from_slice(&bytes).ok()?;
     let expires_at_ms = match parsed {
