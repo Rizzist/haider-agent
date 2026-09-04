@@ -342,8 +342,8 @@ fn provider_catalog_declares_the_vision_capability_split() {
     // statement about its own ignorance rather than about the model.
     for provider in BUILTIN_PROVIDER_NAMES {
         let expected = match provider {
-            "anthropic" | "anthropic-oauth" | "bedrock" | "vertex" | "openai"
-            | "openai-oauth" | "gemini" | "grok-oauth" => Some(FeatureResolve::Native),
+            "anthropic" | "anthropic-oauth" | "bedrock" | "vertex" | "openai" | "openai-oauth"
+            | "gemini" | "grok-oauth" => Some(FeatureResolve::Native),
             // The one first-party, fixed, genuinely text-only seed catalog.
             "deepseek" => Some(FeatureResolve::Unsupported),
             // kimi-oauth answers per-model; openai-compatible / haider-code /
@@ -677,14 +677,16 @@ fn signed_thinking_and_redacted_blocks_are_captured_for_replay() {
                     "type": "thinking",
                     "thinking": "weigh the options",
                     "signature": "sig-first-sig-second",
-                }),
+                })
+                .into(),
             }),
             Ok(StreamEvent::ProviderOpaque {
                 provider: "anthropic".into(),
                 data: serde_json::json!({
                     "type": "redacted_thinking",
                     "data": "ENCRYPTED_PAYLOAD_b64",
-                }),
+                })
+                .into(),
             }),
             Ok(StreamEvent::ToolCallStart {
                 call_id: "toolu_capture".into(),
@@ -702,6 +704,25 @@ fn signed_thinking_and_redacted_blocks_are_captured_for_replay() {
             }),
         ],
         "signed thinking + redacted blocks capture verbatim, BEFORE tool events"
+    );
+    let reasoning = match &items[0] {
+        Ok(StreamEvent::ReasoningDelta { text }) => text,
+        other => panic!("expected reasoning delta, got {other:?}"),
+    };
+    let signed = match &items[1] {
+        Ok(StreamEvent::ProviderOpaque { data, .. }) => data,
+        other => panic!("expected signed thinking, got {other:?}"),
+    };
+    assert!(
+        signed
+            .reply_text()
+            .is_some_and(|text| text.shares_arena_with(reasoning)),
+        "signed native replay must reference the reasoning arena"
+    );
+    assert_ne!(
+        signed.template()["thinking"],
+        "weigh the options",
+        "the native template must not retain a second reasoning String"
     );
 
     // An unsigned thinking block (display-only) captures NOTHING.
@@ -767,11 +788,11 @@ fn thinking_facts_replay_verbatim_in_order_and_normalized_reasoning_stays_reject
                 blocks: vec![
                     Block::ProviderOpaque {
                         provider: "anthropic".into(),
-                        data: thinking.clone(),
+                        data: thinking.clone().into(),
                     },
                     Block::ProviderOpaque {
                         provider: "anthropic".into(),
-                        data: redacted.clone(),
+                        data: redacted.clone().into(),
                     },
                     Block::ToolCall {
                         call_id: "toolu_capture".into(),
@@ -939,7 +960,8 @@ fn server_tool_blocks_and_cited_text_are_captured_verbatim_for_replay() {
                     "id": "srvtoolu_1",
                     "name": "web_search",
                     "input": {"query": "rust sse"},
-                }),
+                })
+                .into(),
             }),
             Ok(StreamEvent::ServerToolUse {
                 call_id: "srvtoolu_1".into(),
@@ -959,7 +981,8 @@ fn server_tool_blocks_and_cited_text_are_captured_verbatim_for_replay() {
                         "page_age": "1 day",
                     }],
                     "future_field": "kept",
-                }),
+                })
+                .into(),
             }),
             Ok(StreamEvent::ServerToolResult {
                 call_id: "srvtoolu_1".into(),
@@ -984,7 +1007,8 @@ fn server_tool_blocks_and_cited_text_are_captured_verbatim_for_replay() {
                         "encrypted_index": "IDX_A",
                         "cited_text": "quote",
                     }],
-                }),
+                })
+                .into(),
             }),
             Ok(StreamEvent::WebSources {
                 sources: vec![haider_protocol::provider::WebSource {
@@ -998,6 +1022,25 @@ fn server_tool_blocks_and_cited_text_are_captured_verbatim_for_replay() {
         ],
         "server tool blocks capture verbatim (unknown fields kept) and never open a client tool call"
     );
+    let first = match &items[4] {
+        Ok(StreamEvent::TextDelta { text }) => text,
+        other => panic!("expected cited text delta, got {other:?}"),
+    };
+    let second = match &items[5] {
+        Ok(StreamEvent::TextDelta { text }) => text,
+        other => panic!("expected cited text delta, got {other:?}"),
+    };
+    let signed = match &items[6] {
+        Ok(StreamEvent::ProviderOpaque { data, .. }) => data,
+        other => panic!("expected cited native text, got {other:?}"),
+    };
+    assert!(first.shares_arena_with(second));
+    assert!(
+        signed
+            .reply_text()
+            .is_some_and(|text| text.shares_arena_with(first))
+    );
+    assert_ne!(signed.template()["text"], "cited answer");
 }
 
 /// LAW (LW2, opaque echo — replay half): captured server_tool_use /
@@ -1040,7 +1083,7 @@ fn server_tool_facts_replay_verbatim_and_cited_text_dedups_normalized_history() 
     });
     let opaque = |data: &serde_json::Value| Block::ProviderOpaque {
         provider: "anthropic".into(),
-        data: data.clone(),
+        data: data.clone().into(),
     };
     let request = TurnRequest {
         model: "claude-fable-5".into(),
@@ -1188,7 +1231,8 @@ fn search_error_object_and_success_list_decode_tolerantly() {
                         "type": "web_search_tool_result_error",
                         "error_code": "max_uses_exceeded",
                     },
-                }),
+                })
+                .into(),
             }),
             Ok(StreamEvent::ServerToolResult {
                 call_id: "srvtoolu_9".into(),
