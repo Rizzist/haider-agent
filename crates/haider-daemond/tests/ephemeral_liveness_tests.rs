@@ -9,6 +9,11 @@ use haider_client::{
     ClientCloseOutcome, ClientConfig, ConnectError, DAEMON_LOG_FILE, DaemonLifetime, EnsureOptions,
     ProfileEnv, ResolvedProfile, connect, ensure_daemon, resolve_profile,
 };
+use haider_rpc::{
+    AttachMode, CommandId, MonitorActionWire, MonitorLifetimeWire, MonitorMutateOutcomeWire,
+    MonitorMutationWire, MonitorOccurrenceWire, MonitorRegisterOutcomeWire, MonitorSourceWire,
+    RequestBody, ResponseBody,
+};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -801,6 +806,135 @@ fn second_client_holds_ephemeral_daemon_until_its_disconnect() {
 
     assert_close_started(second.client.close());
     drop(second);
+    wait_for_cleanup(&runtime, &profile, Some(&mut helper), Some(daemon_pid));
+}
+
+/// An armed durable monitor is daemon work after every client disconnects.
+/// The same black-box process must stay alive until the monitor's durable
+/// timeout makes the profile quiescent, then retire and clean its runtime.
+#[test]
+fn active_monitor_holds_ephemeral_daemon_until_expiry() {
+    let _guard = process_test_guard();
+    let runtime = runtime();
+    let root = test_root();
+    let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
+    let marker = root.path().join("client-ready");
+    let mut helper = spawn_helper(&profile, &marker, false, HelperDaemonLifetime::Ephemeral);
+    wait_for_helper(
+        &runtime,
+        &profile,
+        &marker,
+        &mut helper,
+        "ephemeral monitor helper readiness",
+    );
+    let connected = connect_until_ready(&runtime, &profile, Some(&mut helper), None);
+    let created = runtime
+        .block_on(connected.client.request(RequestBody::SessionCreate {
+            command_id: CommandId::new("ephemeral-monitor-session"),
+            cwd: root.path().to_string_lossy().into_owned(),
+            provider: "anthropic".into(),
+            model: "claude-opus-5".into(),
+            max_tokens: 64,
+        }))
+        .expect("create ephemeral monitor session");
+    let (session_id, worker_generation) = match created {
+        ResponseBody::SessionCreate {
+            session_id,
+            worker_generation,
+            ..
+        } => (session_id, worker_generation),
+        response => panic!("unexpected session create response: {response:?}"),
+    };
+    assert!(matches!(
+        runtime
+            .block_on(connected.client.request(RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: 0,
+                mode: AttachMode::Control,
+                sealed_replay: false,
+            }))
+            .expect("attach monitor control session"),
+        ResponseBody::SessionAttach { .. }
+    ));
+    let registered = runtime
+        .block_on(connected.client.request(RequestBody::MonitorRegister {
+            command_id: CommandId::new("ephemeral-monitor-register"),
+            session_id: session_id.clone(),
+            worker_generation,
+            source: MonitorSourceWire::Timer {
+                interval_ms: 60_000,
+            },
+            filter: None,
+            action: MonitorActionWire {
+                report: true,
+                follow_up: None,
+            },
+            occurrence: MonitorOccurrenceWire::Every,
+            lifetime: MonitorLifetimeWire::Timeout { timeout_ms: 3_000 },
+        }))
+        .expect("register ephemeral monitor");
+    let monitor_id = match registered {
+        ResponseBody::MonitorRegister {
+            receipt:
+                haider_rpc::MonitorRegisterReceiptWire {
+                    outcome: MonitorRegisterOutcomeWire::Registered { monitor },
+                    ..
+                },
+        } => monitor.monitor_id,
+        response => panic!("unexpected monitor register response: {response:?}"),
+    };
+    let paused = runtime
+        .block_on(connected.client.request(RequestBody::MonitorMutate {
+            command_id: CommandId::new("ephemeral-monitor-pause"),
+            session_id: session_id.clone(),
+            worker_generation,
+            mutation: MonitorMutationWire::Pause {
+                monitor_id: monitor_id.clone(),
+            },
+        }))
+        .expect("pause monitor over the live control RPC");
+    assert!(matches!(
+        paused,
+        ResponseBody::MonitorMutate {
+            receipt: haider_rpc::MonitorMutateReceiptWire {
+                outcome: MonitorMutateOutcomeWire::Paused { .. },
+                ..
+            }
+        }
+    ));
+    let resumed = runtime
+        .block_on(connected.client.request(RequestBody::MonitorMutate {
+            command_id: CommandId::new("ephemeral-monitor-resume"),
+            session_id,
+            worker_generation,
+            mutation: MonitorMutationWire::Resume { monitor_id },
+        }))
+        .expect("resume monitor over the live control RPC");
+    assert!(matches!(
+        resumed,
+        ResponseBody::MonitorMutate {
+            receipt: haider_rpc::MonitorMutateReceiptWire {
+                outcome: MonitorMutateOutcomeWire::Resumed { .. },
+                ..
+            }
+        }
+    ));
+    let daemon_pid = std::fs::read_to_string(pid_path(&profile))
+        .expect("PID file exists for monitored daemon")
+        .trim()
+        .parse::<u32>()
+        .expect("PID file carries daemon process id");
+
+    kill_helper(&mut helper);
+    assert_close_started(connected.client.close());
+    drop(connected);
+    runtime.block_on(async { tokio::time::sleep(Duration::from_millis(500)).await });
+    assert!(
+        !process_has_exited(daemon_pid),
+        "active monitor must retain the disconnected ephemeral daemon"
+    );
+    assert!(pid_path(&profile).exists());
+
     wait_for_cleanup(&runtime, &profile, Some(&mut helper), Some(daemon_pid));
 }
 

@@ -377,7 +377,7 @@ fn monitor_report_chat_text(report: &MonitorReport) -> String {
                     truncate_chars(&sms.body, TOOL_PREVIEW_CHARS),
                 ));
             }
-            MonitorEventPayload::Process { line } => {
+            MonitorEventPayload::Process { line, .. } | MonitorEventPayload::Cli { line, .. } => {
                 text.push_str(&format!(
                     "\nProcess event:\n{}\n",
                     truncate_chars(line, TOOL_PREVIEW_CHARS),
@@ -395,7 +395,7 @@ fn monitor_report_chat_text(report: &MonitorReport) -> String {
                     truncate_chars(payload, TOOL_PREVIEW_CHARS),
                 ));
             }
-            MonitorEventPayload::Timer { fired_at_ms } => {
+            MonitorEventPayload::Timer { fired_at_ms, .. } => {
                 text.push_str(&format!("\nTimer fired at {fired_at_ms} ms.\n"));
             }
         }

@@ -6937,7 +6937,9 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             run_state: Some(haider_rpc::ObserveRunStateWire::Idle),
             run_id: None,
             seen_at_ms: None,
-            last_activity_ms: None,
+            // Session-list recency is durable from creation onward; a fresh
+            // session's activity coordinate is its creation timestamp.
+            last_activity_ms: Some(metadata.created_at_ms),
             waiting_why: None,
             needs_input: None,
             metadata: Some(metadata.clone()),

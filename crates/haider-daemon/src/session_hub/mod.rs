@@ -5878,6 +5878,19 @@ impl SessionHub {
         Ok(true)
     }
 
+    /// Active durable monitors are background work just like non-terminal
+    /// runs. An auto-spawned daemon must stay resident until they pause, exit,
+    /// expire, or are removed, even when no client socket remains attached.
+    pub(crate) async fn daemon_is_durably_quiescent_with_monitors(
+        &self,
+    ) -> Result<bool, SessionHubError> {
+        self.inner.monitors.wait_ready().await;
+        if self.inner.monitors.has_active_monitors() {
+            return Ok(false);
+        }
+        self.daemon_is_durably_quiescent().await
+    }
+
     async fn roster_session_ids(&self) -> Result<Vec<SessionId>, SessionHubError> {
         let mut session_ids = self.inner.store.session_ids().await?;
         let fork_candidates = lock(&self.inner.fork_candidates)?;

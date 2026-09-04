@@ -28,7 +28,7 @@ pub use directory::{
 };
 pub use directory::{
     WorkspaceDirectory, WorkspaceDirectoryError, duplicate_workspace_directory,
-    open_workspace_directory,
+    open_workspace_directory, open_workspace_file,
 };
 #[cfg(windows)]
 pub use fs::replace_file_with_backup;

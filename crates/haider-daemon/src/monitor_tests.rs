@@ -33,10 +33,16 @@ fn registration(filter: Option<MonitorFilter>) -> MonitorRegistration {
         },
         occurrence: MonitorOccurrence::Every,
         created_at_ms: 1,
+        activated_at_ms: 1,
         start_sequence: 0,
         expires_at_ms: None,
         branch_id: None,
         agent_id: None,
+        paused: false,
+        exited: false,
+        workspace_root: None,
+        approved_command: None,
+        approved_file_path: None,
     }
 }
 
@@ -49,6 +55,7 @@ fn sms(address: &str, body: &str) -> MonitorEvent {
             body: body.into(),
             received_at_ms: 3,
         }),
+        target_monitor_id: None,
     }
 }
 
@@ -60,6 +67,7 @@ fn test_report(report_id: &str, body: &str, status: MonitorReportStatus) -> Moni
         branch_id: None,
         agent_id: None,
         source: MonitorSourceKind::Sms,
+        occurrence: MonitorOccurrence::Every,
         status,
         events: vec![sms("+1", body)],
         coalesced_count: 1,
@@ -96,15 +104,21 @@ fn filter_matching_is_typed_case_aware_and_source_scoped() {
 fn event_time_fences_registration_and_inclusive_expiry() {
     let mut watch = registration(None);
     watch.created_at_ms = 10;
+    watch.activated_at_ms = 15;
     watch.start_sequence = 5;
     watch.expires_at_ms = Some(20);
 
     let mut before_registration = sms("+1", "before");
-    before_registration.sequence = 5;
-    before_registration.observed_at_ms = 10;
+    before_registration.sequence = 99;
+    before_registration.observed_at_ms = 14;
     assert!(!monitor_matches(&watch, &before_registration));
 
-    let mut after_registration = before_registration.clone();
+    let mut at_activation = before_registration.clone();
+    at_activation.sequence = 5;
+    at_activation.observed_at_ms = 15;
+    assert!(!monitor_matches(&watch, &at_activation));
+
+    let mut after_registration = at_activation.clone();
     after_registration.sequence = 6;
     assert!(monitor_matches(&watch, &after_registration));
 
@@ -249,6 +263,7 @@ fn report_event_and_prompt_bounds_are_explicit() {
         branch_id: None,
         agent_id: None,
         source: MonitorSourceKind::Sms,
+        occurrence: MonitorOccurrence::Every,
         status: MonitorReportStatus::Matched,
         events,
         coalesced_count,
@@ -264,7 +279,6 @@ fn report_event_and_prompt_bounds_are_explicit() {
 fn client_availability_is_exhaustive_and_does_not_invent_adapters() {
     use haider_rpc::{
         MonitorSourceAvailabilityStateWire as Availability, MonitorSourceKindWire as Source,
-        MonitorSourceUnavailableReasonWire as Reason,
     };
 
     assert_eq!(
@@ -276,27 +290,23 @@ fn client_availability_is_exhaustive_and_does_not_invent_adapters() {
             },
             haider_rpc::MonitorSourceAvailabilityWire {
                 source: Source::Process,
-                availability: Availability::Unavailable {
-                    reason: Reason::AdapterInactive,
-                },
+                availability: Availability::Available,
             },
             haider_rpc::MonitorSourceAvailabilityWire {
                 source: Source::File,
-                availability: Availability::Unavailable {
-                    reason: Reason::AdapterInactive,
-                },
+                availability: Availability::Available,
             },
             haider_rpc::MonitorSourceAvailabilityWire {
                 source: Source::Poll,
-                availability: Availability::Unavailable {
-                    reason: Reason::AdapterInactive,
-                },
+                availability: Availability::Available,
             },
             haider_rpc::MonitorSourceAvailabilityWire {
                 source: Source::Timer,
-                availability: Availability::Unavailable {
-                    reason: Reason::AdapterInactive,
-                },
+                availability: Availability::Available,
+            },
+            haider_rpc::MonitorSourceAvailabilityWire {
+                source: Source::Cli,
+                availability: Availability::Available,
             },
         ]
     );
@@ -312,6 +322,10 @@ fn client_availability_is_exhaustive_and_does_not_invent_adapters() {
         haider_rpc::Capability::Control
     );
     assert!(monitor_control_policy().remove_requires_control_attachment);
+    assert!(monitor_control_policy().update_requires_control_attachment);
+    assert!(monitor_control_policy().pause_requires_control_attachment);
+    assert!(monitor_control_policy().resume_requires_control_attachment);
+    assert!(monitor_control_policy().trigger_requires_control_attachment);
 
     assert!(matches!(
         monitor_store_rejection(MonitorError::StoreUnavailable {
@@ -471,6 +485,9 @@ impl MonitorWorld {
             agent_id: None,
             call_id: call.to_owned(),
             device_id: DeviceId::new(format!("monitor-call-{call}")),
+            workspace_root: self._root.path().to_string_lossy().into_owned(),
+            approved_command: None,
+            approved_file_path: None,
         }
     }
 
@@ -819,6 +836,264 @@ async fn client_control_reuses_registry_and_replays_typed_receipts() {
 }
 
 #[tokio::test]
+async fn client_mutation_controls_update_pause_resume_and_trigger() {
+    let world = MonitorWorld::new("client-mutate").await;
+    let generation = world.hub.worker_generation();
+    let registered = world
+        .hub
+        .inner_monitor()
+        .client_register(
+            &world.hub,
+            MonitorClientRegistrationRequest {
+                command_id: haider_rpc::CommandId::new("mutate-register"),
+                session_id: world.session.clone(),
+                worker_generation: generation,
+                source: haider_rpc::MonitorSourceWire::Sms,
+                filter: None,
+                action: haider_rpc::MonitorActionWire {
+                    report: true,
+                    follow_up: None,
+                },
+                occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+                lifetime: haider_rpc::MonitorLifetimeWire::Session,
+            },
+        )
+        .await;
+    let monitor_id = match registered.outcome {
+        haider_rpc::MonitorRegisterOutcomeWire::Registered { monitor } => monitor.monitor_id,
+        other => panic!("expected monitor registration, got {other:?}"),
+    };
+    world
+        .hub
+        .inner_monitor()
+        .inner
+        .runtime_status
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(
+            (world.session.clone(), monitor_id.clone()),
+            MonitorRuntimeStatus {
+                state: MonitorRuntimeState::Armed,
+                last_event: Some(MonitorLastEvent {
+                    at_ms: 17,
+                    summary: "prior fire".into(),
+                }),
+                fire_count: 7,
+                next_fire_at_ms: None,
+                dropped_events: 2,
+            },
+        );
+
+    let paused = world
+        .hub
+        .inner_monitor()
+        .client_mutate(
+            &world.hub,
+            haider_rpc::CommandId::new("mutate-pause"),
+            world.session.clone(),
+            generation,
+            haider_rpc::MonitorMutationWire::Pause {
+                monitor_id: monitor_id.clone(),
+            },
+        )
+        .await;
+    match paused.outcome {
+        haider_rpc::MonitorMutateOutcomeWire::Paused { monitor } => {
+            assert_eq!(monitor.state, haider_rpc::MonitorStateWire::Paused);
+            assert_eq!(monitor.fire_count, 7);
+            assert_eq!(
+                monitor.last_event.expect("prior event").summary,
+                "prior fire"
+            );
+        }
+        other => panic!("expected paused monitor, got {other:?}"),
+    }
+
+    let resumed = world
+        .hub
+        .inner_monitor()
+        .client_mutate(
+            &world.hub,
+            haider_rpc::CommandId::new("mutate-resume"),
+            world.session.clone(),
+            generation,
+            haider_rpc::MonitorMutationWire::Resume {
+                monitor_id: monitor_id.clone(),
+            },
+        )
+        .await;
+    match resumed.outcome {
+        haider_rpc::MonitorMutateOutcomeWire::Resumed { monitor } => {
+            assert_eq!(monitor.state, haider_rpc::MonitorStateWire::Armed);
+            assert_eq!(monitor.fire_count, 7);
+        }
+        other => panic!("expected resumed monitor, got {other:?}"),
+    }
+
+    let updated = world
+        .hub
+        .inner_monitor()
+        .client_mutate(
+            &world.hub,
+            haider_rpc::CommandId::new("mutate-update"),
+            world.session.clone(),
+            generation,
+            haider_rpc::MonitorMutationWire::Update {
+                monitor_id: monitor_id.clone(),
+                source: haider_rpc::MonitorSourceWire::Sms,
+                filter: None,
+                action: haider_rpc::MonitorActionWire {
+                    report: true,
+                    follow_up: Some("updated follow-up".into()),
+                },
+                occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+                lifetime: haider_rpc::MonitorLifetimeWire::Session,
+            },
+        )
+        .await;
+    match updated.outcome {
+        haider_rpc::MonitorMutateOutcomeWire::Updated { monitor } => {
+            assert_eq!(
+                monitor.action.follow_up.as_deref(),
+                Some("updated follow-up")
+            );
+            assert_eq!(monitor.fire_count, 7);
+        }
+        other => panic!("expected updated monitor, got {other:?}"),
+    }
+
+    let unknown = world
+        .hub
+        .inner_monitor()
+        .client_mutate(
+            &world.hub,
+            haider_rpc::CommandId::new("mutate-unknown"),
+            world.session.clone(),
+            generation,
+            haider_rpc::MonitorMutationWire::Unknown,
+        )
+        .await;
+    assert!(matches!(
+        unknown.outcome,
+        haider_rpc::MonitorMutateOutcomeWire::Rejected {
+            rejection: haider_rpc::MonitorControlRejectionWire::InvalidRequest { .. }
+        }
+    ));
+
+    let (reports, mut received) = tokio_mpsc::unbounded_channel();
+    world.install_canonical_test_sink(Arc::new(CapturingSink { reports }));
+    let triggered = world
+        .hub
+        .inner_monitor()
+        .client_mutate(
+            &world.hub,
+            haider_rpc::CommandId::new("mutate-trigger"),
+            world.session.clone(),
+            generation,
+            haider_rpc::MonitorMutationWire::Trigger {
+                monitor_id: monitor_id.clone(),
+            },
+        )
+        .await;
+    assert_eq!(
+        triggered.outcome,
+        haider_rpc::MonitorMutateOutcomeWire::Triggered {
+            monitor_id: monitor_id.clone(),
+        }
+    );
+    let report = timeout(Duration::from_secs(3), received.recv())
+        .await
+        .expect("manual trigger report timeout")
+        .expect("manual trigger report");
+    assert_eq!(report.monitor_id, monitor_id);
+}
+
+#[tokio::test]
+async fn client_mutation_rechecks_shutdown_after_waiting_for_the_mutation_lock() {
+    let world = MonitorWorld::new("mutate-shutdown-race").await;
+    let monitor_id = world
+        .register("register", None, MonitorOccurrence::Every)
+        .await;
+    let service = world.hub.inner_monitor().clone();
+    let hub = world.hub.clone();
+    let session = world.session.clone();
+    let generation = hub.worker_generation();
+    let guard = service.inner.mutations.lock().await;
+    let task = tokio::spawn({
+        let service = service.clone();
+        let monitor_id = monitor_id.clone();
+        async move {
+            service
+                .client_mutate(
+                    &hub,
+                    haider_rpc::CommandId::new("mutate-racing-shutdown"),
+                    session,
+                    generation,
+                    haider_rpc::MonitorMutationWire::Pause { monitor_id },
+                )
+                .await
+        }
+    });
+    // Give the request enough executor turns to complete its read-only
+    // preflight and queue behind the deliberately held mutation lock.
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    service.inner.shutdown.send_replace(true);
+    drop(guard);
+
+    let receipt = timeout(Duration::from_secs(3), task)
+        .await
+        .expect("racing mutation did not stop")
+        .expect("racing mutation task");
+    assert!(matches!(
+        receipt.outcome,
+        haider_rpc::MonitorMutateOutcomeWire::Rejected {
+            rejection: haider_rpc::MonitorControlRejectionWire::ServiceStopped
+        }
+    ));
+    assert!(
+        !service
+            .inner
+            .registry
+            .get(&world.session, &monitor_id)
+            .expect("registered monitor remains projected")
+            .paused
+    );
+    service.shutdown().await.expect("finish monitor shutdown");
+}
+
+#[tokio::test]
+async fn unapproved_command_monitor_is_rejected_without_running() {
+    let world = MonitorWorld::new("approval-no-run").await;
+    let marker = world._root.path().join("must-not-exist");
+    let result = world
+        .execute(
+            "unapproved",
+            MonitorRequest::Register {
+                source: MonitorSource::Process {
+                    command: "touch must-not-exist".into(),
+                    cwd: None,
+                    env_passthrough: Vec::new(),
+                    restart: MonitorProcessRestart::Never,
+                },
+                filter: None,
+                action: MonitorAction {
+                    report: true,
+                    follow_up: None,
+                },
+                occurrence: MonitorOccurrence::Every,
+                lifetime: MonitorLifetime::Session,
+            },
+        )
+        .await;
+    assert_eq!(result.status, ToolResultStatus::Rejected);
+    assert!(result.preview.contains("approval_required"));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
 async fn durable_registry_is_rebuilt_after_store_reopen() {
     let world = MonitorWorld::new("reopen").await;
     let monitor_id = world
@@ -876,6 +1151,93 @@ async fn durable_registry_is_rebuilt_after_store_reopen() {
         .close()
         .await
         .expect("close reopened monitor store");
+}
+
+#[tokio::test]
+async fn daemon_restart_rearms_durable_timer_runner() {
+    let world = MonitorWorld::new("timer-restart").await;
+    let registered = world
+        .execute(
+            "register-timer",
+            MonitorRequest::Register {
+                source: MonitorSource::Timer { interval_ms: 1_000 },
+                filter: None,
+                action: MonitorAction {
+                    report: true,
+                    follow_up: None,
+                },
+                occurrence: MonitorOccurrence::Every,
+                lifetime: MonitorLifetime::Session,
+            },
+        )
+        .await;
+    let monitor_id = serde_json::from_str::<serde_json::Value>(&registered.preview)
+        .expect("timer registration preview")["monitor_id"]
+        .as_str()
+        .expect("timer monitor id")
+        .to_owned();
+    let MonitorWorld {
+        store,
+        hub,
+        session,
+        run: _,
+        lease,
+        _root: root,
+    } = world;
+    hub.inner_monitor()
+        .shutdown()
+        .await
+        .expect("shutdown first monitor service");
+    drop(lease);
+    drop(hub);
+    store.close().await.expect("close first monitor store");
+
+    let reopened_store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen timer monitor store");
+    let reopened_hub = SessionHub::new(
+        reopened_store.clone(),
+        crate::session_hub::SessionHubConfig::default(),
+    )
+    .expect("reopened timer monitor hub");
+    reopened_hub
+        .inner_monitor()
+        .activate(reopened_hub.downgrade());
+    let (reports, mut received) = tokio_mpsc::unbounded_channel();
+    *reopened_hub
+        .inner_monitor()
+        .inner
+        .sink
+        .write()
+        .unwrap_or_else(PoisonError::into_inner) = Arc::new(CapturingSink { reports });
+    reopened_hub.wait_for_monitor_ready().await;
+    let report = timeout(Duration::from_secs(3), received.recv())
+        .await
+        .expect("rearmed timer report timeout")
+        .expect("rearmed timer report");
+    assert_eq!(report.monitor_id, monitor_id);
+    assert!(matches!(
+        report.events.first().map(|event| &event.payload),
+        Some(MonitorEventPayload::Timer { tick: 1, .. })
+    ));
+    assert!(
+        reopened_hub
+            .inner_monitor()
+            .inner
+            .registry
+            .get(&session, &monitor_id)
+            .is_some()
+    );
+    reopened_hub
+        .inner_monitor()
+        .shutdown()
+        .await
+        .expect("shutdown reopened timer monitor service");
+    drop(reopened_hub);
+    reopened_store
+        .close()
+        .await
+        .expect("close reopened timer monitor store");
 }
 
 #[tokio::test]
@@ -1111,6 +1473,7 @@ async fn named_branch_waiting_run_is_woken_as_a_subturn() {
         branch_id: Some(branch_id.clone()),
         agent_id: None,
         source: MonitorSourceKind::Sms,
+        occurrence: MonitorOccurrence::Every,
         status: MonitorReportStatus::Matched,
         events: vec![sms("+1", "wake named")],
         coalesced_count: 1,
@@ -1304,6 +1667,73 @@ async fn stalled_delivery_retains_a_bounded_follow_up_occurrence() {
 }
 
 #[tokio::test]
+async fn terminal_pending_report_rejects_a_second_manual_trigger_and_cleans_up() {
+    let world = MonitorWorld::new("terminal-trigger").await;
+    let monitor_id = world
+        .register("register", None, MonitorOccurrence::Once)
+        .await;
+    let (reports, mut received) = tokio_mpsc::unbounded_channel();
+    let (started, delivery_started) = tokio_oneshot::channel();
+    let (release, release_gate) = tokio_watch::channel(false);
+    world.install_canonical_test_sink(Arc::new(GatedSink {
+        reports,
+        started: StdMutex::new(Some(started)),
+        release: release_gate,
+    }));
+
+    let first = world
+        .execute(
+            "trigger-once",
+            MonitorRequest::Trigger {
+                monitor_id: monitor_id.clone(),
+            },
+        )
+        .await;
+    assert_eq!(first.status, ToolResultStatus::Completed);
+    timeout(Duration::from_secs(3), delivery_started)
+        .await
+        .expect("terminal delivery did not start")
+        .expect("terminal delivery start sender dropped");
+
+    let second = world
+        .execute(
+            "trigger-again",
+            MonitorRequest::Trigger {
+                monitor_id: monitor_id.clone(),
+            },
+        )
+        .await;
+    assert_eq!(second.status, ToolResultStatus::Rejected);
+    assert!(second.preview.contains("terminal_pending"));
+    assert_eq!(
+        world
+            .hub
+            .inner_monitor()
+            .inner
+            .registry
+            .pending_summary(&world.session, &monitor_id),
+        (1, true)
+    );
+
+    release.send_replace(true);
+    let delivered = timeout(Duration::from_secs(3), received.recv())
+        .await
+        .expect("terminal report timeout")
+        .expect("terminal report");
+    assert_eq!(delivered.monitor_id, monitor_id);
+    world.wait_for_count(0).await;
+    assert_eq!(
+        world
+            .hub
+            .inner_monitor()
+            .inner
+            .registry
+            .pending_summary(&world.session, &monitor_id),
+        (0, false)
+    );
+}
+
+#[tokio::test]
 async fn pre_expiry_event_is_classified_before_timeout_via_source_watermark() {
     let world = MonitorWorld::new("expiry-watermark").await;
     let monitor_id = world
@@ -1318,6 +1748,7 @@ async fn pre_expiry_event_is_classified_before_timeout_via_source_watermark() {
         .get(&world.session, &monitor_id)
         .expect("registered monitor");
     registration.created_at_ms = now_ms();
+    registration.activated_at_ms = registration.created_at_ms;
     registration.start_sequence = sources.current_sequence();
     registration.expires_at_ms = Some(now_ms().saturating_add(100));
     world
@@ -1419,6 +1850,48 @@ async fn timeout_reports_and_stops_while_session_lifetime_persists() {
 }
 
 #[tokio::test]
+async fn model_pause_resume_replaces_the_timeout_revision() {
+    let world = MonitorWorld::new("pause-resume-timeout").await;
+    let (reports, mut received) = tokio_mpsc::unbounded_channel();
+    world.install_canonical_test_sink(Arc::new(CapturingSink { reports }));
+    let monitor_id = world
+        .register_with_lifetime(
+            "register",
+            None,
+            MonitorOccurrence::Every,
+            MonitorLifetime::Timeout { timeout_ms: 800 },
+        )
+        .await;
+    let paused = world
+        .execute(
+            "pause",
+            MonitorRequest::Pause {
+                monitor_id: monitor_id.clone(),
+            },
+        )
+        .await;
+    assert_eq!(paused.status, ToolResultStatus::Completed);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let resumed = world
+        .execute(
+            "resume",
+            MonitorRequest::Resume {
+                monitor_id: monitor_id.clone(),
+            },
+        )
+        .await;
+    assert_eq!(resumed.status, ToolResultStatus::Completed);
+
+    let report = timeout(Duration::from_secs(3), received.recv())
+        .await
+        .expect("resumed monitor timeout task was not armed")
+        .expect("resumed monitor timeout report");
+    assert_eq!(report.monitor_id, monitor_id);
+    assert_eq!(report.status, MonitorReportStatus::TimedOut);
+    world.wait_for_count(0).await;
+}
+
+#[tokio::test]
 async fn bounded_registry_and_filter_matching() {
     let world = MonitorWorld::new("bounds-filter").await;
     let filter = MonitorFilter {
@@ -1465,4 +1938,415 @@ async fn bounded_registry_and_filter_matching() {
         .await;
     assert_eq!(overflow.status, ToolResultStatus::Rejected);
     assert!(overflow.preview.contains("limit_reached"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn timer_runner_uses_fake_clock_and_reports_tick_with_wall_time() {
+    let service = MonitorService::default();
+    let mut watch = registration(None);
+    watch.source = MonitorSource::Timer { interval_ms: 1_000 };
+    let mut events = service.source_hub().subscribe(MonitorSourceKind::Timer);
+    service
+        .inner
+        .registry
+        .insert(&watch.owner_session_id, watch.clone());
+    let (cancel, cancelled) = tokio_oneshot::channel();
+    let task = tokio::spawn(run_monitor_source(service, watch, cancelled));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(999)).await;
+    tokio::task::yield_now().await;
+    assert!(events.try_recv().is_err());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    let event = events.try_recv().expect("timer event after one second");
+    assert!(matches!(
+        event.payload,
+        MonitorEventPayload::Timer {
+            tick: 1,
+            fired_at_ms
+        } if fired_at_ms > 0
+    ));
+    let _ = cancel.send(());
+    task.await.expect("timer task");
+}
+
+#[tokio::test]
+async fn file_snapshots_report_create_modify_remove_and_changed_tail() {
+    let root = tempfile::tempdir().expect("file monitor root");
+    let path = root.path().join("watched.txt");
+    assert!(
+        read_file_snapshot(&path, root.path(), None)
+            .await
+            .expect("missing snapshot")
+            .is_none()
+    );
+    tokio::fs::write(&path, "alpha\nbeta\n")
+        .await
+        .expect("create watched file");
+    let created = read_file_snapshot(&path, root.path(), None)
+        .await
+        .expect("created snapshot");
+    let created_payload =
+        file_change_payload(&path, None, created.as_ref()).expect("created file payload");
+    assert!(created_payload.contains(r#""event":"created""#));
+
+    tokio::fs::write(&path, "alpha\ngamma\n")
+        .await
+        .expect("modify watched file");
+    let modified = read_file_snapshot(&path, root.path(), None)
+        .await
+        .expect("modified snapshot");
+    let modified_payload = file_change_payload(&path, created.as_ref(), modified.as_ref())
+        .expect("modified file payload");
+    assert!(modified_payload.contains(r#""event":"modified""#));
+    assert!(modified_payload.contains("gamma"));
+
+    tokio::fs::remove_file(&path)
+        .await
+        .expect("remove watched file");
+    let removed = read_file_snapshot(&path, root.path(), None)
+        .await
+        .expect("removed snapshot");
+    let removed_payload = file_change_payload(&path, modified.as_ref(), removed.as_ref())
+        .expect("removed file payload");
+    assert!(removed_payload.contains(r#""event":"removed""#));
+}
+
+#[tokio::test]
+async fn oversized_file_snapshot_reads_only_the_bounded_tail() {
+    use std::io::{Seek as _, Write as _};
+
+    let root = tempfile::tempdir().expect("bounded file monitor root");
+    let path = root.path().join("oversized.log");
+    let mut file = std::fs::File::create(&path).expect("create oversized file");
+    file.set_len(128 * 1024 * 1024)
+        .expect("extend sparse oversized file");
+    file.seek(std::io::SeekFrom::End(-5))
+        .expect("seek oversized tail");
+    file.write_all(b"tail\n").expect("write oversized tail");
+    drop(file);
+
+    let snapshot = timeout(
+        Duration::from_secs(2),
+        read_file_snapshot(&path, root.path(), None),
+    )
+    .await
+    .expect("oversized snapshot exceeded bounded read deadline")
+    .expect("oversized snapshot read")
+    .expect("oversized snapshot exists");
+    assert_eq!(snapshot.size, 128 * 1024 * 1024);
+    assert_eq!(snapshot.bytes_read, MONITOR_FILE_READ_CAP_BYTES);
+    assert!(
+        snapshot
+            .text
+            .as_deref()
+            .is_some_and(|text| text.ends_with("tail\n"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn file_snapshot_rejects_leaf_and_ancestor_symlink_swaps_before_open() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().expect("file monitor root");
+    let outside = tempfile::tempdir().expect("outside file monitor root");
+    let watched = root.path().join("watched.log");
+    let outside_file = outside.path().join("secret.log");
+    std::fs::write(&watched, "authorized").expect("write watched file");
+    std::fs::write(&outside_file, "secret").expect("write outside file");
+
+    let leaf_error = read_file_snapshot_with_before_open(&watched, root.path(), None, || {
+        std::fs::remove_file(&watched).expect("remove authorized leaf");
+        symlink(&outside_file, &watched).expect("swap watched leaf with symlink");
+    })
+    .await
+    .expect_err("leaf symlink swap must be rejected");
+    assert!(
+        leaf_error
+            .to_string()
+            .contains("securely open watched file")
+    );
+
+    std::fs::remove_file(&watched).expect("remove leaf symlink");
+    let parent = root.path().join("parent");
+    let moved_parent = root.path().join("moved-parent");
+    let watched = parent.join("watched.log");
+    std::fs::create_dir(&parent).expect("create watched parent");
+    std::fs::write(&watched, "authorized").expect("write nested watched file");
+
+    let ancestor_error = read_file_snapshot_with_before_open(&watched, root.path(), None, || {
+        std::fs::rename(&parent, &moved_parent).expect("move authorized parent");
+        symlink(outside.path(), &parent).expect("swap watched ancestor with symlink");
+    })
+    .await
+    .expect_err("ancestor symlink swap must be rejected");
+    assert!(
+        ancestor_error
+            .to_string()
+            .contains("securely open watched file")
+    );
+}
+
+#[test]
+fn poll_conditions_cover_exit_match_change_and_gh_ci_completion() {
+    let result = CapturedCommand {
+        exit_code: 7,
+        stdout: "Deploy READY".into(),
+        stderr: String::new(),
+    };
+    assert!(poll_condition_matches(
+        &MonitorPollUntil::ExitCode { code: 7 },
+        &result,
+        None,
+        false,
+    ));
+    assert!(poll_condition_matches(
+        &MonitorPollUntil::StdoutMatches {
+            pattern: "ready".into(),
+            case_sensitive: false,
+        },
+        &result,
+        None,
+        false,
+    ));
+    assert!(poll_condition_matches(
+        &MonitorPollUntil::StdoutChanged,
+        &result,
+        Some("older"),
+        false,
+    ));
+    assert!(!poll_condition_matches(
+        &MonitorPollUntil::StdoutChanged,
+        &result,
+        Some("Deploy READY"),
+        false,
+    ));
+    let completed = CapturedCommand {
+        exit_code: 0,
+        stdout: r#"{"status":"completed","conclusion":"success"}"#.into(),
+        stderr: String::new(),
+    };
+    assert!(poll_condition_matches(
+        &MonitorPollUntil::StdoutChanged,
+        &completed,
+        None,
+        true,
+    ));
+    let pending = CapturedCommand {
+        stdout: r#"{"status":"in_progress","conclusion":null}"#.into(),
+        ..completed
+    };
+    assert!(!poll_condition_matches(
+        &MonitorPollUntil::StdoutChanged,
+        &pending,
+        None,
+        true,
+    ));
+}
+
+#[tokio::test]
+async fn command_capture_and_process_lines_use_ahrb_bounds() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let (mut writer, reader) = tokio::io::duplex(16 * 1024);
+    let write = tokio::spawn(async move {
+        writer
+            .write_all(&vec![b'x'; MONITOR_OUTPUT_CAP_BYTES + 1_024])
+            .await
+            .expect("write oversized output");
+    });
+    let captured = drain_capped(reader, MONITOR_OUTPUT_CAP_BYTES).await;
+    write.await.expect("output writer");
+    assert!(captured.contains("haider_elision_v1"));
+    assert!(captured.len() <= MONITOR_OUTPUT_CAP_BYTES);
+
+    let input = format!("{}\nnext\n", "y".repeat(MONITOR_OUTPUT_CAP_BYTES + 512));
+    let mut reader = BufReader::new(input.as_bytes());
+    let first = read_bounded_line(&mut reader, MONITOR_OUTPUT_CAP_BYTES)
+        .await
+        .expect("bounded line")
+        .expect("first line");
+    assert!(first.contains("haider_elision_v1"));
+    assert_eq!(
+        read_bounded_line(&mut reader, MONITOR_OUTPUT_CAP_BYTES)
+            .await
+            .expect("second bounded line")
+            .as_deref(),
+        Some("next")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn completed_leader_with_pipe_holding_descendant_is_bounded() {
+    let root = tempfile::tempdir().expect("process pipe drain root");
+    let source = MonitorSource::Process {
+        command: "(sleep 30) & exit 0".into(),
+        cwd: None,
+        env_passthrough: Vec::new(),
+        restart: MonitorProcessRestart::Never,
+    };
+    let approval = haider_tools::MonitorCommandApproval::new(&source, root.path())
+        .expect("process approval")
+        .expect("command approval");
+    let command = ApprovedMonitorCommand::from_approval(&approval);
+    let workspace = root.path().to_string_lossy().into_owned();
+    let error = timeout(
+        Duration::from_secs(2),
+        run_command_capped(&command, Some(&workspace), Duration::from_millis(200)),
+    )
+    .await
+    .expect("capped command hung on inherited pipe")
+    .expect_err("inherited pipe must consume the whole command deadline");
+    assert!(error.contains("including output drain"));
+
+    let mut watch = registration(None);
+    watch.source = source;
+    watch.workspace_root = Some(workspace);
+    watch.approved_command = Some(command);
+    let service = MonitorService::default();
+    let mut subscription = service.source_hub().subscribe(MonitorSourceKind::Process);
+    service
+        .inner
+        .registry
+        .insert(&watch.owner_session_id, watch.clone());
+    let (_cancel, cancelled) = tokio_oneshot::channel();
+    let task = tokio::spawn(run_monitor_source(service, watch, cancelled));
+    let terminal = timeout(Duration::from_secs(3), async {
+        loop {
+            let event = subscription.recv().await.expect("process event");
+            if matches!(
+                event.payload,
+                MonitorEventPayload::Process { terminal: true, .. }
+            ) {
+                break event.payload;
+            }
+        }
+    })
+    .await
+    .expect("process monitor hung on inherited pipe");
+    assert!(matches!(
+        terminal,
+        MonitorEventPayload::Process {
+            terminal: true,
+            exit_code: Some(0),
+            ..
+        }
+    ));
+    timeout(Duration::from_secs(1), task)
+        .await
+        .expect("process runner did not finish")
+        .expect("process runner task");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_runner_emits_lines_exit_and_on_failure_restart() {
+    async fn collect_terminal(subscription: &mut MonitorSubscription) -> Vec<MonitorEventPayload> {
+        let mut payloads = Vec::new();
+        loop {
+            let event = timeout(Duration::from_secs(4), subscription.recv())
+                .await
+                .expect("process event timeout")
+                .expect("process event");
+            let terminal = matches!(
+                event.payload,
+                MonitorEventPayload::Process { terminal: true, .. }
+            );
+            payloads.push(event.payload);
+            if terminal {
+                return payloads;
+            }
+        }
+    }
+
+    let root = tempfile::tempdir().expect("process monitor root");
+    let source = MonitorSource::Process {
+        command: "printf 'one\\ntwo\\n'; exit 7".into(),
+        cwd: None,
+        env_passthrough: Vec::new(),
+        restart: MonitorProcessRestart::OnFailure,
+    };
+    let approval = haider_tools::MonitorCommandApproval::new(&source, root.path())
+        .expect("process approval")
+        .expect("command approval");
+    let mut watch = registration(None);
+    watch.source = source;
+    watch.workspace_root = Some(root.path().to_string_lossy().into_owned());
+    watch.approved_command = Some(ApprovedMonitorCommand::from_approval(&approval));
+    let service = MonitorService::default();
+    let mut subscription = service.source_hub().subscribe(MonitorSourceKind::Process);
+    service
+        .inner
+        .registry
+        .insert(&watch.owner_session_id, watch.clone());
+    let (cancel, cancelled) = tokio_oneshot::channel();
+    let task = tokio::spawn(run_monitor_source(service, watch, cancelled));
+
+    let first = collect_terminal(&mut subscription).await;
+    assert!(first.iter().any(|payload| {
+        matches!(payload, MonitorEventPayload::Process { line, terminal: false, .. } if line == "one")
+    }));
+    assert!(first.iter().any(|payload| {
+        matches!(payload, MonitorEventPayload::Process { line, terminal: false, .. } if line == "two")
+    }));
+    assert!(first.iter().any(|payload| {
+        matches!(
+            payload,
+            MonitorEventPayload::Process {
+                terminal: true,
+                exit_code: Some(7),
+                ..
+            }
+        )
+    }));
+    let restarted = collect_terminal(&mut subscription).await;
+    assert!(restarted.iter().any(|payload| {
+        matches!(
+            payload,
+            MonitorEventPayload::Process {
+                terminal: true,
+                exit_code: Some(7),
+                ..
+            }
+        )
+    }));
+    let _ = cancel.send(());
+    task.await.expect("process runner");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_process_runner_kills_its_descendant_group() {
+    let root = tempfile::tempdir().expect("process cancellation root");
+    let marker = root.path().join("descendant-must-not-write");
+    let source = MonitorSource::Process {
+        command: "(sleep 1; touch descendant-must-not-write) & wait".into(),
+        cwd: None,
+        env_passthrough: Vec::new(),
+        restart: MonitorProcessRestart::Never,
+    };
+    let approval = haider_tools::MonitorCommandApproval::new(&source, root.path())
+        .expect("process approval")
+        .expect("command approval");
+    let mut watch = registration(None);
+    watch.source = source;
+    watch.workspace_root = Some(root.path().to_string_lossy().into_owned());
+    watch.approved_command = Some(ApprovedMonitorCommand::from_approval(&approval));
+    let service = MonitorService::default();
+    service
+        .inner
+        .registry
+        .insert(&watch.owner_session_id, watch.clone());
+    let (cancel, cancelled) = tokio_oneshot::channel();
+    let task = tokio::spawn(run_monitor_source(service, watch, cancelled));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancel.send(()).expect("cancel process runner");
+    task.await.expect("cancelled process runner");
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(
+        !marker.exists(),
+        "cancelled descendant escaped its process group"
+    );
 }

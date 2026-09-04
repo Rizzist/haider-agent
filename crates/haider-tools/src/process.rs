@@ -2171,10 +2171,21 @@ fn same_directory_identity(left: &DirectoryIdentity, right: &DirectoryIdentity) 
 
 #[cfg(unix)]
 pub(crate) fn shell_command(script: &str) -> Command {
-    let executable = unix_shell_executable(env::var_os("SHELL"), is_executable_file);
-    let mut command = Command::new(executable);
-    command.arg("-c").arg(script);
+    let argv = monitor_shell_argv(script);
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
     command
+}
+
+#[cfg(unix)]
+pub(crate) fn monitor_shell_argv(script: &str) -> Vec<String> {
+    vec![
+        unix_shell_executable(env::var_os("SHELL"), is_executable_file)
+            .to_string_lossy()
+            .into_owned(),
+        "-c".into(),
+        script.into(),
+    ]
 }
 
 #[cfg(unix)]
@@ -2214,17 +2225,103 @@ fn is_executable_file(path: &Path) -> bool {
 
 #[cfg(windows)]
 pub(crate) fn shell_command(script: &str) -> Command {
-    let mut command = Command::new(haider_platform::windows_powershell());
-    command.args([
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        script,
-    ]);
+    let argv = monitor_shell_argv(script);
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
     command
+}
+
+#[cfg(windows)]
+pub(crate) fn monitor_shell_argv(script: &str) -> Vec<String> {
+    vec![
+        haider_platform::windows_powershell()
+            .to_string_lossy()
+            .into_owned(),
+        "-NoLogo".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-ExecutionPolicy".into(),
+        "Bypass".into(),
+        "-Command".into(),
+        script.into(),
+    ]
+}
+
+/// Builds a command-backed monitor process from the exact approved argv and
+/// an fd/handle anchored cwd beneath the authorized workspace root.
+pub struct PreparedMonitorProcess {
+    command: Command,
+    #[cfg(windows)]
+    cwd_anchor: OwnedFd,
+}
+
+impl PreparedMonitorProcess {
+    /// Spawns while the Windows root-to-cwd handle chain is still retained.
+    /// Unix transfers its cwd descriptor into the pre-exec closure instead.
+    pub fn spawn(mut self) -> std::io::Result<Child> {
+        let spawned = self.command.spawn();
+        #[cfg(windows)]
+        drop(self.cwd_anchor);
+        spawned
+    }
+
+    #[cfg(all(test, windows))]
+    fn spawn_with_before_spawn(mut self, before_spawn: impl FnOnce()) -> std::io::Result<Child> {
+        before_spawn();
+        let spawned = self.command.spawn();
+        drop(self.cwd_anchor);
+        spawned
+    }
+}
+
+pub fn monitor_process_command(
+    argv: &[String],
+    workspace_root: &Path,
+    cwd: &Path,
+    env_allowlist: &[String],
+) -> ToolResult<PreparedMonitorProcess> {
+    let program = argv
+        .first()
+        .ok_or_else(|| ToolError::invalid_argument("monitor command argv is empty"))?;
+    let workspace_root = std::fs::canonicalize(workspace_root).map_err(|error| {
+        ToolError::io("canonicalize monitor workspace root", workspace_root, error)
+    })?;
+    let cwd = std::fs::canonicalize(cwd)
+        .map_err(|error| ToolError::io("canonicalize monitor cwd", cwd, error))?;
+    if !cwd.starts_with(&workspace_root) {
+        return Err(ToolError::WorkspaceBoundary {
+            workspace_root,
+            requested_path: cwd.clone(),
+            resolved_path: Some(cwd),
+        });
+    }
+    let workspace_dir = haider_platform::open_workspace_directory(&workspace_root)
+        .map_err(|error| ToolError::io("open monitor workspace root", &workspace_root, error))?;
+    let cwd_dir = open_directory_beneath(workspace_dir, &workspace_root, &cwd)?;
+    let mut command = Command::new(program);
+    command
+        .args(&argv[1..])
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    haider_platform::configure_process_environment(&mut command);
+    for name in env_allowlist {
+        if let Some(value) = env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    #[cfg(unix)]
+    set_anchored_current_dir(&mut command, cwd_dir);
+    #[cfg(windows)]
+    set_anchored_current_dir(&mut command, &cwd_dir);
+    haider_platform::configure_process_group(&mut command);
+    Ok(PreparedMonitorProcess {
+        command,
+        #[cfg(windows)]
+        cwd_anchor: cwd_dir,
+    })
 }
 
 pub(crate) fn process_arguments(
@@ -2374,6 +2471,49 @@ mod supervisor_tests {
         assert!(
             !platform_group_exists(group, pid).expect("probe swept process group"),
             "process group remains live after observer-failure teardown"
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_monitor_command_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn monitor_cwd_ancestor_cannot_be_replaced_between_prepare_and_spawn() {
+        let workspace = tempfile::tempdir().expect("monitor process workspace");
+        let parent = workspace.path().join("parent");
+        let cwd = parent.join("cwd");
+        std::fs::create_dir_all(&cwd).expect("create monitor cwd");
+        let moved = workspace.path().join("moved-parent");
+        let argv = monitor_shell_argv("[Console]::Out.Write((Get-Location).Path)");
+        let prepared = monitor_process_command(&argv, workspace.path(), &cwd, &[])
+            .expect("prepare anchored monitor command");
+        let rename_result = Arc::new(Mutex::new(None));
+        let recorded = Arc::clone(&rename_result);
+        let output = prepared
+            .spawn_with_before_spawn(|| {
+                *recorded.lock().expect("record rename") = Some(std::fs::rename(&parent, &moved));
+            })
+            .expect("spawn anchored monitor command")
+            .wait_with_output()
+            .await
+            .expect("wait for anchored monitor command");
+        assert!(output.status.success());
+        assert!(
+            rename_result
+                .lock()
+                .expect("inspect rename")
+                .as_ref()
+                .is_some_and(Result::is_err),
+            "retained cwd anchors must deny ancestor replacement until spawn"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .eq_ignore_ascii_case(&cwd.to_string_lossy()),
+            "spawned process must retain the prepared cwd"
         );
     }
 }

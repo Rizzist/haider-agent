@@ -186,6 +186,22 @@ surfaces.
 
 ### v0.0.970 — retained terminal projection and replay law
 
+- New additive prompt-omitted monitor journal kinds:
+  `monitor_registered`, `monitor_removed`, `monitor_tool_receipt`,
+  `monitor_client_receipt`, `monitor_report_pending`, and
+  `monitor_report_delivered`. Registrations add daemon-owned
+  process/file/poll/timer/CLI source configuration and runtime fences; pending
+  reports retain bounded typed source events, occurrence, omission counts,
+  and the exact follow-up action. Raw-envelope readers must preserve unknown
+  monitor kinds even when they do not project the monitor subsystem.
+- Additive client wire surface: `monitor.mutate`, negotiated independently as
+  `monitor_mutate_v1`, supplies receipt-backed update/pause/resume/trigger
+  controls; monitor rows add defaulted state,
+  last-event/fire-count/next-fire fields and a source summary; process and CLI
+  delivery payloads add structured/terminal/exit-code detail; timer payloads
+  add a tick counter; and `cli` joins the source-kind and availability unions.
+  `SCHEMA_VERSION` remains 1 because these are additive kinds and fields.
+
 - Additive durable terminal fields: the terminal `payload:run_state` now
   retains `terminal_kind` in the journal. Failure, budget, timeout, and
   provider-error terminals also retain `error_code`; success and ordinary

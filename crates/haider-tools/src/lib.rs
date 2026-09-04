@@ -86,17 +86,20 @@ pub use mobile::{
 };
 pub use monitor::{
     MAX_MONITOR_FILTER_CHARS, MAX_MONITOR_FOLLOW_UP_CHARS, MAX_MONITOR_ID_CHARS, MonitorAction,
-    MonitorFilter, MonitorFilterField, MonitorFilterOperator, MonitorLifetime, MonitorOccurrence,
-    MonitorRequest, MonitorSource, MonitorSourceKind, monitor_manifest,
+    MonitorApproval, MonitorCliPreset, MonitorCommandApproval, MonitorFilter, MonitorFilterField,
+    MonitorFilterOperator, MonitorLifetime, MonitorOccurrence, MonitorPollUntil,
+    MonitorProcessRestart, MonitorRequest, MonitorSource, MonitorSourceKind, cli_preset_argv,
+    monitor_manifest,
 };
 pub use plan::{
     PLAN_BODY_MAX_BYTES, PLAN_DECISION_ACCEPT, PLAN_ORIGIN, PLAN_TITLE_MAX_BYTES, Plan, PlanResult,
 };
 pub use process::{
     CommandOutputSink, NoopCommandOutputSink, PROCESS_ADAPTER_INPUT_BYTES,
-    PROCESS_MAX_OUTPUT_BYTES, PROCESS_OUTPUT_CHUNK_BYTES, ProcessBounds, ProcessCancelHandle,
-    ProcessControl, ProcessControlAction, ProcessControlResult, ProcessExec, ProcessExecution,
-    ProcessLifecycleEvent, ProcessLimit, ProcessOutputChunk, ProcessResult, ProcessSignal,
+    PROCESS_MAX_OUTPUT_BYTES, PROCESS_OUTPUT_CHUNK_BYTES, PreparedMonitorProcess, ProcessBounds,
+    ProcessCancelHandle, ProcessControl, ProcessControlAction, ProcessControlResult, ProcessExec,
+    ProcessExecution, ProcessLifecycleEvent, ProcessLimit, ProcessOutputChunk, ProcessResult,
+    ProcessSignal, monitor_process_command,
 };
 pub use redact::redact_lockdown_text;
 pub use request_input::{RequestInput, RequestInputAnswer, RequestInputKind, RequestInputOption};

@@ -21,11 +21,13 @@ use haider_core::{
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
-use haider_protocol::effect::{EffectOutcome, EffectPhase};
+use haider_protocol::effect::{AuthorizationVerdict, EffectOutcome, EffectPhase};
 use haider_protocol::envelope::{PromptRender, RawEnvelope};
 use haider_protocol::ids::{DeviceId, EventId, ItemId, RunId, SessionId, TaskId};
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason};
-use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
+use haider_protocol::session::{
+    SessionInteractionModeV1, SessionMetadataV1, SessionPermissionOverridesV1,
+};
 use haider_protocol::state::RunState;
 use haider_protocol::task::{
     TASK_CONCURRENCY_CAP, TaskCompleted, TaskCompletionDelivery, TaskEventPayload, TaskStarted,
@@ -203,6 +205,273 @@ async fn task_dispatcher_with_grant(
     .await
     .expect("create tool dispatcher")
     .expect("dispatcher available")
+}
+
+async fn task_dispatcher_with_monitor_policy(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    cwd: &str,
+    label: &str,
+    context_run: &RunId,
+    permission_overrides: Option<SessionPermissionOverridesV1>,
+    interaction_mode: SessionInteractionModeV1,
+) -> Arc<dyn ToolDispatcher> {
+    let lease = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("monitor policy tool lease");
+    let mut metadata = task_metadata(cwd);
+    metadata.permission_overrides = permission_overrides;
+    metadata.interaction_mode = interaction_mode;
+    TurnToolFactory::create(
+        &BrokerToolFactory,
+        WorkerToolContext {
+            lockdown: None,
+            diagnostics: None,
+            metadata,
+            store: lease,
+            run_id: context_run.clone(),
+            run_deadline: None,
+            branch_id: None,
+            device_id: DeviceId::new(format!("{label}-tool-device")),
+            event_ids: Arc::new(EventIdGenerator::new(format!("{label}-tool-event"))),
+            delegation: crate::delegation::DelegationHandle::new(hub.clone()),
+            tasks: TaskFacade::with_kill_grace(hub.clone(), Duration::from_millis(300)),
+            agent_id: None,
+            session_context_tail: String::new(),
+            grant: None,
+            mobile_use_active: false,
+            cli_scope: None,
+            typed_workflow_execution: None,
+            loom_provider_fenced: false,
+            web_search: None,
+        },
+    )
+    .await
+    .expect("create monitor policy dispatcher")
+    .expect("monitor policy dispatcher available")
+}
+
+fn monitor_marker_command(marker: &std::path::Path) -> String {
+    let marker = marker
+        .file_name()
+        .expect("monitor marker has a file name")
+        .to_string_lossy();
+    #[cfg(unix)]
+    {
+        format!("printf authorized > '{marker}'")
+    }
+    #[cfg(windows)]
+    {
+        let marker = marker.replace('\'', "''");
+        format!("[IO.File]::WriteAllText('{marker}','authorized')")
+    }
+}
+
+fn monitor_process_args(marker: &std::path::Path) -> serde_json::Value {
+    serde_json::json!({
+        "operation": "register",
+        "source": {
+            "kind": "process",
+            "command": monitor_marker_command(marker),
+            "restart": "never"
+        },
+        "action": {"report": true},
+        "occurrence": "once",
+        "lifetime": {"kind": "timeout", "timeout_ms": 5_000}
+    })
+}
+
+async fn process_effect_phases(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+) -> Vec<EffectPhase> {
+    read_all(store, session_id)
+        .await
+        .into_iter()
+        .filter_map(|envelope| envelope.payload.decode_event().ok())
+        .filter_map(|payload| match payload {
+            EventPayload::Effect(phase) => Some(phase),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The production monitor dispatcher must honor the broker's Ask/Allow/Deny
+/// result before a daemon-owned command can start. Ask and Deny never create
+/// their marker; Allow records authorization and dispatch durably before the
+/// runner is installed and the marker can appear.
+#[tokio::test]
+async fn monitor_command_dispatch_waits_for_durable_broker_authorization() {
+    let profile = tempfile::tempdir().expect("monitor dispatcher profile");
+    let (workspace, cwd) = workspace();
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("monitor dispatcher store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("monitor hub");
+
+    let ask_session = create_task_session(&hub, "monitor-dispatch-ask", &cwd).await;
+    let ask_run = RunId::new("monitor-dispatch-ask-run");
+    prepare_tool_run(&hub, &ask_session, &ask_run, "monitor-dispatch-ask").await;
+    let ask_dispatcher = task_dispatcher_with_monitor_policy(
+        &hub,
+        &ask_session,
+        &cwd,
+        "monitor-dispatch-ask",
+        &ask_run,
+        None,
+        SessionInteractionModeV1::Interactive,
+    )
+    .await;
+    let ask_marker = workspace.path().join("ask-marker");
+    let ask = ask_dispatcher
+        .execute(
+            &ask_run,
+            &ItemId::new("monitor-dispatch-ask-item"),
+            "monitor-dispatch-ask-call",
+            "monitor",
+            monitor_process_args(&ask_marker),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("Ask is a parked tool result");
+    match ask {
+        ToolDispatchResult::ApprovalRequired(_) => {}
+        ToolDispatchResult::Completed(result) => {
+            panic!("Ask completed instead of parking: {}", result.preview)
+        }
+        ToolDispatchResult::Deferred(_) => panic!("Ask became a deferred tool result"),
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!ask_marker.exists(), "Ask started the monitor command");
+    let ask_phases = process_effect_phases(&store, &ask_session).await;
+    assert!(ask_phases.iter().any(|phase| matches!(
+        phase,
+        EffectPhase::Authorized {
+            verdict: AuthorizationVerdict::Ask { .. },
+            ..
+        }
+    )));
+    assert!(
+        !ask_phases
+            .iter()
+            .any(|phase| matches!(phase, EffectPhase::Dispatched { .. }))
+    );
+    ask_dispatcher
+        .cancel()
+        .await
+        .expect("cancel parked Ask dispatcher");
+
+    let deny_session = create_task_session(&hub, "monitor-dispatch-deny", &cwd).await;
+    let deny_run = RunId::new("monitor-dispatch-deny-run");
+    prepare_tool_run(&hub, &deny_session, &deny_run, "monitor-dispatch-deny").await;
+    let deny_dispatcher = task_dispatcher_with_monitor_policy(
+        &hub,
+        &deny_session,
+        &cwd,
+        "monitor-dispatch-deny",
+        &deny_run,
+        None,
+        SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    let deny_marker = workspace.path().join("deny-marker");
+    let denied = deny_dispatcher
+        .execute(
+            &deny_run,
+            &ItemId::new("monitor-dispatch-deny-item"),
+            "monitor-dispatch-deny-call",
+            "monitor",
+            monitor_process_args(&deny_marker),
+            &CancelToken::new(),
+        )
+        .await
+        .expect_err("autonomous unresolved Ask must fail closed");
+    assert!(denied.to_string().contains("no_human_available"));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!deny_marker.exists(), "Deny started the monitor command");
+    let deny_phases = process_effect_phases(&store, &deny_session).await;
+    assert!(deny_phases.iter().any(|phase| matches!(
+        phase,
+        EffectPhase::Authorized {
+            verdict: AuthorizationVerdict::Deny { .. },
+            ..
+        }
+    )));
+    assert!(
+        !deny_phases
+            .iter()
+            .any(|phase| matches!(phase, EffectPhase::Dispatched { .. }))
+    );
+    deny_dispatcher
+        .close()
+        .await
+        .expect("close denied dispatcher");
+
+    let allow_session = create_task_session(&hub, "monitor-dispatch-allow", &cwd).await;
+    let allow_run = RunId::new("monitor-dispatch-allow-run");
+    prepare_tool_run(&hub, &allow_session, &allow_run, "monitor-dispatch-allow").await;
+    let allow_dispatcher = task_dispatcher_with_monitor_policy(
+        &hub,
+        &allow_session,
+        &cwd,
+        "monitor-dispatch-allow",
+        &allow_run,
+        overrides(),
+        SessionInteractionModeV1::Interactive,
+    )
+    .await;
+    let allow_marker = workspace.path().join("allow-marker");
+    let allowed = allow_dispatcher
+        .execute(
+            &allow_run,
+            &ItemId::new("monitor-dispatch-allow-item"),
+            "monitor-dispatch-allow-call",
+            "monitor",
+            monitor_process_args(&allow_marker),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("Allow monitor dispatch");
+    assert!(matches!(allowed, ToolDispatchResult::Completed(_)));
+    timeout(Duration::from_secs(3), async {
+        while !allow_marker.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("authorized monitor command did not start");
+    let allow_phases = process_effect_phases(&store, &allow_session).await;
+    let authorized = allow_phases
+        .iter()
+        .position(|phase| {
+            matches!(
+                phase,
+                EffectPhase::Authorized {
+                    verdict: AuthorizationVerdict::Allow,
+                    ..
+                }
+            )
+        })
+        .expect("durable Allow phase");
+    let dispatched = allow_phases
+        .iter()
+        .position(|phase| matches!(phase, EffectPhase::Dispatched { .. }))
+        .expect("durable Dispatched phase");
+    assert!(authorized < dispatched);
+    assert_eq!(
+        std::fs::read_to_string(&allow_marker).expect("read authorized marker"),
+        "authorized"
+    );
+
+    allow_dispatcher
+        .close()
+        .await
+        .expect("close allowed dispatcher");
+    hub.shutdown()
+        .await
+        .expect("monitor dispatcher hub shutdown");
+    store.close().await.expect("monitor dispatcher store close");
 }
 
 /// E1d dispatch fence: even a forged/unadvertised write call is rejected

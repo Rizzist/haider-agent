@@ -702,6 +702,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "lockdown.set_quota",
         "lockdown.status",
         "monitor.list",
+        "monitor.mutate",
         "monitor.register",
         "monitor.remove",
         "monitor.watch",
@@ -779,8 +780,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        126,
-        "123 v0.0.966 methods plus agent.cancel, status.snapshot, and session.workspace.set"
+        127,
+        "123 v0.0.966 methods plus agent.cancel, status.snapshot, session.workspace.set, and monitor.mutate"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -826,8 +827,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     assert_eq!(fixture.contract, "haider-client-wire/v1");
     assert_eq!(
         fixture.methods.len(),
-        66,
-        "the supplemental fixture must contain the 66 methods absent from the union transcript"
+        67,
+        "the supplemental fixture must contain the 67 methods absent from the union transcript"
     );
     for pair in fixture.methods {
         assert_eq!(wire_method(&pair.request), pair.request_method);
@@ -2023,6 +2024,43 @@ fn unknown_fields_and_future_method_discriminants_are_tolerated() {
             body: RequestBody::Unknown,
         }
     );
+}
+
+#[test]
+fn monitor_nested_future_discriminants_decode_without_losing_the_request_frame() {
+    let restart: haider_rpc::MonitorProcessRestartWire =
+        serde_json::from_str(r#""after_signal""#).expect("future restart value");
+    assert_eq!(restart, haider_rpc::MonitorProcessRestartWire::Unknown);
+
+    let until: haider_rpc::MonitorPollUntilWire = serde_json::from_value(serde_json::json!({
+        "kind": "http_status",
+        "code": 204
+    }))
+    .expect("future poll-until value");
+    assert_eq!(until, haider_rpc::MonitorPollUntilWire::Unknown);
+
+    let preset: haider_rpc::MonitorCliPresetWire =
+        serde_json::from_str(r#""future-cli""#).expect("future CLI preset");
+    assert_eq!(preset, haider_rpc::MonitorCliPresetWire::Unknown);
+
+    let request: RequestBody = serde_json::from_value(serde_json::json!({
+        "method": "monitor.mutate",
+        "command_id": "future-monitor-mutation",
+        "session_id": "future-monitor-session",
+        "worker_generation": 7,
+        "mutation": {
+            "operation": "snooze",
+            "monitor_id": "monitor-future"
+        }
+    }))
+    .expect("future nested monitor mutation must retain its request envelope");
+    assert!(matches!(
+        request,
+        RequestBody::MonitorMutate {
+            mutation: haider_rpc::MonitorMutationWire::Unknown,
+            ..
+        }
+    ));
 }
 
 #[test]
