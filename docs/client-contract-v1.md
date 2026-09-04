@@ -280,6 +280,7 @@ is §4.1.
 | `tool_inventory_v1` | `tools.inventory` |
 | `monitor_v1` | daemon-owned durable session `monitor` model tool and source/delivery runtime; no client RPC method and not the private APK transport |
 | `monitor_control_v1` | typed client `monitor.list`, `monitor.register`, and `monitor.remove` receipts |
+| `monitor_mutate_v1` | typed client `monitor.mutate` update/pause/resume/trigger receipts |
 | `monitor_delivery_v1` | replayable `monitor.watch`, `MonitorDelivery`, and `MonitorDeliveryCaughtUp` |
 | `vault_stage_v1` | `vault.stage` |
 | `account_login_api_v1` | `account.login_api` |
@@ -487,6 +488,7 @@ force selector.
 | `tools.inventory` | `ToolsInventory` | snapshot |
 | `monitor.list` | `MonitorList` | typed snapshot receipt |
 | `monitor.register` | `MonitorRegister` | durable command receipt or structured rejection |
+| `monitor.mutate` | `MonitorMutate` | durable update/pause/resume/trigger receipt or structured rejection |
 | `monitor.remove` | `MonitorRemove` | durable command receipt or structured rejection |
 | `monitor.watch` | `MonitorWatch` | typed watch receipt; report frames are separate |
 | `hooks.list` | `HooksList` | snapshot |
@@ -574,14 +576,15 @@ matching external event. Its source anchors are
 `crates/haider-daemon/src/worker.rs:7382-7389`, and dispatch at
 `crates/haider-daemon/src/worker.rs:9569-9588`.
 
-`monitor_v1` by itself still publishes no client method. Client control and
-delivery are separate contracts gated by `monitor_control_v1` and
-`monitor_delivery_v1` (§5.4-§5.5). A client may render the model tool's
+`monitor_v1` by itself still publishes no client method. Client control,
+mutation, and delivery are separate contracts gated by `monitor_control_v1`,
+`monitor_mutate_v1`, and `monitor_delivery_v1` (§5.4-§5.5). A client may render the model tool's
 ordinary durable item transcript, but MUST NOT copy its manifest into a client
 catalog or treat the tool call as a client receipt.
 
 Without `monitor_control_v1`, `monitor.list/register/remove` are unavailable,
-even when `monitor_v1` is present. That absence is not an empty registry.
+even when `monitor_v1` is present. Without `monitor_mutate_v1`,
+`monitor.mutate` is unavailable. That absence is not an empty registry.
 Without `monitor_delivery_v1`, `monitor.watch` and both delivery frame kinds
 are unavailable, even when the model tool can wake a session. The two client
 bits do not grant their required View/Control capabilities.
@@ -595,7 +598,7 @@ with the APK's positive chat ids, and
 implementation detail, not v1 client frames, not a `monitor` RPC surface, and
 MUST NOT be implemented or consumed by an ADE client.
 
-### 5.4 Typed client monitor control (`monitor_control_v1`)
+### 5.4 Typed client monitor control (`monitor_control_v1` and `monitor_mutate_v1`)
 
 The client control surface uses the real durable monitor registry and the
 canonical `haider-tools` parser. It does not define a second registry or relax
@@ -605,15 +608,21 @@ the model tool's validation. The methods and authorization policy are:
 |---|---|---|
 | `monitor.list` | View (Control also satisfies View) | `session_id: SessionId` |
 | `monitor.register` | Control plus a live Control attachment to `session_id` | `command_id: CommandId`, `session_id: SessionId`, `worker_generation: u64`, `source: MonitorSourceWire`, optional `filter: MonitorFilterWire`, `action: MonitorActionWire`, `occurrence: MonitorOccurrenceWire`, `lifetime: MonitorLifetimeWire` |
+| `monitor.mutate` (`monitor_mutate_v1`) | Control plus a live Control attachment to `session_id` | `command_id: CommandId`, `session_id: SessionId`, `worker_generation: u64`, and `mutation: MonitorMutationWire`; mutation is `update`, `pause`, `resume`, or `trigger` |
 | `monitor.remove` | Control plus a live Control attachment to `session_id` | `command_id: CommandId`, `session_id: SessionId`, `worker_generation: u64`, `monitor_id: String` |
 
 Every successful RPC response has the same method name and one `receipt`
-field. `MonitorListReceiptWire`, `MonitorRegisterReceiptWire`, and
-`MonitorRemoveReceiptWire` all carry `session_id`, `policy`, `sources`, and a
-tagged `outcome`; mutation receipts additionally carry the `command_id` and
-authoritative `worker_generation`. `policy` is typed as
+field. `MonitorListReceiptWire`, `MonitorRegisterReceiptWire`,
+`MonitorMutateReceiptWire`, and `MonitorRemoveReceiptWire` all carry
+`session_id`, `policy`, `sources`, and a tagged `outcome`; mutation receipts
+additionally carry the `command_id` and authoritative `worker_generation`.
+`policy` is typed as
 `{list: view, register: control, register_requires_control_attachment: true,
-remove: control, remove_requires_control_attachment: true, watch: view}`. The
+remove: control, remove_requires_control_attachment: true, update: control,
+update_requires_control_attachment: true, pause: control,
+pause_requires_control_attachment: true, resume: control,
+resume_requires_control_attachment: true, trigger: control,
+trigger_requires_control_attachment: true, watch: view}`. The
 daemon returns this policy as data, but it remains descriptive: negotiated
 `capabilities_granted` and the connection's live attachment ownership are the
 authorization authorities.
@@ -623,14 +632,18 @@ The outcome tags are:
 - list: `listed { monitors: MonitorRegistrationWire[] }` or
   `rejected { rejection }`;
 - register: `registered { monitor: MonitorRegistrationWire }` or
-  `rejected { rejection }`; and
+  `rejected { rejection }`;
+- mutate: `updated | paused | resumed { monitor: MonitorRegistrationWire }`,
+  `triggered { monitor_id: String }`, or `rejected { rejection }`; and
 - remove: `removed { monitor_id: String }` or
   `rejected { rejection }`.
 
 `MonitorRegistrationWire` contains `monitor_id`, `session_id`, optional
 `branch_id`, optional `agent_id`, the complete typed `source`, optional
 `filter`, `action`, `occurrence`, `created_at_ms`,
-`start_source_sequence: u64`, and optional `expires_at_ms`. The start source
+`start_source_sequence: u64`, optional `expires_at_ms`, `state`, optional
+`last_event`, `fire_count`, optional `next_fire_at_ms`, and `source_summary`.
+The start source
 sequence is the source-hub registration fence. It is not a delivery cursor
 and MUST NOT be sent as `monitor.watch.after_cursor`.
 
@@ -642,9 +655,12 @@ or infer them from an attachment.
 
 The source/filter/action/lifetime vocabulary is exactly:
 
-- source: `sms`; `process { command: String }`; `file { path: String }`;
-  `poll { command: String, interval_ms: u64 }`; or
-  `timer { interval_ms: u64 }`;
+- source: `sms`; `process { command, cwd?, env_passthrough[], restart }`;
+  `file { path }`; `poll { command, interval_ms, until, cwd?,
+  env_passthrough[] }`; `timer { interval_ms }`; or `cli { preset, argv[],
+  cwd?, env_passthrough[], interval_ms? }`. CLI preset values are `codex`,
+  `claude-code`, `opencode`, `antigravity`, `gh-ci`, and `custom`; poll-until
+  values are `exit_code`, `stdout_matches`, and `stdout_changed`;
 - filter: `field` is `address | body | payload`, `operator` is
   `equals | contains | starts_with | ends_with`, with `value: String` and
   `case_sensitive: bool`;
@@ -663,19 +679,28 @@ Validation bounds and source/filter compatibility come from
 nested enum values fail closed as `invalid_request`, not as a best-effort
 substitute.
 
-Every receipt includes all five `MonitorSourceAvailabilityWire` rows. The
+Command-backed `process`, `poll`, and `cli` sources are declared on the wire
+but cannot be created or changed through client control: exact argv execution
+requires the model-tool approval flow. Client registration or an attempted
+source change therefore returns structured `invalid_request`. The same rule
+applies to file paths that resolve outside the session workspace because they
+require exact-path read approval.
+
+Every receipt includes all six `MonitorSourceAvailabilityWire` rows. The
 current daemon truth is:
 
 | Source | Availability | Meaning |
 |---|---|---|
-| `sms` | `available` | the only active source subscription/adapter |
-| `process` | `unavailable { reason: adapter_inactive }` | typed extension point; registration is refused |
-| `file` | `unavailable { reason: adapter_inactive }` | typed extension point; registration is refused |
-| `poll` | `unavailable { reason: adapter_inactive }` | typed extension point; registration is refused |
-| `timer` | `unavailable { reason: adapter_inactive }` | typed extension point; registration is refused |
+| `sms` | `available` | incoming transport events are filtered by the durable registry |
+| `process` | `available` | approved exact argv is streamed, batched, and terminally reported |
+| `file` | `available` | workspace-confined or exact-path-approved metadata plus a bounded 64 KiB tail fingerprint are polled |
+| `poll` | `available` | an approved exact argv is polled until its typed condition matches |
+| `timer` | `available` | daemon-owned interval ticks include wall time |
+| `cli` | `available` | approved preset/custom argv emits structured JSON-line reports |
 
-Typed declaration is not availability. A client may render an inactive row,
-but MUST NOT enable its registration control or claim platform support.
+Typed declaration is not availability. If a future daemon returns an
+unavailable row, the client renders that state and MUST NOT enable its
+registration control or claim platform support.
 
 Rejection is `MonitorControlRejectionWire`, tagged by `reason`; it is never a
 bare error string. Defined reasons are `capability_denied { required }`,
@@ -690,12 +715,12 @@ use `detail` only for display. `store_unavailable.retryable` preserves the
 store's typed retry classification; daemon-local encoding, receipt-shape, and
 invariant failures are non-retryable rather than guessed transient.
 
-Register/remove command ids are durable retry identities. A same-command,
+Register/mutate/remove command ids are durable retry identities. A same-command,
 same-arguments retry replays the stored typed receipt; the same command id
 with a different method or canonical body returns `command_conflict`. The
 command-id namespace is profile-global, matching the other durable client
 mutations; changing `session_id` does not create a new namespace. Unsupported
-source, monitor-limit, and remove-not-found outcomes are also durably
+source, monitor-limit, and mutation/remove-not-found outcomes are also durably
 receipted. Capability, missing-control-attachment, malformed-request,
 stale-generation, and stopped-service outcomes assert that no mutation
 committed. `store_unavailable` during receipt finalization is indeterminate:
@@ -2586,7 +2611,7 @@ no selection, mutation, or cursor authority. The monitor direct enums `MonitorSo
 `MonitorOccurrenceWire`, `MonitorLifetimeWire`,
 `MonitorSourceUnavailableReasonWire`, `MonitorSourceAvailabilityStateWire`,
 `MonitorControlRejectionWire`, `MonitorListOutcomeWire`,
-`MonitorRegisterOutcomeWire`, `MonitorRemoveOutcomeWire`,
+`MonitorRegisterOutcomeWire`, `MonitorMutateOutcomeWire`, `MonitorRemoveOutcomeWire`,
 `MonitorWatchOutcomeWire`, `MonitorReportStatusWire`, and
 `MonitorEventPayloadWire` are normatively **Extensible**: each has a
 `#[serde(other)]` `Unknown` arm. A frozen enum's new state requires a

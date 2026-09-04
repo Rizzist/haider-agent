@@ -152,7 +152,7 @@ use haider_tools::{
     ComputerOperation, ComputerOutput, ComputerPermissionPoll, EffectBroker, EffectOperation,
     FsCaseMode, FsEdit, FsEditChange, FsFileGlob, FsGlob, FsPath, FsPathOperation, FsRead,
     FsSearch, FsSearchMode, FsWrite, GraphEvidence, JournalSink, MessageSubagent, MobileBackend,
-    MobileCancelToken, MobileError, MobileOperation, MobileOutput, MonitorRequest,
+    MobileCancelToken, MobileError, MobileOperation, MobileOutput, MonitorApproval, MonitorRequest,
     PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult, ResultBounds,
     ScreenshotRedactionPolicy, SessionGrant, SessionGrantScope, ShellSession, SpawnSubagent,
     ToolError, ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
@@ -16482,21 +16482,124 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 Ok(request) => request,
                 Err(error) => return model_tool_argument_failure(error),
             };
+            let monitor_approval = match request.source() {
+                Some(source) => match MonitorApproval::new(source, Path::new(&self.metadata.cwd)) {
+                    Ok(approval) => approval,
+                    Err(error) => {
+                        let code = if matches!(
+                            &error,
+                            ToolError::Runtime { message }
+                                if message.starts_with("monitor command binary is missing:")
+                        ) {
+                            "binary_missing"
+                        } else {
+                            "monitor_preflight_failed"
+                        };
+                        return Ok(ToolDispatchResult::Completed(BoundedResult {
+                            preview: serde_json::json!({
+                                "status": code,
+                                "source": source.kind(),
+                                "message": error.to_string(),
+                            })
+                            .to_string(),
+                            truncated: false,
+                            data: None,
+                            artifact: None,
+                            images: Vec::new(),
+                            cursor: None,
+                            status: ToolResultStatus::Rejected,
+                            reason: Some(error.to_string()),
+                            presentation: None,
+                        }));
+                    }
+                },
+                None => None,
+            };
+            let coordinates = crate::monitor::MonitorToolCoordinates {
+                run_id: run_id.clone(),
+                branch_id: self.branch_id.clone(),
+                agent_id: self.parent_agent_id.clone(),
+                call_id: call_id.to_owned(),
+                device_id: self.output.device_id.clone(),
+                workspace_root: self.metadata.cwd.clone(),
+                approved_command: monitor_approval
+                    .as_ref()
+                    .and_then(MonitorApproval::command)
+                    .map(crate::monitor::ApprovedMonitorCommand::from_approval),
+                approved_file_path: monitor_approval
+                    .as_ref()
+                    .and_then(MonitorApproval::external_file)
+                    .map(|path| path.to_string_lossy().into_owned()),
+            };
+            if let Some(monitor_approval) = monitor_approval {
+                let mut broker_guard = self.broker.lock().await;
+                let broker = broker_guard.as_mut().ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        "tool dispatcher is already closed",
+                        false,
+                    )
+                })?;
+                let policy = self.policy.lock().await;
+                let intent = broker
+                    .normalize(&monitor_approval)
+                    .await
+                    .map_err(tool_error)?;
+                match broker
+                    .authorize(&intent, &policy)
+                    .await
+                    .map_err(tool_error)?
+                {
+                    AuthorizationVerdict::Allow | AuthorizationVerdict::PreAuthorized { .. } => {
+                        broker
+                            .journal_dispatched(&intent)
+                            .await
+                            .map_err(tool_error)?;
+                    }
+                    AuthorizationVerdict::Ask { menu } => {
+                        let menu = broker.permission_menu(&menu).cloned().ok_or_else(|| {
+                            HaiderError::new(
+                                ErrorCode::Internal,
+                                "monitor command permission menu disappeared before publication",
+                                false,
+                            )
+                        })?;
+                        operation_lease.retain_for_approval();
+                        return Ok(ToolDispatchResult::ApprovalRequired(menu));
+                    }
+                    AuthorizationVerdict::Deny { reason } => {
+                        return Err(tool_error(broker.denial_error(&policy, &intent, reason)));
+                    }
+                }
+                let result = self
+                    .output
+                    .store
+                    .hub()
+                    .execute_monitor_tool(&self.output.store, coordinates, request)
+                    .await;
+                let outcome = match &result {
+                    Ok(result) if result.status == ToolResultStatus::Completed => EffectOutcome::Ok,
+                    Ok(result) => EffectOutcome::Failed {
+                        error: result
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "monitor command registration was rejected".into()),
+                    },
+                    Err(error) => EffectOutcome::Failed {
+                        error: error.to_string(),
+                    },
+                };
+                broker
+                    .journal_outcome(&intent, outcome)
+                    .await
+                    .map_err(tool_error)?;
+                return Ok(ToolDispatchResult::Completed(result.map_err(tool_error)?));
+            }
             let result = self
                 .output
                 .store
                 .hub()
-                .execute_monitor_tool(
-                    &self.output.store,
-                    crate::monitor::MonitorToolCoordinates {
-                        run_id: run_id.clone(),
-                        branch_id: self.branch_id.clone(),
-                        agent_id: self.parent_agent_id.clone(),
-                        call_id: call_id.to_owned(),
-                        device_id: self.output.device_id.clone(),
-                    },
-                    request,
-                )
+                .execute_monitor_tool(&self.output.store, coordinates, request)
                 .await
                 .map_err(tool_error)?;
             return Ok(ToolDispatchResult::Completed(result));

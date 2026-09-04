@@ -2265,6 +2265,7 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_TOOL_INVENTORY_V1.to_owned(),
         FEATURE_MONITOR_V1.to_owned(),
         haider_rpc::FEATURE_MONITOR_CONTROL_V1.to_owned(),
+        haider_rpc::FEATURE_MONITOR_MUTATE_V1.to_owned(),
         haider_rpc::FEATURE_MONITOR_DELIVERY_V1.to_owned(),
         haider_rpc::FEATURE_TRANSCRIPTION_V1.to_owned(),
         FEATURE_TURN_CONTROL_V1.to_owned(),

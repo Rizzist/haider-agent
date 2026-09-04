@@ -1238,14 +1238,14 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // computer manifest description. Linux documents X11/Wayland (+49 bytes
     // over macOS), while Windows is one byte shorter than macOS.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_999;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 17_565;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_950;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 17_516;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_949;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 17_515;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_944;
-    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 11_246;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 17_510;
+    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 11_812;
 
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let stubbed =

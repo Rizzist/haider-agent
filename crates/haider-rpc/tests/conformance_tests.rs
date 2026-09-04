@@ -9,10 +9,11 @@ use haider_rpc::haider_protocol::typed_agent::{
     TypedAgentInstallTerminalStateV1, TypedAgentRequiredCli,
 };
 use haider_rpc::{
-    AttachmentId, CodecError, CommandId, FEATURE_ACCOUNT_OAUTH_IMPORT_V1, FEATURE_MONITOR_V1,
-    FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1, FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1,
-    FEATURE_TYPED_AGENT_INSTALL_V1, RequestBody, RequestId, ResponseBody,
-    TypedAgentInstallCancelOutcomeWire, TypedAgentInstallCancelReceiptWire,
+    AttachmentId, CodecError, CommandId, FEATURE_ACCOUNT_OAUTH_IMPORT_V1,
+    FEATURE_MONITOR_CONTROL_V1, FEATURE_MONITOR_DELIVERY_V1, FEATURE_MONITOR_MUTATE_V1,
+    FEATURE_MONITOR_V1, FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1,
+    FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_V1, RequestBody, RequestId,
+    ResponseBody, TypedAgentInstallCancelOutcomeWire, TypedAgentInstallCancelReceiptWire,
     TypedAgentInstallRetryOutcomeWire, TypedAgentInstallRetryReceiptWire,
     TypedAgentInstallRetryRejectionWire, TypedAgentInstallWatchOutcomeWire,
     TypedAgentInstallWatchReceiptWire, TypedAgentInstallWatchRejectionWire, WireEncoding,
@@ -23,6 +24,9 @@ use haider_rpc::{
 #[test]
 fn monitor_feature_is_pinned() {
     assert_eq!(FEATURE_MONITOR_V1, "monitor_v1");
+    assert_eq!(FEATURE_MONITOR_CONTROL_V1, "monitor_control_v1");
+    assert_eq!(FEATURE_MONITOR_MUTATE_V1, "monitor_mutate_v1");
+    assert_eq!(FEATURE_MONITOR_DELIVERY_V1, "monitor_delivery_v1");
 }
 
 struct CodecCase {
