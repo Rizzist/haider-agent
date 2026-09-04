@@ -1822,6 +1822,10 @@ impl DemoDriver {
             | AppRequest::ShellList
             | AppRequest::ShellClose { .. }
             | AppRequest::MonitorList
+            | AppRequest::MonitorRemove { .. }
+            | AppRequest::MonitorPause { .. }
+            | AppRequest::MonitorResume { .. }
+            | AppRequest::MonitorTrigger { .. }
             // H4 live-only vocabulary: `/hooks` in demo opens its
             // sim-honest empty state and refuses trust locally — neither
             // request is ever pushed.

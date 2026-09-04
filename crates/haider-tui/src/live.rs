@@ -432,6 +432,30 @@ pub enum LiveCommand {
     MonitorList {
         session: SessionId,
     },
+    /// `monitor.remove` — the overlay's stop (970 owner item 2). Durable:
+    /// a stop the user asked for must survive a socket loss, so it carries
+    /// a command id through the outbox like every other mutation.
+    MonitorRemove {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        monitor_id: String,
+    },
+    /// `monitor.mutate` — pause / resume / trigger from the overlay. The
+    /// nested operation keeps all three under one receipt-backed RPC.
+    MonitorMutate {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        mutation: haider_rpc::MonitorMutationWire,
+    },
+    /// `monitor.watch` — the session's monitor DELIVERY lane (owner item
+    /// 3). A READ: it opens a replay strictly after the cursor we hand it,
+    /// and a socket loss simply re-opens it on reattach.
+    MonitorWatch {
+        session: SessionId,
+        after_cursor: u64,
+    },
     /// `hooks.list` — a READ of the daemon's hook discovery for one
     /// workspace (H4 /hooks). No durable identity; the cwd was captured at
     /// issuance by the reducer.
@@ -1108,6 +1132,8 @@ impl LiveCommand {
             Self::SetDefaultModel { command_id, .. } => Some(command_id),
             Self::SelectModel { command_id, .. } => Some(command_id),
             Self::Rename { command_id, .. } => Some(command_id),
+            Self::MonitorRemove { command_id, .. } => Some(command_id),
+            Self::MonitorMutate { command_id, .. } => Some(command_id),
             Self::Seen { command_id, .. } => Some(command_id),
             Self::SelectEffort { command_id, .. } => Some(command_id),
             Self::SelectFast { command_id, .. } => Some(command_id),
@@ -1142,6 +1168,8 @@ impl LiveCommand {
             | Self::ShellList
             | Self::ShellClose { .. }
             | Self::MonitorList { .. }
+            // The monitor delivery lane is a read (see above).
+            | Self::MonitorWatch { .. }
             | Self::HooksList { .. }
             // U2: the usage snapshot is a read (see above).
             | Self::UsageReport
@@ -1470,6 +1498,27 @@ pub enum LiveReply {
     },
     MonitorListed {
         receipt: haider_rpc::MonitorListReceiptWire,
+    },
+    /// `monitor.mutate` answered — pause / resume / trigger (owner item 2).
+    MonitorMutated {
+        receipt: haider_rpc::MonitorMutateReceiptWire,
+    },
+    /// `monitor.remove` answered — the overlay's stop.
+    MonitorRemoved {
+        receipt: haider_rpc::MonitorRemoveReceiptWire,
+    },
+    /// One monitor delivery reached this session (owner item 3): the
+    /// ambient transcript note and the row's `firing` chip.
+    MonitorFired {
+        session: SessionId,
+        report: Box<haider_rpc::MonitorDeliveryReportWire>,
+    },
+    /// The delivery watch has scanned this session's journal through
+    /// `high_water_cursor` — remembered so a reconnect does not rescan a
+    /// fire-free suffix.
+    MonitorCaughtUp {
+        session: SessionId,
+        high_water_cursor: u64,
     },
     /// `hooks.list` answered — discovery truth for /hooks (H4).
     Hooks {
@@ -2133,6 +2182,10 @@ pub struct LiveDriver {
     menus: HashMap<MenuId, MenuCoordinates>,
     /// Latest worker generation per session (create/attach/submit report it).
     generations: HashMap<SessionId, u64>,
+    /// 970 owner item 3: the greatest monitor-delivery cursor this client
+    /// has actually applied, per session. A reconnect resumes the watch from
+    /// here rather than replaying fires the transcript already noted.
+    monitor_cursors: HashMap<SessionId, u64>,
     /// Current connection's worker generation for resident-binding signals.
     /// Cleared on disconnect so an old generation is never re-announced on a
     /// fresh socket before list/attach grounds the new daemon truth.
@@ -2321,6 +2374,7 @@ impl LiveDriver {
             outbox: Vec::new(),
             menus: HashMap::new(),
             generations: HashMap::new(),
+            monitor_cursors: HashMap::new(),
             binding_worker_generation: None,
             resident_binding_token: None,
             announced_resident_binding: None,
@@ -2455,6 +2509,27 @@ impl LiveDriver {
     fn mint(&mut self) -> CommandId {
         self.next_command += 1;
         CommandId::new(format!("{}-{}", self.instance, self.next_command))
+    }
+
+    /// One `monitor.mutate` for the active session: pause, resume, or
+    /// trigger. Durable — the three share the outbox path exactly as the
+    /// wire shares one receipt-backed RPC for them.
+    fn monitor_mutate(
+        &mut self,
+        model: &AppModel,
+        mutation: haider_rpc::MonitorMutationWire,
+    ) -> Vec<LiveCommand> {
+        let Some(session) = model.active_session.clone() else {
+            return Vec::new();
+        };
+        let command_id = self.mint();
+        let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+        vec![self.enqueue(LiveCommand::MonitorMutate {
+            command_id,
+            session,
+            worker_generation,
+            mutation,
+        })]
     }
 
     /// Queue a durable mutation in the outbox and return it for issue.
@@ -3039,7 +3114,7 @@ impl LiveDriver {
                 session,
                 attachment,
                 worker_generation,
-                ..
+                replay_through_seq,
             } => {
                 self.binding_worker_generation = Some(worker_generation);
                 self.cold.remove(&session);
@@ -3067,6 +3142,23 @@ impl LiveDriver {
                 if model.daemon_serves(haider_rpc::FEATURE_MONITOR_CONTROL_V1) {
                     queue_read.push(LiveCommand::MonitorList {
                         session: session.clone(),
+                    });
+                    // 970 owner item 3: the delivery lane behind the ambient
+                    // `◉ monitor … fired` note. It opens strictly AFTER the
+                    // journal head this attach replayed through — a fire is
+                    // news, and replaying a session's whole monitor history
+                    // into the transcript on every attach would be noise,
+                    // not news. Reconnects resume from the greatest cursor
+                    // actually applied.
+                    let after_cursor = self
+                        .monitor_cursors
+                        .get(&session)
+                        .copied()
+                        .unwrap_or(replay_through_seq);
+                    self.monitor_cursors.insert(session.clone(), after_cursor);
+                    queue_read.push(LiveCommand::MonitorWatch {
+                        session: session.clone(),
+                        after_cursor,
                     });
                 }
                 if model.daemon_serves(haider_rpc::FEATURE_SHELL_REGISTRY_V1) {
@@ -3301,6 +3393,32 @@ impl LiveDriver {
             }
             LiveReply::MonitorListed { receipt } => {
                 model.apply_monitor_list(receipt);
+                Vec::new()
+            }
+            LiveReply::MonitorMutated { receipt } => {
+                model.apply_monitor_mutate(receipt);
+                Vec::new()
+            }
+            LiveReply::MonitorRemoved { receipt } => {
+                model.apply_monitor_remove(receipt);
+                Vec::new()
+            }
+            LiveReply::MonitorFired { session, report } => {
+                // A delivery for a session that is no longer the active one
+                // must not write into the transcript on screen.
+                if model.active_session.as_ref() == Some(&session) {
+                    model.apply_monitor_fired(&report);
+                }
+                let cursor = self.monitor_cursors.entry(session).or_default();
+                *cursor = (*cursor).max(report.cursor);
+                Vec::new()
+            }
+            LiveReply::MonitorCaughtUp {
+                session,
+                high_water_cursor,
+            } => {
+                let cursor = self.monitor_cursors.entry(session).or_default();
+                *cursor = (*cursor).max(high_water_cursor);
                 Vec::new()
             }
             LiveReply::Hooks {
@@ -6410,6 +6528,33 @@ impl LiveDriver {
                 Some(session) => vec![LiveCommand::MonitorList { session }],
                 None => Vec::new(),
             },
+            // 970 owner item 2: the overlay's controls. Durable mutations —
+            // each mints a command id and rides the outbox, so a socket
+            // loss retries the stop/pause the user actually asked for.
+            AppRequest::MonitorRemove { monitor_id } => match model.active_session.clone() {
+                Some(session) => {
+                    let command_id = self.mint();
+                    let worker_generation =
+                        self.generations.get(&session).copied().unwrap_or_default();
+                    vec![self.enqueue(LiveCommand::MonitorRemove {
+                        command_id,
+                        session,
+                        worker_generation,
+                        monitor_id,
+                    })]
+                }
+                None => Vec::new(),
+            },
+            AppRequest::MonitorPause { monitor_id } => {
+                self.monitor_mutate(model, haider_rpc::MonitorMutationWire::Pause { monitor_id })
+            }
+            AppRequest::MonitorResume { monitor_id } => {
+                self.monitor_mutate(model, haider_rpc::MonitorMutationWire::Resume { monitor_id })
+            }
+            AppRequest::MonitorTrigger { monitor_id } => self.monitor_mutate(
+                model,
+                haider_rpc::MonitorMutationWire::Trigger { monitor_id },
+            ),
             AppRequest::HooksRefresh { cwd } => {
                 // A read — never outboxed; the cwd is remembered so a
                 // trust receipt can chain its refresh at the same
@@ -7019,6 +7164,9 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
         | LiveCommand::ToolsInventory { session }
         | LiveCommand::SshSetScope { session, .. }
         | LiveCommand::MonitorList { session }
+        | LiveCommand::MonitorRemove { session, .. }
+        | LiveCommand::MonitorMutate { session, .. }
+        | LiveCommand::MonitorWatch { session, .. }
         | LiveCommand::SelectModel { session, .. }
         | LiveCommand::Rename { session, .. }
         | LiveCommand::Seen { session, .. }

@@ -512,3 +512,186 @@ fn composer_image_notice_frames() {
     });
     pin("composer_image_notice", &model);
 }
+
+// ---------------------------------------------------------------------------
+// 970 lane monitorui — the band's task line and the monitors overlay.
+// ---------------------------------------------------------------------------
+
+fn shell_row(id: &str) -> haider_rpc::ShellWire {
+    haider_rpc::ShellWire {
+        id: id.into(),
+        kind: haider_rpc::ShellKindWire::Local,
+        status: haider_rpc::ShellStatusWire::Running,
+        title: "tests".into(),
+        cwd_or_host: "/workspace".into(),
+        created_at_ms: 1,
+        last_activity_ms: 2,
+        bytes_out: 3,
+    }
+}
+
+fn monitor_row(
+    id: &str,
+    source: haider_rpc::MonitorSourceWire,
+    state: haider_rpc::MonitorStateWire,
+) -> haider_rpc::MonitorRegistrationWire {
+    haider_rpc::MonitorRegistrationWire {
+        monitor_id: id.to_owned(),
+        session_id: haider_protocol::ids::SessionId::new("tuivirt-session"),
+        branch_id: None,
+        agent_id: None,
+        source,
+        filter: None,
+        action: haider_rpc::MonitorActionWire {
+            report: true,
+            follow_up: None,
+        },
+        occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+        created_at_ms: 1_000,
+        start_source_sequence: 0,
+        expires_at_ms: None,
+        state,
+        last_event: None,
+        fire_count: 0,
+        next_fire_at_ms: None,
+        source_summary: String::new(),
+    }
+}
+
+/// The band model the count pins share: one running subagent so the
+/// `▾ subagents` half of the row is on screen beside the counts.
+fn band_model() -> AppModel {
+    let mut model = session_model();
+    push_user(&mut model, "spin up a docs pass");
+    push_agent(&mut model, "band-1", "Delegating to a subagent now.");
+    with_subagents(&mut model);
+    model
+}
+
+#[test]
+fn band_task_line_with_one_shell_and_one_monitor_frames() {
+    // 970 owner item 1. Claude Code's task line: the counts sit at the RIGHT
+    // of the `▾ subagents` row, singular at one apiece.
+    let mut model = band_model();
+    model.shells.push(shell_row("sh-one"));
+    model.monitor_count = 1;
+    pin("band_counts_one", &model);
+}
+
+#[test]
+fn band_task_line_with_many_shells_and_monitors_frames() {
+    // 970 owner item 1, plural. Both counts read as one right-aligned run.
+    let mut model = band_model();
+    model.shells.push(shell_row("sh-one"));
+    model.shells.push(shell_row("sh-two"));
+    model.monitor_count = 3;
+    pin("band_counts_many", &model);
+}
+
+#[test]
+fn band_task_line_without_subagents_frames() {
+    // 970 owner item 1. With nothing delegated the row still owes the
+    // counts — the status-bar segment that used to carry them is gone, so
+    // this row is now the only place they appear.
+    let mut model = session_model();
+    push_agent(&mut model, "quiet-1", "Nothing delegated.");
+    model.shells.push(shell_row("sh-one"));
+    model.monitor_count = 2;
+    pin("band_counts_no_subagents", &model);
+}
+
+#[test]
+fn monitors_overlay_states_frames() {
+    // 970 owner item 2. One row per state — armed (selected, so it carries
+    // the action strip), paused, and exited — each stating what it watches,
+    // its fire count, its last event and its next fire.
+    let mut model = session_model();
+    push_agent(&mut model, "mon-1", "Monitors are running.");
+    model.clock_ms = 300_000;
+    let mut armed = monitor_row(
+        "timer-60s",
+        haider_rpc::MonitorSourceWire::Timer {
+            interval_ms: 60_000,
+        },
+        haider_rpc::MonitorStateWire::Armed,
+    );
+    armed.fire_count = 3;
+    armed.last_event = Some(haider_rpc::MonitorLastEventWire {
+        at_ms: 240_000,
+        summary: "tick 3".to_owned(),
+    });
+    armed.next_fire_at_ms = Some(345_000);
+    let mut paused = monitor_row(
+        "gh-ci-42",
+        haider_rpc::MonitorSourceWire::Poll {
+            command: "gh run view 42".to_owned(),
+            interval_ms: 30_000,
+            until: haider_rpc::MonitorPollUntilWire::StdoutChanged,
+            cwd: None,
+            env_passthrough: Vec::new(),
+        },
+        haider_rpc::MonitorStateWire::Paused,
+    );
+    paused.fire_count = 1;
+    let exited = monitor_row(
+        "watch-src",
+        haider_rpc::MonitorSourceWire::File {
+            path: "src/render.rs".to_owned(),
+        },
+        haider_rpc::MonitorStateWire::Exited,
+    );
+    model.monitors = vec![armed, paused, exited];
+    model.monitor_count = 3;
+    model.monitors_open = true;
+    pin("monitors_overlay_states", &model);
+}
+
+#[test]
+fn monitors_overlay_firing_row_frames() {
+    // 970 owner item 3. A monitor this client has seen fire reads `firing`
+    // until the woken subturn completes — a display overlay on daemon truth,
+    // never a modal.
+    let mut model = session_model();
+    push_agent(&mut model, "mon-2", "Monitor woke me.");
+    model.clock_ms = 300_000;
+    let mut armed = monitor_row(
+        "timer-60s",
+        haider_rpc::MonitorSourceWire::Timer {
+            interval_ms: 60_000,
+        },
+        haider_rpc::MonitorStateWire::Armed,
+    );
+    armed.fire_count = 4;
+    model.monitors = vec![armed];
+    model.monitor_count = 1;
+    model.apply_monitor_fired(&haider_rpc::MonitorDeliveryReportWire {
+        report_id: "rep-1".to_owned(),
+        monitor_id: "timer-60s".to_owned(),
+        session_id: haider_protocol::ids::SessionId::new("tuivirt-session"),
+        branch_id: None,
+        agent_id: None,
+        source: haider_rpc::MonitorSourceKindWire::Timer,
+        status: haider_rpc::MonitorReportStatusWire::Matched,
+        events: vec![haider_rpc::MonitorEventWire {
+            sequence: 4,
+            observed_at_ms: 299_000,
+            payload: haider_rpc::MonitorEventPayloadWire::Timer {
+                tick: 4,
+                fired_at_ms: 299_000,
+            },
+        }],
+        coalesced_count: 1,
+        omitted_count: 0,
+        action: haider_rpc::MonitorActionWire {
+            report: true,
+            follow_up: None,
+        },
+        cursor: 9,
+        dedupe: haider_rpc::MonitorDeliveryDedupeWire {
+            delivery_key: "d-9".to_owned(),
+            report_key: "r-timer".to_owned(),
+        },
+    });
+    model.monitors_open = true;
+    pin("monitors_overlay_firing", &model);
+}
