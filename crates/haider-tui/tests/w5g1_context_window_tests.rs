@@ -95,6 +95,7 @@ fn adoption_takes_the_provider_declared_window() {
         LiveReply::Accounts {
             descriptors: vec![oauth_descriptor("openai-oauth", "openai-oauth")],
             revision: Some(1),
+            sources: Vec::new(),
         },
     );
     pass(
@@ -132,6 +133,7 @@ fn an_undeclared_window_keeps_the_seed_honest() {
         LiveReply::Accounts {
             descriptors: vec![oauth_descriptor("anthropic-oauth", "anthropic-oauth")],
             revision: Some(1),
+            sources: Vec::new(),
         },
     );
     pass(
@@ -218,6 +220,7 @@ fn the_model_picker_adopts_the_picked_models_window() {
         LiveReply::Accounts {
             descriptors: vec![oauth_descriptor("openai-oauth", "openai-oauth")],
             revision: Some(1),
+            sources: Vec::new(),
         },
     );
     pass(

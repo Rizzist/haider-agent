@@ -8,10 +8,12 @@ use std::time::{Duration, Instant};
 
 use haider_client::{ClientError, EnsureError, EnsureOptions, ProfileEnv, resolve_profile};
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor};
+use haider_protocol::ids::CredentialAlias;
 use haider_rpc::{
-    Capability, CapabilitySet, ClientKind, CommandId, ErrorData, ProviderApiFamilyWire,
-    ProviderAuthRequirementWire, ProviderProbeFailureWire, ProviderSummaryWire, ProviderTrustWire,
-    RequestBody, ResponseBody, SecretWire, SnapshotAvailabilityWire, StagePurpose,
+    AccountSourceWire, Capability, CapabilitySet, ClientKind, CommandId, ErrorData,
+    ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderProbeFailureWire,
+    ProviderSummaryWire, ProviderTrustWire, RequestBody, ResponseBody, SecretWire,
+    SnapshotAvailabilityWire, StagePurpose,
 };
 use serde::Serialize;
 use zeroize::Zeroizing;
@@ -23,12 +25,43 @@ const ADD_AUTH_HINT: &str = "account add requires authentication material: use -
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AccountCommand {
-    List { json: bool },
-    Import { source: String, confirm: bool },
-    Refresh { alias: String },
-    Remove { alias: String, confirm: bool },
+    List {
+        json: bool,
+    },
+    Use {
+        alias: String,
+        confirm: bool,
+    },
+    SourceList {
+        json: bool,
+    },
+    SourceAdd {
+        kind: String,
+        root: String,
+        label: Option<String>,
+    },
+    SourceRemove {
+        source_id: String,
+    },
+    SourceScan {
+        json: bool,
+    },
+    Import {
+        source: String,
+        confirm: bool,
+    },
+    Refresh {
+        alias: String,
+    },
+    Remove {
+        alias: String,
+        confirm: bool,
+    },
     Add(CustomAccountOptions),
-    Probe { alias: String, json: bool },
+    Probe {
+        alias: String,
+        json: bool,
+    },
     Update(CustomAccountOptions),
 }
 
@@ -71,6 +104,12 @@ pub(crate) struct CustomAccountOptions {
 struct AccountsDocument {
     schema: &'static str,
     accounts: Vec<AccountView>,
+}
+
+#[derive(Serialize)]
+struct AccountSourcesDocument {
+    schema: &'static str,
+    sources: Vec<AccountSourceWire>,
 }
 
 /// Deliberately narrower than `CredentialDescriptor`: adding a public field to
@@ -181,6 +220,78 @@ pub(crate) fn parse_account_command(rest: &[String]) -> Result<AccountCommand, S
         [command, flag] if command == "list" && flag == "--json" => {
             Ok(AccountCommand::List { json: true })
         }
+        [command, alias] if command == "use" && !alias.is_empty() && !alias.starts_with('-') => {
+            Ok(AccountCommand::Use {
+                alias: alias.clone(),
+                confirm: false,
+            })
+        }
+        [command, alias, flag]
+            if command == "use"
+                && !alias.is_empty()
+                && !alias.starts_with('-')
+                && flag == "--confirm" =>
+        {
+            Ok(AccountCommand::Use {
+                alias: alias.clone(),
+                confirm: true,
+            })
+        }
+        [command, subcommand] if command == "source" && subcommand == "list" => {
+            Ok(AccountCommand::SourceList { json: false })
+        }
+        [command, subcommand, flag]
+            if command == "source" && subcommand == "list" && flag == "--json" =>
+        {
+            Ok(AccountCommand::SourceList { json: true })
+        }
+        [command, subcommand, kind, root]
+            if command == "source"
+                && subcommand == "add"
+                && matches!(
+                    kind.as_str(),
+                    "codex" | "codex_home" | "claude" | "claude_file"
+                )
+                && !root.is_empty() =>
+        {
+            Ok(AccountCommand::SourceAdd {
+                kind: kind.clone(),
+                root: root.clone(),
+                label: None,
+            })
+        }
+        [command, subcommand, kind, root, label_flag, label]
+            if command == "source"
+                && subcommand == "add"
+                && matches!(
+                    kind.as_str(),
+                    "codex" | "codex_home" | "claude" | "claude_file"
+                )
+                && !root.is_empty()
+                && label_flag == "--label"
+                && !label.trim().is_empty() =>
+        {
+            Ok(AccountCommand::SourceAdd {
+                kind: kind.clone(),
+                root: root.clone(),
+                label: Some(label.clone()),
+            })
+        }
+        [command, subcommand, source_id]
+            if command == "source" && subcommand == "remove" && source_id.starts_with("src1_") =>
+        {
+            Ok(AccountCommand::SourceRemove {
+                source_id: source_id.clone(),
+            })
+        }
+        [command, subcommand] if command == "source" && subcommand == "scan" => {
+            Ok(AccountCommand::SourceScan { json: false })
+        }
+        [command, subcommand, flag]
+            if command == "source" && subcommand == "scan" && flag == "--json" =>
+        {
+            Ok(AccountCommand::SourceScan { json: true })
+        }
         [command, source]
             if command == "import" && matches!(source.as_str(), "codex" | "claude-code") =>
         {
@@ -258,7 +369,7 @@ pub(crate) fn parse_account_command(rest: &[String]) -> Result<AccountCommand, S
 }
 
 fn account_usage() -> String {
-    "expected list [--json], import <codex|claude-code> [--confirm], refresh <alias>, remove <alias> --confirm, add <alias> --base-url <url> [--api-key <key> | --api-key-env <VAR> | --api-key-stdin | --no-auth] [--api-family openai|anthropic] [--response-open-timeout <duration>] [--chunk-idle-timeout <duration>] [--semantic-progress-timeout <duration>] [--lockdown|--full] [--json], probe <alias> [--json], or update <alias> [mutable options] [--json]".into()
+    "expected list [--json], use <alias> [--confirm], source list [--json], source add <codex|claude_file> <root> [--label <label>], source remove <source-id>, source scan [--json], import <codex|claude-code> [--confirm], refresh <alias>, remove <alias> --confirm, add <alias> --base-url <url> [--api-key <key> | --api-key-env <VAR> | --api-key-stdin | --no-auth] [--api-family openai|anthropic] [--response-open-timeout <duration>] [--chunk-idle-timeout <duration>] [--semantic-progress-timeout <duration>] [--lockdown|--full] [--json], probe <alias> [--json], or update <alias> [mutable options] [--json]".into()
 }
 
 fn parse_custom_options(
@@ -415,6 +526,8 @@ pub(crate) async fn account_command(rest: &[String]) -> ExitCode {
     let json_errors = matches!(
         &command,
         AccountCommand::List { json: true }
+            | AccountCommand::SourceList { json: true }
+            | AccountCommand::SourceScan { json: true }
             | AccountCommand::Add(CustomAccountOptions { json: true, .. })
             | AccountCommand::Probe { json: true, .. }
             | AccountCommand::Update(CustomAccountOptions { json: true, .. })
@@ -428,10 +541,14 @@ pub(crate) async fn account_command(rest: &[String]) -> ExitCode {
         }
     };
     let capabilities = match &command {
-        AccountCommand::List { .. } | AccountCommand::Import { confirm: false, .. } => {
-            CapabilitySet::from([Capability::View])
-        }
-        AccountCommand::Import { confirm: true, .. }
+        AccountCommand::List { .. }
+        | AccountCommand::SourceList { .. }
+        | AccountCommand::Import { confirm: false, .. } => CapabilitySet::from([Capability::View]),
+        AccountCommand::Use { .. }
+        | AccountCommand::SourceAdd { .. }
+        | AccountCommand::SourceRemove { .. }
+        | AccountCommand::SourceScan { .. }
+        | AccountCommand::Import { confirm: true, .. }
         | AccountCommand::Refresh { .. }
         | AccountCommand::Remove { .. }
         | AccountCommand::Add(_)
@@ -448,6 +565,15 @@ pub(crate) async fn account_command(rest: &[String]) -> ExitCode {
     }
     if matches!(&command, AccountCommand::Import { .. }) {
         required_features.insert(haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1.to_owned());
+    }
+    if matches!(
+        &command,
+        AccountCommand::SourceList { .. }
+            | AccountCommand::SourceAdd { .. }
+            | AccountCommand::SourceRemove { .. }
+            | AccountCommand::SourceScan { .. }
+    ) {
+        required_features.insert(haider_rpc::FEATURE_ACCOUNT_SOURCES_V1.to_owned());
     }
     if matches!(&command, AccountCommand::Add(_) | AccountCommand::Update(_)) {
         required_features.insert(haider_rpc::FEATURE_PROVIDER_CONFIGURE_V1.to_owned());
@@ -511,6 +637,69 @@ async fn execute(
                 write_human(&document)
             })
         }
+        AccountCommand::Use { alias, confirm } => execute_use(client, alias, confirm).await,
+        AccountCommand::SourceList { json } => {
+            let sources = source_list(client).await?;
+            Ok(write_sources(sources, json))
+        }
+        AccountCommand::SourceAdd { kind, root, label } => {
+            let response = client
+                .request(RequestBody::AccountSourceAdd {
+                    command_id: CommandId::new(command_id("account-source-add")),
+                    kind,
+                    root,
+                    label,
+                })
+                .await
+                .map_err(AccountError::Client)?;
+            match response {
+                ResponseBody::AccountSourceAdd { source, .. } => {
+                    println!(
+                        "linked source `{}` ({}) — {}",
+                        source.label, source.kind, source.health
+                    );
+                    Ok(ExitCode::SUCCESS)
+                }
+                response => Err(response_error(
+                    response,
+                    "account.source_add response method mismatch",
+                )),
+            }
+        }
+        AccountCommand::SourceRemove { source_id } => {
+            let response = client
+                .request(RequestBody::AccountSourceRemove {
+                    command_id: CommandId::new(command_id("account-source-remove")),
+                    source_id: source_id.clone(),
+                })
+                .await
+                .map_err(AccountError::Client)?;
+            match response {
+                ResponseBody::AccountSourceRemove {
+                    source_id: removed, ..
+                } if removed == source_id => {
+                    println!("unlinked source `{removed}`; its account remains source-gone");
+                    Ok(ExitCode::SUCCESS)
+                }
+                response => Err(response_error(
+                    response,
+                    "account.source_remove response method mismatch",
+                )),
+            }
+        }
+        AccountCommand::SourceScan { json } => {
+            let response = client
+                .request(RequestBody::AccountSourceScan)
+                .await
+                .map_err(AccountError::Client)?;
+            match response {
+                ResponseBody::AccountSourceScan { sources } => Ok(write_sources(sources, json)),
+                response => Err(response_error(
+                    response,
+                    "account.source_scan response method mismatch",
+                )),
+            }
+        }
         AccountCommand::Import { source, confirm } => {
             execute_import(client, &source, confirm).await
         }
@@ -571,6 +760,96 @@ async fn execute(
         AccountCommand::Add(options) => execute_custom(client, options, true).await,
         AccountCommand::Update(options) => execute_custom(client, options, false).await,
         AccountCommand::Probe { alias, json } => execute_probe(client, alias, json).await,
+    }
+}
+
+async fn execute_use(
+    client: &impl AccountClient,
+    alias: String,
+    confirm: bool,
+) -> Result<ExitCode, AccountError> {
+    let (accounts, _) = account_snapshot(client).await?;
+    if !accounts
+        .iter()
+        .any(|descriptor| descriptor.alias.as_str() == alias)
+    {
+        return Err(AccountError::MissingAlias(alias));
+    }
+    let response = client
+        .request(RequestBody::AccountSetActive {
+            command_id: CommandId::new(command_id("account-use")),
+            alias: alias.clone(),
+            confirm_new_epoch: confirm,
+        })
+        .await
+        .map_err(AccountError::Client)?;
+    match response {
+        ResponseBody::AccountSetActive { descriptor, .. } if descriptor.alias.as_str() == alias => {
+            println!(
+                "using account `{}` as the {} profile default",
+                descriptor.alias, descriptor.provider
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        response => Err(response_error(
+            response,
+            "account.set_active response method mismatch",
+        )),
+    }
+}
+
+async fn source_list(client: &impl AccountClient) -> Result<Vec<AccountSourceWire>, AccountError> {
+    let response = client
+        .request(RequestBody::AccountSourceList)
+        .await
+        .map_err(AccountError::Client)?;
+    match response {
+        ResponseBody::AccountSourceList { sources } => Ok(sources),
+        response => Err(response_error(
+            response,
+            "account.source_list response method mismatch",
+        )),
+    }
+}
+
+fn write_sources(sources: Vec<AccountSourceWire>, json: bool) -> ExitCode {
+    if json {
+        return write_json(&AccountSourcesDocument {
+            schema: "haider.account_sources.v1",
+            sources,
+        });
+    }
+    if sources.is_empty() {
+        println!("no credential sources enrolled");
+        return ExitCode::SUCCESS;
+    }
+    for source in sources {
+        let account = source
+            .account_alias
+            .as_ref()
+            .map_or("unlinked", CredentialAlias::as_str);
+        println!(
+            "{}  {}  {}  {}  refresh={}  account={account}",
+            source.source_id, source.kind, source.label, source.health, source.refresh_owner,
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+fn response_error(response: ResponseBody, mismatch: &'static str) -> AccountError {
+    match response {
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => AccountError::Rpc {
+            code,
+            message,
+            retryable,
+            data,
+        },
+        _ => AccountError::Protocol(mismatch),
     }
 }
 

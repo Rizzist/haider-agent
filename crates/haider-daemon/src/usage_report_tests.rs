@@ -14,7 +14,7 @@ use haider_accounts::{MemoryVault, SecretHandle, Vault};
 use haider_protocol::EventPayload;
 use haider_protocol::agent::AgentUsageMetrics;
 use haider_protocol::credential::{
-    AccountIdentity, AuthMethod, CredentialDescriptor, CredentialStatus,
+    AccountIdentity, AuthMethod, CredentialAttentionReason, CredentialDescriptor, CredentialStatus,
 };
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RawEnvelope, RenderTargets};
 use haider_protocol::ids::{AgentId, CredentialAlias, DeviceId, EventId, RunId, SessionId};
@@ -31,7 +31,8 @@ use haider_provider::MeterUnavailable;
 
 use super::{
     MeterTokenSource, OpenAiTokenIdentity, SessionFolder, UsageMeterHttp, UsageReportService,
-    attribute_session, enrich_usage_history_costs, meter_for, openai_token_identity,
+    attribute_session, credential_meter_unavailable_reason, enrich_usage_history_costs, meter_for,
+    openai_token_identity,
 };
 use crate::haider_code_plan::{PlanFetchOutcome, PlanMeterValues, classify_account_response};
 
@@ -103,6 +104,41 @@ impl MeterTokenSource for FailingTokens {
         _descriptor: &CredentialDescriptor,
     ) -> Result<SecretHandle, MeterUnavailable> {
         Err(MeterUnavailable::new("credential_unavailable"))
+    }
+}
+
+#[test]
+fn expired_revoked_and_linked_source_failures_have_distinct_meter_reasons() {
+    assert_eq!(
+        credential_meter_unavailable_reason(&CredentialStatus::Expired),
+        Some("credential_expired")
+    );
+    assert_eq!(
+        credential_meter_unavailable_reason(&CredentialStatus::Revoked),
+        Some("credential_revoked")
+    );
+    for (reason, expected) in [
+        (
+            CredentialAttentionReason::SourceGone,
+            "credential_source_gone",
+        ),
+        (
+            CredentialAttentionReason::SourceUnreadable,
+            "credential_source_unreadable",
+        ),
+        (
+            CredentialAttentionReason::OriginClientRequired,
+            "credential_origin_client_required",
+        ),
+        (
+            CredentialAttentionReason::PolicyBlocked,
+            "credential_policy_blocked",
+        ),
+    ] {
+        assert_eq!(
+            credential_meter_unavailable_reason(&CredentialStatus::NeedsAttention { reason }),
+            Some(expected)
+        );
     }
 }
 
@@ -689,7 +725,7 @@ async fn openai_meter_requires_the_chatgpt_account_id_claim_before_http() {
     assert_eq!(
         report.accounts[0].meter,
         AccountMeterStateV1::Unavailable {
-            reason: "credential_account_id_unavailable".into()
+            reason: "credential_identity_incomplete".into()
         }
     );
     assert_eq!(

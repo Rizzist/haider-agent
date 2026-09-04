@@ -1685,6 +1685,7 @@ pub enum LiveReply {
     Accounts {
         descriptors: Vec<haider_protocol::credential::CredentialDescriptor>,
         revision: Option<u64>,
+        sources: Vec<crate::app::AccountSourceRow>,
     },
     /// `account.device_candidates` answered (D2): the daemon's
     /// metadata-only discovery report. `discovery_disabled` is the honest
@@ -3958,12 +3959,14 @@ impl LiveDriver {
             LiveReply::Accounts {
                 descriptors,
                 revision,
+                sources,
             } => {
                 let rows = descriptors
                     .iter()
                     .map(crate::app::AccountRow::from_descriptor)
                     .collect();
                 if model.accounts.apply_snapshot(rows, revision) {
+                    model.accounts.apply_sources(sources);
                     // Daemon truth landed: an unpinned identity follows the
                     // active account (W5f-2) so the first session can serve.
                     model.bootstrap_identity_from_daemon();

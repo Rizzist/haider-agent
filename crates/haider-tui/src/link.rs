@@ -2188,10 +2188,29 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::AccountList {
             descriptors,
             revision,
+            sources,
             ..
         } => vec![LiveReply::Accounts {
             descriptors,
             revision,
+            sources: sources
+                .into_iter()
+                .map(|source| crate::app::AccountSourceRow {
+                    source_id: source.source_id,
+                    account_alias: source.account_alias,
+                    kind: source.kind,
+                    label: source.label,
+                    path: source.path,
+                    credential_store: source.credential_store,
+                    refresh_owner: source.refresh_owner,
+                    health: source.health,
+                    last_seen_at_ms: source.last_seen_at_ms,
+                    last_refreshed_at_ms: source.last_refreshed_at_ms,
+                    access_expires_at_ms: source.access_expires_at_ms,
+                    plan: source.plan,
+                    masked_identity: source.masked_identity,
+                })
+                .collect(),
         }],
         ResponseBody::AccountDeviceCandidates {
             discovery_disabled,

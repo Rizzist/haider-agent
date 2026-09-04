@@ -11,6 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use haider_accounts::{
+    CredentialSourceHealth, CredentialSourceKind, CredentialSourceRecord, CredentialStoreMode,
+    OAuthIdentityV1, OAuthTokenBundleV1,
+};
 use haider_protocol::credential::AccountIdentity;
 use haider_rpc::DeviceCredentialCandidateWire;
 use serde::de::{IgnoredAny, MapAccess, Visitor};
@@ -21,8 +25,7 @@ use zeroize::Zeroizing;
 use crate::oauth::PlatformClaudeNativeCredentialStore;
 use crate::oauth::{
     ClaudeNativeCredentialStore, ClaudeNativeReadEvent, SecretJson, claude_subscription_identity,
-    load_claude_credential_input, oauth_home_dir, oauth_import_path,
-    parse_claude_credential_metadata,
+    oauth_home_dir, oauth_import_path, parse_claude_credential_metadata,
 };
 
 const DISCOVERY_FILE_LIMIT: u64 = 256 * 1024;
@@ -60,8 +63,8 @@ pub(crate) fn discover_device_candidates_with_native(
 
 pub(crate) fn discover_device_candidates_with_native_event(
     disabled: bool,
-    native: &dyn ClaudeNativeCredentialStore,
-    event: ClaudeNativeReadEvent,
+    _native: &dyn ClaudeNativeCredentialStore,
+    _event: ClaudeNativeReadEvent,
 ) -> Vec<DeviceCandidate> {
     if disabled || discovery_disabled_by_env() {
         return Vec::new();
@@ -70,7 +73,9 @@ pub(crate) fn discover_device_candidates_with_native_event(
     if let Some(candidate) = discover_codex() {
         candidates.push(candidate);
     }
-    if let Some(candidate) = discover_claude(native, event) {
+    // Strict prompt-free mode does not call even a no-UI native-store probe.
+    // A readable file is inspected directly and remains policy-blocked.
+    if let Some(candidate) = discover_claude_file() {
         candidates.push(candidate);
     }
     if let Some(candidate) = discover_claude_unverified_path() {
@@ -128,12 +133,37 @@ fn discovery_disabled_by_env() -> bool {
 #[derive(Deserialize)]
 struct CodexFile {
     tokens: CodexTokens,
+    #[serde(default)]
+    account_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct CodexTokens {
     access_token: SecretJson,
     refresh_token: SecretJson,
+    #[serde(default)]
+    id_token: Option<SecretJson>,
+    #[serde(default)]
+    account_id: Option<String>,
+}
+
+/// Minimal read-through shape for an externally owned Codex login. Unknown
+/// fields (notably `refresh_token`) are skipped by serde and never
+/// materialized into Haider-owned memory.
+#[derive(Deserialize)]
+struct LinkedCodexFile {
+    #[serde(default)]
+    tokens: Option<LinkedCodexTokens>,
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    last_refresh: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LinkedCodexTokens {
+    #[serde(default)]
+    access_token: Option<SecretJson>,
     #[serde(default)]
     id_token: Option<SecretJson>,
     #[serde(default)]
@@ -156,6 +186,296 @@ struct CodexClaims {
 struct CodexAuthClaims {
     #[serde(default)]
     chatgpt_account_id: Option<String>,
+    #[serde(default)]
+    chatgpt_plan_type: Option<String>,
+}
+
+/// One source-owned credential generation. `encoded_bundle` is an ephemeral
+/// access-only broker input: external refresh credentials are never copied.
+pub(crate) struct LinkedSourceMaterial {
+    pub identity: Option<AccountIdentity>,
+    pub display_identity: String,
+    pub last_refreshed_at_ms: Option<u64>,
+    pub access_expires_at_ms: Option<u64>,
+    pub health: CredentialSourceHealth,
+    pub store_mode: CredentialStoreMode,
+    pub encoded_bundle: Option<Zeroizing<Vec<u8>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkedSourceReadFailure {
+    SourceGone,
+    Unreadable,
+    SymlinkEscape,
+    Oversized,
+    PartialWrite,
+    MissingFields,
+    InvalidJson,
+    Invalid,
+    RequiresOriginClient,
+}
+
+/// Reads exactly one enrolled root. No native credential API is reachable
+/// from this function; Claude file sources are metadata-only/policy-blocked.
+pub(crate) fn read_linked_source(
+    source: &CredentialSourceRecord,
+) -> Result<LinkedSourceMaterial, LinkedSourceReadFailure> {
+    let store_mode = linked_source_store_mode(source);
+    if source.kind == CredentialSourceKind::CodexHome
+        && matches!(
+            store_mode,
+            CredentialStoreMode::Keyring
+                | CredentialStoreMode::Auto
+                | CredentialStoreMode::Ephemeral
+        )
+    {
+        return Err(LinkedSourceReadFailure::RequiresOriginClient);
+    }
+    let (path, bytes, metadata) = read_enrolled_file(source)?;
+    let last_refreshed_at_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+    match source.kind {
+        CredentialSourceKind::CodexHome => {
+            linked_codex_material(&path, bytes, store_mode, last_refreshed_at_ms)
+        }
+        CredentialSourceKind::ClaudeFile => {
+            linked_claude_metadata(&path, &bytes, last_refreshed_at_ms, &source.id)
+        }
+    }
+}
+
+pub(crate) fn linked_source_store_mode(source: &CredentialSourceRecord) -> CredentialStoreMode {
+    match source.kind {
+        CredentialSourceKind::CodexHome => codex_store_mode(&source.root),
+        CredentialSourceKind::ClaudeFile => CredentialStoreMode::File,
+    }
+}
+
+fn read_enrolled_file(
+    source: &CredentialSourceRecord,
+) -> Result<(PathBuf, Zeroizing<Vec<u8>>, std::fs::Metadata), LinkedSourceReadFailure> {
+    if !source.root.exists() {
+        return Err(LinkedSourceReadFailure::SourceGone);
+    }
+    let path = source.credential_path();
+    let canonical = std::fs::canonicalize(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            LinkedSourceReadFailure::SourceGone
+        } else {
+            LinkedSourceReadFailure::Unreadable
+        }
+    })?;
+    if !canonical.starts_with(&source.root) {
+        return Err(LinkedSourceReadFailure::SymlinkEscape);
+    }
+    let file = std::fs::File::open(&canonical).map_err(|_| LinkedSourceReadFailure::Unreadable)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| LinkedSourceReadFailure::Unreadable)?;
+    if !metadata.is_file() {
+        return Err(LinkedSourceReadFailure::Invalid);
+    }
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(DISCOVERY_FILE_LIMIT.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| LinkedSourceReadFailure::Unreadable)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > DISCOVERY_FILE_LIMIT {
+        return Err(LinkedSourceReadFailure::Oversized);
+    }
+    Ok((canonical, bytes, metadata))
+}
+
+fn linked_codex_material(
+    _path: &Path,
+    bytes: Zeroizing<Vec<u8>>,
+    store_mode: CredentialStoreMode,
+    last_refreshed_at_ms: Option<u64>,
+) -> Result<LinkedSourceMaterial, LinkedSourceReadFailure> {
+    let parsed: LinkedCodexFile = serde_json::from_slice(&bytes).map_err(|error| {
+        if error.is_eof() {
+            LinkedSourceReadFailure::PartialWrite
+        } else {
+            LinkedSourceReadFailure::InvalidJson
+        }
+    })?;
+    let last_refreshed_at_ms = parsed
+        .last_refresh
+        .as_deref()
+        .and_then(parse_rfc3339_millis)
+        .or(last_refreshed_at_ms);
+    let tokens = parsed
+        .tokens
+        .ok_or(LinkedSourceReadFailure::MissingFields)?;
+    let access_token = tokens
+        .access_token
+        .ok_or(LinkedSourceReadFailure::MissingFields)?;
+    if access_token.0.is_empty() {
+        return Err(LinkedSourceReadFailure::MissingFields);
+    }
+    let access = decode_jwt::<CodexClaims>(&access_token.0).unwrap_or_default();
+    let id = tokens
+        .id_token
+        .as_ref()
+        .and_then(|token| decode_jwt::<CodexClaims>(&token.0))
+        .unwrap_or_default();
+    let email = id.email.and_then(nonempty);
+    let account_id = id
+        .chatgpt_account_id
+        .and_then(nonempty)
+        .or_else(|| {
+            id.openai_auth
+                .as_ref()
+                .and_then(|claims| claims.chatgpt_account_id.clone())
+                .and_then(nonempty)
+        })
+        .or_else(|| tokens.account_id.clone().and_then(nonempty))
+        .or_else(|| parsed.account_id.and_then(nonempty));
+    if account_id.is_none() {
+        return Err(LinkedSourceReadFailure::MissingFields);
+    }
+    let plan = id
+        .openai_auth
+        .and_then(|claims| claims.chatgpt_plan_type)
+        .and_then(nonempty);
+    let display_identity = email
+        .clone()
+        .or_else(|| account_id.clone())
+        .unwrap_or_else(|| "Codex login".to_owned());
+    let captured_at = last_refreshed_at_ms.unwrap_or(0);
+    let identity = AccountIdentity {
+        email,
+        display_name: None,
+        account_id: account_id.clone(),
+        plan,
+        issuer: Some("https://auth.openai.com".to_owned()),
+        captured_at,
+        verified: false,
+    };
+    let expires_at_ms = access.exp.and_then(|seconds| seconds.checked_mul(1000));
+    let expires_at_ms = expires_at_ms.ok_or(LinkedSourceReadFailure::MissingFields)?;
+    let observed_at_ms = now_ms().ok_or(LinkedSourceReadFailure::Invalid)?;
+    let generation = last_refreshed_at_ms.unwrap_or(1).max(1);
+    let subject = account_id.as_deref().unwrap_or(display_identity.as_str());
+    let bundle = OAuthTokenBundleV1::new(
+        haider_provider::OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        "https://auth.openai.com".to_owned(),
+        "app_EMoamEEZ73f0CkXaXp7hrann".to_owned(),
+        None,
+        "Bearer".to_owned(),
+        access_token.0,
+        None,
+        expires_at_ms,
+        None,
+        Vec::new(),
+        OAuthIdentityV1 {
+            subject_hash: blake3::hash(subject.as_bytes()).to_hex().to_string(),
+            display_identity: display_identity.clone(),
+        },
+        generation,
+    )
+    .map_err(|_| LinkedSourceReadFailure::Invalid)?
+    .with_account_identity(identity.clone());
+    let encoded_bundle = bundle
+        .encode()
+        .map_err(|_| LinkedSourceReadFailure::Invalid)?;
+    let health = if expires_at_ms <= observed_at_ms {
+        CredentialSourceHealth::Expired
+    } else {
+        CredentialSourceHealth::Ready
+    };
+    Ok(LinkedSourceMaterial {
+        identity: Some(identity),
+        display_identity,
+        last_refreshed_at_ms,
+        access_expires_at_ms: Some(expires_at_ms),
+        health,
+        store_mode,
+        encoded_bundle: Some(encoded_bundle),
+    })
+}
+
+fn linked_claude_metadata(
+    path: &Path,
+    bytes: &[u8],
+    last_refreshed_at_ms: Option<u64>,
+    source_id: &str,
+) -> Result<LinkedSourceMaterial, LinkedSourceReadFailure> {
+    serde_json::from_slice::<serde::de::IgnoredAny>(bytes).map_err(|error| {
+        if error.is_eof() {
+            LinkedSourceReadFailure::PartialWrite
+        } else {
+            LinkedSourceReadFailure::InvalidJson
+        }
+    })?;
+    let parsed = parse_claude_credential_metadata(path, bytes)
+        .map_err(|_| LinkedSourceReadFailure::MissingFields)?;
+    if !parsed.has_inference_scope {
+        return Err(LinkedSourceReadFailure::MissingFields);
+    }
+    let (display_name, plan) = claude_subscription_identity(parsed.subscription_type.as_deref());
+    let captured_at = last_refreshed_at_ms.unwrap_or(0);
+    let synthetic = format!(
+        "anthropic:{}",
+        &source_id[source_id.len().saturating_sub(16)..]
+    );
+    Ok(LinkedSourceMaterial {
+        identity: Some(AccountIdentity {
+            email: None,
+            display_name: Some(display_name.to_owned()),
+            account_id: Some(synthetic),
+            plan: plan.map(str::to_owned),
+            issuer: Some("https://claude.ai".to_owned()),
+            captured_at,
+            verified: false,
+        }),
+        display_identity: display_name.to_owned(),
+        last_refreshed_at_ms,
+        access_expires_at_ms: Some(parsed.expires_at_ms),
+        health: CredentialSourceHealth::RequiresOriginClient,
+        store_mode: CredentialStoreMode::File,
+        encoded_bundle: None,
+    })
+}
+
+fn codex_store_mode(root: &Path) -> CredentialStoreMode {
+    let path = root.join("config.toml");
+    let Ok(bytes) = std::fs::read(path) else {
+        return CredentialStoreMode::File;
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return CredentialStoreMode::Unknown;
+    };
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "cli_auth_credentials_store" {
+            continue;
+        }
+        return match value
+            .trim()
+            .trim_matches(['\'', '"'])
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "file" => CredentialStoreMode::File,
+            "keyring" => CredentialStoreMode::Keyring,
+            "auto" => CredentialStoreMode::Auto,
+            "ephemeral" => CredentialStoreMode::Ephemeral,
+            _ => CredentialStoreMode::Unknown,
+        };
+    }
+    CredentialStoreMode::File
+}
+
+fn parse_rfc3339_millis(value: &str) -> Option<u64> {
+    let timestamp =
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()?;
+    u64::try_from(timestamp.unix_timestamp_nanos().checked_div(1_000_000)?).ok()
 }
 
 fn discover_codex() -> Option<DeviceCandidate> {
@@ -181,7 +501,8 @@ fn discover_codex() -> Option<DeviceCandidate> {
                 .openai_auth
                 .and_then(|claims| claims.chatgpt_account_id.and_then(nonempty))
         })
-        .or_else(|| parsed.tokens.account_id.clone().and_then(nonempty));
+        .or_else(|| parsed.tokens.account_id.clone().and_then(nonempty))
+        .or_else(|| parsed.account_id.clone().and_then(nonempty));
     let account_label = email.clone().or_else(|| account_id.clone());
     let captured_at = now_ms()?;
     let rich_identity = haider_provider::oauth_identity_source("openai-oauth")
@@ -226,43 +547,31 @@ fn discover_codex() -> Option<DeviceCandidate> {
     ))
 }
 
-fn discover_claude(
-    native: &dyn ClaudeNativeCredentialStore,
-    event: ClaudeNativeReadEvent,
-) -> Option<DeviceCandidate> {
+fn discover_claude_file() -> Option<DeviceCandidate> {
     let path = oauth_import_path("claude-code").ok()?;
-    discover_claude_at_event(&path, native, event)
+    discover_claude_file_at(&path)
 }
 
 #[cfg(test)]
 pub(crate) fn discover_claude_at(
     path: &Path,
-    native: &dyn ClaudeNativeCredentialStore,
+    _native: &dyn ClaudeNativeCredentialStore,
 ) -> Option<DeviceCandidate> {
-    discover_claude_at_event(path, native, ClaudeNativeReadEvent::Ordinary)
+    discover_claude_file_at(path)
 }
 
-fn discover_claude_at_event(
-    path: &Path,
-    native: &dyn ClaudeNativeCredentialStore,
-    event: ClaudeNativeReadEvent,
-) -> Option<DeviceCandidate> {
-    let input = load_claude_credential_input(path, native, event).ok()?;
-    let source_label = if input.native_owner {
-        "Linked to Claude Code"
-    } else {
-        "Claude Code credential file"
-    };
-    let parsed = parse_claude_credential_metadata(&input.location, &input.bytes).ok()?;
+fn discover_claude_file_at(path: &Path) -> Option<DeviceCandidate> {
+    let bytes = read_bounded(path)?;
+    let parsed = parse_claude_credential_metadata(path, &bytes).ok()?;
     if !parsed.has_inference_scope {
         return None;
     }
-    let content_fingerprint = *blake3::hash(&input.bytes).as_bytes();
+    let content_fingerprint = *blake3::hash(&bytes).as_bytes();
     let (display_name, plan) = claude_subscription_identity(parsed.subscription_type.as_deref());
     Some(candidate(
         "claude-code",
         "anthropic-oauth",
-        source_label,
+        "Claude Code credential file (read-only)",
         None,
         Some(AccountIdentity {
             email: None,
@@ -274,12 +583,14 @@ fn discover_claude_at_event(
             verified: false,
         }),
         Some(parsed.expires_at_ms),
-        input.location,
+        path.to_path_buf(),
         Some(content_fingerprint),
-        !parsed.custom_client,
-        parsed
-            .custom_client
-            .then(|| CLAUDE_CUSTOM_CLIENT_REASON.to_owned()),
+        false,
+        Some(if parsed.custom_client {
+            CLAUDE_CUSTOM_CLIENT_REASON.to_owned()
+        } else {
+            "Claude Code subscription credentials remain owned by the official client and cannot be imported by Haider".to_owned()
+        }),
     ))
 }
 

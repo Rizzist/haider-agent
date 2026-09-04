@@ -124,6 +124,14 @@ pub enum CredentialAttentionReason {
     KeychainLocked,
     KeychainMissing,
     KeychainUnavailable,
+    /// The explicitly enrolled external credential file/root disappeared.
+    SourceGone,
+    /// The external source exists but cannot be read safely.
+    SourceUnreadable,
+    /// The source is present but its origin client must broker access.
+    OriginClientRequired,
+    /// Direct use is intentionally disabled by provider policy.
+    PolicyBlocked,
 }
 
 /// Surfaced like a model change in the transcript (§4.4 rotation).

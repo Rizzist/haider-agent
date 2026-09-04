@@ -36,8 +36,11 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use haider_accounts::SecretHandle;
 use haider_protocol::EventPayload;
 use haider_protocol::agent::{AgentMetricsSnapshot, AgentUsageBreakdown, AgentUsageMetrics};
-use haider_protocol::credential::{AuthMethod, CredentialDescriptor};
+use haider_protocol::credential::{
+    AuthMethod, CredentialAttentionReason, CredentialDescriptor, CredentialStatus,
+};
 use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::{AgentId, CredentialAlias, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::provider::{
@@ -75,11 +78,41 @@ impl MeterTokenSource for CredentialBroker {
         &self,
         descriptor: &CredentialDescriptor,
     ) -> Result<SecretHandle, MeterUnavailable> {
+        if let Some(reason) = credential_meter_unavailable_reason(&descriptor.status) {
+            return Err(MeterUnavailable::new(reason));
+        }
         // The broker's own message may name vault/refresh internals; the
         // report carries only the bounded classification.
-        self.resolve(descriptor)
-            .await
-            .map_err(|_| MeterUnavailable::new("credential_unavailable"))
+        self.resolve(descriptor).await.map_err(|error| {
+            let reason = if error.code == ErrorCode::CredentialMissing {
+                "credential_source_gone"
+            } else {
+                "credential_unavailable"
+            };
+            MeterUnavailable::new(reason)
+        })
+    }
+}
+
+/// Converts durable credential health into the stable, bounded meter reason
+/// vocabulary. This prevents a revoked login or vanished linked source from
+/// collapsing back to the screenshot's ambiguous `credential unavailable`.
+fn credential_meter_unavailable_reason(status: &CredentialStatus) -> Option<&'static str> {
+    match status {
+        CredentialStatus::Ok | CredentialStatus::Limited { .. } => None,
+        CredentialStatus::Expired => Some("credential_expired"),
+        CredentialStatus::Revoked => Some("credential_revoked"),
+        CredentialStatus::NeedsAttention { reason } => Some(match reason {
+            CredentialAttentionReason::KeychainDenied => "credential_keychain_denied",
+            CredentialAttentionReason::KeychainLocked => "credential_keychain_locked",
+            CredentialAttentionReason::KeychainMissing | CredentialAttentionReason::SourceGone => {
+                "credential_source_gone"
+            }
+            CredentialAttentionReason::KeychainUnavailable
+            | CredentialAttentionReason::SourceUnreadable => "credential_source_unreadable",
+            CredentialAttentionReason::OriginClientRequired => "credential_origin_client_required",
+            CredentialAttentionReason::PolicyBlocked => "credential_policy_blocked",
+        }),
     }
 }
 
@@ -522,7 +555,7 @@ impl UsageReportService {
                 Some(account_id) => Some(account_id),
                 None => {
                     return (
-                        Err(MeterUnavailable::new("credential_account_id_unavailable")),
+                        Err(MeterUnavailable::new("credential_identity_incomplete")),
                         token_identity,
                     );
                 }

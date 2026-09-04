@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+blake3.workspace = true
 haider-protocol = { path = "../haider-protocol" }
 haider-platform = { path = "../haider-platform" }
 hex.workspace = true

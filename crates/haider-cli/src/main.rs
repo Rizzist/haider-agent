@@ -487,7 +487,7 @@ async fn dispatch(args: &[String]) -> ExitCode {
                  session <id> seen, session <id> recover [--json] [--probe|--mark-done|--retry|--abandon], \
                  session workspace set <path>, session <id> workspace set <path>, \
                  session <id> item <seq> --json [--masked] [--no-spawn], \
-                 account list [--json], account import <codex|claude-code> [--confirm], account refresh <alias>, account remove <alias> --confirm, \
+                 account list [--json], account use <alias> [--confirm], account source list [--json], account source add <codex|claude_file> <root> [--label <label>], account source remove <source-id>, account source scan [--json], account import <codex|claude-code> [--confirm], account refresh <alias>, account remove <alias> --confirm, \
                  account add <alias> --base-url <url> [--api-key <key>|--api-key-env <VAR>|--api-key-stdin|--no-auth] [--api-family openai|anthropic] [--response-open-timeout <dur>] [--chunk-idle-timeout <dur>] [--semantic-progress-timeout <dur>] [--json], \
                  account probe <alias> [--json], account update <alias> [--base-url <url>] [--api-key <key>|--api-key-env <VAR>|--api-key-stdin] [--response-open-timeout <dur>] [--chunk-idle-timeout <dur>] [--semantic-progress-timeout <dur>] [--json], \
                  provider list [--json], provider show <name> [--json], provider add <name> --base-url <url> [--lockdown|--full] ..., provider set <name> (--lockdown|--full), provider remove <name> --confirm, \

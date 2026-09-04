@@ -1335,9 +1335,15 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
         ResponseBody::AccountList { descriptors, .. } => assert!(
             descriptors.iter().any(|current| {
                 current.alias == descriptor.alias
-                    && matches!(current.status, CredentialStatus::Expired)
+                    && matches!(
+                        current.status,
+                        CredentialStatus::NeedsAttention {
+                            reason:
+                                haider_protocol::credential::CredentialAttentionReason::SourceGone
+                        }
+                    )
             }),
-            "successor sees only the durable fail-closed descriptor"
+            "successor migrates the durable descriptor to typed source-gone"
         ),
         other => panic!("unexpected account.list response: {other:?}"),
     }

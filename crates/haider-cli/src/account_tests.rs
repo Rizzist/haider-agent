@@ -63,6 +63,7 @@ fn list_response(alias: &str, revision: Option<u64>) -> ResponseBody {
         revision,
         provider_active: Vec::new(),
         provider_defaults: Vec::new(),
+        sources: Vec::new(),
         availability: Some(SnapshotAvailabilityWire::Available),
     }
 }
@@ -127,6 +128,118 @@ fn import_and_refresh_parsing_are_explicit() {
             alias: "work".into(),
         })
     );
+}
+
+#[test]
+fn source_and_profile_default_commands_have_exact_grammar() {
+    assert_eq!(
+        parse_account_command(&["use".into(), "work".into()]),
+        Ok(AccountCommand::Use {
+            alias: "work".into(),
+            confirm: false,
+        })
+    );
+    assert_eq!(
+        parse_account_command(&["use".into(), "work".into(), "--confirm".into()]),
+        Ok(AccountCommand::Use {
+            alias: "work".into(),
+            confirm: true,
+        })
+    );
+    assert_eq!(
+        parse_account_command(&[
+            "source".into(),
+            "add".into(),
+            "codex".into(),
+            "/tmp/codex-work".into(),
+            "--label".into(),
+            "Work".into(),
+        ]),
+        Ok(AccountCommand::SourceAdd {
+            kind: "codex".into(),
+            root: "/tmp/codex-work".into(),
+            label: Some("Work".into()),
+        })
+    );
+    assert_eq!(
+        parse_account_command(&["source".into(), "scan".into(), "--json".into()]),
+        Ok(AccountCommand::SourceScan { json: true })
+    );
+    assert!(
+        parse_account_command(&["source".into(), "add".into(), "keychain".into(), "/".into()])
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn account_use_resolves_alias_then_sets_the_profile_default() {
+    let selected = descriptor("work");
+    let client = FakeAccountClient::new([
+        list_response("work", Some(3)),
+        ResponseBody::AccountSetActive {
+            descriptor: selected,
+            prior_alias: None,
+            revision: 4,
+        },
+    ]);
+    let result = execute(
+        &client,
+        AccountCommand::Use {
+            alias: "work".into(),
+            confirm: true,
+        },
+    )
+    .await;
+    assert!(matches!(result, Ok(code) if code == ExitCode::SUCCESS));
+    assert!(matches!(
+        client.requests().as_slice(),
+        [
+            RequestBody::AccountList { provider: None },
+            RequestBody::AccountSetActive {
+                alias,
+                confirm_new_epoch: true,
+                ..
+            }
+        ] if alias == "work"
+    ));
+}
+
+#[tokio::test]
+async fn source_add_sends_coordinates_without_credential_material() {
+    let source = AccountSourceWire {
+        source_id: format!("src1_{}", "1".repeat(64)),
+        account_alias: None,
+        kind: "codex_home".into(),
+        label: "Work".into(),
+        path: Some("/tmp/codex-work".into()),
+        credential_store: "file".into(),
+        refresh_owner: "codex".into(),
+        health: "ready".into(),
+        last_seen_at_ms: None,
+        last_refreshed_at_ms: None,
+        access_expires_at_ms: None,
+        plan: None,
+        masked_identity: None,
+    };
+    let client = FakeAccountClient::new([ResponseBody::AccountSourceAdd {
+        source: source.clone(),
+        sources: vec![source],
+    }]);
+    let result = execute(
+        &client,
+        AccountCommand::SourceAdd {
+            kind: "codex".into(),
+            root: "/tmp/codex-work".into(),
+            label: Some("Work".into()),
+        },
+    )
+    .await;
+    assert!(matches!(result, Ok(code) if code == ExitCode::SUCCESS));
+    assert!(matches!(
+        client.requests().as_slice(),
+        [RequestBody::AccountSourceAdd { kind, root, label: Some(label), .. }]
+            if kind == "codex" && root == "/tmp/codex-work" && label == "Work"
+    ));
 }
 
 #[tokio::test]

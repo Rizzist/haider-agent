@@ -30,8 +30,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use haider_accounts::{
-    AccountStore, JsonFileStore, MemoryVault, Resolver, RotationCallback, RotationDecision,
-    RotationTrigger, SecretHandle, StoreLike, Vault,
+    AccountStore, CredentialSourceHealth, CredentialSourceKind, CredentialSourceRecord,
+    CredentialSourceRegistry, JsonFileStore, MemoryVault, Resolver, RotationCallback,
+    RotationDecision, RotationTrigger, SecretHandle, StoreLike, Vault, VaultRefreshLock,
 };
 use haider_core::{
     ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_ACTIVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD,
@@ -64,7 +65,7 @@ use haider_provider::{
     XAI_PROVIDER_NAME, azure_openai_origin, discover_models,
 };
 use haider_rpc::{
-    ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
+    AccountSourceWire, ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
     ERROR_CODE_PERMISSION_DENIED, ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_PROVIDER_MODELS_UNKNOWN,
     ERROR_CODE_PROVIDER_REMOVE_REFUSED, ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_REVISION_CONFLICT,
     ERROR_CODE_UNAUTHORIZED, ErrorData, ProviderApiFamilyWire, ProviderAuthRequirementWire,
@@ -77,14 +78,16 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use zeroize::Zeroizing;
 
+#[cfg(test)]
+use crate::oauth::PlatformClaudeNativeCredentialStore;
 use crate::oauth::{
     ClaudeNativeCredentialAccess, ClaudeNativeCredentialFailure, ClaudeNativeCredentialStore,
     ClaudeNativeImportError, ClaudeNativeReadEvent, CredentialBroker, KIMI_DEVICE_ALIAS,
     OAuthCoordinator, OAuthCoordinatorConfig, OAuthImportMaterial, OAuthInferenceAuthMode,
-    OAuthInferenceHeaderSet, OAuthProviderCatalog, OAuthReadyClaim,
-    PlatformClaudeNativeCredentialStore, RefreshFenceRegistry, is_claude_native_owner_identity,
-    load_claude_native_import_material, load_oauth_import_material_with_native,
-    oauth_import_source_catalog, oauth_import_source_spec, sanctioned_inference,
+    OAuthInferenceHeaderSet, OAuthProviderCatalog, OAuthReadyClaim, RefreshFenceRegistry,
+    is_claude_native_owner_identity, load_claude_native_import_material,
+    load_oauth_import_material_with_native, oauth_import_source_catalog, oauth_import_source_spec,
+    sanctioned_inference,
 };
 use crate::provider_registry::{
     CachedProviderModelSource, JsonProviderRegistryStore, ProductionProviderEndpointValidator,
@@ -105,6 +108,81 @@ const DEVICE_DISCOVERY_WORKER_TIMEOUT: Duration = Duration::from_secs(5);
 /// Status reuses a completed metadata-only discovery briefly. Explicit
 /// account discovery remains an immediate bounded refresh.
 const STATUS_DEVICE_DISCOVERY_TTL: Duration = Duration::from_secs(30);
+/// File notifications are bursty around atomic replacement. This bounded
+/// delay folds the create/rename/write burst into one reconciliation.
+const SOURCE_EVENT_COALESCE: Duration = Duration::from_millis(100);
+const SOURCE_RECONCILE_BASE: Duration = Duration::from_secs(15);
+const SOURCE_RECONCILE_JITTER_MAX_MS: u64 = 5_000;
+
+fn source_reconcile_period(profile_id: &str) -> Duration {
+    let digest = blake3::hash(profile_id.as_bytes());
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&digest.as_bytes()[..8]);
+    let jitter = u64::from_le_bytes(prefix) % (SOURCE_RECONCILE_JITTER_MAX_MS + 1);
+    SOURCE_RECONCILE_BASE + Duration::from_millis(jitter)
+}
+
+struct CredentialSourceWatcher(tokio::task::JoinHandle<()>);
+
+impl CredentialSourceWatcher {
+    fn new(
+        registry: &Arc<StdMutex<CredentialSourceRegistry>>,
+        changed: watch::Sender<u64>,
+    ) -> Self {
+        let registry = Arc::clone(registry);
+        let task = tokio::spawn(async move {
+            let mut observed = HashMap::new();
+            let mut cadence = tokio::time::interval(Duration::from_millis(250));
+            cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                cadence.tick().await;
+                let records = registry
+                    .lock()
+                    .map(|registry| registry.records().to_vec())
+                    .unwrap_or_default();
+                let mut live = HashSet::new();
+                for record in records.into_iter().filter(|record| record.enabled) {
+                    live.insert(record.id.clone());
+                    let fingerprint = source_file_fingerprint(&record);
+                    if observed
+                        .insert(record.id.clone(), fingerprint)
+                        .is_some_and(|previous| previous != fingerprint)
+                    {
+                        changed.send_modify(|generation| {
+                            *generation = generation.wrapping_add(1);
+                        });
+                    }
+                }
+                observed.retain(|source_id, _| live.contains(source_id));
+            }
+        });
+        Self(task)
+    }
+}
+
+impl Drop for CredentialSourceWatcher {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SourceFileFingerprint {
+    credential: Option<(u64, u128)>,
+    config: Option<(u64, u128)>,
+}
+
+fn source_file_fingerprint(record: &CredentialSourceRecord) -> SourceFileFingerprint {
+    fn stamp(path: &std::path::Path) -> Option<(u64, u128)> {
+        let metadata = std::fs::metadata(path).ok()?;
+        let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        Some((metadata.len(), modified.as_nanos()))
+    }
+    SourceFileFingerprint {
+        credential: stamp(&record.credential_path()),
+        config: stamp(&record.root.join("config.toml")),
+    }
+}
 
 // ───────────────────────────── transport class ─────────────────────────────
 
@@ -814,6 +892,7 @@ fn normalize_account_alias(alias: &str) -> Result<String, HaiderError> {
 /// actor after every committed mutation; readers never touch the JSON store,
 /// preserving its single-writer assumption).
 pub(crate) type AccountsSnapshot = Arc<StdMutex<Vec<CredentialDescriptor>>>;
+pub(crate) type AccountSourcesSnapshot = Arc<StdMutex<Vec<AccountSourceWire>>>;
 
 /// One atomically published management read view. RPC reads take this single
 /// lock so account/provider data can never be paired with another revision.
@@ -983,6 +1062,7 @@ pub(crate) struct AccountsFacade {
     pub vault_supported: bool,
     pub discovery_disabled: bool,
     pub device_discovery: DeviceDiscoverySnapshot,
+    pub sources: AccountSourcesSnapshot,
     /// The profile-scoped vault itself, for the SMALL bounded-secret
     /// surfaces the connection task serves inline (T1: the transcription
     /// secret — one ≤512-byte file read/write, comparable to one store
@@ -1142,6 +1222,18 @@ pub(crate) struct DeviceImportJob {
     pub route: LoginRoute,
 }
 
+pub(crate) struct SourceAddJob {
+    pub kind: String,
+    pub root: String,
+    pub label: Option<String>,
+    pub route: LoginRoute,
+}
+
+pub(crate) struct SourceRemoveJob {
+    pub source_id: String,
+    pub route: LoginRoute,
+}
+
 pub(crate) struct SetActiveJob {
     pub command_id: String,
     pub alias: String,
@@ -1249,6 +1341,15 @@ pub(crate) enum AccountCommand {
     RefreshDeviceDiscovery {
         discovery_disabled: bool,
     },
+    SourceList {
+        completed: LoginRoute,
+    },
+    SourceAdd(Box<SourceAddJob>),
+    SourceRemove(Box<SourceRemoveJob>),
+    SourceScan {
+        completed: LoginRoute,
+    },
+    ReconcileSources,
     ImportDevice(Box<DeviceImportJob>),
     SetActive(Box<SetActiveJob>),
     SetLabel(Box<SetLabelJob>),
@@ -1382,6 +1483,8 @@ pub(crate) struct AccountActorConfig {
     pub provider_endpoint_validator: Arc<dyn ProviderEndpointValidator>,
     pub reserved_aliases: HashSet<String>,
     pub refresh_fences: RefreshFenceRegistry,
+    pub source_registry: Arc<StdMutex<CredentialSourceRegistry>>,
+    pub source_snapshot: AccountSourcesSnapshot,
 }
 
 #[async_trait::async_trait]
@@ -1420,7 +1523,7 @@ pub(crate) fn start_account_actor(config: AccountActorConfig) -> AccountActorHan
         None,
         Arc::new(ProductionProviderModelDiscoverer),
         Arc::new(crate::gcloud::GcloudCli),
-        Arc::new(PlatformClaudeNativeCredentialStore::default()),
+        Arc::new(StrictNoNativeCredentialStore),
     )
 }
 
@@ -1509,6 +1612,8 @@ async fn run_account_actor(
         provider_endpoint_validator,
         mut reserved_aliases,
         refresh_fences,
+        source_registry,
+        source_snapshot,
     } = config;
     // Command-owned secrets surviving a retryable validation, bounded by
     // SECRET_TTL; daemon restart wipes them by construction.
@@ -1519,6 +1624,13 @@ async fn run_account_actor(
     > = JoinSet::new();
     let mut model_refresh_routes = HashMap::new();
     let mut refreshing_providers = HashSet::new();
+    let source_reconcile_period = source_reconcile_period(&profile_id);
+    let mut source_reconcile = tokio::time::interval(source_reconcile_period);
+    source_reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    source_reconcile.tick().await;
+    let (source_event_tx, mut source_events) = watch::channel(0_u64);
+    let _source_watcher = CredentialSourceWatcher::new(&source_registry, source_event_tx.clone());
+    let _source_event_tx = source_event_tx;
     let mut draining = false;
     if backfill_oauth_identities(&mut accounts, vault.as_ref()).await {
         refresh_resolver_snapshot(&snapshot, &accounts);
@@ -1586,6 +1698,15 @@ async fn run_account_actor(
                 }
                 continue;
             }
+            _ = source_reconcile.tick(), if !draining => AccountCommand::ReconcileSources,
+            changed = source_events.changed(), if !draining => {
+                if changed.is_err() {
+                    continue;
+                }
+                tokio::time::sleep(SOURCE_EVENT_COALESCE).await;
+                source_events.borrow_and_update();
+                AccountCommand::ReconcileSources
+            }
         };
         match command {
             AccountCommand::Shutdown => {
@@ -1623,14 +1744,27 @@ async fn run_account_actor(
                 .await;
             }
             AccountCommand::OAuthImportSources { completed } => {
+                let sources = oauth_import_source_catalog(&StrictNoNativeCredentialStore)
+                    .into_iter()
+                    .filter(|source| source.source != "claude-code")
+                    .collect();
                 respond(
                     &completed,
-                    ResponseBody::AccountOAuthImportSources {
-                        sources: oauth_import_source_catalog(claude_native.as_ref()),
-                    },
+                    ResponseBody::AccountOAuthImportSources { sources },
                 );
             }
             AccountCommand::ImportOAuth(job) => {
+                if job.source == "claude-code" {
+                    respond_management_error(
+                        &job.route,
+                        &HaiderError::new(
+                            ErrorCode::Unauthorized,
+                            "Claude Code subscription credentials remain owned by the official client",
+                            false,
+                        ),
+                    );
+                    continue;
+                }
                 handle_oauth_import(
                     &store,
                     &mut accounts,
@@ -1644,7 +1778,7 @@ async fn run_account_actor(
                     OAuthCommitResponse::ImportLegacy,
                     None,
                     None,
-                    ClaudeNativeReadEvent::Significant,
+                    ClaudeNativeReadEvent::Ordinary,
                     Arc::clone(&claude_native),
                 )
                 .await;
@@ -1700,6 +1834,226 @@ async fn run_account_actor(
                         )
                         .await
                     });
+                }
+            }
+            AccountCommand::SourceList { completed } => {
+                let sources = source_snapshot
+                    .lock()
+                    .map(|sources| sources.clone())
+                    .unwrap_or_default();
+                respond(&completed, ResponseBody::AccountSourceList { sources });
+            }
+            AccountCommand::SourceAdd(job) => {
+                let kind = match job.kind.as_str() {
+                    "codex" | "codex_home" => CredentialSourceKind::CodexHome,
+                    "claude" | "claude_file" => CredentialSourceKind::ClaudeFile,
+                    _ => {
+                        respond_management_error(
+                            &job.route,
+                            &HaiderError::new(
+                                ErrorCode::InvalidArgument,
+                                "credential source kind must be codex or claude_file",
+                                false,
+                            ),
+                        );
+                        continue;
+                    }
+                };
+                let result = source_registry
+                    .lock()
+                    .map_err(|_| {
+                        HaiderError::new(
+                            ErrorCode::Internal,
+                            "credential source registry is unavailable",
+                            true,
+                        )
+                    })
+                    .and_then(|mut registry| {
+                        let enrolled = registry.enroll(kind, &job.root, job.label.as_deref())?;
+                        reconcile_credential_sources(&mut registry, &mut accounts)?;
+                        publish_source_snapshot(&source_snapshot, &registry, &accounts);
+                        Ok(enrolled.id)
+                    });
+                match result {
+                    Ok(source_id) => {
+                        refresh_resolver_snapshot(&snapshot, &accounts);
+                        if let Err(error) = publish_next_management_revision(
+                            &store,
+                            &snapshot,
+                            management.as_ref(),
+                            &accounts,
+                        )
+                        .await
+                        {
+                            respond_management_error(&job.route, &error);
+                            continue;
+                        }
+                        let sources = source_snapshot
+                            .lock()
+                            .map(|sources| sources.clone())
+                            .unwrap_or_default();
+                        let source = sources
+                            .iter()
+                            .find(|source| source.source_id == source_id)
+                            .cloned();
+                        match source {
+                            Some(source) => respond(
+                                &job.route,
+                                ResponseBody::AccountSourceAdd { source, sources },
+                            ),
+                            None => respond_management_error(
+                                &job.route,
+                                &HaiderError::new(
+                                    ErrorCode::Internal,
+                                    "enrolled credential source disappeared",
+                                    true,
+                                ),
+                            ),
+                        }
+                    }
+                    Err(error) => respond_management_error(&job.route, &error),
+                }
+            }
+            AccountCommand::SourceRemove(job) => {
+                let result = source_registry
+                    .lock()
+                    .map_err(|_| {
+                        HaiderError::new(
+                            ErrorCode::Internal,
+                            "credential source registry is unavailable",
+                            true,
+                        )
+                    })
+                    .and_then(|mut registry| {
+                        let mut removed = registry
+                            .records()
+                            .iter()
+                            .find(|source| source.id == job.source_id)
+                            .cloned()
+                            .ok_or_else(|| {
+                                HaiderError::new(
+                                    ErrorCode::CredentialMissing,
+                                    format!("credential source `{}` does not exist", job.source_id),
+                                    false,
+                                )
+                            })?;
+                        if let Some(alias) =
+                            removed.account_alias.as_deref().map(CredentialAlias::new)
+                            && accounts.get(&alias).is_some()
+                        {
+                            accounts.set_status(
+                                &alias,
+                                CredentialStatus::NeedsAttention {
+                                    reason: CredentialAttentionReason::SourceGone,
+                                },
+                            )?;
+                        }
+                        removed.enabled = false;
+                        removed.health = CredentialSourceHealth::SourceGone;
+                        registry.update(removed)?;
+                        publish_source_snapshot(&source_snapshot, &registry, &accounts);
+                        Ok(())
+                    });
+                match result {
+                    Ok(()) => {
+                        refresh_resolver_snapshot(&snapshot, &accounts);
+                        if let Err(error) = publish_next_management_revision(
+                            &store,
+                            &snapshot,
+                            management.as_ref(),
+                            &accounts,
+                        )
+                        .await
+                        {
+                            respond_management_error(&job.route, &error);
+                            continue;
+                        }
+                        let sources = source_snapshot
+                            .lock()
+                            .map(|sources| sources.clone())
+                            .unwrap_or_default();
+                        respond(
+                            &job.route,
+                            ResponseBody::AccountSourceRemove {
+                                source_id: job.source_id,
+                                sources,
+                            },
+                        );
+                    }
+                    Err(error) => respond_management_error(&job.route, &error),
+                }
+            }
+            AccountCommand::SourceScan { completed } => {
+                let result = source_registry
+                    .lock()
+                    .map_err(|_| {
+                        HaiderError::new(
+                            ErrorCode::Internal,
+                            "credential source registry is unavailable",
+                            true,
+                        )
+                    })
+                    .and_then(|mut registry| {
+                        reconcile_credential_sources(&mut registry, &mut accounts)?;
+                        publish_source_snapshot(&source_snapshot, &registry, &accounts);
+                        Ok(())
+                    });
+                match result {
+                    Ok(()) => {
+                        refresh_resolver_snapshot(&snapshot, &accounts);
+                        if let Err(error) = publish_next_management_revision(
+                            &store,
+                            &snapshot,
+                            management.as_ref(),
+                            &accounts,
+                        )
+                        .await
+                        {
+                            respond_management_error(&completed, &error);
+                            continue;
+                        }
+                        let sources = source_snapshot
+                            .lock()
+                            .map(|sources| sources.clone())
+                            .unwrap_or_default();
+                        respond(&completed, ResponseBody::AccountSourceScan { sources });
+                    }
+                    Err(error) => respond_management_error(&completed, &error),
+                }
+            }
+            AccountCommand::ReconcileSources => {
+                let before = accounts.list().to_vec();
+                let before_sources = source_snapshot
+                    .lock()
+                    .map(|sources| sources.clone())
+                    .unwrap_or_default();
+                let reconciled = source_registry
+                    .lock()
+                    .map_err(|_| {
+                        HaiderError::new(
+                            ErrorCode::Internal,
+                            "credential source registry is unavailable",
+                            true,
+                        )
+                    })
+                    .and_then(|mut registry| {
+                        reconcile_credential_sources(&mut registry, &mut accounts)?;
+                        publish_source_snapshot(&source_snapshot, &registry, &accounts);
+                        Ok(())
+                    });
+                let sources_changed = source_snapshot
+                    .lock()
+                    .map(|sources| source_metadata_changed(&before_sources, &sources))
+                    .unwrap_or(false);
+                if reconciled.is_ok() && (before != accounts.list() || sources_changed) {
+                    refresh_resolver_snapshot(&snapshot, &accounts);
+                    let _ = publish_next_management_revision(
+                        &store,
+                        &snapshot,
+                        management.as_ref(),
+                        &accounts,
+                    )
+                    .await;
                 }
             }
             AccountCommand::ImportDevice(job) => {
@@ -1877,19 +2231,43 @@ async fn run_account_actor(
                 expected,
                 completed,
             } => {
-                let result = handle_oauth_import_heal(
-                    &store,
-                    &mut accounts,
-                    Arc::clone(&vault),
-                    &snapshot,
-                    management.as_ref(),
-                    &reserved_aliases,
-                    &refresh_fences,
-                    &descriptor,
-                    &expected,
-                    Arc::clone(&claude_native),
-                )
-                .await;
+                let linked_source = source_registry.lock().ok().and_then(|registry| {
+                    registry.find_by_alias(descriptor.alias.as_str()).cloned()
+                });
+                let result = if let Some(linked_source) =
+                    linked_source.filter(|source| source.kind == CredentialSourceKind::CodexHome)
+                {
+                    let source_id = linked_source.id;
+                    source_registry
+                        .lock()
+                        .map_err(|_| {
+                            HaiderError::new(
+                                ErrorCode::Internal,
+                                "credential source registry is unavailable",
+                                true,
+                            )
+                        })
+                        .and_then(|mut registry| {
+                            reconcile_credential_sources(&mut registry, &mut accounts)?;
+                            publish_source_snapshot(&source_snapshot, &registry, &accounts);
+                            refresh_resolver_snapshot(&snapshot, &accounts);
+                            Ok(OAuthImportHealResult::LiveOwnerStore { source: source_id })
+                        })
+                } else {
+                    handle_oauth_import_heal(
+                        &store,
+                        &mut accounts,
+                        Arc::clone(&vault),
+                        &snapshot,
+                        management.as_ref(),
+                        &reserved_aliases,
+                        &refresh_fences,
+                        &descriptor,
+                        &expected,
+                        Arc::clone(&claude_native),
+                    )
+                    .await
+                };
                 let _ = completed.send(result);
             }
             AccountCommand::ExpireOAuthRefresh {
@@ -1969,24 +2347,75 @@ async fn backfill_oauth_identities(
         .collect::<Vec<_>>();
     let mut changed = false;
     for (alias, provider) in targets {
-        let Ok(stored) = vault.resolve(&alias) else {
-            continue;
+        let stored = match vault.resolve(&alias) {
+            Ok(stored) => stored,
+            Err(error) => {
+                let reason = if error.code == ErrorCode::CredentialMissing {
+                    CredentialAttentionReason::SourceGone
+                } else {
+                    CredentialAttentionReason::SourceUnreadable
+                };
+                if accounts.get(&alias).is_some_and(|descriptor| {
+                    descriptor.status != CredentialStatus::NeedsAttention { reason }
+                }) && accounts
+                    .set_status(&alias, CredentialStatus::NeedsAttention { reason })
+                    .is_ok()
+                {
+                    changed = true;
+                }
+                continue;
+            }
         };
-        let Ok(bundle) = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) else {
-            continue;
+        let bundle = match haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) {
+            Ok(bundle) => bundle,
+            Err(_) => {
+                let status = CredentialStatus::NeedsAttention {
+                    reason: CredentialAttentionReason::SourceUnreadable,
+                };
+                if accounts
+                    .get(&alias)
+                    .is_some_and(|descriptor| descriptor.status != status)
+                    && accounts.set_status(&alias, status).is_ok()
+                {
+                    changed = true;
+                }
+                continue;
+            }
         };
-        let identity = bundle.account_identity.clone().or_else(|| {
-            let source = haider_provider::oauth_identity_source(&provider)?;
-            source
-                .identity_from_tokens(&haider_provider::OAuthTokens {
-                    access_token: bundle.access_token(),
-                    refresh_token: bundle.refresh_token(),
-                    id_token: bundle.id_token(),
-                    captured_at: unix_ms_after(Duration::ZERO),
+        let identity = bundle
+            .account_identity
+            .clone()
+            .or_else(|| {
+                let source = haider_provider::oauth_identity_source(&provider)?;
+                source
+                    .identity_from_tokens(&haider_provider::OAuthTokens {
+                        access_token: bundle.access_token(),
+                        refresh_token: bundle.refresh_token(),
+                        id_token: bundle.id_token(),
+                        captured_at: unix_ms_after(Duration::ZERO),
+                    })
+                    .ok()
+                    .flatten()
+            })
+            .or_else(|| {
+                (provider == ANTHROPIC_OAUTH_PROVIDER_NAME).then(|| {
+                    let suffix = bundle
+                        .identity
+                        .subject_hash
+                        .chars()
+                        .take(16)
+                        .collect::<String>();
+                    AccountIdentity {
+                        email: None,
+                        display_name: Some(bundle.identity.display_identity.clone()),
+                        account_id: Some(format!("anthropic:{suffix}")),
+                        plan: None,
+                        issuer: Some(bundle.issuer.clone()),
+                        captured_at: unix_ms_after(Duration::ZERO),
+                        verified: false,
+                    }
                 })
-                .ok()
-                .flatten()
-        });
+            });
         if let Some(identity) = identity
             && accounts
                 .backfill_identity(&alias, identity)
@@ -5961,7 +6390,7 @@ async fn handle_device_import(
         OAuthCommitResponse::ImportDevice,
         receipt_candidate,
         expected_source_fingerprint,
-        ClaudeNativeReadEvent::Significant,
+        ClaudeNativeReadEvent::Ordinary,
         claude_native,
     )
     .await;
@@ -9990,10 +10419,14 @@ async fn reconcile_oauth_add_receipts_from(
                     |descriptor| descriptor.active,
                 );
                 let descriptor = oauth_descriptor_for(&provider, &alias, &bundle, active);
-                if accounts.get(&alias).is_some() {
-                    accounts.replace(descriptor)?;
-                } else {
-                    accounts.add(descriptor)?;
+                if accounts.get(&alias) != Some(&descriptor) {
+                    // Observation-only scans preserve the existing durable
+                    // descriptor and publish no new credential generation.
+                    if accounts.get(&alias).is_some() {
+                        accounts.replace(descriptor)?;
+                    } else {
+                        accounts.add(descriptor)?;
+                    }
                 }
                 finalize_oauth_reconciled(store, accounts, &row.command_id, &alias).await?;
             }
@@ -10458,6 +10891,376 @@ async fn finalize_reconciled(
         .map(|_| ())
 }
 
+fn source_alias(record: &CredentialSourceRecord) -> CredentialAlias {
+    let suffix = record
+        .id
+        .strip_prefix("src1_")
+        .unwrap_or(record.id.as_str())
+        .chars()
+        .take(12)
+        .collect::<String>();
+    let prefix = match record.kind {
+        CredentialSourceKind::CodexHome => "codex",
+        CredentialSourceKind::ClaudeFile => "claude",
+    };
+    CredentialAlias::new(format!("{prefix}-{suffix}"))
+}
+
+fn source_failure_health(
+    failure: crate::device_discovery::LinkedSourceReadFailure,
+) -> CredentialSourceHealth {
+    use crate::device_discovery::LinkedSourceReadFailure;
+    match failure {
+        LinkedSourceReadFailure::SourceGone => CredentialSourceHealth::SourceGone,
+        LinkedSourceReadFailure::Unreadable => CredentialSourceHealth::Unreadable,
+        LinkedSourceReadFailure::SymlinkEscape => CredentialSourceHealth::SymlinkEscape,
+        LinkedSourceReadFailure::Oversized => CredentialSourceHealth::Oversized,
+        LinkedSourceReadFailure::PartialWrite => CredentialSourceHealth::PartialWrite,
+        LinkedSourceReadFailure::MissingFields => CredentialSourceHealth::MissingFields,
+        LinkedSourceReadFailure::InvalidJson => CredentialSourceHealth::InvalidJson,
+        LinkedSourceReadFailure::RequiresOriginClient => {
+            CredentialSourceHealth::RequiresOriginClient
+        }
+        LinkedSourceReadFailure::Invalid => CredentialSourceHealth::Invalid,
+    }
+}
+
+fn source_attention(health: &CredentialSourceHealth) -> CredentialAttentionReason {
+    match health {
+        CredentialSourceHealth::SourceGone => CredentialAttentionReason::SourceGone,
+        CredentialSourceHealth::RequiresOriginClient => {
+            CredentialAttentionReason::OriginClientRequired
+        }
+        CredentialSourceHealth::Pending
+        | CredentialSourceHealth::Ready
+        | CredentialSourceHealth::Expired
+        | CredentialSourceHealth::Revoked
+        | CredentialSourceHealth::Unreadable
+        | CredentialSourceHealth::SymlinkEscape
+        | CredentialSourceHealth::Oversized
+        | CredentialSourceHealth::PartialWrite
+        | CredentialSourceHealth::MissingFields
+        | CredentialSourceHealth::InvalidJson
+        | CredentialSourceHealth::Invalid => CredentialAttentionReason::SourceUnreadable,
+    }
+}
+
+fn reconcile_credential_sources(
+    registry: &mut CredentialSourceRegistry,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+) -> Result<(), HaiderError> {
+    let now = unix_ms_after(Duration::ZERO);
+    let records = registry.records().to_vec();
+    for mut record in records.into_iter().filter(|record| record.enabled) {
+        record.last_scanned_at_ms = Some(now);
+        record.store_mode = crate::device_discovery::linked_source_store_mode(&record);
+        match crate::device_discovery::read_linked_source(&record) {
+            Ok(material) => {
+                if matches!(
+                    (record.last_refreshed_at_ms, material.last_refreshed_at_ms),
+                    (Some(current), Some(observed)) if observed < current
+                ) {
+                    // Atomic replacement can race a restored/older auth.json.
+                    // Keep the newest validated generation already published.
+                    registry.update(record)?;
+                    continue;
+                }
+                record.health = material.health.clone();
+                record.store_mode = material.store_mode;
+                record.last_refreshed_at_ms = material.last_refreshed_at_ms;
+                record.access_expires_at_ms = material.access_expires_at_ms;
+                let alias = record
+                    .account_alias
+                    .as_deref()
+                    .map(CredentialAlias::new)
+                    .unwrap_or_else(|| source_alias(&record));
+                record.account_alias = Some(alias.as_str().to_owned());
+                let status = match material.health {
+                    CredentialSourceHealth::Ready => CredentialStatus::Ok,
+                    CredentialSourceHealth::Expired => CredentialStatus::Expired,
+                    CredentialSourceHealth::Revoked => CredentialStatus::Revoked,
+                    CredentialSourceHealth::RequiresOriginClient => {
+                        CredentialStatus::NeedsAttention {
+                            reason: if record.kind == CredentialSourceKind::ClaudeFile {
+                                CredentialAttentionReason::PolicyBlocked
+                            } else {
+                                CredentialAttentionReason::OriginClientRequired
+                            },
+                        }
+                    }
+                    _ => CredentialStatus::NeedsAttention {
+                        reason: source_attention(&material.health),
+                    },
+                };
+                let descriptor = CredentialDescriptor {
+                    alias: alias.clone(),
+                    provider: match record.kind {
+                        CredentialSourceKind::CodexHome => OPENAI_OAUTH_PROVIDER_NAME,
+                        CredentialSourceKind::ClaudeFile => ANTHROPIC_OAUTH_PROVIDER_NAME,
+                    }
+                    .to_owned(),
+                    base_url: None,
+                    auth_method: AuthMethod::OAuth,
+                    identity: material.display_identity,
+                    status,
+                    active: accounts.get(&alias).map_or_else(
+                        || {
+                            accounts
+                                .active_for_provider(match record.kind {
+                                    CredentialSourceKind::CodexHome => OPENAI_OAUTH_PROVIDER_NAME,
+                                    CredentialSourceKind::ClaudeFile => {
+                                        ANTHROPIC_OAUTH_PROVIDER_NAME
+                                    }
+                                })
+                                .is_none()
+                        },
+                        |current| current.active,
+                    ),
+                    label: None,
+                    account_identity: material.identity,
+                    created_at_ms: None,
+                };
+                if accounts.get(&alias).is_some() {
+                    accounts.replace(descriptor)?;
+                } else {
+                    accounts.add(descriptor)?;
+                }
+            }
+            Err(failure) => {
+                record.health = source_failure_health(failure);
+                if let Some(alias) = record.account_alias.as_deref().map(CredentialAlias::new)
+                    && accounts.get(&alias).is_some()
+                {
+                    accounts.set_status(
+                        &alias,
+                        CredentialStatus::NeedsAttention {
+                            reason: source_attention(&record.health),
+                        },
+                    )?;
+                }
+            }
+        }
+        registry.update(record)?;
+    }
+    Ok(())
+}
+
+fn mask_identity(value: &str) -> String {
+    let Some((local, domain)) = value.split_once('@') else {
+        let suffix = value.chars().rev().take(6).collect::<Vec<_>>();
+        return format!("…{}", suffix.into_iter().rev().collect::<String>());
+    };
+    let first = local.chars().next().unwrap_or('•');
+    format!("{first}***@{domain}")
+}
+
+fn account_source_wires(
+    registry: &CredentialSourceRegistry,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+) -> Vec<AccountSourceWire> {
+    let mut external_aliases = HashSet::new();
+    let mut sources = registry
+        .records()
+        .iter()
+        .map(|record| {
+            let descriptor = record
+                .account_alias
+                .as_deref()
+                .and_then(|alias| accounts.get(&CredentialAlias::new(alias)));
+            if let Some(alias) = record.account_alias.as_deref() {
+                external_aliases.insert(alias.to_owned());
+            }
+            let identity = descriptor.and_then(|descriptor| descriptor.account_identity.as_ref());
+            AccountSourceWire {
+                source_id: record.id.clone(),
+                account_alias: record.account_alias.as_deref().map(CredentialAlias::new),
+                kind: record.kind.as_str().to_owned(),
+                label: record.label.clone(),
+                path: Some(record.root.to_string_lossy().into_owned()),
+                credential_store: record.store_mode.as_str().to_owned(),
+                refresh_owner: record.refresh_owner.as_str().to_owned(),
+                health: record.health.as_str().to_owned(),
+                last_seen_at_ms: record
+                    .health
+                    .eq(&CredentialSourceHealth::Ready)
+                    .then_some(record.last_scanned_at_ms)
+                    .flatten()
+                    .or_else(|| {
+                        matches!(
+                            record.health,
+                            CredentialSourceHealth::Expired
+                                | CredentialSourceHealth::RequiresOriginClient
+                        )
+                        .then_some(record.last_scanned_at_ms)
+                        .flatten()
+                    }),
+                last_refreshed_at_ms: record.last_refreshed_at_ms,
+                access_expires_at_ms: record.access_expires_at_ms,
+                plan: identity.and_then(|identity| identity.plan.clone()),
+                masked_identity: identity
+                    .and_then(|identity| {
+                        identity
+                            .email
+                            .as_deref()
+                            .or(identity.account_id.as_deref())
+                            .or(identity.display_name.as_deref())
+                    })
+                    .map(mask_identity),
+            }
+        })
+        .collect::<Vec<_>>();
+    for descriptor in accounts.list().iter().filter(|descriptor| {
+        !external_aliases.contains(descriptor.alias.as_str())
+            && descriptor.auth_method == AuthMethod::OAuth
+    }) {
+        let identity = descriptor.account_identity.as_ref();
+        sources.push(AccountSourceWire {
+            source_id: format!("haider_oauth:{}", descriptor.alias),
+            account_alias: Some(descriptor.alias.clone()),
+            kind: "haider_oauth".to_owned(),
+            label: "Haider OAuth".to_owned(),
+            path: None,
+            credential_store: "haider_vault".to_owned(),
+            refresh_owner: "haider".to_owned(),
+            health: match descriptor.status {
+                CredentialStatus::Ok => "ready",
+                CredentialStatus::Expired => "expired",
+                CredentialStatus::Revoked => "revoked",
+                CredentialStatus::Limited { .. } => "limited",
+                CredentialStatus::NeedsAttention { .. } => "relogin_required",
+            }
+            .to_owned(),
+            last_seen_at_ms: descriptor.created_at_ms,
+            last_refreshed_at_ms: identity.map(|identity| identity.captured_at),
+            access_expires_at_ms: None,
+            plan: identity.and_then(|identity| identity.plan.clone()),
+            masked_identity: identity
+                .and_then(|identity| {
+                    identity
+                        .email
+                        .as_deref()
+                        .or(identity.account_id.as_deref())
+                        .or(identity.display_name.as_deref())
+                })
+                .map(mask_identity),
+        });
+    }
+    sources.sort_by(|left, right| left.source_id.cmp(&right.source_id));
+    sources
+}
+
+fn publish_source_snapshot(
+    snapshot: &AccountSourcesSnapshot,
+    registry: &CredentialSourceRegistry,
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+) {
+    if let Ok(mut view) = snapshot.lock() {
+        *view = account_source_wires(registry, accounts);
+    }
+}
+
+fn source_metadata_changed(before: &[AccountSourceWire], after: &[AccountSourceWire]) -> bool {
+    if before.len() != after.len() {
+        return true;
+    }
+    before.iter().zip(after).any(|(before, after)| {
+        let mut before = before.clone();
+        let mut after = after.clone();
+        // Successful scans update observation time, but that alone is not a
+        // credential generation and must not churn account-list revisions.
+        before.last_seen_at_ms = None;
+        after.last_seen_at_ms = None;
+        before != after
+    })
+}
+
+/// File-vault plus access-only source read-through. Only Codex sources can
+/// yield bytes; Claude file entries are deliberately policy-blocked.
+struct SourceLinkedVault {
+    inner: Arc<dyn Vault>,
+    registry: Arc<StdMutex<CredentialSourceRegistry>>,
+}
+
+struct StrictNoNativeCredentialStore;
+
+impl ClaudeNativeCredentialStore for StrictNoNativeCredentialStore {
+    fn read(
+        &self,
+        _event: ClaudeNativeReadEvent,
+    ) -> Result<crate::oauth::ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
+        Err(ClaudeNativeCredentialFailure::Missing)
+    }
+}
+
+impl SourceLinkedVault {
+    fn new(inner: Arc<dyn Vault>, registry: Arc<StdMutex<CredentialSourceRegistry>>) -> Self {
+        Self { inner, registry }
+    }
+}
+
+impl Vault for SourceLinkedVault {
+    fn put(&self, alias: &CredentialAlias, secret: &[u8]) -> Result<(), HaiderError> {
+        self.inner.put(alias, secret)
+    }
+
+    fn resolve(&self, alias: &CredentialAlias) -> Result<SecretHandle, HaiderError> {
+        let source = self
+            .registry
+            .lock()
+            .ok()
+            .and_then(|registry| registry.find_by_alias(alias.as_str()).cloned());
+        let Some(source) = source else {
+            return self.inner.resolve(alias);
+        };
+        let material = crate::device_discovery::read_linked_source(&source).map_err(|failure| {
+            HaiderError::new(
+                ErrorCode::CredentialMissing,
+                format!(
+                    "linked credential source `{}` is unavailable: {}",
+                    source.id,
+                    source_failure_health(failure).as_str()
+                ),
+                false,
+            )
+        })?;
+        if matches!(
+            (source.last_refreshed_at_ms, material.last_refreshed_at_ms),
+            (Some(current), Some(observed)) if observed < current
+        ) {
+            return Err(HaiderError::new(
+                ErrorCode::CredentialMissing,
+                "linked credential source exposed an older generation",
+                true,
+            ));
+        }
+        let Some(encoded) = material.encoded_bundle else {
+            return Err(HaiderError::new(
+                ErrorCode::Unauthorized,
+                "linked Claude Code credentials require the official origin client",
+                false,
+            ));
+        };
+        let temporary = MemoryVault::new();
+        temporary.put(alias, &encoded)?;
+        temporary.resolve(alias)
+    }
+
+    fn delete(&self, alias: &CredentialAlias) -> Result<(), HaiderError> {
+        self.inner.delete(alias)
+    }
+
+    fn list(&self) -> Result<Vec<CredentialAlias>, HaiderError> {
+        self.inner.list()
+    }
+
+    fn try_refresh_lock(
+        &self,
+        alias: &CredentialAlias,
+    ) -> Result<Option<VaultRefreshLock>, HaiderError> {
+        self.inner.try_refresh_lock(alias)
+    }
+}
+
 // ───────────────────────────── runtime wiring ───────────────────────────────
 
 /// Everything `run_inner` owns for accounts: built after turn recovery,
@@ -10554,6 +11357,55 @@ impl AccountsRuntime {
             None => Box::new(DescriptorStore::Json(JsonFileStore::new(store_dir))),
         };
         let mut accounts = AccountStore::new(descriptor_store)?;
+        let mut source_registry = CredentialSourceRegistry::load(store_dir)?;
+        if !crate::device_discovery::discovery_is_disabled(discovery_disabled) {
+            if let Some(home) = crate::oauth::oauth_home_dir().map(std::path::PathBuf::from) {
+                source_registry.ensure_default(
+                    CredentialSourceKind::CodexHome,
+                    home.join(".codex"),
+                    "Codex default",
+                )?;
+                #[cfg(not(target_os = "macos"))]
+                source_registry.ensure_default(
+                    CredentialSourceKind::ClaudeFile,
+                    home.join(".claude"),
+                    "Claude Code default",
+                )?;
+            }
+            if let Some(root) = std::env::var_os("CODEX_HOME").filter(|root| !root.is_empty()) {
+                let root = std::path::PathBuf::from(root);
+                if root.is_absolute() {
+                    source_registry.ensure_default(
+                        CredentialSourceKind::CodexHome,
+                        root,
+                        "Codex current environment",
+                    )?;
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            if let Some(root) =
+                std::env::var_os("CLAUDE_CONFIG_DIR").filter(|root| !root.is_empty())
+            {
+                let root = std::path::PathBuf::from(root);
+                if root.is_absolute() {
+                    source_registry.ensure_default(
+                        CredentialSourceKind::ClaudeFile,
+                        root,
+                        "Claude Code current environment",
+                    )?;
+                }
+            }
+        }
+        // Explicit enrollments are independent of ambient discovery. The
+        // discovery switch suppresses only auto-enrollment of default roots.
+        reconcile_credential_sources(&mut source_registry, &mut accounts)?;
+        let source_registry = Arc::new(StdMutex::new(source_registry));
+        let source_snapshot: AccountSourcesSnapshot = Arc::new(StdMutex::new(
+            source_registry
+                .lock()
+                .map(|registry| account_source_wires(&registry, &accounts))
+                .unwrap_or_default(),
+        ));
         let provider_store: Box<dyn ProviderRegistryStoreLike> =
             Box::new(JsonProviderRegistryStore::new(store_dir));
         let model_source = Arc::new(CachedProviderModelSource::default());
@@ -10604,9 +11456,14 @@ impl AccountsRuntime {
         // must stay profile-scoped so two profiles' identical aliases can
         // never collide (see profile_vault.rs).
         let vault = match source {
-            Some(inner) => VaultProvision::Available(Arc::new(
-                crate::profile_vault::ProfileVault::new(inner, profile_id),
-            ) as Arc<dyn Vault>),
+            Some(inner) => {
+                let scoped = Arc::new(crate::profile_vault::ProfileVault::new(inner, profile_id))
+                    as Arc<dyn Vault>;
+                VaultProvision::Available(Arc::new(SourceLinkedVault::new(
+                    scoped,
+                    Arc::clone(&source_registry),
+                )) as Arc<dyn Vault>)
+            }
             None => VaultProvision::Unsupported,
         };
         let reserved_aliases = if schema_bootstrapped_from_zero {
@@ -10700,6 +11557,8 @@ impl AccountsRuntime {
             provider_endpoint_validator: Arc::clone(&dependencies.provider_endpoint_validator),
             reserved_aliases,
             refresh_fences: refresh_fences.clone(),
+            source_registry: Arc::clone(&source_registry),
+            source_snapshot: Arc::clone(&source_snapshot),
         };
         match &vault {
             VaultProvision::Available(scoped) => {
@@ -10725,7 +11584,7 @@ impl AccountsRuntime {
                     },
                     Arc::new(ProductionProviderModelDiscoverer),
                     Arc::clone(&gcloud),
-                    Arc::new(PlatformClaudeNativeCredentialStore::default()),
+                    Arc::new(StrictNoNativeCredentialStore),
                 )?;
                 let commands = actor.commands();
                 Ok(Self {
@@ -10737,6 +11596,7 @@ impl AccountsRuntime {
                         vault_supported: true,
                         discovery_disabled,
                         device_discovery,
+                        sources: Arc::clone(&source_snapshot),
                         vault: Some(Arc::clone(scoped)),
                     },
                     actor: Some(actor),
@@ -10761,6 +11621,7 @@ impl AccountsRuntime {
                         vault_supported: false,
                         discovery_disabled,
                         device_discovery,
+                        sources: Arc::clone(&source_snapshot),
                         vault: None,
                     },
                     actor: Some(actor),

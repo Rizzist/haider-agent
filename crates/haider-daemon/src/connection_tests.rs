@@ -354,8 +354,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        109,
-        "durable session-list recency extends the prior 108-feature set"
+        110,
+        "account source discovery extends the prior 109-feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -369,6 +369,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_ACCOUNT_OAUTH_IMPORT_SOURCES_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_OAUTH_IMPORT_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_owned(),
+            haider_rpc::FEATURE_ACCOUNT_SOURCES_V1.to_owned(),
             FEATURE_ACCOUNT_ROTATION_V1.to_owned(),
             haider_rpc::FEATURE_ARTIFACT_PUT_V1.to_owned(),
             haider_rpc::FEATURE_EXPORT_SEQ_V1.to_owned(),
