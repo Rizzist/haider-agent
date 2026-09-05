@@ -1,0 +1,23 @@
+Merge-forward audit, 2026-09-05
+Original worktree HEAD: 2ef810ffd47f7c172d7d6e26eeee00ebe92a4536
+
+Requested command (before edits):
+  git fetch origin wave-970 && git merge --no-commit origin/wave-970
+Exit 255: cannot open protected worktree FETCH_HEAD: Operation not permitted.
+Fallback against the available ref:
+  git merge --no-commit origin/wave-970
+Exit 128: cannot create protected ORIG_HEAD.lock: Operation not permitted.
+
+Read-only access to original Git metadata was retained. A temporary checkout with
+its own writable Git directory was created at /private/tmp/runperm-970-merge:
+  git clone --shared --no-checkout . /private/tmp/runperm-970-merge
+  git -C /private/tmp/runperm-970-merge remote set-url origin https://github.com/Rizzist/haider-agent.git
+  git -C /private/tmp/runperm-970-merge fetch origin wave-970
+  git -C /private/tmp/runperm-970-merge checkout --detach 2ef810ff
+  git -C /private/tmp/runperm-970-merge merge --no-commit origin/wave-970
+Combined exit 0: Already up to date.
+Fetched FETCH_HEAD and origin/wave-970 both:
+  b9c2a0475214102d1fb4c8d9c3ae3f480fd05fe4
+That exact wave commit is already an ancestor of original HEAD.
+No toolrepair commit has landed on the fetched wave; no incoming file changes,
+conflict markers, or unresolved index entries exist. No commit was made.

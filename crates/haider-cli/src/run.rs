@@ -374,15 +374,19 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
         return Err("--resume cannot be combined with another lifecycle action".into());
     }
     if resume_run_id.is_some() {
+        // New-run defaults are not caller overrides: a continuation inherits
+        // its source session's permissions. Reject explicit permission flags,
+        // including --read-only, which the continuation cannot reconfigure.
         if provider.is_some()
             || model.is_some()
             || effort.is_some()
             || fast.is_some()
             || account.is_some()
             || ssh_scope.is_some()
-            || allow_writes
-            || allow_exec
-            || auto_allow
+            || read_only
+            || allow_writes_seen
+            || allow_exec_seen
+            || auto_allow_seen
             || trust_hooks
         {
             return Err("--resume inherits the source session's model and permissions".into());
@@ -2232,6 +2236,58 @@ mod tests {
                 .is_err(),
                 "{incompatible}"
             );
+        }
+    }
+
+    #[test]
+    fn resume_parser_accepts_defaults_and_each_budget_without_prompt() {
+        for flags in [
+            vec![],
+            vec!["--request-tranche", "40"],
+            vec!["--max-requests", "80"],
+            vec!["--max-tokens", "1000"],
+            vec!["--max-cost", "0.50"],
+            vec!["--max-time", "10s"],
+        ] {
+            let mut args = vec!["--resume".to_owned(), "bound-run".to_owned()];
+            args.extend(flags.iter().map(|flag| (*flag).to_owned()));
+            let parsed = parse_run_options_with_config(&args).expect("continuation options");
+            assert_eq!(parsed.options.resume_run_id, Some(RunId::new("bound-run")));
+            assert_eq!(parsed.options.action, RunAction::Execute);
+            assert_eq!(
+                parsed.options.prompt,
+                "Continue the checkpointed task using the retained messages and tool history."
+            );
+            assert!(!parsed.options.prompt_stdin);
+            assert!(!parsed.options.read_only);
+            assert!(parsed.options.allow_writes);
+            assert!(parsed.options.allow_exec);
+            assert!(parsed.options.auto_allow);
+        }
+    }
+
+    #[test]
+    fn resume_parser_rejects_explicit_permission_overrides_in_either_order() {
+        for flag in [
+            "--read-only",
+            "--allow-writes",
+            "--allow-exec",
+            "--auto-allow",
+            "--trust-hooks",
+        ] {
+            for args in [
+                vec!["--resume", "bound-run", flag],
+                vec![flag, "--resume", "bound-run"],
+            ] {
+                let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+                let error = parse_run_options_with_config(&args)
+                    .err()
+                    .expect("explicit permission override must be rejected");
+                assert_eq!(
+                    error, "--resume inherits the source session's model and permissions",
+                    "{args:?}"
+                );
+            }
         }
     }
 
