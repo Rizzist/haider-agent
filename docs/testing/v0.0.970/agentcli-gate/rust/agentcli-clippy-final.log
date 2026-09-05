@@ -1,0 +1,10 @@
+    Blocking waiting for file lock on build directory
+    Checking haider-cli v0.0.969 ($WORKTREE/crates/haider-cli)
+    Checking haider-daemon v0.0.969 ($WORKTREE/crates/haider-daemon)
+    Checking haider-daemond v0.0.969 ($WORKTREE/crates/haider-daemond)
+    Checking haider-client v0.0.969 ($WORKTREE/crates/haider-client)
+    Checking haider-core v0.0.969 ($WORKTREE/crates/haider-core)
+    Checking haider-rpc v0.0.969 ($WORKTREE/crates/haider-rpc)
+    Checking haider-store v0.0.969 ($WORKTREE/crates/haider-store)
+    Checking haider-protocol v0.0.969 ($WORKTREE/crates/haider-protocol)
+    Finished `dev` profile [unoptimized] target(s) in 1m 01s

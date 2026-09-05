@@ -33,10 +33,10 @@ import fcntl
 
 # SGR runs / cursor moves / OSC sequences — stripped for TEXT checks;
 # color checks read the raw bytes (the pty-probe-cursor convention).
-# OSC may end with BEL or ST (ESC followed by backslash). Stopping only
-# at BEL swallows visible paint after an ST-terminated attach notification.
+# OSC strings may end with BEL or ST (ESC backslash). Never consume a
+# subsequent painted frame while searching past an already closed OSC.
 ANSI_RE = re.compile(
-    rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL
+    rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
 )
 
 

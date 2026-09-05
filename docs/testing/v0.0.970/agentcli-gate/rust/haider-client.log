@@ -1,0 +1,228 @@
+   Compiling syn v3.0.3
+   Compiling simd-adler32 v0.3.10
+   Compiling miniz_oxide v0.8.9
+   Compiling flate2 v1.1.9
+   Compiling nom v8.0.0
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.19
+   Compiling serde v1.0.229
+   Compiling thiserror v2.0.19
+   Compiling rmp-serde v1.3.1
+   Compiling euclid v0.20.14
+   Compiling lopdf v0.42.0
+   Compiling haider-protocol v0.0.969 ($WORKTREE/crates/haider-protocol)
+   Compiling pdf-extract v0.12.0
+   Compiling haider-pdf v0.0.969 ($WORKTREE/crates/haider-pdf)
+   Compiling tempfile v3.27.0
+   Compiling haider-rpc v0.0.969 ($WORKTREE/crates/haider-rpc)
+   Compiling haider-client v0.0.969 ($WORKTREE/crates/haider-client)
+    Finished `test` profile [unoptimized] target(s) in 27.25s
+     Running unittests src/lib.rs ($AGENTCLI_TARGET/debug/deps/haider_client-ea4ec2bde803c5b5)
+
+running 63 tests
+test client::tests::client_health_watch_is_event_primary_with_a_typed_repair_deadline ... ok
+test graph::tests::absent_workflow_instance_feature_omits_fence_instead_of_fabricating_one ... ok
+test client::tests::resident_binding_event_overflow_disconnects_for_baseline_recovery ... ok
+test headless::tests::empty_replay_buffer_is_lazy_even_when_read_or_cleared ... ok
+test headless::tests::account_selection_requires_the_daemon_contract ... ok
+test headless::tests::journalview_private_summary_does_not_replace_the_live_response ... ok
+test headless::tests::memory_and_forced_spool_ledgers_serialize_to_identical_bytes ... ok
+test headless::tests::durable_request_deadline_reason_wins_terminal_race_as_timeout ... ok
+test headless::tests::pending_second_interrupt_is_consumed_before_terminal_drain ... ok
+test headless::tests::resume_accepts_terminal_soft_and_hard_checkpoints_and_checks_scope ... ok
+test headless::tests::resume_inherits_budgets_and_applies_only_explicit_new_caps ... ok
+test headless::tests::resume_rejects_active_and_nonbudget_sources ... ok
+test headless::tests::stream_without_result_ledger_forwards_once_and_returns_an_empty_ledger ... ok
+test headless::tests::submit_builder_selects_hook_trust_without_changing_ordinary_turns ... ok
+test client::tests::coalesced_json_welcome_and_msgpack_frame_switches_at_frame_boundary ... ok
+test headless::tests::terminal_kind_vocabulary_is_distinct_and_provider_timeout_stays_provider_owned ... ok
+test headless::tests::threshold_spill_moves_the_complete_prefix_and_preserves_order ... ok
+test lockdown_tests::feature_absence_makes_lockdown_helpers_absent ... ok
+test lockdown_tests::typed_status_and_quota_responses_do_not_parse_prose ... ok
+test observe::tests::waiting_for_route_is_not_a_settled_observe_state ... ok
+test peer_tests::feature_absence_makes_the_peer_surface_absent_without_an_error ... ok
+test peer_tests::received_and_delivery_frames_map_to_typed_subscription_events ... ok
+test peer_tests::typed_peer_responses_preserve_contract_fields ... ok
+test permission::tests::open_settings_request_accepts_no_url ... ok
+test headless::tests::pdf_loader_page_and_byte_caps_are_typed_presentations ... ok
+test profile::profile_tests::default_home_store_dir_is_preserved ... ok
+test profile::profile_tests::endpoint_stays_inside_the_resolved_runtime_directory ... ok
+test profile::profile_tests::explicit_profile_dir_precedes_every_home_variable ... ok
+test profile::profile_tests::home_remains_authoritative_and_userprofile_is_ignored_on_unix ... ok
+test profile::profile_tests::malformed_profile_config_is_loud ... ok
+test profile::profile_tests::missing_store_dir_and_home_is_a_typed_error ... ok
+test profile::profile_tests::model_precedence_is_env_then_config_then_packaged ... ok
+test profile::profile_tests::non_private_and_missing_xdg_rejections_are_reported ... ok
+test profile::profile_tests::overlong_explicit_runtime_root_fails_with_typed_path_budget ... ok
+test profile::profile_tests::capture_reads_userprofile_from_a_scrubbed_environment ... ok
+test profile::profile_tests::overlong_private_xdg_falls_back_to_an_isolated_short_runtime ... ok
+test profile::profile_tests::overlong_homes_share_only_the_private_root_not_the_profile_scope ... ok
+test profile::profile_tests::private_home_contains_store_runtime_and_endpoint ... ok
+test profile::profile_tests::runtime_dir_honors_private_xdg_then_private_tmpdir ... ok
+test profile::profile_tests::runtime_dir_refuses_a_non_private_tmpdir_and_falls_back ... ok
+test profile::profile_tests::runtime_dir_uses_a_verified_prefix_tmp_when_tmpdir_is_unavailable ... ok
+test profile::profile_tests::profile_id_is_deterministic_and_path_scoped ... ok
+test profile::profile_tests::runtime_override_is_a_root_and_never_collapses_profiles ... ok
+test provider_rounds::tests::journalview_legacy_and_unknown_events_preserve_raw_without_invented_rounds ... ok
+test provider_rounds::tests::journalview_retry_cancellation_and_stream_failure_have_honest_causes ... ok
+test provider_rounds::tests::journalview_retry_completion_does_not_duplicate_an_earlier_requests_text ... ok
+test provider_rounds::tests::journalview_unsuccessful_summary_finish_keeps_text_incomplete ... ok
+test session_fork_tests::invalid_cut_refusal_stays_typed ... ok
+test session_fork_tests::journal_projection_reports_only_session_prompts_with_durable_sequences ... ok
+test session_fork_tests::legacy_fork_response_is_refused_rather_than_fabricated_into_a_draft ... ok
+test session_fork_tests::prompt_fork_needs_both_feature_tokens ... ok
+test session_fork_tests::prompt_fork_receipt_preserves_typed_attachment_blocks ... ok
+test shell_registry_tests::all_shell_event_frames_map_without_parallel_taxonomy ... ok
+test shell_registry_tests::shell_registry_surface_obeys_feature_absence_law ... ok
+test shell_tests::typed_shell_request_and_cancel_preserve_exact_coordinates ... ok
+test shell_tests::typed_shell_response_requires_cancel_coordinate_and_preserves_daemon_errors ... ok
+test spawn::tests::genuine_lost_race_keeps_the_loser_reap_wait ... ok
+test spawn::tests::own_healthy_child_skips_the_one_second_loser_grace ... ok
+test ssh_profiles_tests::public_list_response_cannot_carry_auth_material ... ok
+test ssh_profiles_tests::ssh_profiles_surface_obeys_feature_absence_law ... ok
+test provider_rounds::tests::journalview_large_delta_projection_uses_shared_arena_and_replays_identically ... ok
+test headless::tests::timed_out_owned_daemon_reap_terminates_and_reaps_the_process_group ... ok
+test headless::tests::pdf_loader_accepts_case_insensitive_extension_and_records_pages ... ok
+
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+     Running tests/client_tests.rs ($AGENTCLI_TARGET/debug/deps/client_tests-b922fe07c6bf8ed5)
+
+running 18 tests
+test authenticated_daemon_candidate_is_not_treated_as_a_race_loser ... ok
+test connect_retains_kernel_authenticated_peer_credentials ... ok
+test fatal_protocol_error_frame_fails_pending_requests ... ok
+test live_but_old_daemon_is_diagnosed_and_never_killed ... ok
+test answered_pings_keep_the_connection_alive_on_paused_time ... ok
+test profile_mismatch_is_fatal ... ok
+test one_shot_connection_arms_neither_events_nor_heartbeat ... ok
+test no_wire_overlap_is_a_fatal_mismatch_and_never_spawns ... ok
+test request_disconnect_check_sits_inside_the_pending_lock ... ok
+test request_after_observed_disconnect_resolves_with_the_typed_reason ... ok
+test responses_correlate_by_request_id_even_out_of_order ... ok
+test silent_server_trips_the_pong_deadline_on_paused_time ... ok
+
+running 1 test
+test unanswered_request_reaches_typed_continuous_deadline ... ok
+test unnegotiated_prompt_fork_is_missing_feature_and_sends_nothing ... ok
+test user_command_feature_failure_sends_zero_rpc_requests ... ok
+test spawned_daemon_inherits_no_descriptors_beyond_stdio ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.50s
+
+test spawned_daemon_inherits_no_descriptors_beyond_stdio ... ok
+test closed_handshake_is_retried_only_after_a_spawnable_failure_authorizes_a_candidate ... ok
+test racing_launcher_never_owns_the_other_launchers_winner ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.03s
+
+     Running tests/headless_run_tests.rs ($AGENTCLI_TARGET/debug/deps/headless_run_tests-28413a6ef3c6f5d2)
+
+running 34 tests
+test budget_feature_is_required_before_session_mutation ... ok
+test adjacent_store_failure_and_errored_terminal_return_without_hanging ... ok
+test account_only_bootstrap_uses_that_accounts_daemon_default_model ... ok
+test configured_provider_model_selector_reaches_create_as_bare_wire_id ... ok
+test competing_permission_resolution_is_fail_closed_and_cancelled ... ok
+test control_attach_precedes_submit_and_pre_response_events_correlate ... ok
+test daemon_resolved_default_without_published_model_is_typed ... ok
+test duplicate_and_gap_replay_is_lossless_under_output_backpressure ... ok
+test flagless_bootstrap_creates_on_active_provider_and_published_default_model ... ok
+test flagless_bootstrap_without_active_account_is_typed ... ok
+test headless_attach_uploads_then_submits_with_durable_identity ... ok
+test headless_binary_upload_disconnect_retries_snapshot_then_resumes_durable_submit ... ok
+test headless_pin_feature_is_required_before_session_mutation ... ok
+test initial_headless_tuning_is_part_of_atomic_create ... ok
+test lagged_pressure_recovers_every_durable_sequence ... ok
+test nonpermission_input_and_unknown_effect_cancel_with_typed_reasons ... ok
+test override_and_read_only_features_are_required_only_when_used ... ok
+test parked_waiting_does_not_end_run_and_natural_cancelled_is_distinct ... ok
+test permission_answer_response_loss_replays_then_retries_current_generation ... ok
+test permission_menu_selects_typed_allow_once_and_continues_to_done ... ok
+test preacceptance_response_wait_obeys_wall_clock_timeout ... ok
+test blocked_output_does_not_delay_wall_clock_cancellation ... ok
+test read_only_feature_is_required_before_session_mutation ... ok
+test resume_budget_checkpoint_submits_new_turn_in_original_session ... ok
+test run_scoped_hook_trust_requires_only_the_additive_hooks_feature ... ok
+test cancel_response_loss_replays_then_retries_same_command_at_current_generation ... ok
+test submit_response_loss_reconnects_buffers_replay_and_retries_same_command ... ok
+test confirmed_cancel_disconnect_replays_terminal_within_grace ... ok
+test timeout_sends_one_cancel_and_remains_timeout_after_cancelled_terminal ... ok
+test withheld_submit_response_is_recovered_and_durably_cancelled ... ok
+test workflow_unfinished_survives_the_durable_headless_projection ... ok
+test unconfirmed_cancellation_cannot_be_reported_as_timeout ... ok
+test withheld_recovery_barrier_cannot_defeat_run_and_grace_deadlines ... ok
+test r2_05_attach_then_start_are_ordered_separate_requests_with_receipts ... ok
+
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+     Running tests/observe_tests.rs ($AGENTCLI_TARGET/debug/deps/observe_tests-a0f73f18794c51f5)
+
+running 8 tests
+test fleet_reads_return_typed_feature_and_unknown_session_errors ... ok
+test descendant_view_feature_negotiation_never_fabricates_live_lineage ... ok
+test one_shot_status_is_exactly_one_scalar_rpc ... ok
+test permanent_daemon_loss_ends_the_watch_stream_with_a_typed_error ... ok
+test follow_all_repairs_a_dropped_roster_delta_by_rearming_the_watch ... ok
+test watch_recovers_exactly_after_gap_and_forwards_additive_raw_envelopes ... ok
+test replay_overflow_during_attach_is_detected_and_resumed ... ok
+test follow_all_discovers_through_one_persistent_session_list_watch ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.21s
+
+     Running tests/transcription_tests.rs ($AGENTCLI_TARGET/debug/deps/transcription_tests-e71e8b6a301fcdd3)
+
+running 4 tests
+test typed_refusals_and_skewed_bodies_map_distinctly ... ok
+test builders_encode_the_golden_wire_bodies ... ok
+test parsers_consume_the_golden_response_lines ... ok
+test helpers_round_trip_against_a_fake_daemon ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/w3c3_ordered_send_tests.rs ($AGENTCLI_TARGET/debug/deps/w3c3_ordered_send_tests-f9f7bef68b852571)
+
+running 3 tests
+test begin_request_writes_before_it_returns_so_sends_stay_ordered ... ok
+test pending_response_wait_reports_the_typed_disconnect ... ok
+test pending_response_wait_resolves_with_the_correlated_body ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/workflow_graph_projection_tests.rs ($AGENTCLI_TARGET/debug/deps/workflow_graph_projection_tests-6ccc9153333e7204)
+
+running 8 tests
+test an_exact_cursor_noop_page_cannot_hide_malformed_changes ... ok
+test a_page_cursor_mismatch_never_partially_applies_the_suffix ... ok
+test a_second_run_of_the_same_workflow_requires_a_new_graph_baseline ... ok
+test clearing_a_missing_state_removes_its_cursor_and_nodes ... ok
+test malformed_frozen_topology_never_replaces_the_last_good_graph ... ok
+test rejected_node_exposes_its_evidence_refs ... ok
+test reconnect_from_applied_cursor_yields_identical_state ... ok
+test watch_stream_reduces_to_expected_node_states ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/workflow_graph_rpc_adapter_tests.rs ($AGENTCLI_TARGET/debug/deps/workflow_graph_rpc_adapter_tests-d07ed94001c964cd)
+
+running 11 tests
+test adapter_refuses_a_desynced_cursor_without_mutating_its_baseline ... ok
+test empty_sparse_page_can_advance_before_the_next_graph_event_without_a_gap ... ok
+test evidence_less_l2_rejection_keeps_typed_inspection_detail ... ok
+test back_edge_watch_event_lights_retry_input_and_activates_target ... ok
+test l2_watch_events_reduce_to_ready_active_complete_and_input_lights ... ok
+test next_cursor_must_name_the_nonempty_page_tail ... ok
+test malformed_rpc_page_metadata_is_atomic ... ok
+test rejected_l2_node_keeps_openable_evidence_reference ... ok
+test seedless_graph_stays_dark_until_its_external_input_arrives ... ok
+test split_cursor_reconnect_matches_one_uninterrupted_l2_page ... ok
+test wholly_stale_watch_page_is_an_idempotent_duplicate ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests haider_client
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,3 @@
+    Finished `dev` profile [unoptimized] target(s) in 0.15s
+     Running `$AGENTCLI_TARGET/debug/xtask test-count`
+test-count: 4991 tests (baseline 4991) — ok

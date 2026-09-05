@@ -714,6 +714,9 @@ pub fn unregister_turn_trace_for_envelopes(envelopes: &[RawEnvelope]) {
 /// Immutable identity and fencing parameters for one session actor.
 #[derive(Debug, Clone)]
 pub struct HarnessConfig {
+    /// Durable operator delegation; drives the canonical tool path without
+    /// requesting a parent model response.
+    pub agent_spawn: Option<haider_protocol::headless::AgentSpawnSpecV1>,
     pub session_id: SessionId,
     pub branch_id: Option<BranchId>,
     pub agent_id: Option<AgentId>,
@@ -912,6 +915,9 @@ pub struct HarnessConfig {
     started_at_ms: Option<u64>,
 }
 
+#[path = "actor_agent_spawn.rs"]
+mod agent_spawn;
+
 /// Shared lookup table for provider-selected variants of one immutable pack.
 pub type SharedToolPackVariants = Arc<HashMap<Vec<String>, (Arc<[ToolDefinition]>, String)>>;
 
@@ -937,6 +943,7 @@ impl HarnessConfig {
         let cache_diagnostic_key = CacheDiagnosticKey::ephemeral(&session_id, &device_id);
         Self {
             session_id,
+            agent_spawn: None,
             branch_id: None,
             agent_id: None,
             device_id,
@@ -3110,6 +3117,11 @@ impl HarnessActor {
                     )
                 }
             };
+        if let Some(spawn) = self.config.agent_spawn.clone() {
+            return self
+                .drive_agent_spawn(&run_id, spawn, child_wait, &cancel)
+                .await;
+        }
         let restore_budget = checkpoint.is_some()
             || partial_stream.is_some()
             || route_wait.is_some()

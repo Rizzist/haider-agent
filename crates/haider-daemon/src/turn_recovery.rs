@@ -113,7 +113,9 @@ const CHECKPOINT_SHAPE_VERSION: u32 = 1;
 // v8 separates the first logical model boundary from the physical request
 // ordinal, because a turn-owned warmup or cache-resource request may consume
 // ordinal 1 before the first model request.
-const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v8";
+// v9 retains direct operator delegation pins, which must never resume a
+// parent provider request after a restart.
+const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v9";
 
 pub(crate) enum RecoveredWork {
     Queued(RecoveredQueued),
@@ -202,6 +204,8 @@ struct RunReduction {
     child_results: HashSet<AgentId>,
     #[serde(default)]
     headless_configured: bool,
+    #[serde(default)]
+    direct_agent_spawn: bool,
     #[serde(default)]
     headless_budget: RunBudgetV1,
     #[serde(default)]
@@ -389,8 +393,13 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
     visitor: &mut dyn StartupJournalVisitor,
 ) -> Result<StartupTurnRecovery, HaiderError> {
     let mut recovered = Vec::new();
-    let mut touched_sessions = Vec::new();
-    for session_id in store.session_ids().await? {
+    let sessions = store.session_ids().await?;
+    // A public establishment can have a durable child session/relation before
+    // it has an accepted child turn. Reconcile abandoned ownership before the
+    // run reducer, which cannot see that no-turn crash boundary at all.
+    let mut touched_sessions =
+        reconcile_abandoned_public_spawns(store, device_id, &sessions).await?;
+    for session_id in sessions {
         let mut touched = false;
         let runnable_metadata = store.session_metadata(&session_id).await?.is_some();
         let (mut reductions, turn_cursor) = load_recovery_checkpoint(store, &session_id).await?;
@@ -593,6 +602,60 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
                     ),
                     false,
                 ));
+            }
+            // An accepted public child remains fenced until its parent has
+            // committed the broker outcome and marked delegation Running.
+            // The parent replays incomplete establishment with stable ids;
+            // independently recovering this Queued child would cross the
+            // effect boundary before its durable outcome exists.
+            if state != RunState::Cancelling
+                && let Some(record) = store
+                    .delegation_for_child_session(session_id.clone())
+                    .await?
+                && record.child_run_id == run_id
+                && public_spawn_needs_establishment(&record)
+            {
+                continue;
+            }
+            if reduction.direct_agent_spawn && state != RunState::Cancelling {
+                let accepted_seq = reduction.user_seq.ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        "direct agent spawn has no accepted user message",
+                        false,
+                    )
+                })?;
+                let accepted = recovered_acceptance(
+                    &session_id,
+                    &run_id,
+                    turn_ordinal,
+                    accepted_seq,
+                    store.worker_generation(),
+                    reduction.branch_id.clone(),
+                );
+                let incomplete = store
+                    .delegations_for_parent_run(session_id.clone(), run_id.clone())
+                    .await?
+                    .iter()
+                    .any(public_spawn_needs_establishment);
+                if !incomplete
+                    && let Some(checkpoint) =
+                        pending_child_wait(store, &session_id, &run_id, &reduction).await?
+                {
+                    recovered.push(RecoveredWork::ChildWait(Box::new(RecoveredChildWait {
+                        accepted,
+                        checkpoint,
+                        provider_request_ordinal: 0,
+                    })));
+                } else {
+                    // The pinned tool has a stable call identity. Core resumes
+                    // its existing item or creates it before broker admission.
+                    recovered.push(RecoveredWork::Queued(RecoveredQueued {
+                        accepted,
+                        provider_request_ordinal: 0,
+                    }));
+                }
+                continue;
             }
             if state == RunState::Queued {
                 let provider_request_ordinal = recovered_provider_request_ordinal(&reduction);
@@ -846,7 +909,7 @@ pub(crate) async fn recover_interrupted_turns_report_with_visitor(
             .await?;
             touched = true;
         }
-        if touched {
+        if touched && !touched_sessions.contains(&session_id) {
             touched_sessions.push(session_id.clone());
         }
         visitor.finish_session(store, &session_id).await?;
@@ -1285,6 +1348,7 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
             if envelope.render.durable =>
         {
             reduction.headless_configured = true;
+            reduction.direct_agent_spawn = configured.agent_spawn.is_some();
             reduction.headless_budget = configured.budget;
             return;
         }
@@ -1723,6 +1787,134 @@ fn pending_route_wait_checkpoint(reduction: &RunReduction) -> Option<RouteWaitCh
     Some(checkpoint)
 }
 
+fn public_spawn_needs_establishment(record: &haider_core::DelegationRecord) -> bool {
+    record.state == haider_core::DelegationState::Spawned && is_public_operator_spawn(record)
+}
+
+fn is_public_operator_spawn(record: &haider_core::DelegationRecord) -> bool {
+    record
+        .manifest
+        .coordinates
+        .as_ref()
+        .and_then(|value| value.get("public_operator_spawn"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+async fn reconcile_abandoned_public_spawns(
+    store: &SqliteStoreHandle,
+    device_id: &DeviceId,
+    sessions: &[SessionId],
+) -> Result<Vec<SessionId>, HaiderError> {
+    let mut touched = Vec::new();
+    for session_id in sessions {
+        let Some(record) = store
+            .delegation_for_child_session(session_id.clone())
+            .await?
+            .filter(|record| {
+                is_public_operator_spawn(record)
+                    && record.manifest.fencing_epoch != store.worker_generation()
+                    && matches!(
+                        record.state,
+                        haider_core::DelegationState::Spawned
+                            | haider_core::DelegationState::Reported
+                    )
+            })
+        else {
+            continue;
+        };
+        let parent_state = latest_run_state(
+            store,
+            &record.parent_session_id,
+            &record.parent_run_id,
+            record.parent_branch_id.as_ref(),
+        )
+        .await?;
+        if parent_state.is_some_and(|state| !state.is_terminal() && state != RunState::Cancelling)
+            && store
+                .session_metadata(&record.parent_session_id)
+                .await?
+                .is_some()
+        {
+            continue;
+        }
+
+        // No worker may be started for this relation: the parent no longer
+        // owns a resumable spawn. Each step is durable and replayable; keeping
+        // Reported eligible closes a crash between report and collection.
+        if latest_run_state(store, session_id, &record.child_run_id, None)
+            .await?
+            .is_some_and(|state| !state.is_terminal())
+        {
+            let request_json = serde_json::json!({
+                "agent": record.agent_id,
+                "reason": "public spawn parent cannot resume",
+            })
+            .to_string();
+            store
+                .cancel_turn(haider_core::TurnCancelCommand {
+                    command_id: format!("public-spawn-recovery-cancel-{}", record.agent_id),
+                    request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+                    request_json,
+                    session_id: session_id.clone(),
+                    worker_generation: store.worker_generation(),
+                    run_id: record.child_run_id.clone(),
+                    cancelling_event_id: EventId::new(format!(
+                        "public-spawn-recovery-cancelling-{}",
+                        record.agent_id
+                    )),
+                    device_id: device_id.clone(),
+                })
+                .await?;
+            let payloads =
+                cancelled_resumption_payloads(store, session_id, &record.child_run_id).await?;
+            let mut envelopes = recovery_envelopes(
+                store.worker_generation(),
+                device_id,
+                session_id,
+                &record.child_run_id,
+                None,
+                payloads,
+            )?;
+            store.append(&mut envelopes).await?;
+        }
+        if store
+            .graph_status(session_id)
+            .await?
+            .is_some_and(|graph| matches!(graph.phase, GraphPhase::Active | GraphPhase::Blocked))
+        {
+            let request_json = r#"{"why":"public spawn parent cannot resume"}"#.to_owned();
+            store
+                .abandon_graph(haider_core::GraphAbandonCommand {
+                    command_id: format!("public-spawn-recovery-abandon-{}", record.agent_id),
+                    request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+                    request_json,
+                    session_id: session_id.clone(),
+                    worker_generation: store.worker_generation(),
+                    why: "public spawn parent cannot resume".into(),
+                    device_id: device_id.clone(),
+                })
+                .await?;
+        }
+        if record.report.is_none() {
+            store
+                .record_delegation_report(
+                    record.agent_id.clone(),
+                    haider_protocol::agent::ChildReport {
+                        agent: record.agent_id.clone(),
+                        summary: "public spawn cancelled because its parent cannot resume".into(),
+                        verified: haider_protocol::agent::ReportVerification::Red,
+                        workspace_revision: None,
+                    },
+                )
+                .await?;
+        }
+        store.mark_delegation_collected(record.agent_id).await?;
+        touched.push(session_id.clone());
+    }
+    Ok(touched)
+}
+
 async fn pending_child_wait(
     store: &SqliteStoreHandle,
     session_id: &SessionId,
@@ -2126,6 +2318,34 @@ mod composite_recovery_tests {
     use super::*;
 
     #[test]
+    fn direct_agent_spawn_pin_survives_recovery_projection_serialization() {
+        let run = RunId::new("public-spawn-recovery");
+        let mut envelopes = recovery_envelopes(
+            1,
+            &DeviceId::new("test"),
+            &SessionId::new("public-parent"),
+            &run,
+            None,
+            vec![EventPayload::RunState(RunState::Queued)],
+        )
+        .expect("envelope");
+        let mut event = envelopes.remove(0);
+        event.payload = RawPayload::from(serde_json::json!({
+            "type":"headless_run_configured", "provider":"fake", "model":"fake", "max_output_tokens":64,
+            "agent_spawn":{"task":"task","prompt":"prompt"}
+        }));
+        let mut reductions = HashMap::new();
+        reduce(&mut reductions, &event);
+        let reduction = reductions.get(&run).expect("run reduction");
+        assert!(reduction.direct_agent_spawn);
+        let restored: RunReduction =
+            serde_json::from_value(serde_json::to_value(reduction).expect("encode"))
+                .expect("decode");
+        assert!(restored.direct_agent_spawn);
+        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v9");
+    }
+
+    #[test]
     fn auxiliary_attempt_advances_identity_without_moving_model_boundary() {
         let session_id = SessionId::new("turnid-session");
         let run_id = RunId::new("turnid-run");
@@ -2338,7 +2558,7 @@ mod composite_recovery_tests {
         let encoded = rmp_serde::to_vec(&reduction).expect("encode composite checkpoint");
         let recovered: RunReduction =
             rmp_serde::from_slice(&encoded).expect("decode composite checkpoint");
-        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v8");
+        assert_eq!(CHECKPOINT_REDUCER_VERSION, "startup-turn-recovery-v9");
         assert_eq!(
             recovered
                 .workflow_deferral

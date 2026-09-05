@@ -1,0 +1,28 @@
+   Compiling haider-verify v0.0.969 ($WORKTREE/crates/haider-verify)
+    Finished `test` profile [unoptimized] target(s) in 0.31s
+     Running unittests src/lib.rs ($AGENTCLI_TARGET/debug/deps/haider_verify-9fb02bc7c5772414)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/pin_reachability_tests.rs ($AGENTCLI_TARGET/debug/deps/pin_reachability_tests-d159ad551620068b)
+
+running 1 test
+test every_src_test_file_is_declared_by_a_module ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.91s
+
+     Running tests/smoke_tests.rs ($AGENTCLI_TARGET/debug/deps/smoke_tests-1235000a818dfee6)
+
+running 1 test
+test crate_name_is_stable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests haider_verify
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

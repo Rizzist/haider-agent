@@ -3236,6 +3236,7 @@ async fn resume_budget_checkpoint_submits_new_turn_in_original_session() {
                 terminal_seq: Some(2),
                 budget_exhausted: None,
                 spec: HeadlessRunSpecV1 {
+                    agent_spawn: None,
                     cwd: "/original-workspace".into(),
                     provider: "fake".into(),
                     model: "original-model".into(),

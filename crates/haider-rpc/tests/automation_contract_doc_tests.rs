@@ -8,6 +8,7 @@ const AUTOMATION_CONTRACT: &str = include_str!("../../../docs/automation-contrac
 const WIRE_TRANSCRIPT: &str = include_str!("fixtures/wire_transcript.json");
 const METHOD_MATRIX: &str = include_str!("fixtures/client_contract_methods_v1.json");
 const CLI_STATUS: &str = include_str!("../../haider-cli/tests/fixtures/observe_status.json");
+const CLI_AGENT_SPAWN: &str = include_str!("../../haider-cli/tests/fixtures/agent_spawn.json");
 
 fn json_examples() -> Vec<(usize, &'static str, String)> {
     let lines = AUTOMATION_CONTRACT.lines().collect::<Vec<_>>();
@@ -183,7 +184,7 @@ fn every_automation_contract_json_example_decodes_and_matches_a_golden() {
     let examples = json_examples();
     assert_eq!(
         examples.len(),
-        40,
+        41,
         "the method catalog JSON example inventory changed"
     );
 
@@ -276,6 +277,43 @@ fn every_automation_contract_json_example_decodes_and_matches_a_golden() {
                     value, status_golden["daemon"]["caching"],
                     "caching declaration at line {line} must match observe_status.json"
                 );
+            }
+            "value.agent_spawn" => {
+                let golden: Value =
+                    serde_json::from_str(CLI_AGENT_SPAWN).expect("CLI agent spawn golden");
+                assert_eq!(
+                    value, golden,
+                    "agent spawn example must match its real CLI fixture"
+                );
+                assert_eq!(value["schema"], "haider.agent.spawn.v1");
+                assert_eq!(value["ok"], true);
+                assert!(value["error"].is_null());
+                let result = &value["result"];
+                for key in [
+                    "session_id",
+                    "run_id",
+                    "agent_id",
+                    "child_session_id",
+                    "child_run_id",
+                ] {
+                    assert!(
+                        result[key].as_str().is_some_and(|id| !id.is_empty()),
+                        "missing {key}"
+                    );
+                }
+                let manifest: haider_protocol::agent::AgentManifest =
+                    serde_json::from_value(result["manifest"].clone())
+                        .expect("native spawn manifest");
+                assert_eq!(
+                    serde_json::to_value(&manifest.agent).expect("agent ID"),
+                    result["agent_id"]
+                );
+                assert_eq!(
+                    result["manifest"]["coordinates"]["child_session_id"],
+                    result["child_session_id"]
+                );
+                assert_ne!(result["session_id"], result["child_session_id"]);
+                assert_ne!(result["run_id"], result["child_run_id"]);
             }
             other => panic!("unsupported JSON fence tag {other} at line {line}"),
         }

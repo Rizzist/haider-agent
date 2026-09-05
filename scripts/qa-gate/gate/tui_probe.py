@@ -348,11 +348,7 @@ class TuiProcess:
             if b"\x1b[?1049h" not in self.sink[0]:
                 raise RuntimeError("TUI boot expected=alternate_screen actual=absent")
             if session_id is not None:
-                while time.monotonic() < deadline:
-                    if b"message haider" in self.probe.plain(self.sink[0]):
-                        break
-                    self.pump(0.15)
-                else:
+                if not self._wait_for_session_composer(deadline):
                     raise RuntimeError(
                         f"TUI session attach expected=message_composer actual=absent session={session_id}"
                     )
@@ -363,6 +359,28 @@ class TuiProcess:
             # dismissed, reaped, and have its PTY descriptor closed.
             self.close()
             raise
+
+    def _wait_for_session_composer(self, deadline: float) -> bool:
+        # Incremental paint history does not guarantee a complete current
+        # frame after handoff.
+        # Force the same full repaint used by the action probes, and require
+        # the actual composer in that new frame. Both resize phases consume
+        # the original TUI_BOOT deadline; neither starts another allowance.
+        while time.monotonic() < deadline:
+            self.probe.set_size(self.fd, 118, 35)
+            self.pump(min(0.35, max(0.0, deadline - time.monotonic())))
+            if time.monotonic() >= deadline:
+                return False
+            mark = len(self.sink[0])
+            self.probe.set_size(self.fd, 118, 36)
+            self.pump(min(0.8, max(0.0, deadline - time.monotonic())))
+            if time.monotonic() >= deadline:
+                return False
+            raw = self.sink[0][mark:]
+            frame = Frame(118, 36, raw, self.probe.screen_rows(raw))
+            if "message haider" in frame.text:
+                return True
+        return False
 
     def write(self, data: bytes) -> None:
         view = memoryview(data)

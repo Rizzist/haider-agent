@@ -1,0 +1,186 @@
+[
+  {
+    "name": "input-mirror-siblings",
+    "command": [
+      "cargo",
+      "build",
+      "-p",
+      "haider-cli",
+      "-p",
+      "haider-daemond",
+      "--bins",
+      "--locked"
+    ],
+    "exit": 0,
+    "elapsed_s": 95.106,
+    "disk_available_mib": 13660
+  },
+  {
+    "name": "input-mirror-haider-daemond",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "haider-daemond",
+      "--locked",
+      "--no-fail-fast",
+      "--",
+      "--test-threads=4"
+    ],
+    "exit": 0,
+    "elapsed_s": 146.78,
+    "disk_available_mib": 13455
+  },
+  {
+    "name": "input-mirror-haider-cli",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "haider-cli",
+      "--locked",
+      "--no-fail-fast",
+      "--",
+      "--test-threads=4"
+    ],
+    "exit": 0,
+    "elapsed_s": 85.221,
+    "disk_available_mib": 10546
+  },
+  {
+    "name": "input-mirror-haider-rpc",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "haider-rpc",
+      "--locked",
+      "--no-fail-fast",
+      "--",
+      "--test-threads=4"
+    ],
+    "exit": 0,
+    "elapsed_s": 33.642,
+    "disk_available_mib": 10102
+  },
+  {
+    "name": "input-mirror-haider-client",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "haider-client",
+      "--locked",
+      "--no-fail-fast",
+      "--",
+      "--test-threads=4"
+    ],
+    "exit": 0,
+    "elapsed_s": 36.195,
+    "disk_available_mib": 9831
+  },
+  {
+    "name": "input-mirror-haider-daemon",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "haider-daemon",
+      "--locked",
+      "--no-fail-fast",
+      "--",
+      "--test-threads=4"
+    ],
+    "exit": 0,
+    "elapsed_s": 247.78,
+    "disk_available_mib": 9390
+  },
+  {
+    "name": "input-mirror-haider-tui",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "haider-tui",
+      "--locked",
+      "--no-fail-fast",
+      "--",
+      "--test-threads=4"
+    ],
+    "exit": 0,
+    "elapsed_s": 635.085,
+    "disk_available_mib": 7923
+  },
+  {
+    "name": "input-mirror-clippy",
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "haider-cli",
+      "-p",
+      "haider-client",
+      "-p",
+      "haider-core",
+      "-p",
+      "haider-daemon",
+      "-p",
+      "haider-daemond",
+      "-p",
+      "haider-protocol",
+      "-p",
+      "haider-rpc",
+      "-p",
+      "haider-store",
+      "-p",
+      "haider-tui",
+      "--tests",
+      "--locked",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit": 0,
+    "elapsed_s": 177.018,
+    "disk_available_mib": 15337
+  },
+  {
+    "name": "input-mirror-test-count",
+    "command": [
+      "cargo",
+      "run",
+      "-p",
+      "xtask",
+      "--locked",
+      "--",
+      "test-count",
+      "--update"
+    ],
+    "exit": 0,
+    "elapsed_s": 1.094,
+    "disk_available_mib": 14520
+  },
+  {
+    "name": "input-mirror-fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit": 0,
+    "elapsed_s": 7.779,
+    "disk_available_mib": 14520
+  },
+  {
+    "name": "input-mirror-unsafe",
+    "command": [
+      "python3",
+      "scripts/check-unsafe-counts.py"
+    ],
+    "exit": 0,
+    "elapsed_s": 7.754,
+    "disk_available_mib": 14520
+  }
+]

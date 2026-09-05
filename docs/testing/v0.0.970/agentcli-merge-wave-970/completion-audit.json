@@ -1,0 +1,46 @@
+{
+  "command_exits": {
+    "siblings": 0,
+    "workspace-test-final": 0,
+    "workspace-clippy-final": 0,
+    "agent-cli-tests-final": 0,
+    "instruct-pipe": 0,
+    "test-count-final": 0,
+    "python-selfcheck-final2": 0,
+    "probelib-tests": 0,
+    "fmt-check-final": 0,
+    "unsafe-final": 0,
+    "t0-focused": 0
+  },
+  "source_count": 1147,
+  "source_drift": [],
+  "binary_matches": {
+    "haider": true,
+    "haiderd": true
+  },
+  "t0": {
+    "t0.agent.spawn_result": {
+      "status": "PASS",
+      "evidence_rows": 2,
+      "cleanup": "no_orphan_daemons pids=90573 stop=stopped_cleanly alive_after=false"
+    },
+    "t0.tui.palette_activation_closure": {
+      "status": "PASS",
+      "evidence_rows": 43,
+      "cleanup": "no_orphan_daemons pids=90578 stop=stopped_cleanly alive_after=false"
+    }
+  },
+  "union_no_omissions": true,
+  "markers_absent": true,
+  "diff_check_exit": 0,
+  "HEAD": "3b2293e9f4aaf2f8eaf7d0cdff1d3c1555dee1fc",
+  "MERGE_HEAD": "471b9d680610b62c4cdd4a8be7b6ee7faf3959d3",
+  "unmerged_index_paths": [
+    "crates/haider-daemon/src/subagent_core_tests.rs",
+    "scripts/qa-gate/CI_REGISTRY_WALK_QAGATE3.md",
+    "scripts/qa-gate/checks/t0/t0.tui.palette_activation_closure.py",
+    "scripts/tui-probes/probelib.py",
+    "test-baseline.txt"
+  ],
+  "baseline": 5027
+}

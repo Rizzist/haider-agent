@@ -1,0 +1,103 @@
+   Compiling haider-platform v0.0.969 ($WORKTREE/crates/haider-platform)
+    Finished `test` profile [unoptimized] target(s) in 0.62s
+     Running unittests src/lib.rs ($AGENTCLI_TARGET/debug/deps/haider_platform-04ab3c7fcdc6f107)
+
+running 33 tests
+test ipc::ipc_tests::over_budget_unix_socket_fails_with_observed_length_and_limit ... ok
+test fs::tests::unix_directory_sync_uses_the_requested_file_policy ... ok
+test ipc::ipc_tests::peer_artifact_names_are_fixed_and_portably_short ... ok
+test ipc::tests::unix_endpoint_uses_the_short_profile_scoped_name ... ok
+test fs::tests::apple_sync_policies_select_full_barrier_and_plain_operations ... ok
+test ipc::unix::tests::endpoint_budget_checks_the_longest_staging_path_before_bind ... ok
+test ipc::unix::tests::kernel_timeout_is_not_classified_as_synthesized ... ok
+test ipc::unix::tests::shared_sticky_root_derivation_remains_inside_the_socket_budget ... ok
+test ipc::unix::tests::shutdown_error_mapping_accepts_only_not_connected ... ok
+test ipc::unix::tests::shutdown_with_an_already_closed_peer_is_never_a_failure ... ok
+test ipc::unix::tests::connected_unix_peers_report_the_authenticated_process_id ... ok
+test ipc::unix::tests::staging_name_fits_runtime_ceiling_with_ninety_six_random_bits ... ok
+test ipc::unix::tests::synthesized_probe_timeout_is_a_typed_ambiguous_refusal ... ok
+test ipc::tests::runtime_directory_creation_is_recursive_private_and_idempotent ... ok
+test process::tests::background_descriptor_sweep_preserves_synchronous_exec_errors ... ok
+test bounded_wait::tests::pending_lifecycle_wait_has_a_typed_timeout ... ok
+test process::tests::spawned_child_closes_a_known_inherited_descriptor_above_stdio ... ok
+test process::tests::spawned_child_leaks_none_of_twenty_parent_descriptors ... ok
+test reachability::tests::route_status_has_a_conservative_unknown_state ... ok
+test spawn::log_tests::concurrent_process_writer_child ... ok
+test process::tests::spawned_daemon_startup_descriptors_survive_the_bounded_sweep ... ok
+test spawn::log_tests::lock_winner_publishes_the_stable_legacy_log_without_copying ... ok
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+test process::tests::armed_kqueue_observes_a_short_command_without_coarse_backoff ... ok
+test spawn::readiness_tests::launcher_eof_before_liveness_wait_is_observed ... ok
+test spawn::readiness_tests::liveness_descriptors_are_cloexec_and_reader_is_above_stdio ... ok
+
+running 1 test
+test spawn::readiness_tests::readiness_byte_buffered_before_wait_is_observed ... ok
+test spawn::readiness_tests::readiness_descriptors_are_cloexec_and_writer_is_above_stdio ... ok
+test spawn::readiness_tests::readiness_eof_is_never_treated_as_ready ... ok
+test user::tests::macos_tmp_alias_is_classified_through_its_sticky_target ... ok
+test user::tests::sticky_root_derivation_is_idempotent_for_a_hostile_uid_directory ... ok
+test spawn::log_tests::per_process_log_history_is_count_bounded ... ok
+test spawn::log_tests::concurrent_process_writer_child ... ok
+test process::tests::timed_out_child_wait_does_not_pin_runtime_shutdown ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.02s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.02s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.03s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.03s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.03s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.04s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.04s
+
+; finished in 0.04s
+
+test spawn::log_tests::concurrent_process_writers_have_isolated_uncorrupted_lines ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/endpoint_sweep_tests.rs ($AGENTCLI_TARGET/debug/deps/endpoint_sweep_tests-fe4dbbc28d3111ce)
+
+running 2 tests
+test unix::liveness_not_the_keep_list_protects_a_live_endpoint ... ok
+test unix::the_sweep_removes_the_dead_profile_endpoint_only ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests haider_platform
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,66 @@
+{
+  "id": "t0.run.jsonl_contract",
+  "area": "headless",
+  "status": "PASS",
+  "evidence": [
+    {
+      "label": "jsonl_contract",
+      "status": "PASS",
+      "evidence_line": "accepted head_seq=1 envelopes=24 contiguous=true terminal_kind=success exit=0 segment_consumed=true finite_segments=1",
+      "artefacts": []
+    },
+    {
+      "label": "no_orphan_daemons",
+      "status": "PASS",
+      "evidence_line": "no_orphan_daemons pids=93055 stop=stopped_cleanly alive_after=false",
+      "artefacts": []
+    }
+  ],
+  "wall_ms": 194,
+  "artefacts": [],
+  "timed": true,
+  "measurement_accepted": false,
+  "budget": {
+    "total_ms": 146000,
+    "parts": [
+      {
+        "name": "daemon startup deadline",
+        "milliseconds": 30000,
+        "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+      },
+      {
+        "name": "qa attached run --timeout",
+        "milliseconds": 30000,
+        "source": "haider run --timeout 30s (crates/haider-client/src/headless.rs:2583-2591)"
+      },
+      {
+        "name": "terminal cancellation grace",
+        "milliseconds": 2000,
+        "source": "crates/haider-client/src/headless.rs:67-75 DEFAULT_TERMINAL_GRACE"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "daemon stop timeout",
+        "milliseconds": 20000,
+        "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+      },
+      {
+        "name": "post-stop process-exit observation grace",
+        "milliseconds": 2000,
+        "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+      },
+      {
+        "name": "post-stop process-exit observation grace",
+        "milliseconds": 2000,
+        "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+      }
+    ]
+  },
+  "segments": 1,
+  "turns_expected": 1,
+  "expected_fail_until": null
+}

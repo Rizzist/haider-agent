@@ -1,0 +1,270 @@
+   Compiling haider-daemond v0.0.969 ($WORKTREE/crates/haider-daemond)
+    Finished `test` profile [unoptimized] target(s) in 52.03s
+     Running unittests src/bin/haider-symbol-archive.rs ($AGENTCLI_TARGET/debug/deps/haider_symbol_archive-997660d126a6362b)
+
+running 5 tests
+test tests::rejects_a_dsym_from_a_different_macho_build ... ok
+test tests::parses_every_macho_slice_uuid_as_an_archive_key ... ok
+test tests::release_profile_packs_symbols_but_strips_the_shipped_image ... ok
+test tests::reads_pdb_guid_and_age_from_a_fixture_pe_binary ... ok
+test tests::archive_refuses_to_overwrite_an_existing_identity ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs ($AGENTCLI_TARGET/debug/deps/haiderd-798a8fcb6bbf29b8)
+
+running 3 tests
+test telemetry::tests::telemetry_allow_list_excludes_user_derived_fields_and_targets ... ok
+test tests::daemon_runtime_has_bounded_worker_count ... ok
+test tests::daemon_runtime_workers_have_explicit_stack_headroom ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/account_rpc_tests.rs ($AGENTCLI_TARGET/debug/deps/account_rpc_tests-3e9a7086e05ef686)
+
+running 12 tests
+test descriptor_save_failure_deletes_the_just_written_vault_alias_and_recovers ... ok
+test committed_receipt_self_heals_a_missing_descriptor_on_restart ... ok
+test account_remove_survives_a_fresh_daemon_on_the_same_profile ... ok
+test production_wire_path_advertises_builtin_providers_but_never_fake ... ok
+test committed_login_is_picked_up_by_the_next_fake_turn ... ok
+test retryable_validation_keeps_the_pending_command_for_a_stageless_retry ... ok
+test restart_wipes_the_pending_secret_and_a_fresh_stage_completes_the_command ... ok
+test session_create_accepts_gemini_when_account_active ... ok
+test staged_login_commits_descriptor_lists_it_and_replays_for_lost_responses ... ok
+test sentinel_secret_is_absent_from_store_files_receipts_and_formatted_frames ... ok
+test unauthorized_and_permission_denied_are_definitive_and_persist_nothing ... ok
+test vaultless_platforms_answer_the_stable_vault_unsupported_code ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+
+     Running tests/core_loop_e2e_tests.rs ($AGENTCLI_TARGET/debug/deps/core_loop_e2e_tests-b69f299f1312b2a3)
+
+running 20 tests
+test attachment_written_by_the_first_daemon_is_projected_by_the_next_daemon ... ok
+test child_spend_crossing_parent_cap_is_counted_once_and_child_is_reaped ... ok
+test cross_provider_subagent_returns_to_parent_and_fleet_is_truthful ... ok
+test direct_shell_rpc_executes_and_is_visible_to_the_next_turn ... ok
+test fresh_daemon_first_loom_list_returns_the_two_seeded_defaults_across_restart ... ok
+test delegated_question_surfaces_before_later_child_spend_exhausts_budget ... ok
+test fork_from_prompt_preserves_source_cache_and_privilege_boundaries ... ok
+test headless_workflow_provider_request_cap_returns_resumable_budget_cause ... ok
+test headless_three_stage_workflow_completes_with_forwarded_artifacts ... ok
+test headless_five_stage_workflow_has_no_two_hop_ceiling ... ok
+test manually_cancelled_running_child_releases_parent ... ok
+test process_exec_runs_in_a_non_repository_workspace ... ok
+test headless_workflow_resumes_after_daemon_crash_between_stages ... ok
+test subagent_launch_failure_returns_to_parent_instead_of_hanging ... ok
+test process_exec_normal_completion_leaves_outliving_descendant_alone ... ok
+test workflow_hop_cost_cap_terminalizes_budget_before_request_two ... ok
+test cancelling_process_exec_kills_the_real_process_group ... ok
+test workflow_recovery_after_budget_admission_preserves_spend_and_ordinal ... ok
+test terminal_child_run_without_session_idle_still_releases_parent ... ok
+test tool_calls_execute_and_continue_over_real_rpc ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.67s
+
+     Running tests/diagnostic_log_tests.rs ($AGENTCLI_TARGET/debug/deps/diagnostic_log_tests-a8184fea32ca5878)
+
+running 2 tests
+test real_daemon_diagnostic_event_reaches_nonempty_per_process_log ... ok
+test concurrent_real_daemons_have_distinct_logs_with_intact_lines ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.10s
+
+     Running tests/effort_fast_rpc_tests.rs ($AGENTCLI_TARGET/debug/deps/effort_fast_rpc_tests-b9fd92954bfdbbfd)
+
+running 2 tests
+test select_effort_is_receipted_validated_and_replays ... ok
+test select_fast_gates_statically_and_empty_ladders_refuse ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/ephemeral_liveness_tests.rs ($AGENTCLI_TARGET/debug/deps/ephemeral_liveness_tests-e93a7c8da9d39378)
+
+running 9 tests
+test ephemeral_client_process_helper ... ok
+test active_monitor_holds_ephemeral_daemon_until_expiry ... ok
+test killed_attached_client_does_not_stop_persistent_daemon ... ok
+test killed_ready_spawning_client_reaps_ephemeral_daemon_and_runtime_files ... ok
+test killed_spawning_client_cannot_orphan_a_lingering_daemon ... ok
+test killed_spawning_client_reaps_ephemeral_daemon_and_runtime_files ... ok
+test second_client_holds_ephemeral_daemon_until_its_disconnect ... ok
+test two_private_home_instances_are_self_contained_and_never_adopt_each_other ... ok
+test two_profiles_have_disjoint_runtime_trees_and_writes ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.89s
+
+     Running tests/lifecycle_tests.rs ($AGENTCLI_TARGET/debug/deps/lifecycle_tests-d22f19d4b1da933a)
+
+running 38 tests
+test client_max_receive_frame_is_enforced_on_welcome ... ok
+test binding_baseline_requires_view_or_control_capability ... ok
+test already_running_error_carries_incumbent_diagnostics ... ok
+test abrupt_death_kill_9_leaves_recoverable_socket_and_next_start_serves ... ok
+test cold_start_socket_missing_serves_handshake_ping_and_session_list ... ok
+test connections_racing_the_shutdown_request_are_torn_down_completely ... ok
+test connection_admission_cap_rejects_over_limit_peers_and_readmits_a_freed_slot ... ok
+test drain_notifies_every_open_connection_before_close ... ok
+test drain_deadline_covers_the_finalization_tail ... ok
+test drain_reason_is_truncated_to_fit_a_small_client_frame_limit ... ok
+test endpoint_replacement_before_cleanup_is_never_deleted ... ok
+test duplicate_hello_after_handshake_is_a_fatal_unexpected_frame ... ok
+test first_signal_before_startup_drains_without_advertising_ready ... ok
+test endpoint_replacement_racing_cleanup_is_never_deleted ... ok
+test failed_listener_startup_publishes_failed_and_releases_profile_lock ... ok
+test client_that_never_reads_a_byte_cannot_hold_the_barrier_open ... ok
+test handshake_version_mismatch_returns_fatal_rejection ... ok
+test live_foreign_endpoint_is_refused_and_left_intact ... ok
+test forced_shutdown_aborts_a_blocked_writer_instead_of_detaching_it ... ok
+test outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold ... ok
+test oversize_frame_is_rejected_at_connection_layer_before_body_allocation ... ok
+test never_reading_client_is_cut_at_the_drain_deadline_and_releases_everything ... ok
+test one_byte_reader_cannot_hold_the_barrier_open ... ok
+test reconcile_before_ready_marks_unknown_exactly_once_and_never_retries_effect ... ok
+test reserved_drain_notice_survives_an_exhausted_outbound_byte_budget ... ok
+test second_signal_before_startup_prevents_ready_and_forces_termination ... ok
+test second_os_signal_terminates_the_daemon_through_the_forced_exit_path ... ok
+test second_signal_request_selects_immediate_forced_termination_path ... ok
+test simultaneous_start_n_processes_has_one_winner_and_clean_losers ... ok
+test readiness_is_false_during_injected_pre_ready_pause_and_true_after ... ok
+test stale_pid_reuse_is_diagnostic_only_and_does_not_block_start ... ok
+test silent_peer_is_closed_at_the_handshake_deadline_and_frees_its_slot ... ok
+test successor_socket_deletion_guard_preserves_replacement_identity ... ok
+test unreceipted_staging_nodes_are_left_intact ... ok
+test view_connection_receives_exactly_one_unbound_baseline_after_welcome ... ok
+test view_only_connection_is_denied_the_control_frame ... ok
+test idle_daemon_admits_zero_connections_without_clients ... ok
+test stale_cleanup_never_removes_a_node_that_went_live ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.10s
+
+     Running tests/live_turn_rpc_tests.rs ($AGENTCLI_TARGET/debug/deps/live_turn_rpc_tests-f89769734c56f45f)
+
+running 41 tests
+test cancelling_while_provider_factory_is_blocked_never_starts_provider ... ok
+test checkpoint_then_later_queued_recovery_reaches_ready_without_starting_queued ... ok
+test file_attachment_is_inlined_with_header_and_never_reaches_the_provider ... ok
+test compaction_summary_request_carries_no_image_attachments ... ok
+test injected_fake_turn_runs_through_the_openai_provider_name ... ok
+test held_effect_reconciles_unknown_before_cancelled ... ok
+test graceful_drain_parks_a_request_input_checkpoint_for_recovery ... ok
+test metadata_less_live_submit_is_correlated_invalid_argument_without_acceptance ... ok
+test metadata_less_prior_generation_queued_run_terminalizes_and_reaches_ready ... ok
+test panicked_supervisor_terminalizes_run_and_fresh_incarnation_is_usable ... ok
+test revoked_credential_checkpoint_terminalizes_menu_and_reaches_ready ... ok
+test scenario_13_mutation_seam_sweep_manifest_covers_each_load_bearing_boundary ... ok
+test scenario_11_held_effect_becomes_unknown_after_restart_and_never_redispatches ... ok
+test scenario_10_restart_replays_request_input_without_reexecuting_prior_request ... ok
+test scenario_1_production_runtime_accepts_an_injected_fake_provider_factory ... ok
+test scenario_2_real_uds_creates_attaches_and_replays_typed_session ... ok
+test scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failure ... ok
+test scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds ... ok
+test scenario_4_lost_submit_response_replays_one_run_and_one_provider_request ... ok
+test scenario_5_second_turn_contains_prior_completed_conversation ... ok
+test scenario_8_wire_cancel_closes_open_items_and_cancelled_is_run_terminal ... ok
+test session_create_lost_response_retry_survives_removed_cwd_and_rejects_changed_body ... ok
+test scenario_9_restart_resumes_only_queued_and_terminalizes_streaming ... ok
+test session_create_permission_overrides_are_digest_bound_and_persisted ... ok
+test session_create_requires_control_and_ready_welcome_advertises_implemented_feature ... ok
+test vision_unsupported_provider_refuses_locally_with_typed_error ... ok
+test w4a1_committed_approval_crash_before_dispatched_is_safely_lost ... ok
+test vanished_workspace_degrades_plain_turn_and_workspace_set_replays ... ok
+test w4a1_dispatched_real_fs_edit_restarts_as_unknown_without_redispatch ... ok
+test w4a1_pending_patch_approval_restarts_on_the_original_menu_cas ... ok
+test w4a1_fs_write_requires_committed_cas_and_session_grant_survives_restart ... ok
+test w4a2_cancelled_exec_child_process_group_dies ... ok
+test scenario_6_request_input_round_trip_uses_second_control_attachment ... ok
+test scenario_7_two_menu_answers_race_and_only_first_commit_wins ... ok
+test w8a_shell_busy_builtin_rejection_and_inventory_are_typed ... ok
+test w4a2_dispatched_exec_restarts_as_unknown_without_rerun ... ok
+test w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized ... ok
+test w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape ... ok
+test worker_aware_drain_terminalizes_durable_queued_turns_before_store_close ... ok
+test w4a1_real_fs_edit_round_trips_approval_and_returns_tool_result ... ok
+test w8a_shell_exec_cancel_kills_the_process_tree ... ok
+
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.12s
+
+     Running tests/model_select_rpc_tests.rs ($AGENTCLI_TARGET/debug/deps/model_select_rpc_tests-9e6b28a4db5c96b3)
+
+running 2 tests
+test absent_provider_selects_in_place_and_unavailable_provider_refuses_typed ... ok
+test select_model_is_receipted_published_and_next_turn_lands_on_the_new_pair ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+
+     Running tests/oauth_rpc_tests.rs ($AGENTCLI_TARGET/debug/deps/oauth_rpc_tests-3461ddcbde2bebdf)
+
+running 4 tests
+test unavailable_live_provider_returns_reason_without_flow_allocation ... ok
+test real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secret_clean ... ok
+test forced_runtime_joins_blocking_refresh_persistence_before_successor_ready ... ok
+test worker_shutdown_error_still_joins_refresh_persistence_and_withholds_lease ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+
+     Running tests/provider_deadline_rpc_tests.rs ($AGENTCLI_TARGET/debug/deps/provider_deadline_rpc_tests-3ce16d001eeed521)
+
+running 1 test
+test never_opening_provider_is_structured_terminal_before_client_deadline ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.17s
+
+     Running tests/provider_rebind_rpc_tests.rs ($AGENTCLI_TARGET/debug/deps/provider_rebind_rpc_tests-0edef1ee3aadec9f)
+
+running 3 tests
+test provider_rebind_without_overrides_refreshes_changed_registry_endpoint ... ok
+test provider_rebind_selects_named_account_and_rejects_provider_mismatch ... ok
+test provider_rebind_routes_next_request_preserves_inflight_and_replays ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+
+     Running tests/session_rename_rpc_tests.rs ($AGENTCLI_TARGET/debug/deps/session_rename_rpc_tests-0995f1c9ce3bf9c4)
+
+running 3 tests
+test rename_is_receipted_published_listed_and_replayed ... ok
+test stale_generation_rename_is_refused_and_mutates_nothing ... ok
+test auto_title_fires_once_on_first_accept_and_never_overwrites ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+
+     Running tests/session_rpc_tests.rs ($AGENTCLI_TARGET/debug/deps/session_rpc_tests-b526593239ae0308)
+
+running 5 tests
+test five_concurrent_replay_lanes_on_one_connection_never_lag_a_reading_client ... ok
+test byte_bound_replay_of_large_envelopes_never_laggs_a_reading_client ... ok
+test uds_session_lifecycle_lists_reads_attaches_replays_and_detaches ... ok
+test paced_replay_of_a_long_history_never_laggs_a_reading_client ... ok
+test one_hot_attachment_cannot_starve_a_cold_attachment_on_the_same_connection ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
+
+     Running tests/upstretry_e2e_tests.rs ($AGENTCLI_TARGET/debug/deps/upstretry_e2e_tests-5d46bdaaecc64084)
+
+running 1 test
+test bounded_429_ladder_terminalizes_before_caller_deadline ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.69s
+
+     Running tests/usage_report_rpc_tests.rs ($AGENTCLI_TARGET/debug/deps/usage_report_rpc_tests-ff449b13f1de8a17)
+
+running 1 test
+test usage_report_is_advertised_and_answers_typed_over_uds ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/user_message_hook_tests.rs ($AGENTCLI_TARGET/debug/deps/user_message_hook_tests-92d0326cd04e8ea3)
+
+running 1 test
+test user_message_hook_fires_for_headless_and_rpc_submissions_identically ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/version_tests.rs ($AGENTCLI_TARGET/debug/deps/version_tests-2f3deaf0481c2f8b)
+
+running 1 test
+test daemon_version_is_exact_and_has_no_profile_side_effect ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+

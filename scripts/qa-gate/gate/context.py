@@ -510,7 +510,7 @@ class CheckContext:
             return True
         if args[0] in ("run", "--ready", "account", "resume"):
             return True
-        if args[0] in ("session", "sessions"):
+        if args[0] in ("session", "sessions", "agent", "workflow"):
             return "--no-spawn" not in args
         return args[0] == "status" and "--no-spawn" not in args
 

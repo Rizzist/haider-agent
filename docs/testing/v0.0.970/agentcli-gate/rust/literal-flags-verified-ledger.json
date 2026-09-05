@@ -1,0 +1,82 @@
+[
+  {
+    "name": "literal-prompts-verified",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "haider-cli",
+      "--test",
+      "agent_cli_tests",
+      "agent_spawn_prompt_flag_and_cwd_are_public_noninteractive_inputs",
+      "--locked",
+      "--",
+      "--exact",
+      "--test-threads=1"
+    ],
+    "exit": 0,
+    "elapsed_s": 10.772,
+    "disk_available_mib": 8515
+  },
+  {
+    "name": "haider-cli-literal-verified",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "haider-cli",
+      "--locked",
+      "--no-fail-fast",
+      "--",
+      "--test-threads=4"
+    ],
+    "exit": 0,
+    "elapsed_s": 52.745,
+    "disk_available_mib": 8149
+  },
+  {
+    "name": "clippy-cli-final",
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "haider-cli",
+      "--tests",
+      "--locked",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit": 0,
+    "elapsed_s": 32.392,
+    "disk_available_mib": 6764
+  },
+  {
+    "name": "fmt-final",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit": 0,
+    "elapsed_s": 4.711,
+    "disk_available_mib": 6668
+  },
+  {
+    "name": "test-count-verified",
+    "command": [
+      "cargo",
+      "run",
+      "-p",
+      "xtask",
+      "--locked",
+      "--",
+      "test-count"
+    ],
+    "exit": 0,
+    "elapsed_s": 0.832,
+    "disk_available_mib": 6671
+  }
+]

@@ -1,0 +1,4 @@
+   Compiling haider-daemon v0.0.969 ($WORKTREE/crates/haider-daemon)
+   Compiling haider-cli v0.0.969 ($WORKTREE/crates/haider-cli)
+   Compiling haider-daemond v0.0.969 ($WORKTREE/crates/haider-daemond)
+    Finished `dev` profile [unoptimized] target(s) in 1m 35s

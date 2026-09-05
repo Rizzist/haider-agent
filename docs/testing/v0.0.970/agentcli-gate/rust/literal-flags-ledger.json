@@ -1,0 +1,34 @@
+[
+  {
+    "name": "literal-flags-siblings",
+    "command": [
+      "cargo",
+      "build",
+      "-p",
+      "haider-cli",
+      "-p",
+      "haider-daemond",
+      "--bins",
+      "--locked"
+    ],
+    "exit": 0,
+    "elapsed_s": 10.43,
+    "disk_available_mib": 11020
+  },
+  {
+    "name": "haider-cli-final",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "haider-cli",
+      "--locked",
+      "--no-fail-fast",
+      "--",
+      "--test-threads=4"
+    ],
+    "exit": 101,
+    "elapsed_s": 147.133,
+    "disk_available_mib": 10822
+  }
+]

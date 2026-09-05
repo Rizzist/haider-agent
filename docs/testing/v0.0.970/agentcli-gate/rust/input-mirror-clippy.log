@@ -1,0 +1,8 @@
+    Checking haider-rpc v0.0.969 ($WORKTREE/crates/haider-rpc)
+    Checking haider-protocol v0.0.969 ($WORKTREE/crates/haider-protocol)
+    Checking haider-client v0.0.969 ($WORKTREE/crates/haider-client)
+    Checking haider-tui v0.0.969 ($WORKTREE/crates/haider-tui)
+    Checking haider-daemon v0.0.969 ($WORKTREE/crates/haider-daemon)
+    Checking haider-cli v0.0.969 ($WORKTREE/crates/haider-cli)
+    Checking haider-daemond v0.0.969 ($WORKTREE/crates/haider-daemond)
+    Finished `dev` profile [unoptimized] target(s) in 2m 56s
