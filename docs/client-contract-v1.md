@@ -195,6 +195,31 @@ Length zero, a prefix above the decoder limit, or a body above the negotiated
 limit poisons the stream decoder. A client must not resynchronize by scanning
 for JSON.
 
+With `Welcome.features` containing `artifact_put_binary_v1`, the local IPC
+stream additionally accepts binary artifact frames. The prefix's high bit is
+set; its low 31 bits are the body length. This is independent of the selected
+JSON/MessagePack encoding and is rejected before allocation without that
+feature. WebSocket framing is unchanged. A body is a one-byte request-ID length
+(1–128), UTF-8 request ID, then one of:
+
+| Tag | Remaining binary body |
+|---|---|
+| 1, Begin | total bytes as u64 big-endian, then 64 lowercase BLAKE3 hex bytes |
+| 2, Chunk | offset as u64 big-endian, then 1–65,536 raw bytes |
+| 3, Finish | empty |
+
+The maximum total is 512 MiB; the maximum binary body is 65,674 bytes, also
+subject to the connection frame ceiling. One upload may be active per
+connection. Begin and each Chunk receive an ordinary correlated
+`artifact.put.progress` response with `bytes` equal to the received total.
+Wait for each acknowledgment before sending another binary frame; Pings and
+ordinary frames remain serviceable during disk work. Progress acknowledges
+unpublished staging only. Finish requires exact total length and digest and
+returns the existing `artifact.put` response after durable CAS publication.
+Disconnect discards staging, including an incomplete frame. Reconnect retries
+the immutable whole artifact; an already published digest deduplicates. The
+legacy JSON `artifact.put` cap remains 33 MiB and is the old-peer fallback.
+
 ### 3.2 Hello, Welcome, and the switch boundary
 
 `Hello` (`kind: "hello"`) is the first application frame sent by the client.
@@ -266,6 +291,7 @@ is §4.1.
 | `fallback_chain_v1` | durable fallback-lane events and next-lane continuation; no separate method |
 | `compaction_guard_v1` | durable compaction-guard/promotion events; no separate method |
 | `artifact_put_v1` | `artifact.put` |
+| `artifact_put_binary_v1` | bounded binary artifact upload on local IPC; `artifact.put.progress` acknowledgments |
 | `branch_create_v1` | `branch.create`, branch-scoped submit/compact fields and responses |
 | `session_fork_v1` | `session.fork`, `session.metafork` |
 | `session_prompt_fork_v1` | additive prompt selector, editable draft response, and `forked_from` response/roster provenance on the existing `session.fork` method |
@@ -300,6 +326,7 @@ is §4.1.
 | `provider_remove_v1` | `provider.remove` |
 | `provider_models_v1` | `provider.models_refresh`, provider model inventories/details |
 | `models_list_v1` | headless model enumeration composed from `provider.list` and `account.list`; it is not another RPC method |
+| `session_provider_rebind_v1` | `session.provider.rebind` |
 | `session_model_select_v1` | `session.select_model` |
 | `session_rename_v1` | `session.rename`, `SessionSummary.title` |
 | `session_workspace_set_v1` | receipt-backed `session.workspace.set`; additive `workspace_unavailable` and `workspace_selected` raw facts |
@@ -478,6 +505,7 @@ force selector.
 | `queue.promote_steer` | `QueuePromoteSteer` | revision-fenced durable mutation followed by Steer delivery |
 | `run.retry` | `RunRetry` | durable receipt |
 | `session.compact` | `SessionCompact` or `SessionCompactOnBranch` | durable receipt |
+| `session.provider.rebind` | `SessionProviderRebind` | durable receipt; one session, next request boundary |
 | `session.select_model` | `SessionSelectModel` | durable receipt |
 | `session.rename` | `SessionRename` | durable receipt |
 | `session.workspace.set` | `SessionWorkspaceSet` | durable receipt; validates and canonicalizes the requested root after receipt replay |
@@ -528,8 +556,9 @@ force selector.
 
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
-with the historical `wire_transcript.json`, pins a request and successful
-response for every one of the 126 v1 request methods. `menu.answer` and resident
+with the historical `wire_transcript.json`, account-source transcript and
+`provider_rebind_wire.json`, pins a request and successful response for every
+one of the 132 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
 ### 5.3 Account identity and local-login adoption
@@ -2687,11 +2716,14 @@ The machine-checkable contract lives in these fixtures/tests:
   Hello/Welcome, raw replay, menu CAS, accounts/providers/usage, and mutation
   receipts; the appended monitor and Loom registry delta/caught-up entries pin
   both dedicated non-chat streams, the A/C/D union tail, and the four-frame
-  prompt-fork tail. The exact current transcript count is 177.
+  prompt-fork tail. Later fleet/agent/family additions bring the current
+  transcript count to 183.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
-  66 methods absent from the expanded transcript, completing its 60 with golden
-  request and successful response coverage for all 126 request methods and all
-  five command dynamic slots.
+  67 supplemental methods, completing the historical transcript's 60 pairs,
+  four account-source pairs and one provider-rebind pair for all 132 request
+  methods and all five command dynamic slots.
+- `crates/haider-rpc/tests/fixtures/provider_rebind_wire.json`: the additive
+  per-session routing request and durable receipt, generated from typed frames.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.
 - `snapshot_availability_is_compatible_in_both_n_minus_one_directions`:

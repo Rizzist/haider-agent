@@ -22,7 +22,7 @@ mod profile_lock;
 mod provider_view_store;
 mod usage_ledger;
 
-pub use cas::{FileCas, validate_image_block};
+pub use cas::{CasUpload, FileCas, validate_image_block};
 pub use event_store::{
     ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_ACTIVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD,
     AbandonedGraph, AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, AccountAddClaim,
@@ -45,20 +45,22 @@ pub use event_store::{
     PendingHookDispatchMetadata, PinnedGraph, ProcessSignalCommand, ProcessSignalOutcome,
     ProfileLease, QueueConsumeCommand, QueueConsumeOutcome, QueuePromoteCommand,
     QueuePromoteOutcome, QueuePromotePreview, QueueRemoveCommand, QueueRemoveOutcome,
-    QueueSnapshot, RecordedGraphEvidence, RecordedProcessSignal, ReducerPage, RenamedSession,
-    RunRetryCommand, RunRetryOutcome, SUBAGENT_LIVE_LIMIT, SeenSession, SelectedAgentType,
-    SelectedEffort, SelectedFast, SelectedModel, SelectedWorkspace, SessionCreateCommand,
-    SessionCreateOutcome, SessionForkCommand, SessionForkOutcome, SessionMetaforkCommit,
-    SessionProjectionCheckpoint, SessionPromptForkCommand, SessionRecencyKey, SessionRecencyRow,
-    SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
-    SessionSelectAgentTypeCommand, SessionSelectAgentTypeOutcome, SessionSelectEffortCommand,
-    SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
-    SessionSelectModelCommand, SessionSelectModelOutcome, SessionWorkspaceSetCommand,
-    SessionWorkspaceSetOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
-    SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
-    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus, TypedAgentInstallCancelResult,
-    TypedAgentInstallCas, TypedAgentInstallItemCas, TypedAgentInstallRetryResult,
-    TypedAgentInstallSnapshot, TypedAgentInstallWatchPage, TypedAgentInstallWatchResult,
+    QueueSnapshot, ReboundSessionProvider, RecordedGraphEvidence, RecordedProcessSignal,
+    ReducerPage, RenamedSession, RunRetryCommand, RunRetryOutcome, SUBAGENT_LIVE_LIMIT,
+    SeenSession, SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel, SelectedWorkspace,
+    SessionCreateCommand, SessionCreateOutcome, SessionForkCommand, SessionForkOutcome,
+    SessionMetaforkCommit, SessionProjectionCheckpoint, SessionPromptForkCommand,
+    SessionProviderRebindCommand, SessionProviderRebindOutcome, SessionRecencyKey,
+    SessionRecencyRow, SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand,
+    SessionSeenOutcome, SessionSelectAgentTypeCommand, SessionSelectAgentTypeOutcome,
+    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
+    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
+    SessionWorkspaceSetCommand, SessionWorkspaceSetOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, Store, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome,
+    TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
+    TypedAgentInstallCancelResult, TypedAgentInstallCas, TypedAgentInstallItemCas,
+    TypedAgentInstallRetryResult, TypedAgentInstallSnapshot, TypedAgentInstallWatchPage,
+    TypedAgentInstallWatchResult,
 };
 pub use event_store::{
     ForkCacheInheritanceCandidate, fork_provider_view_prefix_digest,

@@ -1790,6 +1790,11 @@ impl HeadlessReducer {
         let mut is_terminal_envelope = false;
         if correlated
             && reduce_core_payload
+            && envelope
+                .payload
+                .get("provider_purpose")
+                .and_then(serde_json::Value::as_str)
+                != Some("compaction")
             && let Ok(payload) = envelope.payload.decode_event()
         {
             match payload {
@@ -3623,13 +3628,32 @@ async fn upload_attachments(
         // One immutable private snapshot is the retry authority. A reconnect
         // never reopens the pathname and every attempt borrows these exact
         // bytes into the segmented RPC frame.
-        let data_base64 = Arc::new(Zeroizing::new(encode_base64(attachment.bytes())));
+        let mut data_base64 = None;
         loop {
-            match connection
+            let response = if connection
                 .client
-                .request_artifact_put(Arc::clone(&data_base64))
-                .await
+                .welcome()
+                .features
+                .contains(haider_rpc::binary_artifact::FEATURE)
             {
+                connection
+                    .client
+                    .put_artifact_stream(
+                        attachment.bytes(),
+                        attachment.bytes().len() as u64,
+                        expected.clone(),
+                    )
+                    .await
+            } else {
+                let snapshot = data_base64.get_or_insert_with(|| {
+                    Arc::new(Zeroizing::new(encode_base64(attachment.bytes())))
+                });
+                connection
+                    .client
+                    .request_artifact_put(Arc::clone(snapshot))
+                    .await
+            };
+            match response {
                 Ok(ResponseBody::ArtifactPut { artifact, bytes }) => {
                     let expected_bytes =
                         u64::try_from(attachment.bytes().len()).unwrap_or(u64::MAX);

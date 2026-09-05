@@ -1,0 +1,68 @@
+# Owner-paste fragment for the read-only external adapter:
+# ~/Documents/CODING/harness-bench/adapters/haider-agent/manifest.toml
+# No product adapter exists at bench/adapters/haider-agent/adapter.toml.
+#
+# Replace the existing [events.metadata] table with the table below; append the
+# narrative/compaction tables and the three rules. Remove the obsolete comment
+# claiming --output json has no model narrative. Keep all existing event rules,
+# including the completed model-response rules: the selectors below capture
+# only deltas, so completed snapshots do not duplicate the reconstructed text.
+# Keep [events].schema_version_pointer = "/schema_version" unchanged.
+#
+# AHRB metadata pointers target NormalizedEvent, whose payload retains the
+# original record in _ahrb_source_raw. Narrative/compaction pointers instead
+# target that original record directly. See harness-bench/src/wave4.rs.
+[events.metadata]
+timestamp_pointer = "/payload/_ahrb_source_raw/committed_at_ms"
+timestamp_format = "unix-ms"
+schema_version_pointer = "/payload/_ahrb_source_raw/schema_version"
+schema_version_value = "1"
+
+[events.narrative]
+assistant_text_event = "model-response"
+assistant_text_pointer = "/payload/delta/text"
+assistant_text_match_fields = { "/payload/type" = "item", "/payload/event" = "delta", "/payload/delta/delta" = "text" }
+assistant_text_aggregation = "item-deltas"
+assistant_text_item_pointer = "/payload/item_id"
+reasoning_event = "model-response"
+reasoning_pointer = "/payload/delta/text"
+reasoning_match_fields = { "/payload/type" = "item", "/payload/event" = "delta", "/payload/delta/delta" = "reasoning" }
+reasoning_aggregation = "item-deltas"
+reasoning_item_pointer = "/payload/item_id"
+# AHRB's exec driver injects /actor from the submitted turn's marker before
+# normalization (src/driver.rs). This is checker correlation, not a claim that
+# Haider durably emits AHRB's marker. Haider's durable request identity is the
+# additive /payload/provider_request object: session_id, run_id, turn_ordinal,
+# request_ordinal and request_kind, matching the provider request header.
+turn_pointer = "/actor"
+
+[events.compaction]
+event = "context-compacted"
+turn_pointer = "/actor"
+# Deliberately no dropped_count_pointer or dropped_span_*_pointer declaration.
+# Haider announces its actual covered graph-node range, dropped item count,
+# summary artifact and retained suffix. The current AHRB checker compares count
+# against omitted AHRB-HISTORY-* ordinary assistant markers, and span endpoints
+# against those marker strings (src/wave4.rs:658; src/runner.rs:14244). Graph
+# node IDs are not marker strings, and all dropped items are not marker count.
+# The owner must teach the checker to correlate those truthful product scope
+# coordinates with its request-history evidence before declaring scoped credit.
+# This fragment declares announcement support only; it does not claim row 73
+# passes. The current checker awards announced-only 0.5 and requires 1.0 to pass.
+
+[[events.rules]]
+matches = "item"
+match_fields = { "/payload/event" = "delta", "/payload/delta/delta" = "text" }
+event = "model-response"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "item"
+match_fields = { "/payload/event" = "delta", "/payload/delta/delta" = "reasoning" }
+event = "model-response"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "context_compaction"
+event = "context-compacted"
+payload_pointer = "/payload"

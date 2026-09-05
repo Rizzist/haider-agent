@@ -1,0 +1,80 @@
+crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_text_turn.jsonl
+  old 12 -> new 12: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 13 -> new 13: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 14 -> new 14: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 15 -> new 15: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 16 -> new 16: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 17 -> new 17: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 18 -> new 18: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 19 -> new 19: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 20 -> new 20: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 21 -> new 21: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  new line 22: atomic terminal started, request 1, reason=end_turn
+  new line 23: atomic terminal completed, request 1, reason=end_turn
+  old 22 -> new 24: additions=provider_request,provider_finish_reason; seq/event-id offset=+2; all other fields unchanged
+  old 23 -> new 25: additions=provider_request,provider_finish_reason; seq/event-id offset=+2; all other fields unchanged
+  old 24 -> new 26: additions=provider_request,provider_finish_reason; seq/event-id offset=+2; all other fields unchanged
+  REVIEWED: 15 changed/new lines; 1 atomic terminal pairs; no other semantic changes.
+
+crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_tool_turn.jsonl
+  old 12 -> new 12: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 13 -> new 13: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 14 -> new 14: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 15 -> new 15: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 16 -> new 16: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 17 -> new 17: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 18 -> new 18: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 19 -> new 19: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 20 -> new 20: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 21 -> new 21: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 22 -> new 22: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 23 -> new 23: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 30 -> new 30: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 31 -> new 31: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 32 -> new 32: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 33 -> new 33: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 34 -> new 34: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 35 -> new 35: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  new line 36: atomic terminal started, request 1, reason=tool_use
+  new line 37: atomic terminal completed, request 1, reason=tool_use
+  old 36 -> new 38: additions=provider_request,provider_finish_reason; seq/event-id offset=+2; all other fields unchanged
+  old 37 -> new 39: additions=provider_request; seq/event-id offset=+2; item allocation 8->9; all other fields unchanged
+  old 38 -> new 40: additions=provider_request; seq/event-id offset=+2; item allocation 8->9; all other fields unchanged
+  old 39 -> new 41: additions=provider_request; seq/event-id offset=+2; item allocation 9->10; all other fields unchanged
+  old 40 -> new 42: additions=provider_request; seq/event-id offset=+2; item allocation 9->10; all other fields unchanged
+  old 41 -> new 43: additions=provider_request; seq/event-id offset=+2; item allocation 10->11; all other fields unchanged
+  old 42 -> new 44: additions=provider_request; seq/event-id offset=+2; item allocation 10->11; all other fields unchanged
+  old 43 -> new 45: additions=provider_request; seq/event-id offset=+2; item allocation 11->12; all other fields unchanged
+  old 44 -> new 46: additions=provider_request; seq/event-id offset=+2; item allocation 11->12; all other fields unchanged
+  old 45 -> new 47: additions=provider_request; seq/event-id offset=+2; all other fields unchanged
+  old 46 -> new 48: additions=provider_request; seq/event-id offset=+2; item allocation 12->13; all other fields unchanged
+  old 47 -> new 49: additions=provider_request; seq/event-id offset=+2; item allocation 12->13; all other fields unchanged
+  old 48 -> new 50: additions=provider_request; seq/event-id offset=+2; item allocation 13->14; all other fields unchanged
+  old 49 -> new 51: additions=provider_request; seq/event-id offset=+2; item allocation 13->14; all other fields unchanged
+  old 50 -> new 52: additions=provider_request; seq/event-id offset=+2; all other fields unchanged
+  new line 53: atomic terminal started, request 2, reason=end_turn
+  new line 54: atomic terminal completed, request 2, reason=end_turn
+  old 51 -> new 55: additions=provider_request,provider_finish_reason; seq/event-id offset=+4; item allocation 12->13; all other fields unchanged
+  old 52 -> new 56: additions=provider_request,provider_finish_reason; seq/event-id offset=+4; all other fields unchanged
+  old 53 -> new 57: additions=provider_request,provider_finish_reason; seq/event-id offset=+4; all other fields unchanged
+  REVIEWED: 40 changed/new lines; 2 atomic terminal pairs; no other semantic changes.
+
+crates/haider-cli/tests/fixtures/oneshot_run_golden.jsonl
+  old 12 -> new 12: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 13 -> new 13: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 14 -> new 14: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 15 -> new 15: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 16 -> new 16: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 17 -> new 17: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 18 -> new 18: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 19 -> new 19: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 20 -> new 20: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  old 21 -> new 21: additions=provider_request; seq/event-id offset=+0; all other fields unchanged
+  new line 22: atomic terminal started, request 1, reason=end_turn
+  new line 23: atomic terminal completed, request 1, reason=end_turn
+  old 22 -> new 24: additions=provider_request,provider_finish_reason; seq/event-id offset=+2; all other fields unchanged
+  old 23 -> new 25: additions=provider_request,provider_finish_reason; seq/event-id offset=+2; all other fields unchanged
+  old 24 -> new 26: additions=provider_request,provider_finish_reason; seq/event-id offset=+2; all other fields unchanged
+  REVIEWED: 15 changed/new lines; 1 atomic terminal pairs; no other semantic changes.
+
+crates/haider-cli/tests/fixtures/turnhygiene/provider_request_no_budget.json: tooling-regenerated, byte-identical to merged upstream

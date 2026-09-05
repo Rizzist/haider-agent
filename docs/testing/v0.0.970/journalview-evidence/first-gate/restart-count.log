@@ -1,0 +1,24 @@
+Filesystem     1M-blocks   Used Available Capacity iused     ifree %iused  Mounted on
+/dev/disk3s1s1    233752  12062     22299    36%  458732 228346080    0%   /
+
+running 89 tests
+.......... 10/89
+actor_restarts_do_not_reuse_run_or_item_ids --- FAILED
+..............................................................................
+failures:
+
+---- actor_restarts_do_not_reuse_run_or_item_ids stdout ----
+
+thread 'actor_restarts_do_not_reuse_run_or_item_ids' (34068717) panicked at crates/haider-core/tests/runtime_tests.rs:5765:5:
+assertion `left == right` failed
+  left: 8
+ right: 6
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    actor_restarts_do_not_reuse_run_or_item_ids
+
+test result: FAILED. 88 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.05s
+
+error: test failed, to rerun pass `-p haider-core --test runtime_tests`

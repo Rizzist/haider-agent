@@ -1,0 +1,26 @@
+{
+  "A": {
+    "haider": {
+      "path": "/tmp/providerrebind-release-A/haider",
+      "bytes": 34634000,
+      "sha256": "b50df910046df66712d40a76d1adf4a2c62aeb93e122de1454be7cf5a83a4c91"
+    },
+    "haiderd": {
+      "path": "/tmp/providerrebind-release-A/haiderd",
+      "bytes": 54307344,
+      "sha256": "0e434a722211dcbe4509c68a93989ad49c29e28739a9e9edd6c5a5df77e5f0f6"
+    }
+  },
+  "B": {
+    "haider": {
+      "path": "/tmp/providerrebind-release-B/haider",
+      "bytes": 34782848,
+      "sha256": "0648d52346d7d080b90c361601661b6ef43fafdfed1db12d3ffe4812d6c9a3e2"
+    },
+    "haiderd": {
+      "path": "/tmp/providerrebind-release-B/haiderd",
+      "bytes": 54522320,
+      "sha256": "0078f395a31e0fc24e4929717e32d1e0b3f18b01b93272ec647e8bf22ba321ea"
+    }
+  }
+}

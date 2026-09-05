@@ -96,6 +96,14 @@ pub struct SessionMetadataV1 {
     /// provider rides along as an attribute of the selected row and both may
     /// change together through `session.select_model`.
     pub provider: String,
+    /// Per-session endpoint override committed by `session.provider.rebind`.
+    /// Absence leaves the provider registry and credential endpoint authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_base_url: Option<String>,
+    /// Durable command identity of the latest explicit provider rebind.
+    /// Ordinary model selection does not advance this request-boundary marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_rebind_id: Option<String>,
     /// Optional account alias pinned by an automation-created session. When
     /// present, provider resolution uses this exact credential rather than
     /// the provider's mutable active-account selection.
@@ -201,6 +209,18 @@ pub struct FastModeSelected {
     pub enabled: bool,
 }
 
+/// Durable endpoint/account selection for the session's next provider request.
+/// The model and conversation are unchanged. Credentials never enter this fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionProviderRebound {
+    pub rebind_id: String,
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+}
+
 /// Additive replay fact emitted atomically with a committed live-session
 /// agent-type binding and its command receipt (W-flow inline identity).
 ///
@@ -239,6 +259,7 @@ pub enum SessionConfigEventPayload {
     },
     EffortSelected(EffortSelected),
     FastModeSelected(FastModeSelected),
+    SessionProviderRebound(SessionProviderRebound),
     AgentTypeSelected(AgentTypeSelected),
 }
 
@@ -319,5 +340,29 @@ impl FastModeSelected {
             SessionConfigEventPayload::FastModeSelected(selected) => Some(selected),
             _ => None,
         }
+    }
+}
+
+impl SessionProviderRebound {
+    pub fn to_payload_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(SessionConfigEventPayload::SessionProviderRebound(
+            self.clone(),
+        ))
+    }
+
+    #[must_use]
+    pub fn from_payload_value(value: &serde_json::Value) -> Option<Self> {
+        match serde_json::from_value::<SessionConfigEventPayload>(value.clone()).ok()? {
+            SessionConfigEventPayload::SessionProviderRebound(rebound) => Some(rebound),
+            _ => None,
+        }
+    }
+
+    /// Rebuild the routing projection from a replayed committed fact.
+    pub fn apply_to_metadata(&self, metadata: &mut SessionMetadataV1) {
+        metadata.provider_rebind_id = Some(self.rebind_id.clone());
+        metadata.provider.clone_from(&self.provider);
+        metadata.provider_base_url.clone_from(&self.base_url);
+        metadata.account_alias.clone_from(&self.account);
     }
 }

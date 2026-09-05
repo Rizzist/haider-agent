@@ -1,0 +1,5 @@
+{
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "cpu_memory_details": "sysctl denied by sandbox; no values inferred"
+}

@@ -1,0 +1,150 @@
+{
+  "schema": "casstream-benchmark-v1",
+  "platform": "darwin",
+  "machine": "arm64",
+  "os_release": "25.6.0",
+  "cpu_count": 10,
+  "measurement": "fresh Python IPC client self getrusage + fresh daemon wait4, peak RSS includes startup; wall excludes fixture/startup",
+  "python": "3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 21.0.0 (clang-2100.1.1.101)]",
+  "blake3_version": "1.0.9",
+  "smoke": false,
+  "daemon": "/Users/rizzist/haider-run/lane-970-casstream/target/debug/haiderd",
+  "daemon_sha256": "9bb55101dd8e34cb7ef069fd66f78a1fbd43f67644aa47d9a7f1879368221d09",
+  "daemon_bytes": 199582736,
+  "samples": [
+    {
+      "run": 1,
+      "mode": "legacy_single",
+      "total_bytes": 276824064,
+      "load_1m_start": 9.646484375,
+      "load_1m_max": 9.646484375,
+      "load_valid": true,
+      "daemon_peak_rss_bytes": 47677440,
+      "daemon_exit_code": 0,
+      "digest_integrity": "rejected object absent",
+      "wall_seconds": 0.6210210410063155,
+      "client_peak_rss_bytes": 674381824,
+      "accepted": false,
+      "responses": [
+        {
+          "frame": {
+            "v": 1,
+            "kind": "protocol_error",
+            "code": "invalid_frame",
+            "message": "frame length 369098855 exceeds configured limit 50331648",
+            "fatal": true
+          },
+          "send_error": "BrokenPipeError"
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    },
+    {
+      "run": 1,
+      "mode": "legacy_eight",
+      "total_bytes": 276824064,
+      "load_1m_start": 9.646484375,
+      "load_1m_max": 10.4951171875,
+      "load_valid": false,
+      "daemon_peak_rss_bytes": 94240768,
+      "daemon_exit_code": 0,
+      "digest_integrity": "verified",
+      "wall_seconds": 28.251835875038523,
+      "client_peak_rss_bytes": 386187264,
+      "accepted": true,
+      "responses": [
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:c21a649ed2fd2158049453767969f9ec82687507d8b01c5d7146c451a0a7239b",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:9f023d8290335041fabde2063046c9b674fe616ea7b6faf455a665ca3e51de03",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:3885681f3103ed0cd5d564f05dcd6d41fe3506bb62b09a267256da87b6c6ef23",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:b193bf0e73825c33a486628b2a7dca0dd89b7a490bd49b793e9bf813f6b51202",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:e5c51c4cf3228b71f1af7115f38bedbdac91dd55608645b5d39aa6810c33fa51",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:6006acf3128cb1ffc0787b8c8cec82a56f9f502f6bde9c254b6db36dd083e4f0",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:fdd67b8d17a23b5251497f0a68307af168a900b9307eaa98cd98bbced73c8f28",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:7576e0113bd97883db02c2193cc0e5367795ec20650b3bb86859d37b76fcf80f",
+          "bytes": 34603008
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    }
+  ],
+  "fixture": {
+    "parts": [
+      {
+        "offset": 0,
+        "bytes": 34603008,
+        "digest": "c21a649ed2fd2158049453767969f9ec82687507d8b01c5d7146c451a0a7239b"
+      },
+      {
+        "offset": 34603008,
+        "bytes": 34603008,
+        "digest": "9f023d8290335041fabde2063046c9b674fe616ea7b6faf455a665ca3e51de03"
+      },
+      {
+        "offset": 69206016,
+        "bytes": 34603008,
+        "digest": "3885681f3103ed0cd5d564f05dcd6d41fe3506bb62b09a267256da87b6c6ef23"
+      },
+      {
+        "offset": 103809024,
+        "bytes": 34603008,
+        "digest": "b193bf0e73825c33a486628b2a7dca0dd89b7a490bd49b793e9bf813f6b51202"
+      },
+      {
+        "offset": 138412032,
+        "bytes": 34603008,
+        "digest": "e5c51c4cf3228b71f1af7115f38bedbdac91dd55608645b5d39aa6810c33fa51"
+      },
+      {
+        "offset": 173015040,
+        "bytes": 34603008,
+        "digest": "6006acf3128cb1ffc0787b8c8cec82a56f9f502f6bde9c254b6db36dd083e4f0"
+      },
+      {
+        "offset": 207618048,
+        "bytes": 34603008,
+        "digest": "fdd67b8d17a23b5251497f0a68307af168a900b9307eaa98cd98bbced73c8f28"
+      },
+      {
+        "offset": 242221056,
+        "bytes": 34603008,
+        "digest": "7576e0113bd97883db02c2193cc0e5367795ec20650b3bb86859d37b76fcf80f"
+      }
+    ],
+    "total_bytes": 276824064,
+    "whole": {
+      "offset": 0,
+      "bytes": 276824064,
+      "digest": "b339fe22d2b0efc1702841e887ab02606d869819540239a09ab8ad7bf389488a"
+    }
+  }
+}

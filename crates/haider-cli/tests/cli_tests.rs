@@ -906,7 +906,15 @@ fn run_json_is_one_stable_typed_stream_summary() {
         Some(&serde_json::json!({
             "type":"run_state",
             "state":"done",
-            "terminal_kind":"success"
+            "terminal_kind":"success",
+            "provider_request": {
+                "session_id": value["session_id"],
+                "run_id": value["run_id"],
+                "turn_ordinal": 1,
+                "request_ordinal": 1,
+                "request_kind": "primary"
+            },
+            "provider_finish_reason": "end_turn"
         }))
     );
 }
@@ -1603,7 +1611,15 @@ fn replay_is_sealed_at_terminal_before_late_same_run_task_facts() {
         Some(&serde_json::json!({
             "type": "run_state",
             "state": "done",
-            "terminal_kind": "success"
+            "terminal_kind": "success",
+            "provider_request": {
+                "session_id": session_id,
+                "run_id": run_id,
+                "turn_ordinal": 1,
+                "request_ordinal": 2,
+                "request_kind": "primary"
+            },
+            "provider_finish_reason": "end_turn"
         }))
     );
 }
@@ -4263,10 +4279,10 @@ fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
     write_final(&mut json, RunOutput::Json, &done).expect("json");
     assert_eq!(
         String::from_utf8(json.clone()).expect("utf8"),
-        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":0,\"refs\":[]},\"outcome\":\"done\",\"response\":\"final answer\",\"events\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":null}\n"
+        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":0,\"refs\":[]},\"outcome\":\"done\",\"response\":\"final answer\",\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":null}\n"
     );
     let value: serde_json::Value = serde_json::from_slice(&json).expect("v1 JSON");
-    assert_eq!(value.as_object().expect("object").len(), 15);
+    assert_eq!(value.as_object().expect("object").len(), 16);
     assert_eq!(value["provider"], "fake");
     assert_eq!(value["model"], "fake-model");
     assert!(value["usage"].is_null());
@@ -4404,11 +4420,11 @@ fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
         assert_eq!(
             String::from_utf8(bytes.clone()).expect("failure utf8"),
             format!(
-                "{{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome_name}\",\"response\":null,\"events\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":{error}}}\n"
+                "{{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome_name}\",\"response\":null,\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":{error}}}\n"
             )
         );
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("failure object");
-        assert_eq!(value.as_object().expect("object").len(), 15);
+        assert_eq!(value.as_object().expect("object").len(), 16);
         assert!(value["response"].is_null());
         assert_eq!(
             value["error"].is_null(),
@@ -4519,7 +4535,7 @@ fn run_json_reports_attachments_additively() {
     write_final(&mut bytes, RunOutput::Json, &attached).expect("attachment JSON");
     assert_eq!(
         String::from_utf8(bytes.clone()).expect("utf8"),
-        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":2,\"refs\":[\"blake3:first\",\"blake3:second\"]},\"outcome\":\"done\",\"response\":null,\"events\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":null}\n"
+        "{\"schema\":\"haider.run.v1\",\"session_id\":\"session-json\",\"run_id\":\"run-json\",\"provider\":\"fake\",\"model\":\"fake-model\",\"attachments\":{\"count\":2,\"refs\":[\"blake3:first\",\"blake3:second\"]},\"outcome\":\"done\",\"response\":null,\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":null}\n"
     );
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("attachment object");
     assert_eq!(value["attachments"]["count"], 2);

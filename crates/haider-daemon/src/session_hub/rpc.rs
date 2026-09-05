@@ -47,6 +47,47 @@ use tokio::time::{MissedTickBehavior, interval_at};
 use zeroize::Zeroizing;
 
 const MAX_ATTACHMENTS_PER_TURN: usize = 5;
+
+pub(super) fn status_caching(
+    idle_ttl_ms: Option<u64>,
+    active_provider: Option<&str>,
+    providers: &[ProviderSummaryWire],
+) -> haider_rpc::DaemonCachingWire {
+    use haider_rpc::{ProviderApiFamilyWire, ProviderCacheRegimeWire, SessionReuseWire};
+    let cache_regimes_by_provider: BTreeMap<_, _> = providers
+        .iter()
+        .map(|provider| {
+            let regime = match provider.api_family {
+                ProviderApiFamilyWire::AnthropicMessages => {
+                    Some(ProviderCacheRegimeWire::ExplicitBreakpoints)
+                }
+                ProviderApiFamilyWire::OpenAiResponses
+                | ProviderApiFamilyWire::OpenAiChatCompletions => {
+                    Some(ProviderCacheRegimeWire::AutomaticPrefix)
+                }
+                _ => None,
+            };
+            (provider.provider.clone(), regime)
+        })
+        .collect();
+    haider_rpc::DaemonCachingWire {
+        // The daemon always prepares cache-aware prompts and persists the
+        // provider-view CAS when the adapter emits a view. These are support
+        // declarations, not guarantees of a cacheable request or remote hit.
+        prompt_cache: true,
+        provider_view_cas: true,
+        session_reuse: if idle_ttl_ms == Some(0) {
+            SessionReuseWire::OneShot
+        } else {
+            SessionReuseWire::Resident
+        },
+        idle_ttl_ms,
+        cache_regime: active_provider
+            .and_then(|provider| cache_regimes_by_provider.get(provider).copied())
+            .flatten(),
+        cache_regimes_by_provider,
+    }
+}
 const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES_PER_TURN: usize = 16 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES_PER_PDF_TURN: usize = 64 * 1024 * 1024;
@@ -3603,6 +3644,26 @@ impl HubConnection {
         self.artifact_put_bytes(request_id, bytes).await
     }
 
+    pub(crate) fn binary_artifact_store(&self) -> Result<SqliteStoreHandle, ResponseBody> {
+        if self.closed.load(Ordering::Acquire) || self.hub.inner.draining.load(Ordering::Acquire) {
+            return Err(ResponseBody::Error {
+                code: ERROR_CODE_DRAINING.into(),
+                message: "connection closed or daemon draining".into(),
+                retryable: true,
+                data: None,
+            });
+        }
+        if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+            return Err(ResponseBody::Error {
+                code: ERROR_CODE_CAPABILITY_DENIED.into(),
+                message: message.into(),
+                retryable: false,
+                data: None,
+            });
+        }
+        Ok(self.hub.inner.store.clone())
+    }
+
     /// Handles one request and enqueues its correlated response.
     pub async fn request(
         &self,
@@ -4791,6 +4852,46 @@ impl HubConnection {
                 }
                 self.session_compact(request_id, command_id, session_id, worker_generation, None)
                     .await
+            }
+            RequestBody::SessionProviderRebind {
+                command_id,
+                session_id,
+                worker_generation,
+                provider,
+                base_url,
+                account,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "provider rebind requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.session_provider_rebind(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    provider,
+                    base_url,
+                    account,
+                )
+                .await
             }
             RequestBody::SessionSelectModel {
                 command_id,
@@ -16138,13 +16239,20 @@ impl HubConnection {
     }
 
     async fn status_snapshot(&self, request_id: RequestId) -> Result<(), SessionHubError> {
-        let (active_account, adoption_available) = match self.hub.accounts()? {
+        let (active_account, adoption_available, caching) = match self.hub.accounts()? {
             Some(facade) => {
-                let Some(active) = facade.management.inspect(|view| {
-                    view.descriptors
+                let Some((active, caching)) = facade.management.inspect(|view| {
+                    let active = view
+                        .descriptors
                         .iter()
                         .find(|descriptor| descriptor.active)
-                        .cloned()
+                        .cloned();
+                    let caching = status_caching(
+                        self.daemon_idle_ttl_ms,
+                        active.as_ref().map(|account| account.provider.as_str()),
+                        &view.providers,
+                    );
+                    (active, caching)
                 }) else {
                     return self.respond_error(
                         request_id,
@@ -16154,9 +16262,13 @@ impl HubConnection {
                         None,
                     );
                 };
-                (active, facade.status_adoption_snapshot())
+                (active, facade.status_adoption_snapshot(), caching)
             }
-            None => (None, Vec::new()),
+            None => (
+                None,
+                Vec::new(),
+                status_caching(self.daemon_idle_ttl_ms, None, &[]),
+            ),
         };
         let session_count = self.hub.roster_session_count().await?;
         let session_ids = self.hub.roster_session_ids().await?;
@@ -16188,6 +16300,7 @@ impl HubConnection {
                     .map(|(_, pid_file_path)| pid_file_path.display().to_string()),
                 idle_ttl_ms: self.daemon_idle_ttl_ms,
                 warm: self.daemon_warm,
+                caching: Some(caching),
                 ready: readiness.is_some_and(|snapshot| snapshot.ready),
                 ready_since: readiness.and_then(|snapshot| snapshot.ready_since_unix_ms),
                 providers_loaded: readiness.is_some_and(|snapshot| snapshot.providers_loaded),
@@ -19221,7 +19334,7 @@ async fn validate_turn_attachments(
                 });
             }
         };
-        let bytes = store.get(artifact).await.map_err(|_| AttachmentValidationFailure {
+        let missing = || AttachmentValidationFailure {
             code: ERROR_CODE_ATTACHMENT_NOT_FOUND,
             message: format!(
                 "attachment {index} references unavailable or unverified artifact {artifact}; upload it with artifact.put and retry"
@@ -19230,34 +19343,66 @@ async fn validate_turn_attachments(
                 index: index_u32,
                 artifact: artifact.clone(),
             }),
-        })?;
+        };
+        let reader = store
+            .open_cas_reader(artifact)
+            .await
+            .map_err(|_| missing())?;
+        let actual_bytes = reader.metadata().map_err(|_| missing())?.len();
+        let is_pdf = matches!(
+            attachment,
+            haider_protocol::tool::AttachmentBlock::Pdf { .. }
+        );
+        let cap = if is_pdf {
+            haider_pdf::MAX_PDF_BYTES
+        } else {
+            MAX_ATTACHMENT_BYTES
+        };
+        if is_pdf && actual_bytes > haider_pdf::MAX_PDF_BYTES as u64 {
+            let message = format!(
+                "PDF attachment {index} is {actual_bytes} bytes; the PDF limit is {}",
+                haider_pdf::MAX_PDF_BYTES
+            );
+            let presentation = haider_protocol::error::ErrorPresentation::new(
+                "pdf-too-large",
+                "PDF is too large",
+                &message,
+                haider_protocol::error::ErrorScope::Turn,
+                [haider_protocol::error::ErrorAction::None],
+            );
+            return Err(AttachmentValidationFailure {
+                code: ERROR_CODE_PDF_TOO_LARGE,
+                message,
+                data: Some(ErrorData::PdfTooLarge {
+                    index: index_u32,
+                    artifact: artifact.clone(),
+                    actual_bytes,
+                    max_bytes: haider_pdf::MAX_PDF_BYTES as u64,
+                    presentation,
+                }),
+            });
+        }
+        if !is_pdf && actual_bytes > cap as u64 {
+            return Err(oversized_attachment(
+                index_u32,
+                artifact,
+                usize::try_from(actual_bytes).unwrap_or(usize::MAX),
+            ));
+        }
+        // The verified file handle is read in bounded chunks. PDF inspection
+        // still requires contiguous bytes, but only after enforcing its cap.
+        use tokio::io::AsyncReadExt as _;
+        let mut reader = tokio::fs::File::from_std(reader).take(cap as u64 + 1);
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| missing())?;
+        if bytes.len() as u64 != actual_bytes {
+            return Err(missing());
+        }
         let canonical_attachment = match attachment {
             haider_protocol::tool::AttachmentBlock::Pdf { name, .. } => {
-                if bytes.len() > haider_pdf::MAX_PDF_BYTES {
-                    let actual_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                    let message = format!(
-                        "PDF attachment {index} is {actual_bytes} bytes; the PDF limit is {}",
-                        haider_pdf::MAX_PDF_BYTES
-                    );
-                    let presentation = haider_protocol::error::ErrorPresentation::new(
-                        "pdf-too-large",
-                        "PDF is too large",
-                        &message,
-                        haider_protocol::error::ErrorScope::Turn,
-                        [haider_protocol::error::ErrorAction::None],
-                    );
-                    return Err(AttachmentValidationFailure {
-                        code: ERROR_CODE_PDF_TOO_LARGE,
-                        message,
-                        data: Some(ErrorData::PdfTooLarge {
-                            index: index_u32,
-                            artifact: artifact.clone(),
-                            actual_bytes,
-                            max_bytes: haider_pdf::MAX_PDF_BYTES as u64,
-                            presentation,
-                        }),
-                    });
-                }
                 let metadata = haider_pdf::inspect_pdf(&bytes).map_err(|error| {
                     let message = format!("PDF attachment {index} could not be parsed: {error}");
                     AttachmentValidationFailure {
@@ -19825,3 +19970,6 @@ mod run_identity_tests {
         assert!(summary.run_id.is_none(), "absent decodes as no active run");
     }
 }
+
+#[path = "provider_rebind.rs"]
+mod provider_rebind;

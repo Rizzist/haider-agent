@@ -1,0 +1,5 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling xtask v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/xtask)
+    Finished `dev` profile [unoptimized] target(s) in 1m 04s
+     Running `target/debug/xtask test-count --update`
+test-count: baseline updated to 4856

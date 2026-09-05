@@ -1,0 +1,70 @@
+{
+  "phase": "premerge diagnostic",
+  "valid": true,
+  "daemon_sha256": "5f4a42ade959802917e289e078b2c7c00815072774cac2a4b849d3cf34cb2313",
+  "daemon_bytes": 199155760,
+  "load_1m_max": 5.53369140625,
+  "groups": {
+    "binary_eight": {
+      "n": 3,
+      "accepted": true,
+      "median": {
+        "wall_seconds": 10.224089458992239,
+        "client_peak_rss_bytes": 27951104,
+        "daemon_peak_rss_bytes": 48758784
+      },
+      "mad": {
+        "wall_seconds": 0.11121666699182242,
+        "client_peak_rss_bytes": 0,
+        "daemon_peak_rss_bytes": 32768
+      }
+    },
+    "binary_single": {
+      "n": 3,
+      "accepted": true,
+      "median": {
+        "wall_seconds": 10.13229658297496,
+        "client_peak_rss_bytes": 27983872,
+        "daemon_peak_rss_bytes": 48611328
+      },
+      "mad": {
+        "wall_seconds": 0.06740908295614645,
+        "client_peak_rss_bytes": 32768,
+        "daemon_peak_rss_bytes": 16384
+      }
+    },
+    "legacy_eight": {
+      "n": 3,
+      "accepted": true,
+      "median": {
+        "wall_seconds": 13.666420250025112,
+        "client_peak_rss_bytes": 431833088,
+        "daemon_peak_rss_bytes": 94109696
+      },
+      "mad": {
+        "wall_seconds": 0.12280599999940023,
+        "client_peak_rss_bytes": 0,
+        "daemon_peak_rss_bytes": 98304
+      }
+    },
+    "legacy_single": {
+      "n": 3,
+      "accepted": false,
+      "median": {
+        "wall_seconds": 0.2989270839607343,
+        "client_peak_rss_bytes": 673628160,
+        "daemon_peak_rss_bytes": 47284224
+      },
+      "mad": {
+        "wall_seconds": 0.001307416066993028,
+        "client_peak_rss_bytes": 32768,
+        "daemon_peak_rss_bytes": 65536
+      }
+    }
+  },
+  "matched_work_reduction_percent": {
+    "wall_seconds": 25.188240432065946,
+    "client_peak_rss_bytes": 93.52733619152407,
+    "daemon_peak_rss_bytes": 48.18941504178274
+  }
+}

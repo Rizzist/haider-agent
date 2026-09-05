@@ -1,0 +1,652 @@
+{
+  "base": "73fe3f68f71b6daffffbb330beb9fabd27141cb7",
+  "upstream": "38359fd3ba799c3e32a09c414f6f41abb90442bd",
+  "backup": "/tmp/journalview-merge-forward-ewvjme92",
+  "files": [
+    {
+      "path": "crates/haider-cli/src/main.rs",
+      "resolution": "upstream content",
+      "sha256": "89e9a3a0906ee4da31288fc9f0e693caedc97383543e95383a0c1ae679bba89d"
+    },
+    {
+      "path": "crates/haider-cli/src/observe.rs",
+      "resolution": "upstream content",
+      "sha256": "d1e43fc368a9473604c12d02f3e89b821415fff70ce1aade3943602ad3bc1372"
+    },
+    {
+      "path": "crates/haider-cli/src/session_provider.rs",
+      "resolution": "upstream content",
+      "sha256": "6ad966be17431e399888deb19ae16f3aab494a384e5935263eb91f8da647ec3e"
+    },
+    {
+      "path": "crates/haider-cli/tests/autospawn_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "6d6347937a09c7210c2e5e762076acc5de54146060a257f2b94d99c7f76e4a55"
+    },
+    {
+      "path": "crates/haider-cli/tests/fixtures/observe_status.json",
+      "resolution": "upstream content",
+      "sha256": "f8fa5a15a46b6497b418ed46887beef8b6b028ae696f173f91e160197fd9ace8"
+    },
+    {
+      "path": "crates/haider-cli/tests/observe_cli_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "443ec5b107a9f3193e84e007b6b33788a19264c177b2758168f40600a873b2cd"
+    },
+    {
+      "path": "crates/haider-client/src/observe.rs",
+      "resolution": "upstream content",
+      "sha256": "88211a74948481cc25d7335917477c5468026e385fb4c341911a6a78a3a0e659"
+    },
+    {
+      "path": "crates/haider-client/tests/headless_run_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "9b836ebd4ec0559947f469c5caa62fc9c982dbfc2cc7e36a7395b6129d49fde2"
+    },
+    {
+      "path": "crates/haider-client/tests/observe_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "107c52803d155bee19b40ab1d6b0c3316dec789fa7798b11f893f548498841e6"
+    },
+    {
+      "path": "crates/haider-core/src/actor.rs",
+      "resolution": "clean three-way content merge",
+      "sha256": "a491cb765e11c9494bf84c3dc61d219d69be28cc3ae6e8daf643f6298179f39d"
+    },
+    {
+      "path": "crates/haider-core/src/lib.rs",
+      "resolution": "upstream content",
+      "sha256": "6affb33e3f434d2cc747c261bd856f909b078199bdb4579b229211d9ebe010e5"
+    },
+    {
+      "path": "crates/haider-core/src/sqlite_store.rs",
+      "resolution": "upstream content",
+      "sha256": "475b050e2198be4511611a87befe38b318c8aac0f3028db448edb8180e21cbdb"
+    },
+    {
+      "path": "crates/haider-core/tests/runtime_tests.rs",
+      "resolution": "clean three-way content merge",
+      "sha256": "7b306d00a3719083f888678ab59eb7dd3b748373e16cd7c0bb9047a38589eae4"
+    },
+    {
+      "path": "crates/haider-daemon/src/accounts.rs",
+      "resolution": "upstream content",
+      "sha256": "7a6a0bc6f3a1dd6a7c7f27e78b487a9b4c82e3a0bb506133536a8790cfd8491d"
+    },
+    {
+      "path": "crates/haider-daemon/src/accounts_provider_rebind_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "d0b26e2befce2d78f317f898d7705c17fe473cc3778f0c2d52091a8eea08a635"
+    },
+    {
+      "path": "crates/haider-daemon/src/accounts_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "551377b5f5e270b9d9c11e4425b791372e741567cee26113912a232b7e4f597c"
+    },
+    {
+      "path": "crates/haider-daemon/src/cache_policy_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "30124af394750711c8b665279adaa5e02a3829556cdd863c0900553f3ed7d895"
+    },
+    {
+      "path": "crates/haider-daemon/src/connection.rs",
+      "resolution": "upstream content",
+      "sha256": "cc7786a75909cd418767420c4715275245d22f4348684aab2fc8a2d0436b0b20"
+    },
+    {
+      "path": "crates/haider-daemon/src/connection_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "5203bf8703f2ebabd223302fd19bd31ee3567bbdb548eea553205670b00bd9bb"
+    },
+    {
+      "path": "crates/haider-daemon/src/loom_authoring_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "ae1e989c572da61cbf3396e17666785e43570a2bcc3cc8d7600948721a52f905"
+    },
+    {
+      "path": "crates/haider-daemon/src/mobile_runtime_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "3651594f1399ba1f78999ea7e8e7430a8705ea210aa58e01486387760916ecdd"
+    },
+    {
+      "path": "crates/haider-daemon/src/permissions_core_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "92055007787bdb376140d100fbf6476148eb2782737cdc2210eb7710ad4f3a67"
+    },
+    {
+      "path": "crates/haider-daemon/src/project_instructions_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "5c1fe276c209cb03690d534eae4117684094c554ddd042076db9d9c2f8cbdb38"
+    },
+    {
+      "path": "crates/haider-daemon/src/provider_rebind.rs",
+      "resolution": "upstream content",
+      "sha256": "67618c3538487c305d3429f21cede6f2094b9f4266c0018996066bc4e96e8e6a"
+    },
+    {
+      "path": "crates/haider-daemon/src/provider_rebind_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "cade3badfe50ecd10b65e51fa285740bfc6857cb98a3274b4d29bbd47cc3864d"
+    },
+    {
+      "path": "crates/haider-daemon/src/session_hub/actor.rs",
+      "resolution": "upstream content",
+      "sha256": "5a9cb5eab7a4ac01e6c194abd5dd2268934382de0539d999edb3925a18b44eab"
+    },
+    {
+      "path": "crates/haider-daemon/src/session_hub/mod.rs",
+      "resolution": "upstream content",
+      "sha256": "e5c76661608c8c02614301781d19b706a774ee14d65b92a1883926d9afb3b47b"
+    },
+    {
+      "path": "crates/haider-daemon/src/session_hub/provider_rebind.rs",
+      "resolution": "upstream content",
+      "sha256": "1b0ab8632bf6bb3396478771d652a241f8035e0abe76ed29c3146a37c737b792"
+    },
+    {
+      "path": "crates/haider-daemon/src/session_hub/provider_rebind_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "d36db6b5692705afdf735c21bd5df8a62e91fccc93282257638cf5016840c78d"
+    },
+    {
+      "path": "crates/haider-daemon/src/session_hub/rpc.rs",
+      "resolution": "upstream content",
+      "sha256": "e25a963d3ee04b649f90e92fe270134041978def1af367f36aed706f2690105d"
+    },
+    {
+      "path": "crates/haider-daemon/src/session_hub_private_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "a3b60b8970d07f86bfc4919f68868f8250f54eec889762dadfe5f15a158cb09a"
+    },
+    {
+      "path": "crates/haider-daemon/src/subagent_core_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "fe7dad5228a1947fc34b8f162c7b6130dca36b2378d9d4290150f5667a451dcb"
+    },
+    {
+      "path": "crates/haider-daemon/src/tasks_runtime_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "8e000fe7236faf51666e02480883a7cb67da8d8bb16eea6756110e7d17b14460"
+    },
+    {
+      "path": "crates/haider-daemon/src/worker.rs",
+      "resolution": "clean three-way content merge",
+      "sha256": "30e587d21e4e6ffd022cbd7226b2eb1cb5a72c0d7022408f37e0c6e8ccca4288"
+    },
+    {
+      "path": "crates/haider-daemond/tests/provider_rebind_rpc_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "d0e6304f19324c61d2efbb7dbcb8d5af3bdf9a35de627f0a678c25a1e84423fb"
+    },
+    {
+      "path": "crates/haider-protocol/src/session.rs",
+      "resolution": "upstream content",
+      "sha256": "4831a51448bd3cb03559195c237e5b0e702ab06bef78d35ceffe6220c6cdc0f1"
+    },
+    {
+      "path": "crates/haider-protocol/tests/golden_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "22cd6996273aa1c3a91f6af21dd667f57692cdc508c3c6519af978986d3840a4"
+    },
+    {
+      "path": "crates/haider-protocol/tests/schema_changelog_tests.rs",
+      "resolution": "clean three-way content merge",
+      "sha256": "22194ba9f78c8001af6908e5997c0a634a2ab1fde0f385b8d1a1593dcc6a15fb"
+    },
+    {
+      "path": "crates/haider-rpc/src/frame.rs",
+      "resolution": "upstream content",
+      "sha256": "1ac5b7724ea8dfbaa09068a3822df1525ae6c1910d1be1bf6b12d2c12d8f520f"
+    },
+    {
+      "path": "crates/haider-rpc/src/lib.rs",
+      "resolution": "upstream content",
+      "sha256": "a7ff62d2f3dc43c548e16f228596a872efb18c341fadf5b339fd09ecf98de05f"
+    },
+    {
+      "path": "crates/haider-rpc/tests/automation_contract_doc_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "d194334c93c778d8985e0246575dd3b10c21af22ab0e410fc3785a980f948bc5"
+    },
+    {
+      "path": "crates/haider-rpc/tests/common/mod.rs",
+      "resolution": "upstream content",
+      "sha256": "637b54da163cbf4170109b1ec4fdb3a5a67e6127298ba676fb03ea311a122ece"
+    },
+    {
+      "path": "crates/haider-rpc/tests/fixtures/provider_rebind_wire.json",
+      "resolution": "upstream content",
+      "sha256": "e29e727b4967d330e5ed406a173ebf3407638665121a77e963f3aea101d61952"
+    },
+    {
+      "path": "crates/haider-rpc/tests/wire_golden_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "b2e7d82ade307a8d91a66b6a96c96f56db26b55065f1f7844ef87e173327fb57"
+    },
+    {
+      "path": "crates/haider-store/src/event_store.rs",
+      "resolution": "clean three-way content merge",
+      "sha256": "ca3a7db6e07103ee6848bed52a7252913c7aa29769554176f5034a074b212595"
+    },
+    {
+      "path": "crates/haider-store/src/lib.rs",
+      "resolution": "upstream content",
+      "sha256": "065b755bc4e2b6b5c749dd57017be2347ddb0147b43712bf6a368e758e34f704"
+    },
+    {
+      "path": "crates/haider-store/tests/session_provider_rebind_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "a50083bedc5a21ba058a3f434ee6bef2e84404d4f8604540d0a3b55e2f9aed1a"
+    },
+    {
+      "path": "crates/haider-tui/src/live.rs",
+      "resolution": "upstream content",
+      "sha256": "a0ef7960152ce9c90b0c946254f5f98626d36a2b6e48c770982601fe22cf3545"
+    },
+    {
+      "path": "crates/haider-tui/tests/session_browser_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "d4312ef7468ffbdb9f4692288351e282bba56e795ccdb8f702c7d93d72ccb124"
+    },
+    {
+      "path": "docs/automation-contract-v1.md",
+      "resolution": "upstream content",
+      "sha256": "6d947350a3385dead6afef4787d2202c6b2ef745cd8b5f338734370454f60373"
+    },
+    {
+      "path": "docs/client-contract-v1.md",
+      "resolution": "upstream content",
+      "sha256": "09938c29a9900eaadff56634c58ccdd6eac886ee7ebb7ebba7015d19add93793"
+    },
+    {
+      "path": "docs/event-schema-changelog.md",
+      "resolution": "resolved additive changelog conflict preserving both complete sections",
+      "sha256": "1129d70dc15ae375c62f0047c7ab8b6dfd532f0483df1808bda06a8a83937ecf"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/README.md",
+      "resolution": "upstream content",
+      "sha256": "7f7eeb02c94f642779c91f2228506186dbf1e28e6f10cf08dcc7cca87a9a88c7"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/clippy-tests-attempt-1.exit",
+      "resolution": "upstream content",
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/clippy-tests-attempt-1.log",
+      "resolution": "upstream content",
+      "sha256": "4b876392a028389f5eb4e6db20bba5653ddf147b0e42472e8978cc224237a186"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/clippy-tests-preflight.exit",
+      "resolution": "upstream content",
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/clippy-tests-preflight.log",
+      "resolution": "upstream content",
+      "sha256": "8e99fc694a78bc474afe4d8696495520a4c55bfb980b0f76d09f3a6809ade724"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/clippy-tests.exit",
+      "resolution": "upstream content",
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/clippy-tests.log",
+      "resolution": "upstream content",
+      "sha256": "4aed51829e7da14553c6695e9d271560fe84e46eed566ef80c2d94b3cc2d0464"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/commands.txt",
+      "resolution": "upstream content",
+      "sha256": "649116deafce50bf4831485652323a38e4cb26e9997e258c9b8cb81ea0fe2ce9"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/diff-check.exit",
+      "resolution": "upstream content",
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/diff-check.log",
+      "resolution": "upstream content",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/disk-clippy-attempt-1.log",
+      "resolution": "upstream content",
+      "sha256": "0ed16f3eec61526bbe6a7a23ddd26ef0a640360707a0c1b8a059f78787ca855a"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/disk-clippy-preflight.log",
+      "resolution": "upstream content",
+      "sha256": "928ec5ab4465a55f2142cf76d87d41f057c0e534fc9a6ee1f1ed7d7c091b8035"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/disk-clippy.log",
+      "resolution": "upstream content",
+      "sha256": "487dd394fa335b1cf29582c86903badce7d65410fa21bebd9914fc1a4868b811"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/disk-prebuild-final.log",
+      "resolution": "upstream content",
+      "sha256": "1d46df40d1ccb0596e63ab809143138e27b508cd02e039b3086ca168d8321e84"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/disk-prebuild.log",
+      "resolution": "upstream content",
+      "sha256": "6ae99e71f5b1fc2425301413a7adad0abcaabcd40f48d452c0b065de6f557711"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/disk-test-count.log",
+      "resolution": "upstream content",
+      "sha256": "8a13d5660daf096ab7e324992c38f80b8466e9b601ae1bf270e3c65589da98bf"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/disk-workspace-tests-attempt-1.log",
+      "resolution": "upstream content",
+      "sha256": "5439d373576b9cd6c076569f8fd451cda3426ae2a69f3f4d67344c01a68f352e"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/disk-workspace-tests.log",
+      "resolution": "upstream content",
+      "sha256": "39d05bc80c992708c58efa4dd4780c0510b33a0585a92df2c0a1c12cf1158b45"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/format.exit",
+      "resolution": "upstream content",
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/format.log",
+      "resolution": "upstream content",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/sibling-file-types.log",
+      "resolution": "upstream content",
+      "sha256": "ef7f57fdd6352973b8070bdd758360b89f86442b2d1acd9ca21c6e09d55057da"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/sibling-sizes-final.json",
+      "resolution": "upstream content",
+      "sha256": "e501374562cc40e687f9f40c807c147258461d41d96f914208404089779a4228"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/sibling-sizes.json",
+      "resolution": "upstream content",
+      "sha256": "e501374562cc40e687f9f40c807c147258461d41d96f914208404089779a4228"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/siblings-build-final.exit",
+      "resolution": "upstream content",
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/siblings-build-final.log",
+      "resolution": "upstream content",
+      "sha256": "93e65aaeaeca0d12fb3d1c5d308d108732cfd015f70e16e3500718ff1a8cff5d"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/siblings-build.exit",
+      "resolution": "upstream content",
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/siblings-build.log",
+      "resolution": "upstream content",
+      "sha256": "bb76d746acf8827d33e2ea465a2a7e5fa1c6a4d49d77f76f98461f0764efb480"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/test-baseline-before.txt",
+      "resolution": "upstream content",
+      "sha256": "a8b448e0c25ec65a694e192c1ef922617442781481ad19d4e648ce3c1806e2c5"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/test-count.exit",
+      "resolution": "upstream content",
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/test-count.log",
+      "resolution": "upstream content",
+      "sha256": "abdb75b19d99af32836ae1dbef81f8b081f1f6282c0b9d27f3c9661ba5aedc08"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/verifier.md",
+      "resolution": "upstream content",
+      "sha256": "eb49a53322f6aa986fc1232ab707599d4fa82bd63128f14605d5791599b46faa"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/workspace-test-totals-attempt-1.json",
+      "resolution": "upstream content",
+      "sha256": "6592d2fbca1ab60e14b4d23519cca8a8b4f940e9b50211f8f01171bf1ba4296b"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/workspace-test-totals.json",
+      "resolution": "upstream content",
+      "sha256": "6592d2fbca1ab60e14b4d23519cca8a8b4f940e9b50211f8f01171bf1ba4296b"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/workspace-tests-attempt-1.exit",
+      "resolution": "upstream content",
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/workspace-tests-attempt-1.log",
+      "resolution": "upstream content",
+      "sha256": "b4dc2f6ef4b1ded029b39cb843d5f825a5957181e6ba2634484e9352a74977bb"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/workspace-tests.exit",
+      "resolution": "upstream content",
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-clippy-continuation/workspace-tests.log",
+      "resolution": "upstream content",
+      "sha256": "b597cc0d42eb2bcedb4ae738d2e47ec5bda314838991eed9e2a77fd34c628c76"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-continuation/clippy-tests.log",
+      "resolution": "upstream content",
+      "sha256": "a530b80b558cceefea4c7290256ff4495986788bde702432597bac1063e26fa1"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-continuation/disk-clippy.log",
+      "resolution": "upstream content",
+      "sha256": "7c1084eb990f6042aef22b5bfcee2d1ca7b72fe343d244099f64ec8652b7e89a"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-continuation/disk-prebuild.log",
+      "resolution": "upstream content",
+      "sha256": "978a7824d59d3c33f0b3a2b7738dee77c15c4c9e613a697e6dc6faec6bc53d05"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-continuation/disk-workspace-tests.log",
+      "resolution": "upstream content",
+      "sha256": "e186834bf8bb79206b10e0f1799b6dbb85030b891e6ac65888f643d02f101882"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-continuation/format.exit",
+      "resolution": "upstream content",
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-continuation/format.log",
+      "resolution": "upstream content",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-continuation/sibling-sizes.json",
+      "resolution": "upstream content",
+      "sha256": "e501374562cc40e687f9f40c807c147258461d41d96f914208404089779a4228"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-continuation/siblings-build.log",
+      "resolution": "upstream content",
+      "sha256": "77c337021d43493230327ef132c7a262a4f06a7bfd5536b827916ce0f9cd6cb1"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-continuation/workspace-test-totals.json",
+      "resolution": "upstream content",
+      "sha256": "6592d2fbca1ab60e14b4d23519cca8a8b4f940e9b50211f8f01171bf1ba4296b"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-continuation/workspace-tests.exit",
+      "resolution": "upstream content",
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind-continuation/workspace-tests.log",
+      "resolution": "upstream content",
+      "sha256": "7ea51c3f3a7e4cf7f9e5cd3b5d4bcf9b47b80537c2de6d16970acbfd5003b320"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind.md",
+      "resolution": "upstream content",
+      "sha256": "be2a817f3cc08c70a331777330fad59e380c0dc9f6245d416c8fbd59b01e8736"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/abba/1-A.json",
+      "resolution": "upstream content",
+      "sha256": "5add013e91aaec334dde288de15708793cdfeeb097e8daa3aec5f740359a7bcf"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/abba/1-A.stdout",
+      "resolution": "upstream content",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/abba/2-B.json",
+      "resolution": "upstream content",
+      "sha256": "8c70e86fc434bff2b4e4de36d49b247450beaacc84ec9492ba5ea859dab3e969"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/abba/2-B.stdout",
+      "resolution": "upstream content",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/abba/3-B.json",
+      "resolution": "upstream content",
+      "sha256": "b219272c5659f7109127d2fecfe6fad7725bb1e1e824b663674a2f315d52f76b"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/abba/3-B.stdout",
+      "resolution": "upstream content",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/abba/4-A.json",
+      "resolution": "upstream content",
+      "sha256": "4b338fb591824a52071bf4ecaffcb4bbcd40303887dbe26bf22f4829f94d42af"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/abba/4-A.stdout",
+      "resolution": "upstream content",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/abba/load-readiness.jsonl",
+      "resolution": "upstream content",
+      "sha256": "313f33a0303ca1bc4779fdb1cb47db6ac9c7b11041fb3e51e5446fafbab9f674"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/abba/release-A-build.log",
+      "resolution": "upstream content",
+      "sha256": "8f3ef992a0ce5c98f2feee73f429015809ffeec13b9d9e57e7fc9f7b108b673e"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/abba/release-B-build.log",
+      "resolution": "upstream content",
+      "sha256": "e27715c9fcd991261bdeb7da558ee2d93a8b9a6f8039ac5eb446fb0812bb79ee"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/abba/release-manifest.json",
+      "resolution": "upstream content",
+      "sha256": "a81113c09c5ae1271fa911916bc45c8d7c4ef8fa649b874b4b2025cb51318eea"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/abba/run-abba.sh",
+      "resolution": "upstream content",
+      "sha256": "329f5028030e31db586e65d86fbbbeb03801d5aa626a5af5831ed3c16a548703"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/abba/summarize-abba.py",
+      "resolution": "upstream content",
+      "sha256": "4ffc04f4b0777e14b1afe09df0bb166d9b78edb0c9e7bd51d8659c8b02625e5b"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/abba/summary.json",
+      "resolution": "upstream content",
+      "sha256": "074c3a0d5ab83be5eb2e4a2c8e2936c0ff476c316c6d5d42a69457796ed04ceb"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/baseline-source-check.json",
+      "resolution": "upstream content",
+      "sha256": "bf886b585eedf3570143fcdba3bc70b07a2c3e112b17a50477071f403c6fc90a"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/cli-smoke.json",
+      "resolution": "upstream content",
+      "sha256": "680a323b4246abc25eb528ad32bad1407829baba58275f52b3c0e27d990522a4"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/gate-summary.json",
+      "resolution": "upstream content",
+      "sha256": "60a1768e36d4bc39cb9c27c4d0b8765123e0d95e65b5509af4d2f35e85bf5121"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/qa-gate.log",
+      "resolution": "upstream content",
+      "sha256": "ccd2a0236d0ccf30bfa265f4960ed2908ff408371132eb4017cbefb1c7f2e23d"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/recovery-tests.log",
+      "resolution": "upstream content",
+      "sha256": "43fa5449449da969ea79a65830a1c9baa8c621e7b41ad45008156edb9b3d16d9"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/rpc-proxy-tests.log",
+      "resolution": "upstream content",
+      "sha256": "f6e4ab4cb98ee042bfe8ff4956e8f8bfc7ac86d7e9c8b67a070a7048cf6c69d1"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/test-count.log",
+      "resolution": "upstream content",
+      "sha256": "a763fbbad971bba7ad99ee02981077430999981097a234e8aee76f02ce432bb0"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/turnhygiene.log",
+      "resolution": "upstream content",
+      "sha256": "ffb6006906cf77a6ea0eb1cc16b1507759b4716ea92b41d727b09ab9553d7882"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/verifier.md",
+      "resolution": "upstream content",
+      "sha256": "128ad9ca5799f0424f3255dc1f663a215fa2f95957ceb496ebef9cc4a441a1bd"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/wire-goldens.log",
+      "resolution": "upstream content",
+      "sha256": "c6fe6f240d27f19d5c1f07512fedcb97d3a0a4281325c06b7fb5614d94b8fa9d"
+    },
+    {
+      "path": "docs/testing/v0.0.970/providerrebind/workspace-tests.log",
+      "resolution": "upstream content",
+      "sha256": "d330cd1811e2e164768084e8068dccffbcf00a1c6ea6fbbc7b74c009d8f8cf74"
+    },
+    {
+      "path": "scripts/qa-gate/CI_REGISTRY_WALK_QAGATE3.md",
+      "resolution": "upstream content",
+      "sha256": "41b0006dbe086ef526cbc130c8f65c241051a60ad99ba2a220c3724160f29254"
+    },
+    {
+      "path": "test-baseline.txt",
+      "resolution": "retained pending xtask recount",
+      "sha256": "34d1eb4d5a102bb441143c544509f03ba95ff5890e3d2433091380f9aeac9d27"
+    }
+  ]
+}

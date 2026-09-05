@@ -147,6 +147,7 @@ session_config_kinds! {
     SessionConfigEventPayload::SessionSeen { .. } => "session_seen",
     SessionConfigEventPayload::EffortSelected(_) => "effort_selected",
     SessionConfigEventPayload::FastModeSelected(_) => "fast_mode_selected",
+    SessionConfigEventPayload::SessionProviderRebound(_) => "session_provider_rebound",
     SessionConfigEventPayload::AgentTypeSelected(_) => "agent_type_selected",
 }
 
@@ -209,4 +210,32 @@ fn every_current_automation_kind_is_pinned_in_the_schema_changelog() {
     assert_documented(&changelog, "session_config", SESSION_CONFIG_KINDS);
     assert_documented(&changelog, "workspace", WORKSPACE_KINDS);
     assert_documented(&changelog, "terminal", terminal_kinds());
+}
+
+#[test]
+fn journalview_additions_are_documented_without_a_schema_bump() {
+    use haider_protocol::context_compaction::ContextCompactionEventPayload;
+    fn kind(payload: &ContextCompactionEventPayload) -> &str {
+        match payload {
+            ContextCompactionEventPayload::ContextCompaction(_) => "context_compaction",
+        }
+    }
+    let _ = kind;
+    let changelog = include_str!("../../../docs/event-schema-changelog.md");
+    assert_documented(changelog, "journalview", ["context_compaction"]);
+    for field in [
+        "provider_request",
+        "provider_finish_reason",
+        "provider_terminal_cause",
+        "provider_purpose",
+        "provider_rounds",
+        "dropped_item_count",
+        "retained_suffix_size",
+    ] {
+        assert!(
+            changelog.contains(field),
+            "missing journalview field: {field}"
+        );
+    }
+    assert_eq!(haider_protocol::envelope::SCHEMA_VERSION, 1);
 }

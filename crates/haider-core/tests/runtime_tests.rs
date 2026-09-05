@@ -7,10 +7,10 @@ use haider_core::{
     HarnessHandle, MemoryStore, PromptHistoryCompiler, ProviderAttemptDecision,
     ProviderAttemptResolver, ProviderBudgetGuard, ProviderBudgetGuardError, ProviderBudgetPermit,
     ProviderPairSwitch, ProviderPairSwitchCause, ProviderPairSwitchCommitter,
-    ProviderPairSwitchTarget, ResolvedProviderAttempt, RouteWaitCheckpoint,
-    RouteWaitTextCheckpoint, RouteWaitToolCheckpoint, StoreHandle, SubmitCommittedTurn,
-    SubmitRouteWaitTurn, SubmitTurn, ToolDispatchResult, ToolDispatcher,
-    VISION_IMAGE_ESTIMATE_TOKENS, estimate_provider_request_input_tokens,
+    ProviderPairSwitchTarget, ProviderRebindResolver, ProviderRebindTarget,
+    ResolvedProviderAttempt, RouteWaitCheckpoint, RouteWaitTextCheckpoint, RouteWaitToolCheckpoint,
+    StoreHandle, SubmitCommittedTurn, SubmitRouteWaitTurn, SubmitTurn, ToolDispatchResult,
+    ToolDispatcher, VISION_IMAGE_ESTIMATE_TOKENS, estimate_provider_request_input_tokens,
 };
 use haider_platform::RouteStatus;
 use haider_protocol::EventPayload;
@@ -135,12 +135,40 @@ fn normalize(mut payload: serde_json::Value) -> serde_json::Value {
 
 fn assert_items_closed_before_terminal(events: &[RawEnvelope]) {
     let mut open = HashSet::<ItemId>::new();
+    let mut finished_requests = HashSet::new();
     let mut saw_terminal = false;
     for event in events {
         assert!(!saw_terminal, "an envelope followed the terminal run state");
         match typed(event) {
             EventPayload::Item(ItemEvent::Started { item_id, .. }) => {
                 assert!(open.insert(item_id), "an item started twice");
+            }
+            EventPayload::Item(ItemEvent::Completed {
+                item_id,
+                item: TurnItem::Extension { kind, data },
+            }) if kind == "provider_round_terminal_v1" => {
+                assert!(open.remove(&item_id), "completed item was not open");
+                // Terminal metadata obeys the same paired item lifecycle and
+                // additionally pins one exact Finish per physical request.
+                let request: haider_protocol::cache::ProviderRequestAttemptV1 =
+                    serde_json::from_value(event.payload["provider_request"].clone())
+                        .expect("terminal fact request correlation");
+                assert!(request.coordinates_valid());
+                assert_eq!(request.session_id, event.session_id);
+                assert_eq!(Some(&request.run_id), event.run_id.as_ref());
+                assert!(finished_requests.insert((
+                    request.run_id,
+                    request.turn_ordinal,
+                    request.request_ordinal,
+                )));
+                let reason: FinishReason =
+                    serde_json::from_value(event.payload["provider_finish_reason"].clone())
+                        .expect("terminal fact Finish");
+                assert_eq!(data, serde_json::json!({"reason": reason}));
+                assert_eq!(
+                    serde_json::to_value(event.render).expect("render"),
+                    serde_json::json!({"ui": false, "durable": true, "prompt": "omit"})
+                );
             }
             EventPayload::Item(ItemEvent::Completed { item_id, .. }) => {
                 assert!(open.remove(&item_id), "completed item was not open");
@@ -476,7 +504,7 @@ async fn full_turn_commits_exact_projected_sequence() {
         .iter()
         .find_map(|event| event.run_id.as_ref())
         .expect("turn event run id");
-    let expected = vec![
+    let mut expected = vec![
         serde_json::json!({"type":"run_state","state":"queued"}),
         serde_json::json!({
             "type":"user_message",
@@ -782,8 +810,32 @@ async fn full_turn_commits_exact_projected_sequence() {
                 }
             }
         }),
-        serde_json::json!({"type":"run_state","state":"done"}),
+        serde_json::json!({
+            "type":"item", "event":"started", "item_id":"<item>",
+            "item":{"item":"extension", "kind":"provider_round_terminal_v1",
+                "data":{"reason":"tool_use"}}
+        }),
+        serde_json::json!({
+            "type":"item", "event":"completed", "item_id":"<item>",
+            "item":{"item":"extension", "kind":"provider_round_terminal_v1",
+                "data":{"reason":"tool_use"}},
+            "provider_finish_reason":"tool_use"
+        }),
+        serde_json::json!({"type":"run_state","state":"done", "provider_finish_reason":"tool_use"}),
     ];
+    let correlation = serde_json::json!({
+        "session_id": SESSION,
+        "run_id": correlation_run_id,
+        "turn_ordinal": 1,
+        "request_ordinal": 1,
+        "request_kind": "primary"
+    });
+    // This one-request fixture activates correlation at Thinking, after its
+    // three acceptance events. Compare every additive field without stripping
+    // metadata from the actual stream.
+    for payload in &mut expected[3..] {
+        payload["provider_request"] = correlation.clone();
+    }
     assert_eq!(actual, expected);
     assert!(events.windows(2).all(|pair| pair[1].seq == pair[0].seq + 1));
     assert!(
@@ -4882,6 +4934,195 @@ async fn rotation_is_once_pre_first_event_and_durable_before_the_alternate() {
     );
 }
 
+/// Rebind factory-time rotation obeys the same durable-before-POST law as a
+/// turn's initial account resolution, including publishing pending Thinking.
+#[tokio::test]
+async fn provider_rebind_initial_rotation_is_durable_before_target_request() {
+    let store = Arc::new(MemoryStore::new());
+    let target = Arc::new(RotationAwareFinishProvider {
+        store: store.clone(),
+        requests: AtomicUsize::new(0),
+        saw_rotation_before_request: AtomicBool::new(false),
+        cache_account: Mutex::new(None),
+    });
+    let rotation = RotationEvent {
+        provider: "fake".into(),
+        from: CredentialAlias::new("rebind-a"),
+        to: CredentialAlias::new("rebind-b"),
+        cause: RotationCause::RateLimit,
+    };
+    let original = Arc::new(FakeProvider::new(Vec::new()));
+    let mut cfg = config();
+    cfg.usage_account = Some(rotation.from.clone());
+    cfg.provider_rebind_resolver = Some(Arc::new(OneRebindResolver(Mutex::new(Some(
+        ProviderRebindTarget {
+            provider: target.clone(),
+            provider_name: "fake".into(),
+            account: Some(rotation.to.clone()),
+            context_window: None,
+            cached_input_is_subset: false,
+            provider_request_state: Default::default(),
+            auth_scope: "api_key".into(),
+            attempt_resolver: None,
+            route_epoch: "factory-rotated-rebind".into(),
+            initial_rotation: Some(rotation.clone()),
+            // The Rotation itself also spends the budget; these two facts
+            // need not be redundant for every resolver implementation.
+            rotation_budget_consumed: false,
+        },
+    )))));
+    let handle = HarnessActor::spawn(cfg, original.clone(), store.clone());
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("rebind factory rotated"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert!(original.requests().is_empty());
+    assert_eq!(target.requests.load(Ordering::SeqCst), 1);
+    assert!(target.saw_rotation_before_request.load(Ordering::SeqCst));
+    assert_eq!(
+        *target.cache_account.lock().expect("cache scope"),
+        Some(("rebind-b".into(), None))
+    );
+    let events = store.events(&SessionId::new(SESSION)).await;
+    let rotations: Vec<_> = events
+        .iter()
+        .filter_map(|event| match typed(event) {
+            EventPayload::Rotation(value) => Some((event.seq, value)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rotations.len(), 1);
+    assert_eq!(rotations[0].1, rotation);
+    assert!(
+        events.iter().any(|event| event.seq < rotations[0].0
+            && matches!(typed(event), EventPayload::RunState(RunState::Thinking))),
+        "pending Thinking must be committed before the rebind Rotation"
+    );
+    handle.stop().await.expect("actor stops");
+}
+
+/// The target's consumed flag, its factory rotation, and the turn's prior
+/// consumed flag independently forbid another automatic rotation on auth
+/// failure. A fresh-budget control proves the target resolver is reachable.
+#[tokio::test]
+async fn provider_rebind_cannot_refund_or_drop_consumed_rotation_budget() {
+    for (prior_consumed, target_consumed, with_rotation) in [
+        (false, true, false),
+        (false, false, true),
+        (true, false, false),
+        (false, false, false),
+    ] {
+        let store = Arc::new(MemoryStore::new());
+        let failed_target = Arc::new(CountingOpeningErrorProvider::inspecting(
+            ProviderError::new(
+                ProviderErrorKind::Authentication,
+                "rebound account rejects auth",
+            ),
+            store.clone(),
+        ));
+        let alternate = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        }]));
+        let resolver = Arc::new(ScriptedRotationResolver {
+            calls: AtomicUsize::new(0),
+            first: alternate.clone(),
+            first_alias: CredentialAlias::new("rebind-c"),
+            second: alternate.clone(),
+            second_alias: CredentialAlias::new("rebind-d"),
+        });
+        let rotation = with_rotation.then(|| RotationEvent {
+            provider: "fake".into(),
+            from: CredentialAlias::new("rebind-a"),
+            to: CredentialAlias::new("rebind-b"),
+            cause: RotationCause::Error,
+        });
+        let mut cfg = config();
+        cfg.usage_account = Some(CredentialAlias::new("rebind-a"));
+        cfg.rotation_budget_consumed = prior_consumed;
+        cfg.provider_rebind_resolver = Some(Arc::new(OneRebindResolver(Mutex::new(Some(
+            ProviderRebindTarget {
+                provider: failed_target.clone(),
+                provider_name: "fake".into(),
+                account: Some(CredentialAlias::new("rebind-b")),
+                context_window: None,
+                cached_input_is_subset: false,
+                provider_request_state: Default::default(),
+                auth_scope: "api_key".into(),
+                attempt_resolver: Some(resolver.clone()),
+                route_epoch: "rebind-budget".into(),
+                initial_rotation: rotation,
+                rotation_budget_consumed: target_consumed,
+            },
+        )))));
+        let handle =
+            HarnessActor::spawn(cfg, Arc::new(FakeProvider::new(Vec::new())), store.clone());
+        let outcome = handle
+            .submit_turn(SubmitTurn::new("rebind auth failure"))
+            .await
+            .expect("turn accepted")
+            .wait()
+            .await
+            .expect("turn outcome");
+        let consumed = prior_consumed || target_consumed || with_rotation;
+        assert_eq!(
+            outcome.state,
+            if consumed {
+                RunState::Errored
+            } else {
+                RunState::Done
+            },
+            "prior={prior_consumed} target={target_consumed} rotation={with_rotation}"
+        );
+        assert_eq!(
+            resolver.calls.load(Ordering::SeqCst),
+            usize::from(!consumed)
+        );
+        assert_eq!(alternate.requests().len(), usize::from(!consumed));
+        assert_eq!(failed_target.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            failed_target
+                .saw_rotation_before_request
+                .load(Ordering::SeqCst),
+            with_rotation
+        );
+        assert_eq!(
+            store
+                .events(&SessionId::new(SESSION))
+                .await
+                .iter()
+                .filter(|event| matches!(typed(event), EventPayload::Rotation(_)))
+                .count(),
+            usize::from(with_rotation) + usize::from(!consumed)
+        );
+        handle.stop().await.expect("actor stops");
+    }
+}
+
+struct OneRebindResolver(Mutex<Option<ProviderRebindTarget>>);
+
+impl std::fmt::Debug for OneRebindResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OneRebindResolver")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl ProviderRebindResolver for OneRebindResolver {
+    async fn refresh(
+        &self,
+        _model: &str,
+        _reasoning: &str,
+    ) -> Result<Option<ProviderRebindTarget>, HaiderError> {
+        Ok(self.0.lock().expect("one rebind snapshot").take())
+    }
+}
+
 /// H2: a resolver that decides `Retry` (credential refresh) on EVERY 401 must
 /// not loop forever. The refresh is budgeted under `MAX_API_RETRIES`, so a
 /// persistently-failing 401 falls through to `Errored` within a bound instead
@@ -5708,9 +5949,10 @@ async fn actor_restarts_do_not_reuse_run_or_item_ids() {
             .iter()
             .any(|id| id.starts_with("run-session-test-24-"))
     );
-    // Each request has a cache diagnostic, visible request-budget status and
-    // assistant item. Six unique IDs prove none are reused across restart.
-    assert_eq!(item_ids.len(), 6);
+    // Each request has a cache diagnostic, request-budget status, assistant
+    // item and paired Finish marker. Eight unique IDs prove none are reused
+    // across restart, including the newly allocated terminal markers.
+    assert_eq!(item_ids.len(), 8);
     assert!(
         item_ids
             .iter()
@@ -5740,15 +5982,16 @@ async fn memory_store_allocates_and_reads_committed_sequences() {
         StoreHandle::latest_seq(store.as_ref(), &SessionId::new(SESSION))
             .await
             .expect("latest"),
-        // The budget status adds Started + Completed to the former 8 events.
-        10
+        // Budget status adds Started + Completed to the former 8 events;
+        // the paired provider Finish marker adds two more: 8 + 2 + 2.
+        12
     );
     let tail = StoreHandle::read(store.as_ref(), &SessionId::new(SESSION), 3, 10)
         .await
         .expect("read");
     assert_eq!(
         tail.iter().map(|event| event.seq).collect::<Vec<_>>(),
-        vec![4, 5, 6, 7, 8, 9, 10]
+        vec![4, 5, 6, 7, 8, 9, 10, 11, 12]
     );
 }
 

@@ -1,0 +1,22 @@
+Command: env RUST_MIN_STACK=8388608 HAIDER_DISCOVERY_DISABLED=1 HAIDER_TEST_DEVICE_NAME=test-mac CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 HAIDER_TEST_SIBLINGS_PREBUILT=1 cargo test -p haider-daemon --lib provider_rebind
+Last prebuild disk check: 18490 MiB available.
+Captured completion output:
+    Finished `test` profile [unoptimized] target(s) in 2m 25s
+     Running unittests src/lib.rs (target/debug/deps/haider_daemon-d1b756653db6a16e)
+
+running 11 tests
+test session_hub::rpc::provider_rebind::tests::provider_rebind_frozen_policy_compares_actual_permission_bits ... ok
+test accounts::accounts_tests::provider_rebind::provider_rebind_selected_unknown_or_other_provider_account_fails_before_build ... ok
+test accounts::accounts_tests::provider_rebind::provider_rebind_endpoint_overrides_both_coordinates_without_global_mutation ... ok
+test accounts::accounts_tests::provider_rebind::provider_rebind_cache_reuses_same_route_and_separates_changed_endpoint ... ok
+test accounts::accounts_tests::provider_rebind::provider_rebind_two_registered_custom_providers_use_their_selected_accounts ... ok
+test worker::provider_rebind::tests::provider_rebind_recovery_rejects_changed_frozen_permissions_and_lockdown_provider ... ok
+test worker::provider_rebind::tests::provider_rebind_rejects_keyless_adapter_resolved_after_full_policy_receipt ... ok
+test worker::provider_rebind::tests::provider_rebind_new_identity_rebuilds_same_route_using_current_model ... ok
+test worker::provider_rebind::tests::provider_rebind_after_automatic_model_change_builds_current_live_request_configuration ... ok
+test session_hub::rpc::provider_rebind::tests::provider_rebind_guard_uses_frozen_binding_after_nonterminal_model_selection ... ok
+test worker::provider_rebind::tests::provider_rebind_cross_provider_active_recovery_preserves_route_run_model_and_authority ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 1053 filtered out; finished in 0.40s
+
+

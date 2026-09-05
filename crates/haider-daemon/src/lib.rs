@@ -60,6 +60,7 @@ mod auto_hermetic;
 #[cfg(test)]
 #[path = "auto_hermetic_tests.rs"]
 mod auto_hermetic_tests;
+mod binary_upload;
 mod cache_policy;
 #[cfg(test)]
 mod cache_policy_tests;

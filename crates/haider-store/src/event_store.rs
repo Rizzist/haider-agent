@@ -6,7 +6,9 @@
 //! - An envelope is TRUE only once [`EventStore::append`] returns. Publishing
 //!   committed envelopes to live subscribers is the caller's duty.
 //! - The `envelope_json` column stores the authoritative encoded record: JSON
-//!   text for legacy rows and MessagePack for current rows. Each row's bytes
+//!   text for legacy rows and MessagePack for current rows, with a private
+//!   CAS-backed record for large text. Reads hydrate that text before exposing
+//!   the unchanged envelope schema. Each row's bytes
 //!   remain authoritative and immutable;
 //!   the `seq` / `event_id` / `committed_at_ms` columns are denormalized
 //!   copies for indexing, cross-checked against the record on every read.
@@ -33,6 +35,7 @@ use haider_protocol::checkpoint::{
     CHECKPOINT_LIST_MAX_PAGE, CheckpointCursor, CheckpointListPage, CheckpointRecorded,
 };
 use haider_protocol::context::ContextEconomy;
+use haider_protocol::context_compaction::ContextCompactionEventPayload;
 use haider_protocol::credential::CredentialDescriptor;
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectOutcome, EffectPhase, WorkspaceMutation,
@@ -94,7 +97,7 @@ use haider_protocol::reply::{ReplyArenaWriter, ReplyText};
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::session::{
     EffortSelected, FastModeSelected, ModelSelected, SessionInteractionModeV1, SessionMetadataV1,
-    SessionPermissionOverridesV1,
+    SessionPermissionOverridesV1, SessionProviderRebound,
 };
 use haider_protocol::session_fork::{
     ForkCacheSegmentV1, ForkContextEpoch, SessionForkDraft, SessionForkInvalidCutReason,
@@ -126,6 +129,9 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
+
+#[path = "event_text_cas.rs"]
+mod event_text_cas;
 
 #[cfg(test)]
 #[path = "event_store_append_tests.rs"]
@@ -1310,6 +1316,46 @@ pub enum SessionSelectFastOutcome {
     },
     IdempotentReplay {
         selected: SelectedFast,
+    },
+}
+
+/// Validated secret-free coordinates for one session endpoint rebind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionProviderRebindCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub provider: String,
+    pub base_url: Option<String>,
+    pub account: Option<String>,
+    pub event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Stable response stored in the `session.provider.rebind` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReboundSessionProvider {
+    pub session_id: SessionId,
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    pub selected_seq: u64,
+    pub worker_generation: u64,
+}
+
+/// Atomic metadata/event/receipt outcome for one session provider rebind.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionProviderRebindOutcome {
+    Committed {
+        selected: ReboundSessionProvider,
+        envelope: Box<RawEnvelope>,
+    },
+    IdempotentReplay {
+        selected: ReboundSessionProvider,
     },
 }
 
@@ -4704,7 +4750,7 @@ impl Store {
                 let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
                 let cursor = u64::try_from(stored_seq)
                     .map_err(|_| corrupt("workflow graph event has a negative cursor"))?;
-                let envelope = decode_envelope_column(row, 1).map_err(|error| {
+                let envelope = decode_envelope_column(&transaction, row, 1).map_err(|error| {
                     corrupt(format!(
                         "invalid workflow graph envelope at {session_id}:{cursor}: {error}"
                     ))
@@ -8138,6 +8184,8 @@ impl Store {
         )?;
 
         let metadata = SessionMetadataV1 {
+            provider_base_url: None,
+            provider_rebind_id: None,
             cwd: command.cwd.clone(),
             provider: command.provider.clone(),
             account_alias,
@@ -8291,7 +8339,7 @@ impl Store {
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
-                        decode_envelope_column(row, 1),
+                        decode_envelope_column(&connection, row, 1),
                         row.get::<_, String>(2)?,
                         row.get::<_, i64>(3)?,
                     ))
@@ -9279,6 +9327,16 @@ impl Store {
                 false,
             ));
         }
+        if metadata.provider != command.provider {
+            // A route override belongs to its selected provider. A later
+            // ordinary model selection must never carry that endpoint or a
+            // rebind-pinned account into a different adapter.
+            if metadata.provider_rebind_id.is_some() {
+                metadata.account_alias = None;
+            }
+            metadata.provider_base_url = None;
+            metadata.provider_rebind_id = None;
+        }
         metadata.provider = command.provider.clone();
         metadata.model = command.model.clone();
         let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
@@ -10096,6 +10154,81 @@ impl Store {
             }
             SessionConfigOutcome::IdempotentReplay { selected } => {
                 SessionSelectFastOutcome::IdempotentReplay { selected }
+            }
+        })
+    }
+
+    /// Preflight a committed receipt before registry or generation validation.
+    pub fn session_provider_rebind_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<ReboundSessionProvider>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "session.provider.rebind",
+            request_digest,
+            request_json,
+            "session-provider-rebind",
+        )
+    }
+
+    /// Commit a daemon-validated route and its replayable fact in one transaction.
+    /// The provider registry is validated by the daemon; the store fences the
+    /// session generation and preserves the selected model and conversation.
+    pub fn rebind_session_provider(
+        &self,
+        command: &SessionProviderRebindCommand,
+    ) -> StoreResult<SessionProviderRebindOutcome> {
+        let rebound = SessionProviderRebound {
+            rebind_id: command.command_id.clone(),
+            provider: command.provider.clone(),
+            base_url: command.base_url.clone(),
+            account: command.account.clone(),
+        };
+        let fact = rebound.to_payload_value().map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize session-provider-rebound payload: {error}"),
+                false,
+            )
+        })?;
+        let session_id = command.session_id.clone();
+        let generation = self.worker_generation;
+        let outcome = self.select_session_config(
+            SessionConfigSelection {
+                command_id: &command.command_id,
+                request_digest: &command.request_digest,
+                request_json: &command.request_json,
+                session_id: &command.session_id,
+                worker_generation: command.worker_generation,
+                method: "session.provider.rebind",
+                description: "session-provider-rebind",
+                event_id: command.event_id.clone(),
+                device_id: command.device_id.clone(),
+            },
+            fact,
+            |_| Ok(()),
+            |metadata| rebound.apply_to_metadata(metadata),
+            |selected_seq| ReboundSessionProvider {
+                session_id,
+                provider: command.provider.clone(),
+                base_url: command.base_url.clone(),
+                account: command.account.clone(),
+                selected_seq,
+                worker_generation: generation,
+            },
+        )?;
+        Ok(match outcome {
+            SessionConfigOutcome::Committed { selected, envelope } => {
+                SessionProviderRebindOutcome::Committed { selected, envelope }
+            }
+            SessionConfigOutcome::IdempotentReplay { selected } => {
+                SessionProviderRebindOutcome::IdempotentReplay { selected }
             }
         })
     }
@@ -12075,7 +12208,7 @@ impl Store {
         while let Some(row) = rows.next().map_err(map_sqlite_error)? {
             let session_id: String = row.get(0).map_err(map_sqlite_error)?;
             let seq: i64 = row.get(1).map_err(map_sqlite_error)?;
-            let envelope = decode_envelope_column(row, 2).map_err(|error| {
+            let envelope = decode_envelope_column(&connection, row, 2).map_err(|error| {
                 corrupt(format!(
                     "invalid hook-outbox envelope for session {session_id}, seq {seq}: {error}"
                 ))
@@ -12105,7 +12238,9 @@ impl Store {
     /// or decoded by this query.
     ///
     /// The first row is always returned when `limit > 0`, even when its
-    /// encoded envelope exceeds `byte_budget`. The encoded length is used
+    /// logical encoded envelope exceeds `byte_budget`. CAS-backed records
+    /// carry that original length in their fixed header so references cannot
+    /// undercharge this page. The encoded length is used
     /// only to retain the same forward-progress and page-bound contract as
     /// [`Self::pending_hook_dispatches_bounded`].
     pub fn pending_hook_dispatch_metadata_bounded(
@@ -12124,7 +12259,10 @@ impl Store {
         let mut statement = connection
             .prepare_cached(
                 "SELECT e.session_id, e.seq, o.run_id, e.payload_kind,
-                        length(e.envelope_json), o.workspace_unavailable
+                        CASE WHEN substr(e.envelope_json, 1, 17) = X'C16861696465722E746578742D63617301'
+                             THEN CAST(substr(e.envelope_json, 18, 20) AS INTEGER)
+                             ELSE length(e.envelope_json)
+                        END, o.workspace_unavailable
                  FROM hook_dispatch_outbox AS o
                  JOIN events AS e
                    ON e.session_id = o.session_id AND e.seq = o.seq
@@ -12218,7 +12356,7 @@ impl Store {
         let Some(row) = rows.next().map_err(map_sqlite_error)? else {
             return Ok(None);
         };
-        let envelope = decode_envelope_column(row, 0).map_err(|error| {
+        let envelope = decode_envelope_column(&connection, row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid hook-outbox envelope for session {session_id}, seq {seq}: {error}"
             ))
@@ -13184,7 +13322,7 @@ impl Store {
             let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
             let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
             let stored_committed_at_ms: i64 = row.get(3).map_err(map_sqlite_error)?;
-            let envelope = decode_envelope_column(row, 1).map_err(|error| {
+            let envelope = decode_envelope_column(&connection, row, 1).map_err(|error| {
                 corrupt(format!(
                     "invalid envelope for session {session}, seq {stored_seq}: {error}"
                 ))
@@ -13976,7 +14114,7 @@ fn validate_request_budget_continuation(
         .query([command.session_id.as_str()])
         .map_err(map_sqlite_error)?;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let envelope = decode_envelope_column(row, 0)
+        let envelope = decode_envelope_column(transaction, row, 0)
             .map_err(|error| corrupt(format!("invalid continuation envelope: {error}")))?;
         if envelope.run_id.as_ref() != Some(source)
             || envelope.branch_id != command.branch_id
@@ -14134,7 +14272,7 @@ fn graph_evidence_provenance(
         .map_err(map_sqlite_error)?;
     let mut recorded = Vec::<(RawEnvelope, EvidenceRecorded)>::new();
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let envelope = decode_envelope_column(row, 0).map_err(|error| {
+        let envelope = decode_envelope_column(connection, row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid graph provenance envelope in session {session_id}: {error}"
             ))
@@ -14187,7 +14325,7 @@ fn graph_evidence_provenance(
             ])
             .map_err(map_sqlite_error)?;
         while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-            let envelope = decode_envelope_column(row, 0).map_err(|error| {
+            let envelope = decode_envelope_column(connection, row, 0).map_err(|error| {
                 corrupt(format!(
                     "invalid graph signal provenance envelope in session {session_id}: {error}"
                 ))
@@ -14241,7 +14379,7 @@ fn graph_evidence_provenance(
             ])
             .map_err(map_sqlite_error)?;
         while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-            let envelope = decode_envelope_column(row, 0).map_err(|error| {
+            let envelope = decode_envelope_column(connection, row, 0).map_err(|error| {
                 corrupt(format!(
                     "invalid graph mutation provenance envelope in session {session_id}: {error}"
                 ))
@@ -14393,7 +14531,7 @@ fn load_graph_reduction_envelopes(
         .map_err(map_sqlite_error)?;
     let mut envelopes = Vec::new();
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        envelopes.push(decode_envelope_column(row, 0).map_err(|error| {
+        envelopes.push(decode_envelope_column(connection, row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid graph-reduction envelope in session {session_id}: {error}"
             ))
@@ -14430,7 +14568,7 @@ fn load_workflow_backfill_envelopes(
     let mut envelopes = Vec::new();
     let mut resident_bytes = 0_usize;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let envelope = decode_envelope_column(row, 0).map_err(|error| {
+        let envelope = decode_envelope_column(connection, row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid workflow-backfill envelope in session {session_id}: {error}"
             ))
@@ -14463,7 +14601,7 @@ fn backfill_payload_kinds(connection: &mut Connection) -> StoreResult<()> {
         let mut decoded = Vec::new();
         while let Some(row) = rows.next().map_err(map_sqlite_error)? {
             let rowid: i64 = row.get(0).map_err(map_sqlite_error)?;
-            let envelope = decode_envelope_column(row, 1).map_err(|error| {
+            let envelope = decode_envelope_column(connection, row, 1).map_err(|error| {
                 corrupt(format!(
                     "invalid legacy envelope during payload-kind backfill: {error}"
                 ))
@@ -14526,7 +14664,7 @@ fn load_graph_telemetry_envelopes(
         .map_err(map_sqlite_error)?;
     let mut envelopes = Vec::new();
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        envelopes.push(decode_envelope_column(row, 0).map_err(|error| {
+        envelopes.push(decode_envelope_column(connection, row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid graph telemetry envelope in session {session_id}: {error}"
             ))
@@ -15465,7 +15603,7 @@ fn validate_computer_observation_effect(
     };
 
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let envelope = decode_envelope_column(row, 0).map_err(|error| {
+        let envelope = decode_envelope_column(transaction, row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid effect envelope in session {session_id}: {error}"
             ))
@@ -15677,7 +15815,7 @@ fn load_workspace_mutation(
         .query([session_id.as_str()])
         .map_err(map_sqlite_error)?;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let envelope = decode_envelope_column(row, 0).map_err(|error| {
+        let envelope = decode_envelope_column(transaction, row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid workspace-mutation envelope in session {session_id}: {error}"
             ))
@@ -15734,7 +15872,7 @@ fn load_workspace_mutation(
             .map_err(map_sqlite_error)?;
         let mut matched_intent = false;
         while let Some(row) = intent_rows.next().map_err(map_sqlite_error)? {
-            let intent_envelope = decode_envelope_column(row, 0).map_err(|error| {
+            let intent_envelope = decode_envelope_column(transaction, row, 0).map_err(|error| {
                 corrupt(format!(
                     "invalid effect envelope in session {session_id}: {error}"
                 ))
@@ -15975,7 +16113,7 @@ fn load_child_graph_attachments(
         .map_err(map_sqlite_error)?;
     let mut attached = Vec::new();
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let envelope = decode_envelope_column(row, 0).map_err(|error| {
+        let envelope = decode_envelope_column(connection, row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid child attachment envelope in session {session_id}: {error}"
             ))
@@ -16070,7 +16208,7 @@ fn load_child_template_observations(
     let mut rows = statement.query([]).map_err(map_sqlite_error)?;
     let mut observed = Vec::new();
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let envelope = decode_envelope_column(row, 0).map_err(|error| {
+        let envelope = decode_envelope_column(connection, row, 0).map_err(|error| {
             corrupt(format!("invalid child cache observation envelope: {error}"))
         })?;
         if let Ok(EventPayload::ChildTemplateObserved(item)) = envelope.payload.decode_event() {
@@ -16471,7 +16609,7 @@ fn process_signals_since(
         .map_err(map_sqlite_error)?;
     let mut signals = Vec::new();
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let envelope = decode_envelope_column(row, 0).map_err(|error| {
+        let envelope = decode_envelope_column(transaction, row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid process-signal envelope in session {session_id}: {error}"
             ))
@@ -16540,7 +16678,7 @@ fn workspace_revision_at_or_before(
         ])
         .map_err(map_sqlite_error)?;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let envelope = decode_envelope_column(row, 0).map_err(|error| {
+        let envelope = decode_envelope_column(transaction, row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid workspace-mutation envelope in session {session_id}: {error}"
             ))
@@ -16603,7 +16741,7 @@ fn process_effect_outcome_seq(
         .query([session_id.as_str()])
         .map_err(map_sqlite_error)?;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let envelope = decode_envelope_column(row, 0).map_err(|error| {
+        let envelope = decode_envelope_column(transaction, row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid process-effect envelope in session {session_id}: {error}"
             ))
@@ -16680,7 +16818,7 @@ fn validate_process_signal_provenance(
     let mut matched_intent = false;
     let mut matched_terminal = false;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let envelope = decode_envelope_column(row, 0).map_err(|error| {
+        let envelope = decode_envelope_column(transaction, row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid effect envelope in session {session_id}: {error}"
             ))
@@ -17009,7 +17147,7 @@ fn projected_turn_ordinal(
         .map_err(map_sqlite_error)?;
     let mut seen = HashSet::<RunId>::new();
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let envelope = decode_envelope_column(row, 0).map_err(|error| {
+        let envelope = decode_envelope_column(connection, row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid envelope while resolving turn ordinal for session {session_id}: {error}"
             ))
@@ -17632,7 +17770,7 @@ fn rebuild_run_head_projection(connection: &Connection, session_id: &SessionId) 
             let stored_seq = row.get::<_, i64>(0).map_err(map_sqlite_error)?;
             let stored_event_id = row.get::<_, String>(2).map_err(map_sqlite_error)?;
             let stored_committed_at_ms = row.get::<_, i64>(3).map_err(map_sqlite_error)?;
-            let envelope = decode_envelope_column(row, 1).map_err(|error| {
+            let envelope = decode_envelope_column(connection, row, 1).map_err(|error| {
                 corrupt(format!(
                     "invalid envelope for run-head rebuild in session {session_id}, seq {stored_seq}: {error}"
                 ))
@@ -17887,7 +18025,7 @@ fn queue_entries(
     let mut held_ids = HashSet::<EventId>::new();
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
-        let envelope = decode_envelope_column(row, 1).map_err(|error| {
+        let envelope = decode_envelope_column(connection, row, 1).map_err(|error| {
             corrupt(format!(
                 "invalid queue envelope for session {session_id}, seq {seq}: {error}"
             ))
@@ -18045,7 +18183,7 @@ fn main_timeline_retrying_event_id(
     let Some(row) = rows.next().map_err(map_sqlite_error)? else {
         return Ok(None);
     };
-    let envelope = decode_envelope_column(row, 0).map_err(|error| {
+    let envelope = decode_envelope_column(connection, row, 0).map_err(|error| {
         corrupt(format!(
             "invalid envelope JSON for session {session_id}, seq {state_seq}: {error}"
         ))
@@ -18086,7 +18224,7 @@ fn main_timeline_run_prompt_source(
     let mut source = None;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
-        let envelope = decode_envelope_column(row, 1).map_err(|error| {
+        let envelope = decode_envelope_column(connection, row, 1).map_err(|error| {
             corrupt(format!(
                 "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
             ))
@@ -18160,7 +18298,7 @@ fn latest_main_timeline_failed_turn(
     let mut failed = HashSet::<RunId>::new();
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
-        let envelope = decode_envelope_column(row, 1).map_err(|error| {
+        let envelope = decode_envelope_column(connection, row, 1).map_err(|error| {
             corrupt(format!(
                 "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
             ))
@@ -18246,7 +18384,7 @@ fn latest_tree_head(
         .map_err(map_sqlite_error)?;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let seq: i64 = row.get(0).map_err(map_sqlite_error)?;
-        let envelope = decode_envelope_column(row, 1).map_err(|error| {
+        let envelope = decode_envelope_column(connection, row, 1).map_err(|error| {
             corrupt(format!(
                 "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
             ))
@@ -20389,7 +20527,7 @@ fn load_envelope(
     rows.next()
         .map_err(map_sqlite_error)?
         .map(|row| {
-            decode_envelope_column(row, 0).map_err(|error| {
+            decode_envelope_column(connection, row, 0).map_err(|error| {
                 corrupt(format!(
                     "invalid envelope for session {session_id}, seq {seq}: {error}"
                 ))
@@ -20411,7 +20549,7 @@ fn load_envelope_by_event_id(
     rows.next()
         .map_err(map_sqlite_error)?
         .map(|row| {
-            decode_envelope_column(row, 0)
+            decode_envelope_column(transaction, row, 0)
                 .map_err(|error| corrupt(format!("invalid envelope for event {event_id}: {error}")))
         })
         .transpose()
@@ -20515,7 +20653,7 @@ fn historical_resolution(
         .map_err(map_sqlite_error)?;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
-        let envelope = decode_envelope_column(row, 1).map_err(|error| {
+        let envelope = decode_envelope_column(transaction, row, 1).map_err(|error| {
             corrupt(format!(
                 "invalid envelope JSON for session {}, seq {seq}: {error}",
                 command.session_id
@@ -20648,7 +20786,7 @@ impl EventStore for Store {
             let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
             let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
             let stored_committed_at_ms: i64 = row.get(3).map_err(map_sqlite_error)?;
-            let envelope = decode_envelope_column(row, 1).map_err(|error| {
+            let envelope = decode_envelope_column(&connection, row, 1).map_err(|error| {
                 corrupt(format!(
                     "invalid envelope for session {session}, seq {stored_seq}: {error}"
                 ))
@@ -21093,7 +21231,7 @@ fn stamp_checkpoint_record(
         .map_err(map_sqlite_error)?;
     let mut revision = None;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let candidate = decode_envelope_column(row, 0).map_err(|error| {
+        let candidate = decode_envelope_column(transaction, row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid effect envelope while stamping checkpoint {}: {error}",
                 checkpoint.checkpoint_id
@@ -21253,7 +21391,7 @@ fn validate_workspace_mutation_intent(
         .query([envelope.session_id.as_str()])
         .map_err(map_sqlite_error)?;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let candidate = decode_envelope_column(row, 0).map_err(|error| {
+        let candidate = decode_envelope_column(transaction, row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid effect envelope in session {}: {error}",
                 envelope.session_id
@@ -21489,7 +21627,7 @@ fn durable_headless_run_facts(
         let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
         let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
         let stored_committed_at_ms: i64 = row.get(3).map_err(map_sqlite_error)?;
-        let envelope = decode_envelope_column(row, 1).map_err(|error| {
+        let envelope = decode_envelope_column(transaction, row, 1).map_err(|error| {
             corrupt(format!(
                 "invalid headless envelope for session {session_id}, seq {stored_seq}: {error}"
             ))
@@ -21699,7 +21837,7 @@ fn latest_adjacent_run_failure(
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    decode_envelope_column(row, 1),
+                    decode_envelope_column(transaction, row, 1),
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
                 ))
@@ -21818,6 +21956,8 @@ fn validate_worker_run_transitions(
                 decode_payload::<WorkspaceEventPayload>(&envelope.payload),
                 Ok(WorkspaceEventPayload::WorkspaceUnavailable(_))
             );
+        let supplemental_context_compaction = kind == Some("context_compaction")
+            && decode_payload::<ContextCompactionEventPayload>(&envelope.payload).is_ok();
         let supplemental_computer_permission =
             matches!(
                 kind,
@@ -21839,6 +21979,7 @@ fn validate_worker_run_transitions(
                 || supplemental_computer_permission
                 || supplemental_run_budget
                 || supplemental_run_deadline
+                || supplemental_context_compaction
             {
                 return Err(store_error(
                     ErrorCode::InvalidArgument,
@@ -21852,7 +21993,8 @@ fn validate_worker_run_transitions(
             || supplemental_workspace_unavailable
             || supplemental_computer_permission
             || supplemental_run_budget
-            || supplemental_run_deadline)
+            || supplemental_run_deadline
+            || supplemental_context_compaction)
             && (!envelope.render.durable || envelope.render.prompt != PromptRender::Omit)
         {
             return Err(store_error(
@@ -21860,6 +22002,40 @@ fn validate_worker_run_transitions(
                 "supplemental worker fact must be durable and omitted from prompt replay",
                 false,
             ));
+        }
+        if supplemental_context_compaction {
+            let ContextCompactionEventPayload::ContextCompaction(fact) =
+                decode_payload::<ContextCompactionEventPayload>(&envelope.payload).map_err(
+                    |error| {
+                        store_error(
+                            ErrorCode::InvalidArgument,
+                            format!("invalid compaction announcement: {error}"),
+                            false,
+                        )
+                    },
+                )?;
+            let matching_node = envelopes.iter().any(|candidate| {
+                candidate.run_id == envelope.run_id
+                    && candidate.branch_id == envelope.branch_id
+                    && candidate.agent_id == envelope.agent_id
+                    && matches!(candidate.payload.decode_event(),
+                        Ok(EventPayload::NodeCommitted(TreeNode { kind: NodeKind::Compaction { covers_from, covers_to, summary_artifact, resume_cause, .. }, .. }))
+                            if covers_from == fact.covers_from && covers_to == fact.covers_to
+                                && summary_artifact == fact.summary_artifact && resume_cause == fact.resume_cause
+                    )
+            });
+            if fact.turn_ordinal == 0
+                || fact.request_ordinal == 0
+                || fact.dropped_item_count == 0
+                || fact.operation_id.is_empty()
+                || !matching_node
+            {
+                return Err(store_error(
+                    ErrorCode::InvalidArgument,
+                    "compaction announcement requires valid request coordinates and its matching overlay in the same worker batch",
+                    false,
+                ));
+            }
         }
         if supplemental_run_budget
             && !durable_headless_run_facts(transaction, session_id, run_id)?.configured
@@ -21876,7 +22052,8 @@ fn validate_worker_run_transitions(
                 if supplemental_project_instructions
                     || supplemental_workspace_unavailable
                     || supplemental_computer_permission
-                    || supplemental_run_budget =>
+                    || supplemental_run_budget
+                    || supplemental_context_compaction =>
             {
                 None
             }
@@ -22243,7 +22420,7 @@ fn source_fork_cache_boundary(
     let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
     let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
     let stored_committed_at_ms: i64 = row.get(3).map_err(map_sqlite_error)?;
-    let envelope = decode_envelope_column(row, 1).map_err(|error| {
+    let envelope = decode_envelope_column(connection, row, 1).map_err(|error| {
         corrupt(format!(
             "invalid session-fork boundary for session {source_session_id}, seq {stored_seq}: {error}"
         ))
@@ -22844,7 +23021,7 @@ fn load_fork_coordinate_envelope(
             params![session_id.as_str(), seq_sql],
             |row| {
                 Ok((
-                    decode_envelope_column(row, 0),
+                    decode_envelope_column(connection, row, 0),
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                 ))
@@ -23088,7 +23265,7 @@ fn load_fork_source_envelopes(
         let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
         let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
         let stored_committed_at_ms: i64 = row.get(3).map_err(map_sqlite_error)?;
-        let envelope = decode_envelope_column(row, 1).map_err(|error| {
+        let envelope = decode_envelope_column(connection, row, 1).map_err(|error| {
             corrupt(format!(
                 "invalid fork-source envelope for session {session_id}, seq {stored_seq}: {error}"
             ))
@@ -23490,7 +23667,7 @@ fn validate_branch_fork(
     let mut candidate = None;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
-        let envelope = decode_envelope_column(row, 1).map_err(|error| {
+        let envelope = decode_envelope_column(connection, row, 1).map_err(|error| {
             corrupt(format!(
                 "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
             ))
@@ -24066,12 +24243,18 @@ fn encoded_envelope_len(envelope: &RawEnvelope) -> io::Result<usize> {
     Ok(counter.len)
 }
 
-/// Inserts an event through SQLite's incremental BLOB API. The serializer is
-/// run once to count the exact byte length and once to fill the zeroblob; its
-/// only scratch allocation is the small reply-free envelope skeleton.
+/// Inserts an event through SQLite's incremental BLOB API. Inline rows count
+/// and stream the serializer; large text first becomes durable in CAS and the
+/// small private reference record fills the zeroblob.
 fn insert_encoded_event(connection: &Connection, envelope: &RawEnvelope) -> StoreResult<()> {
-    let encoded_len = encoded_envelope_len(envelope)
-        .map_err(|error| store_io_error("measure event envelope", error))?;
+    // CAS objects are durable before the SQL reference is eligible to commit.
+    // A rolled-back SQL transaction can leave only harmless unreferenced objects.
+    let indirect = event_text_cas::encode(connection, envelope)?;
+    let encoded_len = match &indirect {
+        Some(bytes) => bytes.len(),
+        None => encoded_envelope_len(envelope)
+            .map_err(|error| store_io_error("measure event envelope", error))?,
+    };
     let blob_len = i32::try_from(encoded_len).map_err(|_| {
         store_error(
             ErrorCode::InvalidArgument,
@@ -24098,8 +24281,11 @@ fn insert_encoded_event(connection: &Connection, envelope: &RawEnvelope) -> Stor
     let mut blob = connection
         .blob_open("main", "events", "envelope_json", row_id, false)
         .map_err(map_sqlite_error)?;
-    write_envelope_messagepack(&mut blob, envelope)
-        .map_err(|error| store_io_error("write event envelope", error))?;
+    match &indirect {
+        Some(bytes) => blob.write_all(bytes),
+        None => write_envelope_messagepack(&mut blob, envelope),
+    }
+    .map_err(|error| store_io_error("write event envelope", error))?;
     blob.flush()
         .map_err(|error| store_io_error("flush event envelope", error))?;
     Ok(())
@@ -24179,7 +24365,8 @@ fn read_reducer_page_with_connection(
             .get(3)
             .map_err(map_sqlite_error)
             .map_err(FilteredReadError::Store)?;
-        let envelope = decode_envelope_column(row, 1).map_err(|_| FilteredReadError::Decode)?;
+        let envelope =
+            decode_envelope_column(connection, row, 1).map_err(|_| FilteredReadError::Decode)?;
         validate_stored_envelope(
             session,
             stored_seq,
@@ -24258,16 +24445,20 @@ where
 
 /// Decodes the authoritative event record according to its SQLite storage
 /// class. Version-13-and-earlier rows are JSON `TEXT`; current rows are
-/// MessagePack `BLOB`s.
-fn decode_envelope_column(row: &rusqlite::Row<'_>, index: usize) -> Result<RawEnvelope, String> {
+/// MessagePack `BLOB`s, including private CAS-backed records that are hydrated
+/// before this boundary returns.
+fn decode_envelope_column(
+    connection: &Connection,
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> Result<RawEnvelope, String> {
     let value = row
         .get_ref(index)
         .map_err(|error| format!("cannot read encoded envelope column: {error}"))?;
     match value {
         ValueRef::Text(bytes) => serde_json::from_slice(bytes)
             .map_err(|error| format!("legacy JSON decode failed: {error}")),
-        ValueRef::Blob(bytes) => rmp_serde::from_slice(bytes)
-            .map_err(|error| format!("MessagePack decode failed: {error}")),
+        ValueRef::Blob(bytes) => event_text_cas::decode(connection, bytes),
         ValueRef::Null => Err("encoded envelope has SQLite NULL storage class".to_owned()),
         ValueRef::Integer(_) => Err("encoded envelope has SQLite INTEGER storage class".to_owned()),
         ValueRef::Real(_) => Err("encoded envelope has SQLite REAL storage class".to_owned()),
@@ -26112,6 +26303,102 @@ mod run_head_projection_tests {
                 mode: DeliveryMode::Queue,
             },
         )
+    }
+
+    #[test]
+    fn worker_compaction_fact_requires_typed_scope_matching_overlay_and_active_run() {
+        let root = tempfile::tempdir().expect("compaction store root");
+        let store = Store::open(root.path()).expect("compaction store");
+        let mut seed = [state(1, "compaction-run", None, RunState::Compacting)];
+        seed[0].worker_generation = store.worker_generation();
+        store.append(&mut seed).expect("seed active compaction run");
+        let session = seed[0].session_id.clone();
+        let node = event(
+            2,
+            Some("compaction-run"),
+            None,
+            EventPayload::NodeCommitted(TreeNode {
+                node: NodeId::new("compaction-node"),
+                parent: None,
+                kind: NodeKind::Compaction {
+                    covers_from: NodeId::new("covered-a"),
+                    covers_to: NodeId::new("covered-b"),
+                    summary_artifact: ArtifactRef::new("blake3:summary"),
+                    tokens_before: 10,
+                    tokens_after: 2,
+                    resume_cause: haider_protocol::history::CompactionResume::AutoMidTurn,
+                },
+            }),
+        );
+        let fact = raw_event(
+            3,
+            Some("compaction-run"),
+            None,
+            serde_json::json!({
+                "type": "context_compaction",
+                "turn_ordinal": 1,
+                "request_ordinal": 1,
+                "operation_id": "compaction-operation",
+                "covers_from": "covered-a",
+                "covers_to": "covered-b",
+                "summary_artifact": "blake3:summary",
+                "dropped_item_count": 2,
+                "dropped_item_unit": "provider_message",
+                "retained_suffix_size": 1,
+                "retained_suffix_unit": "provider_message",
+                "resume_cause": "auto_mid_turn"
+            }),
+        );
+        let connection = store.connection().expect("store connection");
+        validate_worker_run_transitions(&connection, &session, &[node.clone(), fact.clone()], 1)
+            .expect("recognized typed compaction fact passes its owning run gate");
+        for mutation in [
+            "missing-field",
+            "unknown-kind",
+            "wrong-unit",
+            "wrong-scope",
+            "no-run",
+            "wrong-branch",
+            "not-durable",
+            "prompt-visible",
+            "zero-coordinate",
+            "no-overlay",
+        ] {
+            let mut candidate = fact.clone();
+            match mutation {
+                "missing-field" => {
+                    candidate
+                        .payload
+                        .as_object_mut()
+                        .expect("object")
+                        .remove("covers_to");
+                }
+                "unknown-kind" => {
+                    candidate.payload["type"] = serde_json::json!("context_compaction_unknown")
+                }
+                "wrong-unit" => {
+                    candidate.payload["dropped_item_unit"] = serde_json::json!("journal_event")
+                }
+                "wrong-scope" => {
+                    candidate.payload["covers_to"] = serde_json::json!("uncovered-node")
+                }
+                "no-run" => candidate.run_id = None,
+                "wrong-branch" => candidate.branch_id = Some(BranchId::new("other-branch")),
+                "not-durable" => candidate.render.durable = false,
+                "prompt-visible" => candidate.render.prompt = PromptRender::Verbatim,
+                "zero-coordinate" => candidate.payload["request_ordinal"] = serde_json::json!(0),
+                "no-overlay" => {}
+                _ => unreachable!(),
+            }
+            let batch = if mutation == "no-overlay" {
+                vec![candidate]
+            } else {
+                vec![node.clone(), candidate]
+            };
+            let error = validate_worker_run_transitions(&connection, &session, &batch, 1)
+                .expect_err(mutation);
+            assert_eq!(error.code, ErrorCode::InvalidArgument, "{mutation}");
+        }
     }
 
     fn legacy_run_states(journal: &[RawEnvelope]) -> StoreResult<HashMap<RunId, DurableRunHead>> {

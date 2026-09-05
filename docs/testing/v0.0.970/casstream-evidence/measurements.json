@@ -1,0 +1,575 @@
+{
+  "schema": "casstream-benchmark-v1",
+  "platform": "darwin",
+  "measurement": "fresh Python IPC client self getrusage + fresh daemon wait4, peak RSS includes startup; wall excludes fixture/startup",
+  "python": "3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 21.0.0 (clang-2100.1.1.101)]",
+  "blake3_version": "1.0.9",
+  "smoke": false,
+  "daemon": "/Users/rizzist/haider-run/lane-970-casstream/target/debug/haiderd",
+  "daemon_sha256": "5f4a42ade959802917e289e078b2c7c00815072774cac2a4b849d3cf34cb2313",
+  "daemon_bytes": 199155760,
+  "samples": [
+    {
+      "run": 1,
+      "mode": "legacy_single",
+      "total_bytes": 276824064,
+      "load_1m_start": 5.53369140625,
+      "load_1m_max": 5.53369140625,
+      "load_valid": true,
+      "daemon_peak_rss_bytes": 47284224,
+      "daemon_exit_code": 0,
+      "digest_integrity": "rejected object absent",
+      "wall_seconds": 0.2925776250194758,
+      "client_peak_rss_bytes": 673939456,
+      "accepted": false,
+      "responses": [
+        {
+          "frame": {
+            "v": 1,
+            "kind": "protocol_error",
+            "code": "invalid_frame",
+            "message": "frame length 369098855 exceeds configured limit 50331648",
+            "fatal": true
+          },
+          "send_error": "BrokenPipeError"
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    },
+    {
+      "run": 1,
+      "mode": "legacy_eight",
+      "total_bytes": 276824064,
+      "load_1m_start": 5.53369140625,
+      "load_1m_max": 5.53369140625,
+      "load_valid": true,
+      "daemon_peak_rss_bytes": 94109696,
+      "daemon_exit_code": 0,
+      "digest_integrity": "verified",
+      "wall_seconds": 13.530279083992355,
+      "client_peak_rss_bytes": 431833088,
+      "accepted": true,
+      "responses": [
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:c21a649ed2fd2158049453767969f9ec82687507d8b01c5d7146c451a0a7239b",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:9f023d8290335041fabde2063046c9b674fe616ea7b6faf455a665ca3e51de03",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:3885681f3103ed0cd5d564f05dcd6d41fe3506bb62b09a267256da87b6c6ef23",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:b193bf0e73825c33a486628b2a7dca0dd89b7a490bd49b793e9bf813f6b51202",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:e5c51c4cf3228b71f1af7115f38bedbdac91dd55608645b5d39aa6810c33fa51",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:6006acf3128cb1ffc0787b8c8cec82a56f9f502f6bde9c254b6db36dd083e4f0",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:fdd67b8d17a23b5251497f0a68307af168a900b9307eaa98cd98bbced73c8f28",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:7576e0113bd97883db02c2193cc0e5367795ec20650b3bb86859d37b76fcf80f",
+          "bytes": 34603008
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    },
+    {
+      "run": 1,
+      "mode": "binary_eight",
+      "total_bytes": 276824064,
+      "load_1m_start": 4.90380859375,
+      "load_1m_max": 4.90380859375,
+      "load_valid": true,
+      "daemon_peak_rss_bytes": 48791552,
+      "daemon_exit_code": 0,
+      "digest_integrity": "verified",
+      "wall_seconds": 10.224089458992239,
+      "client_peak_rss_bytes": 27951104,
+      "accepted": true,
+      "responses": [
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:c21a649ed2fd2158049453767969f9ec82687507d8b01c5d7146c451a0a7239b",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:9f023d8290335041fabde2063046c9b674fe616ea7b6faf455a665ca3e51de03",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:3885681f3103ed0cd5d564f05dcd6d41fe3506bb62b09a267256da87b6c6ef23",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:b193bf0e73825c33a486628b2a7dca0dd89b7a490bd49b793e9bf813f6b51202",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:e5c51c4cf3228b71f1af7115f38bedbdac91dd55608645b5d39aa6810c33fa51",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:6006acf3128cb1ffc0787b8c8cec82a56f9f502f6bde9c254b6db36dd083e4f0",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:fdd67b8d17a23b5251497f0a68307af168a900b9307eaa98cd98bbced73c8f28",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:7576e0113bd97883db02c2193cc0e5367795ec20650b3bb86859d37b76fcf80f",
+          "bytes": 34603008
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    },
+    {
+      "run": 1,
+      "mode": "binary_single",
+      "total_bytes": 276824064,
+      "load_1m_start": 4.53662109375,
+      "load_1m_max": 4.53662109375,
+      "load_valid": true,
+      "daemon_peak_rss_bytes": 48611328,
+      "daemon_exit_code": 0,
+      "digest_integrity": "verified",
+      "wall_seconds": 10.064887500018813,
+      "client_peak_rss_bytes": 27951104,
+      "accepted": true,
+      "responses": [
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:b339fe22d2b0efc1702841e887ab02606d869819540239a09ab8ad7bf389488a",
+          "bytes": 276824064
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    },
+    {
+      "run": 2,
+      "mode": "binary_single",
+      "total_bytes": 276824064,
+      "load_1m_start": 4.30615234375,
+      "load_1m_max": 4.3974609375,
+      "load_valid": true,
+      "daemon_peak_rss_bytes": 48627712,
+      "daemon_exit_code": 0,
+      "digest_integrity": "verified",
+      "wall_seconds": 15.461532249988522,
+      "client_peak_rss_bytes": 27983872,
+      "accepted": true,
+      "responses": [
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:b339fe22d2b0efc1702841e887ab02606d869819540239a09ab8ad7bf389488a",
+          "bytes": 276824064
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    },
+    {
+      "run": 2,
+      "mode": "binary_eight",
+      "total_bytes": 276824064,
+      "load_1m_start": 4.3974609375,
+      "load_1m_max": 4.3974609375,
+      "load_valid": true,
+      "daemon_peak_rss_bytes": 48758784,
+      "daemon_exit_code": 0,
+      "digest_integrity": "verified",
+      "wall_seconds": 10.45040633296594,
+      "client_peak_rss_bytes": 27951104,
+      "accepted": true,
+      "responses": [
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:c21a649ed2fd2158049453767969f9ec82687507d8b01c5d7146c451a0a7239b",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:9f023d8290335041fabde2063046c9b674fe616ea7b6faf455a665ca3e51de03",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:3885681f3103ed0cd5d564f05dcd6d41fe3506bb62b09a267256da87b6c6ef23",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:b193bf0e73825c33a486628b2a7dca0dd89b7a490bd49b793e9bf813f6b51202",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:e5c51c4cf3228b71f1af7115f38bedbdac91dd55608645b5d39aa6810c33fa51",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:6006acf3128cb1ffc0787b8c8cec82a56f9f502f6bde9c254b6db36dd083e4f0",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:fdd67b8d17a23b5251497f0a68307af168a900b9307eaa98cd98bbced73c8f28",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:7576e0113bd97883db02c2193cc0e5367795ec20650b3bb86859d37b76fcf80f",
+          "bytes": 34603008
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    },
+    {
+      "run": 2,
+      "mode": "legacy_eight",
+      "total_bytes": 276824064,
+      "load_1m_start": 4.18212890625,
+      "load_1m_max": 4.24755859375,
+      "load_valid": true,
+      "daemon_peak_rss_bytes": 93962240,
+      "daemon_exit_code": 0,
+      "digest_integrity": "verified",
+      "wall_seconds": 13.789226250024512,
+      "client_peak_rss_bytes": 432193536,
+      "accepted": true,
+      "responses": [
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:c21a649ed2fd2158049453767969f9ec82687507d8b01c5d7146c451a0a7239b",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:9f023d8290335041fabde2063046c9b674fe616ea7b6faf455a665ca3e51de03",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:3885681f3103ed0cd5d564f05dcd6d41fe3506bb62b09a267256da87b6c6ef23",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:b193bf0e73825c33a486628b2a7dca0dd89b7a490bd49b793e9bf813f6b51202",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:e5c51c4cf3228b71f1af7115f38bedbdac91dd55608645b5d39aa6810c33fa51",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:6006acf3128cb1ffc0787b8c8cec82a56f9f502f6bde9c254b6db36dd083e4f0",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:fdd67b8d17a23b5251497f0a68307af168a900b9307eaa98cd98bbced73c8f28",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:7576e0113bd97883db02c2193cc0e5367795ec20650b3bb86859d37b76fcf80f",
+          "bytes": 34603008
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    },
+    {
+      "run": 2,
+      "mode": "legacy_single",
+      "total_bytes": 276824064,
+      "load_1m_start": 3.828125,
+      "load_1m_max": 3.828125,
+      "load_valid": true,
+      "daemon_peak_rss_bytes": 47448064,
+      "daemon_exit_code": 0,
+      "digest_integrity": "rejected object absent",
+      "wall_seconds": 0.30023450002772734,
+      "client_peak_rss_bytes": 673628160,
+      "accepted": false,
+      "responses": [
+        {
+          "frame": {
+            "v": 1,
+            "kind": "protocol_error",
+            "code": "invalid_frame",
+            "message": "frame length 369098855 exceeds configured limit 50331648",
+            "fatal": true
+          },
+          "send_error": "BrokenPipeError"
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    },
+    {
+      "run": 3,
+      "mode": "legacy_single",
+      "total_bytes": 276824064,
+      "load_1m_start": 3.828125,
+      "load_1m_max": 3.828125,
+      "load_valid": true,
+      "daemon_peak_rss_bytes": 47218688,
+      "daemon_exit_code": 0,
+      "digest_integrity": "rejected object absent",
+      "wall_seconds": 0.2989270839607343,
+      "client_peak_rss_bytes": 673595392,
+      "accepted": false,
+      "responses": [
+        {
+          "frame": {
+            "v": 1,
+            "kind": "protocol_error",
+            "code": "invalid_frame",
+            "message": "frame length 369098855 exceeds configured limit 50331648",
+            "fatal": true
+          },
+          "send_error": "BrokenPipeError"
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    },
+    {
+      "run": 3,
+      "mode": "legacy_eight",
+      "total_bytes": 276824064,
+      "load_1m_start": 3.828125,
+      "load_1m_max": 3.828125,
+      "load_valid": true,
+      "daemon_peak_rss_bytes": 94208000,
+      "daemon_exit_code": 0,
+      "digest_integrity": "verified",
+      "wall_seconds": 13.666420250025112,
+      "client_peak_rss_bytes": 431833088,
+      "accepted": true,
+      "responses": [
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:c21a649ed2fd2158049453767969f9ec82687507d8b01c5d7146c451a0a7239b",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:9f023d8290335041fabde2063046c9b674fe616ea7b6faf455a665ca3e51de03",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:3885681f3103ed0cd5d564f05dcd6d41fe3506bb62b09a267256da87b6c6ef23",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:b193bf0e73825c33a486628b2a7dca0dd89b7a490bd49b793e9bf813f6b51202",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:e5c51c4cf3228b71f1af7115f38bedbdac91dd55608645b5d39aa6810c33fa51",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:6006acf3128cb1ffc0787b8c8cec82a56f9f502f6bde9c254b6db36dd083e4f0",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:fdd67b8d17a23b5251497f0a68307af168a900b9307eaa98cd98bbced73c8f28",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:7576e0113bd97883db02c2193cc0e5367795ec20650b3bb86859d37b76fcf80f",
+          "bytes": 34603008
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    },
+    {
+      "run": 3,
+      "mode": "binary_eight",
+      "total_bytes": 276824064,
+      "load_1m_start": 3.35498046875,
+      "load_1m_max": 3.35498046875,
+      "load_valid": true,
+      "daemon_peak_rss_bytes": 48644096,
+      "daemon_exit_code": 0,
+      "digest_integrity": "verified",
+      "wall_seconds": 10.112872792000417,
+      "client_peak_rss_bytes": 28016640,
+      "accepted": true,
+      "responses": [
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:c21a649ed2fd2158049453767969f9ec82687507d8b01c5d7146c451a0a7239b",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:9f023d8290335041fabde2063046c9b674fe616ea7b6faf455a665ca3e51de03",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:3885681f3103ed0cd5d564f05dcd6d41fe3506bb62b09a267256da87b6c6ef23",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:b193bf0e73825c33a486628b2a7dca0dd89b7a490bd49b793e9bf813f6b51202",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:e5c51c4cf3228b71f1af7115f38bedbdac91dd55608645b5d39aa6810c33fa51",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:6006acf3128cb1ffc0787b8c8cec82a56f9f502f6bde9c254b6db36dd083e4f0",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:fdd67b8d17a23b5251497f0a68307af168a900b9307eaa98cd98bbced73c8f28",
+          "bytes": 34603008
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:7576e0113bd97883db02c2193cc0e5367795ec20650b3bb86859d37b76fcf80f",
+          "bytes": 34603008
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    },
+    {
+      "run": 3,
+      "mode": "binary_single",
+      "total_bytes": 276824064,
+      "load_1m_start": 3.06591796875,
+      "load_1m_max": 3.1357421875,
+      "load_valid": true,
+      "daemon_peak_rss_bytes": 48513024,
+      "daemon_exit_code": 0,
+      "digest_integrity": "verified",
+      "wall_seconds": 10.13229658297496,
+      "client_peak_rss_bytes": 28344320,
+      "accepted": true,
+      "responses": [
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:b339fe22d2b0efc1702841e887ab02606d869819540239a09ab8ad7bf389488a",
+          "bytes": 276824064
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    }
+  ],
+  "fixture": {
+    "parts": [
+      {
+        "offset": 0,
+        "bytes": 34603008,
+        "digest": "c21a649ed2fd2158049453767969f9ec82687507d8b01c5d7146c451a0a7239b"
+      },
+      {
+        "offset": 34603008,
+        "bytes": 34603008,
+        "digest": "9f023d8290335041fabde2063046c9b674fe616ea7b6faf455a665ca3e51de03"
+      },
+      {
+        "offset": 69206016,
+        "bytes": 34603008,
+        "digest": "3885681f3103ed0cd5d564f05dcd6d41fe3506bb62b09a267256da87b6c6ef23"
+      },
+      {
+        "offset": 103809024,
+        "bytes": 34603008,
+        "digest": "b193bf0e73825c33a486628b2a7dca0dd89b7a490bd49b793e9bf813f6b51202"
+      },
+      {
+        "offset": 138412032,
+        "bytes": 34603008,
+        "digest": "e5c51c4cf3228b71f1af7115f38bedbdac91dd55608645b5d39aa6810c33fa51"
+      },
+      {
+        "offset": 173015040,
+        "bytes": 34603008,
+        "digest": "6006acf3128cb1ffc0787b8c8cec82a56f9f502f6bde9c254b6db36dd083e4f0"
+      },
+      {
+        "offset": 207618048,
+        "bytes": 34603008,
+        "digest": "fdd67b8d17a23b5251497f0a68307af168a900b9307eaa98cd98bbced73c8f28"
+      },
+      {
+        "offset": 242221056,
+        "bytes": 34603008,
+        "digest": "7576e0113bd97883db02c2193cc0e5367795ec20650b3bb86859d37b76fcf80f"
+      }
+    ],
+    "total_bytes": 276824064,
+    "whole": {
+      "offset": 0,
+      "bytes": 276824064,
+      "digest": "b339fe22d2b0efc1702841e887ab02606d869819540239a09ab8ad7bf389488a"
+    }
+  },
+  "medians": {
+    "binary_eight": {
+      "wall_seconds": 10.224089458992239,
+      "client_peak_rss_bytes": 27951104,
+      "daemon_peak_rss_bytes": 48758784
+    },
+    "binary_single": {
+      "wall_seconds": 10.13229658297496,
+      "client_peak_rss_bytes": 27983872,
+      "daemon_peak_rss_bytes": 48611328
+    },
+    "legacy_eight": {
+      "wall_seconds": 13.666420250025112,
+      "client_peak_rss_bytes": 431833088,
+      "daemon_peak_rss_bytes": 94109696
+    },
+    "legacy_single": {
+      "wall_seconds": 0.2989270839607343,
+      "client_peak_rss_bytes": 673628160,
+      "daemon_peak_rss_bytes": 47284224
+    }
+  },
+  "valid": true
+}

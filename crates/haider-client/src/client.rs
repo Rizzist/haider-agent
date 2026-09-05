@@ -568,6 +568,7 @@ impl Shared {
 
 /// One live negotiated connection. See the module charter.
 pub struct RpcClient {
+    binary_upload: tokio::sync::Mutex<()>,
     shared: Arc<Shared>,
     outbound: mpsc::Sender<ClientOutboundFrame>,
     events: StdMutex<Option<mpsc::Receiver<WireFrame>>>,
@@ -587,6 +588,19 @@ pub struct RpcClient {
     welcome: Welcome,
     /// Kernel-authenticated identity captured before the stream was split.
     peer_credentials: PeerCredentials,
+}
+
+struct BinaryUploadAbort<'a> {
+    client: &'a RpcClient,
+    armed: bool,
+}
+
+impl Drop for BinaryUploadAbort<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.client.close();
+        }
+    }
 }
 
 impl RpcClient {
@@ -649,6 +663,7 @@ impl RpcClient {
             )));
         }
         Ok(Self {
+            binary_upload: tokio::sync::Mutex::new(()),
             shared,
             outbound,
             events: StdMutex::new(events_rx),
@@ -800,6 +815,112 @@ impl RpcClient {
             )
             .map(ClientOutboundFrame::ArtifactPut)
             .map_err(ClientError::Encode)
+        })
+        .await?
+        .wait()
+        .await
+    }
+
+    /// Streams an immutable artifact snapshot with bounded frames. Callers
+    /// retain/reopen the SAME snapshot when using the reconnect seam. Every
+    /// acknowledged chunk is staging only; Finish verifies and publishes CAS.
+    pub async fn put_artifact_stream<R: AsyncRead + Unpin>(
+        &self,
+        mut reader: R,
+        bytes: u64,
+        digest: haider_protocol::ids::ArtifactRef,
+    ) -> Result<ResponseBody, ClientError> {
+        use haider_rpc::binary_artifact::{self as binary, Frame};
+        if !self.welcome.features.contains(binary::FEATURE) {
+            return Err(ClientError::MissingFeature(binary::FEATURE));
+        }
+        // One existing request budget covers lock admission, source reads,
+        // all chunk acknowledgments and publication; no per-chunk reset.
+        let deadline = Instant::now() + self.request_timeout;
+        let transfer = async {
+            let _exclusive = self.binary_upload.lock().await;
+            let mut abort = BinaryUploadAbort {
+                client: self,
+                armed: true,
+            };
+            let begin = self
+                .binary_artifact_request(|request_id| Frame::Begin {
+                    request_id,
+                    bytes,
+                    digest: digest.clone(),
+                })
+                .await?;
+            if !matches!(begin, ResponseBody::ArtifactPutProgress { bytes: 0 }) {
+                if matches!(begin, ResponseBody::Error { .. }) {
+                    abort.armed = false;
+                    return Ok(begin);
+                }
+                return Err(ClientError::Encode(CodecError::InvalidBinaryFrame));
+            }
+            let chunk_size = binary::CHUNK_BYTES.min(self.outbound_limit.saturating_sub(138));
+            if chunk_size == 0 {
+                return Err(ClientError::Encode(CodecError::InvalidBinaryFrame));
+            }
+            let mut buffer = Zeroizing::new(vec![0; chunk_size]);
+            let mut offset = 0_u64;
+            while offset < bytes {
+                let wanted = (bytes - offset).min(chunk_size as u64) as usize;
+                let read = reader.read(&mut buffer[..wanted]).await.map_err(|error| {
+                    ClientError::Disconnected(DisconnectReason::Io(error.to_string()))
+                })?;
+                if read == 0 {
+                    return Err(ClientError::Encode(CodecError::InvalidBinaryFrame));
+                }
+                let chunk = Zeroizing::new(buffer[..read].to_vec());
+                let response = self
+                    .binary_artifact_request(|request_id| Frame::Chunk {
+                        request_id,
+                        offset,
+                        bytes: chunk,
+                    })
+                    .await?;
+                offset += read as u64;
+                if !matches!(response, ResponseBody::ArtifactPutProgress { bytes } if bytes == offset)
+                {
+                    return if matches!(response, ResponseBody::Error { .. }) {
+                        Ok(response)
+                    } else {
+                        Err(ClientError::Encode(CodecError::InvalidBinaryFrame))
+                    };
+                }
+            }
+            let response = self
+                .binary_artifact_request(|request_id| Frame::Finish { request_id })
+                .await?;
+            if !matches!(&response, ResponseBody::ArtifactPut { artifact, bytes: count } if artifact == &digest && *count == bytes)
+                && !matches!(response, ResponseBody::Error { .. })
+            {
+                return Err(ClientError::Encode(CodecError::InvalidBinaryFrame));
+            }
+            abort.armed = false;
+            Ok(response)
+        };
+        match tokio::time::timeout_at(deadline, transfer).await {
+            Ok(result) => result,
+            Err(_) => {
+                let reason = DisconnectReason::RequestTimeout {
+                    request_id: "artifact.put.binary".into(),
+                    timeout: self.request_timeout,
+                };
+                self.shared.fail(reason.clone());
+                Err(ClientError::Disconnected(reason))
+            }
+        }
+    }
+
+    async fn binary_artifact_request(
+        &self,
+        build: impl FnOnce(RequestId) -> haider_rpc::binary_artifact::Frame,
+    ) -> Result<ResponseBody, ClientError> {
+        self.begin_correlated_encoded(|id| {
+            haider_rpc::binary_artifact::encode(&build(id.clone()), self.outbound_limit)
+                .map(ClientOutboundFrame::Contiguous)
+                .map_err(ClientError::Encode)
         })
         .await?
         .wait()

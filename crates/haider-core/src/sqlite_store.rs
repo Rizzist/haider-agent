@@ -1017,6 +1017,32 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.select_session_fast(&command))).await
     }
 
+    /// Read the durable rebind receipt before mutable registry validation.
+    pub async fn session_provider_rebind_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::ReboundSessionProvider>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.session_provider_rebind_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    /// Atomically commit one validated per-session provider route.
+    pub async fn rebind_session_provider(
+        &self,
+        command: haider_store::SessionProviderRebindCommand,
+    ) -> Result<haider_store::SessionProviderRebindOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.rebind_session_provider(&command)))
+            .await
+    }
+
     pub async fn create_delegation(
         &self,
         record: DelegationRecord,
@@ -2428,6 +2454,36 @@ impl SqliteStoreHandle {
     pub async fn put_file(&self, path: std::path::PathBuf) -> Result<ArtifactRef, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.put_file(&path))).await
+    }
+
+    /// Streaming CAS disk work owns no SQLite lock, but failures must still
+    /// update the same write-health latch as ordinary artifact puts.
+    pub fn note_cas_write_error(&self, error: &HaiderError) {
+        self.owner.note_failed_write(error, Vec::new());
+    }
+
+    /// Creates an unpublished streaming sink; chunk writes own no store lock.
+    pub async fn begin_cas_put(
+        &self,
+        expected_len: u64,
+    ) -> Result<haider_store::CasUpload, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.cas().begin_put(expected_len))).await
+    }
+
+    /// Opens a verified seekable CAS reader without retaining the blob in RAM.
+    /// Verification and subsequent reads do not hold the SQLite store lock.
+    pub async fn open_cas_reader(
+        &self,
+        artifact: &ArtifactRef,
+    ) -> Result<std::fs::File, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let artifact = artifact.clone();
+        run_blocking(move || {
+            let cas = owner.with_store(|store| Ok(store.cas().clone()))?;
+            cas.open_verified(&artifact)
+        })
+        .await
     }
 
     /// Validates, bounds, and durably stores one PNG/JPEG on the blocking

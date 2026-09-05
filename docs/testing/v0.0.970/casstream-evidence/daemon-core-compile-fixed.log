@@ -1,0 +1,79 @@
+   Compiling num-traits v0.2.19
+   Compiling tokio v1.53.1
+   Compiling futures-util v0.3.33
+   Compiling rmp v0.8.15
+   Compiling rmp-serde v1.3.1
+   Compiling haider-protocol v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-protocol)
+   Compiling tokio-util v0.7.19
+   Compiling crossbeam-utils v0.8.22
+   Compiling h2 v0.4.15
+   Compiling haider-platform v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-platform)
+   Compiling rustls v0.23.42
+   Compiling hyper v1.11.0
+   Compiling moxcms v0.8.1
+   Compiling tower v0.5.3
+   Compiling hyper-util v0.1.20
+   Compiling crossbeam-epoch v0.9.20
+   Compiling tokio-rustls v0.26.4
+   Compiling image v0.25.10
+   Compiling globset v0.4.20
+   Compiling hyper-rustls v0.27.9
+   Compiling crossbeam-deque v0.8.7
+   Compiling tower-http v0.6.11
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling tempfile v3.27.0
+   Compiling rusqlite v0.38.0
+   Compiling reqwest v0.13.4
+   Compiling ignore v0.4.33
+   Compiling haider-accounts v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-accounts)
+   Compiling haider-provider v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-provider)
+   Compiling haider-tools v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-tools)
+   Compiling haider-store v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-store)
+   Compiling crypto-bigint v0.7.5
+   Compiling haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-core)
+   Compiling elliptic-curve v0.14.1
+   Compiling primefield v0.14.0
+   Compiling rfc6979 v0.6.0
+   Compiling ecdsa v0.17.0
+   Compiling primeorder v0.14.0
+   Compiling num-integer v0.1.46
+   Compiling ssh-encoding v0.3.0
+   Compiling lopdf v0.42.0
+   Compiling num-bigint v0.4.8
+   Compiling crypto-primes v0.7.2
+   Compiling euclid v0.20.14
+   Compiling getrandom v0.2.17
+   Compiling time v0.3.54
+   Compiling pdf-extract v0.12.0
+   Compiling ring v0.17.14
+   Compiling ssh-cipher v0.3.0
+   Compiling rsa v0.10.0-rc.18
+   Compiling p384 v0.14.0
+   Compiling p256 v0.14.0
+   Compiling p521 v0.14.0
+   Compiling futures-executor v0.3.33
+   Compiling module-lattice v0.2.3
+   Compiling zopfli v0.8.3
+   Compiling ml-kem v0.3.2
+   Compiling futures v0.3.33
+   Compiling haider-pdf v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-pdf)
+   Compiling simple_asn1 v0.6.4
+   Compiling ssh-key v0.7.0-rc.11
+   Compiling russh-cryptovec v0.62.0
+   Compiling internal-russh-num-bigint v0.5.0
+   Compiling haider-rpc v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-rpc)
+   Compiling russh-util v0.52.0
+   Compiling russh v0.63.1
+   Compiling jsonwebtoken v9.3.1
+   Compiling zip v2.4.2
+   Compiling haider-client v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-client)
+   Compiling haider-daemon v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-daemon)
+error[E0425]: cannot find value `REQUEST_TIMEOUT` in crate `haider_client`
+   --> crates/haider-daemon/src/connection_duplex_tests.rs:405:45
+    |
+405 |         tokio::time::timeout(haider_client::REQUEST_TIMEOUT, async {
+    |                                             ^^^^^^^^^^^^^^^ not found in `haider_client`
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `haider-daemon` (lib test) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

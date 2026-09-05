@@ -53,6 +53,8 @@ fn overrides() -> Option<SessionPermissionOverridesV1> {
 
 fn task_metadata(cwd: &str) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        provider_base_url: None,
+        provider_rebind_id: None,
         cwd: cwd.to_owned(),
         provider: "fake".into(),
         account_alias: None,

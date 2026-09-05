@@ -2,13 +2,15 @@
 
 Status: orchestrator-facing guide for wire protocol `v = 1`  
 Byte authority: `crates/haider-rpc/tests/fixtures/wire_transcript.json` and
-`client_contract_methods_v1.json`
+`client_contract_methods_v1.json`; the caching declaration comes from
+`crates/haider-cli/tests/fixtures/observe_status.json`.
 
 This guide is for a controller that has never used the Rust SDK. It summarizes
 the existing protocol; it does not add a method, field, event, or compatibility
 promise. Every JSON block below is copied either as a complete `ws_body` frame
 from `wire_transcript.json` or as an exact request/response body from
-`client_contract_methods_v1.json`. The fence tag says which real
+`client_contract_methods_v1.json`, or as the exact `daemon.caching` value
+from the CLI status golden. The fence tag says which real
 `haider-rpc` type parses it. The source note beside each example names its
 golden line.
 
@@ -674,9 +676,121 @@ remains a CLI status field, not `ResponseBody::StatusSnapshot`. The visible
 `crates/haider-cli/src/observe.rs:67-78`, `:240-272`, `:562-608`; its typed
 meaning is at `crates/haider-client/src/profile.rs:187-200` on that branch.
 
+## 11. Daemon caching and reuse declaration
+
+Since v0.0.970, `haider status --json` includes `daemon.caching` from the
+daemon's additive `status.snapshot.caching` object. An older daemon that
+omits this declaration produces `daemon.caching: null`; absence is unknown,
+not disabled. A representative declaration is:
+
+```json value.daemon_caching
+{"prompt_cache":true,"provider_view_cas":true,"session_reuse":"resident","idle_ttl_ms":30000,"cache_regime":"automatic-prefix","cache_regimes_by_provider":{"openai":"automatic-prefix","anthropic":"explicit-breakpoints"}}
+```
+
+Source: `crates/haider-cli/tests/fixtures/observe_status.json:1`,
+`daemon.caching`; type: `haider_rpc::DaemonCachingWire`.
+
+| Field | Meaning |
+| --- | --- |
+| `prompt_cache` | The daemon's cache-aware prompt preparation is enabled. This is support, not a cache-hit metric or a claim that every request emits cache controls: adapter model/auth verification, account/header certainty, model minimums, and the upstream provider determine eligibility and actual cache reads. Auxiliary requests such as credential probes and degraded compaction may omit cache metadata. |
+| `provider_view_cas` | The daemon persists content-addressed provider views and their journal facts before dispatch when the adapter supplies a provider view. This local durable artifact store is separate from upstream prompt caching and does not memoize provider replies. |
+| `session_reuse` | `one_shot` only when the serving daemon's effective idle TTL is zero; otherwise `resident`, including a direct daemon with no idle limit. This reports process reuse policy, not a promise that every session worker remains in memory. Session journals survive either policy. |
+| `idle_ttl_ms` | The serving daemon's effective idle timeout, identical to `daemon.idle_ttl_ms`: zero for one-shot, a positive timeout in milliseconds for finite retention, and `null` for unbounded retention. It is neither a prompt-cache TTL nor a session-worker eviction deadline. |
+| `cache_regime` | The adapter regime for the daemon's active account, identified by the same status document's `account.provider`. `null` means there is no active account or its adapter has no declared regime. |
+| `cache_regimes_by_provider` | Registry provider IDs mapped to adapter regimes, including custom providers. Use the session's effective provider ID here when annotating a rebound or otherwise overridden session; the daemon active account can differ from that session. Missing entries and `null` values mean unknown. |
+
+OpenAI Responses and OpenAI chat-completions family adapters declare
+`automatic-prefix`. A proxy ledger reporting zero explicit breakpoints is
+therefore compatible with prompt caching; it must not be interpreted as
+disabled caching. This is the baseline family convention; supported OpenAI
+models can additionally emit explicit TTL/breakpoint overlays, and the
+subscription lite adapter has an opt-in breakpoint experiment. The declaration
+does not promise that every OpenAI request has zero markers.
+Anthropic Messages family adapters declare
+`explicit-breakpoints`, using `cache_control` with `type: "ephemeral"` on
+eligible prompt blocks. This includes custom providers using those families.
+Other families currently declare `null`, so no cache protocol is guessed for
+Gemini or externally supervised ACP agents. A regime describes the adapter's
+request convention; it cannot promise that a custom endpoint implements a
+cache. Harnesses should record the declaration alongside measured cache-read
+usage and breakpoint counts. Daemon lifetime and warm residency alone do not
+prove that an upstream cache survived or that a stateless client had no cache.
+
+The active-account regime and provider map come from one management snapshot;
+this read performs no provider network requests. Unknown additive fields or
+future regime strings must be tolerated by consumers.
+
+## Per-session provider rebind
+
+`haider session provider rebind --session <id> --provider <id>
+[--base-url <url>] [--account <name>]` sends the negotiated
+`session.provider.rebind` RPC (`session_provider_rebind_v1`). The CLI prints a
+JSON receipt with schema `haider.session_provider_rebind.v1`, `session_id`,
+`provider`, `base_url`, `account`, `selected_seq`, and `worker_generation`.
+The RPC accepts those routing arguments plus `command_id` and
+`worker_generation`; a Control capability and control attachment to that
+session are required. Repeating the same command ID and coordinates returns
+the original receipt; reusing it for different coordinates is a conflict.
+
+A successful response means the `session_provider_rebound` event, the session
+metadata projection, and the command receipt committed atomically. The event
+is additive and replays through the ordinary journal cursor without provider
+traffic. Restarted workers read the persisted binding. No daemon restart,
+profile-registry rewrite, or change to any other session is required.
+
+The request boundary is the point where the worker snapshots an adapter
+before preparing provider-specific history, cache metadata, and its durable
+request attempt. A request already past that boundary retains its original
+adapter through response completion. A subsequent request, including a
+continuation after a tool result or a retry through the core request loop,
+picks up a rebind acknowledged before its boundary. Transport work already
+owned by the earlier request stays with that request. A manual compaction
+captures its route when the operation starts; any internal degraded fallback
+retains that snapshot, and a later separate compaction reads the new binding.
+The model, effort and speed are unchanged; the current model must be accepted by the target
+provider's registry policy. Normal model selection retains its next-turn
+contract. Selecting a different provider later clears an earlier rebind's
+endpoint and account overrides.
+
+Omitting `base_url` clears this session's URL override and uses the registry
+or account endpoint. Omitting `account` clears the explicit account pin and
+uses the selected provider's normal active-account resolution (or its
+registered no-auth mode). An explicit alias must exist and belong to the
+selected provider. Adapter construction uses session-local copies of both
+endpoint sources, so an old pooled adapter cannot conceal the new URL.
+
+URL overrides are allowed for registered custom providers and the
+`openai-compatible` proxy adapter, subject to the registry's TrustedLan
+endpoint validation (loopback and trusted LAN endpoints are supported;
+metadata/link-local destinations and public plain HTTP are refused).
+`bedrock` and `vertex` permit only their existing enterprise URL templates.
+Fixed first-party, OAuth, and externally supervised agent endpoints cannot
+be redirected by this verb. Unknown providers return `provider_unknown`,
+unknown accounts `account_unknown`, wrong-provider aliases
+`account_provider_mismatch`, disabled providers `provider_unavailable`, and
+forbidden or malformed URL overrides `invalid_argument`. Stale generations
+and command conflicts use the existing typed errors. A trust-class change,
+or a provider change within lockdown, returns `busy` while a run is active;
+retry after the session becomes idle. This preserves its frozen tool/effect
+permissions.
+
+A changed route resets the request loop's cache comparison state and marks a
+configuration-change rewarm. The caching declaration above describes adapter
+support; a rebind does not promise a hit at a different endpoint or account.
+Harnesses should retain each rebind receipt, effective provider ID, caching
+declaration, and observed proxy/provider usage on the corresponding row.
+
 ## Additive changelog
 
 ### 2026-09-03 — v0.0.970
+
+- Added `session.provider.rebind`, its CLI verb, negotiated feature, and
+  durable `session_provider_rebound` event for per-session endpoint routing.
+
+- Added `status.snapshot.caching`, projected as `daemon.caching` by
+  `haider status --json`, declaring cache-aware prompt preparation,
+  provider-view CAS, effective process reuse/idle TTL, and provider adapter
+  cache regimes. It does not change cache, reuse, or eviction behavior.
 
 - Added stable per-turn provider request correlation headers, matching
   request-attempt journal coordinates, and matching opt-in daemon trace

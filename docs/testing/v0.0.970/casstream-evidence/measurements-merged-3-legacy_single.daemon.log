@@ -1,0 +1,13 @@
+haiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1
+haiderd: ephemeral-lifecycle event=connection_retired reason=error attached_clients=0
+haiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/hcs-srvr85ta/r/h.sock
+haiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/hcs-srvr85ta/r/h.sock
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=completed barrier_breached=false
+haiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/hcs-srvr85ta/r/h.sock
+haiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/hcs-srvr85ta/r/.haiderd-pid-9288ec8786ac2cb94116f906
+haiderd: ephemeral-lifecycle event=cleanup step=remove daemon-private temporary directory outcome=removed_exact_owned_directory path=/private/tmp/hcs-srvr85ta/r/tmp/.haiderd-tmp-14c76d75573d38bbb687c669
+haiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/hcs-srvr85ta/r/tmp
+haiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=retained_unowned_directory reason=directory_not_created_by_this_daemon path=/private/tmp/hcs-srvr85ta/r retained_entries=[]
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=completed barrier_breached=false

@@ -89,6 +89,27 @@ impl Peer {
         }
     }
 
+    async fn binary_next(&mut self) -> haider_rpc::binary_artifact::Frame {
+        self.decoder.set_binary_artifacts(true);
+        loop {
+            let mut bytes = [0_u8; 8192];
+            let read = self.stream.read(&mut bytes).await.expect("binary read");
+            assert_ne!(read, 0);
+            let batch = self.decoder.push(&bytes[..read]);
+            assert!(batch.error.is_none(), "binary decode: {:?}", batch.error);
+            for frame in batch.frames {
+                if let WireFrame::Ping { nonce } = frame {
+                    self.write(&WireFrame::Pong { nonce }).await;
+                } else {
+                    panic!("ordinary request overtook binary upload");
+                }
+            }
+            if let Some(frame) = batch.binary_artifacts.into_iter().next() {
+                return frame;
+            }
+        }
+    }
+
     async fn request(&mut self) -> (RequestId, RequestBody) {
         match self.next().await {
             WireFrame::Request { request_id, body } => (request_id, body),
@@ -215,6 +236,8 @@ async fn respond_create_and_attach_with_account(
             created_seq: 0,
             worker_generation: 7,
             metadata: SessionMetadataV1 {
+                provider_base_url: None,
+                provider_rebind_id: None,
                 cwd: "/tmp".into(),
                 provider: provider.into(),
                 account_alias: account_alias.map(Into::into),
@@ -399,6 +422,8 @@ async fn r2_05_attach_then_start_are_ordered_separate_requests_with_receipts() {
                 created_seq: 0,
                 worker_generation: 7,
                 metadata: SessionMetadataV1 {
+                    provider_base_url: None,
+                    provider_rebind_id: None,
                     cwd: "/tmp".into(),
                     provider: "fake".into(),
                     account_alias: None,
@@ -1230,31 +1255,109 @@ async fn submit_response_loss_reconnects_buffers_replay_and_retries_same_command
 /// or durable command identity across the reconnect.
 #[tokio::test]
 async fn headless_attach_uploads_then_submits_with_durable_identity() {
+    attach_upload_resume_case(false).await;
+}
+
+#[tokio::test]
+async fn headless_binary_upload_disconnect_retries_snapshot_then_resumes_durable_submit() {
+    attach_upload_resume_case(true).await;
+}
+
+async fn attach_upload_resume_case(binary: bool) {
     let (_root, profile) = profile();
     let listener = UnixListener::bind(&profile.endpoint_path).expect("bind reconnect peer");
     let mut handshake = welcome(&profile);
     handshake
         .features
         .insert(haider_rpc::FEATURE_ARTIFACT_PUT_V1.to_owned());
+    if binary {
+        handshake
+            .features
+            .insert(haider_rpc::binary_artifact::FEATURE.to_owned());
+    }
     let image_bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
     let expected_ref = ArtifactRef::new(format!("blake3:{}", blake3::hash(&image_bytes).to_hex()));
     let peer_ref = expected_ref.clone();
     let peer = tokio::spawn(async move {
         let mut first = accept_peer(&listener, handshake.clone()).await;
-        let (put_request, put) = first.request().await;
-        let RequestBody::ArtifactPut { data_base64 } = put else {
-            panic!("artifact.put must precede session.create, got {put:?}");
-        };
-        assert_eq!(data_base64, "iVBORw0KGgo=");
-        first
-            .respond(
-                put_request,
-                ResponseBody::ArtifactPut {
-                    artifact: peer_ref.clone(),
-                    bytes: 8,
-                },
-            )
-            .await;
+        if binary {
+            use haider_rpc::binary_artifact::Frame;
+            let Frame::Begin {
+                request_id,
+                bytes,
+                digest,
+            } = first.binary_next().await
+            else {
+                panic!("begin")
+            };
+            assert_eq!(bytes, 8);
+            assert_eq!(digest, peer_ref);
+            first
+                .respond(request_id, ResponseBody::ArtifactPutProgress { bytes: 0 })
+                .await;
+            let Frame::Chunk { bytes, offset, .. } = first.binary_next().await else {
+                panic!("chunk")
+            };
+            assert_eq!(offset, 0);
+            assert_eq!(&*bytes, &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+            // Lose the chunk ACK. The public headless reconnect seam must
+            // restart upload using the immutable original bytes.
+            drop(first);
+            first = accept_peer(&listener, handshake.clone()).await;
+            let Frame::Begin {
+                request_id,
+                bytes,
+                digest,
+            } = first.binary_next().await
+            else {
+                panic!("retry begin")
+            };
+            assert_eq!(bytes, 8);
+            assert_eq!(digest, peer_ref);
+            first
+                .respond(request_id, ResponseBody::ArtifactPutProgress { bytes: 0 })
+                .await;
+            let Frame::Chunk {
+                request_id,
+                bytes,
+                offset,
+            } = first.binary_next().await
+            else {
+                panic!("retry chunk")
+            };
+            assert_eq!(offset, 0);
+            assert_eq!(&*bytes, &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+            first
+                .respond(request_id, ResponseBody::ArtifactPutProgress { bytes: 8 })
+                .await;
+            let Frame::Finish { request_id } = first.binary_next().await else {
+                panic!("finish")
+            };
+            first
+                .respond(
+                    request_id,
+                    ResponseBody::ArtifactPut {
+                        artifact: peer_ref.clone(),
+                        bytes: 8,
+                    },
+                )
+                .await;
+        } else {
+            let (put_request, put) = first.request().await;
+            let RequestBody::ArtifactPut { data_base64 } = put else {
+                panic!("artifact.put must precede session.create, got {put:?}");
+            };
+            assert_eq!(data_base64, "iVBORw0KGgo=");
+            first
+                .respond(
+                    put_request,
+                    ResponseBody::ArtifactPut {
+                        artifact: peer_ref.clone(),
+                        bytes: 8,
+                    },
+                )
+                .await;
+        }
 
         let (session_id, _) = accept_create_and_attach(&mut first).await;
         let (_, submit) = first.request().await;

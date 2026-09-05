@@ -22,7 +22,7 @@ use haider_protocol::tool::{
 use image::imageops::FilterType;
 use image::{DynamicImage, ImageFormat, ImageReader, Limits};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Cursor, ErrorKind, Read, Write};
+use std::io::{Cursor, ErrorKind, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -88,7 +88,196 @@ pub struct FileCas {
     root: PathBuf,
 }
 
+/// An unpublished upload. Only complete bytes matching the caller's digest
+/// become visible; dropping an upload closes and removes its staging file.
+/// The sink owns no store lock and retains only an incremental hash state.
+pub struct CasUpload {
+    cas: FileCas,
+    temporary: Option<File>,
+    temporary_path: TemporaryPath,
+    hasher: blake3::Hasher,
+    expected_len: u64,
+    received_len: u64,
+    failed: bool,
+}
+
+impl CasUpload {
+    /// Bytes accepted after the last complete chunk; publication makes them durable.
+    pub fn received_len(&self) -> u64 {
+        self.received_len
+    }
+
+    /// Publishes an internal stream under the digest of its exact written bytes.
+    /// Untrusted transports must use [`Self::finish`] with their declared digest.
+    pub fn finish_computed(self) -> StoreResult<ArtifactRef> {
+        let digest = ArtifactRef::new(format!("blake3:{}", self.hasher.finalize().to_hex()));
+        self.finish(&digest)
+    }
+
+    /// Copies one bounded transport chunk directly into the staging file.
+    /// A rejected chunk poisons the upload, preventing publication of a prefix.
+    pub fn write_chunk(&mut self, bytes: &[u8]) -> StoreResult<()> {
+        let next_len = self.received_len.checked_add(bytes.len() as u64);
+        if self.failed || next_len.is_none_or(|length| length > self.expected_len) {
+            self.failed = true;
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "CAS upload exceeds its declared length or was previously aborted",
+                false,
+            ));
+        }
+        let Some(file) = self.temporary.as_mut() else {
+            self.failed = true;
+            return Err(store_error(
+                ErrorCode::Internal,
+                "CAS upload is closed",
+                false,
+            ));
+        };
+        if let Err(error) = file.write_all(bytes) {
+            self.failed = true;
+            return Err(io_error(
+                "write CAS upload",
+                self.temporary_path.path(),
+                error,
+            ));
+        }
+        self.hasher.update(bytes);
+        self.received_len = next_len.unwrap_or(self.received_len);
+        Ok(())
+    }
+
+    /// Publishes only the complete declared length and matching BLAKE3 digest.
+    /// The independent artifact durability boundary remains Full-at-return.
+    pub fn finish(mut self, expected: &ArtifactRef) -> StoreResult<ArtifactRef> {
+        parse_artifact_ref(expected)?;
+        let actual = ArtifactRef::new(format!("blake3:{}", self.hasher.finalize().to_hex()));
+        if self.failed || self.received_len != self.expected_len || actual != *expected {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "CAS upload length or BLAKE3 digest does not match its declaration",
+                false,
+            ));
+        }
+        let file = self
+            .temporary
+            .take()
+            .ok_or_else(|| store_error(ErrorCode::Internal, "CAS upload is closed", false))?;
+        sync_file(
+            &file,
+            self.temporary_path.path(),
+            haider_platform::SyncPolicy::Full,
+        )?;
+        drop(file);
+        let path = self.cas.path_for(expected)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| store_error(ErrorCode::Internal, "CAS object has no shard", false))?;
+        if self.cas.verify_existing(expected, &path)? {
+            cleanup_temporary(
+                &mut self.temporary_path,
+                &self.cas.root,
+                haider_platform::SyncPolicy::Full,
+            )?;
+            // A concurrent publisher may have linked this object but not yet
+            // synced its shard. Our acknowledgement owns the same durability
+            // guarantee even when deduplication avoids publishing a new link.
+            sync_directory(parent, haider_platform::SyncPolicy::Full)?;
+            return Ok(expected.clone());
+        }
+        let shard_created = !parent.exists();
+        fs::create_dir_all(parent).map_err(|error| io_error("create CAS shard", parent, error))?;
+        if shard_created {
+            sync_directory(&self.cas.root, haider_platform::SyncPolicy::Full)?;
+        }
+        match fs::hard_link(self.temporary_path.path(), &path) {
+            Ok(()) => {
+                cleanup_temporary(
+                    &mut self.temporary_path,
+                    &self.cas.root,
+                    haider_platform::SyncPolicy::Full,
+                )?;
+                sync_directory(parent, haider_platform::SyncPolicy::Full)?;
+                Ok(expected.clone())
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                let valid = self.cas.verify_existing(expected, &path);
+                cleanup_temporary(
+                    &mut self.temporary_path,
+                    &self.cas.root,
+                    haider_platform::SyncPolicy::Full,
+                )?;
+                if valid? {
+                    sync_directory(parent, haider_platform::SyncPolicy::Full)?;
+                    Ok(expected.clone())
+                } else {
+                    Err(corrupt_object(&path))
+                }
+            }
+            Err(error) => Err(io_error("publish CAS upload", &path, error)),
+        }
+    }
+}
+
+impl Write for CasUpload {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.write_chunk(bytes)
+            .map_err(|error| std::io::Error::other(error.message))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // write_chunk writes directly to File; finish owns the sync boundary.
+        Ok(())
+    }
+}
+
+impl Drop for CasUpload {
+    fn drop(&mut self) {
+        // Windows cannot unlink an open file. Close before TemporaryPath drops.
+        drop(self.temporary.take());
+    }
+}
+
 impl FileCas {
+    /// Begins an upload without buffering the declared content in memory.
+    pub fn begin_put(&self, expected_len: u64) -> StoreResult<CasUpload> {
+        let (temporary_path, temporary) = create_temporary(&self.root)?;
+        Ok(CasUpload {
+            cas: self.clone(),
+            temporary: Some(temporary),
+            temporary_path,
+            hasher: blake3::Hasher::new(),
+            expected_len,
+            received_len: 0,
+            failed: false,
+        })
+    }
+
+    /// Opens a blob with bounded-memory integrity verification, rewinding the
+    /// same handle so pathname replacement cannot change the verified object.
+    /// CAS objects are immutable; callers may then stream or seek this handle.
+    pub fn open_verified(&self, artifact: &ArtifactRef) -> StoreResult<File> {
+        let path = self.path_for(artifact)?;
+        let mut file = File::open(&path).map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot read CAS object {}: {error}", path.display()),
+                    false,
+                )
+            } else {
+                io_error("open CAS object", &path, error)
+            }
+        })?;
+        if artifact_for_reader(&mut file, &path)? != *artifact {
+            return Err(corrupt_object(&path));
+        }
+        file.rewind()
+            .map_err(|error| io_error("rewind CAS object", &path, error))?;
+        Ok(file)
+    }
+
     /// Opens a CAS in a profile root, creating its directory if needed.
     pub fn open(profile_root: impl AsRef<Path>) -> StoreResult<Self> {
         Self::open_namespace(profile_root.as_ref(), "cas")
@@ -198,14 +387,6 @@ impl FileCas {
         drop(temporary);
 
         let path = self.path_for(&artifact)?;
-        if self.verify_existing(&artifact, &path)? {
-            cleanup_temporary(
-                &mut temporary_path,
-                &self.root,
-                haider_platform::SyncPolicy::Full,
-            )?;
-            return Ok(artifact);
-        }
         let parent = path.parent().ok_or_else(|| {
             store_error(
                 ErrorCode::Internal,
@@ -213,6 +394,15 @@ impl FileCas {
                 false,
             )
         })?;
+        if self.verify_existing(&artifact, &path)? {
+            cleanup_temporary(
+                &mut temporary_path,
+                &self.root,
+                haider_platform::SyncPolicy::Full,
+            )?;
+            sync_directory(parent, haider_platform::SyncPolicy::Full)?;
+            return Ok(artifact);
+        }
         let shard_created = !parent.exists();
         fs::create_dir_all(parent).map_err(|error| io_error("create CAS shard", parent, error))?;
         if shard_created {
@@ -241,6 +431,7 @@ impl FileCas {
                     haider_platform::SyncPolicy::Full,
                 )?;
                 if winner_is_valid? {
+                    sync_directory(parent, haider_platform::SyncPolicy::Full)?;
                     Ok(artifact)
                 } else {
                     Err(corrupt_object(&path))
@@ -409,10 +600,6 @@ impl FileCas {
     ) -> StoreResult<ArtifactRef> {
         let artifact = artifact_for(bytes);
         let path = self.path_for(&artifact)?;
-        if self.verify_existing(&artifact, &path)? {
-            return Ok(artifact);
-        }
-
         let parent = path.parent().ok_or_else(|| {
             store_error(
                 ErrorCode::Internal,
@@ -420,6 +607,15 @@ impl FileCas {
                 false,
             )
         })?;
+        if self.verify_existing(&artifact, &path)? {
+            // The winner may still be between hard_link and shard sync.
+            // Independent puts must close their own durability boundary;
+            // deferred batches retain their existing group-owned fence.
+            if !defer_shard_sync {
+                sync_directory(parent, policy)?;
+            }
+            return Ok(artifact);
+        }
         let shard_created = !parent.exists();
         fs::create_dir_all(parent).map_err(|error| io_error("create CAS shard", parent, error))?;
         if shard_created && !defer_shard_sync {

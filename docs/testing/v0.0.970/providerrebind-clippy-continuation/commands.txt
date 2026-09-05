@@ -1,0 +1,39 @@
+Providerrebind clippy continuation, 2026-09-05
+Starting HEAD: 45f3d5c5
+
+Environment for sibling build, workspace tests, clippy, and test-count:
+export RUST_MIN_STACK=8388608
+export HAIDER_DISCOVERY_DISABLED=1
+export HAIDER_TEST_DEVICE_NAME=test-mac
+export CARGO_INCREMENTAL=0
+export CARGO_PROFILE_DEV_DEBUG=0
+
+Before each Cargo build-capable command: df -m /
+Abort with ENVIRONMENT-BLOCKED if available disk is below 700 MiB.
+
+cargo build -p haider-cli -p haider-daemond --bin haider --bin haiderd
+Verify target/debug/haiderd is larger than 10 MiB.
+export HAIDER_TEST_SIBLINGS_PREBUILT=1
+
+cargo test -q --workspace --no-fail-fast
+cargo clippy --workspace --tests -- -D warnings
+cargo run -q -p xtask -- test-count --update
+
+Execution record: the first workspace pass succeeded, then clippy reported
+two additional test lints. After correcting those tests, the exact clippy
+command passed as a preflight. Siblings were freshly built again, the test
+baseline was recounted, and the exact workspace test followed by exact
+clippy command both passed on the final source tree. Attempt-1 logs are kept
+separately; workspace-tests.log and clippy-tests.log are the final gates.
+
+Formatting and whitespace verification:
+cargo fmt --all -- --check
+git diff --check
+
+The workspace totals sum all anchored libtest result summaries in
+workspace-tests.log, using the same accounting as the prior landing report.
+The xtask baseline independently counts source test-attribute markers.
+
+The source initializer correction was already uncommitted at the start of
+this continuation. It is preserved and checked against committed HEAD.
+The committed merge is retained. No commit, fetch, or merge is performed.

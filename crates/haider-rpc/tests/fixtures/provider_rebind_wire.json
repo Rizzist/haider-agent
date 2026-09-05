@@ -1,0 +1,30 @@
+[
+  {
+    "v": 1,
+    "kind": "request",
+    "request_id": "request-provider-rebind",
+    "body": {
+      "method": "session.provider.rebind",
+      "command_id": "command-provider-rebind",
+      "session_id": "session-1",
+      "worker_generation": 3,
+      "provider": "benchmark-proxy",
+      "base_url": "http://127.0.0.1:8000/v1",
+      "account": "benchmark-account"
+    }
+  },
+  {
+    "v": 1,
+    "kind": "response",
+    "request_id": "request-provider-rebind",
+    "body": {
+      "method": "session.provider.rebind",
+      "session_id": "session-1",
+      "provider": "benchmark-proxy",
+      "base_url": "http://127.0.0.1:8000/v1",
+      "account": "benchmark-account",
+      "selected_seq": 17,
+      "worker_generation": 3
+    }
+  }
+]
