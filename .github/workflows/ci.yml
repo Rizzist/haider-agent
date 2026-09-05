@@ -15,8 +15,9 @@ on:
 # profile. It runs automatically on main, is a required `needs` dependency of
 # release.yml for every v* tag/manual release build, and can be invoked before
 # tagging with `gh workflow run ship-gate.yml --ref <candidate-ref>`; the
-# pre-tag ritual is to wait for ci.yml, xplat.yml, and that manual ship gate on
-# the exact candidate SHA before creating the tag. release.yml and the Android
+# ship gate first requires successful ci.yml and xplat.yml runs on the exact
+# caller SHA, dispatching missing evidence. The local scripts/ship-970.sh
+# pregate uses the same resolver before tagging. release.yml and the Android
 # release workflows continue to build actual artifacts with release settings.
 
 concurrency:
@@ -52,6 +53,8 @@ jobs:
         run: cargo run -p xtask -- check
       - name: release packaging regression tests
         run: python3 -m unittest scripts/tests/test_release_packaging.py
+      - name: release evidence policy regression tests
+        run: bash scripts/release/tests/require-evidence-test.sh
       - name: self-test
         env:
           # The CLI-only self-test embeds the same deep actor future that

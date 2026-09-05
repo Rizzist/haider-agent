@@ -17,6 +17,9 @@ env:
 
 jobs:
   ship-gate:
+    permissions:
+      actions: write
+      contents: read
     uses: ./.github/workflows/ship-gate.yml
 
   build:
