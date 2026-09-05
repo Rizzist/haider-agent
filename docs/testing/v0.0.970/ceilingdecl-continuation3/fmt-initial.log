@@ -1,0 +1,12 @@
+Diff in /Users/rizzist/haider-run/lane-970-ceilingdecl/crates/haider-daemon/src/connection_tests.rs:356:
+ /// provider rows from the legacy fleet shape.
+ #[test]
+ fn welcome_features_pin_served_management_families() {
+[31m-    eprintln!("handshake pin: served_features={}", welcome_features().len());
+(B[m[32m+    eprintln!(
+(B[m[32m+        "handshake pin: served_features={}",
+(B[m[32m+        welcome_features().len()
+(B[m[32m+    );
+(B[m     assert_eq!(
+         welcome_features().len(),
+         115,

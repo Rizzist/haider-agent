@@ -840,6 +840,105 @@ fn replay_of_a_tool_call_turn_equals_the_live_run_scoped_jsonl() {
     );
 }
 
+/// A read-only cap still surfaces work; a writing cap proves mutation from
+/// receipts. Changing the workspace after exit must not alter replay facts.
+#[test]
+fn capped_run_retains_terminal_progress_for_untouched_and_mutated_workspaces() {
+    for mutate in [false, true] {
+        let profile = TestProfile::new();
+        std::fs::write(profile.workspace.join("existing.txt"), "preexisting dirt")
+            .expect("initial workspace");
+        let (name, args) = if mutate {
+            (
+                "fs_write",
+                serde_json::json!({"path":"partial.txt", "content":"partial work"}),
+            )
+        } else {
+            ("fs_read", serde_json::json!({"path":"existing.txt"}))
+        };
+        let script = serde_json::json!([
+            {"step":"emit_tool_call", "call_id":"partial-call", "name":name, "args":args},
+            {"step":"finish", "reason":"tool_use"},
+            {"step":"expect_tool_result", "call_id":"partial-call"},
+            {"step":"emit_text", "text":"must never request this segment"},
+            {"step":"finish", "reason":"end_turn"}
+        ])
+        .to_string();
+        let mut live = profile.command();
+        live.args([
+            "run",
+            "--provider",
+            "fake",
+            "--output",
+            "json",
+            "--request-tranche",
+            "1",
+            "--max-requests",
+            "1",
+            "-p",
+            "make partial progress",
+        ])
+        .env("HAIDER_TEST_FAKE_PROVIDER", script);
+        let output = output_with_boot_retry(&mut live);
+        assert_eq!(
+            output.status.code(),
+            Some(78),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("run JSON");
+        let terminal = &result["terminal"];
+        assert_eq!(terminal["end_reason"], "harness_internal_ceiling");
+        assert_eq!(terminal["internal_cap_detected"], true);
+        assert_eq!(terminal["exit_code"], 78);
+        assert_eq!(
+            terminal["ceilings"],
+            serde_json::json!({"soft":1,"hard":1,"used":1})
+        );
+        assert_eq!(terminal["continuation"]["run_id"], result["run_id"]);
+        assert_eq!(terminal["continuation"]["session_id"], result["session_id"]);
+        assert_eq!(
+            terminal["workspace_state"],
+            if mutate { "mutated" } else { "untouched" }
+        );
+        assert_eq!(
+            terminal["workspace_before"] == terminal["workspace_after"],
+            !mutate
+        );
+        assert_eq!(
+            terminal["partial_progress"],
+            serde_json::json!({
+                "files_written": if mutate { vec!["partial.txt"] } else { Vec::<&str>::new() },
+                "files_deleted": [], "tool_calls": 1, "last_request_ordinal": 1
+            })
+        );
+        assert_eq!(result["error"]["code"], "request_budget_exceeded");
+        let events = result["events"].as_array().expect("retained events");
+        assert_eq!(
+            events.last().expect("terminal envelope")["payload"]["terminal"],
+            *terminal
+        );
+        std::fs::write(
+            profile.workspace.join("later.txt"),
+            "outside the original run",
+        )
+        .expect("change workspace after terminal");
+        let mut replay = profile.command();
+        replay.args([
+            "run",
+            "--replay",
+            result["run_id"].as_str().expect("run id"),
+        ]);
+        let replay = output_with_boot_retry(&mut replay);
+        assert_success(&replay, "capped replay");
+        let replay: serde_json::Value =
+            serde_json::from_slice(&replay.stdout).expect("replay JSON");
+        assert_eq!(replay["terminal"], *terminal);
+        assert_eq!(replay["events"], result["events"]);
+        assert_eq!(replay["provider_requests"], 0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pins: provider request body
 // ---------------------------------------------------------------------------

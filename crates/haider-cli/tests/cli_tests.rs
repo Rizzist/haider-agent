@@ -3816,6 +3816,7 @@ fn jsonl_store_failure_emits_errored_and_returns_nonzero_without_hanging() {
 
 fn result(outcome: HeadlessOutcome, failure: Option<HeadlessRunFailure>) -> HeadlessRunResult {
     HeadlessRunResult {
+        terminal: None,
         session_id: SessionId::new("session-json"),
         run_id: RunId::new("run-json"),
         provider: "fake".into(),

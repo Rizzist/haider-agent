@@ -482,3 +482,9 @@ new error codes retain the established forward-compatibility behavior.
   output provenance for eviction/recovery; legacy facts omit it. Optional
   `truncation` on `SshShellResultWire` carries the same typed captured-byte
   provenance. Both are additive and are omitted when unavailable/unused.
+- v0.0.970 ceiling declaration: additive headless `run_state` terminal evidence
+  (`terminal.end_reason = harness_internal_ceiling`, ceilings, continuation,
+  pre/post workspace receipts and partial progress), retained unchanged in JSON
+  and durable replay. Dedicated request-ceiling exit 78 replaces shared 77.
+  The prompt-omitted `turn_workspace_before_v1` extension is committed before
+  first dispatch. `schema_version` remains 1; legacy events omit these fields.
