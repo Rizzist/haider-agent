@@ -3030,7 +3030,11 @@ fn run_nonpermission_input_rejects_without_guessing_and_continues() {
     ]"#;
     let out = haider_with_boot_retry(
         &["run", "--provider", "fake", "hello", "--jsonl"],
-        &[("HAIDER_TEST_FAKE_PROVIDER", script)],
+        &[
+            ("HAIDER_TEST_FAKE_PROVIDER", script),
+            // Exercise autonomous-input rejection after explicit tool exposure.
+            ("HAIDER_TOOL_EXPOSURE", "request_input"),
+        ],
     );
     assert!(
         out.status.success(),
@@ -3542,6 +3546,8 @@ fn run_read_only_denial_is_typed_and_terminal() {
             "json",
         ])
         .env("HAIDER_TEST_FAKE_PROVIDER", registry_script)
+        // Exercise the read-only permission gate for this configured capability.
+        .env("HAIDER_TOOL_EXPOSURE", "loom_register")
         .output()
         .expect("read-only registry run");
     assert_eq!(registry_output.status.code(), Some(i32::from(EX_BLOCKED)));
@@ -3816,6 +3822,7 @@ fn jsonl_store_failure_emits_errored_and_returns_nonzero_without_hanging() {
 
 fn result(outcome: HeadlessOutcome, failure: Option<HeadlessRunFailure>) -> HeadlessRunResult {
     HeadlessRunResult {
+        terminal: None,
         session_id: SessionId::new("session-json"),
         run_id: RunId::new("run-json"),
         provider: "fake".into(),

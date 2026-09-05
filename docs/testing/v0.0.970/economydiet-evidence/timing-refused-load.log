@@ -1,0 +1,2 @@
+1/4 A warm: starting existing proof harness
+{"status": "NO_SHIP", "completed_runs": [{"label": "A", "kind": "warm", "path": "1-A-warm.json", "sha256": "50f8fe5c30e9d4f57a1b8e3a7c0c3063f2cabe7e5d4595b8a476f06c3c38ce7a", "passed": false, "measurement_accepted": false}], "failures": [], "measurement_reasons": ["load end=3.28 is not below 3.00"]}

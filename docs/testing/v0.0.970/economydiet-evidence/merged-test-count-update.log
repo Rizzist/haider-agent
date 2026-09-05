@@ -1,0 +1,4 @@
+   Compiling xtask v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/xtask)
+    Finished `dev` profile [unoptimized] target(s) in 0.16s
+     Running `/private/tmp/haider-economydiet-target/debug/xtask test-count --update`
+test-count: baseline updated to 4969

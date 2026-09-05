@@ -39,6 +39,9 @@
 #[path = "peer_prompt_tests.rs"]
 mod peer_prompt_tests;
 
+#[path = "tool_exposure.rs"]
+mod tool_exposure;
+
 use crate::{
     ArtifactReader, InteractionGate, InteractionResolution, InteractionResolutionPolicy,
     PromptHistoryCompiler, ProviderViewAppendRequest, StoreHandle, unix_time_ms,
@@ -144,6 +147,149 @@ fn model_tool_result_projection(
     tool_name: &str,
     result: &BoundedResult,
 ) -> ModelToolResultProjection {
+    // Old journals and explicitly configured catalogs still dispatch `exec`.
+    let tool_name = if tool_name == "exec" {
+        "process_exec"
+    } else {
+        tool_name
+    };
+    if let Some((output, remote)) = tool_envelope_output(tool_name, result) {
+        // Receipts remain in the durable BoundedResult. Project only the
+        // tool-owned envelope, never JSON read from a file or printed by a
+        // command. Reusing the bounded-output path preserves caps, source
+        // omission disclosures, and the typed truncation footer on replay.
+        let mut payload = result.clone();
+        payload.preview = output;
+        payload.truncation = None;
+        let mut projection = if let Some(savings) =
+            trusted_process_output_savings(result.payload_text())
+                .filter(|_| tool_name == "process_exec")
+        {
+            ModelToolResultProjection {
+                preview: payload.preview,
+                truncated: result.truncated,
+                savings: Some(savings),
+            }
+        } else {
+            model_tool_payload_projection(if remote { "ssh_shell" } else { tool_name }, &payload)
+        };
+        if let Some(marker) = result.truncation.clone() {
+            payload.preview = projection.preview;
+            payload.declare_truncation(marker);
+            projection.preview = payload.preview;
+            projection.truncated = true;
+        }
+        if let Some(savings) = projection.savings.as_mut() {
+            let cost = OutputSavings::from_provider_request_bytes(
+                &savings.scope,
+                savings.input_bytes as usize,
+                haider_tools::provider_request_text_projection_bytes(&projection.preview),
+                savings.omitted_bytes as usize,
+                savings.omitted_bytes_exact,
+            );
+            savings.output_bytes = cost.output_bytes;
+            savings.estimated_tokens_after = cost.estimated_tokens_after;
+            savings.estimated_net_tokens_saved = cost.estimated_net_tokens_saved;
+            savings.estimated_tokens_saved = cost.estimated_tokens_saved;
+        }
+        return projection;
+    }
+    model_tool_payload_projection(tool_name, result)
+}
+
+/// Recognize only daemon-owned envelopes for the corresponding tool route.
+/// Values inside `output`/`result` are opaque; even receipt-shaped user text
+/// must survive byte-for-byte. Task IDs used to page background output are
+/// functional return values and are not process receipt envelopes.
+fn tool_envelope_output(tool_name: &str, result: &BoundedResult) -> Option<(String, bool)> {
+    let process = matches!(tool_name, "process_exec" | "ssh_shell");
+    let mutation = matches!(
+        tool_name,
+        "fs_write" | "fs_edit" | "fs_path" | "write" | "edit"
+    );
+    let graph_receipt = tool_name == "graph_evidence";
+    if !process && !mutation && !graph_receipt {
+        return None;
+    }
+    let mut value: serde_json::Value = serde_json::from_str(result.payload_text()).ok()?;
+    if graph_receipt {
+        value.get("fingerprint")?.as_str()?;
+        let object = value.as_object_mut()?;
+        object.remove("fingerprint");
+        object.remove("through_seq");
+        return Some((value.to_string(), false));
+    }
+    if mutation {
+        if result.status != ToolResultStatus::Completed
+            && value
+                .pointer("/error/kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("stale_read")
+        {
+            let details = value.pointer_mut("/error/details")?.as_object_mut()?;
+            details.remove("current_digest");
+            details.remove("recorded_digest");
+            return Some((value.to_string(), false));
+        }
+        value.get("mutation_digest")?.as_str()?;
+        let receipt = value.get("workspace_mutation")?;
+        receipt.get("run_id")?.as_str()?;
+        receipt.get("effect_id")?.as_str()?;
+        return value
+            .get("result")?
+            .as_str()
+            .map(|output| (output.to_owned(), false));
+    }
+    let remote = value.get("remote").and_then(serde_json::Value::as_bool) == Some(true);
+    let mut output = if remote {
+        // These two streams have no interleaving information in the remote
+        // protocol; preserve their existing stdout-then-stderr order.
+        format!(
+            "{}{}",
+            value.get("stdout")?.as_str()?,
+            value.get("stderr")?.as_str()?
+        )
+    } else {
+        for key in [
+            "status",
+            "effect_id",
+            "command_arg_digest",
+            "transcript_digest",
+            "output_adapter",
+        ] {
+            value.get(key)?;
+        }
+        value.get("output")?.as_str()?.to_owned()
+    };
+    if let Some(code) = value
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|code| *code != 0)
+    {
+        append_tool_output_line(&mut output, &format!("[exit_code={code}]"));
+    } else if result.status != ToolResultStatus::Completed {
+        // Signal, timeout, and cancellation may have no numeric exit code.
+        // Their terminal diagnosis is output, never an implied success.
+        let reason = result
+            .reason
+            .as_deref()
+            .unwrap_or("process did not complete");
+        append_tool_output_line(&mut output, reason);
+    }
+    Some((output, remote))
+}
+
+fn append_tool_output_line(output: &mut String, line: &str) {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(line);
+}
+
+fn model_tool_payload_projection(
+    tool_name: &str,
+    result: &BoundedResult,
+) -> ModelToolResultProjection {
     const INVENTORY_MODEL_PREVIEW_MAX_BYTES: usize = 8 * 1024;
     if result.truncation.is_some() && result.payload_text() != result.preview {
         // A producer already bounded this output and declared the exact raw
@@ -153,7 +299,7 @@ fn model_tool_result_projection(
         let mut legacy = result.clone();
         legacy.preview = result.payload_text().to_owned();
         legacy.truncation = None;
-        let legacy_projection = model_tool_result_projection(tool_name, &legacy);
+        let legacy_projection = model_tool_payload_projection(tool_name, &legacy);
         let mut projected = legacy;
         projected.preview = legacy_projection.preview;
         if let Some(marker) = result.truncation.clone() {
@@ -375,6 +521,9 @@ mod actor_tool_result_tests;
 #[cfg(test)]
 #[path = "actor_context_economy_tests.rs"]
 mod actor_context_economy_tests;
+
+#[path = "actor_ceiling.rs"]
+mod actor_ceiling;
 
 #[cfg(test)]
 #[path = "actor_journalview_tests.rs"]
@@ -613,6 +762,7 @@ pub struct HarnessConfig {
     pub tools: Vec<ToolDefinition>,
     /// Daemon-owned immutable pack; standalone embedders keep using `tools`.
     shared_tools: Option<Arc<[ToolDefinition]>>,
+    tool_exposure: Option<tool_exposure::ToolExposure>,
     /// Canonical digest of `tools` when the daemon installed an immutable
     /// tool-pack view. Standalone embedders that mutate `tools` directly leave
     /// this unset and retain canonical on-demand behavior.
@@ -720,6 +870,9 @@ pub struct HarnessConfig {
     /// Warn the model once after this many logical requests. Transport retries
     /// do not spend another request. A fresh continuation turn resets the budget.
     pub provider_request_tranche: usize,
+    /// Headless workspace for durable pre/post tree receipts at the hard cap.
+    /// Embedders without a workspace leave this absent.
+    pub ceiling_workspace: Option<std::path::PathBuf>,
     /// Logical requests already spent before a restart-safe continuation was
     /// reconstructed. Ordinary accepted turns start at zero.
     pub provider_requests_already_made: usize,
@@ -803,6 +956,7 @@ impl HarnessConfig {
             volatile_user_tail: None,
             tools: Vec::new(),
             shared_tools: None,
+            tool_exposure: None,
             tool_pack_digest: None,
             enforce_advertised_tool_ceiling: false,
             provider_tool_fallback_tools: Vec::new(),
@@ -845,6 +999,7 @@ impl HarnessConfig {
             broadcast_capacity: 128,
             max_provider_requests_per_turn: DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN,
             provider_request_tranche: 32,
+            ceiling_workspace: None,
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             turn_ordinal: 1,
@@ -910,6 +1065,7 @@ impl HarnessConfig {
             self.shared_provider_tool_fallback_tools = fallback.map(|(tools, _)| Arc::clone(tools));
             self.provider_tool_fallback_digest = fallback.map(|(_, digest)| digest.clone());
             self.tool_result_images_supported = state.tool_result_images_supported;
+            self.refresh_tool_exposure();
             return;
         }
         if let Some(base) = self.shared_provider_tool_base.as_ref() {
@@ -941,6 +1097,7 @@ impl HarnessConfig {
                 .as_deref()
                 .map(canonical_tool_definitions_digest);
             self.tool_result_images_supported = state.tool_result_images_supported;
+            self.refresh_tool_exposure();
             return;
         }
         if let Some(base) = self.provider_tool_base.as_ref() {
@@ -967,14 +1124,17 @@ impl HarnessConfig {
             self.shared_provider_tool_fallback_tools = None;
             self.provider_tool_fallback_digest = None;
             self.tool_result_images_supported = state.tool_result_images_supported;
+            self.refresh_tool_exposure();
             return;
         }
+        self.restore_owned_tool_exposure();
         self.shared_tools = None;
         self.tool_pack_digest = None;
         self.provider_tool_fallback_tools.clear();
         self.shared_provider_tool_fallback_tools = None;
         self.provider_tool_fallback_digest = None;
         self.tool_result_images_supported = state.tool_result_images_supported;
+        self.refresh_tool_exposure();
     }
 
     /// Installs daemon-cached immutable packs for the initial provider lane.
@@ -1005,6 +1165,7 @@ impl HarnessConfig {
         self.shared_provider_tool_fallback_tools = fallback_tools;
         self.provider_tool_fallback_digest = fallback_digest;
         self.tool_result_images_supported = state.tool_result_images_supported;
+        self.refresh_tool_exposure();
     }
 
     /// Returns the active definitions without materializing an immutable pack.
@@ -1030,6 +1191,7 @@ impl HarnessConfig {
     }
 
     fn activate_provider_tool_fallback(&mut self) {
+        self.note_tool_exposure_fallback();
         self.shared_tools = self.shared_provider_tool_fallback_tools.take();
         self.tools = if self.shared_tools.is_some() {
             Vec::new()
@@ -1631,6 +1793,15 @@ pub struct ContextCompactionRequest<'a> {
 
 #[async_trait]
 pub trait ContextCompactor: Send + Sync + std::fmt::Debug {
+    /// Rebinds replay/accounting to a deliberately promoted tool surface.
+    /// Compactors independent of tools keep their current implementation.
+    fn with_tool_definitions(
+        &self,
+        _tools: Arc<[ToolDefinition]>,
+    ) -> Option<Arc<dyn ContextCompactor>> {
+        None
+    }
+
     async fn plan(
         &self,
         run_id: &RunId,
@@ -3361,6 +3532,23 @@ impl HarnessActor {
             }
         }
         let mut continuation_count = 0usize;
+        let (workspace_before, mut pending_workspace_receipt) = match self
+            .prepare_ceiling_workspace(&run_id, restore_budget, &cancel)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(_) if cancel.is_cancelled() => {
+                return self
+                    .cancelled_outcome_with_items(&run_id, &mut message, &mut reasoning, &mut tools)
+                    .await;
+            }
+            Err(error) => return self.errored_state_outcome(&run_id, error).await,
+        };
+        if cancel.is_cancelled() {
+            return self
+                .cancelled_outcome_with_items(&run_id, &mut message, &mut reasoning, &mut tools)
+                .await;
+        }
         let mut forced_compaction_used = false;
         // Once an ineffective compaction promotes this turn, later request
         // rounds may use the larger hard budget but must never compact again.
@@ -3517,6 +3705,65 @@ impl HarnessActor {
             }
         }
         'requests: loop {
+            if provider_attempt == 0 {
+                let budget = self.request_budget();
+                if !soft_bound_emitted && provider_request_count >= budget.tranche {
+                    let status = self.request_budget_status(
+                        &run_id,
+                        provider_request_count,
+                        RequestBudgetPhaseV1::SoftBound,
+                    );
+                    if let Err(error) = self.commit_request_budget_note(&run_id, &status).await {
+                        return self.errored_state_outcome(&run_id, error).await;
+                    }
+                    messages.push(Message::user_text(status.model_note()));
+                    soft_bound_emitted = true;
+                }
+                if provider_request_count >= budget.hard_cap {
+                    if let Err(error) = self
+                        .commit_pending_thinking(&run_id, &mut thinking_pending)
+                        .await
+                    {
+                        return self.errored_state_outcome(&run_id, error).await;
+                    }
+                    let status = self.request_budget_status(
+                        &run_id,
+                        provider_request_count,
+                        RequestBudgetPhaseV1::HardBound,
+                    );
+                    let mut error = request_budget_error(&status);
+                    if let Some(before) = &workspace_before {
+                        match self
+                            .ceiling_terminal(
+                                &run_id,
+                                &status,
+                                before,
+                                request_ordinals.current(),
+                                &cancel,
+                            )
+                            .await
+                        {
+                            Ok(terminal) => {
+                                if let Some(details) = error.details.as_mut() {
+                                    details["terminal"] = serde_json::json!(terminal);
+                                }
+                            }
+                            Err(error) => return self.errored_state_outcome(&run_id, error).await,
+                        }
+                    }
+                    return self
+                        .errored_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                            error,
+                        )
+                        .await;
+                }
+            }
+            // The exhausted logical cap takes precedence over route refresh:
+            // no unavailable provider may replace its typed terminal/receipts.
             // Snapshot BEFORE provider-specific history projection, cache/CAS
             // preparation and transport. A rebind never mutates an Arc used
             // by an earlier in-flight request.
@@ -3613,43 +3860,6 @@ impl HarnessActor {
                             )
                             .await;
                     }
-                }
-            }
-            if provider_attempt == 0 {
-                let budget = self.request_budget();
-                if !soft_bound_emitted && provider_request_count >= budget.tranche {
-                    let status = self.request_budget_status(
-                        &run_id,
-                        provider_request_count,
-                        RequestBudgetPhaseV1::SoftBound,
-                    );
-                    if let Err(error) = self.commit_request_budget_note(&run_id, &status).await {
-                        return self.errored_state_outcome(&run_id, error).await;
-                    }
-                    messages.push(Message::user_text(status.model_note()));
-                    soft_bound_emitted = true;
-                }
-                if provider_request_count >= budget.hard_cap {
-                    if let Err(error) = self
-                        .commit_pending_thinking(&run_id, &mut thinking_pending)
-                        .await
-                    {
-                        return self.errored_state_outcome(&run_id, error).await;
-                    }
-                    let status = self.request_budget_status(
-                        &run_id,
-                        provider_request_count,
-                        RequestBudgetPhaseV1::HardBound,
-                    );
-                    return self
-                        .errored_outcome_with_items(
-                            &run_id,
-                            &mut message,
-                            &mut reasoning,
-                            &mut tools,
-                            request_budget_error(&status),
-                        )
-                        .await;
                 }
             }
             if provider_attempt == 0 {
@@ -4227,6 +4437,7 @@ impl HarnessActor {
                         provider_view: provider_view_attempt_data,
                         cache: request_attempt_data,
                         response_epoch: replay.response_epoch,
+                        workspace_receipt: pending_workspace_receipt.take(),
                         request_budget: (provider_attempt == 1).then(|| {
                             self.request_budget_status(
                                 &run_id,
@@ -8076,13 +8287,18 @@ impl HarnessActor {
         if !tool_call_within_advertised_ceiling(&self.config, &tools[index].name) {
             let authority = if self.config.agent_id.is_some() {
                 "child"
+            } else if self.config.tool_exposure.is_some() {
+                "session"
             } else {
                 "workflow"
             };
-            let reason = format!(
+            let mut reason = format!(
                 "grant ceiling violation: {authority} is not allowed to use `{}`",
                 tools[index].name
             );
+            if self.config.tool_exposure.is_some() {
+                reason.push_str("; call list_tools with a matching filter to discover and enable authorized tools");
+            }
             let result = BoundedResult {
                 preview: serde_json::json!({
                     "status": "rejected",
@@ -8123,6 +8339,12 @@ impl HarnessActor {
         if tools[index].name == "todo_write" {
             return self
                 .complete_todo_write(run_id, tools, index)
+                .await
+                .map(Some);
+        }
+        if tools[index].name == "list_tools" {
+            return self
+                .complete_list_tools(run_id, tools, index)
                 .await
                 .map(Some);
         }
@@ -10269,6 +10491,12 @@ impl HarnessActor {
                 prompt_omit_render(),
             )?,
         ]);
+        if error.code == ErrorCode::RequestBudgetExceeded
+            && let Some(terminal) = error.details.as_ref().and_then(|data| data.get("terminal"))
+            && let Some(envelope) = envelopes.last_mut()
+        {
+            envelope.payload["terminal"] = terminal.clone();
+        }
         self.flush_pending_item_delta().await?;
         self.append_and_publish_owned(envelopes).await?;
         self.state.send_replace(Some(RunState::Errored));
@@ -10609,11 +10837,20 @@ impl HarnessActor {
             cache: cache_attempt_data,
             response_epoch,
             request_budget,
+            workspace_receipt,
         } = markers;
         self.flush_pending_item_delta().await?;
         let mut envelopes = Vec::with_capacity(
             usize::from(provider_view_data.is_some()) * 2 + usize::from(*thinking_pending) + 4,
         );
+        for receipt in workspace_receipt.into_iter().flatten() {
+            envelopes.extend(self.uncommitted_extension_marker(
+                run_id,
+                actor_ceiling::WORKSPACE_RECEIPT_KIND,
+                receipt,
+                hidden_prompt_omit_render(),
+            )?);
+        }
         if let Some(data) = provider_view_data {
             envelopes.extend(self.uncommitted_extension_marker(
                 run_id,
@@ -11833,6 +12070,7 @@ struct PendingUsageCommit {
 }
 
 struct RequestAttemptMarkers {
+    workspace_receipt: Option<Vec<serde_json::Value>>,
     provider_view: Option<serde_json::Value>,
     cache: serde_json::Value,
     response_epoch: u64,
@@ -12031,6 +12269,13 @@ fn tool_call_within_advertised_ceiling(config: &HarnessConfig, name: &str) -> bo
     if config.agent_id.is_none() && !config.enforce_advertised_tool_ceiling {
         return true;
     }
+    // The legacy exec spelling dispatches the same core capability. It
+    // never adds a declaration or bypasses a child/explicit grant ceiling.
+    let name = if config.tool_exposure.is_some() && name == "exec" {
+        "process_exec"
+    } else {
+        name
+    };
     config
         .tool_definitions()
         .iter()

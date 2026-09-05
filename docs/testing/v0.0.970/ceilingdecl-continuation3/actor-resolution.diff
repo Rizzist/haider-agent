@@ -1,0 +1,18 @@
+--- conflicted actor
++++ resolved actor
+@@ -376,14 +376,12 @@
+ #[path = "actor_context_economy_tests.rs"]
+ mod actor_context_economy_tests;
+ 
+-<<<<<<< HEAD
+ #[path = "actor_ceiling.rs"]
+ mod actor_ceiling;
+-=======
++
+ #[cfg(test)]
+ #[path = "actor_journalview_tests.rs"]
+ mod actor_journalview_tests;
+->>>>>>> origin/wave-970
+ 
+ // Two soft tranches cover the reported 53-round solved benchmark with 11
+ // requests of headroom, while preserving a finite guard against runaway work.

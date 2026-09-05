@@ -1,0 +1,15 @@
+Auto-merging crates/haider-cli/tests/cli_tests.rs
+Auto-merging crates/haider-cli/tests/fixtures/oneshot_run_golden.jsonl
+CONFLICT (content): Merge conflict in crates/haider-cli/tests/fixtures/oneshot_run_golden.jsonl
+Auto-merging crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_text_turn.jsonl
+CONFLICT (content): Merge conflict in crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_text_turn.jsonl
+Auto-merging crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_tool_turn.jsonl
+CONFLICT (content): Merge conflict in crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_tool_turn.jsonl
+Auto-merging crates/haider-cli/tests/turnhygiene_pin_tests.rs
+Auto-merging crates/haider-core/src/actor.rs
+Auto-merging crates/haider-daemon/src/permissions_core_tests.rs
+CONFLICT (content): Merge conflict in crates/haider-daemon/src/permissions_core_tests.rs
+Auto-merging crates/haider-daemon/src/worker.rs
+Auto-merging docs/event-schema-changelog.md
+Auto-merging docs/jsonl-run-contract-v1.md
+Automatic merge failed; fix conflicts and then commit the result.

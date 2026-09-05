@@ -1,0 +1,3 @@
+    Finished `dev` profile [unoptimized] target(s) in 0.14s
+     Running `/private/tmp/haider-economydiet-target/debug/xtask test-count`
+test-count: 4969 tests (baseline 4969) — ok

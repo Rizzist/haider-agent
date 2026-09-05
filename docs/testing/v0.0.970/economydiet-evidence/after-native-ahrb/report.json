@@ -1,0 +1,2202 @@
+{
+  "schema": 3,
+  "spec_version": 3,
+  "run_id": "ahrb-economy-d8debc17f3383383",
+  "profile_path": "/tmp/ahrb-2433bf25-10ffe",
+  "fingerprint": {
+    "harness": "haider-agent",
+    "harness_version": "haider 0.0.969",
+    "manifest": "e1cae5238327997acf8791dcfd40ec3601a9f69fcc2fc5d086b5c7409563a11c",
+    "workflows": "ee6a69428510881f25fc470c0643f45c347a87bb6499ed590a455405af64366c",
+    "fake_model": "0.1.0",
+    "normalizer": "0.1.0",
+    "ahrb_revision": "76d6a4d8456bdfaddabc4cfa0539c60348962bec",
+    "platform": "macos-aarch64",
+    "host_memory_bytes": 0,
+    "profile": "quick"
+  },
+  "results": [],
+  "badge": null,
+  "metrics": {
+    "economy.cache_bust_count": 0.0,
+    "economy.cache_eligible_fraction": 0.0,
+    "economy.context_token_curve_slope": 0.0,
+    "economy.effective_cost_usd": 0.18225,
+    "economy.effective_reference_tokens": 18225.0,
+    "economy.invalidated_prefix_tokens": 0.0,
+    "economy.last_context_size_tokens": 6576.0,
+    "economy.model_turns": 1.0,
+    "economy.per_turn_fixed_overhead_tokens": 6031.0,
+    "economy.redundant_tokens": 0.0,
+    "economy.reference_cost_usd": 0.18225,
+    "economy.retry_attempts": 1.0,
+    "economy.retry_reference_tokens": 11649.0,
+    "economy.stable_prefix_preserved_fraction": 0.0,
+    "economy.tool_batching_factor": 0.0,
+    "economy.tool_calls": 5.0,
+    "economy.total_reference_tokens": 18225.0,
+    "economy.wasted_tool_call_count": 0.0
+  },
+  "details": {},
+  "resource_metrics": {},
+  "resource_summary": {
+    "topology": "shared-daemon-sessions",
+    "profile": "quick",
+    "comparison_scope": "cross-topology-economy-only",
+    "peak_rss_mib": 0.0,
+    "mean_rss_mib": 0.0,
+    "median_rss_mib": 0.0,
+    "cpu_total_s": 0.0,
+    "cpu_per_turn_ms": 0.0,
+    "wall_per_turn_ms": 0.0,
+    "sampler_overhead_pct": 0.0
+  },
+  "economy_summary": {
+    "schema": 4,
+    "task": "ahrb-harness-economy-mvp-v1",
+    "profile": "quick",
+    "turn_budget": 8,
+    "reference_tokenizer": {
+      "encoding": "o200k_base-style",
+      "version": "ahrb-o200k-base-style-bpe-v1",
+      "vocabulary_sha256": "bca069c1ed9a057d9adfd579bcaefeac940a799d27a7fd427eb83eac778fc826",
+      "vocabulary_entries": 272
+    },
+    "reference_token_label": "reference tokens (o200k_base-style)",
+    "model_turns": 1,
+    "total_reference_tokens": 18225,
+    "tool_calls": 5,
+    "tool_results": 0,
+    "tool_result_requests": 0,
+    "tool_batching_factor": 0.0,
+    "last_context_size_tokens": 6576,
+    "completion": "looped",
+    "completion_label": "scripted terminal plus verified scripted workspace effect; not real-task success",
+    "effects_verified": {
+      "label": "verified scripted workspace mutation and read-back; proves the benchmark fixture landed, NOT that a real task was solved",
+      "expected": [
+        {
+          "path": "economy-output.txt",
+          "content_sha256": "b97fe6d2349a0c3d4e49df9916f57fd83ff8473142eabf5b086f0263e8156375",
+          "edit_call_id": "economy-edit",
+          "read_back_call_id": "economy-verify"
+        }
+      ],
+      "observed": [
+        {
+          "path": "economy-output.txt",
+          "before_content_sha256": null,
+          "after_content_sha256": null,
+          "edit_observations": 0,
+          "edit_reported_success": false,
+          "read_back_path_verified": false,
+          "read_back_content_sha256": null,
+          "read_back_observations": 0
+        }
+      ],
+      "workspace_receipt_before_sha256": "e903988c4dfe00f44f302cd0dace2634d2a2d6991d654f1dd44d05a40b539843",
+      "workspace_receipt_after_sha256": "dc44662b01596a94c63117b4f473e6c21f8e9e80bf15cf78aacad102fef37253",
+      "all_verified": false
+    },
+    "reference_tariff_usd_per_million_tokens": 10.0,
+    "reference_cost_usd": 0.18225,
+    "cost_outcome_label": "run cost; tokens_per_completed_task is available only with a verified scripted workspace effect",
+    "tokens_per_completed_task": null,
+    "cache_eligible_fraction": 0.0,
+    "cache_eligible_fraction_label": "cache-eligible fraction (prefix upper bound)",
+    "cache_control_breakpoints": 0,
+    "cache_control_breakpoints_per_request": [
+      0
+    ],
+    "cache_control_breakpoints_label": "harness-declared cache_control occurrences (separate from cache eligibility)",
+    "cache_eligibility_note": "shared-daemon-sessions can preserve cross-turn process state, but this value remains a serialized-prefix upper bound, not an observed server-cache hit rate",
+    "redundant_tokens": 0,
+    "redundant_tokens_label": "redundant reference tokens",
+    "context_token_curve": [
+      6576
+    ],
+    "context_token_curve_slope": 0.0,
+    "context_token_curve_label": "context token curve (reference tokens per primary request)",
+    "context_token_curve_last_matches_last_context_size": true,
+    "per_turn_fixed_overhead_tokens": 6031,
+    "per_turn_fixed_overhead_tokens_label": "fixed overhead / turn (reference tokens)",
+    "wasted_tool_call_count": 0,
+    "wasted_tool_call_count_label": "wasted tool calls (deterministic task-proven only)",
+    "retry_attempts": 1,
+    "retry_reference_tokens": 11649,
+    "retry_label": "physical retries reported separately; retry request tokens remain in MVP totals",
+    "cache_regime": "automatic-prefix",
+    "cache_regime_label": "provider cache regime; 0 cache_control breakpoints under automatic-prefix is expected, NOT no caching",
+    "cache_input_discount": 0.9,
+    "cache_input_discount_label": "STATED assumption: fraction of full input price not paid for a cache-eligible token; NOT a measured provider rate",
+    "effective_reference_tokens": 18225.0,
+    "effective_cost_usd": 0.18225,
+    "effective_cost_label": "effective cost assuming automatic prefix caching of the eligible prefix at 90% input discount; UPPER-BOUND proxy from serialized-prefix reuse, NOT a measured server cache-hit rate",
+    "stable_prefix_preserved_fraction": 0.0,
+    "cache_bust_count": 0,
+    "invalidated_prefix_tokens": 0,
+    "invalidated_prefix_tokens_per_turn": [],
+    "prefix_stability_label": "consecutive primary-request serialized-message-prefix stability (reference-token LCP; ordered invalidation array covers turns N>=2)"
+  },
+  "samples": [],
+  "processes": [],
+  "membership": [],
+  "events": [
+    {
+      "actor": "ahrb-harness-economy-mvp-v1:economy",
+      "cursor": 1,
+      "event": "turn-accepted",
+      "id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:0561ae0a8bfe6adda8b0280f5d5310a3b6026d973e99d6857ffd831b0ef4c8dd:r0:x0",
+      "payload": {
+        "_ahrb_cursor": 1,
+        "_ahrb_id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:0561ae0a8bfe6adda8b0280f5d5310a3b6026d973e99d6857ffd831b0ef4c8dd:r0:x0",
+        "_ahrb_receipt": {
+          "receipt_end_ns": 537828056300000,
+          "receipt_start_ns": 537828056294000,
+          "receipt_wall_end_ns": 1788593264799207000,
+          "receipt_wall_start_ns": 1788593264799201000
+        },
+        "_ahrb_source_raw": {
+          "_ahrb_cursor": 1,
+          "_ahrb_id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:0561ae0a8bfe6adda8b0280f5d5310a3b6026d973e99d6857ffd831b0ef4c8dd:r0:x0",
+          "actor": "ahrb-harness-economy-mvp-v1:economy",
+          "event": "accepted",
+          "head_seq": 1,
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374"
+        },
+        "actor": "ahrb-harness-economy-mvp-v1:economy",
+        "event": "accepted",
+        "head_seq": 1,
+        "session_id": "session-8415f4a7972489a50fe7246582dfa374"
+      },
+      "session_id": "session-8415f4a7972489a50fe7246582dfa374"
+    },
+    {
+      "actor": "ahrb-harness-economy-mvp-v1:economy",
+      "cursor": 2,
+      "event": "model-request",
+      "id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-1:r1:x0",
+      "payload": {
+        "_ahrb_receipt": {
+          "receipt_end_ns": 537828094476000,
+          "receipt_start_ns": 537828094465000,
+          "receipt_wall_end_ns": 1788593264837383000,
+          "receipt_wall_start_ns": 1788593264837373000
+        },
+        "_ahrb_source_raw": {
+          "_ahrb_cursor": 2,
+          "_ahrb_id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-1:r1:x0",
+          "actor": "ahrb-harness-economy-mvp-v1:economy",
+          "authority_epoch": 0,
+          "committed_at_ms": 1788593264826,
+          "device_id": "worker-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3",
+          "event_id": "worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-1",
+          "payload": {
+            "state": "thinking",
+            "type": "run_state"
+          },
+          "render": {
+            "durable": true,
+            "prompt": "omit",
+            "ui": true
+          },
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "schema_version": 1,
+          "seq": 8,
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "worker_generation": 1
+        },
+        "state": "thinking",
+        "type": "run_state"
+      },
+      "session_id": "session-8415f4a7972489a50fe7246582dfa374"
+    },
+    {
+      "actor": "ahrb-harness-economy-mvp-v1:economy",
+      "cursor": 3,
+      "event": "tool-call",
+      "id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-14:r2:x0",
+      "payload": {
+        "_ahrb_receipt": {
+          "receipt_end_ns": 537828112196000,
+          "receipt_start_ns": 537828112185000,
+          "receipt_wall_end_ns": 1788593264855104000,
+          "receipt_wall_start_ns": 1788593264855092000
+        },
+        "_ahrb_source_raw": {
+          "_ahrb_cursor": 3,
+          "_ahrb_id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-14:r2:x0",
+          "actor": "ahrb-harness-economy-mvp-v1:economy",
+          "authority_epoch": 0,
+          "committed_at_ms": 1788593264847,
+          "device_id": "worker-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3",
+          "event_id": "worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-14",
+          "payload": {
+            "event": "started",
+            "item": {
+              "args": {},
+              "call_id": "economy-bootstrap-a",
+              "item": "tool_call",
+              "name": "fs_write",
+              "status": "in_progress"
+            },
+            "item_id": "item-session-8415f4a7972489a50fe7246582dfa374-1-1788593264825-6",
+            "provider_request": {
+              "request_kind": "primary",
+              "request_ordinal": 1,
+              "run_id": "run-0c2e00d0397e252db2a755c587717366",
+              "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+              "turn_ordinal": 1
+            },
+            "type": "item"
+          },
+          "render": {
+            "durable": true,
+            "prompt": "verbatim",
+            "ui": true
+          },
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "schema_version": 1,
+          "seq": 21,
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "worker_generation": 1
+        },
+        "args": {},
+        "arguments": {},
+        "call_id": "economy-bootstrap-a",
+        "item": "tool_call",
+        "name": "fs_write",
+        "status": "in_progress"
+      },
+      "session_id": "session-8415f4a7972489a50fe7246582dfa374"
+    },
+    {
+      "actor": "ahrb-harness-economy-mvp-v1:economy",
+      "cursor": 4,
+      "event": "tool-call",
+      "id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-20:r2:x0",
+      "payload": {
+        "_ahrb_receipt": {
+          "receipt_end_ns": 537828130829000,
+          "receipt_start_ns": 537828130816000,
+          "receipt_wall_end_ns": 1788593264873736000,
+          "receipt_wall_start_ns": 1788593264873724000
+        },
+        "_ahrb_source_raw": {
+          "_ahrb_cursor": 4,
+          "_ahrb_id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-20:r2:x0",
+          "actor": "ahrb-harness-economy-mvp-v1:economy",
+          "authority_epoch": 0,
+          "committed_at_ms": 1788593264854,
+          "device_id": "worker-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3",
+          "event_id": "worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-20",
+          "payload": {
+            "event": "started",
+            "item": {
+              "args": {},
+              "call_id": "economy-bootstrap-b",
+              "item": "tool_call",
+              "name": "fs_write",
+              "status": "in_progress"
+            },
+            "item_id": "item-session-8415f4a7972489a50fe7246582dfa374-1-1788593264825-9",
+            "provider_request": {
+              "request_kind": "primary",
+              "request_ordinal": 1,
+              "run_id": "run-0c2e00d0397e252db2a755c587717366",
+              "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+              "turn_ordinal": 1
+            },
+            "type": "item"
+          },
+          "render": {
+            "durable": true,
+            "prompt": "verbatim",
+            "ui": true
+          },
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "schema_version": 1,
+          "seq": 27,
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "worker_generation": 1
+        },
+        "args": {},
+        "arguments": {},
+        "call_id": "economy-bootstrap-b",
+        "item": "tool_call",
+        "name": "fs_write",
+        "status": "in_progress"
+      },
+      "session_id": "session-8415f4a7972489a50fe7246582dfa374"
+    },
+    {
+      "actor": "ahrb-harness-economy-mvp-v1:economy",
+      "cursor": 5,
+      "event": "tool-call",
+      "id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-26:r2:x0",
+      "payload": {
+        "_ahrb_receipt": {
+          "receipt_end_ns": 537828130921000,
+          "receipt_start_ns": 537828130913000,
+          "receipt_wall_end_ns": 1788593264873828000,
+          "receipt_wall_start_ns": 1788593264873820000
+        },
+        "_ahrb_source_raw": {
+          "_ahrb_cursor": 5,
+          "_ahrb_id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-26:r2:x0",
+          "actor": "ahrb-harness-economy-mvp-v1:economy",
+          "authority_epoch": 0,
+          "committed_at_ms": 1788593264856,
+          "device_id": "worker-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3",
+          "event_id": "worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-26",
+          "payload": {
+            "event": "started",
+            "item": {
+              "args": {},
+              "call_id": "economy-bootstrap-c",
+              "item": "tool_call",
+              "name": "fs_write",
+              "status": "in_progress"
+            },
+            "item_id": "item-session-8415f4a7972489a50fe7246582dfa374-1-1788593264825-12",
+            "provider_request": {
+              "request_kind": "primary",
+              "request_ordinal": 1,
+              "run_id": "run-0c2e00d0397e252db2a755c587717366",
+              "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+              "turn_ordinal": 1
+            },
+            "type": "item"
+          },
+          "render": {
+            "durable": true,
+            "prompt": "verbatim",
+            "ui": true
+          },
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "schema_version": 1,
+          "seq": 33,
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "worker_generation": 1
+        },
+        "args": {},
+        "arguments": {},
+        "call_id": "economy-bootstrap-c",
+        "item": "tool_call",
+        "name": "fs_write",
+        "status": "in_progress"
+      },
+      "session_id": "session-8415f4a7972489a50fe7246582dfa374"
+    },
+    {
+      "actor": "ahrb-harness-economy-mvp-v1:economy",
+      "cursor": 6,
+      "event": "tool-call",
+      "id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-32:r2:x0",
+      "payload": {
+        "_ahrb_receipt": {
+          "receipt_end_ns": 537828131005000,
+          "receipt_start_ns": 537828130998000,
+          "receipt_wall_end_ns": 1788593264873912000,
+          "receipt_wall_start_ns": 1788593264873905000
+        },
+        "_ahrb_source_raw": {
+          "_ahrb_cursor": 6,
+          "_ahrb_id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-32:r2:x0",
+          "actor": "ahrb-harness-economy-mvp-v1:economy",
+          "authority_epoch": 0,
+          "committed_at_ms": 1788593264864,
+          "device_id": "worker-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3",
+          "event_id": "worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-32",
+          "payload": {
+            "event": "started",
+            "item": {
+              "args": {},
+              "call_id": "economy-bootstrap-d",
+              "item": "tool_call",
+              "name": "fs_write",
+              "status": "in_progress"
+            },
+            "item_id": "item-session-8415f4a7972489a50fe7246582dfa374-1-1788593264825-15",
+            "provider_request": {
+              "request_kind": "primary",
+              "request_ordinal": 1,
+              "run_id": "run-0c2e00d0397e252db2a755c587717366",
+              "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+              "turn_ordinal": 1
+            },
+            "type": "item"
+          },
+          "render": {
+            "durable": true,
+            "prompt": "verbatim",
+            "ui": true
+          },
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "schema_version": 1,
+          "seq": 39,
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "worker_generation": 1
+        },
+        "args": {},
+        "arguments": {},
+        "call_id": "economy-bootstrap-d",
+        "item": "tool_call",
+        "name": "fs_write",
+        "status": "in_progress"
+      },
+      "session_id": "session-8415f4a7972489a50fe7246582dfa374"
+    },
+    {
+      "actor": "ahrb-harness-economy-mvp-v1:economy",
+      "cursor": 7,
+      "event": "tool-call",
+      "id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-38:r2:x0",
+      "payload": {
+        "_ahrb_receipt": {
+          "receipt_end_ns": 537828131089000,
+          "receipt_start_ns": 537828131082000,
+          "receipt_wall_end_ns": 1788593264873996000,
+          "receipt_wall_start_ns": 1788593264873989000
+        },
+        "_ahrb_source_raw": {
+          "_ahrb_cursor": 7,
+          "_ahrb_id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-38:r2:x0",
+          "actor": "ahrb-harness-economy-mvp-v1:economy",
+          "authority_epoch": 0,
+          "committed_at_ms": 1788593264867,
+          "device_id": "worker-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3",
+          "event_id": "worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-38",
+          "payload": {
+            "event": "started",
+            "item": {
+              "args": {},
+              "call_id": "economy-bootstrap-e",
+              "item": "tool_call",
+              "name": "fs_write",
+              "status": "in_progress"
+            },
+            "item_id": "item-session-8415f4a7972489a50fe7246582dfa374-1-1788593264825-18",
+            "provider_request": {
+              "request_kind": "primary",
+              "request_ordinal": 1,
+              "run_id": "run-0c2e00d0397e252db2a755c587717366",
+              "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+              "turn_ordinal": 1
+            },
+            "type": "item"
+          },
+          "render": {
+            "durable": true,
+            "prompt": "verbatim",
+            "ui": true
+          },
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "schema_version": 1,
+          "seq": 45,
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "worker_generation": 1
+        },
+        "args": {},
+        "arguments": {},
+        "call_id": "economy-bootstrap-e",
+        "item": "tool_call",
+        "name": "fs_write",
+        "status": "in_progress"
+      },
+      "session_id": "session-8415f4a7972489a50fe7246582dfa374"
+    },
+    {
+      "actor": "ahrb-harness-economy-mvp-v1:economy",
+      "cursor": 8,
+      "event": "tool-result",
+      "id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-50:r3:x0",
+      "payload": {
+        "_ahrb_receipt": {
+          "receipt_end_ns": 537828171011000,
+          "receipt_start_ns": 537828171001000,
+          "receipt_wall_end_ns": 1788593264913918000,
+          "receipt_wall_start_ns": 1788593264913908000
+        },
+        "_ahrb_source_raw": {
+          "_ahrb_cursor": 8,
+          "_ahrb_id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-50:r3:x0",
+          "actor": "ahrb-harness-economy-mvp-v1:economy",
+          "authority_epoch": 0,
+          "committed_at_ms": 1788593264899,
+          "device_id": "worker-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3",
+          "event_id": "worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-50",
+          "payload": {
+            "call_id": "economy-bootstrap-a",
+            "effects": [
+              {
+                "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-a.txt",
+                "bytes": 768,
+                "kind": "create",
+                "name": "context-a.txt",
+                "path": "context-a.txt"
+              }
+            ],
+            "provider_request": {
+              "request_kind": "primary",
+              "request_ordinal": 1,
+              "run_id": "run-0c2e00d0397e252db2a755c587717366",
+              "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+              "turn_ordinal": 1
+            },
+            "result": {
+              "effects": [
+                {
+                  "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-a.txt",
+                  "bytes": 768,
+                  "kind": "create",
+                  "name": "context-a.txt",
+                  "path": "context-a.txt"
+                }
+              ],
+              "preview": "{\"mutation_digest\":\"blake3:51ebab861579791731a36baeee04907d6ced78c7eb11ea0d31f20edf67da10e5\",\"result\":\"wrote 768 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-a.txt\",\"subject_digest\":\"blake3:5e714ff49904352021fd8a76a5781e9f7c50bdae78b5c3520b865f0e698dc905\",\"workspace_mutation\":{\"effect_id\":\"effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-1\",\"run_id\":\"run-0c2e00d0397e252db2a755c587717366\"},\"workspace_revision\":\"workspace-revision:55\"}",
+              "truncated": false
+            },
+            "type": "tool_result"
+          },
+          "render": {
+            "durable": true,
+            "prompt": "verbatim",
+            "ui": true
+          },
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "schema_version": 1,
+          "seq": 57,
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "worker_generation": 1
+        },
+        "arguments": {},
+        "call_id": "economy-bootstrap-a",
+        "effects": [
+          {
+            "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-a.txt",
+            "bytes": 768,
+            "kind": "create",
+            "name": "context-a.txt",
+            "path": "context-a.txt"
+          }
+        ],
+        "name": "fs_write",
+        "native_call_id": "economy-bootstrap-a",
+        "native_result": {
+          "effects": [
+            {
+              "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-a.txt",
+              "bytes": 768,
+              "kind": "create",
+              "name": "context-a.txt",
+              "path": "context-a.txt"
+            }
+          ],
+          "preview": "{\"mutation_digest\":\"blake3:51ebab861579791731a36baeee04907d6ced78c7eb11ea0d31f20edf67da10e5\",\"result\":\"wrote 768 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-a.txt\",\"subject_digest\":\"blake3:5e714ff49904352021fd8a76a5781e9f7c50bdae78b5c3520b865f0e698dc905\",\"workspace_mutation\":{\"effect_id\":\"effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-1\",\"run_id\":\"run-0c2e00d0397e252db2a755c587717366\"},\"workspace_revision\":\"workspace-revision:55\"}",
+          "truncated": false
+        },
+        "provider_request": {
+          "request_kind": "primary",
+          "request_ordinal": 1,
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "turn_ordinal": 1
+        },
+        "result": {
+          "effects": [
+            {
+              "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-a.txt",
+              "bytes": 768,
+              "kind": "create",
+              "name": "context-a.txt",
+              "path": "context-a.txt"
+            }
+          ],
+          "preview": "{\"mutation_digest\":\"blake3:51ebab861579791731a36baeee04907d6ced78c7eb11ea0d31f20edf67da10e5\",\"result\":\"wrote 768 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-a.txt\",\"subject_digest\":\"blake3:5e714ff49904352021fd8a76a5781e9f7c50bdae78b5c3520b865f0e698dc905\",\"workspace_mutation\":{\"effect_id\":\"effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-1\",\"run_id\":\"run-0c2e00d0397e252db2a755c587717366\"},\"workspace_revision\":\"workspace-revision:55\"}",
+          "preview_record": {
+            "mutation_digest": "blake3:51ebab861579791731a36baeee04907d6ced78c7eb11ea0d31f20edf67da10e5",
+            "result": "wrote 768 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-a.txt",
+            "subject_digest": "blake3:5e714ff49904352021fd8a76a5781e9f7c50bdae78b5c3520b865f0e698dc905",
+            "workspace_mutation": {
+              "effect_id": "effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-1",
+              "run_id": "run-0c2e00d0397e252db2a755c587717366"
+            },
+            "workspace_revision": "workspace-revision:55"
+          },
+          "truncated": false
+        },
+        "type": "tool_result"
+      },
+      "session_id": "session-8415f4a7972489a50fe7246582dfa374"
+    },
+    {
+      "actor": "ahrb-harness-economy-mvp-v1:economy",
+      "cursor": 9,
+      "event": "tool-result",
+      "id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-62:r3:x0",
+      "payload": {
+        "_ahrb_receipt": {
+          "receipt_end_ns": 537828201179000,
+          "receipt_start_ns": 537828201169000,
+          "receipt_wall_end_ns": 1788593264944087000,
+          "receipt_wall_start_ns": 1788593264944076000
+        },
+        "_ahrb_source_raw": {
+          "_ahrb_cursor": 9,
+          "_ahrb_id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-62:r3:x0",
+          "actor": "ahrb-harness-economy-mvp-v1:economy",
+          "authority_epoch": 0,
+          "committed_at_ms": 1788593264931,
+          "device_id": "worker-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3",
+          "event_id": "worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-62",
+          "payload": {
+            "call_id": "economy-bootstrap-b",
+            "effects": [
+              {
+                "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-b.txt",
+                "bytes": 752,
+                "kind": "create",
+                "name": "context-b.txt",
+                "path": "context-b.txt"
+              }
+            ],
+            "provider_request": {
+              "request_kind": "primary",
+              "request_ordinal": 1,
+              "run_id": "run-0c2e00d0397e252db2a755c587717366",
+              "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+              "turn_ordinal": 1
+            },
+            "result": {
+              "effects": [
+                {
+                  "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-b.txt",
+                  "bytes": 752,
+                  "kind": "create",
+                  "name": "context-b.txt",
+                  "path": "context-b.txt"
+                }
+              ],
+              "preview": "{\"mutation_digest\":\"blake3:48c777775faedd626b4ea57eec7c866ba48b5db7a8af9f09fa082c80d09c94db\",\"result\":\"wrote 752 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-b.txt\",\"subject_digest\":\"blake3:709c7096c0815f95812eb08fda1c0b7ed59e7820d33c0a6ade9f9207ee8c80ef\",\"workspace_mutation\":{\"effect_id\":\"effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-2\",\"run_id\":\"run-0c2e00d0397e252db2a755c587717366\"},\"workspace_revision\":\"workspace-revision:67\"}",
+              "truncated": false
+            },
+            "type": "tool_result"
+          },
+          "render": {
+            "durable": true,
+            "prompt": "verbatim",
+            "ui": true
+          },
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "schema_version": 1,
+          "seq": 69,
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "worker_generation": 1
+        },
+        "arguments": {},
+        "call_id": "economy-bootstrap-b",
+        "effects": [
+          {
+            "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-b.txt",
+            "bytes": 752,
+            "kind": "create",
+            "name": "context-b.txt",
+            "path": "context-b.txt"
+          }
+        ],
+        "name": "fs_write",
+        "native_call_id": "economy-bootstrap-b",
+        "native_result": {
+          "effects": [
+            {
+              "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-b.txt",
+              "bytes": 752,
+              "kind": "create",
+              "name": "context-b.txt",
+              "path": "context-b.txt"
+            }
+          ],
+          "preview": "{\"mutation_digest\":\"blake3:48c777775faedd626b4ea57eec7c866ba48b5db7a8af9f09fa082c80d09c94db\",\"result\":\"wrote 752 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-b.txt\",\"subject_digest\":\"blake3:709c7096c0815f95812eb08fda1c0b7ed59e7820d33c0a6ade9f9207ee8c80ef\",\"workspace_mutation\":{\"effect_id\":\"effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-2\",\"run_id\":\"run-0c2e00d0397e252db2a755c587717366\"},\"workspace_revision\":\"workspace-revision:67\"}",
+          "truncated": false
+        },
+        "provider_request": {
+          "request_kind": "primary",
+          "request_ordinal": 1,
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "turn_ordinal": 1
+        },
+        "result": {
+          "effects": [
+            {
+              "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-b.txt",
+              "bytes": 752,
+              "kind": "create",
+              "name": "context-b.txt",
+              "path": "context-b.txt"
+            }
+          ],
+          "preview": "{\"mutation_digest\":\"blake3:48c777775faedd626b4ea57eec7c866ba48b5db7a8af9f09fa082c80d09c94db\",\"result\":\"wrote 752 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-b.txt\",\"subject_digest\":\"blake3:709c7096c0815f95812eb08fda1c0b7ed59e7820d33c0a6ade9f9207ee8c80ef\",\"workspace_mutation\":{\"effect_id\":\"effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-2\",\"run_id\":\"run-0c2e00d0397e252db2a755c587717366\"},\"workspace_revision\":\"workspace-revision:67\"}",
+          "preview_record": {
+            "mutation_digest": "blake3:48c777775faedd626b4ea57eec7c866ba48b5db7a8af9f09fa082c80d09c94db",
+            "result": "wrote 752 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-b.txt",
+            "subject_digest": "blake3:709c7096c0815f95812eb08fda1c0b7ed59e7820d33c0a6ade9f9207ee8c80ef",
+            "workspace_mutation": {
+              "effect_id": "effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-2",
+              "run_id": "run-0c2e00d0397e252db2a755c587717366"
+            },
+            "workspace_revision": "workspace-revision:67"
+          },
+          "truncated": false
+        },
+        "type": "tool_result"
+      },
+      "session_id": "session-8415f4a7972489a50fe7246582dfa374"
+    },
+    {
+      "actor": "ahrb-harness-economy-mvp-v1:economy",
+      "cursor": 10,
+      "event": "tool-result",
+      "id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-74:r3:x0",
+      "payload": {
+        "_ahrb_receipt": {
+          "receipt_end_ns": 537828231656000,
+          "receipt_start_ns": 537828231645000,
+          "receipt_wall_end_ns": 1788593264974563000,
+          "receipt_wall_start_ns": 1788593264974552000
+        },
+        "_ahrb_source_raw": {
+          "_ahrb_cursor": 10,
+          "_ahrb_id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-74:r3:x0",
+          "actor": "ahrb-harness-economy-mvp-v1:economy",
+          "authority_epoch": 0,
+          "committed_at_ms": 1788593264960,
+          "device_id": "worker-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3",
+          "event_id": "worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-74",
+          "payload": {
+            "call_id": "economy-bootstrap-c",
+            "effects": [
+              {
+                "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-c.txt",
+                "bytes": 768,
+                "kind": "create",
+                "name": "context-c.txt",
+                "path": "context-c.txt"
+              }
+            ],
+            "provider_request": {
+              "request_kind": "primary",
+              "request_ordinal": 1,
+              "run_id": "run-0c2e00d0397e252db2a755c587717366",
+              "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+              "turn_ordinal": 1
+            },
+            "result": {
+              "effects": [
+                {
+                  "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-c.txt",
+                  "bytes": 768,
+                  "kind": "create",
+                  "name": "context-c.txt",
+                  "path": "context-c.txt"
+                }
+              ],
+              "preview": "{\"mutation_digest\":\"blake3:444cdef145cb554717e3c2ad32d53a8cfcd9ae354682346cbb0e0195f7257024\",\"result\":\"wrote 768 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-c.txt\",\"subject_digest\":\"blake3:584e46c1e4bc5eed23f36ffc5015382c3130df960e4b21173333fae6d3b630b1\",\"workspace_mutation\":{\"effect_id\":\"effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-3\",\"run_id\":\"run-0c2e00d0397e252db2a755c587717366\"},\"workspace_revision\":\"workspace-revision:79\"}",
+              "truncated": false
+            },
+            "type": "tool_result"
+          },
+          "render": {
+            "durable": true,
+            "prompt": "verbatim",
+            "ui": true
+          },
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "schema_version": 1,
+          "seq": 81,
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "worker_generation": 1
+        },
+        "arguments": {},
+        "call_id": "economy-bootstrap-c",
+        "effects": [
+          {
+            "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-c.txt",
+            "bytes": 768,
+            "kind": "create",
+            "name": "context-c.txt",
+            "path": "context-c.txt"
+          }
+        ],
+        "name": "fs_write",
+        "native_call_id": "economy-bootstrap-c",
+        "native_result": {
+          "effects": [
+            {
+              "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-c.txt",
+              "bytes": 768,
+              "kind": "create",
+              "name": "context-c.txt",
+              "path": "context-c.txt"
+            }
+          ],
+          "preview": "{\"mutation_digest\":\"blake3:444cdef145cb554717e3c2ad32d53a8cfcd9ae354682346cbb0e0195f7257024\",\"result\":\"wrote 768 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-c.txt\",\"subject_digest\":\"blake3:584e46c1e4bc5eed23f36ffc5015382c3130df960e4b21173333fae6d3b630b1\",\"workspace_mutation\":{\"effect_id\":\"effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-3\",\"run_id\":\"run-0c2e00d0397e252db2a755c587717366\"},\"workspace_revision\":\"workspace-revision:79\"}",
+          "truncated": false
+        },
+        "provider_request": {
+          "request_kind": "primary",
+          "request_ordinal": 1,
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "turn_ordinal": 1
+        },
+        "result": {
+          "effects": [
+            {
+              "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-c.txt",
+              "bytes": 768,
+              "kind": "create",
+              "name": "context-c.txt",
+              "path": "context-c.txt"
+            }
+          ],
+          "preview": "{\"mutation_digest\":\"blake3:444cdef145cb554717e3c2ad32d53a8cfcd9ae354682346cbb0e0195f7257024\",\"result\":\"wrote 768 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-c.txt\",\"subject_digest\":\"blake3:584e46c1e4bc5eed23f36ffc5015382c3130df960e4b21173333fae6d3b630b1\",\"workspace_mutation\":{\"effect_id\":\"effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-3\",\"run_id\":\"run-0c2e00d0397e252db2a755c587717366\"},\"workspace_revision\":\"workspace-revision:79\"}",
+          "preview_record": {
+            "mutation_digest": "blake3:444cdef145cb554717e3c2ad32d53a8cfcd9ae354682346cbb0e0195f7257024",
+            "result": "wrote 768 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-c.txt",
+            "subject_digest": "blake3:584e46c1e4bc5eed23f36ffc5015382c3130df960e4b21173333fae6d3b630b1",
+            "workspace_mutation": {
+              "effect_id": "effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-3",
+              "run_id": "run-0c2e00d0397e252db2a755c587717366"
+            },
+            "workspace_revision": "workspace-revision:79"
+          },
+          "truncated": false
+        },
+        "type": "tool_result"
+      },
+      "session_id": "session-8415f4a7972489a50fe7246582dfa374"
+    },
+    {
+      "actor": "ahrb-harness-economy-mvp-v1:economy",
+      "cursor": 11,
+      "event": "tool-result",
+      "id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-86:r3:x0",
+      "payload": {
+        "_ahrb_receipt": {
+          "receipt_end_ns": 537828258395000,
+          "receipt_start_ns": 537828258385000,
+          "receipt_wall_end_ns": 1788593265001302000,
+          "receipt_wall_start_ns": 1788593265001292000
+        },
+        "_ahrb_source_raw": {
+          "_ahrb_cursor": 11,
+          "_ahrb_id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-86:r3:x0",
+          "actor": "ahrb-harness-economy-mvp-v1:economy",
+          "authority_epoch": 0,
+          "committed_at_ms": 1788593264990,
+          "device_id": "worker-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3",
+          "event_id": "worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-86",
+          "payload": {
+            "call_id": "economy-bootstrap-d",
+            "effects": [
+              {
+                "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-d.txt",
+                "bytes": 736,
+                "kind": "create",
+                "name": "context-d.txt",
+                "path": "context-d.txt"
+              }
+            ],
+            "provider_request": {
+              "request_kind": "primary",
+              "request_ordinal": 1,
+              "run_id": "run-0c2e00d0397e252db2a755c587717366",
+              "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+              "turn_ordinal": 1
+            },
+            "result": {
+              "effects": [
+                {
+                  "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-d.txt",
+                  "bytes": 736,
+                  "kind": "create",
+                  "name": "context-d.txt",
+                  "path": "context-d.txt"
+                }
+              ],
+              "preview": "{\"mutation_digest\":\"blake3:41d3599e8818d5a1127b8d58f4283458c9fda15680fa15f303a5618618713415\",\"result\":\"wrote 736 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-d.txt\",\"subject_digest\":\"blake3:bc63147bbbca4c6f115162e2aea1a541afe91f2fe4af058c28341c70323739e8\",\"workspace_mutation\":{\"effect_id\":\"effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-4\",\"run_id\":\"run-0c2e00d0397e252db2a755c587717366\"},\"workspace_revision\":\"workspace-revision:91\"}",
+              "truncated": false
+            },
+            "type": "tool_result"
+          },
+          "render": {
+            "durable": true,
+            "prompt": "verbatim",
+            "ui": true
+          },
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "schema_version": 1,
+          "seq": 93,
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "worker_generation": 1
+        },
+        "arguments": {},
+        "call_id": "economy-bootstrap-d",
+        "effects": [
+          {
+            "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-d.txt",
+            "bytes": 736,
+            "kind": "create",
+            "name": "context-d.txt",
+            "path": "context-d.txt"
+          }
+        ],
+        "name": "fs_write",
+        "native_call_id": "economy-bootstrap-d",
+        "native_result": {
+          "effects": [
+            {
+              "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-d.txt",
+              "bytes": 736,
+              "kind": "create",
+              "name": "context-d.txt",
+              "path": "context-d.txt"
+            }
+          ],
+          "preview": "{\"mutation_digest\":\"blake3:41d3599e8818d5a1127b8d58f4283458c9fda15680fa15f303a5618618713415\",\"result\":\"wrote 736 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-d.txt\",\"subject_digest\":\"blake3:bc63147bbbca4c6f115162e2aea1a541afe91f2fe4af058c28341c70323739e8\",\"workspace_mutation\":{\"effect_id\":\"effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-4\",\"run_id\":\"run-0c2e00d0397e252db2a755c587717366\"},\"workspace_revision\":\"workspace-revision:91\"}",
+          "truncated": false
+        },
+        "provider_request": {
+          "request_kind": "primary",
+          "request_ordinal": 1,
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "turn_ordinal": 1
+        },
+        "result": {
+          "effects": [
+            {
+              "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-d.txt",
+              "bytes": 736,
+              "kind": "create",
+              "name": "context-d.txt",
+              "path": "context-d.txt"
+            }
+          ],
+          "preview": "{\"mutation_digest\":\"blake3:41d3599e8818d5a1127b8d58f4283458c9fda15680fa15f303a5618618713415\",\"result\":\"wrote 736 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-d.txt\",\"subject_digest\":\"blake3:bc63147bbbca4c6f115162e2aea1a541afe91f2fe4af058c28341c70323739e8\",\"workspace_mutation\":{\"effect_id\":\"effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-4\",\"run_id\":\"run-0c2e00d0397e252db2a755c587717366\"},\"workspace_revision\":\"workspace-revision:91\"}",
+          "preview_record": {
+            "mutation_digest": "blake3:41d3599e8818d5a1127b8d58f4283458c9fda15680fa15f303a5618618713415",
+            "result": "wrote 736 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-d.txt",
+            "subject_digest": "blake3:bc63147bbbca4c6f115162e2aea1a541afe91f2fe4af058c28341c70323739e8",
+            "workspace_mutation": {
+              "effect_id": "effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-4",
+              "run_id": "run-0c2e00d0397e252db2a755c587717366"
+            },
+            "workspace_revision": "workspace-revision:91"
+          },
+          "truncated": false
+        },
+        "type": "tool_result"
+      },
+      "session_id": "session-8415f4a7972489a50fe7246582dfa374"
+    },
+    {
+      "actor": "ahrb-harness-economy-mvp-v1:economy",
+      "cursor": 12,
+      "event": "tool-result",
+      "id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-98:r3:x0",
+      "payload": {
+        "_ahrb_receipt": {
+          "receipt_end_ns": 537828299309000,
+          "receipt_start_ns": 537828299299000,
+          "receipt_wall_end_ns": 1788593265042216000,
+          "receipt_wall_start_ns": 1788593265042207000
+        },
+        "_ahrb_source_raw": {
+          "_ahrb_cursor": 12,
+          "_ahrb_id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-98:r3:x0",
+          "actor": "ahrb-harness-economy-mvp-v1:economy",
+          "authority_epoch": 0,
+          "committed_at_ms": 1788593265031,
+          "device_id": "worker-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3",
+          "event_id": "worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-98",
+          "payload": {
+            "call_id": "economy-bootstrap-e",
+            "effects": [
+              {
+                "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-e.txt",
+                "bytes": 752,
+                "kind": "create",
+                "name": "context-e.txt",
+                "path": "context-e.txt"
+              }
+            ],
+            "provider_request": {
+              "request_kind": "primary",
+              "request_ordinal": 1,
+              "run_id": "run-0c2e00d0397e252db2a755c587717366",
+              "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+              "turn_ordinal": 1
+            },
+            "result": {
+              "effects": [
+                {
+                  "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-e.txt",
+                  "bytes": 752,
+                  "kind": "create",
+                  "name": "context-e.txt",
+                  "path": "context-e.txt"
+                }
+              ],
+              "preview": "{\"mutation_digest\":\"blake3:515dfbf8f1e13e829751a07481034f2ccb0dce5f75129bf070594617bbf47c0d\",\"result\":\"wrote 752 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-e.txt\",\"subject_digest\":\"blake3:f16179fc373c3de998083d82446a7c73742d42d42d236082fc6b4e4ac5dc5ed5\",\"workspace_mutation\":{\"effect_id\":\"effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-5\",\"run_id\":\"run-0c2e00d0397e252db2a755c587717366\"},\"workspace_revision\":\"workspace-revision:103\"}",
+              "truncated": false
+            },
+            "type": "tool_result"
+          },
+          "render": {
+            "durable": true,
+            "prompt": "verbatim",
+            "ui": true
+          },
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "schema_version": 1,
+          "seq": 105,
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "worker_generation": 1
+        },
+        "arguments": {},
+        "call_id": "economy-bootstrap-e",
+        "effects": [
+          {
+            "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-e.txt",
+            "bytes": 752,
+            "kind": "create",
+            "name": "context-e.txt",
+            "path": "context-e.txt"
+          }
+        ],
+        "name": "fs_write",
+        "native_call_id": "economy-bootstrap-e",
+        "native_result": {
+          "effects": [
+            {
+              "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-e.txt",
+              "bytes": 752,
+              "kind": "create",
+              "name": "context-e.txt",
+              "path": "context-e.txt"
+            }
+          ],
+          "preview": "{\"mutation_digest\":\"blake3:515dfbf8f1e13e829751a07481034f2ccb0dce5f75129bf070594617bbf47c0d\",\"result\":\"wrote 752 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-e.txt\",\"subject_digest\":\"blake3:f16179fc373c3de998083d82446a7c73742d42d42d236082fc6b4e4ac5dc5ed5\",\"workspace_mutation\":{\"effect_id\":\"effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-5\",\"run_id\":\"run-0c2e00d0397e252db2a755c587717366\"},\"workspace_revision\":\"workspace-revision:103\"}",
+          "truncated": false
+        },
+        "provider_request": {
+          "request_kind": "primary",
+          "request_ordinal": 1,
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "turn_ordinal": 1
+        },
+        "result": {
+          "effects": [
+            {
+              "absolute_path": "/private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-e.txt",
+              "bytes": 752,
+              "kind": "create",
+              "name": "context-e.txt",
+              "path": "context-e.txt"
+            }
+          ],
+          "preview": "{\"mutation_digest\":\"blake3:515dfbf8f1e13e829751a07481034f2ccb0dce5f75129bf070594617bbf47c0d\",\"result\":\"wrote 752 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-e.txt\",\"subject_digest\":\"blake3:f16179fc373c3de998083d82446a7c73742d42d42d236082fc6b4e4ac5dc5ed5\",\"workspace_mutation\":{\"effect_id\":\"effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-5\",\"run_id\":\"run-0c2e00d0397e252db2a755c587717366\"},\"workspace_revision\":\"workspace-revision:103\"}",
+          "preview_record": {
+            "mutation_digest": "blake3:515dfbf8f1e13e829751a07481034f2ccb0dce5f75129bf070594617bbf47c0d",
+            "result": "wrote 752 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-e.txt",
+            "subject_digest": "blake3:f16179fc373c3de998083d82446a7c73742d42d42d236082fc6b4e4ac5dc5ed5",
+            "workspace_mutation": {
+              "effect_id": "effect-session-8415f4a7972489a50fe7246582dfa374-1-1788593264819-5",
+              "run_id": "run-0c2e00d0397e252db2a755c587717366"
+            },
+            "workspace_revision": "workspace-revision:103"
+          },
+          "truncated": false
+        },
+        "type": "tool_result"
+      },
+      "session_id": "session-8415f4a7972489a50fe7246582dfa374"
+    },
+    {
+      "actor": "ahrb-harness-economy-mvp-v1:economy",
+      "cursor": 13,
+      "event": "model-request",
+      "id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-106:r1:x0",
+      "payload": {
+        "_ahrb_receipt": {
+          "receipt_end_ns": 537828322395000,
+          "receipt_start_ns": 537828322388000,
+          "receipt_wall_end_ns": 1788593265065302000,
+          "receipt_wall_start_ns": 1788593265065295000
+        },
+        "_ahrb_source_raw": {
+          "_ahrb_cursor": 13,
+          "_ahrb_id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-106:r1:x0",
+          "actor": "ahrb-harness-economy-mvp-v1:economy",
+          "authority_epoch": 0,
+          "committed_at_ms": 1788593265038,
+          "device_id": "worker-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3",
+          "event_id": "worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-106",
+          "payload": {
+            "provider_finish_reason": "tool_use",
+            "provider_request": {
+              "request_kind": "primary",
+              "request_ordinal": 1,
+              "run_id": "run-0c2e00d0397e252db2a755c587717366",
+              "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+              "turn_ordinal": 1
+            },
+            "state": "thinking",
+            "type": "run_state"
+          },
+          "render": {
+            "durable": true,
+            "prompt": "omit",
+            "ui": true
+          },
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "schema_version": 1,
+          "seq": 113,
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "worker_generation": 1
+        },
+        "provider_finish_reason": "tool_use",
+        "provider_request": {
+          "request_kind": "primary",
+          "request_ordinal": 1,
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "turn_ordinal": 1
+        },
+        "state": "thinking",
+        "type": "run_state"
+      },
+      "session_id": "session-8415f4a7972489a50fe7246582dfa374"
+    },
+    {
+      "actor": "ahrb-harness-economy-mvp-v1:economy",
+      "cursor": 14,
+      "event": "terminal-failure",
+      "id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-118:r7:x0",
+      "payload": {
+        "_ahrb_receipt": {
+          "receipt_end_ns": 537828322569000,
+          "receipt_start_ns": 537828322564000,
+          "receipt_wall_end_ns": 1788593265065476000,
+          "receipt_wall_start_ns": 1788593265065471000
+        },
+        "_ahrb_source_raw": {
+          "_ahrb_cursor": 14,
+          "_ahrb_id": "b9ba1b7e-7645-4e37-8671-7243cf3ed02c:turn-1:worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-118:r7:x0",
+          "actor": "ahrb-harness-economy-mvp-v1:economy",
+          "authority_epoch": 0,
+          "committed_at_ms": 1788593265056,
+          "device_id": "worker-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3",
+          "event_id": "worker-event-session-8415f4a7972489a50fe7246582dfa374-1-4015d5183bdfdcc45c46883ebdc9b3d3-118",
+          "payload": {
+            "error_code": "provider_error",
+            "provider_request": {
+              "request_kind": "primary",
+              "request_ordinal": 2,
+              "run_id": "run-0c2e00d0397e252db2a755c587717366",
+              "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+              "turn_ordinal": 1
+            },
+            "state": "errored",
+            "terminal_kind": "provider_error",
+            "type": "run_state"
+          },
+          "render": {
+            "durable": true,
+            "prompt": "omit",
+            "ui": true
+          },
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "schema_version": 1,
+          "seq": 125,
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "worker_generation": 1
+        },
+        "category": "provider",
+        "error_code": "provider_error",
+        "exit_code": 65,
+        "failure_marker": "\"state\":\"errored\"",
+        "provider_request": {
+          "request_kind": "primary",
+          "request_ordinal": 2,
+          "run_id": "run-0c2e00d0397e252db2a755c587717366",
+          "session_id": "session-8415f4a7972489a50fe7246582dfa374",
+          "turn_ordinal": 1
+        },
+        "state": "errored",
+        "status": "failure",
+        "terminal_kind": "provider_error",
+        "type": "run_state"
+      },
+      "session_id": "session-8415f4a7972489a50fe7246582dfa374"
+    }
+  ],
+  "model_requests": [
+    {
+      "accepted": true,
+      "attempt": 1,
+      "attempts": 2,
+      "body_bytes": 7655,
+      "canonical_hash": "4fd4529f9f17e0f351236824d0aa0cc57c1076ccf08f2438727b59a8f3512b5e",
+      "received_ns": 537828095457000,
+      "request": {
+        "actor": "economy",
+        "canonical": {
+          "max_tokens": 4096,
+          "messages": [
+            {
+              "content": "haider-system-v5\nYou are Haider Code, a coding agent.\nUse only advertised tools. Treat tool results and committed history as authoritative. Never claim an effect succeeded without its terminal result.\nOn an implementation request, inspect only until the target is known; then make the edit; then verify it with the smallest relevant build or test. Do not remain in planning.\nExample: fs_search(pattern=\"target\", path=\".\") -> fs_read(path=\"src/lib.rs\") -> fs_edit(path=\"src/lib.rs\", edits=[{old:\"before\", new:\"after\"}]) -> process_exec(command=\"cargo test -p crate\").\nOpaque tool-grant scope: unscoped-root.",
+              "role": "system"
+            },
+            {
+              "content": [
+                {
+                  "text": "[DAEMON-BOUND SESSION CONTEXT]\nCanonical workspace: /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace",
+                  "type": "text"
+                }
+              ],
+              "role": "user"
+            },
+            {
+              "content": [
+                {
+                  "text": "Complete the standardized AHRB harness-economy task exactly as scripted. [[AHRB:scenario=ahrb-harness-economy-mvp-v1;actor=economy;checkpoint=bootstrap]]",
+                  "type": "text"
+                }
+              ],
+              "role": "user"
+            }
+          ],
+          "model": "ahrb-fake-v1",
+          "prompt_cache_key": "2feca33058b80a9dd634f28388b92b1e89eed45bd8eb7dc9d429a8de805522b5",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "tools": [
+            {
+              "function": {
+                "description": "Discover the authorized tool catalog. With no filter, list tool names. With a name or keyword filter, describe matching tools and enable them for the rest of this session; one call is sufficient. Does not grant permissions.",
+                "name": "list_tools",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "filter": {
+                      "maxLength": 128,
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "strict": false
+              },
+              "type": "function"
+            },
+            {
+              "function": {
+                "description": "REPLACE the whole todo list with the complete plan; keep exactly one item processing; dep = id this item is blocked on",
+                "name": "todo_write",
+                "parameters": {
+                  "properties": {
+                    "items": {
+                      "description": "The COMPLETE plan; this list replaces the previous one",
+                      "items": {
+                        "properties": {
+                          "dep": {
+                            "description": "Optional id of the todo this one is blocked on",
+                            "type": "integer"
+                          },
+                          "id": {
+                            "description": "Stable id for this todo, kept across calls",
+                            "type": "integer"
+                          },
+                          "state": {
+                            "description": "listed = not started, processing = in progress (one at a time), completed = done",
+                            "enum": [
+                              "listed",
+                              "processing",
+                              "completed"
+                            ],
+                            "type": "string"
+                          },
+                          "text": {
+                            "description": "Short imperative description",
+                            "maxLength": 500,
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "text",
+                          "state"
+                        ],
+                        "type": "object"
+                      },
+                      "maxItems": 50,
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "items"
+                  ],
+                  "type": "object"
+                },
+                "strict": false
+              },
+              "type": "function"
+            },
+            {
+              "function": {
+                "description": "read a redacted 8 KiB UTF-8 preview; prefer offset/limit range reads; directories are capped; full owner-authorized bytes use the artifact re-read handle",
+                "name": "fs_read",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "limit": {
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "offset": {
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "path": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "path"
+                  ],
+                  "type": "object"
+                },
+                "strict": false
+              },
+              "type": "function"
+            },
+            {
+              "function": {
+                "description": "List workspace paths matching a repository-aware glob; use it to find files by name or extension before reading them",
+                "name": "fs_glob",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "include_hidden": {
+                      "default": false,
+                      "type": "boolean"
+                    },
+                    "path": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "pattern": {
+                      "description": ".git paths are always excluded",
+                      "maxLength": 1024,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "respect_gitignore": {
+                      "default": true,
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "pattern"
+                  ],
+                  "type": "object"
+                },
+                "strict": false
+              },
+              "type": "function"
+            },
+            {
+              "function": {
+                "description": "Search workspace file contents; use it to locate symbols or text before reading or editing a file",
+                "name": "fs_search",
+                "parameters": {
+                  "additionalProperties": false,
+                  "anyOf": [
+                    {
+                      "required": [
+                        "pattern"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "query"
+                      ]
+                    }
+                  ],
+                  "properties": {
+                    "case": {
+                      "enum": [
+                        "sensitive",
+                        "insensitive",
+                        "smart"
+                      ],
+                      "type": "string"
+                    },
+                    "context": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "after": {
+                          "maximum": 5,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "before": {
+                          "maximum": 5,
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "file_glob": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "exclude": {
+                          "items": {
+                            "maxLength": 1024,
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "maxItems": 32,
+                          "type": "array"
+                        },
+                        "include": {
+                          "items": {
+                            "maxLength": 1024,
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "maxItems": 32,
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "glob": {
+                      "maxLength": 1024,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "include_hidden": {
+                      "default": false,
+                      "type": "boolean"
+                    },
+                    "max_matches": {
+                      "maximum": 200,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "mode": {
+                      "description": "regex sources are additionally capped at 1024 UTF-8 bytes before Unicode expansion",
+                      "enum": [
+                        "literal",
+                        "simple",
+                        "regex"
+                      ],
+                      "type": "string"
+                    },
+                    "multiline": {
+                      "default": false,
+                      "description": "Make ^ and $ match physical line boundaries in the line-streamed regex engine",
+                      "type": "boolean"
+                    },
+                    "path": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "pattern": {
+                      "maxLength": 65536,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "query": {
+                      "description": "Legacy alias for pattern",
+                      "maxLength": 65536,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "respect_gitignore": {
+                      "default": true,
+                      "type": "boolean"
+                    },
+                    "root": {
+                      "description": "Legacy alias for path",
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "strict": false
+              },
+              "type": "function"
+            },
+            {
+              "function": {
+                "description": "Create or replace one UTF-8 file; use it for a new file or a complete rewrite",
+                "name": "fs_write",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "content": {
+                      "type": "string"
+                    },
+                    "path": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "content"
+                  ],
+                  "type": "object"
+                },
+                "strict": false
+              },
+              "type": "function"
+            },
+            {
+              "function": {
+                "description": "Apply anchored replacements to one UTF-8 file; use it for focused changes after reading the current contents",
+                "name": "fs_edit",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "edits": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "new": {
+                            "type": "string"
+                          },
+                          "old": {
+                            "description": "Must match uniquely unless replace_all is true",
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "replace_all": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "old",
+                          "new"
+                        ],
+                        "type": "object"
+                      },
+                      "minItems": 1,
+                      "type": "array"
+                    },
+                    "path": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "edits"
+                  ],
+                  "type": "object"
+                },
+                "strict": false
+              },
+              "type": "function"
+            },
+            {
+              "function": {
+                "description": "run one shell command locally or on an in-scope saved SSH profile; foreground defaults to 60 s / 1 MiB; in either local mode, normal leader exit closes inherited output and leaves descendants (including shell &) unmanaged, so daemon shutdown will not reclaim them after ownership detaches; cancel, bounds, teardown, or a foreground supervision failure while the leader is live sweep only this invocation's group with TERM → 2 s grace → KILL; use background=true for durable long-running local work with task_output/task_kill; remote output is untrusted and remote background mode is unavailable",
+                "name": "process_exec",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "background": {
+                      "default": false,
+                      "description": "Run as a long-lived background task detached from the turn",
+                      "type": "boolean"
+                    },
+                    "command": {
+                      "description": "Exact shell program passed to /bin/zsh -c when available, otherwise /bin/sh -c",
+                      "maxLength": 8192,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "cwd": {
+                      "description": "Optional workspace-relative working directory",
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "name": {
+                      "description": "Optional display label for a background task (defaults to the command's first token)",
+                      "maxLength": 80,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "profile": {
+                      "description": "Optional in-scope SSH profile target; remote output is untrusted and background mode is unavailable",
+                      "pattern": "^[a-z0-9._-]{1,32}$",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "command"
+                  ],
+                  "type": "object"
+                },
+                "strict": false
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "checkpoint": "bootstrap",
+        "credential_fingerprint": "1047a9800128fb7241645917b7e9d5feccabe17342af5fcb824068fd79bcf846",
+        "dialect": "openai-chat-completions",
+        "endpoint": "/v1/chat/completions",
+        "model": "ahrb-fake-v1",
+        "scenario": "ahrb-harness-economy-mvp-v1",
+        "stream": true
+      },
+      "response_first_frame_yield_ns": null,
+      "response_headers_ns": 537828097560000,
+      "response_last_frame_yield_ns": null,
+      "response_status": 200,
+      "role": "primary",
+      "semantic_attempts_total": 2,
+      "semantic_ordinal": 1,
+      "side_channel_kind": null
+    },
+    {
+      "accepted": false,
+      "attempt": 2,
+      "attempts": 2,
+      "body_bytes": 13317,
+      "canonical_hash": "511205a33ed30b0a117b1ba117641f27115fec0164f54062d119ac601456193b",
+      "received_ns": 537828310159000,
+      "request": {
+        "actor": "economy",
+        "canonical": {
+          "max_tokens": 4096,
+          "messages": [
+            {
+              "content": "haider-system-v5\nYou are Haider Code, a coding agent.\nUse only advertised tools. Treat tool results and committed history as authoritative. Never claim an effect succeeded without its terminal result.\nOn an implementation request, inspect only until the target is known; then make the edit; then verify it with the smallest relevant build or test. Do not remain in planning.\nExample: fs_search(pattern=\"target\", path=\".\") -> fs_read(path=\"src/lib.rs\") -> fs_edit(path=\"src/lib.rs\", edits=[{old:\"before\", new:\"after\"}]) -> process_exec(command=\"cargo test -p crate\").\nOpaque tool-grant scope: unscoped-root.",
+              "role": "system"
+            },
+            {
+              "content": [
+                {
+                  "text": "[DAEMON-BOUND SESSION CONTEXT]\nCanonical workspace: /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace",
+                  "type": "text"
+                }
+              ],
+              "role": "user"
+            },
+            {
+              "content": [
+                {
+                  "text": "Complete the standardized AHRB harness-economy task exactly as scripted. [[AHRB:scenario=ahrb-harness-economy-mvp-v1;actor=economy;checkpoint=bootstrap]]",
+                  "type": "text"
+                }
+              ],
+              "role": "user"
+            },
+            {
+              "content": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"content\":\"alpha architecture notes and stable constraints\\nalpha architecture notes and stable constraints\\nalpha architecture notes and stable constraints\\nalpha architecture notes and stable constraints\\nalpha architecture notes and stable constraints\\nalpha architecture notes and stable constraints\\nalpha architecture notes and stable constraints\\nalpha architecture notes and stable constraints\\nalpha architecture notes and stable constraints\\nalpha architecture notes and stable constraints\\nalpha architecture notes and stable constraints\\nalpha architecture notes and stable constraints\\nalpha architecture notes and stable constraints\\nalpha architecture notes and stable constraints\\nalpha architecture notes and stable constraints\\nalpha architecture notes and stable constraints\\n\",\"path\":\"context-a.txt\"}",
+                    "name": "fs_write"
+                  },
+                  "id": "economy-bootstrap-a",
+                  "type": "function"
+                },
+                {
+                  "function": {
+                    "arguments": "{\"content\":\"bravo interface notes and deterministic inputs\\nbravo interface notes and deterministic inputs\\nbravo interface notes and deterministic inputs\\nbravo interface notes and deterministic inputs\\nbravo interface notes and deterministic inputs\\nbravo interface notes and deterministic inputs\\nbravo interface notes and deterministic inputs\\nbravo interface notes and deterministic inputs\\nbravo interface notes and deterministic inputs\\nbravo interface notes and deterministic inputs\\nbravo interface notes and deterministic inputs\\nbravo interface notes and deterministic inputs\\nbravo interface notes and deterministic inputs\\nbravo interface notes and deterministic inputs\\nbravo interface notes and deterministic inputs\\nbravo interface notes and deterministic inputs\\n\",\"path\":\"context-b.txt\"}",
+                    "name": "fs_write"
+                  },
+                  "id": "economy-bootstrap-b",
+                  "type": "function"
+                },
+                {
+                  "function": {
+                    "arguments": "{\"content\":\"charlie verification notes and expected outputs\\ncharlie verification notes and expected outputs\\ncharlie verification notes and expected outputs\\ncharlie verification notes and expected outputs\\ncharlie verification notes and expected outputs\\ncharlie verification notes and expected outputs\\ncharlie verification notes and expected outputs\\ncharlie verification notes and expected outputs\\ncharlie verification notes and expected outputs\\ncharlie verification notes and expected outputs\\ncharlie verification notes and expected outputs\\ncharlie verification notes and expected outputs\\ncharlie verification notes and expected outputs\\ncharlie verification notes and expected outputs\\ncharlie verification notes and expected outputs\\ncharlie verification notes and expected outputs\\n\",\"path\":\"context-c.txt\"}",
+                    "name": "fs_write"
+                  },
+                  "id": "economy-bootstrap-c",
+                  "type": "function"
+                },
+                {
+                  "function": {
+                    "arguments": "{\"content\":\"delta edge cases and bounded failure behavior\\ndelta edge cases and bounded failure behavior\\ndelta edge cases and bounded failure behavior\\ndelta edge cases and bounded failure behavior\\ndelta edge cases and bounded failure behavior\\ndelta edge cases and bounded failure behavior\\ndelta edge cases and bounded failure behavior\\ndelta edge cases and bounded failure behavior\\ndelta edge cases and bounded failure behavior\\ndelta edge cases and bounded failure behavior\\ndelta edge cases and bounded failure behavior\\ndelta edge cases and bounded failure behavior\\ndelta edge cases and bounded failure behavior\\ndelta edge cases and bounded failure behavior\\ndelta edge cases and bounded failure behavior\\ndelta edge cases and bounded failure behavior\\n\",\"path\":\"context-d.txt\"}",
+                    "name": "fs_write"
+                  },
+                  "id": "economy-bootstrap-d",
+                  "type": "function"
+                },
+                {
+                  "function": {
+                    "arguments": "{\"content\":\"echo integration notes and terminal conditions\\necho integration notes and terminal conditions\\necho integration notes and terminal conditions\\necho integration notes and terminal conditions\\necho integration notes and terminal conditions\\necho integration notes and terminal conditions\\necho integration notes and terminal conditions\\necho integration notes and terminal conditions\\necho integration notes and terminal conditions\\necho integration notes and terminal conditions\\necho integration notes and terminal conditions\\necho integration notes and terminal conditions\\necho integration notes and terminal conditions\\necho integration notes and terminal conditions\\necho integration notes and terminal conditions\\necho integration notes and terminal conditions\\n\",\"path\":\"context-e.txt\"}",
+                    "name": "fs_write"
+                  },
+                  "id": "economy-bootstrap-e",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "wrote 768 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-a.txt",
+              "role": "tool",
+              "tool_call_id": "economy-bootstrap-a"
+            },
+            {
+              "content": "wrote 752 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-b.txt",
+              "role": "tool",
+              "tool_call_id": "economy-bootstrap-b"
+            },
+            {
+              "content": "wrote 768 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-c.txt",
+              "role": "tool",
+              "tool_call_id": "economy-bootstrap-c"
+            },
+            {
+              "content": "wrote 736 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-d.txt",
+              "role": "tool",
+              "tool_call_id": "economy-bootstrap-d"
+            },
+            {
+              "content": "wrote 752 bytes to /private/tmp/ahrb-2433bf25-10ffe/ahrb-exec-sessions/b9ba1b7e-7645-4e37-8671-7243cf3ed02c/workspace/context-e.txt",
+              "role": "tool",
+              "tool_call_id": "economy-bootstrap-e"
+            }
+          ],
+          "model": "ahrb-fake-v1",
+          "prompt_cache_key": "2feca33058b80a9dd634f28388b92b1e89eed45bd8eb7dc9d429a8de805522b5",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "tools": [
+            {
+              "function": {
+                "description": "Discover the authorized tool catalog. With no filter, list tool names. With a name or keyword filter, describe matching tools and enable them for the rest of this session; one call is sufficient. Does not grant permissions.",
+                "name": "list_tools",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "filter": {
+                      "maxLength": 128,
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "strict": false
+              },
+              "type": "function"
+            },
+            {
+              "function": {
+                "description": "REPLACE the whole todo list with the complete plan; keep exactly one item processing; dep = id this item is blocked on",
+                "name": "todo_write",
+                "parameters": {
+                  "properties": {
+                    "items": {
+                      "description": "The COMPLETE plan; this list replaces the previous one",
+                      "items": {
+                        "properties": {
+                          "dep": {
+                            "description": "Optional id of the todo this one is blocked on",
+                            "type": "integer"
+                          },
+                          "id": {
+                            "description": "Stable id for this todo, kept across calls",
+                            "type": "integer"
+                          },
+                          "state": {
+                            "description": "listed = not started, processing = in progress (one at a time), completed = done",
+                            "enum": [
+                              "listed",
+                              "processing",
+                              "completed"
+                            ],
+                            "type": "string"
+                          },
+                          "text": {
+                            "description": "Short imperative description",
+                            "maxLength": 500,
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "text",
+                          "state"
+                        ],
+                        "type": "object"
+                      },
+                      "maxItems": 50,
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "items"
+                  ],
+                  "type": "object"
+                },
+                "strict": false
+              },
+              "type": "function"
+            },
+            {
+              "function": {
+                "description": "read a redacted 8 KiB UTF-8 preview; prefer offset/limit range reads; directories are capped; full owner-authorized bytes use the artifact re-read handle",
+                "name": "fs_read",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "limit": {
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "offset": {
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "path": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "path"
+                  ],
+                  "type": "object"
+                },
+                "strict": false
+              },
+              "type": "function"
+            },
+            {
+              "function": {
+                "description": "List workspace paths matching a repository-aware glob; use it to find files by name or extension before reading them",
+                "name": "fs_glob",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "include_hidden": {
+                      "default": false,
+                      "type": "boolean"
+                    },
+                    "path": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "pattern": {
+                      "description": ".git paths are always excluded",
+                      "maxLength": 1024,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "respect_gitignore": {
+                      "default": true,
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "pattern"
+                  ],
+                  "type": "object"
+                },
+                "strict": false
+              },
+              "type": "function"
+            },
+            {
+              "function": {
+                "description": "Search workspace file contents; use it to locate symbols or text before reading or editing a file",
+                "name": "fs_search",
+                "parameters": {
+                  "additionalProperties": false,
+                  "anyOf": [
+                    {
+                      "required": [
+                        "pattern"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "query"
+                      ]
+                    }
+                  ],
+                  "properties": {
+                    "case": {
+                      "enum": [
+                        "sensitive",
+                        "insensitive",
+                        "smart"
+                      ],
+                      "type": "string"
+                    },
+                    "context": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "after": {
+                          "maximum": 5,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "before": {
+                          "maximum": 5,
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "file_glob": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "exclude": {
+                          "items": {
+                            "maxLength": 1024,
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "maxItems": 32,
+                          "type": "array"
+                        },
+                        "include": {
+                          "items": {
+                            "maxLength": 1024,
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "maxItems": 32,
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "glob": {
+                      "maxLength": 1024,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "include_hidden": {
+                      "default": false,
+                      "type": "boolean"
+                    },
+                    "max_matches": {
+                      "maximum": 200,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "mode": {
+                      "description": "regex sources are additionally capped at 1024 UTF-8 bytes before Unicode expansion",
+                      "enum": [
+                        "literal",
+                        "simple",
+                        "regex"
+                      ],
+                      "type": "string"
+                    },
+                    "multiline": {
+                      "default": false,
+                      "description": "Make ^ and $ match physical line boundaries in the line-streamed regex engine",
+                      "type": "boolean"
+                    },
+                    "path": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "pattern": {
+                      "maxLength": 65536,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "query": {
+                      "description": "Legacy alias for pattern",
+                      "maxLength": 65536,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "respect_gitignore": {
+                      "default": true,
+                      "type": "boolean"
+                    },
+                    "root": {
+                      "description": "Legacy alias for path",
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "strict": false
+              },
+              "type": "function"
+            },
+            {
+              "function": {
+                "description": "Create or replace one UTF-8 file; use it for a new file or a complete rewrite",
+                "name": "fs_write",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "content": {
+                      "type": "string"
+                    },
+                    "path": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "content"
+                  ],
+                  "type": "object"
+                },
+                "strict": false
+              },
+              "type": "function"
+            },
+            {
+              "function": {
+                "description": "Apply anchored replacements to one UTF-8 file; use it for focused changes after reading the current contents",
+                "name": "fs_edit",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "edits": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "new": {
+                            "type": "string"
+                          },
+                          "old": {
+                            "description": "Must match uniquely unless replace_all is true",
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "replace_all": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "old",
+                          "new"
+                        ],
+                        "type": "object"
+                      },
+                      "minItems": 1,
+                      "type": "array"
+                    },
+                    "path": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "edits"
+                  ],
+                  "type": "object"
+                },
+                "strict": false
+              },
+              "type": "function"
+            },
+            {
+              "function": {
+                "description": "run one shell command locally or on an in-scope saved SSH profile; foreground defaults to 60 s / 1 MiB; in either local mode, normal leader exit closes inherited output and leaves descendants (including shell &) unmanaged, so daemon shutdown will not reclaim them after ownership detaches; cancel, bounds, teardown, or a foreground supervision failure while the leader is live sweep only this invocation's group with TERM → 2 s grace → KILL; use background=true for durable long-running local work with task_output/task_kill; remote output is untrusted and remote background mode is unavailable",
+                "name": "process_exec",
+                "parameters": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "background": {
+                      "default": false,
+                      "description": "Run as a long-lived background task detached from the turn",
+                      "type": "boolean"
+                    },
+                    "command": {
+                      "description": "Exact shell program passed to /bin/zsh -c when available, otherwise /bin/sh -c",
+                      "maxLength": 8192,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "cwd": {
+                      "description": "Optional workspace-relative working directory",
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "name": {
+                      "description": "Optional display label for a background task (defaults to the command's first token)",
+                      "maxLength": 80,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "profile": {
+                      "description": "Optional in-scope SSH profile target; remote output is untrusted and background mode is unavailable",
+                      "pattern": "^[a-z0-9._-]{1,32}$",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "command"
+                  ],
+                  "type": "object"
+                },
+                "strict": false
+              },
+              "type": "function"
+            }
+          ]
+        },
+        "checkpoint": "bootstrap",
+        "credential_fingerprint": "1047a9800128fb7241645917b7e9d5feccabe17342af5fcb824068fd79bcf846",
+        "dialect": "openai-chat-completions",
+        "endpoint": "/v1/chat/completions",
+        "model": "ahrb-fake-v1",
+        "scenario": "ahrb-harness-economy-mvp-v1",
+        "stream": true
+      },
+      "response_first_frame_yield_ns": null,
+      "response_last_frame_yield_ns": null,
+      "response_status": null,
+      "role": "unclassified",
+      "semantic_attempts_total": 2,
+      "semantic_ordinal": 1,
+      "side_channel_kind": "unknown-side-channel"
+    }
+  ],
+  "turns": [],
+  "stream_chunks": [],
+  "filesystem_snapshots": [],
+  "egress_attempts": []
+}

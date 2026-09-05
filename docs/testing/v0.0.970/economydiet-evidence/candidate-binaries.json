@@ -1,0 +1,14 @@
+{
+  "label": "final candidate including session workspace promotion persistence fix",
+  "profile": "dev opt-level=0 debug=0 incremental=0",
+  "binaries": {
+    "haider": {
+      "bytes": 111003472,
+      "sha256": "abcd0487bedbfaf7b2525e3feb2ca85ea3e5b065b9db95458de1e1807f7c8f05"
+    },
+    "haiderd": {
+      "bytes": 200782496,
+      "sha256": "96c98ec4b8cc3a5113e1343307ea63d9a15d92b8c99e627da156eaf462e3a2a7"
+    }
+  }
+}

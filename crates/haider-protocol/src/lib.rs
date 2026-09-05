@@ -13,6 +13,7 @@
 pub mod agent;
 pub mod branch;
 pub mod cache;
+pub mod ceiling;
 pub mod checkpoint;
 pub mod computer;
 pub mod context;

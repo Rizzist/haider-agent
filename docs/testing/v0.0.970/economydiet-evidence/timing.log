@@ -1,0 +1,17 @@
+1/4 A warm: starting existing proof harness
+1/4 A warm: proof accepted
+1/4 A one_shot: starting existing proof harness
+1/4 A one_shot: proof accepted
+2/4 B warm: starting existing proof harness
+2/4 B warm: proof accepted
+2/4 B one_shot: starting existing proof harness
+2/4 B one_shot: proof accepted
+3/4 B warm: starting existing proof harness
+3/4 B warm: proof accepted
+3/4 B one_shot: starting existing proof harness
+3/4 B one_shot: proof accepted
+4/4 A warm: starting existing proof harness
+4/4 A warm: proof accepted
+4/4 A one_shot: starting existing proof harness
+4/4 A one_shot: proof accepted
+{"binaries": {"A": {"haider": "208f7bf8acb795c6be0311268e0583b027c923fac9fb8a28944aaf3a9c9c364f", "haiderd": "17d631a072a217244b3fbde550f0aca61f64a48e1c2edae49c5d0218395cf4dd"}, "B": {"haider": "1a76e49b82210215f6c0b7e6e852aafac234dae41f9de9980a511d3bd535a3fa", "haiderd": "3e4ffe7dfd3e225af8f6f0fca42c535192904e7df8e31e76247087413463ce1c"}}, "comparison": {"one_shot": {"baseline_count": 42, "baseline_mad_ms": 2.0808959999999956, "baseline_median_ms": 107.424208, "candidate_count": 42, "candidate_mad_ms": 2.104812499999994, "candidate_median_ms": 107.43433350000001, "delta_ms": 0.010125500000015109, "max_mad_ms": 2.104812499999994, "neutral_within_mad": true}, "warm_single": {"baseline_count": 50, "baseline_mad_ms": 2.6012494999999944, "baseline_median_ms": 51.855625, "candidate_count": 50, "candidate_mad_ms": 2.1798125000000006, "candidate_median_ms": 47.2232085, "delta_ms": -4.632416500000005, "max_mad_ms": 2.6012494999999944, "neutral_within_mad": true}, "warm_tool": {"baseline_count": 50, "baseline_mad_ms": 4.688125499999991, "baseline_median_ms": 83.3680005, "candidate_count": 50, "candidate_mad_ms": 3.503041000000003, "candidate_median_ms": 74.8159995, "delta_ms": -8.55200099999999, "max_mad_ms": 4.688125499999991, "neutral_within_mad": true}}, "criterion": "B median <= A median + max(A MAD, B MAD); existing load and correctness proof pins unchanged", "order": "ABBA", "runs": [{"kind": "warm", "label": "A", "measurement_accepted": true, "passed": true, "path": "1-A-warm.json", "sha256": "fc0e66aef2f2f9c333e3f8975abae8dc391d0b4d9d1b78e0d5a68cbe368a6353"}, {"kind": "one_shot", "label": "A", "measurement_accepted": true, "passed": true, "path": "1-A-one_shot.json", "sha256": "0eb804243d54fab2070c805f2388e62f089da8a30d5285cf11d91d99e483e9e0"}, {"kind": "warm", "label": "B", "measurement_accepted": true, "passed": true, "path": "2-B-warm.json", "sha256": "6e44535f86d506038922d823bfd1e8007417bc2928b98182fa8319daa7f7aa36"}, {"kind": "one_shot", "label": "B", "measurement_accepted": true, "passed": true, "path": "2-B-one_shot.json", "sha256": "21d78acae74302565b4526c532d5ff6ec7cdacdb3f281f09e820dbd96fdeae3c"}, {"kind": "warm", "label": "B", "measurement_accepted": true, "passed": true, "path": "3-B-warm.json", "sha256": "f120673d22490cc5b7c7ef4c9c273d7fb0609fc1b9698994656b3e7ba376ea23"}, {"kind": "one_shot", "label": "B", "measurement_accepted": true, "passed": true, "path": "3-B-one_shot.json", "sha256": "6f6e6dc44a725bfde004927de1997ea40a9e3fa93a858c8a631fde78d7e82e8f"}, {"kind": "warm", "label": "A", "measurement_accepted": true, "passed": true, "path": "4-A-warm.json", "sha256": "557d78da226a32d8deade1eb13db18db74bd2f1459d0acddf4233f48b3ee25d1"}, {"kind": "one_shot", "label": "A", "measurement_accepted": true, "passed": true, "path": "4-A-one_shot.json", "sha256": "ade749fd869102e1d1f6e78ccc23015d465309e562641a0b5856b42c57f0365e"}], "schema": "haider.economydiet.abba.v1", "status": "SHIP"}

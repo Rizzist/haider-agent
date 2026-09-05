@@ -1,0 +1,13 @@
+    Checking haider-protocol v0.0.969 (/Users/rizzist/haider-run/lane-970-ceilingdecl/crates/haider-protocol)
+    Checking haider-accounts v0.0.969 (/Users/rizzist/haider-run/lane-970-ceilingdecl/crates/haider-accounts)
+    Checking haider-rpc v0.0.969 (/Users/rizzist/haider-run/lane-970-ceilingdecl/crates/haider-rpc)
+    Checking haider-provider v0.0.969 (/Users/rizzist/haider-run/lane-970-ceilingdecl/crates/haider-provider)
+    Checking haider-store v0.0.969 (/Users/rizzist/haider-run/lane-970-ceilingdecl/crates/haider-store)
+    Checking haider-client v0.0.969 (/Users/rizzist/haider-run/lane-970-ceilingdecl/crates/haider-client)
+    Checking haider-tools v0.0.969 (/Users/rizzist/haider-run/lane-970-ceilingdecl/crates/haider-tools)
+    Checking haider-tui v0.0.969 (/Users/rizzist/haider-run/lane-970-ceilingdecl/crates/haider-tui)
+    Checking haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-ceilingdecl/crates/haider-core)
+    Checking haider-daemon v0.0.969 (/Users/rizzist/haider-run/lane-970-ceilingdecl/crates/haider-daemon)
+    Checking haider-cli v0.0.969 (/Users/rizzist/haider-run/lane-970-ceilingdecl/crates/haider-cli)
+    Checking haider-daemond v0.0.969 (/Users/rizzist/haider-run/lane-970-ceilingdecl/crates/haider-daemond)
+    Finished `dev` profile [unoptimized] target(s) in 2m 03s

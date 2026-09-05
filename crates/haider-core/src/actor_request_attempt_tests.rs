@@ -629,6 +629,7 @@ async fn rejected_combined_append_does_not_publish_or_advance_state() {
             1,
             None,
             RequestAttemptMarkers {
+                workspace_receipt: None,
                 provider_view: Some(serde_json::json!({"provider_view": "exact"})),
                 cache: serde_json::json!({"cache_attempt": "diagnostic"}),
                 response_epoch: 0,
@@ -669,6 +670,7 @@ async fn provider_view_and_request_attempt_share_one_ordered_append() {
             1,
             None,
             RequestAttemptMarkers {
+                workspace_receipt: None,
                 provider_view: Some(serde_json::json!({"provider_view": "exact"})),
                 cache: serde_json::json!({"cache_attempt": "diagnostic"}),
                 response_epoch: 0,

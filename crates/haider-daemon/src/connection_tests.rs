@@ -356,6 +356,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// provider rows from the legacy fleet shape.
 #[test]
 fn welcome_features_pin_served_management_families() {
+    eprintln!(
+        "handshake pin: served_features={}",
+        welcome_features().len()
+    );
     assert_eq!(
         welcome_features().len(),
         115,

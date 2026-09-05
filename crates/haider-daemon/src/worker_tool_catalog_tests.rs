@@ -75,13 +75,27 @@ fn tool_catalog_and_provider_schemas_have_process_wide_identity() {
 
 #[test]
 fn request_input_provider_schema_matches_pinned_wire_bytes() {
-    const GOLDEN: &[u8] = br#"{"name":"request_input","description":"","input_schema":{"properties":{"body":{"items":{"type":"string"},"type":"array"},"default":{"type":"string"},"kind":{"enum":["question","choice"],"type":"string"},"options":{"items":{"properties":{"detail":{"type":"string"},"key":{"type":"string"},"label":{"type":"string"}},"required":["key","label"],"type":"object"},"type":"array"},"title":{"type":"string"}},"required":["kind","title"],"type":"object"}}"#;
-    let definition = registered_provider_definitions()
-        .first()
-        .cloned()
+    let definitions = registered_provider_definitions();
+    assert_eq!(
+        definitions.first().expect("discovery first").name,
+        "list_tools"
+    );
+    let definition = definitions
+        .iter()
+        .find(|tool| tool.name == "request_input")
         .expect("request_input provider definition");
-    assert_eq!(definition.name, "request_input");
-    assert_eq!(serde_json::to_vec(&definition).expect("wire bytes"), GOLDEN);
+    let mut actual = serde_json::to_vec(definition).expect("wire bytes");
+    actual.push(b'\n');
+    if std::env::var_os("UPDATE_FIXTURES").is_some() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/fixtures/request_input_provider_schema.json");
+        std::fs::write(path, &actual).expect("regenerate provider schema fixture");
+        return;
+    }
+    assert_eq!(
+        actual,
+        include_bytes!("fixtures/request_input_provider_schema.json")
+    );
 }
 
 #[test]
@@ -791,9 +805,35 @@ fn turn_tool_pack_cache_is_process_bounded() {
     );
 }
 
+/// Exact native schema bytes and their provider-cache digest move together.
+/// Regenerate deliberately with UPDATE_FIXTURES=1; normal runs compare the
+/// complete frozen artifact, including property descriptions and constraints.
+fn assert_tool_surface_fixture(filename: &str, definitions: &[ToolDefinition]) {
+    let surface = serde_json::json!({
+        "definitions": definitions,
+        "digest": canonical_tool_definitions_digest(definitions),
+    });
+    let mut actual = serde_json::to_vec_pretty(&surface).expect("serialize tool surface");
+    actual.push(b'\n');
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/fixtures")
+        .join(filename);
+    if std::env::var_os("UPDATE_FIXTURES").is_some() {
+        std::fs::write(&path, &actual).expect("regenerate native tool surface");
+        return;
+    }
+    let expected = std::fs::read(&path).expect("read pinned native tool surface");
+    assert_eq!(
+        actual,
+        expected,
+        "native tool surface drifted: {}",
+        path.display()
+    );
+}
+
 /// MUTATION CHECK: the public peer schemas, routes, permission defaults, and
 /// provider-pack digest must move together. Changing either manifest requires
-/// an explicit update to the expected definitions below.
+/// an explicit regeneration of the frozen native definitions.
 #[test]
 fn peer_tool_surface_is_manifest_and_digest_pinned() {
     let list = registered_tool_by_name("peer_list").expect("peer_list manifest");
@@ -810,34 +850,7 @@ fn peer_tool_surface_is_manifest_and_digest_pinned() {
         provider_definition(&list.manifest),
         provider_definition(&send.manifest),
     ];
-    let expected = [
-        ToolDefinition {
-            name: "peer_list".into(),
-            description: String::new(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {"filter": {"type": "string"}}
-            }),
-        },
-        ToolDefinition {
-            name: "peer_send".into(),
-            description: String::new(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "to": {"type": "string"},
-                    "message": {"type": "string"},
-                    "summary": {"type": "string"}
-                },
-                "required": ["to", "message"]
-            }),
-        },
-    ];
-    assert_eq!(actual, expected);
-    assert_eq!(
-        canonical_tool_definitions_digest(&actual),
-        canonical_tool_definitions_digest(&expected)
-    );
+    assert_tool_surface_fixture("peer_provider_schemas.json", &actual);
 }
 
 /// MUTATION CHECK: make catalog discovery effectful, drop the filter, or let
@@ -849,16 +862,9 @@ fn list_models_surface_is_manifest_route_and_text_pinned() {
     assert_eq!(list.default, ToolPermissionDefault::Allow);
     assert_eq!(list.manifest.dispatch, DispatchMode::Await);
     assert!(list.manifest.effects.is_empty());
-    assert_eq!(
-        provider_definition(&list.manifest),
-        ToolDefinition {
-            name: "list_models".into(),
-            description: String::new(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {"filter": {"type": "string"}}
-            }),
-        }
+    assert_tool_surface_fixture(
+        "list_models_provider_schema.json",
+        &[provider_definition(&list.manifest)],
     );
     let manual = tool_manual_line("list_models").expect("list_models manual line");
     assert_eq!(
@@ -942,35 +948,7 @@ fn ssh_tool_surface_is_manifest_and_digest_pinned() {
         provider_definition(&list.manifest),
         provider_definition(&shell.manifest),
     ];
-    let expected = [
-        ToolDefinition {
-            name: "ssh_list".into(),
-            description: String::new(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        ToolDefinition {
-            name: "ssh_shell".into(),
-            description: String::new(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "profile": {"type": "string"},
-                    "command": {"type": "string"},
-                    "cwd": {"type": "string"},
-                    "timeout_s": {"type": "integer"}
-                },
-                "required": ["profile", "command"]
-            }),
-        },
-    ];
-    assert_eq!(actual, expected);
-    assert_eq!(
-        canonical_tool_definitions_digest(&actual),
-        canonical_tool_definitions_digest(&expected)
-    );
+    assert_tool_surface_fixture("ssh_provider_schemas.json", &actual);
 }
 
 /// A model-authored remote command must stop at an Ask menu before a russh

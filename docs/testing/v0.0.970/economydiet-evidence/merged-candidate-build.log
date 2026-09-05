@@ -1,0 +1,13 @@
+   Compiling haider-protocol v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-protocol)
+   Compiling haider-rpc v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-rpc)
+   Compiling haider-accounts v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-accounts)
+   Compiling haider-provider v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-provider)
+   Compiling haider-client v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-client)
+   Compiling haider-store v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-store)
+   Compiling haider-tools v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-tools)
+   Compiling haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-core)
+   Compiling haider-tui v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-tui)
+   Compiling haider-daemon v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-daemon)
+   Compiling haider-cli v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-cli)
+   Compiling haider-daemond v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-daemond)
+    Finished `dev` profile [unoptimized] target(s) in 1m 55s

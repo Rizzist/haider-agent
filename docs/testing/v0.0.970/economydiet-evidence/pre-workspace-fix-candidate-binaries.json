@@ -1,0 +1,14 @@
+{
+  "label": "candidate including four verifier fixes",
+  "profile": "dev opt-level=0 debug=0 incremental=0",
+  "binaries": {
+    "haider": {
+      "bytes": 111003472,
+      "sha256": "abcd0487bedbfaf7b2525e3feb2ca85ea3e5b065b9db95458de1e1807f7c8f05"
+    },
+    "haiderd": {
+      "bytes": 200783104,
+      "sha256": "6c2fcdadf6761d5131d4ce10640acae6310a9df6ebcb89598fc7fed3f1867d69"
+    }
+  }
+}
