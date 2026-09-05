@@ -15,3 +15,7 @@ target-linux/
 
 # lane evidence dirs (binaries + raw reports) never enter the repo
 .lane-evidence-*/
+
+# Lane A/B binary stashes (built haider/haiderd copies) must never be committed (registry #97)
+/.*-baseline/
+/.*-candidate/

@@ -1,0 +1,295 @@
+[identity]
+schema = 1
+id = "haider-agent"
+name = "Haider Agent"
+revision = "0.0.967-readiness-json-v1"
+
+[availability]
+exec_paths = ["haider"]
+required_exec_paths = ["haiderd"]
+version_probe = ["haider", "--version"]
+version_pattern = "haider"
+
+[fake_model]
+dialect = "open-ai-chat-completions"
+base_url_env = "OPENAI_BASE_URL"
+credential_env = "OPENAI_API_KEY"
+auth_required = false
+model = "ahrb-fake-v1"
+# Account creation probes the OpenAI-compatible model catalog before accepting
+# the provider. That control-plane request is served but is not a model turn.
+allowed_paths = ["/v1/models", "/v1/chat/completions"]
+
+[model_roles.primary]
+model = "ahrb-fake-v1"
+required = true
+
+[isolation.roots]
+HOME = "{{profile}}/home"
+XDG_CONFIG_HOME = "{{profile}}/config"
+XDG_CACHE_HOME = "{{profile}}/cache"
+XDG_DATA_HOME = "{{profile}}/data"
+XDG_STATE_HOME = "{{profile}}/state"
+XDG_RUNTIME_DIR = "{{profile}}/run"
+HAIDER_RUNTIME_DIR = "{{profile}}/run"
+TMPDIR = "{{profile}}/tmp"
+
+[isolation]
+generated_files = []
+forbidden_roots = ["~/.config/haider", "~/.local/share/haider"]
+socket_path_suffixes = ["0123456789abcdef0123456789abcdef/haiderd.sock"]
+
+[isolation.environment]
+HAIDER_RUN_DAEMON_IDLE_TTL_MS = "600000"
+
+# Haider's public status command auto-spawns a detached daemon. AHRB parses its
+# PID and process-global ready bit directly from status JSON and verifies every
+# reported state/runtime path remains inside the cold HOME/runtime roots.
+# Every benchmark turn remains a `haider run` thin-client invocation; AHRB does
+# not speak or decode Haider's private socket protocol.
+[daemon]
+persistent = true
+start = ["haider", "status", "--json"]
+launcher_exits = true
+# The bench account MUST carry a stored credential: a custom endpoint with no
+# active credential is auto-hermetic by contract (client-contract-v1.md §20,
+# verified on 0.0.967: fs_write is redirected to ~/.haider/lockdown/<hash>/ and
+# process_exec is never offered; explicit `provider set --full` cannot lift it).
+# `--api-key-env` keeps the credential out of argv; the fake model's own
+# credential env is what the harness would send anyway.
+initialize = [
+  "haider", "account", "add", "ahrb",
+  "--base-url", "{{base_url}}", "--api-key-env", "OPENAI_API_KEY", "--api-family", "openai",
+  "--response-open-timeout", "2s", "--chunk-idle-timeout", "2s",
+  "--semantic-progress-timeout", "2s", "--json"
+]
+shutdown = ["haider", "daemon", "stop", "--json"]
+grace_ms = 5000
+
+[daemon.shutdown_result]
+outcome_pointer = "/outcome"
+clean_outcomes = ["stopped_cleanly", "not_running"]
+escalate_outcomes = ["did_not_stop"]
+
+[daemon.readiness]
+kind = "command-json"
+command = ["haider", "status", "--json"]
+pid_pointer = "/daemon/pid"
+ready_pointer = "/daemon/ready"
+timeout_ms = 30000
+
+[daemon.readiness.json_pointer_roots]
+"/profile_path" = "HOME"
+"/runtime_dir" = "HAIDER_RUNTIME_DIR"
+"/daemon/pipe_dir" = "HOME"
+
+[transport]
+kind = "exec"
+command = [
+  "haider", "run", "-p", "{{prompt}}", "--model", "ahrb/{{model}}",
+  "--output", "jsonl", "--allow-writes", "--allow-exec",
+  "--timeout", "30s"
+]
+timeout_ms = 30000
+
+[sessions]
+list = ["haider", "sessions", "--json", "--no-spawn"]
+wait_ready = ["haider", "sessions", "wait-ready", "--count", "{{count}}", "--timeout", "{{timeout}}", "--json", "--no-spawn"]
+resume_control = ["haider", "resume", "{{session_id}}", "--json"]
+recover_probe = ["haider", "session", "{{session_id}}", "recover", "--probe", "--json"]
+id_pointer = "/session_id"
+run_id_pointer = "/run_id"
+
+[next_input]
+[agents]
+cancel = ["haider", "run", "--stop", "{{run_id}}"]
+
+[concurrency]
+topology = "shared-daemon-sessions"
+max_agents = 32
+fanout_mode = "thin-client-session-fanout"
+
+[tools.aliases]
+write = ["fs_write", "process_exec"]
+read = ["fs_read", "process_exec"]
+fail = ["process_exec", "fs_read"]
+
+[tools.bindings]
+"fs_write.path" = "path"
+"fs_write.content" = "content"
+"fs_read.path" = "path"
+"process_exec.command" = "command"
+
+[tools.fixtures]
+write = ["{{ahrb_fixture}}", "write", "--path", "{{path}}", "--content", "{{content}}"]
+read = ["{{ahrb_fixture}}", "read", "--path", "{{path}}"]
+fail = ["{{ahrb_fixture}}", "fail", "--message", "{{message}}"]
+
+# `haider run --output jsonl` starts with a top-level accepted announcement,
+# followed by durable RawEnvelope records whose discriminator is payload.type.
+[events]
+source = "stdout"
+replay_command = ["haider", "run", "--replay", "{{run_id}}"]
+replay_mode = "document"
+replay_records_pointer = "/events"
+replay_assertions = { "/schema" = "haider.run.replay.v1", "/mode" = "durable_journal", "/provider_requests" = "0", "/integrity/sequences_strictly_increasing" = "true", "/integrity/run_id_stable" = "true", "/integrity/exactly_one_typed_terminal" = "true", "/integrity/terminal_seq_matches_status" = "true", "/equivalence/equivalent" = "true" }
+replay_state_command = ["haider", "run", "--status", "{{run_id}}", "--output", "json"]
+replay_state_assertions = { "/schema" = "haider.run.status.v1" }
+replay_state_pointers = ["/result/head_seq", "/result/terminal_seq"]
+replay_compare_live_records = true
+replay_cursor_start = 2
+framing = "jsonl"
+type_pointer = "/payload/type"
+id_pointer = "/event_id"
+cursor_pointer = "/seq"
+schema_version_pointer = "/schema_version"
+schema_versions = [1]
+warn_unmapped_payload_kinds = true
+
+# Narrative is intentionally undeclared. The saved row-69 journals (for example
+# results/haider-agent/2026-09-02T17:06:20Z-3eac4351/report.json) retain only a
+# final completed agent_message at /payload/item/text, omit the pre-tool
+# assistant item, and contain no reasoning item; run_state state="thinking" is
+# lifecycle metadata, not model reasoning. The 40-run real-model study using
+# `haider run --output json` likewise exposed no text-stream or reasoning
+# events. Row 69 therefore remains honestly UNSUPPORTED until Haider journals
+# the complete model narrative.
+[events.metadata]
+schema_version_pointer = "/schema_version"
+schema_version_value = "1"
+
+[[events.rules]]
+matches = "accepted"
+event = "turn-accepted"
+
+[[events.rules]]
+matches = "run_state"
+match_fields = { "/payload/state" = "thinking" }
+event = "model-request"
+payload_pointer = "/payload"
+
+# The tool call is mapped from the `started` item (status=in_progress, carries
+# call_id/name/args): verified on 0.0.967 the daemon journals `tool_result`
+# BEFORE the `completed` tool_call item, so mapping the completed item would
+# invert call/result order.
+[[events.rules]]
+matches = "item"
+match_fields = { "/payload/event" = "started", "/payload/item/item" = "tool_call" }
+event = "tool-call"
+payload_pointer = "/payload/item"
+payload_bindings = { call_id = "/payload/item/call_id", name = "/payload/item/name", arguments = "/payload/item/args" }
+
+[[events.rules]]
+matches = "tool_result"
+event = "tool-result"
+payload_pointer = "/payload"
+payload_bindings = { call_id = "/payload/call_id", result = "/payload/result" }
+
+[[events.rules]]
+matches = "item"
+match_fields = { "/payload/event" = "completed", "/payload/item/item" = "agent_message" }
+event = "model-response"
+payload_pointer = "/payload/item"
+
+[[events.rules]]
+matches = "agent_message"
+event = "model-response"
+payload_pointer = "/payload"
+
+# Terminals are keyed on the DURABLE `state` field. Verified on 0.0.967 ground
+# truth: the live carrier enriches the terminal run_state with `terminal_kind`
+# and `error_code`, but `run --replay` reproduces only `{"state": ...}`, so rules
+# keyed on terminal_kind make replay one event shorter than the live stream.
+# Durable states: done | errored | cancelled (a wall-clock timeout is journaled
+# as `cancelled`; the timeout distinction exists only on the live carrier).
+# `run_failed` is the human-facing error detail, not the typed terminal
+# (replay integrity asserts exactly one typed terminal), so it is left unmapped.
+[[events.rules]]
+matches = "run_state"
+match_fields = { "/payload/state" = "done" }
+event = "terminal-success"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "run_state"
+match_fields = { "/payload/state" = "errored" }
+event = "terminal-failure"
+payload_pointer = "/payload"
+
+[[events.rules]]
+matches = "run_state"
+match_fields = { "/payload/state" = "cancelled" }
+event = "terminal-cancelled"
+payload_pointer = "/payload"
+
+[exit]
+success = 0
+success_stdout = []
+failure_stdout = ['"event":"error"', '"state":"errored"', '"status":"failure"']
+failures = { usage = 2, provider = 65, unavailable = 69, software = 70, io = 74, protocol = 76, blocked = 77, idle-timeout = 124, cancelled = 130 }
+
+[process]
+executable_names = ["haiderd", "haider"]
+
+[resources]
+turn_timeout_ms = 30000
+idle_timeout_ms = 2000
+max_output_bytes = 1048576
+
+[hooks]
+[cleanup]
+paths = ["{{profile}}"]
+
+[capture]
+redact_env = ["OPENAI_API_KEY"]
+max_bytes = 1048576
+
+[capabilities.injection_surface.provider]
+method = "cli"
+argv = ["--model", "ahrb/{{provider}}"]
+argv_position = "suffix"
+
+[capabilities.injection_surface.base_url]
+method = "cli"
+argv = ["--base-url", "{{base_url}}"]
+argv_position = "suffix"
+
+[capabilities.injection_surface.credential]
+method = "environment"
+environment = "OPENAI_API_KEY"
+
+[capabilities.required]
+headless = "haider run --output jsonl is a noninteractive thin client over the resident daemon"
+tool_result_role_fidelity = "OpenAI-compatible tool messages preserve the native tool-result role"
+
+[capabilities.optional]
+sessions = "durable daemon sessions are listable with haider sessions --json --no-spawn"
+resume = "haider resume <session-id> --json and session recover --probe --json are headless"
+durable_journal = "haider run --replay <run-id> replays the daemon-owned durable journal"
+
+# TODO(orchestrator): confirm the exact resume/recovery control JSON schemas
+# before replacing AHRB's conservative error/negative-field checks with
+# adapter-declared typed pointers. Also copy 0.0.968's status `runtime_dir`
+# resolution field into evidence when that release becomes the probed target.
+# TODO(orchestrator): check the scrubbed 0.0.967 live-turn and native-replay
+# JSONL samples into the verification workspace, and confirm that the observed
+# item/direct agent-message and run_state/direct terminal alternatives are
+# mutually exclusive within one turn. AHRB intentionally preserves duplicate
+# normalized events rather than hiding a changed Haider emission contract.
+# TODO(orchestrator): reconcile the probed CLI with the Wave-4 assertion for
+# `--max-cost` and `--max-time`, including the exact time-unit syntax, then pin
+# a harness-visible 2/3 micro-USD tariff carrier.
+# TODO(orchestrator): capture the exact usage JSONL carrier, normalized event,
+# per-turn versus cumulative scope, and all five JSON pointers before declaring
+# usage_reporting.
+# TODO(orchestrator): pin public create/fork/delete operations, repeated-delete
+# semantics, and every lifecycle pointer before declaring session_ops_cli;
+# sessions/list/resume/recover alone are insufficient.
+# TODO(orchestrator): verify complete allow, filesystem-deny, and network-deny
+# argv before declaring headless_permission_model; `--allow-writes` and
+# `--allow-exec` alone do not prove denial granularity.
+# TODO(orchestrator): pin the exact mode-0600 account/auth credential file, or
+# revise SPEC-v2 rule 6 for env-only credentials, before declaring
+# secrets_hygiene_on_disk.
+# TODO(orchestrator): capture timestamp and exact usage metadata from the live
+# JSONL carrier; only `/schema_version = 1` is currently grounded.

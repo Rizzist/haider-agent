@@ -11,7 +11,9 @@
 
 use std::ffi::OsString;
 use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,9 +26,11 @@ use crate::acp::antigravity::select_oauth_personal_method;
 use crate::acp::client::{
     ACP_MAX_PENDING_REQUESTS, ACP_OAUTH_URL_LINE_PREFIX, ACP_OAUTH_URL_REDACTION,
     ACP_STDERR_TAIL_BYTES, ACP_STRIPPED_ENVIRONMENT_NAMES, ACP_STRIPPED_ENVIRONMENT_PREFIXES,
-    AcpChildReap, AcpClientHandler, AcpConnection, AcpError, AcpLaunchSpec,
-    RefusingAcpClientHandler, StderrRing, acp_child_environment,
+    AcpClientHandler, AcpConnection, AcpError, RefusingAcpClientHandler, StderrRing,
+    acp_child_environment,
 };
+#[cfg(unix)]
+use crate::acp::client::{AcpChildReap, AcpLaunchSpec};
 use crate::acp::codec::{FrameError, LineFramer, encode_frame};
 use crate::acp::wire::{
     ACP_PROTOCOL_VERSION, AuthMethod, AuthMethodType, ClientInfo, FsReadTextFileRequest,
@@ -1259,6 +1263,7 @@ async fn usage_update_does_not_produce_a_billing_usage_event() {
 // 12. Real subprocess
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 fn scratch_dir(label: &str) -> std::path::PathBuf {
     static NONCE: AtomicU64 = AtomicU64::new(0);
     let directory = std::env::temp_dir().join(format!(

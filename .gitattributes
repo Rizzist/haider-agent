@@ -9,6 +9,7 @@
 docs/client-contract-v1.md text eol=lf
 docs/client-contract-v1-enum-audit.md text eol=lf
 crates/haider-rpc/src/frame.rs text eol=lf
+crates/haider-daemon/src/worker.rs text eol=lf
 crates/**/tests/fixtures/** text eol=lf
 crates/**/tests/goldens/** text eol=lf
 # Release metadata is rendered and packaged on both Unix and Windows runners.

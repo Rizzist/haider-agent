@@ -1,0 +1,18 @@
+{
+  "isolated_root": "/private/tmp/haider-probe-qa-1om1ljzc",
+  "source": "/private/tmp/haider-probe-qa-yndl_t_m/p",
+  "results": [
+    {
+      "attempt": 1,
+      "constructor_error": null,
+      "wall_seconds": 1.313,
+      "raw_bytes": 14572,
+      "screen_rows_has_placeholder": true,
+      "raw_has_alternate_screen": true,
+      "updated_stripped_raw_has_placeholder": true
+    }
+  ],
+  "cleanup": "no_orphan_daemons pids=43810 stop=stopped_cleanly alive_after=false",
+  "cleanup_status": "PASS",
+  "plain_implementation": "updated ANSI_RE accepting BEL or ST OSC terminators"
+}

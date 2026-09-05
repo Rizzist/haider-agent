@@ -1,0 +1,15 @@
+{
+  "base_commit": "7431f8e6e9500729362cc4eb3cfb2bbc62cf462a",
+  "label": "merged candidate including verifier fixes and session workspace promotion persistence",
+  "profile": "dev opt-level=0 debug=0 incremental=0",
+  "binaries": {
+    "haider": {
+      "bytes": 111582320,
+      "sha256": "1a76e49b82210215f6c0b7e6e852aafac234dae41f9de9980a511d3bd535a3fa"
+    },
+    "haiderd": {
+      "bytes": 201161520,
+      "sha256": "3e4ffe7dfd3e225af8f6f0fca42c535192904e7df8e31e76247087413463ce1c"
+    }
+  }
+}

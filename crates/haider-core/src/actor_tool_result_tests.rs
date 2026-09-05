@@ -93,6 +93,156 @@ fn local_process_output_keeps_its_existing_model_adapter() {
     );
 }
 
+fn process_envelope(output: &str, exit_code: Option<i32>) -> BoundedResult {
+    result(serde_json::json!({
+        "status": "completed", "effect_id": "effect-durable-only",
+        "command_arg_digest": "blake3:command", "transcript_digest": "blake3:transcript",
+        "output_adapter": "generic", "output": output, "exit_code": exit_code,
+        "process_signal": {"run_id": "run-durable-only", "call_id": "call", "effect_id": "effect"},
+        "limits": {"wall_timeout_ms": 60000, "max_output_bytes": 1048576},
+        "workspace_revision": "blake3:workspace", "artifact": null,
+    }).to_string())
+}
+
+#[test]
+fn process_model_envelope_is_output_and_only_nonzero_exit_with_journal_unchanged() {
+    for (exit, expected) in [
+        (None, "hello\n"),
+        (Some(0), "hello\n"),
+        (Some(7), "hello\n[exit_code=7]"),
+    ] {
+        let durable = process_envelope("hello\n", exit);
+        let before = serde_json::to_vec(&durable).expect("journal bytes");
+        assert_eq!(
+            model_tool_result_preview("process_exec", &durable),
+            (expected.into(), false)
+        );
+        assert_eq!(
+            model_tool_result_preview("exec", &durable),
+            (expected.into(), false)
+        );
+        let replayed = serde_json::from_slice(&before).expect("replay journal");
+        assert_eq!(
+            model_tool_result_preview("process_exec", &replayed),
+            (expected.into(), false)
+        );
+        assert_eq!(
+            model_tool_result_preview("exec", &replayed),
+            (expected.into(), false)
+        );
+        assert_eq!(serde_json::to_vec(&durable).expect("journal bytes"), before);
+        assert!(durable.preview.contains("effect-durable-only"));
+        assert!(durable.preview.contains("run-durable-only"));
+        assert!(durable.preview.contains("limits"));
+    }
+}
+
+#[test]
+fn process_without_exit_code_retains_terminal_failure_diagnosis() {
+    let mut durable = process_envelope("partial output", None);
+    durable.status = ToolResultStatus::Failed;
+    durable.reason = Some("process ended by signal 9".into());
+    assert_eq!(
+        model_tool_result_preview("process_exec", &durable).0,
+        "partial output\nprocess ended by signal 9"
+    );
+}
+
+#[test]
+fn envelope_shaped_command_output_and_file_contents_are_opaque() {
+    let text = process_envelope("do not unwrap this text", Some(9)).preview;
+    let durable = process_envelope(&text, Some(0));
+    assert_eq!(model_tool_result_preview("process_exec", &durable).0, text);
+    let file = result(text.clone());
+    assert_eq!(model_tool_result_preview("fs_read", &file).0, text);
+}
+
+#[test]
+fn filesystem_model_result_drops_receipt_and_preserves_journal_effects() {
+    for tool in ["fs_write", "fs_edit", "fs_path", "write", "edit"] {
+        let mut durable = result(
+            serde_json::json!({
+                "result": "wrote src/lib.rs", "mutation_digest": "blake3:mutation",
+                "workspace_revision": "blake3:workspace", "subject_digest": "blake3:subject",
+                "workspace_mutation": {"run_id": "run-receipt", "effect_id": "effect-receipt"},
+            })
+            .to_string(),
+        );
+        durable.effects.push(ToolFileEffect {
+            kind: ToolFileEffectKind::Write,
+            name: "lib.rs".into(),
+            path: "src/lib.rs".into(),
+            absolute_path: "/workspace/src/lib.rs".into(),
+            bytes: 24,
+        });
+        let bytes = serde_json::to_vec(&durable).expect("journal");
+        assert_eq!(
+            model_tool_result_preview(tool, &durable),
+            ("wrote src/lib.rs".into(), false)
+        );
+        let replayed = serde_json::from_slice(&bytes).expect("replay");
+        assert_eq!(
+            model_tool_result_preview(tool, &replayed).0,
+            "wrote src/lib.rs"
+        );
+        assert_eq!(
+            serde_json::to_vec(&durable).expect("unchanged journal"),
+            bytes
+        );
+        let wire: serde_json::Value = serde_json::from_slice(&bytes).expect("journal JSON");
+        assert_eq!(wire["effects"][0]["path"], "src/lib.rs");
+        assert_eq!(wire["effects"][0]["bytes"], 24);
+    }
+}
+
+#[test]
+fn remote_model_output_keeps_nonzero_exit_and_bounds_after_envelope_removal() {
+    let mut durable = result(
+        serde_json::json!({
+            "remote": true, "untrusted": true, "profile": "machine",
+            "stdout": "x".repeat(12000), "stderr": "diagnostic tail", "exit_code": 4,
+        })
+        .to_string(),
+    );
+    durable.status = ToolResultStatus::Failed;
+    for tool in ["ssh_shell", "process_exec"] {
+        let projection = super::model_tool_result_projection(tool, &durable);
+        assert!(projection.truncated);
+        assert!(projection.preview.len() <= 8192);
+        assert!(
+            projection
+                .preview
+                .ends_with("diagnostic tail\n[exit_code=4]")
+        );
+        assert!(!projection.preview.contains("\"profile\""));
+    }
+}
+
+#[test]
+fn stale_read_digests_and_graph_receipt_fingerprints_stay_journal_only() {
+    let mut stale = result(serde_json::json!({"status":"rejected", "error":{
+        "kind":"stale_read", "message":"re-read before editing", "details":{
+            "current_digest":"blake3:new", "recorded_digest":"blake3:old", "remedy":"re-read before editing"}}}).to_string());
+    stale.status = ToolResultStatus::Rejected;
+    let model = model_tool_result_preview("fs_edit", &stale).0;
+    assert!(model.contains("stale_read") && model.contains("re-read before editing"));
+    assert!(!model.contains("blake3:"));
+    assert!(stale.preview.contains("blake3:new"));
+    let receipt = result(
+        serde_json::json!({"ok":true, "node":"VERIFY", "attempt":1,
+        "graph_id":"graph", "fingerprint":"blake3:receipt", "through_seq":21})
+        .to_string(),
+    );
+    let model: serde_json::Value =
+        serde_json::from_str(&model_tool_result_preview("graph_evidence", &receipt).0)
+            .expect("graph output");
+    assert_eq!(
+        model,
+        serde_json::json!({"ok":true, "node":"VERIFY", "attempt":1, "graph_id":"graph"})
+    );
+    assert!(receipt.preview.contains("fingerprint"));
+}
+
 #[test]
 fn every_bounded_tool_truncation_gets_a_machine_marker_at_the_model_boundary() {
     let mut durable = result("bounded symbol list".into());
@@ -227,13 +377,19 @@ fn process_savings_preview() -> (String, OutputSavings) {
 }
 
 #[test]
-fn typed_process_savings_is_forwarded_once_and_not_wrapped_again() {
+fn typed_process_savings_is_journal_only_and_recosted_for_model_output() {
     let (preview, savings) = process_savings_preview();
     let mut durable = result(preview.clone());
     durable.truncated = true;
     let projection = super::model_tool_result_projection("process_exec", &durable);
-    assert_eq!(projection.preview, preview);
-    assert_eq!(projection.savings, Some(savings));
+    let output: serde_json::Value = serde_json::from_str(&preview).expect("process envelope");
+    assert_eq!(
+        projection.preview,
+        output["output"].as_str().expect("output")
+    );
+    let projected_savings = projection.savings.expect("journal output accounting");
+    assert!(projected_savings.output_bytes < savings.output_bytes);
+    assert_savings_disclosures_unchanged(&savings, &projected_savings);
     assert_eq!(durable.preview, preview, "durable input remains untouched");
 }
 
@@ -253,11 +409,14 @@ fn declared_process_footer_changes_only_cost_and_preserves_omission_disclosures(
     durable.declare_truncation(ToolTruncation::from_bytes(&[b'x'; 5_000], 0));
     let projection = super::model_tool_result_projection("process_exec", &durable);
     let typed_savings = projection.savings.expect("declared process accounting");
-    assert!(typed_savings.output_bytes > legacy_savings.output_bytes);
+    assert!(typed_savings.output_bytes < legacy_savings.output_bytes);
     assert_savings_disclosures_unchanged(&legacy_savings, &typed_savings);
     assert_eq!(
         projection.preview,
-        expected_declared_preview(&preview, durable.truncation.as_ref().expect("provenance"))
+        expected_declared_preview(
+            serde_json::from_str::<serde_json::Value>(&preview).expect("process envelope")["output"]
+                .as_str().expect("output"),
+            durable.truncation.as_ref().expect("provenance"))
     );
     assert_eq!(durable.payload_text(), preview);
 }

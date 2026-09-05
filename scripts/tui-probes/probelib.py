@@ -33,7 +33,11 @@ import fcntl
 
 # SGR runs / cursor moves / OSC sequences — stripped for TEXT checks;
 # color checks read the raw bytes (the pty-probe-cursor convention).
-ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+# OSC may end with BEL or ST (ESC followed by backslash). Stopping only
+# at BEL swallows visible paint after an ST-terminated attach notification.
+ANSI_RE = re.compile(
+    rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL
+)
 
 
 def plain(chunk):

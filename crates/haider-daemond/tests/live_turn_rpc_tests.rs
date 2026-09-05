@@ -226,6 +226,15 @@ fn fake_dependencies(script: Vec<FakeStep>) -> (DaemonDependencies, Arc<FakeProv
     fake_dependencies_for_provider(script, "fake")
 }
 
+// Input lifecycle fixtures declare the capability they exercise across restarts.
+fn request_input_dependencies(script: Vec<FakeStep>) -> (DaemonDependencies, Arc<FakeProvider>) {
+    let (dependencies, fake) = fake_dependencies(script);
+    (
+        dependencies.with_tool_exposure(Some(vec!["request_input".into()])),
+        fake,
+    )
+}
+
 fn fake_dependencies_for_provider(
     script: Vec<FakeStep>,
     provider_name: &str,
@@ -3672,7 +3681,7 @@ async fn scenario_6_request_input_round_trip_uses_second_control_attachment() {
         root.path().join("store"),
         root.path().join("runtime"),
     );
-    let (dependencies, fake) = fake_dependencies(vec![
+    let (dependencies, fake) = request_input_dependencies(vec![
         FakeStep::EmitRequestInput {
             call_id: "choose-1".into(),
             kind: FakeInputKind::Choice,
@@ -3810,7 +3819,7 @@ async fn scenario_7_two_menu_answers_race_and_only_first_commit_wins() {
         root.path().join("store"),
         root.path().join("runtime"),
     );
-    let (dependencies, fake) = fake_dependencies(vec![
+    let (dependencies, fake) = request_input_dependencies(vec![
         FakeStep::EmitRequestInput {
             call_id: "race-1".into(),
             kind: FakeInputKind::Choice,
@@ -5519,6 +5528,7 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
     assert_eq!(
         names,
         [
+            "list_tools",
             "request_input",
             // D4/E2 (v0.0.925): the actor-owned plan surface and the
             // plan-gated loom_register sit with request_input —
@@ -6050,7 +6060,7 @@ async fn revoked_credential_checkpoint_terminalizes_menu_and_reaches_ready() {
         root.path().join("store"),
         root.path().join("runtime"),
     );
-    let (first_dependencies, fake) = fake_dependencies(vec![
+    let (first_dependencies, fake) = request_input_dependencies(vec![
         FakeStep::EmitRequestInput {
             call_id: "revoked-choice".into(),
             kind: FakeInputKind::Choice,
@@ -6105,7 +6115,8 @@ async fn revoked_credential_checkpoint_terminalizes_menu_and_reaches_ready() {
     let dependencies = DaemonDependencies {
         provider_factory: ProviderFactoryConfig::injected(Arc::new(RevokedCredentialFactory)),
         ..DaemonDependencies::default()
-    };
+    }
+    .with_tool_exposure(Some(vec!["request_input".into()]));
     let second_task = ready_with_dependencies(&config, dependencies).await;
     second_task.shutdown_handle().request("fixture inspected");
     second_task.join().await.expect("daemon joins");
@@ -6151,7 +6162,7 @@ async fn checkpoint_then_later_queued_recovery_reaches_ready_without_starting_qu
         root.path().join("store"),
         root.path().join("runtime"),
     );
-    let (first_dependencies, first_fake) = fake_dependencies(vec![
+    let (first_dependencies, first_fake) = request_input_dependencies(vec![
         FakeStep::EmitRequestInput {
             call_id: "mixed-choice".into(),
             kind: FakeInputKind::Choice,
@@ -6216,7 +6227,7 @@ async fn checkpoint_then_later_queued_recovery_reaches_ready_without_starting_qu
     drop(client);
     first_task.crash().await;
 
-    let (second_dependencies, second_fake) = fake_dependencies(vec![FakeStep::Hang]);
+    let (second_dependencies, second_fake) = request_input_dependencies(vec![FakeStep::Hang]);
     let second_task = ready_with_dependencies(&config, second_dependencies).await;
     assert!(
         second_fake.requests().is_empty(),
@@ -6275,7 +6286,7 @@ async fn scenario_10_restart_replays_request_input_without_reexecuting_prior_req
         root.path().join("store"),
         root.path().join("runtime"),
     );
-    let (dependencies, fake) = fake_dependencies(vec![
+    let (dependencies, fake) = request_input_dependencies(vec![
         FakeStep::EmitRequestInput {
             call_id: "restart-choice".into(),
             kind: FakeInputKind::Choice,
@@ -9802,7 +9813,7 @@ async fn graceful_drain_parks_a_request_input_checkpoint_for_recovery() {
         root.path().join("store"),
         root.path().join("runtime"),
     );
-    let (dependencies, fake) = fake_dependencies(vec![
+    let (dependencies, fake) = request_input_dependencies(vec![
         FakeStep::EmitRequestInput {
             call_id: "park-choice".into(),
             kind: FakeInputKind::Choice,

@@ -885,6 +885,18 @@ async fn run_provider_budget_case_inner(
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    // A scripted delegation budget case explicitly requests that feature;
+    // ordinary budget cases keep the production default coding surface.
+    let tool_factory: Arc<dyn crate::worker::TurnToolFactory> = if script
+        .iter()
+        .any(|step| matches!(step, FakeStep::EmitToolCall { name, .. } if name == "spawn_subagent"))
+    {
+        crate::worker::DaemonDependencies::default()
+            .with_tool_exposure(Some(vec!["spawn_subagent".into()]))
+            .tool_factory
+    } else {
+        Arc::new(BrokerToolFactory)
+    };
     let provider = Arc::new(if native_pdf.is_some() {
         FakeProvider::new(script).with_pdf_documents_native()
     } else {
@@ -897,7 +909,7 @@ async fn run_provider_budget_case_inner(
             provider_factory: Arc::new(FakeBudgetProviderFactory {
                 provider: Arc::clone(&provider),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory,
             delegation: Some(crate::delegation::DelegationHandle::new(hub.clone())),
             web_search: None,
         },
@@ -1772,7 +1784,10 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
             provider_factory: Arc::new(FakeBudgetProviderFactory {
                 provider: Arc::clone(&provider),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            // This retirement case includes a delegated child by design.
+            tool_factory: crate::worker::DaemonDependencies::default()
+                .with_tool_exposure(Some(vec!["spawn_subagent".into()]))
+                .tool_factory,
             delegation: Some(crate::delegation::DelegationHandle::new(hub.clone())),
             web_search: None,
         },

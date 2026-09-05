@@ -1,0 +1,35 @@
+{
+  "isolated_root": "/private/tmp/haider-probe-qa-42pz7o28",
+  "source": "/private/tmp/haider-probe-qa-yndl_t_m/p",
+  "results": [
+    {
+      "attempt": 1,
+      "constructor_error": "RuntimeError: TUI session attach expected=message_composer actual=absent session=session-c0cc2d30469e355a6b90f3a59bda7478",
+      "wall_seconds": 25.738,
+      "raw_bytes": 13827,
+      "old_stripped_raw_has_placeholder": false,
+      "screen_rows_has_placeholder": true,
+      "raw_has_alternate_screen": true
+    },
+    {
+      "attempt": 2,
+      "constructor_error": "RuntimeError: TUI session attach expected=message_composer actual=absent session=session-c0cc2d30469e355a6b90f3a59bda7478",
+      "wall_seconds": 25.67,
+      "raw_bytes": 13827,
+      "old_stripped_raw_has_placeholder": false,
+      "screen_rows_has_placeholder": true,
+      "raw_has_alternate_screen": true
+    },
+    {
+      "attempt": 3,
+      "constructor_error": "RuntimeError: TUI session attach expected=message_composer actual=absent session=session-c0cc2d30469e355a6b90f3a59bda7478",
+      "wall_seconds": 25.742,
+      "raw_bytes": 13850,
+      "old_stripped_raw_has_placeholder": false,
+      "screen_rows_has_placeholder": true,
+      "raw_has_alternate_screen": true
+    }
+  ],
+  "cleanup": "no_orphan_daemons pids=32332 stop=stopped_cleanly alive_after=false",
+  "cleanup_status": "PASS"
+}

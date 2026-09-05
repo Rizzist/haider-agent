@@ -1,0 +1,20 @@
+{
+  "started_unix": 1788598872.810236,
+  "max_wait_seconds": 600,
+  "required_load_below": 3.0,
+  "samples": [
+    {
+      "unix": 1788598872.810236,
+      "load_1m": 5.60888671875
+    },
+    {
+      "unix": 1788598942.519974,
+      "load_1m": 3.20849609375
+    },
+    {
+      "unix": 1788598972.522377,
+      "load_1m": 2.85498046875
+    }
+  ],
+  "outcome": "eligible"
+}

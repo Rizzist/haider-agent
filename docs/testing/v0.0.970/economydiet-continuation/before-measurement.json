@@ -1,0 +1,213 @@
+{
+  "combined_stable_prefix_bytes": 16698,
+  "completion": "terminal-without-effect",
+  "context_token_curve": [
+    14766,
+    38933,
+    50873,
+    57960,
+    59958,
+    61853,
+    64277,
+    66694
+  ],
+  "context_token_curve_slope": 4584.666666666666,
+  "default_tool_names": [
+    "request_input",
+    "plan",
+    "loom_register",
+    "todo_write",
+    "graph_evidence",
+    "fs_read",
+    "fs_glob",
+    "fs_search",
+    "fs_write",
+    "fs_edit",
+    "write",
+    "edit",
+    "fs_path",
+    "process_exec",
+    "spawn_subagent",
+    "message_subagent",
+    "task_output",
+    "task_kill",
+    "web_fetch",
+    "computer",
+    "monitor",
+    "list_models",
+    "peer_list",
+    "peer_send",
+    "ssh_list",
+    "ssh_shell"
+  ],
+  "effects_verified": false,
+  "independent_effect_evidence": {
+    "all_verified": true,
+    "available": true,
+    "checks": {
+      "captured_edit_content_sha256_matches": true,
+      "captured_edit_path_matches": true,
+      "captured_read_path_matches": true,
+      "correlated_model_readback_sha256_matches": true,
+      "external_output_sha256_matches": true,
+      "output_absent_before": true,
+      "workspace_receipt_changed": true
+    },
+    "label": "independent captured-call/model-readback/filesystem join; does not replace AHRB completion or waste metrics"
+  },
+  "independent_side_framing_note": "system/tools side counts each include their own JSON object framing; combined frames once",
+  "manual_bytes": 5162,
+  "model_turns": 8,
+  "per_turn_fixed_overhead_tokens": 14222,
+  "policy_bytes": 725,
+  "python_unicode_version": "16.0.0",
+  "reference_tokenizer": {
+    "encoding": "o200k_base-style",
+    "version": "ahrb-o200k-base-style-bpe-v1",
+    "vocabulary_entries": 272,
+    "vocabulary_sha256": "bca069c1ed9a057d9adfd579bcaefeac940a799d27a7fd427eb83eac778fc826"
+  },
+  "report_sha256": "4174495b928255510caf2ae4cc00c2048cc9ad54fea478b0ad1099fc3007a35c",
+  "schema": "haider.economydiet.measure.v1",
+  "stable_combined_sha256": "d5c6d3cbfe97a1931602ae2d72f88d5a47eeb920a9de7dc1c8e368ff3af0766c",
+  "stable_system_sha256": "f96e6614a1b17983185550c3d65594b963b433f50f2b6e5144c5d7381b974e87",
+  "stable_tools_sha256": "d7386d527a0bf31a3b19e12564be0f9e17fa160a141cea14925f8cfaf83f9728",
+  "system_content_bytes": 5887,
+  "system_envelope_bytes": 5984,
+  "system_identical_every_request": true,
+  "system_side_tokens": 5481,
+  "task": "ahrb-harness-economy-mvp-v1",
+  "tokenizer_crosscheck": "all primary request counts and exact-prefix total match AHRB",
+  "tool_envelope_bytes": 10715,
+  "tool_result_content_bytes_per_result": 1280.5882352941176,
+  "tool_result_content_bytes_total": 21770,
+  "tool_result_envelope_overhead_bytes_per_result": 1099.3529411764705,
+  "tool_result_envelope_overhead_bytes_total": 18689,
+  "tool_result_envelopes": [
+    {
+      "call_id": "economy-bootstrap-a",
+      "content_bytes": 946,
+      "envelope_overhead_bytes": 815,
+      "output_bytes": 131,
+      "wire_message_bytes": 1076
+    },
+    {
+      "call_id": "economy-bootstrap-b",
+      "content_bytes": 946,
+      "envelope_overhead_bytes": 815,
+      "output_bytes": 131,
+      "wire_message_bytes": 1076
+    },
+    {
+      "call_id": "economy-bootstrap-c",
+      "content_bytes": 946,
+      "envelope_overhead_bytes": 815,
+      "output_bytes": 131,
+      "wire_message_bytes": 1076
+    },
+    {
+      "call_id": "economy-bootstrap-d",
+      "content_bytes": 946,
+      "envelope_overhead_bytes": 815,
+      "output_bytes": 131,
+      "wire_message_bytes": 1076
+    },
+    {
+      "call_id": "economy-bootstrap-e",
+      "content_bytes": 947,
+      "envelope_overhead_bytes": 816,
+      "output_bytes": 131,
+      "wire_message_bytes": 1077
+    },
+    {
+      "call_id": "economy-context-a",
+      "content_bytes": 1525,
+      "envelope_overhead_bytes": 1298,
+      "output_bytes": 227,
+      "wire_message_bytes": 1710
+    },
+    {
+      "call_id": "economy-context-b",
+      "content_bytes": 1524,
+      "envelope_overhead_bytes": 1298,
+      "output_bytes": 226,
+      "wire_message_bytes": 1709
+    },
+    {
+      "call_id": "economy-context-c",
+      "content_bytes": 1525,
+      "envelope_overhead_bytes": 1298,
+      "output_bytes": 227,
+      "wire_message_bytes": 1710
+    },
+    {
+      "call_id": "economy-context-d",
+      "content_bytes": 1523,
+      "envelope_overhead_bytes": 1298,
+      "output_bytes": 225,
+      "wire_message_bytes": 1708
+    },
+    {
+      "call_id": "economy-context-e",
+      "content_bytes": 1526,
+      "envelope_overhead_bytes": 1300,
+      "output_bytes": 226,
+      "wire_message_bytes": 1711
+    },
+    {
+      "call_id": "economy-probe-a",
+      "content_bytes": 1525,
+      "envelope_overhead_bytes": 1298,
+      "output_bytes": 227,
+      "wire_message_bytes": 1708
+    },
+    {
+      "call_id": "economy-probe-c",
+      "content_bytes": 1525,
+      "envelope_overhead_bytes": 1298,
+      "output_bytes": 227,
+      "wire_message_bytes": 1708
+    },
+    {
+      "call_id": "economy-probe-e",
+      "content_bytes": 1524,
+      "envelope_overhead_bytes": 1298,
+      "output_bytes": 226,
+      "wire_message_bytes": 1707
+    },
+    {
+      "call_id": "economy-edit",
+      "content_bytes": 946,
+      "envelope_overhead_bytes": 811,
+      "output_bytes": 135,
+      "wire_message_bytes": 1069
+    },
+    {
+      "call_id": "economy-verify",
+      "content_bytes": 841,
+      "envelope_overhead_bytes": 812,
+      "output_bytes": 29,
+      "wire_message_bytes": 966
+    },
+    {
+      "call_id": "economy-iterate-one",
+      "content_bytes": 1528,
+      "envelope_overhead_bytes": 1302,
+      "output_bytes": 226,
+      "wire_message_bytes": 1715
+    },
+    {
+      "call_id": "economy-iterate-two",
+      "content_bytes": 1527,
+      "envelope_overhead_bytes": 1302,
+      "output_bytes": 225,
+      "wire_message_bytes": 1714
+    }
+  ],
+  "tool_schema_array_bytes": 10705,
+  "tool_side_tokens": 8741,
+  "tools_identical_every_request": true,
+  "unique_tool_results": 17,
+  "wasted_tool_call_count": 0,
+  "wasted_tool_call_label": "wasted tool calls (deterministic task-proven only)"
+}
