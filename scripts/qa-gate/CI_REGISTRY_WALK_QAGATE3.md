@@ -304,3 +304,61 @@ Scope: the uncommitted `session_provider.rs` initializer correction and two
 - #92 checked — build-capable commands record disk headroom; the gate retains failures and missing-executable diagnostics in its raw log.
 - #93 checked: none — no class #93 is defined in the supplied registry.
 - #94-#96 checked: none — no deadline, negotiated-connection wait, provider durability boundary, or performance policy changed. Windows/Linux behavior is by inspection; gates here run on macOS arm64.
+
+## journalview continuation, merged through 38359fd3
+
+- #1-#18 checked: no dependency, platform seam, lint exemption, or harness weakening introduced. New tests exercise durable ownership and actual item lifecycles.
+- #19/#20 checked: formatting, whitespace, exact Clippy test targets, and authoritative `xtask test-count --update`; merged upstream 4910 -> lane 4925.
+- #21/#41/#42/#44/#54/#64/#67/#71/#72/#74/#81/#92 checked: full ENV LAW, two build jobs, disk checks before each build with the 700 MiB floor, fresh siblings, `HAIDER_TEST_SIBLINGS_PREBUILT=1`, and haiderd 200566368 bytes. Four test threads avoid the observed shared-host scheduling failure without changing any test deadline or assertion.
+- #22/#23 checked: request/Finish metadata is content-free; narrative remains the already captured provider output and is not added to diagnostic logs.
+- #24-#28 checked: no credential flow, process-global configuration, release workflow, or public error policy changed.
+- #29/#30 fixed: correlation is stamped before durable append and publication; recovery uses the exact source item, not a later Side request. Named journal/live/JSON/replay regressions retain raw byte equality. Rebind-error cleanup closes recovered items before the terminal under the original request.
+- #31/#32 checked: no new provider transport or dispatch path; failed admission cannot claim an unsent request.
+- #33 fixed: additive schema ledger, legacy compatibility, typed atomic compaction announcement and matching-overlay validation. Replay normalizes zero fields inside raw envelopes.
+- #34-#40 checked: shared arena assembles normalized rounds without duplicate completion snapshots; JSONL retains no duplicate summary. Actual Finish reasons are preserved; incomplete summary text remains incomplete.
+- #43/#45-#53 checked: no new timing threshold or platform gate. Existing golden sequences are regenerated, not hand-merged; primary and empty-summary terminal markers retain the frozen Started/Completed lifecycle.
+- #55-#63/#65/#66 checked: no archive, STT, rendering, or platform error-mapping change. Incoming casstream/providerrebind changes remain preserved.
+- #68-#70/#75/#76 checked: no new external wait or discovery/cleanup policy. Private summarizer output remains prompt-omitted and excluded from final response selection.
+- #73 checked: all 70 changed/new JSONL golden lines reviewed; `provider_request_no_budget.json` is byte-identical to merged upstream and the measured instruct-pipe pin stays 13552 -> 13552 bytes.
+- #77-#80 checked: no unsafe added and no release, dependency, or benchmark claim. Existing unsafe and QA self-checks retained.
+- #82-#84 checked: both protected OAuth files remain unchanged; the initial timing failure and unchanged isolation/daemon reruns are retained as evidence.
+- #85-#91 checked: full workspace test with `--no-fail-fast` and Clippy `--workspace --tests -- -D warnings`; both content merges preserve the incoming sides, and the final ref guard rejects a stale-tree verdict. Git merge recording remains for the orchestrator because the Git directory is read-only.
+- #93: no class #93 is defined in the supplied registry.
+- #94/#95 checked: no new product deadline or negotiated-connection wait; the regression adds no timeout.
+- #96 checked: no latency or benchmark-score claim. macOS execution only; Linux/Windows behavior is by inspection. AHRB scoped credit remains undeclared until its owner maps the checker units; the supplied TOML declares announced-only support.
+
+## ceilingdecl continuation 3, prestarted merge through 368f093c
+
+- #1-#18/#22-#28 checked: no dependency, platform seam, credential flow, lint exemption, or test weakening. The actor resolution retains both module declarations; production control flow is otherwise unchanged.
+- #19/#20 checked: formatting passes after formatting the new content-free handshake diagnostic; `cargo run -q -p xtask -- test-count --update` resolves the 4929/4925 baseline conflict to 4944. Saved source backups live outside the workspace so the counter sees no duplicate Rust tests.
+- #21/#41/#42/#44/#54/#64/#67/#71/#72/#74/#81/#92 checked: full ENV LAW, two build jobs, four test threads, disk checks before every build-capable command with the 700 MiB floor, fresh `haider`/`haiderd` siblings, and `HAIDER_TEST_SIBLINGS_PREBUILT=1`. The built `haiderd` is 200942448 bytes, above 10 MiB.
+- #29-#40 checked: narrative capture/recovery, actual provider Finish metadata, normalized provider rounds, scoped compaction announcements, durable request ownership, cap receipts, and typed end reasons from both merge sides remain present. `hard_request_bound_preserves_typed_terminal_before_provider_rebind_refresh` executes and passes with two provider opens, two refreshes, and one typed cap terminal with workspace receipts/progress.
+- #43/#45-#63/#65/#66/#68-#70/#75-#80/#82-#84 checked: no timeout, platform gate, transport, publication boundary, archive, STT, rendering, cleanup policy, unsafe, release, or protected OAuth source changes. No failure or ignore is suppressed.
+- #73/#89-#91 checked: all three conflicted JSONL fixtures are regenerated through their existing test update modes, never hand-merged. Every line is compared to both saved merge sides: 76 changed/new lines versus ceilingdecl HEAD (17 one-shot, 17 text, 42 tool), only narrative correlation/Finish fields, four atomic terminal pairs, and derived sequence/item IDs; against incoming journalview, only three workspace receipt pairs and derived sequence/item/workspace-revision references. Provider-request fixture is also regenerated and remains byte-identical. Measured instruct-pipe pin stays 13552 -> 13552 bytes (full prefix 19736, registered 29, advertised 26, native descriptions 690); handshake stays 115 -> 115 features. The initial exact handshake selector matched zero tests; the corrected selector executes one passing test and prints 115.
+- #85-#88 checked: the orchestrator already started the real merge; only working-tree files are edited, with no git metadata command or commit. Exact full-gate commands and their final exits/totals are recorded in `docs/testing/v0.0.970/ceilingdecl-continuation3/`; the orchestrator owns merge recording.
+- #93: no class #93 is defined in the supplied registry.
+- #94/#95 checked: no product deadline or negotiated-connection wait is added or changed.
+- #96 checked: no performance claim. Execution is macOS only; Linux/Windows behavior is by inspection. Historical lens citations are treated as drifted: for example, the old actor budget-projection location near 3549 is now near 3988; cap-before-refresh and narrative ownership are audited by construct in the merged source.
+- Final gates: `cargo test -q --workspace --no-fail-fast` exits 0 (5350 top-level passes, 0 failures, 13 pre-existing ignores; 12 additional nested subprocess probes pass), and `cargo clippy --workspace --tests -- -D warnings` exits 0. Final `xtask test-count` confirms 4944/4944. Independent verifier: findings=1 real=1 noise=0, the corrected empty handshake selector; final code/golden/gate verdict SHIP.
+
+## v0.0.970 customprov delta walk, merged through 7431f8e6
+
+- #1-#8 checked — provider declares the already-locked workspace `unicode-width` dependency; no version, platform backend, packaging or global credential-store format changes.
+- #9-#18 checked — shared ID-display validation is used at both discovery boundaries; no production lint suppressions, test ignores or assertion weakening are added. The new integration module follows the repository convention permitting descriptive `expect` calls in tests.
+- #19/#20 checked — final merged source passes rustfmt and whitespace checks; `xtask test-count --update` and verification report 4944 → 4966 (+22 source test markers).
+- #21/#41/#42/#44/#54/#64/#67/#71/#72/#74/#81/#92 checked — full ENV LAW, two build jobs, four test threads, disk check before each build-capable command and 700 MiB stop floor; fresh siblings precede `HAIDER_TEST_SIBLINGS_PREBUILT=1`. `haiderd` is 201235968 bytes. Fake loopback HTTP and UDS tests use hermetic profiles; no installed daemon or host credentials are reused.
+- #22-#28 fixed/checked — API keys are staged through the existing same-user local vault path and masked in the card; probe commands/replies carry opaque references only. Secret reflection, control characters and zero-width model IDs cannot enter the picker/cache; errors use existing redaction. OAuth sources are untouched.
+- #29/#30 checked — discovery is a correlated read-only accounts-worker job. Cancel, disconnect and a new attempt retire stale replies; probe changes no profile, account, cache or durable receipt.
+- #31/#32 checked — the existing compatible catalog transport retains fixed-origin resolution/pinning, proxy-off, redirect refusal and bounded bodies. Saved-key probes enforce claimed-origin repoint guards before network access; explicitly confirmed manual inventory avoids redundant availability GETs.
+- #33-#40 checked — additive `provider.models_probe` has a feature gate, exhaustive wire pair and Control/local credential checks. Final configure keeps existing CAS/receipt replay and persists the full confirmed inventory for `list_models`; no-op configure retains established cache behavior.
+- #43/#45-#53 checked — create/edit field order, discovery/default selection, typed fallback and one-Enter confirmation are pinned. New picker/fallback goldens cover 80/118/160 columns. All twelve existing accounts/calendar goldens are byte-identical; per-file reasons are in `customprov.md`. Long fallback reasons retain a visible manual-entry instruction at 80 columns.
+- #55-#63/#65/#66/#68-#70/#75/#76 checked — contract table and advertised feature count move together (132 → 133 methods; 115 → 116 features). No archive, STT, source discovery, platform error mapping, cleanup or publication boundary changes.
+- #73/#89-#91 checked — real upstream merge completed in an isolated writable checkout because original Git metadata is read-only; both journalview and ceilingdecl are preserved. Incoming provider-request and JSONL goldens are regenerated through existing tooling, never hand-merged. Instruct-pipe pin stays 13552 → 13552. Tested workspace source and isolated lane source are compared byte-for-byte before commit delivery.
+- #77-#80/#82-#84 checked — no unsafe, deadline exemption, release or performance claim; protected `oauth.rs` and `oauth_tests.rs` remain unchanged. Initial gate expectation failures are retained in evidence and repaired directly.
+- #85-#88 checked — final gate runs `cargo test -q --workspace --no-fail-fast` and `cargo clippy --workspace --tests -- -D warnings` on merged source; exact exits and totals are recorded in `docs/testing/v0.0.970/customprov.md`.
+- #93: no class #93 is defined in the supplied registry.
+- #94/#95 checked — no new product deadline or blocking connection wait; the existing worker/driver reply loop continues servicing negotiated connection traffic.
+- #96 checked — no measured latency claim. Tests execute on macOS arm64; Windows/Linux behavior is by inspection. All supplied turnperf and turnperf2 evidence was read and used to bound scope.
+
+- Final customprov gates: workspace exit 0 (5372 top-level passes +12 nested probes, 0 failures, 13 existing ignores); strict Clippy with tests exit 0; test baseline 4966/4966. Gated-source hashes remain unchanged after both commands.
+- Independent customprov verifier: findings=6 real=5 noise=1; all five real findings fixed, stale completion-wording report rejected as noise; code verdict SHIP. Original Git ref is read-only; the writable isolated lane checkout and bundle carry the commit.

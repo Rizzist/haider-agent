@@ -135,12 +135,40 @@ fn normalize(mut payload: serde_json::Value) -> serde_json::Value {
 
 fn assert_items_closed_before_terminal(events: &[RawEnvelope]) {
     let mut open = HashSet::<ItemId>::new();
+    let mut finished_requests = HashSet::new();
     let mut saw_terminal = false;
     for event in events {
         assert!(!saw_terminal, "an envelope followed the terminal run state");
         match typed(event) {
             EventPayload::Item(ItemEvent::Started { item_id, .. }) => {
                 assert!(open.insert(item_id), "an item started twice");
+            }
+            EventPayload::Item(ItemEvent::Completed {
+                item_id,
+                item: TurnItem::Extension { kind, data },
+            }) if kind == "provider_round_terminal_v1" => {
+                assert!(open.remove(&item_id), "completed item was not open");
+                // Terminal metadata obeys the same paired item lifecycle and
+                // additionally pins one exact Finish per physical request.
+                let request: haider_protocol::cache::ProviderRequestAttemptV1 =
+                    serde_json::from_value(event.payload["provider_request"].clone())
+                        .expect("terminal fact request correlation");
+                assert!(request.coordinates_valid());
+                assert_eq!(request.session_id, event.session_id);
+                assert_eq!(Some(&request.run_id), event.run_id.as_ref());
+                assert!(finished_requests.insert((
+                    request.run_id,
+                    request.turn_ordinal,
+                    request.request_ordinal,
+                )));
+                let reason: FinishReason =
+                    serde_json::from_value(event.payload["provider_finish_reason"].clone())
+                        .expect("terminal fact Finish");
+                assert_eq!(data, serde_json::json!({"reason": reason}));
+                assert_eq!(
+                    serde_json::to_value(event.render).expect("render"),
+                    serde_json::json!({"ui": false, "durable": true, "prompt": "omit"})
+                );
             }
             EventPayload::Item(ItemEvent::Completed { item_id, .. }) => {
                 assert!(open.remove(&item_id), "completed item was not open");
@@ -476,7 +504,7 @@ async fn full_turn_commits_exact_projected_sequence() {
         .iter()
         .find_map(|event| event.run_id.as_ref())
         .expect("turn event run id");
-    let expected = vec![
+    let mut expected = vec![
         serde_json::json!({"type":"run_state","state":"queued"}),
         serde_json::json!({
             "type":"user_message",
@@ -782,8 +810,32 @@ async fn full_turn_commits_exact_projected_sequence() {
                 }
             }
         }),
-        serde_json::json!({"type":"run_state","state":"done"}),
+        serde_json::json!({
+            "type":"item", "event":"started", "item_id":"<item>",
+            "item":{"item":"extension", "kind":"provider_round_terminal_v1",
+                "data":{"reason":"tool_use"}}
+        }),
+        serde_json::json!({
+            "type":"item", "event":"completed", "item_id":"<item>",
+            "item":{"item":"extension", "kind":"provider_round_terminal_v1",
+                "data":{"reason":"tool_use"}},
+            "provider_finish_reason":"tool_use"
+        }),
+        serde_json::json!({"type":"run_state","state":"done", "provider_finish_reason":"tool_use"}),
     ];
+    let correlation = serde_json::json!({
+        "session_id": SESSION,
+        "run_id": correlation_run_id,
+        "turn_ordinal": 1,
+        "request_ordinal": 1,
+        "request_kind": "primary"
+    });
+    // This one-request fixture activates correlation at Thinking, after its
+    // three acceptance events. Compare every additive field without stripping
+    // metadata from the actual stream.
+    for payload in &mut expected[3..] {
+        payload["provider_request"] = correlation.clone();
+    }
     assert_eq!(actual, expected);
     assert!(events.windows(2).all(|pair| pair[1].seq == pair[0].seq + 1));
     assert!(
@@ -5897,9 +5949,10 @@ async fn actor_restarts_do_not_reuse_run_or_item_ids() {
             .iter()
             .any(|id| id.starts_with("run-session-test-24-"))
     );
-    // Each request has a cache diagnostic, visible request-budget status and
-    // assistant item. Six unique IDs prove none are reused across restart.
-    assert_eq!(item_ids.len(), 6);
+    // Each request has a cache diagnostic, request-budget status, assistant
+    // item and paired Finish marker. Eight unique IDs prove none are reused
+    // across restart, including the newly allocated terminal markers.
+    assert_eq!(item_ids.len(), 8);
     assert!(
         item_ids
             .iter()
@@ -5929,15 +5982,16 @@ async fn memory_store_allocates_and_reads_committed_sequences() {
         StoreHandle::latest_seq(store.as_ref(), &SessionId::new(SESSION))
             .await
             .expect("latest"),
-        // The budget status adds Started + Completed to the former 8 events.
-        10
+        // Budget status adds Started + Completed to the former 8 events;
+        // the paired provider Finish marker adds two more: 8 + 2 + 2.
+        12
     );
     let tail = StoreHandle::read(store.as_ref(), &SessionId::new(SESSION), 3, 10)
         .await
         .expect("read");
     assert_eq!(
         tail.iter().map(|event| event.seq).collect::<Vec<_>>(),
-        vec![4, 5, 6, 7, 8, 9, 10]
+        vec![4, 5, 6, 7, 8, 9, 10, 11, 12]
     );
 }
 

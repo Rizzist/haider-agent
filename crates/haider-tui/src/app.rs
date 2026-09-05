@@ -747,6 +747,14 @@ pub enum CustomPhase {
     /// Typing name/origin (also the retype state after a failure — the
     /// error line renders above the still-editable fields).
     Editing { error: Option<String> },
+    /// Read-only catalog discovery is in flight; the key is already staged.
+    Probing,
+    /// Choose one discovered id, or type an id when discovery failed.
+    Choosing {
+        models: Vec<String>,
+        selection: usize,
+        error: Option<String>,
+    },
     /// `provider.configure` is in flight.
     Submitting,
 }
@@ -762,9 +770,8 @@ pub struct CustomProviderCard {
     pub name: String,
     /// OpenAI-compatible base URL (`http://127.0.0.1:8000/v1`).
     pub origin: String,
-    /// The served model id, free-form (`llama3.1:8b`) — an enabled create
-    /// REQUIRES a model inventory and a default (daemon law, W5g-5), so
-    /// the card asks for the one the server actually serves.
+    /// The selected model id, or a manually entered fallback. An enabled
+    /// create requires an inventory and a default (daemon law, W5g-5).
     pub model: String,
     pub focus: CustomField,
     /// Caret offset in the focused field, counted in Unicode scalar values
@@ -786,9 +793,8 @@ pub struct CustomProviderCard {
     /// API family selected for a discovery-backed generic provider. Presets
     /// and enterprise cards retain their fixed family.
     pub family: haider_rpc::ProviderApiFamilyWire,
-    /// `true` only for the user-authored custom-server card. Unlike legacy
-    /// presets, this shape leaves the inventory empty so the daemon probes
-    /// the server and publishes its live `/v1/models` list.
+    /// User-authored create or custom-provider edit. Probe the server before
+    /// model selection; preserve the returned inventory on final configure.
     pub discover_models: bool,
     /// Raw API key while the custom card is being edited. This is the same
     /// zeroize-on-drop boundary as [`LoginCard`]: Debug is redacted, render
@@ -829,9 +835,12 @@ impl CustomProviderCard {
     /// reaches a mutation operation; create-mode prefills remain ordinary
     /// editable values.
     pub(crate) fn can_edit_field(&self, field: CustomField) -> bool {
+        if let CustomPhase::Choosing { models, .. } = &self.phase {
+            return field == CustomField::Model && models.is_empty();
+        }
         matches!(self.phase, CustomPhase::Editing { .. })
             && self.has_field(field)
-            && !(self.edit && field == CustomField::Name)
+            && !(self.edit && matches!(field, CustomField::Name | CustomField::ApiFamily))
     }
 
     fn field_value(&self, field: CustomField) -> Option<&str> {
@@ -985,9 +994,9 @@ impl CustomProviderCard {
         const GENERIC_DISCOVERY_KEYED: &[CustomField] = &[
             CustomField::Name,
             CustomField::Origin,
+            CustomField::Key,
             CustomField::Auth,
             CustomField::ApiFamily,
-            CustomField::Key,
         ];
         const GENERIC_DISCOVERY_KEYLESS: &[CustomField] = &[
             CustomField::Name,
@@ -1010,6 +1019,11 @@ impl CustomProviderCard {
             (CustomCardKind::Vertex, _, _, _) => VERTEX,
             (CustomCardKind::Azure, true, _, _) => GENERIC_CREATE,
         };
+        let fields: Vec<_> = fields
+            .iter()
+            .copied()
+            .filter(|field| self.can_edit_field(*field))
+            .collect();
         let current = fields
             .iter()
             .position(|field| *field == self.focus)
@@ -3919,6 +3933,15 @@ pub enum AppRequest {
     /// a late reply for this attempt must not configure anything.
     CustomProviderRetired {
         attempt: u64,
+    },
+    /// Discover before creating anything. Raw keys only cross vault.stage.
+    CustomModelsProbe {
+        attempt: u64,
+        name: String,
+        origin: String,
+        keyless: bool,
+        family: haider_rpc::ProviderApiFamilyWire,
+        secret: Option<haider_rpc::SecretWire>,
     },
     /// Create or edit a custom OpenAI-compatible provider
     /// (`provider.configure`, W5g-4/W10b). The provider name is the stable
@@ -11858,23 +11881,41 @@ impl AppModel {
             .clone()
             .or_else(|| summary.models.first().cloned())
             .unwrap_or_default();
-        let cursor = model.chars().count();
+        let discover_models =
+            summary.inventory_authority == haider_rpc::ModelInventoryAuthorityWire::Advisory;
+        let cursor = if discover_models {
+            summary
+                .endpoint
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .count()
+        } else {
+            model.chars().count()
+        };
         self.custom_add = Some(CustomProviderCard {
             name: summary.provider.clone(),
             origin: summary.endpoint.clone().unwrap_or_default(),
             model,
-            focus: CustomField::Model,
+            focus: if discover_models {
+                CustomField::Origin
+            } else {
+                CustomField::Model
+            },
             cursor,
             phase: CustomPhase::Editing { error: None },
             attempt: self.custom_attempt_seq,
             edit: true,
             keyless: summary.auth_methods.is_empty(),
             family: summary.api_family,
-            discover_models: false,
+            discover_models,
             secret: zeroize::Zeroizing::new(String::new()),
             kind: CustomCardKind::Generic,
             extra: String::new(),
         });
+        if discover_models && !self.mode.fabricates_locally() {
+            self.requests.push(AppRequest::AccountsRefresh);
+        }
         self.dirty = true;
     }
 
@@ -12157,7 +12198,10 @@ impl AppModel {
         let Some(card) = self.custom_add.as_mut() else {
             return;
         };
-        if !matches!(card.phase, CustomPhase::Editing { .. }) {
+        if !matches!(
+            card.phase,
+            CustomPhase::Editing { .. } | CustomPhase::Choosing { .. }
+        ) {
             return;
         }
         if !account_alias_ok(&card.name) {
@@ -12170,20 +12214,51 @@ impl AppModel {
             self.dirty = true;
             return;
         }
+        if card.discover_models && matches!(card.phase, CustomPhase::Editing { .. }) {
+            // Enter walks the required fields; auth/family remain optional
+            // choices reachable by Tab after the key.
+            if card.focus == CustomField::Name {
+                card.focus_end(CustomField::Origin);
+                self.dirty = true;
+                return;
+            }
+            if !card.keyless && card.focus == CustomField::Origin {
+                card.focus_end(CustomField::Key);
+                self.dirty = true;
+                return;
+            }
+            let can_reuse_key = card.edit
+                && self.accounts.rows.iter().any(|row| {
+                    row.provider == card.name
+                        && row.selected
+                        && row.method == haider_protocol::credential::AuthMethod::ApiKey
+                });
+            if !card.keyless && !can_reuse_key && card.secret.is_empty() {
+                card.focus_end(CustomField::Key);
+                self.dirty = true;
+                return;
+            }
+            let secret = (!card.keyless && !card.secret.is_empty()).then(|| card.take_key());
+            card.phase = CustomPhase::Probing;
+            self.requests.push(AppRequest::CustomModelsProbe {
+                attempt: card.attempt,
+                name: card.name.clone(),
+                origin: card.origin.trim().to_owned(),
+                keyless: card.keyless,
+                family: card.family,
+                secret,
+            });
+            self.dirty = true;
+            return;
+        }
         // An ENABLED create requires a model inventory and a default
         // (daemon law) — the card refuses to submit what would bounce.
         // Bedrock/vertex carry the profile's SEEDED inventory instead of a
         // typed model.
-        if !card.discover_models
-            && matches!(card.kind, CustomCardKind::Generic | CustomCardKind::Azure)
+        if matches!(card.kind, CustomCardKind::Generic | CustomCardKind::Azure)
             && card.model.trim().is_empty()
         {
             card.focus_end(CustomField::Model);
-            self.dirty = true;
-            return;
-        }
-        if card.discover_models && !card.keyless && card.secret.is_empty() {
-            card.focus_end(CustomField::Key);
             self.dirty = true;
             return;
         }
@@ -12193,7 +12268,17 @@ impl AppModel {
         let keyless = card.keyless;
         let (origin, family, models, default_model) = match card.kind {
             CustomCardKind::Generic => {
-                (card.origin.trim().to_owned(), card.family, Vec::new(), None)
+                let models = match &card.phase {
+                    CustomPhase::Choosing { models, .. } => models.clone(),
+                    _ => Vec::new(),
+                };
+                let default_model = (!models.is_empty()).then(|| model.clone());
+                (
+                    card.origin.trim().to_owned(),
+                    card.family,
+                    models,
+                    default_model,
+                )
             }
             CustomCardKind::Azure => (
                 azure_v1_base(card.origin.trim()),
@@ -12229,7 +12314,7 @@ impl AppModel {
         let Some(card) = self.custom_add.as_mut() else {
             return;
         };
-        let secret = (card.discover_models && !card.keyless).then(|| card.take_key());
+        let secret = None; // The probe's staged reference stays in the live driver.
         card.phase = CustomPhase::Submitting;
         self.requests.push(AppRequest::ProviderConfigure {
             attempt,
@@ -12243,6 +12328,51 @@ impl AppModel {
             default_model,
             expected_revision,
         });
+        self.dirty = true;
+    }
+
+    pub fn custom_models_probed(
+        &mut self,
+        attempt: u64,
+        models: Vec<String>,
+        default_model: Option<String>,
+        error: Option<String>,
+    ) {
+        let Some(card) = self
+            .custom_add
+            .as_mut()
+            .filter(|card| card.attempt == attempt && matches!(card.phase, CustomPhase::Probing))
+        else {
+            return;
+        };
+        let selection = models
+            .iter()
+            .position(|id| *id == card.model)
+            .or_else(|| {
+                default_model
+                    .as_ref()
+                    .and_then(|default| models.iter().position(|id| id == default))
+            })
+            .unwrap_or(0);
+        if let Some(model) = models.get(selection) {
+            card.model = model.clone();
+        }
+        let error = if models.is_empty() {
+            Some(format!(
+                "{} — type the model id",
+                error
+                    .as_deref()
+                    .unwrap_or("server returned an empty model list")
+            ))
+        } else {
+            None
+        };
+        card.phase = CustomPhase::Choosing {
+            models,
+            selection,
+            error,
+        };
+        card.focus_end(CustomField::Model);
         self.dirty = true;
     }
 
@@ -12275,7 +12405,7 @@ impl AppModel {
         if card.keyless {
             self.providers.message = Some(if card.discover_models {
                 format!(
-                    "✓ provider {} created · no auth · live models discovered",
+                    "✓ provider {} configured · no auth · model ready",
                     card.name
                 )
             } else {
@@ -12303,12 +12433,17 @@ impl AppModel {
         }
         if credential_staged {
             self.accounts.message = Some(format!(
-                "✓ provider {} configured · registering its account and live models…",
+                "✓ provider {} configured · registering its account…",
                 card.name
             ));
             let login_attempt = self.open_staged_login_card(&card.name, card.name.clone());
             self.dirty = true;
             return Some(login_attempt);
+        }
+        if card.edit && card.discover_models {
+            self.providers.message = Some(format!("✓ provider {} updated", card.name));
+            self.dirty = true;
+            return None;
         }
         // G4b: every keyed kind chains into the masked key card; the copy
         // names what the "key" actually is on each surface.
@@ -12346,6 +12481,36 @@ impl AppModel {
                 _ => {}
             }
             return;
+        }
+        if let Some(card) = self.custom_add.as_mut()
+            && let CustomPhase::Choosing {
+                models, selection, ..
+            } = &mut card.phase
+        {
+            match code {
+                KeyCode::Up | KeyCode::Down if !models.is_empty() => {
+                    *selection = if code == KeyCode::Up {
+                        selection.checked_sub(1).unwrap_or(models.len() - 1)
+                    } else {
+                        (*selection + 1) % models.len()
+                    };
+                    card.model = models[*selection].clone();
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
+                    self.requests.push(AppRequest::CustomProviderRetired {
+                        attempt: card.attempt,
+                    });
+                    self.custom_attempt_seq += 1;
+                    card.attempt = self.custom_attempt_seq;
+                    card.phase = CustomPhase::Editing { error: None };
+                    card.focus_end(CustomField::Origin);
+                    self.dirty = true;
+                    return;
+                }
+                _ => {}
+            }
         }
         match code {
             KeyCode::Esc => self.cancel_custom_add(),

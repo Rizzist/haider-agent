@@ -1,0 +1,6 @@
+
+running 1 test
+test oauth::tests::device_flow_runner_continues_and_honors_slow_down_interval ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1059 filtered out; finished in 0.37s
+

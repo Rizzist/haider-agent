@@ -88,6 +88,9 @@ use haider_protocol::cache::{
 use haider_protocol::context::{
     ContextCompactionTier, ContextFootprint, ContextFootprintTruth, OutputSavings,
 };
+use haider_protocol::context_compaction::{
+    CompactionItemUnit, ContextCompactionEventPayload, ContextCompactionV1,
+};
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase, FileFreshness,
     WorkspaceMutation,
@@ -614,6 +617,104 @@ impl std::fmt::Debug for DaemonContextCompactor {
 }
 
 impl DaemonContextCompactor {
+    async fn append_compaction_narrative(
+        &self,
+        correlation: &ProviderRequestAttemptV1,
+        mut events: Vec<ItemEvent>,
+        finish: Option<FinishReason>,
+        terminal_cause: Option<&str>,
+    ) -> Result<(), HaiderError> {
+        if events.is_empty() {
+            if finish.is_none() && terminal_cause.is_none() {
+                return Ok(());
+            }
+            // A request can terminate before emitting any narrative (for
+            // example rejected cache replay or immediate EOF). Preserve its
+            // actual cause without inventing an empty assistant message.
+            let item_id = ItemId::new(format!(
+                "compaction-request-terminal-{}-{}",
+                correlation.turn_ordinal, correlation.request_ordinal
+            ));
+            let item = TurnItem::Extension {
+                kind: "provider_round_terminal_v1".into(),
+                data: serde_json::json!({}),
+            };
+            events.push(ItemEvent::Started {
+                item_id: item_id.clone(),
+                item: item.clone(),
+            });
+            events.push(ItemEvent::Completed { item_id, item });
+        }
+        let correlation_value = serde_json::to_value(correlation)
+            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+        let mut envelopes = events
+            .into_iter()
+            .map(|event| {
+                let mut envelope = supervisor_envelope(
+                    &self.store,
+                    &self.device_id,
+                    self.branch_id.clone(),
+                    Some(correlation.run_id.clone()),
+                    self.event_ids.next(),
+                    EventPayload::Item(event),
+                )?;
+                envelope.agent_id = self.agent_id.clone();
+                envelope.render.ui = false;
+                envelope
+                    .payload
+                    .insert_metadata("provider_request", correlation_value.clone());
+                envelope
+                    .payload
+                    .insert_metadata("provider_purpose", serde_json::json!("compaction"));
+                if let Some(reason) = finish {
+                    envelope
+                        .payload
+                        .insert_metadata("provider_finish_reason", serde_json::json!(reason));
+                }
+                if let Some(cause) = terminal_cause {
+                    envelope
+                        .payload
+                        .insert_metadata("provider_terminal_cause", serde_json::json!(cause));
+                }
+                Ok(envelope)
+            })
+            .collect::<Result<Vec<_>, HaiderError>>()?;
+        // The raw attachment stream is released by the hub only after this
+        // append commits, including for attempts that later fail/cancel.
+        StoreHandle::append(&self.store, &mut envelopes).await?;
+        Ok(())
+    }
+
+    async fn close_failed_compaction_narrative(
+        &self,
+        correlation: &ProviderRequestAttemptV1,
+        text: (&ItemId, &str),
+        reasoning: (&ItemId, &str),
+        interruption: &ErrorPresentation,
+        terminal_cause: &str,
+    ) -> Result<(), HaiderError> {
+        let mut events = Vec::new();
+        if !reasoning.1.is_empty() {
+            events.push(ItemEvent::Completed {
+                item_id: reasoning.0.clone(),
+                item: TurnItem::Reasoning {
+                    summary: reasoning.1.into(),
+                },
+            });
+        }
+        if !text.1.is_empty() {
+            events.push(ItemEvent::Completed {
+                item_id: text.0.clone(),
+                item: TurnItem::IncompleteAgentMessage {
+                    text: text.1.into(),
+                    interruption: interruption.clone(),
+                },
+            });
+        }
+        self.append_compaction_narrative(correlation, events, None, Some(terminal_cause))
+            .await
+    }
+
     fn auxiliary_request_recorder(
         &self,
         run_id: &RunId,
@@ -1393,6 +1494,11 @@ impl ContextCompactor for DaemonContextCompactor {
             latest_compaction_summary_end,
             economy_before,
         } = request;
+        // Count the active projection before replacement-summary generation
+        // expands it back to original journal fragments. The latter would
+        // count already summarized history as if it had been dropped again.
+        let dropped_item_count = covered_messages.len() as u64;
+        let retained_suffix_size = retained_messages.len() as u64;
         let replaced_projection_tokens = estimate_provider_request_bytes_div_four(
             &covered_messages,
             &self.post_compaction_system_prompt,
@@ -1649,6 +1755,13 @@ impl ContextCompactor for DaemonContextCompactor {
             // burning it as an uncached full-price fallback both lies about
             // the failure class and pays for the lie.
             Err(error) if error.retryable => {
+                self.append_compaction_narrative(
+                    &replay_correlation,
+                    Vec::new(),
+                    None,
+                    Some("open_error"),
+                )
+                .await?;
                 self.release_budget_request(run_id, false, &mut budget_permit)
                     .await?;
                 return Err(HaiderError::new(
@@ -1659,11 +1772,25 @@ impl ContextCompactor for DaemonContextCompactor {
                 .into());
             }
             Err(error) if error.presentation.subcode.as_str() == "provider-timeout" => {
+                self.append_compaction_narrative(
+                    &replay_correlation,
+                    Vec::new(),
+                    None,
+                    Some("open_error"),
+                )
+                .await?;
                 self.release_budget_request(run_id, false, &mut budget_permit)
                     .await?;
                 return Err(self.provider_open_error(run_id, error).await.into());
             }
             Err(_) => {
+                self.append_compaction_narrative(
+                    &replay_correlation,
+                    Vec::new(),
+                    None,
+                    Some("open_error"),
+                )
+                .await?;
                 self.release_budget_request(run_id, false, &mut budget_permit)
                     .await?;
                 // Some provider families cannot replay durable multimodal
@@ -1789,6 +1916,13 @@ impl ContextCompactor for DaemonContextCompactor {
                 {
                     Ok(stream) => stream,
                     Err(error) => {
+                        self.append_compaction_narrative(
+                            &fallback_correlation,
+                            Vec::new(),
+                            None,
+                            Some("open_error"),
+                        )
+                        .await?;
                         self.release_budget_request(run_id, false, &mut budget_permit)
                             .await?;
                         return Err(self.provider_open_error(run_id, error).await.into());
@@ -1804,6 +1938,22 @@ impl ContextCompactor for DaemonContextCompactor {
             }
         };
         let mut summary = String::new();
+        let mut reasoning_summary = String::new();
+        let correlation = ProviderRequestAttemptV1 {
+            session_id: self.store.session_id().clone(),
+            run_id: run_id.clone(),
+            turn_ordinal: self.turn_ordinal,
+            request_ordinal,
+            request_kind: ProviderRequestKind::Side,
+        };
+        let text_item_id = ItemId::new(format!(
+            "compaction-text-{}-{request_ordinal}",
+            intent.operation_id
+        ));
+        let reasoning_item_id = ItemId::new(format!(
+            "compaction-reasoning-{}-{request_ordinal}",
+            intent.operation_id
+        ));
         let mut finished = false;
         let mut reported_usage: Option<Usage> = None;
         loop {
@@ -1815,6 +1965,14 @@ impl ContextCompactor for DaemonContextCompactor {
             {
                 Ok(Some(Ok(item))) => item,
                 Ok(Some(Err(error))) | Err(error) => {
+                    self.close_failed_compaction_narrative(
+                        &correlation,
+                        (&text_item_id, &summary),
+                        (&reasoning_item_id, &reasoning_summary),
+                        &error.presentation,
+                        "stream_error",
+                    )
+                    .await?;
                     self.release_budget_request(
                         run_id,
                         reported_usage.is_some(),
@@ -1823,14 +1981,63 @@ impl ContextCompactor for DaemonContextCompactor {
                     .await?;
                     return Err(self.provider_stream_error(run_id, error).await.into());
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    let error = HaiderError::new(
+                        ErrorCode::ProviderError,
+                        "context summarization stream ended without a finish",
+                        false,
+                    );
+                    self.close_failed_compaction_narrative(
+                        &correlation,
+                        (&text_item_id, &summary),
+                        (&reasoning_item_id, &reasoning_summary),
+                        &presentation_for_haider_error(&error),
+                        "stream_eof",
+                    )
+                    .await?;
+                    break;
+                }
             };
             match item {
                 StreamEvent::NetworkUnavailable | StreamEvent::NetworkRestored => {}
                 StreamEvent::TextDelta { text } => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let mut events = Vec::new();
+                    if summary.is_empty() {
+                        events.push(ItemEvent::Started {
+                            item_id: text_item_id.clone(),
+                            item: TurnItem::AgentMessage { text: "".into() },
+                        });
+                    }
+                    events.push(ItemEvent::Delta {
+                        item_id: text_item_id.clone(),
+                        delta: ItemDelta::Text { text: text.clone() },
+                    });
+                    self.append_compaction_narrative(&correlation, events, None, None)
+                        .await?;
                     text.visit_strs(|segment| summary.push_str(segment));
                 }
-                StreamEvent::ReasoningDelta { .. } => {}
+                StreamEvent::ReasoningDelta { text } => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let mut events = Vec::new();
+                    if reasoning_summary.is_empty() {
+                        events.push(ItemEvent::Started {
+                            item_id: reasoning_item_id.clone(),
+                            item: TurnItem::Reasoning { summary: "".into() },
+                        });
+                    }
+                    events.push(ItemEvent::Delta {
+                        item_id: reasoning_item_id.clone(),
+                        delta: ItemDelta::Reasoning { text: text.clone() },
+                    });
+                    self.append_compaction_narrative(&correlation, events, None, None)
+                        .await?;
+                    text.visit_strs(|segment| reasoning_summary.push_str(segment));
+                }
                 StreamEvent::UsageUpdate(mut usage) => {
                     let mut scope = self.usage_scope.clone();
                     scope.request_kind = UsageRequestKind::Compaction;
@@ -1894,29 +2101,69 @@ impl ContextCompactor for DaemonContextCompactor {
                             vec![EventPayload::Usage(usage.clone())],
                         )
                         .await?;
-                        guard.after_usage(run_id).await?;
+                        if let Err(error) = guard.after_usage(run_id).await {
+                            let (cause, interruption) = match &error {
+                                ProviderBudgetGuardError::Cancelled => {
+                                    ("cancelled", ErrorPresentation::default())
+                                }
+                                ProviderBudgetGuardError::Failure(error) => {
+                                    ("request_guard_error", presentation_for_haider_error(error))
+                                }
+                            };
+                            self.close_failed_compaction_narrative(
+                                &correlation,
+                                (&text_item_id, &summary),
+                                (&reasoning_item_id, &reasoning_summary),
+                                &interruption,
+                                cause,
+                            )
+                            .await?;
+                            return Err(error.into());
+                        }
                     }
                     reported_usage = Some(usage);
                 }
-                StreamEvent::Finish {
-                    reason: FinishReason::EndTurn,
-                } => {
-                    self.release_budget_request(
-                        run_id,
-                        reported_usage.is_some(),
-                        &mut budget_permit,
-                    )
-                    .await?;
-                    finished = true;
-                    break;
-                }
                 StreamEvent::Finish { reason } => {
+                    let mut events = Vec::new();
+                    if !reasoning_summary.is_empty() {
+                        events.push(ItemEvent::Completed {
+                            item_id: reasoning_item_id.clone(),
+                            item: TurnItem::Reasoning {
+                                summary: reasoning_summary.clone().into(),
+                            },
+                        });
+                    }
+                    if !summary.is_empty() {
+                        events.push(ItemEvent::Completed {
+                            item_id: text_item_id.clone(),
+                            item: if reason == FinishReason::EndTurn {
+                                TurnItem::AgentMessage {
+                                    text: summary.clone().into(),
+                                }
+                            } else {
+                                TurnItem::IncompleteAgentMessage {
+                                    text: summary.clone().into(),
+                                    interruption: presentation_for_haider_error(&HaiderError::new(
+                                        ErrorCode::ProviderError,
+                                        format!("context summarization ended with {reason:?}"),
+                                        false,
+                                    )),
+                                }
+                            },
+                        });
+                    }
+                    self.append_compaction_narrative(&correlation, events, Some(reason), None)
+                        .await?;
                     self.release_budget_request(
                         run_id,
                         reported_usage.is_some(),
                         &mut budget_permit,
                     )
                     .await?;
+                    if reason == FinishReason::EndTurn {
+                        finished = true;
+                        break;
+                    }
                     return Err(HaiderError::new(
                         ErrorCode::ProviderError,
                         format!("context summarization ended with {reason:?}"),
@@ -1935,6 +2182,19 @@ impl ContextCompactor for DaemonContextCompactor {
                 | StreamEvent::ServerToolResult { .. }
                 | StreamEvent::WebSources { .. } => {}
                 StreamEvent::RefusalDelta { .. } => {
+                    let error = HaiderError::new(
+                        ErrorCode::ProviderError,
+                        "context summarization was refused by the provider",
+                        false,
+                    );
+                    self.close_failed_compaction_narrative(
+                        &correlation,
+                        (&text_item_id, &summary),
+                        (&reasoning_item_id, &reasoning_summary),
+                        &presentation_for_haider_error(&error),
+                        "refusal",
+                    )
+                    .await?;
                     self.release_budget_request(
                         run_id,
                         reported_usage.is_some(),
@@ -1951,6 +2211,19 @@ impl ContextCompactor for DaemonContextCompactor {
                 StreamEvent::ToolCallStart { .. }
                 | StreamEvent::ToolCallArgsDelta { .. }
                 | StreamEvent::ToolCallEnd { .. } => {
+                    let error = HaiderError::new(
+                        ErrorCode::ProviderError,
+                        "context summarization returned tool calls",
+                        false,
+                    );
+                    self.close_failed_compaction_narrative(
+                        &correlation,
+                        (&text_item_id, &summary),
+                        (&reasoning_item_id, &reasoning_summary),
+                        &presentation_for_haider_error(&error),
+                        "unsupported_tool_call",
+                    )
+                    .await?;
                     self.release_budget_request(
                         run_id,
                         reported_usage.is_some(),
@@ -2018,7 +2291,7 @@ impl ContextCompactor for DaemonContextCompactor {
             kind: NodeKind::Compaction {
                 covers_from: intent.covers_from.clone(),
                 covers_to: intent.covers_to.clone(),
-                summary_artifact: artifact,
+                summary_artifact: artifact.clone(),
                 tokens_before,
                 tokens_after,
                 resume_cause: intent.resume_cause.clone(),
@@ -2128,6 +2401,46 @@ impl ContextCompactor for DaemonContextCompactor {
                 Ok(envelope)
             })
             .collect::<Result<Vec<_>, HaiderError>>()?;
+        let correlation_value = serde_json::to_value(&correlation)
+            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+        // Announce only the committed overlay, before its resumed/terminal
+        // state. Provider narrative was already committed incrementally.
+        let terminal = envelopes.pop().ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "compaction batch has no terminal",
+                false,
+            )
+        })?;
+        let announcement = ContextCompactionEventPayload::ContextCompaction(ContextCompactionV1 {
+            turn_ordinal: self.turn_ordinal,
+            request_ordinal,
+            operation_id: intent.operation_id.clone(),
+            covers_from: intent.covers_from.clone(),
+            covers_to: intent.covers_to.clone(),
+            dropped_item_count,
+            dropped_item_unit: CompactionItemUnit::ProviderMessage,
+            retained_suffix_size,
+            retained_suffix_unit: CompactionItemUnit::ProviderMessage,
+            summary_artifact: artifact,
+            resume_cause: intent.resume_cause.clone(),
+        })
+        .to_payload_value()
+        .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+        let mut announcement = supervisor_raw_envelope(
+            &self.store,
+            &self.device_id,
+            self.branch_id.clone(),
+            Some(run_id.clone()),
+            self.event_ids.next(),
+            announcement,
+        );
+        announcement.agent_id = self.agent_id.clone();
+        announcement
+            .payload
+            .insert_metadata("provider_request", correlation_value);
+        envelopes.push(announcement);
+        envelopes.push(terminal);
         self.store
             .append_at_head(expected_head, &mut envelopes)
             .await?;
@@ -8596,6 +8909,9 @@ async fn start_turn(
     config.interaction_policy =
         haider_core::InteractionResolutionPolicy::new(metadata.interaction_mode);
     config.provider_requests_already_made = provider_requests_already_made;
+    config.ceiling_workspace = headless
+        .as_ref()
+        .map(|_| std::path::PathBuf::from(&metadata.cwd));
     config.provider_request_ordinal_already_made = provider_request_ordinal_already_made;
     config.turn_ordinal = accepted.turn_ordinal;
     config.provider_request_ordinals = Some(request_ordinals.clone());

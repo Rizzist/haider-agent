@@ -29,6 +29,7 @@ pub mod observe;
 pub mod peer;
 pub mod permission;
 pub mod profile;
+pub mod provider_rounds;
 pub mod session_fork;
 pub mod shell;
 pub mod shell_registry;

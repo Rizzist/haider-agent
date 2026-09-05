@@ -18,6 +18,7 @@ use haider_client::{
     run_headless_with_session_config_event_mode_and_interrupts, stop_headless_run,
 };
 use haider_protocol::EventPayload;
+use haider_protocol::ceiling::{INTERNAL_CEILING_EXIT_CODE, InternalCeilingTerminalV1};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorCode;
 use haider_protocol::headless::{HeadlessRunEventPayload, RunBudgetV1, durable_run_terminal_v1};
@@ -1135,6 +1136,8 @@ struct DurableReplayEquivalence {
 
 #[derive(Serialize)]
 struct DurableReplayDocument<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal: Option<InternalCeilingTerminalV1>,
     schema: &'static str,
     mode: &'static str,
     session_id: &'a str,
@@ -1145,6 +1148,7 @@ struct DurableReplayDocument<'a> {
     model: &'a str,
     response: Option<haider_protocol::reply::ReplyText>,
     events: &'a HeadlessRunEvents,
+    provider_rounds: Vec<haider_client::provider_rounds::ProviderRound>,
     integrity: DurableReplayIntegrity,
     equivalence: DurableReplayEquivalence,
 }
@@ -1203,6 +1207,7 @@ fn write_durable_replay(
     let mut sequences_strictly_increasing = true;
     let mut run_id_stable = true;
     let mut terminal_sequences = Vec::new();
+    let mut terminal = None;
     events.try_for_each(|envelope| {
         first_seq.get_or_insert(envelope.seq);
         if previous_seq.is_some_and(|previous| envelope.seq <= previous) {
@@ -1213,6 +1218,10 @@ fn write_durable_replay(
         run_id_stable &= envelope.run_id.as_ref() == Some(&status.run_id);
         if is_typed_terminal_run_state(&envelope) {
             terminal_sequences.push(envelope.seq);
+            terminal = InternalCeilingTerminalV1::from_payload(&envelope.payload).filter(|block| {
+                block.continuation.session_id == status.session_id
+                    && block.continuation.run_id == status.run_id
+            });
         }
         Ok(())
     })?;
@@ -1237,6 +1246,7 @@ fn write_durable_replay(
     }
     let response = replay_final_text(events)?;
     let document = DurableReplayDocument {
+        terminal,
         schema: "haider.run.replay.v1",
         mode: "durable_journal",
         session_id: status.session_id.as_str(),
@@ -1247,6 +1257,7 @@ fn write_durable_replay(
         model: &status.spec.model,
         response,
         events,
+        provider_rounds: haider_client::provider_rounds::provider_rounds(events)?,
         integrity: DurableReplayIntegrity {
             event_count: events.len(),
             first_seq,
@@ -1513,6 +1524,14 @@ fn replay_final_text(
 ) -> io::Result<Option<haider_protocol::reply::ReplyText>> {
     let mut final_text = None;
     events.try_for_each(|envelope| {
+        if envelope
+            .payload
+            .get("provider_purpose")
+            .and_then(serde_json::Value::as_str)
+            == Some("compaction")
+        {
+            return Ok(());
+        }
         let payload = envelope.payload;
         if let Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
             item:
@@ -1666,7 +1685,7 @@ fn write_error_json(
     let outcome = failure.outcome;
     let retryable = failure.retryable;
     let line = format!(
-        "{{\"schema\":\"haider.run.v1\",\"session_id\":null,\"run_id\":null,\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome}\",\"response\":null,\"events\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{retryable}}}}}"
+        "{{\"schema\":\"haider.run.v1\",\"session_id\":null,\"run_id\":null,\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome}\",\"response\":null,\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{retryable}}}}}"
     );
     output.write_all(line.as_bytes())?;
     output.write_all(b"\n")?;
@@ -1948,6 +1967,37 @@ pub(crate) fn write_final(
                 response.write_to(&mut output)?;
                 output.write_all(b"\n")?;
             }
+            if let Some(terminal) = &result.terminal {
+                let workspace = match terminal.workspace_state {
+                    Some(haider_protocol::ceiling::WorkspaceStateV1::Mutated) => "mutated",
+                    Some(haider_protocol::ceiling::WorkspaceStateV1::Untouched) => "untouched",
+                    None => "unavailable (see receipt error)",
+                };
+                writeln!(
+                    output,
+                    "Partial progress: {} files written, {} files deleted, {} tool calls; requests {}/{} (soft {}), last request {}; workspace {}; resume {}",
+                    terminal
+                        .partial_progress
+                        .files_written
+                        .as_ref()
+                        .map_or("unavailable".to_owned(), |files| files.len().to_string()),
+                    terminal
+                        .partial_progress
+                        .files_deleted
+                        .as_ref()
+                        .map_or("unavailable".to_owned(), |files| files.len().to_string()),
+                    terminal.partial_progress.tool_calls,
+                    terminal.ceilings.used,
+                    terminal.ceilings.hard,
+                    terminal.ceilings.soft,
+                    terminal.partial_progress.last_request_ordinal,
+                    workspace,
+                    terminal.continuation.run_id
+                )?;
+                if let Some(error) = &terminal.workspace_receipt_error {
+                    writeln!(output, "Workspace receipt: {}", error.detail)?;
+                }
+            }
         }
         RunOutput::Json => {
             write_run_json(&mut output, result)?;
@@ -1981,6 +2031,8 @@ struct RunJsonError<'a> {
 
 #[derive(Serialize)]
 struct RunJson<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal: &'a Option<InternalCeilingTerminalV1>,
     schema: &'static str,
     session_id: &'a str,
     run_id: &'a str,
@@ -1990,6 +2042,7 @@ struct RunJson<'a> {
     outcome: HeadlessOutcome,
     response: &'a Option<haider_protocol::reply::ReplyText>,
     events: &'a HeadlessRunEvents,
+    provider_rounds: Vec<haider_client::provider_rounds::ProviderRound>,
     usage: &'a Option<haider_protocol::provider::Usage>,
     budget_exhausted: &'a Option<haider_protocol::headless::RunBudgetExhaustedV1>,
     replay: &'a Option<haider_protocol::headless::ReplayDivergenceV1>,
@@ -2021,6 +2074,7 @@ fn write_run_json(mut output: impl Write, result: &HeadlessRunResult) -> io::Res
     serde_json::to_writer(
         &mut output,
         &RunJson {
+            terminal: &result.terminal,
             schema: "haider.run.v1",
             session_id: result.session_id.as_str(),
             run_id: result.run_id.as_str(),
@@ -2033,6 +2087,7 @@ fn write_run_json(mut output: impl Write, result: &HeadlessRunResult) -> io::Res
             outcome: result.outcome,
             response: &result.response,
             events: &result.events,
+            provider_rounds: haider_client::provider_rounds::provider_rounds(&result.events)?,
             usage: &result.usage,
             budget_exhausted: &result.budget_exhausted,
             replay: &result.replay,
@@ -2072,6 +2127,9 @@ pub(crate) fn exit_code_for_result(result: &HeadlessRunResult) -> u8 {
         HeadlessOutcome::Timeout => EX_TIMEOUT,
         HeadlessOutcome::InputRequired => EX_BLOCKED,
         HeadlessOutcome::Errored => match result.failure.as_ref().map(|failure| &failure.code) {
+            Some(HeadlessFailureCode::Run(ErrorCode::RequestBudgetExceeded)) => {
+                INTERNAL_CEILING_EXIT_CODE
+            }
             Some(HeadlessFailureCode::Run(
                 ErrorCode::ProviderError
                 | ErrorCode::ProviderTimeout
@@ -2082,7 +2140,6 @@ pub(crate) fn exit_code_for_result(result: &HeadlessRunResult) -> u8 {
                 ErrorCode::PermissionDenied
                 | ErrorCode::EffectUnknownOutcome
                 | ErrorCode::BudgetExhausted
-                | ErrorCode::RequestBudgetExceeded
                 | ErrorCode::WorkflowUnfinished,
             ))
             | Some(HeadlessFailureCode::Blocked(_)) => EX_BLOCKED,
@@ -2292,9 +2349,10 @@ mod tests {
     }
 
     #[test]
-    fn request_budget_exit_is_blocked_and_json_preserves_resume_instruction() {
+    fn request_budget_exit_is_distinct_and_json_preserves_resume_instruction() {
         let message = "request hard cap reached; continue with haider run --resume bound-run";
         let result = HeadlessRunResult {
+            terminal: None,
             session_id: haider_protocol::ids::SessionId::new("budget-session"),
             run_id: RunId::new("bound-run"),
             provider: "fake".into(),
@@ -2316,7 +2374,7 @@ mod tests {
                 presentation: None,
             }),
         };
-        assert_eq!(exit_code_for_result(&result), EX_BLOCKED);
+        assert_eq!(exit_code_for_result(&result), 78);
         let mut json = Vec::new();
         write_final(&mut json, RunOutput::Json, &result).expect("budget JSON");
         let value: serde_json::Value = serde_json::from_slice(&json).expect("JSON");
@@ -2474,6 +2532,29 @@ mod tests {
             "payload": payload,
         }))
         .expect("legacy raw envelope")
+    }
+
+    #[test]
+    fn journalview_replay_private_summary_never_becomes_final_response() {
+        let events = HeadlessRunEvents::from_envelopes(
+            RunId::new("run-legacy"),
+            [
+                legacy_replay_envelope(
+                    1,
+                    serde_json::json!({
+                        "type":"item", "event":"completed", "item_id":"summary",
+                        "item":{"item":"agent_message", "text":"private compaction summary"},
+                        "provider_purpose":"compaction",
+                    }),
+                ),
+                legacy_replay_envelope(
+                    2,
+                    serde_json::json!({"type":"run_state", "state":"cancelled"}),
+                ),
+            ],
+        )
+        .expect("ledger");
+        assert_eq!(replay_final_text(&events).expect("response"), None);
     }
 
     /// Pre-v0.0.970 journals lack the additive terminal projection. Replay

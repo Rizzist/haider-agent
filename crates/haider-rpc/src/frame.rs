@@ -341,6 +341,8 @@ pub const FEATURE_PROVIDER_CONFIGURE_V1: &str = "provider_configure_v1";
 pub const FEATURE_PROVIDER_REMOVE_V1: &str = "provider_remove_v1";
 /// Daemon implements provider-owned model discovery refresh.
 pub const FEATURE_PROVIDER_MODELS_V1: &str = "provider_models_v1";
+/// Daemon supports read-only custom model probes before provider creation.
+pub const FEATURE_PROVIDER_MODELS_PROBE_V1: &str = "provider_models_probe_v1";
 
 /// Headless enumeration of every registered provider and its complete
 /// published model inventory, composed from `provider.list` and
@@ -4089,6 +4091,17 @@ pub enum RequestBody {
     /// authenticated catalog.
     #[serde(rename = "provider.models_refresh")]
     ProviderModelsRefresh { provider: String },
+    /// Read-only custom-provider discovery. A staged key is borrowed without
+    /// consuming it; no provider, receipt, credential, or cache is written.
+    #[serde(rename = "provider.models_probe")]
+    ProviderModelsProbe {
+        provider: String,
+        origin: String,
+        api_family: ProviderApiFamilyWire,
+        keyless: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        probe_vault_reference: Option<String>,
+    },
     /// Creates a custom provider or safely updates mutable fields on an
     /// existing profile. API family is create-only; a custom provider may
     /// switch its auth requirement between `api_key` and `none` in place.
@@ -4500,6 +4513,7 @@ impl RequestBody {
     #[must_use]
     pub const fn additive_shape_feature(&self) -> Option<&'static str> {
         match self {
+            Self::ProviderModelsProbe { .. } => Some(FEATURE_PROVIDER_MODELS_PROBE_V1),
             Self::SessionFork {
                 prompt: Some(_), ..
             } => Some(FEATURE_SESSION_PROMPT_FORK_V1),
@@ -5181,6 +5195,13 @@ pub enum ResponseBody {
     ProviderModelsRefresh {
         provider: ProviderSummaryWire,
         revision: u64,
+    },
+    #[serde(rename = "provider.models_probe")]
+    ProviderModelsProbe {
+        provider: String,
+        models: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_model: Option<String>,
     },
     #[serde(rename = "provider.configure")]
     ProviderConfigure {

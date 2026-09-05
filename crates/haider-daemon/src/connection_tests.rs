@@ -356,10 +356,14 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// provider rows from the legacy fleet shape.
 #[test]
 fn welcome_features_pin_served_management_families() {
+    eprintln!(
+        "handshake pin: served_features={}",
+        welcome_features().len()
+    );
     assert_eq!(
         welcome_features().len(),
-        115,
-        "provider rebind extends the merged 114-feature set"
+        116,
+        "custom-provider model probes extend the merged 115-feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -425,6 +429,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
             haider_rpc::FEATURE_PROVIDER_LOCKDOWN_V1.to_owned(),
             FEATURE_PROVIDER_MODELS_V1.to_owned(),
+            haider_rpc::FEATURE_PROVIDER_MODELS_PROBE_V1.to_owned(),
             FEATURE_PROVIDER_REMOVE_V1.to_owned(),
             haider_rpc::FEATURE_RESIDENT_SESSION_BINDING_V1.to_owned(),
             haider_rpc::FEATURE_RESIDENT_SESSION_BINDING_TOKEN_V1.to_owned(),

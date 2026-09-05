@@ -6140,13 +6140,35 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
         .iter()
         .find(|provider| provider.provider == "custom")
         .expect("custom provider");
-    assert!(
-        custom.models.iter().any(|model| model == "model-a")
-            && custom.models.iter().any(|model| model == "model-b"),
-        "management keeps the injected discovered inventory, not provider.configure literals"
+    assert_eq!(
+        custom.models,
+        vec!["model-a".to_owned()],
+        "management publishes the complete explicitly confirmed custom inventory"
     );
     assert_eq!(custom.default_model.as_deref(), Some("model-a"));
     drop(view);
+    // The committed model-b receipt above must still replay even though
+    // this fresh command proves B was removed from the actual inventory.
+    commands
+        .send(set_default(
+            "removed-custom-default",
+            "removed-custom-default-request",
+            "model-b",
+            3,
+        ))
+        .await
+        .expect("send removed-model selection");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("removed-model deadline")
+            .expect("removed-model response"),
+        WireFrame::Response {
+            body: ResponseBody::Error { code, .. },
+            ..
+        } if code == ERROR_CODE_INVALID_ARGUMENT
+    ));
+    assert_eq!(management.read().expect("stable management").revision, 3);
     actor.shutdown().await;
 }
 
@@ -13843,4 +13865,488 @@ async fn every_attempt_construction_path_keeps_an_agent_owned_account_off_the_va
         1,
         "exactly the credential-bearing lane read"
     );
+}
+
+struct CustomprovFixtureDiscovery {
+    reflected_key: bool,
+    fail_with_key: bool,
+    invisible_separator: Option<char>,
+}
+
+#[async_trait::async_trait]
+impl ProviderModelDiscoverer for CustomprovFixtureDiscovery {
+    async fn discover(
+        &self,
+        source: CatalogSource,
+        access_token: Option<&str>,
+        etag: Option<&str>,
+    ) -> Result<DiscoveredCatalog, CatalogError> {
+        assert!(matches!(source, CatalogSource::OpenAiCompatible { .. }));
+        assert_eq!(access_token, Some("CUSTOMPROV_STAGED_KEY"));
+        assert_eq!(etag, None, "a probe cannot consume the durable cache");
+        if self.fail_with_key {
+            return Err(CatalogError::Transport {
+                reason: "fixture reflected CUSTOMPROV_STAGED_KEY".into(),
+            });
+        }
+        let reflected_id = self.invisible_separator.map_or_else(
+            || "CUSTOMPROV_STAGED_KEY".to_owned(),
+            |separator| format!("CUSTOMPROV_{separator}STAGED_KEY"),
+        );
+        let ids = if self.reflected_key {
+            vec![reflected_id.as_str()]
+        } else {
+            vec!["z-server-default", "a-other-model"]
+        };
+        Ok(DiscoveredCatalog {
+            models: customprov_model_rows(&ids),
+            etag: Some("probe-only-etag".into()),
+        })
+    }
+}
+
+fn customprov_model_rows(ids: &[&str]) -> Vec<haider_provider::DiscoveredModel> {
+    ids.iter()
+        .map(|slug| haider_provider::DiscoveredModel {
+            slug: (*slug).to_owned(),
+            display_name: (*slug).to_owned(),
+            context_window: None,
+            description: None,
+            default_effort: None,
+            supported_efforts: Vec::new(),
+            visible: true,
+            priority: None,
+            extensions: None,
+        })
+        .collect()
+}
+
+/// Probing runs as a tracked network worker and writes no configuration,
+/// account, vault entry, model cache, or revision. The sole public result is
+/// the discovered picker inventory and the provider's first/default id.
+#[tokio::test]
+async fn customprov_probe_is_read_only_and_never_echoes_a_staged_key() {
+    for (reflected_key, fail_with_key, invisible_separator) in [
+        (false, false, None),
+        (true, false, None),
+        (false, true, None),
+        (true, false, Some('\u{200b}')),
+        (true, false, Some('\u{feff}')),
+    ] {
+        let dir = test_store_dir();
+        let store = open_store(dir.path()).await;
+        let accounts = memory_accounts();
+        let vault = MemoryVault::new();
+        let providers = test_provider_registry();
+        let prior = providers.summaries(&|_| false);
+        let discoverer: Arc<dyn ProviderModelDiscoverer> = Arc::new(CustomprovFixtureDiscovery {
+            reflected_key,
+            fail_with_key,
+            invisible_separator,
+        });
+        let mut tasks = JoinSet::new();
+        let mut routes = HashMap::new();
+        let (sink, mut frames) = channel_sink();
+        begin_provider_models_probe(
+            &accounts,
+            &vault,
+            &providers,
+            &discoverer,
+            &mut tasks,
+            &mut routes,
+            ProviderModelsProbeJob {
+                provider: "customprov-probe".into(),
+                origin: "http://127.0.0.1:18080/v1".into(),
+                api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+                keyless: false,
+                probe_secret: Some(Zeroizing::new(b"CUSTOMPROV_STAGED_KEY".to_vec())),
+                route: LoginRoute {
+                    request_id: RequestId::new("customprov-probe"),
+                    sink,
+                },
+            },
+        );
+        assert_eq!(
+            tasks.len(),
+            1,
+            "network work must not block the account actor"
+        );
+        tasks
+            .join_next()
+            .await
+            .expect("probe task exists")
+            .expect("probe worker completes");
+        let frame = frames.try_recv().expect("probe reply");
+        assert!(!format!("{frame:?}").contains("CUSTOMPROV_STAGED_KEY"));
+        assert!(
+            !serde_json::to_string(&frame)
+                .expect("public probe frame")
+                .contains("CUSTOMPROV_STAGED_KEY")
+        );
+        match frame {
+            WireFrame::Response {
+                body:
+                    ResponseBody::ProviderModelsProbe {
+                        provider,
+                        models,
+                        default_model,
+                    },
+                ..
+            } => {
+                assert!(!reflected_key && !fail_with_key);
+                assert_eq!(provider, "customprov-probe");
+                assert_eq!(models, vec!["z-server-default", "a-other-model"]);
+                assert_eq!(default_model.as_deref(), Some("z-server-default"));
+            }
+            WireFrame::Response {
+                body:
+                    ResponseBody::Error {
+                        data: Some(ErrorData::ProviderProbeFailed { failure, .. }),
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(
+                    failure,
+                    if reflected_key {
+                        ProviderProbeFailureWire::NonOpenAiCompatibleBody
+                    } else {
+                        ProviderProbeFailureWire::Unreachable
+                    }
+                );
+            }
+            other => panic!("unexpected probe reply: {other:?}"),
+        }
+        assert!(
+            frames.try_recv().is_err(),
+            "probe cannot emit account events"
+        );
+        assert!(providers.get("customprov-probe").is_none());
+        assert_eq!(providers.summaries(&|_| false), prior);
+        assert!(accounts.list().is_empty());
+        assert!(vault.list().expect("vault entries").is_empty());
+        assert!(
+            store
+                .provider_models("customprov-probe".into())
+                .await
+                .expect("read probe cache")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .management_revision()
+                .await
+                .expect("management revision"),
+            0
+        );
+        store.close().await.expect("close probe store");
+    }
+}
+
+struct CustomprovCanonicalEndpoint;
+
+#[async_trait::async_trait]
+impl ProviderEndpointValidator for CustomprovCanonicalEndpoint {
+    async fn validate(&self, origin: &str) -> Result<String, HaiderError> {
+        Ok(origin.trim_end_matches('/').to_owned())
+    }
+}
+
+struct CustomprovNoSecondDiscovery;
+
+#[async_trait::async_trait]
+impl ProviderModelDiscoverer for CustomprovNoSecondDiscovery {
+    async fn discover(
+        &self,
+        _: CatalogSource,
+        _: Option<&str>,
+        _: Option<&str>,
+    ) -> Result<DiscoveredCatalog, CatalogError> {
+        panic!("a confirmed picker or manual fallback must not require a second model discovery")
+    }
+}
+
+/// The complete chosen picker list survives create in the durable cache and
+/// modelcat's list_models projection. An edit can also choose a manual id
+/// after a failed probe even when the old endpoint's cached list disagrees.
+#[tokio::test]
+async fn customprov_confirmed_inventory_and_manual_edit_reach_list_models_without_reprobe() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let accounts = memory_accounts();
+    let vault = MemoryVault::new();
+    let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
+    let mut providers = test_provider_registry();
+    for (revision, ids, selected) in [
+        (0, vec!["server-default", "other-model"], "other-model"),
+        (1, vec!["manual-id"], "manual-id"),
+    ] {
+        let (sink, mut frames) = channel_sink();
+        handle_provider_configure(
+            ProviderConfigureContext {
+                store: &store,
+                accounts: &accounts,
+                vault: &vault,
+                management: Some(&management),
+                providers: &mut providers,
+                endpoint_validator: Arc::new(CustomprovCanonicalEndpoint),
+                model_discoverer: &CustomprovNoSecondDiscovery,
+            },
+            ProviderConfigureJob {
+                command_id: format!("customprov-confirm-{revision}"),
+                input: ProviderConfigureInput {
+                    provider: "customprov-confirm".into(),
+                    api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+                    origin: Some("http://127.0.0.1:18080/v1".into()),
+                    auth_requirement: Some(ProviderAuthRequirementWire::None),
+                    enabled: true,
+                    trust: None,
+                    models: ids.iter().map(|id| (*id).to_owned()).collect(),
+                    default_model: Some(selected.into()),
+                    response_open_timeout_ms: None,
+                    chunk_idle_timeout_ms: None,
+                    semantic_progress_timeout_ms: None,
+                },
+                probe_secret: None,
+                expected_revision: revision,
+                route: LoginRoute {
+                    request_id: RequestId::new(format!("customprov-confirm-{revision}")),
+                    sink,
+                },
+            },
+        )
+        .await;
+        match frames.try_recv().expect("configure reply") {
+            WireFrame::Response {
+                body:
+                    ResponseBody::ProviderConfigure {
+                        provider,
+                        revision: result_revision,
+                    },
+                ..
+            } => {
+                assert_eq!(result_revision, revision + 1);
+                assert_eq!(provider.default_model.as_deref(), Some(selected));
+                assert_eq!(provider.models.len(), ids.len());
+                assert!(
+                    ids.iter()
+                        .all(|id| provider.models.iter().any(|model| model == id))
+                );
+            }
+            other => panic!("unexpected confirm reply: {other:?}"),
+        }
+        let cached = store
+            .provider_models("customprov-confirm".into())
+            .await
+            .expect("cache read")
+            .expect("confirmed cache");
+        let cached: Vec<haider_provider::DiscoveredModel> =
+            serde_json::from_str(&cached.models_json).expect("cached model rows");
+        assert_eq!(
+            cached
+                .iter()
+                .map(|model| model.slug.as_str())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        let view = management.read().expect("published management");
+        let catalog = crate::model_select::ModelSelectionAuthority::new(None, view.providers)
+            .model_catalog(Some("customprov-confirm"), 50);
+        assert_eq!(catalog.models.len(), ids.len());
+        assert!(
+            ids.iter()
+                .all(|id| catalog.models.iter().any(|row| row.model == *id))
+        );
+    }
+    store.close().await.expect("close confirm store");
+}
+
+/// Verifier V1: editing a custom provider cannot send its saved credential
+/// to an origin already claimed by another provider, even during a probe.
+#[tokio::test]
+async fn customprov_probe_rejects_claimed_origin_before_resolving_or_sending_key() {
+    let provider_store = EndpointEditProviderStore::new(vec![
+        endpoint_edit_profile("custom-a", "http://127.0.0.1:18080/v1"),
+        endpoint_edit_profile("custom-b", "http://127.0.0.1:18081/v1"),
+    ]);
+    let providers = endpoint_edit_registry(provider_store, &["custom-a", "custom-b"]);
+    let mut accounts = memory_accounts();
+    let alias = CredentialAlias::new("customprov-repoint-key");
+    accounts
+        .add(CredentialDescriptor {
+            alias: alias.clone(),
+            provider: "custom-a".into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "custom key".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+        })
+        .expect("existing custom account");
+    let vault = MemoryVault::new();
+    vault
+        .put(&alias, b"CUSTOMPROV_SAVED_KEY")
+        .expect("saved API key");
+    let discoverer: Arc<dyn ProviderModelDiscoverer> = Arc::new(CustomprovNoSecondDiscovery);
+    let mut tasks = JoinSet::new();
+    let mut routes = HashMap::new();
+    let (sink, mut frames) = channel_sink();
+    begin_provider_models_probe(
+        &accounts,
+        &vault,
+        &providers,
+        &discoverer,
+        &mut tasks,
+        &mut routes,
+        ProviderModelsProbeJob {
+            provider: "custom-a".into(),
+            origin: "http://127.0.0.1:18081/v1/".into(),
+            api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+            keyless: false,
+            probe_secret: None,
+            route: LoginRoute {
+                request_id: RequestId::new("claimed-probe"),
+                sink,
+            },
+        },
+    );
+    assert!(
+        tasks.is_empty(),
+        "claimed-origin rejection must precede all network work"
+    );
+    assert!(routes.is_empty());
+    match frames.try_recv().expect("claimed-origin refusal") {
+        WireFrame::Response {
+            body: ResponseBody::Error { code, message, .. },
+            ..
+        } => {
+            assert_eq!(code, ERROR_CODE_INVALID_ARGUMENT);
+            assert!(message.contains("already registered"));
+            assert!(!message.contains("CUSTOMPROV_SAVED_KEY"));
+        }
+        other => panic!("unexpected claimed-origin reply: {other:?}"),
+    }
+}
+
+/// Verifier V2 and the login follow-through: a user-confirmed custom model
+/// needs URL/DNS safety, not an available /models endpoint. The real
+/// production validator accepts an offline loopback origin and login stores
+/// the key without another catalog request or inference side effect.
+#[tokio::test]
+async fn customprov_manual_offline_create_and_key_login_complete_without_models_get() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve offline endpoint");
+    let origin = format!(
+        "http://{}/v1/",
+        listener.local_addr().expect("offline endpoint")
+    );
+    drop(listener);
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let mut accounts = memory_accounts();
+    let vault = MemoryVault::new();
+    let mut providers = test_provider_registry();
+    let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
+    let (sink, mut frames) = channel_sink();
+    handle_provider_configure(
+        ProviderConfigureContext {
+            store: &store,
+            accounts: &accounts,
+            vault: &vault,
+            management: Some(&management),
+            providers: &mut providers,
+            endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+            model_discoverer: &CustomprovNoSecondDiscovery,
+        },
+        ProviderConfigureJob {
+            command_id: "customprov-offline-create".into(),
+            input: endpoint_create_input("customprov-offline", &origin),
+            probe_secret: None,
+            expected_revision: 0,
+            route: LoginRoute {
+                request_id: RequestId::new("customprov-offline-create"),
+                sink: Arc::clone(&sink),
+            },
+        },
+    )
+    .await;
+    assert!(matches!(
+        frames.try_recv().expect("offline create reply"),
+        WireFrame::Response {
+            body: ResponseBody::ProviderConfigure { .. },
+            ..
+        }
+    ));
+    let snapshot = Arc::new(StdMutex::new(Vec::new()));
+    let mut pending = HashMap::new();
+    handle_login(
+        &store,
+        &mut accounts,
+        &vault,
+        &ProviderCredentialValidator,
+        &snapshot,
+        Some(&management),
+        &providers,
+        "customprov-offline-profile",
+        "unused-global-model",
+        &mut pending,
+        &HashSet::new(),
+        LoginJob {
+            command_id: "customprov-offline-login".into(),
+            provider: "customprov-offline".into(),
+            display_alias: Some("customprov-offline-key".into()),
+            validation_model: None,
+            replace_existing: false,
+            secret: Some(Zeroizing::new(b"CUSTOMPROV_OFFLINE_KEY".to_vec())),
+            route: LoginRoute {
+                request_id: RequestId::new("customprov-offline-login"),
+                sink,
+            },
+        },
+    )
+    .await;
+    let reply = frames.try_recv().expect("offline login reply");
+    assert!(!format!("{reply:?}").contains("CUSTOMPROV_OFFLINE_KEY"));
+    match reply {
+        WireFrame::Response {
+            body: ResponseBody::AccountLoginApi { descriptor },
+            ..
+        } => {
+            assert_eq!(descriptor.provider, "customprov-offline");
+            assert_eq!(
+                vault
+                    .resolve(&descriptor.alias)
+                    .expect("saved manual key")
+                    .expose_secret(),
+                b"CUSTOMPROV_OFFLINE_KEY"
+            );
+            assert!(
+                !descriptor
+                    .account_identity
+                    .is_some_and(|identity| identity.verified)
+            );
+        }
+        other => panic!("manual key login must complete: {other:?}"),
+    }
+    assert_eq!(accounts.list().len(), 1);
+    store.close().await.expect("close offline store");
+}
+
+#[test]
+fn customprov_manual_key_acceptance_requires_nonempty_utf8_without_controls() {
+    assert!(accept_configured_custom_key("custom", b"key-value").is_ok());
+    for key in [
+        b"".as_slice(),
+        b"   ".as_slice(),
+        b"\xff".as_slice(),
+        b"key\nheader".as_slice(),
+    ] {
+        let error = accept_configured_custom_key("custom", key).expect_err("invalid custom key");
+        assert!(matches!(error.kind, ValidationFailureKind::Unauthorized));
+        assert!(!error.message.contains("key\nheader"));
+    }
 }

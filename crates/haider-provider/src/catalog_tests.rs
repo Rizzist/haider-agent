@@ -306,8 +306,23 @@ async fn custom_catalog_reports_unauthorized_invalid_body_and_empty_list() {
             br#"{"error":"unauthorized"}"#.as_slice(),
             "unauthorized",
         ),
+        (
+            "404 Not Found",
+            br#"{"error":"no models endpoint"}"#.as_slice(),
+            "unavailable",
+        ),
         ("200 OK", b"not-json".as_slice(), "invalid_body"),
+        (
+            "200 OK",
+            br#"{"models":[{"id":"wrong-shape"}]}"#.as_slice(),
+            "invalid_body",
+        ),
         ("200 OK", br#"{"data":[]}"#.as_slice(), "empty"),
+        (
+            "200 OK",
+            br#"{"data":[{"id":""},{"id":"  "},{"name":"missing-id"}]}"#.as_slice(),
+            "empty",
+        ),
     ] {
         let (origin, fixture) = one_shot_catalog(status, body).await;
         let error = discover_models(CatalogSource::OpenAiCompatible { origin }, None, None)
@@ -319,6 +334,7 @@ async fn custom_catalog_reports_unauthorized_invalid_body_and_empty_list() {
             ("unauthorized", CatalogError::Unauthorized)
                 | ("invalid_body", CatalogError::InvalidBody { .. })
                 | ("empty", CatalogError::Empty)
+                | ("unavailable", CatalogError::Unavailable { .. })
         ));
     }
 }
@@ -399,4 +415,99 @@ fn grok_oauth_catalog_parses_proxy_model_metadata() {
         CatalogSource::XaiApi.endpoint(),
         "https://api.x.ai/v1/models"
     );
+}
+
+/// The server owns both its id order and optional advertised default. Empty
+/// or duplicate ids cannot strand the custom-provider picker.
+#[tokio::test]
+async fn customprov_catalog_fixture_success_preserves_order_and_advertised_default() {
+    for (body, expected) in [
+        (br#"{"data":[{"id":"z-first"},{"id":"a-second"}]}"#.as_slice(), vec!["z-first", "a-second"]),
+        (br#"{"default_model":"a-second","data":[{"id":"z-first"},{"id":"a-second"},{"id":""},{"id":"a-second"}]}"#.as_slice(), vec!["a-second", "z-first"]),
+        (br#"{"default":"a-second","data":[{"id":"z-first"},{"id":"a-second"}]}"#.as_slice(), vec!["a-second", "z-first"]),
+        (br#"{"data":[{"id":"z-first"},{"id":"a-second","is_default":true}]}"#.as_slice(), vec!["a-second", "z-first"]),
+        (br#"{"default_model":"absent","data":[{"id":"z-first"},{"id":"a-second"}]}"#.as_slice(), vec!["z-first", "a-second"]),
+    ] {
+        let (origin, fixture) = one_shot_catalog("200 OK", body).await;
+        let catalog = discover_models(CatalogSource::OpenAiCompatible { origin }, Some("CUSTOMPROV_KEY_SENTINEL"), None)
+            .await.expect("discover fixture models");
+        let request = fixture.await.expect("catalog fixture");
+        assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+        assert!(request.contains("authorization: Bearer CUSTOMPROV_KEY_SENTINEL\r\n"));
+        assert_eq!(catalog.models.iter().map(|model| model.slug.as_str()).collect::<Vec<_>>(), expected);
+    }
+}
+
+#[tokio::test]
+async fn customprov_catalog_fixture_unreachable_and_404_are_actionable() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve refused address");
+    let origin = format!(
+        "http://{}",
+        listener.local_addr().expect("reserved address")
+    );
+    drop(listener);
+    let error = discover_models(
+        CatalogSource::OpenAiCompatible { origin },
+        Some("CUSTOMPROV_NEVER_ECHO"),
+        None,
+    )
+    .await
+    .expect_err("closed port is unreachable");
+    assert!(matches!(error, CatalogError::Transport { .. }));
+    assert!(!error.to_string().contains("CUSTOMPROV_NEVER_ECHO"));
+    let (origin, fixture) = one_shot_catalog("404 Not Found", b"CUSTOMPROV_NEVER_ECHO").await;
+    let error = discover_models(
+        CatalogSource::OpenAiCompatible { origin },
+        Some("CUSTOMPROV_NEVER_ECHO"),
+        None,
+    )
+    .await
+    .expect_err("missing model endpoint");
+    fixture.await.expect("404 fixture");
+    assert_eq!(error.to_string(), "server returned 404 for /models");
+}
+
+#[tokio::test]
+async fn customprov_catalog_reflected_key_never_becomes_a_model_id() {
+    let (origin, fixture) =
+        one_shot_catalog("200 OK", br#"{"data":[{"id":"CUSTOMPROV_REFLECTED_KEY"}]}"#).await;
+    let error = discover_models(
+        CatalogSource::OpenAiCompatible { origin },
+        Some("CUSTOMPROV_REFLECTED_KEY"),
+        None,
+    )
+    .await
+    .expect_err("reflected credential must not reach a picker or cache");
+    fixture.await.expect("reflecting fixture");
+    assert!(matches!(error, CatalogError::InvalidBody { .. }));
+    assert!(!format!("{error:?} {error}").contains("CUSTOMPROV_REFLECTED_KEY"));
+}
+
+/// Verifier V4: terminal rendering can drop controls and zero-width Unicode
+/// characters, so raw substring equality cannot prevent reflected-key display.
+#[tokio::test]
+async fn customprov_catalog_rejects_control_obfuscated_key_ids() {
+    for body in [
+        br#"{"data":[{"id":"CUSTOMPROV_\u001bSTAGED_KEY"}]}"#.as_slice(),
+        br#"{"data":[{"id":"CUSTOMPROV_\nSTAGED_KEY"}]}"#.as_slice(),
+        br#"{"data":[{"id":"CUSTOMPROV_\u200bSTAGED_KEY"}]}"#.as_slice(),
+        br#"{"data":[{"id":"CUSTOMPROV_\ufeffSTAGED_KEY"}]}"#.as_slice(),
+    ] {
+        let (origin, fixture) = one_shot_catalog("200 OK", body).await;
+        let error = discover_models(
+            CatalogSource::OpenAiCompatible { origin },
+            Some("CUSTOMPROV_STAGED_KEY"),
+            None,
+        )
+        .await
+        .expect_err("control-bearing ids cannot reach rendering");
+        fixture.await.expect("control-bearing catalog fixture");
+        assert!(matches!(error, CatalogError::InvalidBody { .. }));
+        assert_eq!(
+            error.to_string(),
+            "model catalog id contains characters that cannot be displayed safely"
+        );
+    }
 }

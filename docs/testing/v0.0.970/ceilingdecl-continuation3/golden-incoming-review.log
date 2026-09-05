@@ -1,0 +1,91 @@
+crates/haider-cli/tests/fixtures/oneshot_run_golden.jsonl
+  line 12: added durable workspace-before receipt started
+  line 13: added durable workspace-before receipt completed
+  incoming 12 -> line 14: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 13 -> line 15: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 14 -> line 16: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 15 -> line 17: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 16 -> line 18: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 17 -> line 19: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 18 -> line 20: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 19 -> line 21: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 20 -> line 22: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 21 -> line 23: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 22 -> line 24: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 23 -> line 25: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 24 -> line 26: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 25 -> line 27: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 26 -> line 28: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  REVIEWED: 17 changed/new lines vs incoming; one added receipt pair; journalview fields unchanged; contiguous seq.
+
+crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_text_turn.jsonl
+  line 12: added durable workspace-before receipt started
+  line 13: added durable workspace-before receipt completed
+  incoming 12 -> line 14: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 13 -> line 15: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 14 -> line 16: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 15 -> line 17: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 16 -> line 18: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 17 -> line 19: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 18 -> line 20: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 19 -> line 21: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 20 -> line 22: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 21 -> line 23: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 22 -> line 24: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 23 -> line 25: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 24 -> line 26: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 25 -> line 27: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 26 -> line 28: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  REVIEWED: 17 changed/new lines vs incoming; one added receipt pair; journalview fields unchanged; contiguous seq.
+
+crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_tool_turn.jsonl
+  line 12: added durable workspace-before receipt started
+  line 13: added durable workspace-before receipt completed
+  incoming 12 -> line 14: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 13 -> line 15: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 14 -> line 16: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 15 -> line 17: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 16 -> line 18: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 17 -> line 19: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 18 -> line 20: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 19 -> line 21: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 20 -> line 22: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 21 -> line 23: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 22 -> line 24: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 23 -> line 25: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 24 -> line 26: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 25 -> line 27: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 26 -> line 28: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 27 -> line 29: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 28 -> line 30: receipt-induced seq/event offset +2, item offset +1; outcome-seq-derived workspace revision 27->29; all other semantic fields unchanged
+  incoming 29 -> line 31: receipt-induced seq/event offset +2, item offset +1; refers to same outcome revision workspace-revision:27->workspace-revision:29; all other semantic fields unchanged
+  incoming 30 -> line 32: receipt-induced seq/event offset +2, item offset +1; embedded references use the same verified outcome revision; all other semantic fields unchanged
+  incoming 31 -> line 33: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 32 -> line 34: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 33 -> line 35: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 34 -> line 36: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 35 -> line 37: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 36 -> line 38: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 37 -> line 39: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 38 -> line 40: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 39 -> line 41: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 40 -> line 42: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 41 -> line 43: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 42 -> line 44: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 43 -> line 45: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 44 -> line 46: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 45 -> line 47: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 46 -> line 48: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 47 -> line 49: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 48 -> line 50: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 49 -> line 51: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 50 -> line 52: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 51 -> line 53: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 52 -> line 54: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 53 -> line 55: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 54 -> line 56: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 55 -> line 57: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 56 -> line 58: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  incoming 57 -> line 59: receipt-induced seq/event offset +2, item offset +1; all other semantic fields unchanged
+  REVIEWED: 48 changed/new lines vs incoming; one added receipt pair; journalview fields unchanged; contiguous seq.
+

@@ -5885,6 +5885,26 @@ pub fn azure_openai_origin(origin: &str) -> bool {
         })
 }
 
+/// Validates a configured custom origin without requiring an HTTP endpoint
+/// to be online. Shape and DNS/SSRF checks share the inference transport's
+/// policy; every later credential-bearing request still pins its own DNS
+/// resolution and refuses redirects.
+pub async fn validate_openai_compatible_origin(
+    base_url: &str,
+    policy: CompatibleOriginPolicy,
+) -> Result<String, ProviderError> {
+    let endpoints = compatible_endpoints(base_url, policy)?;
+    let transport = compatible_transport(&endpoints, policy)?;
+    if let Some(guard) = transport.guard {
+        connect_before_deadline(
+            OPENAI_DEFAULT_TRANSPORT_CONFIG.connect_timeout,
+            guard.validate(),
+        )
+        .await?;
+    }
+    Ok(endpoints.base_url)
+}
+
 /// Validates and probes a configured OpenAI-compatible endpoint without
 /// attaching credential material.
 ///

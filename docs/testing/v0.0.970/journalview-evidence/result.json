@@ -1,0 +1,44 @@
+{
+  "completed_at_utc": "2026-09-05T06:16:29.060673+00:00",
+  "merged_origin_wave_970": "38359fd3ba799c3e32a09c414f6f41abb90442bd",
+  "git_head": "372a2639fd5ae971d6ecc29f61f7cbe1ad5a0551",
+  "git_merge_recorded": false,
+  "working_content_merge_resolved": true,
+  "checks": {
+    "fmt": 0,
+    "diff": 0,
+    "unsafe": 0,
+    "qa-selftests": 0,
+    "rebind-regression": 0,
+    "workspace": 0,
+    "clippy": 0,
+    "xtask": 0
+  },
+  "final_gate_exit": 0,
+  "source_hashes_verified": 76,
+  "test_baseline_upstream": 4910,
+  "test_baseline_final": 4925,
+  "instruct_pipe_bytes_old": 13552,
+  "instruct_pipe_bytes_new": 13552,
+  "environment": {
+    "RUST_MIN_STACK": "8388608",
+    "HAIDER_DISCOVERY_DISABLED": "1",
+    "HAIDER_TEST_DEVICE_NAME": "test-mac",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_BUILD_JOBS": "2",
+    "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+    "RUST_TEST_THREADS": "4"
+  },
+  "platform": "Darwin 25.6.0 arm64",
+  "verifier": {
+    "findings": 4,
+    "real": 4,
+    "noise": 0
+  },
+  "notes": [
+    "xtask emitted nine nonfatal file-length soft-cap warnings; all checks exit zero.",
+    "The workspace log contains nested fixture subprocess test results; see workspace-summary.json.",
+    "Git merge recording is blocked by the read-only shared Git directory; the orchestrator must record the resolved merge."
+  ]
+}

@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use crate::origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 use reqwest::header::HeaderValue;
+use unicode_width::UnicodeWidthChar;
 
 /// Hard cap on a discovery response body. The codex payload embeds
 /// per-model base instructions, so this is generous but still bounded.
@@ -421,12 +422,20 @@ pub async fn discover_models_with_resolver(
         }
         // Grok round 2: the proxy's 402/426 are its client-version gate —
         // an ACTIONABLE misconfiguration, never generic unavailability.
-        if matches!(status, 402 | 426) {
+        if matches!(source, CatalogSource::GrokOAuth) && matches!(status, 402 | 426) {
             return Err(CatalogError::Unavailable {
                 reason: format!(
                     "the Grok subscription proxy rejected this client ({status}): the pinned \
                      x-grok-client-version is no longer admitted — update the harness"
                 ),
+            });
+        }
+        if matches!(
+            source,
+            CatalogSource::OpenAiCompatible { .. } | CatalogSource::AnthropicCompatible { .. }
+        ) {
+            return Err(CatalogError::Unavailable {
+                reason: format!("server returned {status} for /models"),
             });
         }
         // 401/403/404 under a subscription token is the "not served to this
@@ -464,6 +473,20 @@ pub async fn discover_models_with_resolver(
             reason: format!("model catalog response is not JSON: {error}"),
         })?;
     let models = parse_catalog(source, &value)?;
+    // A credential-reflecting server must not smuggle the key into a
+    // public picker, receipt, cache, or event as a model id.
+    if access_token
+        .filter(|secret| !secret.is_empty())
+        .is_some_and(|secret| {
+            models
+                .iter()
+                .any(|model| model.slug.contains(secret) || model.display_name.contains(secret))
+        })
+    {
+        return Err(CatalogError::InvalidBody {
+            reason: "model catalog response contains credential material".to_owned(),
+        });
+    }
     if models.is_empty() {
         return Err(CatalogError::Empty);
     }
@@ -471,6 +494,16 @@ pub async fn discover_models_with_resolver(
         models,
         etag: response_etag,
     })
+}
+
+/// Custom model ids must retain every character when a terminal draws
+/// them. Controls and zero-width characters can hide inside a reflected
+/// credential and disappear on screen; use the same Unicode width rules as
+/// the accounts renderer at both the parser and daemon reply boundaries.
+#[must_use]
+pub fn compatible_model_id_is_display_safe(id: &str) -> bool {
+    id.chars()
+        .all(|character| UnicodeWidthChar::width(character).is_some_and(|width| width > 0))
 }
 
 /// Parses either provider's shape. Public so the fake-server tests drive the
@@ -532,9 +565,29 @@ pub fn parse_catalog(
                 | CatalogSource::HaiderCodeApi
                 | CatalogSource::XaiApi
         ) {
-            let Some(slug) = entry.get("id").and_then(serde_json::Value::as_str) else {
+            let Some(raw_slug) = entry.get("id").and_then(serde_json::Value::as_str) else {
                 continue;
             };
+            if matches!(
+                source,
+                CatalogSource::OpenAiCompatible { .. } | CatalogSource::AnthropicCompatible { .. }
+            ) && !compatible_model_id_is_display_safe(raw_slug)
+            {
+                return Err(CatalogError::InvalidBody {
+                    reason: "model catalog id contains characters that cannot be displayed safely"
+                        .to_owned(),
+                });
+            }
+            let slug = raw_slug.trim();
+            if slug.is_empty() {
+                continue;
+            }
+            if models
+                .iter()
+                .any(|model: &DiscoveredModel| model.slug == slug)
+            {
+                continue;
+            }
             models.push(DiscoveredModel {
                 slug: slug.to_owned(),
                 display_name: slug.to_owned(),
@@ -686,6 +739,34 @@ pub fn parse_catalog(
             priority: entry.get("priority").and_then(serde_json::Value::as_i64),
             extensions: kimi_extensions.or(grok_extensions),
         });
+    }
+    if matches!(
+        source,
+        CatalogSource::OpenAiCompatible { .. } | CatalogSource::AnthropicCompatible { .. }
+    ) {
+        let advertised_default = value
+            .get("default_model")
+            .or_else(|| value.get("default"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|entry| {
+                        entry
+                            .get("default")
+                            .or_else(|| entry.get("is_default"))
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                    })
+                    .and_then(|entry| entry.get("id"))
+                    .and_then(serde_json::Value::as_str)
+            });
+        if let Some(index) = advertised_default
+            .and_then(|default| models.iter().position(|model| model.slug == default.trim()))
+        {
+            let default = models.remove(index);
+            models.insert(0, default);
+        }
     }
     Ok(models)
 }
