@@ -21,6 +21,32 @@ the same rule and resume strictly after its last fully processed `seq`.
 Unknown additive envelope or payload fields must be ignored. Existing payload
 types and fields retain their meanings.
 
+## Durable model narrative and compaction (v0.0.970)
+
+Assistant text and emitted reasoning summaries are captured by the existing
+`item` lifecycle (`agent_message`/`incomplete_agent_message`, `reasoning`, and
+`text`/`reasoning` deltas). Their additive `payload.provider_request` coordinates
+match `X-Haider-Turn`: session_id, run_id, turn_ordinal, request_ordinal,
+request_kind. These coordinates and any provider_finish_reason are journaled
+before publication; committed_at_ms and schema_version supply metadata.
+
+JSON documents from both `--output json` and `run --replay` add `provider_rounds`,
+a shared derived projection of request coordinates, emitted_text,
+reasoning_summary, tool_calls, results and terminal_cause. It does not modify
+raw envelopes. Unsupported future request metadata stays in the raw events;
+legacy absence never causes invented request coordinates. Private compaction
+narrative is marked provider_purpose=compaction and excluded from final response.
+
+A successful compaction appends `payload.type=context_compaction` in the same
+transaction as its history overlay. It announces the trigger turn, successful
+summary request ordinal, inclusive covers_from/covers_to node range,
+summary_artifact, dropped_item_count and retained_suffix_size. Both count units
+are explicitly provider_message: active prefix replaced and original suffix
+retained, excluding the new summary and request-only scaffolding. Replacing an
+old summary counts it once; the journal's original history is not deleted.
+Failed compaction emits no announcement. Full field and compatibility details
+are in `docs/event-schema-changelog.md`.
+
 ## Additive context-economy accounting
 
 Model-boundary reductions do not rewrite earlier journal records. Conversation

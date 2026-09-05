@@ -35,6 +35,7 @@ use haider_protocol::checkpoint::{
     CHECKPOINT_LIST_MAX_PAGE, CheckpointCursor, CheckpointListPage, CheckpointRecorded,
 };
 use haider_protocol::context::ContextEconomy;
+use haider_protocol::context_compaction::ContextCompactionEventPayload;
 use haider_protocol::credential::CredentialDescriptor;
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectOutcome, EffectPhase, WorkspaceMutation,
@@ -21955,6 +21956,8 @@ fn validate_worker_run_transitions(
                 decode_payload::<WorkspaceEventPayload>(&envelope.payload),
                 Ok(WorkspaceEventPayload::WorkspaceUnavailable(_))
             );
+        let supplemental_context_compaction = kind == Some("context_compaction")
+            && decode_payload::<ContextCompactionEventPayload>(&envelope.payload).is_ok();
         let supplemental_computer_permission =
             matches!(
                 kind,
@@ -21976,6 +21979,7 @@ fn validate_worker_run_transitions(
                 || supplemental_computer_permission
                 || supplemental_run_budget
                 || supplemental_run_deadline
+                || supplemental_context_compaction
             {
                 return Err(store_error(
                     ErrorCode::InvalidArgument,
@@ -21989,7 +21993,8 @@ fn validate_worker_run_transitions(
             || supplemental_workspace_unavailable
             || supplemental_computer_permission
             || supplemental_run_budget
-            || supplemental_run_deadline)
+            || supplemental_run_deadline
+            || supplemental_context_compaction)
             && (!envelope.render.durable || envelope.render.prompt != PromptRender::Omit)
         {
             return Err(store_error(
@@ -21997,6 +22002,40 @@ fn validate_worker_run_transitions(
                 "supplemental worker fact must be durable and omitted from prompt replay",
                 false,
             ));
+        }
+        if supplemental_context_compaction {
+            let ContextCompactionEventPayload::ContextCompaction(fact) =
+                decode_payload::<ContextCompactionEventPayload>(&envelope.payload).map_err(
+                    |error| {
+                        store_error(
+                            ErrorCode::InvalidArgument,
+                            format!("invalid compaction announcement: {error}"),
+                            false,
+                        )
+                    },
+                )?;
+            let matching_node = envelopes.iter().any(|candidate| {
+                candidate.run_id == envelope.run_id
+                    && candidate.branch_id == envelope.branch_id
+                    && candidate.agent_id == envelope.agent_id
+                    && matches!(candidate.payload.decode_event(),
+                        Ok(EventPayload::NodeCommitted(TreeNode { kind: NodeKind::Compaction { covers_from, covers_to, summary_artifact, resume_cause, .. }, .. }))
+                            if covers_from == fact.covers_from && covers_to == fact.covers_to
+                                && summary_artifact == fact.summary_artifact && resume_cause == fact.resume_cause
+                    )
+            });
+            if fact.turn_ordinal == 0
+                || fact.request_ordinal == 0
+                || fact.dropped_item_count == 0
+                || fact.operation_id.is_empty()
+                || !matching_node
+            {
+                return Err(store_error(
+                    ErrorCode::InvalidArgument,
+                    "compaction announcement requires valid request coordinates and its matching overlay in the same worker batch",
+                    false,
+                ));
+            }
         }
         if supplemental_run_budget
             && !durable_headless_run_facts(transaction, session_id, run_id)?.configured
@@ -22013,7 +22052,8 @@ fn validate_worker_run_transitions(
                 if supplemental_project_instructions
                     || supplemental_workspace_unavailable
                     || supplemental_computer_permission
-                    || supplemental_run_budget =>
+                    || supplemental_run_budget
+                    || supplemental_context_compaction =>
             {
                 None
             }
@@ -26263,6 +26303,102 @@ mod run_head_projection_tests {
                 mode: DeliveryMode::Queue,
             },
         )
+    }
+
+    #[test]
+    fn worker_compaction_fact_requires_typed_scope_matching_overlay_and_active_run() {
+        let root = tempfile::tempdir().expect("compaction store root");
+        let store = Store::open(root.path()).expect("compaction store");
+        let mut seed = [state(1, "compaction-run", None, RunState::Compacting)];
+        seed[0].worker_generation = store.worker_generation();
+        store.append(&mut seed).expect("seed active compaction run");
+        let session = seed[0].session_id.clone();
+        let node = event(
+            2,
+            Some("compaction-run"),
+            None,
+            EventPayload::NodeCommitted(TreeNode {
+                node: NodeId::new("compaction-node"),
+                parent: None,
+                kind: NodeKind::Compaction {
+                    covers_from: NodeId::new("covered-a"),
+                    covers_to: NodeId::new("covered-b"),
+                    summary_artifact: ArtifactRef::new("blake3:summary"),
+                    tokens_before: 10,
+                    tokens_after: 2,
+                    resume_cause: haider_protocol::history::CompactionResume::AutoMidTurn,
+                },
+            }),
+        );
+        let fact = raw_event(
+            3,
+            Some("compaction-run"),
+            None,
+            serde_json::json!({
+                "type": "context_compaction",
+                "turn_ordinal": 1,
+                "request_ordinal": 1,
+                "operation_id": "compaction-operation",
+                "covers_from": "covered-a",
+                "covers_to": "covered-b",
+                "summary_artifact": "blake3:summary",
+                "dropped_item_count": 2,
+                "dropped_item_unit": "provider_message",
+                "retained_suffix_size": 1,
+                "retained_suffix_unit": "provider_message",
+                "resume_cause": "auto_mid_turn"
+            }),
+        );
+        let connection = store.connection().expect("store connection");
+        validate_worker_run_transitions(&connection, &session, &[node.clone(), fact.clone()], 1)
+            .expect("recognized typed compaction fact passes its owning run gate");
+        for mutation in [
+            "missing-field",
+            "unknown-kind",
+            "wrong-unit",
+            "wrong-scope",
+            "no-run",
+            "wrong-branch",
+            "not-durable",
+            "prompt-visible",
+            "zero-coordinate",
+            "no-overlay",
+        ] {
+            let mut candidate = fact.clone();
+            match mutation {
+                "missing-field" => {
+                    candidate
+                        .payload
+                        .as_object_mut()
+                        .expect("object")
+                        .remove("covers_to");
+                }
+                "unknown-kind" => {
+                    candidate.payload["type"] = serde_json::json!("context_compaction_unknown")
+                }
+                "wrong-unit" => {
+                    candidate.payload["dropped_item_unit"] = serde_json::json!("journal_event")
+                }
+                "wrong-scope" => {
+                    candidate.payload["covers_to"] = serde_json::json!("uncovered-node")
+                }
+                "no-run" => candidate.run_id = None,
+                "wrong-branch" => candidate.branch_id = Some(BranchId::new("other-branch")),
+                "not-durable" => candidate.render.durable = false,
+                "prompt-visible" => candidate.render.prompt = PromptRender::Verbatim,
+                "zero-coordinate" => candidate.payload["request_ordinal"] = serde_json::json!(0),
+                "no-overlay" => {}
+                _ => unreachable!(),
+            }
+            let batch = if mutation == "no-overlay" {
+                vec![candidate]
+            } else {
+                vec![node.clone(), candidate]
+            };
+            let error = validate_worker_run_transitions(&connection, &session, &batch, 1)
+                .expect_err(mutation);
+            assert_eq!(error.code, ErrorCode::InvalidArgument, "{mutation}");
+        }
     }
 
     fn legacy_run_states(journal: &[RawEnvelope]) -> StoreResult<HashMap<RunId, DurableRunHead>> {

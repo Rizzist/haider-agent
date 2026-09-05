@@ -1,0 +1,10 @@
+{
+  "result_blocks": 335,
+  "passed": 5343,
+  "failed": 0,
+  "ignored": 13,
+  "measured": 0,
+  "filtered_out": 1400,
+  "exit_code": 0,
+  "aggregation": "Sum of all test-result lines in the raw log, including nested fixture subprocess runs; not a count of distinct source tests. Filtered counts belong to those nested fixture subprocesses. The top-level workspace command has no test-name filter."
+}

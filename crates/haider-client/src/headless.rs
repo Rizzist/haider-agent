@@ -1790,6 +1790,11 @@ impl HeadlessReducer {
         let mut is_terminal_envelope = false;
         if correlated
             && reduce_core_payload
+            && envelope
+                .payload
+                .get("provider_purpose")
+                .and_then(serde_json::Value::as_str)
+                != Some("compaction")
             && let Ok(payload) = envelope.payload.decode_event()
         {
             match payload {

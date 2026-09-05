@@ -304,3 +304,25 @@ Scope: the uncommitted `session_provider.rs` initializer correction and two
 - #92 checked — build-capable commands record disk headroom; the gate retains failures and missing-executable diagnostics in its raw log.
 - #93 checked: none — no class #93 is defined in the supplied registry.
 - #94-#96 checked: none — no deadline, negotiated-connection wait, provider durability boundary, or performance policy changed. Windows/Linux behavior is by inspection; gates here run on macOS arm64.
+
+## journalview continuation, merged through 38359fd3
+
+- #1-#18 checked: no dependency, platform seam, lint exemption, or harness weakening introduced. New tests exercise durable ownership and actual item lifecycles.
+- #19/#20 checked: formatting, whitespace, exact Clippy test targets, and authoritative `xtask test-count --update`; merged upstream 4910 -> lane 4925.
+- #21/#41/#42/#44/#54/#64/#67/#71/#72/#74/#81/#92 checked: full ENV LAW, two build jobs, disk checks before each build with the 700 MiB floor, fresh siblings, `HAIDER_TEST_SIBLINGS_PREBUILT=1`, and haiderd 200566368 bytes. Four test threads avoid the observed shared-host scheduling failure without changing any test deadline or assertion.
+- #22/#23 checked: request/Finish metadata is content-free; narrative remains the already captured provider output and is not added to diagnostic logs.
+- #24-#28 checked: no credential flow, process-global configuration, release workflow, or public error policy changed.
+- #29/#30 fixed: correlation is stamped before durable append and publication; recovery uses the exact source item, not a later Side request. Named journal/live/JSON/replay regressions retain raw byte equality. Rebind-error cleanup closes recovered items before the terminal under the original request.
+- #31/#32 checked: no new provider transport or dispatch path; failed admission cannot claim an unsent request.
+- #33 fixed: additive schema ledger, legacy compatibility, typed atomic compaction announcement and matching-overlay validation. Replay normalizes zero fields inside raw envelopes.
+- #34-#40 checked: shared arena assembles normalized rounds without duplicate completion snapshots; JSONL retains no duplicate summary. Actual Finish reasons are preserved; incomplete summary text remains incomplete.
+- #43/#45-#53 checked: no new timing threshold or platform gate. Existing golden sequences are regenerated, not hand-merged; primary and empty-summary terminal markers retain the frozen Started/Completed lifecycle.
+- #55-#63/#65/#66 checked: no archive, STT, rendering, or platform error-mapping change. Incoming casstream/providerrebind changes remain preserved.
+- #68-#70/#75/#76 checked: no new external wait or discovery/cleanup policy. Private summarizer output remains prompt-omitted and excluded from final response selection.
+- #73 checked: all 70 changed/new JSONL golden lines reviewed; `provider_request_no_budget.json` is byte-identical to merged upstream and the measured instruct-pipe pin stays 13552 -> 13552 bytes.
+- #77-#80 checked: no unsafe added and no release, dependency, or benchmark claim. Existing unsafe and QA self-checks retained.
+- #82-#84 checked: both protected OAuth files remain unchanged; the initial timing failure and unchanged isolation/daemon reruns are retained as evidence.
+- #85-#91 checked: full workspace test with `--no-fail-fast` and Clippy `--workspace --tests -- -D warnings`; both content merges preserve the incoming sides, and the final ref guard rejects a stale-tree verdict. Git merge recording remains for the orchestrator because the Git directory is read-only.
+- #93: no class #93 is defined in the supplied registry.
+- #94/#95 checked: no new product deadline or negotiated-connection wait; the regression adds no timeout.
+- #96 checked: no latency or benchmark-score claim. macOS execution only; Linux/Windows behavior is by inspection. AHRB scoped credit remains undeclared until its owner maps the checker units; the supplied TOML declares announced-only support.

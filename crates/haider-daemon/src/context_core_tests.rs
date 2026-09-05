@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used)]
 
-use crate::session_hub::{SessionHub, SessionHubConfig};
+use crate::session_hub::{FrameSendError, FrameSink, SessionHub, SessionHubConfig};
 use crate::worker::{
     BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, WorkerDependencies, WorkerManager,
 };
@@ -14,6 +14,7 @@ use haider_protocol::EventPayload;
 use haider_protocol::context::{
     ContextFootprint, ContextFootprintTruth, ContextSavingsEvent, ContextSavingsMeasurement,
 };
+use haider_protocol::context_compaction::{CompactionItemUnit, ContextCompactionEventPayload};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
@@ -27,11 +28,22 @@ use haider_protocol::provider::{
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep, Provider};
-use std::sync::Arc;
+use haider_rpc::{AttachMode, Capability, RequestBody, RequestId, WireFrame};
+use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, timeout};
 
 struct FixedProviderFactory {
     provider: Arc<dyn Provider>,
+}
+
+#[derive(Default)]
+struct CompactionFrameSink(Mutex<Vec<WireFrame>>);
+
+impl FrameSink for CompactionFrameSink {
+    fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
+        self.0.lock().expect("compaction frames").push(frame);
+        Ok(())
+    }
 }
 
 struct FixedWindowProviderFactory {
@@ -795,8 +807,61 @@ async fn automatic_compaction_plans_and_commits_on_the_accepted_branch() {
         })
         .collect::<Vec<_>>();
     assert_eq!(compactions.len(), 1);
-    assert_eq!(compactions[0].run_id, Some(branch_run));
-    assert_eq!(compactions[0].branch_id, Some(branch_id));
+    assert_eq!(compactions[0].run_id, Some(branch_run.clone()));
+    assert_eq!(compactions[0].branch_id, Some(branch_id.clone()));
+    let announcements = events
+        .iter()
+        .filter_map(|event| {
+            ContextCompactionEventPayload::from_payload_value(&event.payload)
+                .map(|ContextCompactionEventPayload::ContextCompaction(fact)| (event, fact))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        announcements.len(),
+        1,
+        "one durable scoped announcement per overlay"
+    );
+    let (announcement, fact) = &announcements[0];
+    assert_eq!(announcement.run_id, Some(branch_run));
+    assert_eq!(announcement.branch_id, Some(branch_id));
+    assert!(announcement.committed_at_ms > 0);
+    assert!(announcement.render.durable);
+    assert_eq!(announcement.render.prompt, PromptRender::Omit);
+    assert!(fact.turn_ordinal > 0);
+    assert_eq!(
+        fact.request_ordinal, 1,
+        "automatic compaction is the first physical request"
+    );
+    assert_eq!(
+        fact.dropped_item_count, 1,
+        "exactly the covered original user message is replaced"
+    );
+    assert_eq!(fact.dropped_item_unit, CompactionItemUnit::ProviderMessage);
+    assert_eq!(
+        fact.retained_suffix_size, 5,
+        "two recent user/assistant pairs plus the current user"
+    );
+    let EventPayload::NodeCommitted(node) =
+        compactions[0].payload.decode_event().expect("node payload")
+    else {
+        panic!("compaction node")
+    };
+    let NodeKind::Compaction {
+        covers_from,
+        covers_to,
+        summary_artifact,
+        ..
+    } = node.kind
+    else {
+        panic!("compaction kind")
+    };
+    assert_eq!(fact.covers_from, covers_from);
+    assert_eq!(fact.covers_to, covers_to);
+    assert_eq!(
+        fact.covers_from, fact.covers_to,
+        "forced fixture drops precisely its one-node covered range"
+    );
+    assert_eq!(fact.summary_artifact, summary_artifact);
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
     let resumed_text = requests[1]
@@ -833,7 +898,7 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
     let root = tempfile::tempdir().expect("temp profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let session_id = SessionId::new("manual-compaction-replay");
-    let provider = Arc::new(FakeProvider::new(vec![
+    let mut steps = vec![
         FakeStep::EmitText {
             text: "durable answer".into(),
         },
@@ -853,6 +918,9 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
         },
         FakeStep::EmitText {
             text: "summary of durable history".into(),
+        },
+        FakeStep::EmitReasoning {
+            text: "retain the durable outcome".into(),
         },
         FakeStep::EmitUsage {
             usage: Usage {
@@ -880,7 +948,45 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
         FakeStep::Finish {
             reason: FinishReason::EndTurn,
         },
-    ]));
+        FakeStep::EmitText {
+            text: "replacement summary".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitText {
+            text: "partial replacement summary".into(),
+        },
+        FakeStep::EmitReasoning {
+            text: "partial replacement reasoning".into(),
+        },
+        FakeStep::Error {
+            kind: haider_provider::ProviderErrorKind::MalformedFrame,
+            message: "fixture stream failure after narrative".into(),
+            retry_after_ms: None,
+        },
+        FakeStep::PrematureEof,
+    ];
+    let unsuccessful_finishes = [
+        FinishReason::Cancelled,
+        FinishReason::Error,
+        FinishReason::MaxTokens,
+        FinishReason::Refusal,
+        FinishReason::ToolUse,
+        FinishReason::PauseTurn,
+    ];
+    for reason in unsuccessful_finishes {
+        steps.extend([
+            FakeStep::EmitText {
+                text: "unfinished summary".into(),
+            },
+            FakeStep::EmitReasoning {
+                text: "emitted reasoning".into(),
+            },
+            FakeStep::Finish { reason },
+        ]);
+    }
+    let provider = Arc::new(FakeProvider::new(steps));
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
     let manager = WorkerManager::start(
         hub.clone(),
@@ -992,6 +1098,30 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
     );
     assert_eq!(provider.requests().len(), 1);
 
+    let sink = Arc::new(CompactionFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([Capability::View]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("compaction view connection");
+    connection
+        .request(
+            RequestId::new("manual-compaction-live-attach"),
+            RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: store
+                    .latest_seq(&session_id)
+                    .await
+                    .expect("pre-compaction cursor"),
+                mode: AttachMode::View,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("attach before manual compaction");
+
     let first = manager_handle
         .compact(
             session_id.clone(),
@@ -1017,6 +1147,116 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
         .read(&session_id, 0, 512)
         .await
         .expect("read compacted journal");
+    let announcements = journal
+        .iter()
+        .filter_map(|event| {
+            ContextCompactionEventPayload::from_payload_value(&event.payload)
+                .map(|ContextCompactionEventPayload::ContextCompaction(fact)| (event, fact))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        announcements.len(),
+        1,
+        "receipt replay must not announce a second compaction"
+    );
+    let (announcement, fact) = &announcements[0];
+    assert_eq!(fact.dropped_item_count, 2);
+    assert_eq!(fact.retained_suffix_size, 0);
+    assert_eq!(fact.resume_cause, CompactionResume::ManualIdle);
+    assert_eq!(
+        fact.request_ordinal, 1,
+        "manual compaction owns its own request sequence"
+    );
+    let nodes = journal
+        .iter()
+        .filter_map(|event| match event.payload.decode_event().ok()? {
+            EventPayload::NodeCommitted(node) => Some(node.node),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let from = nodes
+        .iter()
+        .position(|node| node == &fact.covers_from)
+        .expect("covered start");
+    let to = nodes
+        .iter()
+        .position(|node| node == &fact.covers_to)
+        .expect("covered end");
+    assert_eq!(
+        fact.dropped_item_count as usize,
+        to - from + 1,
+        "forced one-message-per-node fixture: announced drop equals exact inclusive covered range"
+    );
+    // Registry #94: 5 seconds = 50 * 100ms scheduling quanta for the
+    // in-process postcommit attachment delivery, with no nested process wait.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if sink.0.lock().expect("frames").iter().any(|frame| {
+                matches!(frame,
+                    WireFrame::Event { envelope, .. } if envelope.event_id == announcement.event_id
+                )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("announcement is delivered live");
+    let live = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Event { envelope, .. } if envelope.event_id == announcement.event_id => {
+                Some(envelope.clone())
+            }
+            _ => None,
+        })
+        .expect("live announcement");
+    assert_eq!(
+        live, **announcement,
+        "journal and stream contain the same committed scope fact"
+    );
+    let json = serde_json::to_value(&live).expect("JSON announcement");
+    assert_eq!(json["payload"]["type"], "context_compaction");
+    assert_eq!(json["payload"]["dropped_item_count"], 2);
+    assert_eq!(json["payload"]["retained_suffix_size"], 0);
+    let narratives = journal
+        .iter()
+        .filter(|event| {
+            event
+                .payload
+                .get("provider_purpose")
+                .and_then(serde_json::Value::as_str)
+                == Some("compaction")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        narratives.len(),
+        6,
+        "summarizer text and reasoning each have durable start, delta, completion"
+    );
+    for event in &narratives {
+        assert_eq!(event.run_id, announcement.run_id);
+        assert_eq!(
+            event.payload["provider_request"]["turn_ordinal"],
+            fact.turn_ordinal
+        );
+        assert_eq!(
+            event.payload["provider_request"]["request_ordinal"],
+            fact.request_ordinal
+        );
+        if matches!(
+            event.payload.decode_event().expect("narrative"),
+            EventPayload::Item(ItemEvent::Completed { .. })
+        ) {
+            assert_eq!(event.payload["provider_finish_reason"], "end_turn");
+        }
+        assert_eq!(event.render.prompt, PromptRender::Omit);
+    }
+    assert!(narratives.iter().any(|event| matches!(event.payload.decode_event().expect("narrative payload"), EventPayload::Item(ItemEvent::Completed { item: TurnItem::Reasoning { summary }, .. }) if summary == "retain the durable outcome")));
     let payloads = journal
         .into_iter()
         .filter_map(|event| {
@@ -1132,6 +1372,225 @@ async fn cm1f_manual_compaction_usage_is_journaled_once_in_its_own_lane() {
     assert_eq!(reset.context_window, Some(32_000));
     assert!(reset.used_tokens > summary_only_tokens);
     assert!(reset.used_tokens < 32_000);
+
+    manager_handle
+        .compact(
+            session_id.clone(),
+            "replacement-compact-command".into(),
+            store.worker_generation(),
+            None,
+        )
+        .await
+        .expect("replacement compaction");
+    let replacement_journal = store
+        .read(&session_id, 0, 512)
+        .await
+        .expect("replacement journal");
+    let replacement = replacement_journal
+        .iter()
+        .filter_map(|event| {
+            ContextCompactionEventPayload::from_payload_value(&event.payload)
+                .map(|ContextCompactionEventPayload::ContextCompaction(fact)| fact)
+        })
+        .next_back()
+        .expect("replacement announcement");
+    assert_eq!(
+        replacement.dropped_item_count, 1,
+        "replacement drops the one active old summary, not its expanded original source"
+    );
+    assert_eq!(replacement.retained_suffix_size, 0);
+
+    manager_handle
+        .compact(
+            session_id.clone(),
+            "failed-compact-command".into(),
+            store.worker_generation(),
+            None,
+        )
+        .await
+        .expect_err("replacement summary fails after emitting both narrative sides");
+    let failed_journal = store
+        .read(&session_id, 0, 512)
+        .await
+        .expect("failed summary journal");
+    let failed_run = RunId::new("manual-compact-failed-compact-command");
+    let failed_deltas = failed_journal
+        .iter()
+        .filter(|event| event.run_id.as_ref() == Some(&failed_run))
+        .filter_map(|event| {
+            let EventPayload::Item(ItemEvent::Delta { delta, .. }) =
+                event.payload.decode_event().ok()?
+            else {
+                return None;
+            };
+            Some((event, delta))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failed_deltas.len(),
+        2,
+        "failed compactor preserves every emitted text and reasoning delta"
+    );
+    assert!(failed_deltas.iter().any(|(_, delta)| matches!(delta, haider_protocol::item::ItemDelta::Text { text } if text == "partial replacement summary")));
+    assert!(failed_deltas.iter().any(|(_, delta)| matches!(delta, haider_protocol::item::ItemDelta::Reasoning { text } if text == "partial replacement reasoning")));
+    for (event, _) in &failed_deltas {
+        assert_eq!(event.payload["provider_request"]["request_ordinal"], 1);
+        assert!(
+            event.payload["provider_request"]["turn_ordinal"]
+                .as_u64()
+                .is_some_and(|ordinal| ordinal > 0)
+        );
+        assert_eq!(event.render.prompt, PromptRender::Omit);
+        assert!(event.committed_at_ms > 0);
+    }
+    let failed_completions = failed_journal
+        .iter()
+        .filter(|event| {
+            event.run_id.as_ref() == Some(&failed_run)
+                && event
+                    .payload
+                    .get("provider_terminal_cause")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("stream_error")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failed_completions.len(),
+        2,
+        "both narrative items retain the actual request terminal cause"
+    );
+    assert!(failed_completions.iter().any(|event| matches!(
+        event.payload.decode_event().expect("failed narrative"),
+        EventPayload::Item(ItemEvent::Completed { item: TurnItem::IncompleteAgentMessage { text, .. }, .. })
+            if text == "partial replacement summary"
+    )));
+    assert_eq!(
+        failed_journal
+            .iter()
+            .filter(
+                |event| ContextCompactionEventPayload::from_payload_value(&event.payload).is_some()
+            )
+            .count(),
+        2,
+        "failed summary never announces a committed overlay"
+    );
+    manager_handle
+        .compact(
+            session_id.clone(),
+            "empty-compact-command".into(),
+            store.worker_generation(),
+            None,
+        )
+        .await
+        .expect_err("no-output summarizer ends without a finish");
+    let empty_run = RunId::new("manual-compact-empty-compact-command");
+    let empty_journal = store
+        .read(&session_id, 0, 512)
+        .await
+        .expect("empty summary journal");
+    let empty_markers = empty_journal
+        .iter()
+        .filter(|event| {
+            event.run_id.as_ref() == Some(&empty_run)
+                && event
+                    .payload
+                    .get("provider_terminal_cause")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("stream_eof")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        empty_markers.len(),
+        2,
+        "terminal marker has a paired lifecycle"
+    );
+    assert_eq!(empty_markers[0].payload["event"], "started");
+    assert_eq!(empty_markers[1].payload["event"], "completed");
+    assert_eq!(empty_markers[0].seq + 1, empty_markers[1].seq);
+    for field in [
+        "item_id",
+        "item",
+        "provider_request",
+        "provider_terminal_cause",
+    ] {
+        assert_eq!(
+            empty_markers[0].payload[field],
+            empty_markers[1].payload[field]
+        );
+    }
+    let empty_terminal = empty_markers[1];
+    assert_eq!(
+        empty_terminal.payload["provider_request"]["request_ordinal"],
+        1
+    );
+    assert!(
+        matches!(empty_terminal.payload.decode_event().expect("terminal marker"),
+            EventPayload::Item(ItemEvent::Completed { item: TurnItem::Extension { kind, .. }, .. })
+                if kind == "provider_round_terminal_v1"
+        )
+    );
+
+    // A stream Finish closes the lifecycle, but only EndTurn completes the
+    // summary. Preserve partial narrative and the exact finish cause for all
+    // unsuccessful finishes without announcing or installing an overlay.
+    for reason in unsuccessful_finishes {
+        let command = format!("unfinished-{reason:?}");
+        let run = RunId::new(format!("manual-compact-{command}"));
+        manager_handle
+            .compact(session_id.clone(), command, store.worker_generation(), None)
+            .await
+            .expect_err("unsuccessful Finish cannot commit a summary");
+        let journal = store
+            .read(&session_id, 0, 1024)
+            .await
+            .expect("finish journal");
+        let completed = journal
+            .iter()
+            .filter(|event| {
+                event.run_id.as_ref() == Some(&run)
+                    && event.payload.get("provider_finish_reason")
+                        == Some(&serde_json::json!(reason))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completed.len(),
+            2,
+            "both emitted narrative sides retain {reason:?}"
+        );
+        assert!(
+            completed.iter().any(|event| matches!(
+                event.payload.decode_event().expect("unfinished text"),
+                EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::IncompleteAgentMessage { text, .. }, ..
+                }) if text == "unfinished summary"
+            )),
+            "{reason:?} must not mark partial summary text complete"
+        );
+        assert!(completed.iter().any(|event| matches!(
+            event.payload.decode_event().expect("reasoning"),
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::Reasoning { summary }, ..
+            }) if summary == "emitted reasoning"
+        )));
+        assert!(completed.iter().all(|event| {
+            event.payload["provider_request"]["request_ordinal"] == 1
+                && event.render.prompt == PromptRender::Omit
+        }));
+        assert!(
+            !journal.iter().any(|event| {
+                event.run_id.as_ref() == Some(&run)
+                    && (ContextCompactionEventPayload::from_payload_value(&event.payload).is_some()
+                        || matches!(
+                            event.payload.decode_event(),
+                            Ok(EventPayload::NodeCommitted(TreeNode {
+                                kind: NodeKind::Compaction { .. },
+                                ..
+                            }))
+                        ))
+            }),
+            "{reason:?} never publishes a compaction announcement or overlay"
+        );
+    }
 
     manager.shutdown().await.expect("manager shutdown");
     hub.shutdown().await.expect("hub shutdown");

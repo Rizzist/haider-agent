@@ -1,0 +1,1914 @@
+
+running 18 tests
+..................
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+
+running 18 tests
+...i..............
+test result: ok. 17 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 75 tests
+{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.........................................................................
+test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.04s
+
+
+running 139 tests
+...{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+....{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+..{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+............................................................................. 87/139
+............... 102/139
+run_json_is_one_stable_typed_stream_summary --- FAILED
+.. 105/139
+replay_is_sealed_at_terminal_before_late_same_run_task_facts --- FAILED
+.................................
+failures:
+
+---- run_json_is_one_stable_typed_stream_summary stdout ----
+
+thread 'run_json_is_one_stable_typed_stream_summary' (34013263) panicked at crates/haider-cli/tests/cli_tests.rs:904:5:
+assertion `left == right` failed
+  left: Some(Object {"provider_finish_reason": String("end_turn"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-c4593c03a7c4c9d804437434a4a34991"), "session_id": String("session-09c475002d4db208b311e4bae019b6df"), "turn_ordinal": Number(1)}, "state": String("done"), "terminal_kind": String("success"), "type": String("run_state")})
+ right: Some(Object {"state": String("done"), "terminal_kind": String("success"), "type": String("run_state")})
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- replay_is_sealed_at_terminal_before_late_same_run_task_facts stdout ----
+
+thread 'replay_is_sealed_at_terminal_before_late_same_run_task_facts' (34013221) panicked at crates/haider-cli/tests/cli_tests.rs:1598:5:
+assertion `left == right` failed
+  left: Some(Object {"provider_finish_reason": String("end_turn"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(2), "run_id": String("run-df1bde916893e8ccdd358da1da44ab02"), "session_id": String("session-8d18d160c32d72b6f6fe5ef4e38b0c98"), "turn_ordinal": Number(1)}, "state": String("done"), "terminal_kind": String("success"), "type": String("run_state")})
+ right: Some(Object {"state": String("done"), "terminal_kind": String("success"), "type": String("run_state")})
+
+
+failures:
+    replay_is_sealed_at_terminal_before_late_same_run_task_facts
+    run_json_is_one_stable_typed_stream_summary
+
+test result: FAILED. 137 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.71s
+
+error: test failed, to rerun pass `-p haider-cli --test cli_tests`
+
+running 87 tests
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+...........{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+............................................................................ 87/87
+
+test result: ok. 87 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 10 tests
+..........
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 81 tests
+....{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+............................................................................
+test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+
+
+running 10 tests
+..........
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.89s
+
+
+running 87 tests
+.........{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+............................................................................ 87/87
+
+test result: ok. 87 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 82 tests
+....{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+............................................................................
+test result: ok. 82 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.74s
+
+
+running 98 tests
+...{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+...{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+................................................................................ 87/98
+...........
+test result: ok. 98 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s
+
+
+running 20 tests
+....................
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 63 tests
+...............................................................
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+
+running 18 tests
+..............
+running 1 test
+.test spawned_daemon_inherits_no_descriptors_beyond_stdio ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.51s
+
+...
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+
+
+running 34 tests
+..................................
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.22s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 66 tests
+..................................................................
+test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 40 tests
+.......i................................
+test result: ok. 39 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 89 tests
+..... 5/89
+cancellation_during_finish_item_close_wins_before_done --- FAILED
+.............. 20/89
+full_turn_commits_exact_projected_sequence --- FAILED
+..... 26/89
+malformed_tool_result_replays_with_the_same_provider_safe_arguments --- FAILED
+. 28/89
+memory_store_allocates_and_reads_committed_sequences --- FAILED
+. 30/89
+malformed_tool_json_is_durable_invalid_result_with_one_repair_continuation --- FAILED
+. 32/89
+non_object_tool_arguments_are_repairable_invalid_calls --- FAILED
+. 34/89
+pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_activity --- FAILED
+...... 41/89
+provider_opaque_state_is_journaled_and_replayed_on_tool_follow_up --- FAILED
+recovered_malformed_tool_keeps_safe_arguments_and_consumed_repair_allowance --- FAILED
+.. 45/89
+recovered_tool_name_correction_survives_a_checkpoint --- FAILED
+. 47/89
+repair_allowance_survives_restart_after_a_new_request_epoch --- FAILED
+repair_recovery_read_failure_leaves_the_checkpoint_recoverable --- FAILED
+repair_reset_store_failure_closes_pending_tools_without_dispatch --- FAILED
+............ 62/89
+second_consecutive_malformed_tool_json_terminates_after_one_repair --- FAILED
+........ 71/89
+tool_name_case_and_underscore_repair_is_reported_in_durable_and_live_result --- FAILED
+tool_name_repair_does_not_resolve_ambiguous_or_unadvertised_names --- FAILED
+...... 79/89
+valid_tool_call_resets_malformed_repair_allowance --- FAILED
+.........
+failures:
+
+---- cancellation_during_finish_item_close_wins_before_done stdout ----
+
+thread 'cancellation_during_finish_item_close_wins_before_done' (34018435) panicked at crates/haider-core/tests/runtime_tests.rs:146:17:
+completed item was not open
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- full_turn_commits_exact_projected_sequence stdout ----
+
+thread 'full_turn_commits_exact_projected_sequence' (34018453) panicked at crates/haider-core/tests/runtime_tests.rs:787:5:
+assertion `left == right` failed
+  left: [Object {"state": String("queued"), "type": String("run_state")}, Object {"attachments": Array [], "mode": String("steer"), "text": String("do the work"), "type": String("user_message")}, Object {"kind": Object {"attachments": Array [], "kind": String("user_turn"), "text": String("do the work")}, "node": String("<node>"), "type": String("node_committed")}, Object {"provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "state": String("thinking"), "type": String("run_state")}, Object {"event": String("started"), "item": Object {"data": Object {"correlation": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "diagnostic": Object {"breakpoint_hashes": Object {"history": String("<hash>"), "system": String("<hash>"), "tools": String("<hash>")}, "cache_domain_hash": String("<hash>"), "control": Object {"state": String("unavailable")}, "history_message_count": Number(0), "prefix_match": Object {"state": String("unavailable")}, "stable_prefix_tokens": Number(3)}, "ordinal": Number(1)}, "item": String("extension"), "kind": String("cache_request_attempt_v1")}, "item_id": String("<item>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"event": String("completed"), "item": Object {"data": Object {"correlation": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "diagnostic": Object {"breakpoint_hashes": Object {"history": String("<hash>"), "system": String("<hash>"), "tools": String("<hash>")}, "cache_domain_hash": String("<hash>"), "control": Object {"state": String("unavailable")}, "history_message_count": Number(0), "prefix_match": Object {"state": String("unavailable")}, "stable_prefix_tokens": Number(3)}, "ordinal": Number(1)}, "item": String("extension"), "kind": String("cache_request_attempt_v1")}, "item_id": String("<item>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"event": String("started"), "item": Object {"data": Object {"budget": Object {"hard_cap": Number(64), "tranche": Number(32)}, "continuation": Object {"run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test")}, "phase": String("progress"), "used": Number(1)}, "item": String("extension"), "kind": String("provider_request_budget_v1")}, "item_id": String("<item>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"event": String("completed"), "item": Object {"data": Object {"budget": Object {"hard_cap": Number(64), "tranche": Number(32)}, "continuation": Object {"run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test")}, "phase": String("progress"), "used": Number(1)}, "item": String("extension"), "kind": String("provider_request_budget_v1")}, "item_id": String("<item>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "state": String("streaming"), "type": String("run_state")}, Object {"event": String("started"), "item": Object {"item": String("agent_message"), "text": String("")}, "item_id": String("<item>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"delta": Object {"delta": String("text"), "text": String("hello")}, "event": String("delta"), "item_id": String("<item>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"event": String("completed"), "item": Object {"item": String("agent_message"), "text": String("hello")}, "item_id": String("<item>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"kind": Object {"kind": String("assistant_commit"), "text": String("hello"), "verdict": Object {"verdict": String("not_applicable")}}, "node": String("<node>"), "parent": String("<node>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("node_committed")}, Object {"event": String("started"), "item": Object {"args": Object {}, "call_id": String("call-1"), "item": String("tool_call"), "name": String("inspect"), "status": String("in_progress")}, "item_id": String("<item>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"event": String("started"), "item": Object {"data": Object {"response_epoch": Number(0), "stream_event": Object {"call_id": String("call-1"), "event": String("tool_call_start"), "name": String("inspect")}}, "item": String("extension"), "kind": String("haider.route_replay_event.v1")}, "item_id": String("<item>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"event": String("completed"), "item": Object {"data": Object {"response_epoch": Number(0), "stream_event": Object {"call_id": String("call-1"), "event": String("tool_call_start"), "name": String("inspect")}}, "item": String("extension"), "kind": String("haider.route_replay_event.v1")}, "item_id": String("<item>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"delta": Object {"delta": String("tool_args"), "fragment": String("{\"path\":\"src/lib.rs\"}")}, "event": String("delta"), "item_id": String("<item>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"event": String("started"), "item": Object {"data": Object {"response_epoch": Number(0), "stream_event": Object {"args_fragment": String("{\"path\":\"src/lib.rs\"}"), "call_id": String("call-1"), "event": String("tool_call_args_delta")}}, "item": String("extension"), "kind": String("haider.route_replay_event.v1")}, "item_id": String("<item>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"event": String("completed"), "item": Object {"data": Object {"response_epoch": Number(0), "stream_event": Object {"args_fragment": String("{\"path\":\"src/lib.rs\"}"), "call_id": String("call-1"), "event": String("tool_call_args_delta")}}, "item": String("extension"), "kind": String("haider.route_replay_event.v1")}, "item_id": String("<item>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"event": String("completed"), "item": Object {"args": Object {"path": String("src/lib.rs")}, "call_id": String("call-1"), "item": String("tool_call"), "name": String("inspect"), "status": String("pending")}, "item_id": String("<item>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"kind": Object {"kind": String("tool_exchange"), "summary": String("tool call settled as Pending"), "tool": String("inspect")}, "node": String("<node>"), "parent": String("<node>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("node_committed")}, Object {"event": String("started"), "item": Object {"data": Object {"response_epoch": Number(0), "stream_event": Object {"call_id": String("call-1"), "event": String("tool_call_end")}}, "item": String("extension"), "kind": String("haider.route_replay_event.v1")}, "item_id": String("<item>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"event": String("completed"), "item": Object {"data": Object {"response_epoch": Number(0), "stream_event": Object {"call_id": String("call-1"), "event": String("tool_call_end")}}, "item": String("extension"), "kind": String("haider.route_replay_event.v1")}, "item_id": String("<item>"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"cached": Number(3), "input": Number(11), "output": Number(7), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "reasoning": Number(2), "request": Object {"cache": Object {"breakpoint_hashes": Object {"history": String("<hash>"), "system": String("<hash>"), "tools": String("<hash>")}, "cache_domain_hash": String("<hash>"), "classification": Object {"class": String("unavailable")}, "control": Object {"state": String("unavailable")}, "history_message_count": Number(0), "prefix_match": Object {"state": String("unavailable")}, "stable_prefix_tokens": Number(3)}, "cached": Number(3), "input": Number(11), "ordinal": Number(1), "output": Number(7), "reasoning": Number(2), "source": String("provider_reported")}, "source": String("provider_reported"), "type": String("usage")}, Object {"event": String("completed"), "item": Object {"data": Object {"reason": String("tool_use")}, "item": String("extension"), "kind": String("provider_round_terminal_v1")}, "item_id": String("<item>"), "provider_finish_reason": String("tool_use"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "type": String("item")}, Object {"provider_finish_reason": String("tool_use"), "provider_request": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "state": String("done"), "type": String("run_state")}]
+ right: [Object {"state": String("queued"), "type": String("run_state")}, Object {"attachments": Array [], "mode": String("steer"), "text": String("do the work"), "type": String("user_message")}, Object {"kind": Object {"attachments": Array [], "kind": String("user_turn"), "text": String("do the work")}, "node": String("<node>"), "type": String("node_committed")}, Object {"state": String("thinking"), "type": String("run_state")}, Object {"event": String("started"), "item": Object {"data": Object {"correlation": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "diagnostic": Object {"breakpoint_hashes": Object {"history": String("<hash>"), "system": String("<hash>"), "tools": String("<hash>")}, "cache_domain_hash": String("<hash>"), "control": Object {"state": String("unavailable")}, "history_message_count": Number(0), "prefix_match": Object {"state": String("unavailable")}, "stable_prefix_tokens": Number(3)}, "ordinal": Number(1)}, "item": String("extension"), "kind": String("cache_request_attempt_v1")}, "item_id": String("<item>"), "type": String("item")}, Object {"event": String("completed"), "item": Object {"data": Object {"correlation": Object {"request_kind": String("primary"), "request_ordinal": Number(1), "run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test"), "turn_ordinal": Number(1)}, "diagnostic": Object {"breakpoint_hashes": Object {"history": String("<hash>"), "system": String("<hash>"), "tools": String("<hash>")}, "cache_domain_hash": String("<hash>"), "control": Object {"state": String("unavailable")}, "history_message_count": Number(0), "prefix_match": Object {"state": String("unavailable")}, "stable_prefix_tokens": Number(3)}, "ordinal": Number(1)}, "item": String("extension"), "kind": String("cache_request_attempt_v1")}, "item_id": String("<item>"), "type": String("item")}, Object {"event": String("started"), "item": Object {"data": Object {"budget": Object {"hard_cap": Number(64), "tranche": Number(32)}, "continuation": Object {"run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test")}, "phase": String("progress"), "used": Number(1)}, "item": String("extension"), "kind": String("provider_request_budget_v1")}, "item_id": String("<item>"), "type": String("item")}, Object {"event": String("completed"), "item": Object {"data": Object {"budget": Object {"hard_cap": Number(64), "tranche": Number(32)}, "continuation": Object {"run_id": String("run-session-test-23-1788583834187-1"), "session_id": String("session-test")}, "phase": String("progress"), "used": Number(1)}, "item": String("extension"), "kind": String("provider_request_budget_v1")}, "item_id": String("<item>"), "type": String("item")}, Object {"state": String("streaming"), "type": String("run_state")}, Object {"event": String("started"), "item": Object {"item": String("agent_message"), "text": String("")}, "item_id": String("<item>"), "type": String("item")}, Object {"delta": Object {"delta": String("text"), "text": String("hello")}, "event": String("delta"), "item_id": String("<item>"), "type": String("item")}, Object {"event": String("completed"), "item": Object {"item": String("agent_message"), "text": String("hello")}, "item_id": String("<item>"), "type": String("item")}, Object {"kind": Object {"kind": String("assistant_commit"), "text": String("hello"), "verdict": Object {"verdict": String("not_applicable")}}, "node": String("<node>"), "parent": String("<node>"), "type": String("node_committed")}, Object {"event": String("started"), "item": Object {"args": Object {}, "call_id": String("call-1"), "item": String("tool_call"), "name": String("inspect"), "status": String("in_progress")}, "item_id": String("<item>"), "type": String("item")}, Object {"event": String("started"), "item": Object {"data": Object {"response_epoch": Number(0), "stream_event": Object {"call_id": String("call-1"), "event": String("tool_call_start"), "name": String("inspect")}}, "item": String("extension"), "kind": String("haider.route_replay_event.v1")}, "item_id": String("<item>"), "type": String("item")}, Object {"event": String("completed"), "item": Object {"data": Object {"response_epoch": Number(0), "stream_event": Object {"call_id": String("call-1"), "event": String("tool_call_start"), "name": String("inspect")}}, "item": String("extension"), "kind": String("haider.route_replay_event.v1")}, "item_id": String("<item>"), "type": String("item")}, Object {"delta": Object {"delta": String("tool_args"), "fragment": String("{\"path\":\"src/lib.rs\"}")}, "event": String("delta"), "item_id": String("<item>"), "type": String("item")}, Object {"event": String("started"), "item": Object {"data": Object {"response_epoch": Number(0), "stream_event": Object {"args_fragment": String("{\"path\":\"src/lib.rs\"}"), "call_id": String("call-1"), "event": String("tool_call_args_delta")}}, "item": String("extension"), "kind": String("haider.route_replay_event.v1")}, "item_id": String("<item>"), "type": String("item")}, Object {"event": String("completed"), "item": Object {"data": Object {"response_epoch": Number(0), "stream_event": Object {"args_fragment": String("{\"path\":\"src/lib.rs\"}"), "call_id": String("call-1"), "event": String("tool_call_args_delta")}}, "item": String("extension"), "kind": String("haider.route_replay_event.v1")}, "item_id": String("<item>"), "type": String("item")}, Object {"event": String("completed"), "item": Object {"args": Object {"path": String("src/lib.rs")}, "call_id": String("call-1"), "item": String("tool_call"), "name": String("inspect"), "status": String("pending")}, "item_id": String("<item>"), "type": String("item")}, Object {"kind": Object {"kind": String("tool_exchange"), "summary": String("tool call settled as Pending"), "tool": String("inspect")}, "node": String("<node>"), "parent": String("<node>"), "type": String("node_committed")}, Object {"event": String("started"), "item": Object {"data": Object {"response_epoch": Number(0), "stream_event": Object {"call_id": String("call-1"), "event": String("tool_call_end")}}, "item": String("extension"), "kind": String("haider.route_replay_event.v1")}, "item_id": String("<item>"), "type": String("item")}, Object {"event": String("completed"), "item": Object {"data": Object {"response_epoch": Number(0), "stream_event": Object {"call_id": String("call-1"), "event": String("tool_call_end")}}, "item": String("extension"), "kind": String("haider.route_replay_event.v1")}, "item_id": String("<item>"), "type": String("item")}, Object {"cached": Number(3), "input": Number(11), "output": Number(7), "reasoning": Number(2), "request": Object {"cache": Object {"breakpoint_hashes": Object {"history": String("<hash>"), "system": String("<hash>"), "tools": String("<hash>")}, "cache_domain_hash": String("<hash>"), "classification": Object {"class": String("unavailable")}, "control": Object {"state": String("unavailable")}, "history_message_count": Number(0), "prefix_match": Object {"state": String("unavailable")}, "stable_prefix_tokens": Number(3)}, "cached": Number(3), "input": Number(11), "ordinal": Number(1), "output": Number(7), "reasoning": Number(2), "source": String("provider_reported")}, "source": String("provider_reported"), "type": String("usage")}, Object {"state": String("done"), "type": String("run_state")}]
+
+---- malformed_tool_result_replays_with_the_same_provider_safe_arguments stdout ----
+
+thread 'malformed_tool_result_replays_with_the_same_provider_safe_arguments' (34018464) panicked at crates/haider-core/tests/runtime_tests.rs:146:17:
+completed item was not open
+
+---- memory_store_allocates_and_reads_committed_sequences stdout ----
+
+thread 'memory_store_allocates_and_reads_committed_sequences' (34018467) panicked at crates/haider-core/tests/runtime_tests.rs:5739:5:
+assertion `left == right` failed
+  left: 11
+ right: 10
+
+---- malformed_tool_json_is_durable_invalid_result_with_one_repair_continuation stdout ----
+
+thread 'malformed_tool_json_is_durable_invalid_result_with_one_repair_continuation' (34018463) panicked at crates/haider-core/tests/runtime_tests.rs:146:17:
+completed item was not open
+
+---- non_object_tool_arguments_are_repairable_invalid_calls stdout ----
+
+thread 'non_object_tool_arguments_are_repairable_invalid_calls' (34018471) panicked at crates/haider-core/tests/runtime_tests.rs:146:17:
+completed item was not open
+
+---- pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_activity stdout ----
+
+thread 'pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_activity' (34018473) panicked at crates/haider-core/tests/runtime_tests.rs:146:17:
+completed item was not open
+
+---- provider_opaque_state_is_journaled_and_replayed_on_tool_follow_up stdout ----
+
+thread 'provider_opaque_state_is_journaled_and_replayed_on_tool_follow_up' (34018479) panicked at crates/haider-core/tests/runtime_tests.rs:146:17:
+completed item was not open
+
+---- recovered_malformed_tool_keeps_safe_arguments_and_consumed_repair_allowance stdout ----
+
+thread 'recovered_malformed_tool_keeps_safe_arguments_and_consumed_repair_allowance' (34018481) panicked at crates/haider-core/tests/runtime_tests.rs:146:17:
+completed item was not open
+
+---- recovered_tool_name_correction_survives_a_checkpoint stdout ----
+
+thread 'recovered_tool_name_correction_survives_a_checkpoint' (34018486) panicked at crates/haider-core/tests/runtime_tests.rs:146:17:
+completed item was not open
+
+---- repair_allowance_survives_restart_after_a_new_request_epoch stdout ----
+
+thread 'repair_allowance_survives_restart_after_a_new_request_epoch' (34018488) panicked at crates/haider-core/tests/runtime_tests.rs:146:17:
+completed item was not open
+
+---- repair_recovery_read_failure_leaves_the_checkpoint_recoverable stdout ----
+
+thread 'repair_recovery_read_failure_leaves_the_checkpoint_recoverable' (34018489) panicked at crates/haider-core/tests/runtime_tests.rs:146:17:
+completed item was not open
+
+---- repair_reset_store_failure_closes_pending_tools_without_dispatch stdout ----
+
+thread 'repair_reset_store_failure_closes_pending_tools_without_dispatch' (34018490) panicked at crates/haider-core/tests/runtime_tests.rs:146:17:
+completed item was not open
+
+---- second_consecutive_malformed_tool_json_terminates_after_one_repair stdout ----
+
+thread 'second_consecutive_malformed_tool_json_terminates_after_one_repair' (34018511) panicked at crates/haider-core/tests/runtime_tests.rs:146:17:
+completed item was not open
+
+---- tool_name_case_and_underscore_repair_is_reported_in_durable_and_live_result stdout ----
+
+thread 'tool_name_case_and_underscore_repair_is_reported_in_durable_and_live_result' (34018520) panicked at crates/haider-core/tests/runtime_tests.rs:146:17:
+completed item was not open
+
+---- tool_name_repair_does_not_resolve_ambiguous_or_unadvertised_names stdout ----
+
+thread 'tool_name_repair_does_not_resolve_ambiguous_or_unadvertised_names' (34018521) panicked at crates/haider-core/tests/runtime_tests.rs:146:17:
+completed item was not open
+
+---- valid_tool_call_resets_malformed_repair_allowance stdout ----
+
+thread 'valid_tool_call_resets_malformed_repair_allowance' (34018528) panicked at crates/haider-core/tests/runtime_tests.rs:146:17:
+completed item was not open
+
+
+failures:
+    cancellation_during_finish_item_close_wins_before_done
+    full_turn_commits_exact_projected_sequence
+    malformed_tool_json_is_durable_invalid_result_with_one_repair_continuation
+    malformed_tool_result_replays_with_the_same_provider_safe_arguments
+    memory_store_allocates_and_reads_committed_sequences
+    non_object_tool_arguments_are_repairable_invalid_calls
+    pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_activity
+    provider_opaque_state_is_journaled_and_replayed_on_tool_follow_up
+    recovered_malformed_tool_keeps_safe_arguments_and_consumed_repair_allowance
+    recovered_tool_name_correction_survives_a_checkpoint
+    repair_allowance_survives_restart_after_a_new_request_epoch
+    repair_recovery_read_failure_leaves_the_checkpoint_recoverable
+    repair_reset_store_failure_closes_pending_tools_without_dispatch
+    second_consecutive_malformed_tool_json_terminates_after_one_repair
+    tool_name_case_and_underscore_repair_is_reported_in_durable_and_live_result
+    tool_name_repair_does_not_resolve_ambiguous_or_unadvertised_names
+    valid_tool_call_resets_malformed_repair_allowance
+
+test result: FAILED. 72 passed; 17 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.05s
+
+error: test failed, to rerun pass `-p haider-core --test runtime_tests`
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 1060 tests
+.................................................i..................................... 87/1060
+...........................i........................................................... 174/1060
+...........................................................
+running 1 test
+............................ 261/1060
+..........
+running 1 test
+..test hooks::tests::hook_secret_child_probe ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1059 filtered out; finished in 0.13s
+
+........................................................................... 348/1060
+.................................i..................................................... 435/1060
+....................................................................................... 522/1060
+....................................................................................... 609/1060
+....................................................................................... 696/1060
+....................................................................................... 783/1060
+....................................................................................... 870/1060
+....................................................................................... 957/1060
+....................................................................................... 1044/1060
+................
+test result: ok. 1057 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 15.86s
+
+
+running 105 tests
+....................................................................................... 87/105
+..................
+test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.47s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+
+running 20 tests
+....................
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.31s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.58s
+
+
+running 38 tests
+......................................
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.75s
+
+
+running 41 tests
+.........................................
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.42s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.09s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.96s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.66s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 10 tests
+..........
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.10s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 33 tests
+..........................
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+
+running 1 test
+..
+running 1 test
+
+running 1 test
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.01s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.01s
+
+..test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.02s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.03s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.03s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+test spawn::log_tests::concurrent_process_writer_child ... 
+ok
+
+test result: oktest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.04s
+
+. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.04s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.04s
+
+.
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 86 tests
+......................................................................................
+test result: ok. 86 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 58 tests
+..........................................................
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 10 tests
+..........
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 260 tests
+....................................................................................... 87/260
+....................................................................................... 174/260
+......................................................................................
+test result: ok. 260 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.70s
+
+
+running 5 tests
+iii..
+test result: ok. 2 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 24 tests
+........................
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+
+
+running 20 tests
+....................
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 2 tests
+ii
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 18 tests
+..................
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 1 test
+i
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+test: live_openai_responses_text_smoke_is_explicitly_gated, ignore_message: live OpenAI smoke; requires HAIDER_LIVE_PROVIDER_TESTS=1
+
+
+running 35 tests
+...................................
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 17 tests
+.................
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 1 test
+i
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+test: live_anthropic_oauth_meter_parses_and_normalizes, ignore_message: live anthropic-oauth usage poll; requires HAIDER_LIVE_USAGE_TESTS=1 + HAIDER_ANTHROPIC_OAUTH_TOKEN
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 25 tests
+.........................
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 10 tests
+..........
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 101 tests
+....................................................................................... 87/101
+..............
+test result: ok. 101 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+
+running 69 tests
+......................
+running 1 test
+test event_store::group_commit_tests::crash_mid_group_loses_the_whole_group_atomically ... ...............................................
+test result: ok. 69 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.39s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.64s
+
+
+running 65 tests
+.................................................................
+test result: ok. 65 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.84s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.95s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+
+running 22 tests
+......................
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 28 tests
+............................
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+
+running 13 tests
+.............
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.64s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+
+running 85 tests
+.....i...............................................................................
+test result: ok. 84 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.57s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
+
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 35 tests
+...................................
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 29 tests
+
+running 1 test
+.test env_view_redacts_secret_names_and_preserves_non_secret_values ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 28 filtered out; finished in 0.00s
+
+.........
+running 1 test
+test process_exec_repository_without_a_git_binary_still_detects_source_mutation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 28 filtered out; finished in 0.01s
+
+...................
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.88s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 30 tests
+..............................
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 28 tests
+............................
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 10 tests
+..........
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 16 tests
+................
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 17 tests
+.................
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 21 tests
+.....................
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 18 tests
+..................
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 31 tests
+...............................
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 22 tests
+......................
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 15 tests
+...............
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 16 tests
+................
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 10 tests
+..........
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 17 tests
+.................
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 15 tests
+...............
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 25 tests
+.........................
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 17 tests
+.................
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+
+running 26 tests
+..........................
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 46 tests
+..............................................
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 49 tests
+.................................................
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+
+
+running 21 tests
+.....................
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.95s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.68s
+
+
+running 2 tests
+.test first_frame_and_cached_p95_are_flat_from_10k_to_200k_rows has been running for over 60 seconds
+.
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 312.01s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 21 tests
+.....................
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 30 tests
+..............................
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 10 tests
+..........
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 21 tests
+.....................
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 13 tests
+.............
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+
+
+running 21 tests
+.....................
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 25 tests
+.........................
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.32s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 7 tests
+......]52;c;aHR0cHM6Ly9hdXRoLm9wZW5haS5jb20veA==.
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 25 tests
+.........................
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 21 tests
+.....................
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+
+running 28 tests
+............................
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 18 tests
+..................
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 15 tests
+...............
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: 2 targets failed:
+    `-p haider-cli --test cli_tests`
+    `-p haider-core --test runtime_tests`

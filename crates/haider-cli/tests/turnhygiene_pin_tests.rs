@@ -1454,3 +1454,79 @@ fn detached_run_journals_the_same_envelopes_as_an_attached_run() {
         "an unattached turn must journal exactly what an attached one does"
     );
 }
+
+/// The normalized narrative is derived from the same durable events in both
+/// JSON doors. Intermediate assistant text and emitted reasoning must survive
+/// the tool boundary, independently of the final `response` convenience field.
+#[test]
+fn journalview_json_and_replay_pin_both_narrative_sides_per_request() {
+    let profile = TestProfile::new();
+    let mut script: Vec<serde_json::Value> = serde_json::from_str(&tool_turn_script()).unwrap();
+    script.insert(
+        0,
+        serde_json::json!({"step":"emit_text", "text":"Before the tool."}),
+    );
+    script.insert(
+        0,
+        serde_json::json!({"step":"emit_reasoning", "text":"Plan the tool."}),
+    );
+    script.insert(
+        5,
+        serde_json::json!({"step":"emit_reasoning", "text":"Check the result."}),
+    );
+    let mut live = profile.command();
+    live.args([
+        "run",
+        "--provider",
+        "fake",
+        "--allow-exec",
+        "--output",
+        "json",
+        "-p",
+        "journalview",
+    ])
+    .env(
+        "HAIDER_TEST_FAKE_PROVIDER",
+        serde_json::to_string(&script).unwrap(),
+    );
+    let output = output_with_boot_retry(&mut live);
+    assert_success(&output, "journalview JSON");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rounds = json["provider_rounds"]
+        .as_array()
+        .expect("normalized rounds");
+    assert_eq!(rounds.len(), 2);
+    for (index, round) in rounds.iter().enumerate() {
+        assert_eq!(round["request_ordinal"], index + 1);
+        assert_eq!(round["turn_ordinal"], 1);
+        assert_eq!(round["session_id"], json["session_id"]);
+        assert_eq!(round["run_id"], json["run_id"]);
+        assert_eq!(round["request_kind"], "primary");
+        for side in ["emitted_text", "reasoning_summary"] {
+            let item = &round[side][0];
+            assert_eq!(item["completed"], true);
+            assert_eq!(item["schema_version"], 1);
+            assert!(item["committed_at_ms"].as_u64().unwrap() > 0);
+            assert!(item["first_seq"].as_u64().unwrap() < item["last_seq"].as_u64().unwrap());
+        }
+    }
+    assert_eq!(rounds[0]["emitted_text"][0]["text"], "Before the tool.");
+    assert_eq!(rounds[0]["reasoning_summary"][0]["text"], "Plan the tool.");
+    assert_eq!(rounds[0]["tool_calls"][0]["call_id"], "golden-exec");
+    assert_eq!(rounds[0]["results"][0]["call_id"], "golden-exec");
+    assert_eq!(rounds[0]["terminal_cause"], "tool_use");
+    assert_eq!(rounds[1]["emitted_text"][0]["text"], "golden tool");
+    assert_eq!(
+        rounds[1]["reasoning_summary"][0]["text"],
+        "Check the result."
+    );
+    assert_eq!(rounds[1]["terminal_cause"], "end_turn");
+    let mut replay = profile.command();
+    replay.args(["run", "--replay", json["run_id"].as_str().unwrap()]);
+    let output = output_with_boot_retry(&mut replay);
+    assert_success(&output, "journalview replay");
+    let replay: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(replay["provider_rounds"], json["provider_rounds"]);
+    assert_eq!(replay["events"], json["events"]);
+    assert_eq!(replay["provider_requests"], 0);
+}

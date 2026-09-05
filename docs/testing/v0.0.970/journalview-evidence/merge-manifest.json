@@ -1,0 +1,452 @@
+{
+  "base": "372a2639fd5ae971d6ecc29f61f7cbe1ad5a0551",
+  "upstream": "73fe3f68f71b6daffffbb330beb9fabd27141cb7",
+  "backup": "/tmp/journalview-merge-forward-an321id4",
+  "files": [
+    {
+      "path": "crates/haider-client/src/client.rs",
+      "resolution": "upstream content",
+      "sha256": "73ef57cf36ea48a114e1bbdba4c0304c228fce463c4072e9cfd6e67fb1ef2f0f"
+    },
+    {
+      "path": "crates/haider-client/src/headless.rs",
+      "resolution": "clean three-way content merge",
+      "sha256": "d0853443560a9520a653dad6f7250b511b36ab7d430a622f1c4e7d73f0c1b7df"
+    },
+    {
+      "path": "crates/haider-client/tests/headless_run_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "a5c892f10ff21a730f83ebd57c1c9d557498cd08cce6a44fee3cc380ba35de65"
+    },
+    {
+      "path": "crates/haider-core/src/sqlite_store.rs",
+      "resolution": "upstream content",
+      "sha256": "ca15febb1cc68d6af895ae67b84590ed439988e7c8b79ced5fdbacdf6c87edf4"
+    },
+    {
+      "path": "crates/haider-daemon/src/binary_upload.rs",
+      "resolution": "upstream content",
+      "sha256": "430571677a93ceee811cc5fa89219cbf40ca8e0acce49a56baab2dc6bcbd8147"
+    },
+    {
+      "path": "crates/haider-daemon/src/connection.rs",
+      "resolution": "upstream content",
+      "sha256": "ad75b6d9dd8369ef8fe7890b73f25a1e3f9f680a36f59b16698cc5891d6cebaa"
+    },
+    {
+      "path": "crates/haider-daemon/src/connection_duplex_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "c1edf80d8ccebc8efd8020930651f2977046964b6cc5cfcd751a25722a88dc1a"
+    },
+    {
+      "path": "crates/haider-daemon/src/connection_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "d7bc4999b373ce97cd19cc1abeab222019e3a97e25a87cd9925fd922e6b1c247"
+    },
+    {
+      "path": "crates/haider-daemon/src/lib.rs",
+      "resolution": "upstream content",
+      "sha256": "a9d2b5d501025a86f6f64c7ff3e11b0fd3d394f80ef7a4397eb550915dee9c1c"
+    },
+    {
+      "path": "crates/haider-daemon/src/session_hub/rpc.rs",
+      "resolution": "upstream content",
+      "sha256": "d45e74296db8a2ac72f6f544d5d48d7ea8d6a1deeed48fcb5e3cef9c2b342cef"
+    },
+    {
+      "path": "crates/haider-rpc/src/binary_artifact.rs",
+      "resolution": "upstream content",
+      "sha256": "138439f62b3fdc66ac1a063b078529fbd5cd0179788e391d45a3c280ffd20c73"
+    },
+    {
+      "path": "crates/haider-rpc/src/codec.rs",
+      "resolution": "upstream content",
+      "sha256": "3f09ea8756a3c7f59a28dabb7c8cf85824e868637f2f368389809cdcd21720d8"
+    },
+    {
+      "path": "crates/haider-rpc/src/frame.rs",
+      "resolution": "upstream content",
+      "sha256": "4c5b365b939029937a81cc469aff9cc07c977865df4eabf0a7c3ce15bdab5376"
+    },
+    {
+      "path": "crates/haider-rpc/src/lib.rs",
+      "resolution": "upstream content",
+      "sha256": "f945ec019a4372794365fe938f22c357f7715d9311274679874c5c22846ee350"
+    },
+    {
+      "path": "crates/haider-rpc/src/uds_codec.rs",
+      "resolution": "upstream content",
+      "sha256": "1158250a6f8d2d046c1e2407135458926d0bf3887c46f6ebb0e413bfcc70bcb4"
+    },
+    {
+      "path": "crates/haider-store/src/cas.rs",
+      "resolution": "upstream content",
+      "sha256": "8da56df7ca889ad511f2bd85eb495adbbfcb82163c2159b7a3b454ae08755b18"
+    },
+    {
+      "path": "crates/haider-store/src/cas_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "78f74c11a0b90a98eb876c96bc19b0f90c1fa48413bbd852b5028fdf83dcd55c"
+    },
+    {
+      "path": "crates/haider-store/src/event_store.rs",
+      "resolution": "clean three-way content merge",
+      "sha256": "140f6f43d10385de1e636e1e74058d0b889dbfc8ca6aeca78f7ad6e6aa14f96e"
+    },
+    {
+      "path": "crates/haider-store/src/event_text_cas.rs",
+      "resolution": "upstream content",
+      "sha256": "e314bd920f30f1741bcd4b33d6249bc41b0ebd4bc36f57e3250cfc1b08dbf42f"
+    },
+    {
+      "path": "crates/haider-store/src/event_text_cas_tests.rs",
+      "resolution": "upstream content",
+      "sha256": "7070e444ad711f2eb52abe0444e18290910b99468cabc04ef62a12bf0bb17431"
+    },
+    {
+      "path": "crates/haider-store/src/lib.rs",
+      "resolution": "upstream content",
+      "sha256": "328c998bc3290ac8b7b37f290ff18635cdfa45a2e13093f7069ce3fae4ade8e6"
+    },
+    {
+      "path": "docs/client-contract-v1.md",
+      "resolution": "upstream content",
+      "sha256": "cfa21d9ea506986a5987359248bc5057ec51ddd5afbadfa77f0060263221a5cc"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/casstream-source-sha256.json",
+      "resolution": "upstream content",
+      "sha256": "8df5e6a24aceafd8d42c8d722c3e6ecaa771f4da210f56eb2f78259d662b163b"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/daemon-core-compile-fixed.log",
+      "resolution": "upstream content",
+      "sha256": "0e8a399497f7c52fc3429f2dd1c8338824e62fdca583dec3aa53f312646e54fa"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/daemon-core-feature-pin-fixed.log",
+      "resolution": "upstream content",
+      "sha256": "df8a54c34d2cb9c506ec22790c39a0b0b8214f435f8e51b55fca4ad9a73f89ca"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/diff-check.log",
+      "resolution": "upstream content",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/final-binaries.log",
+      "resolution": "upstream content",
+      "sha256": "f41bea97228a7d09a96ec28bebcda08a624ac7fa77894034fa28bfebf2cc7c63"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/fmt.log",
+      "resolution": "upstream content",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/host.json",
+      "resolution": "upstream content",
+      "sha256": "8a4d2e49af72713f6c79f18bfc0fb7a15bf893d18a5c98f4258c5d7b896a2dd5"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-1-binary_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "b020a0e64be2c65a451a4d0d3b0573305ded867982ecb57880bc8f4b512cd6e8"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-1-binary_single.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "e00a17974b6be7cbaa52668948d91a3800e14bfd52656a48e5f6850f6a909cd9"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-1-legacy_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "a55d012962648cb68ab1bcb722a143954b4fb1b96336a9b0dd3fbdb349a38b30"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-1-legacy_single.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "47d050af22d87b1f251921ec0a9365ced59b796886b64c5b84ab2a5cc52326cb"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-2-binary_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "33729059026209748ebf3d943da8551b636deeeec0b7e9b1390642e3a43a7f09"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-2-binary_single.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "0a9651d6b885e81ee6c17a87f7611ee301231d4d63f541057019e5ff9c9d1f87"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-2-legacy_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "5124337daecb301765bd6c3528a674e644214eb046709ca1339e6ef70f305701"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-2-legacy_single.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "9754336ae9a8c18cfaa425709e2ac32ff4a531478bf8c6cac13601ff0d26ef7f"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-3-binary_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "6ec3585b9b911255d5126e113c18708d7368a1be6416db7da05e7f008a720117"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-3-binary_single.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "fd599dd04b0a99ad89e546a22638f5755d9a1cb3544aaf167215df7eb4ca4d5e"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-3-legacy_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "e10b4dba21508261d835f0349f07f2e27d07872a11a1a547e575549ff5de1e6b"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-3-legacy_single.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "8b6087820af887d48b08da2957ceb6a7517d683bae2a110a29e806a8ef16106c"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-1-binary_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "f38907a8c1001a3fe70fa423c780152917016bfcfaac4fe33fe57b2c530718bd"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-1-binary_single.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "2e97ed269767adb0e936dcac0c46639f38e5f9065afdac5080207190fd4dc536"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-1-legacy_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "e21fdd3148626fdd86e425a6bf24bb95355dffcfb08f0510ac195a6c881615fe"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-1-legacy_single.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "96f6234732f01186cb4b0a8a57c3c023d89352f005ddfe8744fbcb3c4af1eb80"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-2-binary_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "22626326df3ebfa18d114963d74b403b18e3d974843c412ba3b17cdb9f08c507"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-2-binary_single.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "1007320952cd31924b621b1a726e6aa6d2d385cfdcf118ae6559d3f899d54176"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-2-legacy_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "df6c46a40bbd5d7c17635b294b80438ba14898bdd27ba89d3c77f82a27ed5310"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-2-legacy_single.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "80ac525c5a198065a91ae3355571f12434574961b64edcdc61656a8b727b75c2"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-3-binary_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "9463dd2a4ccdee16b5a9cd60c9b3b65cbb409c076a349ec562ceeb65c375351e"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-3-binary_single.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "b5f81aa5ba2551e84d348b6e05439c022993b939942c7270062c4bb86a49bb08"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-3-legacy_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "429dd84628a26f9986adeb83bb33eefdb23f363113859b74b4be92c625a5c7f7"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-3-legacy_single.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "6fb10edf5a60291d2ebf7ace5a0588d2adbf7b375619f642c8367b953675b153"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-load-blocked.stdout.log",
+      "resolution": "upstream content",
+      "sha256": "ee3317d62acd6a7944b1cc5dfe2c37c05d50e2b2976e398a647692df97f6baa8"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-overload-1-1-legacy_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "d23df2d1ba517073cb6acd47f7cad4b4f3cebfb78d774576ad38733af7f270c3"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-overload-1-1-legacy_single.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "ecba4cfcb967646614358e60807aaa98467ef5525104d626b4bd70a7bc27e5f9"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-overload-1.json",
+      "resolution": "upstream content",
+      "sha256": "1863776c3e5710c573c03bad69ba3c22fae13a8c60774748ce8705e5fa572909"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-overload-1.stdout.log",
+      "resolution": "upstream content",
+      "sha256": "2e4fd0ab6ad256dfa8891dad3f85fd194ac64896391cb62ca635c134e568feea"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged-summary.json",
+      "resolution": "upstream content",
+      "sha256": "59be3859c6b85d9274314351e1b49696677d34ad55bd00caa92cc8ca558f079d"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged.json",
+      "resolution": "upstream content",
+      "sha256": "cbdd94876731816237e5da85a95a7b2eebfc10f2ec41a60e4653a843bc8343bc"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-merged.stdout.log",
+      "resolution": "upstream content",
+      "sha256": "fcfef2bd024b21478d5a20a419a87b7551cf8a335d9c7b5802c38b1402200c3d"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-premerge-full-summary.json",
+      "resolution": "upstream content",
+      "sha256": "6e1348ed4cda3f8b3897e0916319184804c4f2e36f1b41068c5ee45c93567a97"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements-premerge-summary.json",
+      "resolution": "upstream content",
+      "sha256": "b783600ddb11ae09f84050d753d1f514ee0ca27923d672fc7c87251e10b6b82a"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements.json",
+      "resolution": "upstream content",
+      "sha256": "14d0f0ed704597a46ba945cc457348a661d7d37e67404dfb54d39e412f602150"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/measurements.stdout.log",
+      "resolution": "upstream content",
+      "sha256": "338591b203d7c85a4721d802dd3f57719fa86e43e80c42780be297d51cd45867"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/merge-forward.log",
+      "resolution": "upstream content",
+      "sha256": "c492b62e84c9b66e2c18525e658621003aab0845ff140380b5b99f88489eba04"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/merged-clippy.log",
+      "resolution": "upstream content",
+      "sha256": "822d67c04dd50494bfbf4c432e065fd2447599c36fc3475774fc55dd85af2a9b"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/merged-golden-regeneration.log",
+      "resolution": "upstream content",
+      "sha256": "2c7d31860c05be7599708fee2c296058ff5badf7448759c7cc8aed4ba0b99695"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/merged-preexisting-ignores.txt",
+      "resolution": "upstream content",
+      "sha256": "c1e5c52b9763f34d50404c6facaed0fd6b3e69a3f74146172ee1d29516934042"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/merged-test-summary.json",
+      "resolution": "upstream content",
+      "sha256": "d3a1f6910e70d740868d85f36ca2eb77130b259520665c94f5ccebed3068d8e6"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/merged-tests.log",
+      "resolution": "upstream content",
+      "sha256": "81bd18b3d94f6f34a9712afa76011f97b5b2059a9a6faf259f58658763b76fc3"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/premerge/clippy.log",
+      "resolution": "upstream content",
+      "sha256": "9d7e06f3fdc94f93bdf33868e48e87ace2863ee9235a49dd9ddbf384eb16f0dc"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/premerge/daemon-core-tests.log",
+      "resolution": "upstream content",
+      "sha256": "b16ae6ef8b1f901f70eb7d24ea83937c2f40369847891b74c4c13b7ec33602c7"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/premerge/final-binaries.log",
+      "resolution": "upstream content",
+      "sha256": "a846723a77de3441ca86558aa92dc02fcacbba276f4a5f94a1d4d13e9def66fc"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/premerge/fmt.log",
+      "resolution": "upstream content",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/premerge/golden-regeneration.log",
+      "resolution": "upstream content",
+      "sha256": "0c3ad74042cb0ad069361e234580d7eb932a93a1c72cc6de55886e0321d011bf"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/premerge/rpc-client-tests.log",
+      "resolution": "upstream content",
+      "sha256": "78b876f695fe4aa23685ba01e436d084a380caf87952d25e5a4d6d46d69cf840"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/premerge/store-tests.log",
+      "resolution": "upstream content",
+      "sha256": "45a1128a50bfa9aed5d1e09fe271ea7d8a7f8611c0daebb7e0531f4de044aa2f"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/premerge/test-count.log",
+      "resolution": "upstream content",
+      "sha256": "f230ad40037c373e3b66127e2ce0abfe807f963d8fe6eb3b6154c80850262e35"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-evidence/test-count.log",
+      "resolution": "upstream content",
+      "sha256": "0483952ce67aaebdf3bd41a2d2cb6c17725ca659b1fe8d47b63809dea4edbeea"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-smoke-1-legacy_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "0a1c0599767bc71dc650daa4c43c48ffdc5f0d0c1e7acf60067f7bcb46705cef"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-smoke2-1-legacy_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "9fbb4e958684f35e0255b81b131accfffa9cec15c6984d697801919a1d4e180d"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-smoke3-1-binary_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "9987070110ee62ba92e4b3f066483364e74030582fda24f101f5978a4bf04de4"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-smoke3-1-binary_single.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "fb76555367fc6bb92003165f8a17ac0aeec29ced706bf23909567a5f7a87aab6"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-smoke3-1-legacy_eight.daemon.log",
+      "resolution": "upstream content",
+      "sha256": "49b6987969ca4fde27f56dd2f8988c7708fba382cb6f012d978f3561c13db724"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream-smoke3.json",
+      "resolution": "upstream content",
+      "sha256": "f276c7b396a3adccb90502eff49c8d902f4d6435b382571a865f0b431c4cffbb"
+    },
+    {
+      "path": "docs/testing/v0.0.970/casstream.md",
+      "resolution": "upstream content",
+      "sha256": "0b7b99a836f12f3c819e2438c59a26a227f22c9f6ec127a14886c3d31206236a"
+    },
+    {
+      "path": "scripts/qa-gate/casstream_bench.py",
+      "resolution": "upstream content",
+      "sha256": "0e3975ec296785689bd89a753456f76eec1414fe5d718adec5cca159ef584204"
+    },
+    {
+      "path": "test-baseline.txt",
+      "resolution": "retained pending xtask recount",
+      "sha256": "8801b6dcc1bd1930efee1452005c2ef50787922ec33ad2c457ce8712f95bc3d5"
+    }
+  ]
+}
