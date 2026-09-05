@@ -1,0 +1,146 @@
+{
+  "counting_note": "Summed libtest summaries include nested subprocess probes; this is not a count of unique source test markers.",
+  "crates": [
+    {
+      "crate": "haider-protocol",
+      "log": "haider-protocol.log",
+      "passed": 176,
+      "failed": 0,
+      "ignored": 0,
+      "summary_count": 13
+    },
+    {
+      "crate": "haider-core",
+      "log": "haider-core.log",
+      "passed": 287,
+      "failed": 0,
+      "ignored": 1,
+      "summary_count": 18
+    },
+    {
+      "crate": "haider-rpc",
+      "log": "input-mirror-haider-rpc.log",
+      "passed": 166,
+      "failed": 0,
+      "ignored": 0,
+      "summary_count": 16
+    },
+    {
+      "crate": "haider-store",
+      "log": "haider-store.log",
+      "passed": 298,
+      "failed": 0,
+      "ignored": 0,
+      "summary_count": 26
+    },
+    {
+      "crate": "haider-client",
+      "log": "input-mirror-haider-client.log",
+      "passed": 150,
+      "failed": 0,
+      "ignored": 0,
+      "summary_count": 10
+    },
+    {
+      "crate": "haider-tools",
+      "log": "haider-tools.log",
+      "passed": 237,
+      "failed": 0,
+      "ignored": 1,
+      "summary_count": 22
+    },
+    {
+      "crate": "haider-provider",
+      "log": "haider-provider.log",
+      "passed": 403,
+      "failed": 0,
+      "ignored": 7,
+      "summary_count": 16
+    },
+    {
+      "crate": "haider-verify",
+      "log": "haider-verify.log",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "summary_count": 4
+    },
+    {
+      "crate": "haider-accounts",
+      "log": "haider-accounts.log",
+      "passed": 37,
+      "failed": 0,
+      "ignored": 1,
+      "summary_count": 5
+    },
+    {
+      "crate": "haider-platform",
+      "log": "haider-platform.log",
+      "passed": 42,
+      "failed": 0,
+      "ignored": 0,
+      "summary_count": 10
+    },
+    {
+      "crate": "haider-pdf",
+      "log": "haider-pdf.log",
+      "passed": 11,
+      "failed": 0,
+      "ignored": 0,
+      "summary_count": 3
+    },
+    {
+      "crate": "haider-stt",
+      "log": "haider-stt.log",
+      "passed": 78,
+      "failed": 0,
+      "ignored": 0,
+      "summary_count": 12
+    },
+    {
+      "crate": "haider-tui",
+      "log": "input-mirror-haider-tui.log",
+      "passed": 1452,
+      "failed": 0,
+      "ignored": 0,
+      "summary_count": 143
+    },
+    {
+      "crate": "xtask",
+      "log": "xtask.log",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "summary_count": 1
+    },
+    {
+      "crate": "haider-daemon",
+      "log": "input-mirror-haider-daemon.log",
+      "passed": 1188,
+      "failed": 0,
+      "ignored": 3,
+      "summary_count": 6
+    },
+    {
+      "crate": "haider-daemond",
+      "log": "input-mirror-haider-daemond.log",
+      "passed": 154,
+      "failed": 0,
+      "ignored": 0,
+      "summary_count": 19
+    },
+    {
+      "crate": "haider-cli",
+      "log": "input-mirror-haider-cli.log",
+      "passed": 748,
+      "failed": 0,
+      "ignored": 0,
+      "summary_count": 15
+    }
+  ],
+  "totals": {
+    "passed": 5430,
+    "failed": 0,
+    "ignored": 13
+  }
+}

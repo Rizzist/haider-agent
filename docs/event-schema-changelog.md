@@ -434,6 +434,30 @@ not all been called out together in this ledger. Their schema status is:
   because this is an additive nested field on an existing payload kind.
 
 
+### v0.0.970 — public operator-authored agent spawn
+
+Optional `HeadlessRunSpecV1.agent_spawn` is omitted for legacy specs and gated
+by `agent_cli_v1`. It persists task/prompt and optional model/provider/type/
+workflow/trigger inputs in the existing headless acceptance receipt. A
+coordinator executes the native spawn tool and publishes ordinary
+`AgentSpawned`, `ChildSpawn`, `AgentReport`, and `ChildResult` facts without a
+parent provider request. The durable child manifest coordinate
+`public_headless: true` selects autonomous input handling and is inherited by
+its descendants. `public_operator_spawn: true` marks only the directly
+admitted child and preserves the broker/recovery boundary without granting
+descendants standalone workflow admission. Existing event kinds, sequence authority, schema version,
+and ordinary provider-authored child behavior are unchanged.
+
+### v0.0.970 — surface-watch caller identity (RPC only)
+
+`SessionSurfaceWatching` optionally carries `caller_owner`, the actual caller's
+daemon-minted connection identity, distinct from the adopted input's publisher.
+The TUI learns this identity at its existing watch-adoption barrier before
+publishing local input, with request-session and connection-epoch checks. A
+delayed self-echo cannot erase newer typing, and matching foreign text/revisions
+cannot rename the caller. Older responses omit the field and retain the prior
+compatibility path. This adds no durable event kind or schema-version bump.
+
 ### v0.0.970 — logical request budgets and continuation
 
 Additive extension kind `provider_request_budget_v1` uses the existing

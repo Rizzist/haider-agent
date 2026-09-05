@@ -852,6 +852,15 @@ the APK convention.
 - `session.surface_watch` returns the complete current input/status baseline in
   its response. Every `SessionSurfaceDelta` is also a complete latest snapshot,
   not a patch. Either `None` clears that surface.
+  Since v0.0.970, the response optionally includes `caller_owner`, the caller's
+  daemon-minted connection identity. This is distinct from `input.owner`, which
+  identifies the publisher of the adopted snapshot. Establish caller identity
+  at the watch acknowledgement before publishing local edits, and correlate
+  that acknowledgement to its requested session and connection epoch. Ignore
+  subsequent input echoes with that caller identity while continuing to apply
+  current foreign-owner updates. Equal text or revision numbers do not identify
+  the publisher. Older responses omit the field; the TUI retains its previous
+  exact-echo inference only for that legacy path. Identity resets on reconnect.
 - every View or Control connection receives exactly one required
   `ResidentSessionBinding` baseline after `Welcome`, even when no publisher has
   ever bound. Later values are unsolicited required pushes.
@@ -3500,6 +3509,15 @@ quota, toggle-boundary, and subagent rules.
 
 ## 21. Additive changelog
 
+### 2026-09-05 — v0.0.970 public agent/workflow surface
+
+- Added the public CLI mappings and negotiated operator-authored spawn pin
+  described in section 22. Legacy headless specs omit the pin and retain their
+  existing serialized form and execution behavior.
+- Added optional `caller_owner` to the existing surface-watch response. The
+  watch adoption barrier establishes input-mirror identity before local edits
+  can produce delayed self-echoes; session/epoch correlation rejects old replies.
+
 ### 2026-09-03 — v0.0.970 positive daemon readiness
 
 - `status.snapshot` adds optional/default-compatible `ready_since` and
@@ -3567,3 +3585,60 @@ receipt replay stays idempotent. This is distinct from read-only `--replay`
 and from `run.retry`, which retries the original prompt. Interactive/branch
 users submit the next turn on their existing timeline; parents continue a
 bound child with `message_subagent` in the child's existing session.
+
+## 22. Public agent/workflow CLI and operator-authored delegation
+
+The public verbs are `haider agent spawn|list|message|cancel|wait` and
+`haider workflow run|status|list`. Their flags, JSON schemas, exit statuses,
+timeouts, and follow-up report provenance are normative in
+[the automation contract](automation-contract-v1.md#public-agent-and-workflow-commands-v00970).
+
+Spawn/run require `agent_cli_v1` before submitting the additive
+`HeadlessRunSpecV1.agent_spawn` pin through `headless.run.start`. The pin is
+an object with required `task`/`prompt` and optional `model`, `provider`,
+`agent_type`, `workflow`, and `workflow_trigger` strings. It is persisted in
+the existing headless acceptance transaction and receipt. Omission preserves
+the ordinary provider-driven headless turn. A client MUST NOT send the pin
+to an older daemon that would ignore it.
+
+The pin identifies an operator-authored tool invocation, not an assistant
+provider response. The coordinator executes one canonical `spawn_subagent`
+through the broker and deferred-child machinery; it makes no parent provider
+request. Existing model/type validation, grants, provider ceilings, durable
+effect ordering, and recursion limits apply. The original delegation returns
+the existing `AgentSpawned`, `ChildSpawn`, `AgentReport`, and completed
+`ChildResult` facts, followed by the coordinator's terminal. Results and IDs
+are read from durable envelopes, never parsed from assistant prose or derived
+from opaque ID formats. Recovery recognizes the pinned coordinator and resumes
+its stable tool identity / child checkpoint instead of issuing a parent model
+request or spawning a second child.
+
+Public children carry a durable `public_headless` manifest coordinate and use
+autonomous input handling, inherited by their descendants. Ordinary
+provider-authored children retain their existing delegated-menu behavior.
+The direct child also carries `public_operator_spawn: true`, which records
+the operator admission boundary and is not inherited by model-created
+descendants. Recovery uses that boundary to fence dispatch until the parent
+broker outcome exists, or settle a partial child if its parent cannot resume.
+For public children, a question without a default commits
+`no_human_available` as a rejected tool result, closes the menu, restores
+streaming and feeds the result to the provider. Clients MUST continue waiting
+for the eventual typed terminal and must not turn this intermediate rejection
+into a terminal agent failure.
+
+Public workflow run uses the same child path with an explicit selector and
+trigger. A standalone public child pins the admitted workflow without inventing
+a parent graph evidence slot. Existing provider-authored child workflows keep
+their parent-attempt/slot requirements. Unknown selectors and trigger fallback
+are rejected for public workflow execution. Catalog workflows with human
+confirmation nodes are rejected rather than dropping those gates. `workflow list` reads the native
+`loom.list.workflow_catalog`; status reads `graph.status` and
+`workflow.graph.state`, preserving null typed activation when absent.
+
+List reads `session.fleet`; message/cancel retain their existing Control
+attachment, direct-child ownership and receipt rules. Wait uses bounded
+`session.read` pages and the sole `RawEnvelope.seq` cursor. A successful
+initial wait requires both the exact child's terminal and the parent's
+completed `ChildResult`; fleet state alone is insufficient. Negotiated
+connections continue servicing keepalive during observation. Command timeout
+or disconnect does not transfer daemon work ownership to the client.

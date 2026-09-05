@@ -1,0 +1,185 @@
+{
+  "id": "t0.tui.login_paths",
+  "area": "tui",
+  "status": "PASS",
+  "evidence": [
+    {
+      "label": "anthropic_api_key_card",
+      "status": "PASS",
+      "evidence_line": "/login anthropic api key_card expected=true actual=true sizes=118x36,80x24 journal_delta(events=0,receipts=0,sessions=0) alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "artefacts": []
+    },
+    {
+      "label": "anthropic_method_choice",
+      "status": "PASS",
+      "evidence_line": "/login anthropic method_choice expected=true actual=true sizes=118x36,80x24 journal_delta(events=0,receipts=0,sessions=0) alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "artefacts": []
+    },
+    {
+      "label": "kimi_oauth_only_refusal",
+      "status": "PASS",
+      "evidence_line": "/login kimi api refusal_remedy expected='/login kimi oauth' actual=true sizes=118x36,80x24 journal_delta(events=0,receipts=0,sessions=0) alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "artefacts": []
+    },
+    {
+      "label": "custom_fields",
+      "status": "PASS",
+      "evidence_line": "/login custom reaches name/base-URL/key expected=true actual=true sizes=118x36,80x24 journal_delta(events=0,receipts=0,sessions=0) alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "artefacts": []
+    },
+    {
+      "label": "masked_key_non_disclosure",
+      "status": "PASS",
+      "evidence_line": "sentinel submitted=true frame_flash_hits=0 journal_store_hits=[] masked_expected=true actual=true journal_delta(events=0,receipts=1,sessions=0) alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "artefacts": []
+    },
+    {
+      "label": "no_orphan_daemons",
+      "status": "PASS",
+      "evidence_line": "no_orphan_daemons pids=72204 stop=stopped_cleanly alive_after=false",
+      "artefacts": []
+    }
+  ],
+  "wall_ms": 21078,
+  "artefacts": [],
+  "timed": false,
+  "measurement_accepted": null,
+  "budget": {
+    "total_ms": 391500,
+    "parts": [
+      {
+        "name": "daemon startup deadline",
+        "milliseconds": 30000,
+        "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "daemon stop timeout",
+        "milliseconds": 20000,
+        "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+      },
+      {
+        "name": "post-stop process-exit observation grace",
+        "milliseconds": 2000,
+        "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+      },
+      {
+        "name": "post-stop process-exit observation grace",
+        "milliseconds": 2000,
+        "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+      }
+    ]
+  },
+  "segments": 1,
+  "turns_expected": 0,
+  "expected_fail_until": null
+}

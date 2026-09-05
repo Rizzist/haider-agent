@@ -1,5 +1,332 @@
 #![allow(clippy::expect_used)]
 
+#[tokio::test]
+async fn public_workflow_catalog_human_templates_have_explicit_headless_refusal() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let parent = SessionId::new("public-catalog-parent");
+    let run = RunId::new("public-catalog-run");
+    accept_parent_with_interaction_mode(
+        &hub,
+        &parent,
+        &run,
+        "public-catalog",
+        haider_protocol::session::SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    let mut pin = store
+        .read(&parent, 0, 1)
+        .await
+        .expect("seed envelope")
+        .remove(0);
+    pin.seq = 0;
+    pin.event_id = EventId::new("public-catalog-pin");
+    pin.run_id = Some(run.clone());
+    pin.payload = serde_json::json!({"type":"headless_run_configured","cwd":test_cwd(),"provider":"fake","model":"fake-model","max_output_tokens":4096,"agent_spawn":{"task":"workflow","prompt":"work"}}).into();
+    hub.append(std::slice::from_mut(&mut pin))
+        .await
+        .expect("pin");
+    let delegation = DelegationHandle::new(hub.clone());
+    for entry in haider_protocol::graph::built_in_workflow_catalog()
+        .into_iter()
+        .filter(|entry| entry.main_session_eligible)
+    {
+        let result = delegation.establish(SpawnCoordinates {
+            parent_session_id:parent.clone(), parent_run_id:run.clone(), parent_branch_id:None, parent_agent_id:None,
+            tool_item_id:haider_protocol::ids::ItemId::new(format!("tool-{}",entry.template.name)), call_id:format!("call-{}",entry.template.name),
+            metadata:hub.session_metadata(&parent).await.expect("metadata").expect("parent"), agent_type:None, lockdown:false, auto_hermetic:false,
+        }, SpawnSubagent::from_tool_args(serde_json::json!({"task":"workflow","prompt":"work","workflow":format!("workflow_ref({})",entry.template.name),"workflow_trigger":"dependent_phases"})).expect("workflow request")).await;
+        let error = result.err().expect("human workflow refused");
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("kind"))
+                .and_then(serde_json::Value::as_str),
+            Some("child_human_gate_forbidden"),
+            "{} must be recognized, then refused for its human gate",
+            entry.template.name
+        );
+    }
+    assert!(
+        hub.delegations_for_parent_run(parent, run)
+            .await
+            .expect("children")
+            .is_empty()
+    );
+    drop(delegation);
+    hub.shutdown().await.expect("hub close");
+    store.close().await.expect("store close");
+}
+
+async fn public_spawn_establishment_restart(
+    fail_before_accept: bool,
+    parent_cancelled: Option<bool>,
+) {
+    use haider_protocol::ids::ItemId;
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let parent = SessionId::new("public-recovery-parent");
+    let run = RunId::new("public-recovery-run");
+    accept_parent_with_interaction_mode(
+        &hub,
+        &parent,
+        &run,
+        "public-recovery",
+        haider_protocol::session::SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    let mut pin = store
+        .read(&parent, 0, 1)
+        .await
+        .expect("seed envelope")
+        .remove(0);
+    pin.seq = 0;
+    pin.event_id = EventId::new("public-recovery-pin");
+    pin.run_id = Some(run.clone());
+    pin.payload = serde_json::json!({"type":"headless_run_configured", "cwd":test_cwd(), "provider":"fake","model":"fake-model","max_output_tokens":4096,"agent_spawn":{"task":"test","prompt":"test prompt"}}).into();
+    hub.append(std::slice::from_mut(&mut pin))
+        .await
+        .expect("pin");
+    let coordinates = |metadata| SpawnCoordinates {
+        parent_session_id: parent.clone(),
+        parent_run_id: run.clone(),
+        parent_branch_id: None,
+        parent_agent_id: None,
+        tool_item_id: ItemId::new("public-recovery-tool"),
+        call_id: "public-recovery-call".into(),
+        metadata,
+        agent_type: None,
+        lockdown: false,
+        auto_hermetic: false,
+    };
+    let request = SpawnSubagent::from_tool_args(if parent_cancelled.is_some() {
+        serde_json::json!({"task":"test","prompt":"test prompt","workflow":"deeper","workflow_trigger":"dependent_phases"})
+    } else {
+        serde_json::json!({"task":"test","prompt":"test prompt"})
+    })
+    .expect("spawn request");
+    let metadata = hub
+        .session_metadata(&parent)
+        .await
+        .expect("metadata")
+        .expect("parent");
+    let delegation = if fail_before_accept {
+        DelegationHandle::fail_after_establishment_row(hub.clone())
+    } else {
+        DelegationHandle::new(hub.clone())
+    };
+    let first = delegation
+        .establish(coordinates(metadata), request.clone())
+        .await;
+    assert_eq!(first.is_err(), fail_before_accept);
+    let record = hub
+        .delegations_for_parent_run(parent.clone(), run.clone())
+        .await
+        .expect("records")
+        .remove(0);
+    assert_eq!(
+        store
+            .turn_ordinal(record.child_session_id.clone(), record.child_run_id.clone())
+            .await
+            .expect("ordinal")
+            .is_none(),
+        fail_before_accept
+    );
+    if let Some(terminal) = parent_cancelled {
+        store
+            .cancel_turn(TurnCancelCommand {
+                command_id: "public-recovery-parent-cancel".into(),
+                request_digest: "public-recovery-parent-cancel-digest".into(),
+                request_json: r#"{"reason":"test interrupted establishment cancellation"}"#.into(),
+                session_id: parent.clone(),
+                worker_generation: store.worker_generation(),
+                run_id: run.clone(),
+                cancelling_event_id: EventId::new("public-recovery-parent-cancelling"),
+                device_id: DeviceId::new("public-recovery-device"),
+            })
+            .await
+            .expect("seed durable parent cancellation without live child cleanup");
+        if terminal {
+            let payloads =
+                crate::turn_recovery::cancelled_resumption_payloads(&store, &parent, &run)
+                    .await
+                    .expect("parent cancellation closure");
+            let mut envelopes = payloads
+                .into_iter()
+                .enumerate()
+                .map(|(index, payload)| {
+                    let mut envelope = pin.clone();
+                    envelope.seq = 0;
+                    envelope.event_id = EventId::new(format!("parent-cancel-terminal-{index}"));
+                    if matches!(payload, EventPayload::SessionState(_)) {
+                        envelope.run_id = None;
+                    }
+                    envelope.payload = serde_json::to_value(payload).expect("payload").into();
+                    envelope
+                })
+                .collect::<Vec<_>>();
+            store.append(&mut envelopes).await.expect("parent terminal");
+        }
+    }
+    drop(first);
+    drop(delegation);
+    hub.shutdown().await.expect("hub close");
+    drop(hub);
+    store.close().await.expect("store close");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("reopen");
+    let work = crate::turn_recovery::recover_interrupted_turns(&store, &DeviceId::new("restart"))
+        .await
+        .expect("recovery");
+    if parent_cancelled.is_some() {
+        assert!(
+            work.is_empty(),
+            "abandoned parent and child must never resume"
+        );
+        let settled = store
+            .delegation(record.agent_id.clone())
+            .await
+            .expect("settled relation")
+            .expect("relation");
+        assert_eq!(settled.state, haider_core::DelegationState::Collected);
+        assert_eq!(
+            settled.report.expect("cancelled report").verified,
+            haider_protocol::agent::ReportVerification::Red
+        );
+        assert_eq!(
+            store
+                .graph_status(&record.child_session_id)
+                .await
+                .expect("graph")
+                .expect("child graph")
+                .phase,
+            haider_protocol::graph::GraphPhase::Abandoned
+        );
+        let child_events = store
+            .read(&record.child_session_id, 0, 1024)
+            .await
+            .expect("child events");
+        let states = child_events
+            .iter()
+            .filter(|event| event.run_id.as_ref() == Some(&record.child_run_id))
+            .filter_map(|event| match event.payload.decode_event() {
+                Ok(EventPayload::RunState(state)) => Some(state),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if fail_before_accept {
+            assert!(
+                states.is_empty(),
+                "recovery must not invent child acceptance"
+            );
+        } else {
+            assert_eq!(states.last(), Some(&RunState::Cancelled));
+        }
+        let child_head = store
+            .latest_seq(&record.child_session_id)
+            .await
+            .expect("child head");
+        assert!(
+            crate::turn_recovery::recover_interrupted_turns(&store, &DeviceId::new("restart"))
+                .await
+                .expect("idempotent recovery")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .latest_seq(&record.child_session_id)
+                .await
+                .expect("child head"),
+            child_head
+        );
+        store.close().await.expect("store close");
+        return;
+    }
+    assert_eq!(
+        work.len(),
+        1,
+        "child cannot cross the broker outcome boundary by independent queued recovery"
+    );
+    assert!(
+        matches!(&work[0], crate::turn_recovery::RecoveredWork::Queued(parent_work) if parent_work.accepted.session_id == parent)
+    );
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("recovered hub");
+    let metadata = hub
+        .session_metadata(&parent)
+        .await
+        .expect("metadata")
+        .expect("parent");
+    let delegation = DelegationHandle::new(hub.clone());
+    let replay = delegation
+        .establish(coordinates(metadata), request)
+        .await
+        .expect("finish interrupted establishment");
+    assert_eq!(replay.ticket.manifest.agent, record.agent_id);
+    assert_eq!(
+        hub.delegations_for_parent_run(parent.clone(), run.clone())
+            .await
+            .expect("records")
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .turn_ordinal(record.child_session_id.clone(), record.child_run_id.clone())
+            .await
+            .expect("ordinal")
+            .is_some()
+    );
+    assert_eq!(
+        hub.session_metadata(&record.child_session_id)
+            .await
+            .expect("child metadata")
+            .expect("child")
+            .interaction_mode,
+        haider_protocol::session::SessionInteractionModeV1::Autonomous
+    );
+    // A model-created descendant inherits no-human interaction but remains
+    // subject to the ordinary workflow parent-attempt/parent-slot contract.
+    let descendant = delegation.establish(SpawnCoordinates {
+        parent_session_id:record.child_session_id.clone(), parent_run_id:record.child_run_id.clone(), parent_agent_id:Some(record.agent_id.clone()),
+        parent_branch_id:None, tool_item_id:ItemId::new("model-grandchild"), call_id:"model-grandchild-call".into(),
+        metadata:hub.session_metadata(&record.child_session_id).await.expect("child metadata").expect("child"), agent_type:None, lockdown:false, auto_hermetic:false,
+    }, SpawnSubagent::from_tool_args(serde_json::json!({"task":"workflow","prompt":"work","workflow":"deeper","workflow_trigger":"dependent_phases"})).expect("workflow request")).await;
+    assert!(
+        descendant.is_err(),
+        "inherited headless interaction must not authorize a standalone model workflow"
+    );
+    assert!(
+        hub.delegations_for_parent_run(record.child_session_id, record.child_run_id)
+            .await
+            .expect("descendants")
+            .is_empty()
+    );
+    drop(delegation);
+    hub.shutdown().await.expect("hub close");
+    store.close().await.expect("store close");
+}
+
+#[tokio::test]
+async fn public_spawn_restart_finishes_row_committed_before_child_acceptance() {
+    public_spawn_establishment_restart(true, None).await;
+}
+
+#[tokio::test]
+async fn public_spawn_restart_fences_accepted_child_until_broker_completion() {
+    public_spawn_establishment_restart(false, None).await;
+}
+
+#[tokio::test]
+async fn public_spawn_restart_cancels_unlaunched_child_for_abandoned_parent() {
+    for terminal in [false, true] {
+        for fail_before_accept in [false, true] {
+            public_spawn_establishment_restart(fail_before_accept, Some(terminal)).await;
+        }
+    }
+}
+
 #[cfg(unix)]
 use crate::connection::{ConnectionContext, DrainNotice, serve};
 #[cfg(unix)]

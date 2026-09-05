@@ -771,6 +771,7 @@ async fn start_headless_run_with_budget(
             text: "execute the pinned workflow".into(),
             attachments: Vec::new(),
             spec: HeadlessRunSpecV1 {
+                agent_spawn: None,
                 continuation_of: None,
                 cwd: workspace.to_string_lossy().into_owned(),
                 provider: provider.into(),

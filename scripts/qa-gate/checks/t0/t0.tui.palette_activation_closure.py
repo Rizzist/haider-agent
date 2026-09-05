@@ -117,6 +117,7 @@ SURFACE_SIGNATURES = {
     "aura": ("native duplex", "hold to talk"),
     "history": ("↑↓ / digits choose", "⏎ load"),
     "sessions": ("session-", "turns"),
+    "monitors": ("monitors", "x stop", "p pause", "t trigger", "no active monitors"),
     "update": ("checking for updates",),
 }
 

@@ -1,0 +1,32 @@
+    Blocking waiting for file lock on build directory
+    Checking haider-protocol v0.0.969 ($WORKTREE/crates/haider-protocol)
+    Checking rustix v1.1.4
+    Checking haider-platform v0.0.969 ($WORKTREE/crates/haider-platform)
+    Checking tempfile v3.27.0
+    Checking haider-pdf v0.0.969 ($WORKTREE/crates/haider-pdf)
+    Checking crossterm v0.29.0
+    Checking ratatui-crossterm v0.1.2
+    Checking ratatui v0.30.2
+    Checking ratatui-image v11.0.6
+    Checking haider-stt v0.0.969 ($WORKTREE/crates/haider-stt)
+   Compiling haider-daemon v0.0.969 ($WORKTREE/crates/haider-daemon)
+    Checking haider-verify v0.0.969 ($WORKTREE/crates/haider-verify)
+    Checking haider-store v0.0.969 ($WORKTREE/crates/haider-store)
+    Checking haider-rpc v0.0.969 ($WORKTREE/crates/haider-rpc)
+    Checking haider-accounts v0.0.969 ($WORKTREE/crates/haider-accounts)
+    Checking haider-provider v0.0.969 ($WORKTREE/crates/haider-provider)
+    Checking haider-tools v0.0.969 ($WORKTREE/crates/haider-tools)
+    Checking haider-client v0.0.969 ($WORKTREE/crates/haider-client)
+    Checking haider-tui v0.0.969 ($WORKTREE/crates/haider-tui)
+    Checking haider-core v0.0.969 ($WORKTREE/crates/haider-core)
+error: unused import: `StoreHandle`
+ --> crates/haider-core/tests/agent_spawn_tests.rs:5:5
+  |
+5 |     StoreHandle, SubmitTurn, ToolDispatchResult, ToolDispatcher,
+  |     ^^^^^^^^^^^
+  |
+  = note: `-D unused-imports` implied by `-D warnings`
+  = help: to override `-D warnings` add `#[allow(unused_imports)]`
+
+error: could not compile `haider-core` (test "agent_spawn_tests") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

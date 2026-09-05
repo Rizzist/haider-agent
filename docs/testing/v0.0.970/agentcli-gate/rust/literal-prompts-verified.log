@@ -1,0 +1,9 @@
+   Compiling haider-cli v0.0.969 ($WORKTREE/crates/haider-cli)
+    Finished `test` profile [unoptimized] target(s) in 4.86s
+     Running tests/agent_cli_tests.rs ($AGENTCLI_TARGET/debug/deps/agent_cli_tests-c5f670a3c4f1e196)
+
+running 1 test
+test agent_spawn_prompt_flag_and_cwd_are_public_noninteractive_inputs ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 4.95s
+

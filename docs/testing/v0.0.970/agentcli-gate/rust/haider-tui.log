@@ -1,0 +1,2309 @@
+   Compiling haider-tui v0.0.969 ($WORKTREE/crates/haider-tui)
+    Finished `test` profile [unoptimized] target(s) in 59.35s
+     Running unittests src/lib.rs ($AGENTCLI_TARGET/debug/deps/haider_tui-56656149d62ada6a)
+
+running 32 tests
+test app::custom_provider_tests::abandoned_probe_replies_cannot_overwrite_an_edited_connection_or_create_provider ... ok
+test app::custom_provider_tests::custom_server_key_paste_is_masked_and_debug_redacted ... ok
+test app::custom_provider_tests::keyed_custom_server_stages_discovers_picks_then_configures_and_consumes_one_reference ... ok
+test app::custom_provider_tests::lockdown_status_chip_changes_only_at_a_turn_boundary ... ok
+test app::custom_provider_tests::no_auth_and_anthropic_choices_probe_before_configuring_without_a_secret ... ok
+test app::custom_provider_tests::lockdown_provider_marks_registry_picker_and_existing_status_strip ... ok
+test app::custom_provider_tests::typed_probe_failure_class_survives_link_mapping_and_allows_manual_fallback ... ok
+test app::custom_provider_tests::provider_list_and_model_picker_both_offer_the_trust_toggle ... ok
+test app::custom_provider_tests::typed_stage_failure_reopens_the_exact_card_and_requires_a_key_retype ... ok
+test app::e3_recovery_tests::e3b_oauth_expired_committed_action_dispatches_oauth_start ... ok
+test app::ssh_shell_registry_tests::opening_ssh_terminal_swallows_paste_until_the_channel_id_arrives ... ok
+test app::ssh_shell_registry_tests::shell_and_monitor_segments_open_distinct_overlays ... ok
+test app::ssh_shell_registry_tests::ssh_form_allows_plain_s_in_cwd_without_submitting ... ok
+test app::ssh_shell_registry_tests::ssh_form_refuses_port_zero_before_rpc_submission ... ok
+test app::ssh_shell_registry_tests::ssh_form_masks_and_redacts_password_before_staging ... ok
+test app::ssh_shell_registry_tests::ssh_list_overlay_and_scope_commands_emit_typed_requests ... ok
+test app::ssh_shell_registry_tests::ssh_profile_overlay_opens_add_edit_test_remove_and_shell_flows ... ok
+test app::ssh_shell_registry_tests::ssh_terminal_input_is_redacted_and_ctrl_d_is_typed_eof ... ok
+test app::ssh_shell_registry_tests::ssh_test_host_key_mismatch_keeps_its_typed_code ... ok
+test app::ssh_shell_registry_tests::status_strip_never_carries_a_shell_or_monitor_count ... ok
+test commands::tests::help_command_rows_are_derived_from_the_authoritative_catalog ... ok
+test commands::tests::shared_theme_arguments_match_the_theme_registry ... ok
+test md::emoji_width_tests::emoji_clusters_stay_one_unit_across_measure_and_wrap ... ok
+test runtime::runtime_presentation_tests::live_presentation_gate_accelerates_only_live_first_content_and_terminal_edges ... ok
+test runtime::runtime_presentation_tests::live_presentation_gate_matches_visible_and_hidden_extension_rows ... ok
+test runtime::runtime_presentation_tests::live_presentation_gate_opens_after_a_raised_catchup_high_water ... ok
+test runtime::runtime_presentation_tests::live_presentation_gate_rejects_missing_catchup_duplicates_and_gaps ... ok
+test runtime::theme_probe_tests::prompt_osc_answer_is_parsed_before_the_deadline ... ok
+test runtime::theme_probe_tests::silent_osc_probe_uses_only_the_short_bounded_poll ... ok
+test app::ssh_shell_registry_tests::ssh_terminal_splits_large_paste_at_the_wire_input_bound ... ok
+test app::custom_provider_tests::lockdown_overlay_and_refusal_keep_their_own_visual_taxonomy ... ok
+test app::custom_provider_tests::noncompatible_discovery_error_renders_without_the_staged_key ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/agent_type_binding_tests.rs ($AGENTCLI_TARGET/debug/deps/agent_type_binding_tests-a6c54f5f4b43f3ae)
+
+running 7 tests
+test p_bind_carries_the_exact_id_on_the_wire ... ok
+test p_bind_unbound_or_ungated_flashes_honestly ... ok
+test bind_receipts_flash_and_refusals_carry_the_daemon_message ... ok
+test agent_type_fact_moves_identity_and_a_clearing_fact_reverts ... ok
+test types_pane_leads_with_none_and_none_is_synthetic ... ok
+test roster_row_accent_joins_the_summary_and_falls_back ... ok
+test session_accent_paints_from_bound_scout_and_reverts ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/app_render_tests.rs ($AGENTCLI_TARGET/debug/deps/app_render_tests-256548f15ed0fcdd)
+
+running 28 tests
+test boot_swallows_ordinary_input ... ok
+test clear_starts_fresh_and_launcher_typing_never_leaks_old_turns ... ok
+test demo_plain_path_is_deterministic_and_complete ... ok
+test digit_attaches_a_sample_and_autoplay_is_one_shot ... ok
+test boot_screen_shows_mark_word_and_progressing_checks ... ok
+test invalid_theme_and_unknown_commands_are_told_apart ... ok
+test launcher_shows_header_band_identity_and_composer ... ok
+test narrow_launcher_keeps_the_text_mark_and_no_sanctum ... ok
+test command_decode_error_is_visible_in_the_session_view ... ok
+test one_turn_at_a_time_across_digits_and_submits ... ok
+test clicks_attach_sessions_and_wheel_scrolls ... ok
+test palette_enter_runs_the_highlighted_command ... ok
+test paste_behind_a_blocking_menu_is_dropped ... ok
+test reducer_handles_quit_composer_and_navigation ... ok
+test narrow_status_bar_keeps_the_badge_and_drops_the_meter ... ok
+test same_length_prompts_produce_distinct_turn_items ... ok
+test honesty_notices_survive_long_bottom_anchored_output ... ok
+test open_menu_replaces_the_composer_and_answers_through_the_outbox ... ok
+test refusals_flash_honestly_and_help_opens ... ok
+test short_launcher_keeps_the_composer_visible ... ok
+test session_screen_has_header_and_composer_gap ... ok
+test stream_ended_never_dirties_the_frame ... ok
+test status_bar_has_boxed_chips_and_hint ... ok
+test typed_text_starts_a_session_and_requests_a_turn ... ok
+test window_title_strips_control_characters ... ok
+test slash_palette_filters_completes_and_runs ... ok
+test session_screen_shows_transcript_and_meter ... ok
+test theme_cycle_changes_the_ground_color ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/b2b_branch_command_tests.rs ($AGENTCLI_TARGET/debug/deps/b2b_branch_command_tests-6600c828c7c3867e)
+
+running 8 tests
+test slash_branch_is_session_only_and_feature_gated ... ok
+test slash_branch_new_is_demo_honest_and_the_demo_picker_shows_main ... ok
+test picker_enter_and_digits_switch_and_close_the_card_locally ... ok
+test slash_branch_name_switches_directly_and_unknown_names_are_honest ... ok
+test slash_branch_new_gates_busy_and_empty_sessions_honestly ... ok
+test slash_branch_new_issues_exact_captured_coordinates ... ok
+test the_picker_lists_main_and_named_branches_with_the_active_marked ... ok
+test the_status_bar_names_the_active_branch ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/b2b_branch_state_tests.rs ($AGENTCLI_TARGET/debug/deps/b2b_branch_state_tests-ddddcd06411582ee)
+
+running 19 tests
+test a_fork_receipt_activates_only_the_originating_session ... ok
+test a_typed_fork_failure_leaves_topology_unchanged ... ok
+test aggregate_session_state_routes_session_global_off_a_branch_stamped_stream ... ok
+test a_submit_queued_before_a_later_switch_still_carries_its_captured_branch ... ok
+test branch_responses_map_to_their_driver_facts ... ok
+test branch_created_installs_a_warm_view_and_stamped_content_stays_out_of_main ... ok
+test background_slots_materialize_branch_views_through_the_same_router ... ok
+test checkpoint_commands_require_checkpoint_feature_at_send_time ... ok
+test branch_state_survives_session_a_to_b_to_a_checkout ... ok
+test fork_issuance_travels_exact_coordinates_to_the_wire ... ok
+test interleaved_branch_seqs_advance_one_cursor_and_switching_never_rewinds ... ok
+test main_branch_wire_bytes_stay_historical_and_branches_ride_the_decode_forms ... ok
+test inactive_branch_chips_stay_there_and_the_launcher_aggregate_counts_them ... ok
+test no_live_branch_before_daemon_truth_and_the_journal_fact_activates_once ... ok
+test shell_exec_on_main_stays_unbranched_and_old_daemons_keep_legacy_bytes ... ok
+test render_ui_false_never_mutates_display_but_records_command_coordinates ... ok
+test menu_answers_and_compact_capture_the_branch_at_issuance ... ok
+test sibling_compaction_and_footprint_never_leak_into_the_active_branch ... ok
+test shell_exec_captures_the_named_branch_through_the_scoped_wire ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/b2b_m3_polish_tests.rs ($AGENTCLI_TARGET/debug/deps/b2b_m3_polish_tests-7084763984e795d6)
+
+running 10 tests
+test help_text_names_the_real_provider_roster ... ok
+test palette_login_slots_name_the_real_roster ... ok
+test login_palette_activation_preserves_provider_then_method_slots ... ok
+test slash_login_oauth_refuses_a_provider_without_a_flow ... ok
+test directly_typed_provider_without_a_method_opens_the_method_choice ... ok
+test slash_login_oauth_shares_the_buttons_feature_gate ... ok
+test selecting_a_login_provider_visibly_advances_to_its_method_slot ... ok
+test slash_login_openai_and_anthropic_oauth_mirror_the_buttons ... ok
+test directly_typed_login_methods_reach_every_supported_provider_path ... ok
+test waiting_device_maps_to_device_honest_copy ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/b2b_m3_tree_tests.rs ($AGENTCLI_TARGET/debug/deps/b2b_m3_tree_tests-24a5c13c23fabdae)
+
+running 14 tests
+test drill_breadcrumb_and_esc_walk_parent_then_close_session_scoped ... ok
+test enter_on_a_branch_row_switches_via_the_same_atomic_swap ... ok
+test a_cross_branch_node_row_jump_rides_the_atomic_switch ... ok
+test a_near_tail_target_clamps_honestly ... ok
+test f_from_a_drilled_branch_names_that_branch_and_completion_returns_to_the_session ... ok
+test f_issues_the_selected_rows_exact_coordinates_not_the_trackers ... ok
+test f_refusals_are_honest ... ok
+test an_unmaterialized_node_keeps_the_anchor_armed_until_catchup ... ok
+test selection_clamps_and_a_stale_hit_on_a_replaced_row_cannot_activate ... ok
+test the_active_dot_follows_the_sessions_active_branch ... ok
+test tree_opens_at_the_root_and_nests_fork_markers_under_the_exact_fork_node ... ok
+test enter_on_a_node_row_lands_the_render_resolved_jump ... ok
+test jump_resolves_after_resize_with_fresh_geometry ... ok
+test jump_geometry_survives_wrapping_newlines_wide_glyphs_and_widths ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/b4b_attach_tests.rs ($AGENTCLI_TARGET/debug/deps/b4b_attach_tests-fc6aabd4d3e30dfb)
+
+running 11 tests
+test demo_attach_refuses ... ok
+test daemon_pdf_admission_rejection_keeps_its_typed_card_through_the_link ... ok
+test feature_ungated_attach_is_honest ... ok
+test disconnect_drops_uploading_chips_with_an_honest_notice ... ok
+test attach_text_fallback_chips_a_file_and_submit_carries_the_block ... ok
+test paste_is_a_local_pill_never_an_upload ... ok
+test attach_uploads_then_submit_carries_refs ... ok
+test upload_reply_completes_the_issuing_draft_not_the_displayed_surface ... ok
+test pending_attachments_clear_on_submit_and_survive_branch_switch_capture ... ok
+test pdf_chip_uses_pdf_glyph_basename_pages_and_transcript_plain_parity ... ok
+test oversized_and_non_image_attach_are_honest_notices_with_no_upload ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/b6b_provider_buttons_tests.rs ($AGENTCLI_TARGET/debug/deps/b6b_provider_buttons_tests-863cfd57959a08e7)
+
+running 4 tests
+test slash_login_kimi_oauth_and_gemini_api_parse ... ok
+test ungated_provider_button_is_honest ... ok
+test kimi_and_gemini_buttons_dispatch_the_daemon_flows ... ok
+test providers_screen_shares_the_same_buttons ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/cache_metric_display_tests.rs ($AGENTCLI_TARGET/debug/deps/cache_metric_display_tests-fe13285302652f54)
+
+running 3 tests
+test an_absent_reread_rate_renders_na_never_zero ... ok
+test both_numbers_are_shown_and_distinguishable ... ok
+test no_cache_telemetry_reports_na ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cg_graph_tui_tests.rs ($AGENTCLI_TARGET/debug/deps/cg_graph_tui_tests-f6f148440742d7e5)
+
+running 12 tests
+test abandoned_graph_status_is_terminal ... ok
+test completed_graph_paints_every_node_satisfied ... ok
+test blocked_and_hold_glyphs_differ_from_active ... ok
+test first_build_attempt_and_advances_are_not_noise_rows ... ok
+test m2b_status_is_property_based_not_name_based ... ok
+test m2c_finalization_deferred_surfaces_a_bounded_note ... ok
+test graph_facts_render_quiet_transcript_notes ... ok
+test m2d_run_set_renders_aggregate_and_child_stages ... ok
+test reattempt_marker_shows_only_past_the_first_attempt ... ok
+test slotted_verify_never_labels_an_attested_slot_verified ... ok
+test status_body_carries_gate_epoch_and_evidence ... ok
+test strip_glyph_vocabulary_maps_node_state ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cm1_cache_usage_tests.rs ($AGENTCLI_TARGET/debug/deps/cm1_cache_usage_tests-79901a9d3a7eb40d)
+
+running 9 tests
+test cm1c_reported_zero_and_missing_render_differently ... ok
+test footer_absent_reread_rate_is_na_never_zero ... ok
+test footer_reread_basis_points_keep_two_decimal_places ... ok
+test footer_uses_published_reread_rate_not_local_lifetime_share ... ok
+test part_a_mixed_session_separates_metered_and_all_lane_api_rate ... ok
+test part_a_unknown_auth_is_unknown_price_not_a_subscription_plan ... ok
+test unknown_request_kind_is_visible_but_excluded_from_classified_totals ... ok
+test part_a_mixed_unpriced_oauth_lane_keeps_labeled_unknown_all_lane_rate ... ok
+test cm1g_session_fold_and_responsive_cache_readout_laws ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/customprov_flow_tests.rs ($AGENTCLI_TARGET/debug/deps/customprov_flow_tests-f4fb9ab49798724b)
+
+running 9 tests
+test a_keyed_provider_whose_saved_account_was_removed_requires_a_new_key ... ok
+test edit_order_locks_name_and_reuses_existing_key_for_discovery ... ok
+test empty_discovery_offers_an_editable_manual_id_with_the_reason ... ok
+test generic_enter_order_is_name_origin_key_discovery_model_then_create ... ok
+test generic_tab_order_keeps_api_key_before_optional_auth_and_api_family ... ok
+test switching_a_keyless_provider_edit_to_api_key_requires_a_new_key ... ok
+test picker_respects_advertised_default_and_arrow_selection_without_editing_ids ... ok
+test discovery_success_picker_goldens_at_owner_widths ... ok
+test discovery_404_fallback_goldens_keep_the_typed_reason_at_owner_widths ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/d2_device_discovery_tests.rs ($AGENTCLI_TARGET/debug/deps/d2_device_discovery_tests-3512526eb2abb8da)
+
+running 4 tests
+test accounts_refresh_triggers_metadata_only_device_discovery ... ok
+test adoption_offer_requires_yes_before_receipted_import ... ok
+test ungated_and_demo_modes_never_request_device_discovery ... ok
+test discovery_completion_refreshes_roster_truth_not_candidate_chrome ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/e1_error_visibility_tests.rs ($AGENTCLI_TARGET/debug/deps/e1_error_visibility_tests-94b93e25cc126caf)
+
+running 4 tests
+test e1b_refusal_item_is_visible_in_done_transcript ... ok
+test e2a_typed_run_failure_render_never_uses_legacy_body_marker ... ok
+test e1a_tool_terminal_status_and_reason_render_inline ... ok
+test e4_incomplete_assistant_item_has_explicit_plain_label ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/e5_error_visual_tests.rs ($AGENTCLI_TARGET/debug/deps/e5_error_visual_tests-8a9f3edcfd8deab0)
+
+running 5 tests
+test e5d_plain_recovery_card_carries_detail_and_facts ... ok
+test e5a_fact_line_composes_and_sheds_whole_segments ... ok
+test e5b_incomplete_marker_wears_dim_warning_never_err ... ok
+test e5e_typed_run_failure_renders_the_card_shaped_block ... ok
+test e5c_recovery_card_accent_facts_countdown_and_primary_affordance ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/e8_error_visual_tests.rs ($AGENTCLI_TARGET/debug/deps/e8_error_visual_tests-da93c695eccaa276)
+
+running 6 tests
+test e8c_busy_exhausted_renders_the_err_card_and_banner ... ok
+test e8d_retry_markers_read_as_quiet_dim_fact_lines ... ok
+test e8b_effect_recovery_card_is_calm_amber_with_typed_detail ... ok
+test e8f_peer_live_only_notice_is_one_quiet_status_line ... ok
+test e8e_web_fetch_retry_note_on_completed_row_is_dim ... ok
+test e8a_store_fault_banner_wears_the_err_rail_and_facts ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/error_wave3_tests.rs ($AGENTCLI_TARGET/debug/deps/error_wave3_tests-6484a87ebf56765b)
+
+running 6 tests
+test post_start_microphone_failure_uses_typed_voice_status_and_preserves_ghost ... ok
+test link_supervisor_restart_is_visible_and_terminal_failure_is_persistent ... ok
+test busy_same_command_id_retries_visibly_and_stops_after_three_issues ... ok
+test e7_peers_alias_uses_the_quiet_peer_registry_notice ... ok
+test store_unwritable_banner_state_is_persistent_until_healthy_edge ... ok
+test sustained_unknown_payloads_emit_one_durable_compatibility_diagnostic ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/f2_composer_identity_tests.rs ($AGENTCLI_TARGET/debug/deps/f2_composer_identity_tests-98b0bd815db0f990)
+
+running 7 tests
+test auth_label_derivation_is_truthful_never_a_guess ... ok
+test fast_mode_marker_rides_the_reasoning_segment ... ok
+test meter_yields_whole_when_the_bar_is_narrow ... ok
+test width_degradation_drops_whole_segments_in_order ... ok
+test launcher_rule_shows_the_default_pair_identity ... ok
+test composer_top_rule_carries_model_auth_reasoning_and_no_alias ... ok
+test status_bar_keeps_tokens_directly_right_of_the_state ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/f2_error_visibility_tests.rs ($AGENTCLI_TARGET/debug/deps/f2_error_visibility_tests-d07fc6d1c252710a)
+
+running 16 tests
+test a_paired_reason_is_never_doubled ... ok
+test a_deferred_effect_failure_flushes_at_the_terminal_state ... ok
+test a_mismatched_result_error_does_not_suppress_the_effect_row ... ok
+test an_unowned_effect_failure_keeps_its_standalone_row ... ok
+test effect_cancel_escalation_is_visible ... ok
+test effect_unknown_outcome_is_visible ... ok
+test effect_failed_is_visible ... ok
+test errored_without_a_paired_reason_synthesizes_a_line ... ok
+test interleaved_results_attribute_each_effect_to_its_own_row ... ok
+test red_gate_verdicts_are_visible_and_green_stays_quiet ... ok
+test rotation_is_visible_like_a_model_change ... ok
+test a_rejected_submit_lands_in_the_session_view ... ok
+test two_bare_failures_settle_one_effect_each_never_two_on_one_row ... ok
+test failed_tool_rows_wear_the_error_glyph ... ok
+test run_failed_reason_is_a_visible_error_line ... ok
+test a_failed_tool_call_renders_exactly_one_row ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/f2_markdown_tests.rs ($AGENTCLI_TARGET/debug/deps/f2_markdown_tests-f0bf56894a945227)
+
+running 17 tests
+test double_star_pair_emboldens_and_consumes_markers ... ok
+test code_keeps_its_pill_inside_emphasis ... ok
+test bullets_and_numbers_mark_aligned ... ok
+test fenced_code_restyles_without_touching_line_geometry ... ok
+test headings_keep_marks_and_style_the_text ... ok
+test byte_content_preservation_only_matched_markers_are_consumed ... ok
+test inline_code_pill_and_literal_stray_backtick ... ok
+test line_stability_one_rendered_line_per_source_line ... ok
+test marker_free_text_renders_byte_identical ... ok
+test nested_emphasis_marries_kinds_and_keeps_every_char ... ok
+test single_marker_emphasis_is_word_shaped ... ok
+test styled_wrap_matches_the_hand_computed_oracle ... ok
+test every_streaming_prefix_renders_line_stable ... ok
+test unterminated_spans_render_literally_then_restyle_in_place ... ok
+test styled_wrap_never_moves_a_break ... ok
+test transcript_renders_bold_without_the_markers ... ok
+test streaming_tail_restyles_when_the_span_closes ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/f2_model_picker_tests.rs ($AGENTCLI_TARGET/debug/deps/f2_model_picker_tests-15b5303f9f7bbaea)
+
+running 21 tests
+test all_unavailable_api_group_refuses_without_opening_provider_stage ... ok
+test advisory_custom_current_model_is_visible_as_unlisted_not_available ... ok
+test api_aggregate_summarizes_divergent_provider_facts ... ok
+test api_duplicates_collapse_without_merging_the_oauth_pair ... ok
+test clicking_a_row_selects_its_carried_pair ... ok
+test exact_model_enter_opens_the_picker_not_an_arg_slot ... ok
+test launcher_selection_sets_the_default_pair ... ok
+test live_selection_is_receipted_and_renders_the_resolved_pair ... ok
+test model_query_prefills_the_search ... ok
+test bare_model_opens_the_full_screen_picker_with_oauth_pairs_and_api_choices ... ok
+test picker_owns_its_keys_while_open ... ok
+test refusal_after_close_reaches_the_session_view ... ok
+test rows_carry_the_auth_flavor_and_context_window ... ok
+test provider_stage_searches_live_and_escape_returns_before_closing ... ok
+test provider_stage_selection_preserves_pending_and_resolved_truth ... ok
+test search_matches_model_and_provider_case_insensitively ... ok
+test selection_without_the_feature_names_the_stale_daemon ... ok
+test typed_refusal_lands_inline_and_the_row_stays_selectable ... ok
+test provider_stage_reuses_the_shared_follow_viewport_rule ... ok
+test rows_mark_the_current_pair_and_provider_defaults ... ok
+test unavailable_rows_refuse_with_their_reason ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/f2_providers_scroll_tests.rs ($AGENTCLI_TARGET/debug/deps/f2_providers_scroll_tests-574183afad14250a)
+
+running 7 tests
+test entry_contract_still_requests_summaries ... ok
+test chip_hits_follow_the_scrolled_rows ... ok
+test add_login_buttons_pin_at_the_bottom ... ok
+test long_rosters_scroll_to_reach_every_row ... ok
+test page_keys_and_wheel_move_and_clamp ... ok
+test scroll_indicator_marks_hidden_content_honestly ... ok
+test cursor_walk_keeps_the_selected_provider_visible ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/fleet_view_tests.rs ($AGENTCLI_TARGET/debug/deps/fleet_view_tests-0269aa2de5153cee)
+
+running 19 tests
+test entry_summary_counts_every_bucket_honestly ... ok
+test alt_f_without_a_fleet_keeps_the_composer_word_motion ... ok
+test alt_f_opens_the_fleet_for_the_current_session ... ok
+test fleet_read_is_single_flight_with_one_chase ... ok
+test fleet_read_failure_lands_on_the_screen ... ok
+test enter_reroots_esc_walks_up_and_out ... ok
+test matrix_pattern_is_deterministic_and_never_empty ... ok
+test plain_parity_carries_the_styled_information ... ok
+test plain_renders_the_fetching_and_failed_states_honestly ... ok
+test rollup_arithmetic_agrees_with_the_wire ... ok
+test row_metric_wears_the_s4_cost_vocabulary ... ok
+test live_open_gates_on_the_daemon_feature ... ok
+test stale_reply_for_another_session_installs_nothing ... ok
+test thresholds_are_the_frozen_spec_values ... ok
+test leaf_enter_opens_member_detail_with_workflow_and_esc_backs_out ... ok
+test truncation_witness_renders_an_honest_footer ... ok
+test twenty_nodes_render_the_list_twenty_one_the_grid ... ok
+test five_children_collapse_to_one_summary_row ... ok
+test under_five_children_keep_inline_rows ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/format_tests.rs ($AGENTCLI_TARGET/debug/deps/format_tests-63116189979d1ecd)
+
+running 6 tests
+test default_meter_width_matches_the_sim ... ok
+test fmt_tok_matches_sim_tiers ... ok
+test fmt_tok_keeps_the_sim_boundary_quirk ... ok
+test fmt_tok_survives_the_extremes_without_overflow ... ok
+test meter_cells_clamps_out_of_range_ratios ... ok
+test meter_cells_renders_full_and_empty_cells ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/g2_rename_tests.rs ($AGENTCLI_TARGET/debug/deps/g2_rename_tests-f9cdd40a77928a32)
+
+running 5 tests
+test session_list_last_model_hydrates_roster_rows ... ok
+test demo_rename_is_local ... ok
+test rename_issues_the_wire_command_and_applies_the_normalized_reply ... ok
+test rename_refusals_are_honest_notices_with_no_command ... ok
+test session_list_title_hydrates_launcher_rows_and_sessions_browser ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/g3_effort_fast_tests.rs ($AGENTCLI_TARGET/debug/deps/g3_effort_fast_tests-7b9ff272b5332ffa)
+
+running 5 tests
+test empty_ladder_pair_refuses_effort_honestly ... ok
+test fast_gate_refuses_client_side_on_unsupported_pairs ... ok
+test bare_effort_opens_the_ladder_picker_from_daemon_truth ... ok
+test effort_and_fast_replies_write_the_identity_line ... ok
+test picker_enter_commits_and_esc_closes ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/g4a_local_oss_presets_tests.rs ($AGENTCLI_TARGET/debug/deps/g4a_local_oss_presets_tests-41e9b4b17ecddbfe)
+
+running 5 tests
+test lmstudio_preset_prefills_the_local_origin ... ok
+test keyless_commit_skips_the_key_card_and_chains_discovery ... ok
+test ollama_preset_prefills_the_local_origin ... ok
+test footer_hints_and_add_buttons_offer_the_local_presets ... ok
+test empty_keyless_discovery_hints_start_the_server_then_refresh ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/g4b_enterprise_cards_tests.rs ($AGENTCLI_TARGET/debug/deps/g4b_enterprise_cards_tests-0315a5e3f4566fa7)
+
+running 4 tests
+test vertex_card_collects_project_and_location ... ok
+test azure_card_derives_the_v1_base_and_chains_the_key_card ... ok
+test bedrock_card_builds_the_mantle_url_and_echoes_the_seeded_inventory ... ok
+test enterprise_footer_buttons_and_edit_routing ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/g5_table_tests.rs ($AGENTCLI_TARGET/debug/deps/g5_table_tests-064cdf7c5c7acd6d)
+
+running 18 tests
+test lg1_natural_grid_golden_at_wide_budget ... ok
+test double_width_glyphs_keep_the_grid_aligned ... ok
+test lb1_one_source_three_budgets_natural_wrapped_stacked ... ok
+test lp1_escaped_pipe_stays_literal_inside_its_cell ... ok
+test lg2_wrapped_grid_distributes_with_floors_and_alignment ... ok
+test lp1_inline_styling_renders_inside_cells ... ok
+test lg2_column_floor_holds_the_longest_word_and_the_minimum ... ok
+test lp1_missing_delimiter_and_marked_lines_stay_paragraphs ... ok
+test lp1_ragged_rows_pad_and_truncate_to_the_header ... ok
+test lp1_table_recognized_with_roles_and_alignment ... ok
+test ls1_empty_cells_keep_their_labelled_line ... ok
+test ls1_stacked_records_bold_labels_rules_no_header_block ... ok
+test streaming_cursor_rides_the_last_table_cell ... ok
+test table_plain_path_is_pipe_separated_cells ... ok
+test layout_rows_always_fit_the_budget ... ok
+test lst1_streaming_prefixes_render_and_settle ... ok
+test transcript_flips_grid_to_stacked_with_terminal_width ... ok
+test lst1_final_frame_equals_the_all_at_once_render ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/h4_hooks_tui_tests.rs ($AGENTCLI_TARGET/debug/deps/h4_hooks_tui_tests-6141f3cc6d95964c)
+
+running 8 tests
+test edited_hook_renders_revoked_state ... ok
+test decision_firing_jumps_to_its_committed_menu ... ok
+test firings_render_bounded_newest_first ... ok
+test trust_revision_event_refreshes_the_summary_workspace ... ok
+test hooks_screen_lists_daemon_truth_with_trust_states ... ok
+test ungated_and_demo_are_honest ... ok
+test trust_and_revoke_dispatch_receipted_commands_and_install_nothing_locally ... ok
+test decision_chip_follows_the_journaled_fact ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/hit_alignment_tests.rs ($AGENTCLI_TARGET/debug/deps/hit_alignment_tests-045a76c0531adc17)
+
+running 12 tests
+test help_hint_hit_covers_the_rendered_hint_text ... ok
+test empty_palette_renders_nothing_and_esc_dismisses_keeping_text ... ok
+test launcher_row_hits_align_on_the_compact_banner_path ... ok
+test back_chip_hit_covers_the_rendered_chip ... ok
+test composer_carries_the_sim_signature ... ok
+test launcher_composer_is_bottom_anchored_with_the_gold_rule ... ok
+test launcher_row_hits_align_with_their_rendered_rows ... ok
+test menu_option_hits_align_with_their_rows ... ok
+test palette_carries_the_sim_signature ... ok
+test palette_row_hits_align_and_click_runs_that_row ... ok
+test talk_chip_hit_covers_exactly_the_rendered_chip ... ok
+test thinking_beat_shows_the_transient_transcript_tail ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/image_created_tui_tests.rs ($AGENTCLI_TARGET/debug/deps/image_created_tui_tests-876d4c41b98ac7e1)
+
+running 5 tests
+test reveal_command_selects_the_file_on_this_platform ... ok
+test reveal_refuses_image_named_symlinks_to_non_images ... ok
+test reveal_refuses_untrusted_shapes ... ok
+test image_row_click_requests_a_shell_reveal_by_value ... ok
+test image_extension_renders_and_registers_its_absolute_reveal_path ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/lane_h_input_mirror_tests.rs ($AGENTCLI_TARGET/debug/deps/lane_h_input_mirror_tests-416c400e2c42e9fd)
+
+running 7 tests
+test ade_draft_survives_tui_attach_and_lands_in_the_composer ... ok
+test remote_replace_never_overwrites_a_modal_in_progress ... ok
+test remote_apply_replaces_through_the_reducer_without_recording_history ... ok
+test fresh_foreign_publisher_low_revision_applies_over_high_local_floor ... ok
+test stale_and_echo_revisions_drop_and_the_next_local_publish_wins ... ok
+test watch_frames_map_to_the_surface_reducer_and_stay_feature_gated ... ok
+test watch_is_issued_on_entry_switch_and_connection_epoch ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/launcher_fixes_tests.rs ($AGENTCLI_TARGET/debug/deps/launcher_fixes_tests-00158df4ec60eaa4)
+
+running 4 tests
+test older_daemon_without_fields_degrades_honestly ... ok
+test roster_shows_summary_counts_without_attach ... ok
+test checkin_values_beat_stale_summaries ... ok
+test launcher_content_block_is_centered ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/loom_cli_presence_tests.rs ($AGENTCLI_TARGET/debug/deps/loom_cli_presence_tests-9c90db08e0cf2093)
+
+running 5 tests
+test the_path_probe_matches_what_an_exec_would_find ... ok
+test unprobed_is_never_reported_missing ... ok
+test ctrl_i_seeds_a_turn_for_exactly_the_missing_programs ... ok
+test the_detail_marks_present_missing_and_stays_silent_on_unprobed ... ok
+test the_list_row_carries_the_missing_count ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/loom_tui_tests.rs ($AGENTCLI_TARGET/debug/deps/loom_tui_tests-1f8ee80e4122bd0a)
+
+running 8 tests
+test disconnect_clears_the_loom_snapshot ... ok
+test graph_screen_annotates_loom_nodes ... ok
+test graph_annotations_require_the_pinned_digest ... ok
+test loom_screen_loading_state_and_esc_origin ... ok
+test seeded_scout_renders_its_registry_accent_never_gold ... ok
+test loom_screen_lists_registry ... ok
+test typed_chip_paints_its_loom_accent ... ok
+test typed_chip_accent_requires_a_loom_aware_daemon ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/loom_workflows_qol_tests.rs ($AGENTCLI_TARGET/debug/deps/loom_workflows_qol_tests-3823c3c05d94e5ad)
+
+running 31 tests
+test authoring_wire_failure_is_routed_to_the_editor_without_a_command_id ... ok
+test authoring_without_a_bound_session_never_chooses_a_model_implicitly ... ok
+test alt_m_still_selects_the_session_model_used_for_ai_drafting ... ok
+test authoring_feature_absence_never_calls_or_falls_back_to_chat ... ok
+test absent_catalog_feature_never_becomes_a_hardcoded_or_legacy_list ... ok
+test correlated_authoring_replies_update_the_parked_editor_offscreen ... ok
+test closing_a_confirmed_editor_reports_that_registration_is_retained ... ok
+test bare_letters_type_into_the_composer_and_never_fire_registry_actions ... ok
+test disconnected_epoch_rejects_a_queued_old_authoring_reply ... ok
+test drafted_text_is_editable_and_ctrl_s_confirms_the_exact_revision ... ok
+test ctrl_n_opens_typed_authoring_per_pane_and_enter_sends_prose_to_draft ... ok
+test editor_surfaces_validate_archive_and_install_cancel ... ok
+test feature_loss_hides_confirm_affordance_for_an_open_editor ... ok
+test graph_receipts_flash_and_refusals_carry_the_daemon_message ... ok
+test graph_strip_parks_nonpending_loom_text_and_restores_the_session_draft ... ok
+test builtin_and_none_details_render_from_the_catalog ... ok
+test late_reply_cannot_bind_to_a_reopened_editor ... ok
+test loom_editor_has_a_dedicated_draft_surface ... ok
+test draft_validation_locations_render_inline_and_transport_failure_releases_pending ... ok
+test open_authoring_owns_empty_revision_and_blocks_hidden_registry_actions ... ok
+test loom_paste_and_seed_preserve_exact_pretyped_prose ... ok
+test loom_reply_installs_workflow_rows_from_the_published_catalog ... ok
+test p_on_none_abandons_the_active_graph ... ok
+test pane_entry_rerequests_the_loom_snapshot ... ok
+test p_pin_carries_the_selected_template_name_on_the_wire ... ok
+test p_without_a_bound_session_flashes_honestly ... ok
+test revise_reply_clears_prior_confirmation_and_cli_seed_cannot_overwrite_editor ... ok
+test pending_authoring_locks_edits_and_navigation ... ok
+test fleet_rows_paint_the_typed_accent_and_fall_back ... ok
+test reconnect_to_pre_catalog_daemon_renders_typed_absence_immediately ... ok
+test workflows_pane_leads_with_none_then_builtins_then_registered ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/mock_tests.rs ($AGENTCLI_TARGET/debug/deps/mock_tests-70a3c990004faf29)
+
+running 3 tests
+test demo_script_produces_the_expected_transcript ... ok
+test demo_script_walks_boot_to_done ... ok
+test demo_boot_checks_progress_one_at_a_time ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/oauth_calendar_tests.rs ($AGENTCLI_TARGET/debug/deps/oauth_calendar_tests-03a5c969ef39a75d)
+
+running 8 tests
+test calendar_projects_the_existing_provider_fixtures_exactly ... ok
+test angle_keys_still_switch_accounts_while_the_calendar_lists_every_account ... ok
+test calendar_spills_past_month_end_and_never_guesses_ambiguous_windows ... ok
+test calendar_uses_exact_fixture_resets_and_names_unknowns_without_guessing ... ok
+test one_s_opens_calendar_then_the_existing_scope_ring_continues ... ok
+test calendar_light_goldens_at_owner_widths ... ok
+test direct_calendar_scope_keeps_the_provider_filter ... ok
+test calendar_dark_goldens_at_owner_widths ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/ota_update_tui_tests.rs ($AGENTCLI_TARGET/debug/deps/ota_update_tui_tests-b7e560b5688e4c74)
+
+running 7 tests
+test live_pass_maps_both_ota_requests_to_the_closed_shell_vocabulary ... ok
+test current_event_clears_a_stale_release_and_reports_the_running_version ... ok
+test demo_update_command_remains_a_stub_without_shell_effects ... ok
+test update_failure_flashes_the_typed_error_and_keeps_the_session_alive ... ok
+test pending_release_update_command_requests_the_transaction ... ok
+test update_command_without_a_pending_release_requests_an_immediate_check ... ok
+test available_event_sets_model_and_persists_a_theme_slot_indicator ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/p1_masking_sweep_tests.rs ($AGENTCLI_TARGET/debug/deps/p1_masking_sweep_tests-86a01634b836f50d)
+
+running 3 tests
+test oauth_receipts_mask_the_identity_always ... ok
+test launcher_header_carries_the_alias_never_the_identity ... ok
+test accounts_rows_mask_by_default_and_r_reveals_per_visit ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/peer_messaging_tests.rs ($AGENTCLI_TARGET/debug/deps/peer_messaging_tests-b5fd881095800c20)
+
+running 2 tests
+test delivered_peer_message_is_its_own_untrusted_transcript_block ... ok
+test peer_slash_lists_and_sends_with_an_inline_affordance ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/permission_card_tests.rs ($AGENTCLI_TARGET/debug/deps/permission_card_tests-33ff39e087c756a5)
+
+running 7 tests
+test a_live_turn_keeps_its_permission_card ... ok
+test a_cancelled_turn_takes_the_permission_card_with_it ... ok
+test key_r_answers_the_paired_permission_menu ... ok
+test key_o_requests_open_settings_for_the_parked_permission ... ok
+test permission_events_set_and_clear_the_card ... ok
+test granted_card_shows_restart_and_drops_retry ... ok
+test card_renders_labelled_prompt_with_open_settings_and_retry ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/plain_tests.rs ($AGENTCLI_TARGET/debug/deps/plain_tests-b7253a79ce3e5e93)
+
+running 5 tests
+test status_glyphs_cover_every_tool_status ... ok
+test status_line_without_window_omits_the_meter ... ok
+test streaming_agent_text_shows_the_cursor_block ... ok
+test command_blocks_render_output_tail_and_truncation_notice ... ok
+test demo_script_renders_the_full_plain_story ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/plan_surface_tests.rs ($AGENTCLI_TARGET/debug/deps/plan_surface_tests-3dfe53b2691509f0)
+
+running 4 tests
+test plan_document_fills_the_transcript_and_options_keep_the_band ... ok
+test plan_document_scrolls_and_clamps ... ok
+test overscroll_clamps_in_state_and_new_plans_open_at_the_top ... ok
+test an_open_plan_suppresses_the_sticky_prompt_band ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/projection_tests.rs ($AGENTCLI_TARGET/debug/deps/projection_tests-e6c832d02415b91c)
+
+running 22 tests
+test cancelled_turn_shows_interrupted_idle_until_decay ... ok
+test badge_walks_the_run_state_machine_with_sim_labels ... ok
+test command_output_is_decoded_bounded_and_lossy ... ok
+test completed_tool_call_releases_the_fragment_accumulation ... ok
+test an_attach_cursor_gap_checks_the_very_first_delivered_envelope ... ok
+test completed_without_started_lands_as_finished_block ... ok
+test agent_message_streams_then_completed_replaces ... ok
+test context_tokens_saturate_on_adversarial_usage ... ok
+test command_tail_capacity_stays_bounded_after_huge_chunks ... ok
+test empty_plan_completed_clears_the_pinned_panel_and_closes_the_id ... ok
+test finished_plan_redelivery_does_not_duplicate_history ... ok
+test harness_starting_wins_the_badge_and_exposes_checks ... ok
+test item_lifecycle_is_idempotent_under_redelivery ... ok
+test plan_pins_updates_and_unpins_into_transcript_when_done ... ok
+test orphan_deltas_are_counted_never_fatal ... ok
+test stale_plan_started_cannot_overwrite_a_progressed_plan ... ok
+test tool_call_accumulates_arg_fragments_for_display ... ok
+test non_ui_envelopes_advance_seq_without_display_mutation ... ok
+test duplicate_envelopes_are_a_no_op_and_the_cursor_survives ... ok
+test usage_drives_the_context_meter ... ok
+test raw_stream_tracks_gaps_duplicates_and_unknown_payloads ... ok
+test user_messages_and_menus_project ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/prompt_backtrack_tests.rs ($AGENTCLI_TARGET/debug/deps/prompt_backtrack_tests-e6ab06e395cfa722)
+
+running 5 tests
+test journal_replay_populates_per_session_history_newest_first ... ok
+test esc_interrupt_precedes_backtrack_and_backtrack_requires_idle_empty ... ok
+test history_command_loads_a_durable_prompt_by_newest_first_ordinal ... ok
+test repeated_escape_loads_verbatim_and_redo_appends_only_on_journal_echo ... ok
+test backtrack_overlay_renders_compact_single_line_prompt_rows ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/prompt_fork_tests.rs ($AGENTCLI_TARGET/debug/deps/prompt_fork_tests-4e453a6ad691b4cb)
+
+running 14 tests
+test a_legacy_fork_response_never_becomes_an_empty_draft ... ok
+test a_receipt_that_names_the_source_as_its_child_is_refused ... ok
+test a_daemon_without_both_tokens_refuses_before_anything_is_issued ... ok
+test a_live_prompt_without_a_sequence_refuses_rather_than_inventing_zero ... ok
+test f_outside_the_chooser_types_into_the_composer ... ok
+test an_unattachable_child_names_the_resume_command_instead_of_a_silent_loss ... ok
+test double_escape_then_f_forks_at_the_durable_journal_sequence ... ok
+test forking_opens_the_child_and_leaves_the_original_untouched ... ok
+test issuance_travels_the_exact_prompt_cut_to_the_wire ... ok
+test single_escape_still_interrupts_and_never_forks ... ok
+test older_rows_and_the_slash_command_reach_the_same_cut ... ok
+test the_draft_is_editable_and_preserves_typed_attachments ... ok
+test the_chooser_shows_the_fork_verb_and_flattens_multiline_prompts ... ok
+test a_prompt_without_a_committed_sequence_is_refused_not_invented ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/provider_card_edit_tests.rs ($AGENTCLI_TARGET/debug/deps/provider_card_edit_tests-55f7f2d8d1270999)
+
+running 4 tests
+test create_preset_name_and_origin_prefills_are_editable ... ok
+test existing_provider_origin_is_editable_but_name_is_not ... ok
+test multibyte_field_click_and_edit_never_split_utf8 ... ok
+test click_places_caret_at_character_and_past_end_clamps ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/provider_command_tests.rs ($AGENTCLI_TARGET/debug/deps/provider_command_tests-f5abe1c868ad771f)
+
+running 3 tests
+test provider_without_a_default_model_refuses_rather_than_guessing ... ok
+test provider_at_the_launcher_stays_client_owned ... ok
+test provider_switch_in_a_live_session_is_receipted_not_local ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/qol_drag_autoscroll_tests.rs ($AGENTCLI_TARGET/debug/deps/qol_drag_autoscroll_tests-8d0d5eb367ea6be2)
+
+running 4 tests
+test drag_at_the_top_edge_scrolls_up_and_keeps_the_anchor_parked ... ok
+test interior_drags_never_scroll_and_release_still_copies ... ok
+test a_drag_with_no_selection_does_not_scroll ... ok
+test drag_at_the_bottom_edge_scrolls_down_and_clamps_at_the_tail ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/qol_paste_pill_tests.rs ($AGENTCLI_TARGET/debug/deps/qol_paste_pill_tests-fae3bec0d8f5fc00)
+
+running 15 tests
+test clearing_the_draft_drops_the_store ... ok
+test delete_forward_at_the_left_edge_removes_the_whole_pill ... ok
+test large_paste_becomes_an_atomic_placeholder_not_inline_text ... ok
+test backspace_at_the_right_edge_removes_the_whole_pill_and_its_store ... ok
+test fresh_paste_mints_above_orphan_placeholder_tokens ... ok
+test history_recall_reproduces_the_sent_bytes_not_the_placeholder ... ok
+test multiple_pastes_number_per_draft_and_all_expand ... ok
+test login_card_paste_lands_in_the_masked_buffer_never_a_pill ... ok
+test small_paste_inlines_exactly_as_before ... ok
+test placeholders_survive_editing_around_them ... ok
+test submit_expands_the_placeholder_byte_exact_at_its_position ... ok
+test the_caret_never_rests_inside_the_pill ... ok
+test talk_setup_key_paste_lands_in_the_card_never_a_pill ... ok
+test very_long_single_line_paste_pills_too ... ok
+test word_backspace_at_the_edge_swallows_the_pill_whole ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/qol_status_publish_tests.rs ($AGENTCLI_TARGET/debug/deps/qol_status_publish_tests-aca34b3af94775f1)
+
+running 5 tests
+test provider_open_wait_surfaces_elapsed_and_remaining_budget ... ok
+test a_new_connection_epoch_republishes_the_same_strip ... ok
+test publishes_only_on_change_with_monotonic_revisions ... ok
+test the_published_string_equals_the_rendered_strip ... ok
+test ungated_daemon_wrong_screen_and_unrendered_bar_publish_nothing ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/qol_store_health_tests.rs ($AGENTCLI_TARGET/debug/deps/qol_store_health_tests-cbce907bd9ad63b3)
+
+running 3 tests
+test every_degraded_code_maps_to_the_persistent_diagnostic ... ok
+test a_degraded_snapshot_arriving_pre_attach_still_raises_the_banner ... ok
+test banner_paints_while_degraded_survives_redraws_and_clears_on_healthy ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/request_budget_tui_tests.rs ($AGENTCLI_TARGET/debug/deps/request_budget_tui_tests-7f85270502b9b99d)
+
+running 1 test
+test budget_status_without_label_renders_counts_and_continuation_in_both_surfaces ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/review2_fix_tests.rs ($AGENTCLI_TARGET/debug/deps/review2_fix_tests-9de0ea5ab1674f15)
+
+running 16 tests
+test alt_and_shift_enter_insert_newlines_and_enter_submits ... ok
+test composer_grows_rows_and_shows_multiline_text ... ok
+test agent_body_wraps_by_cells_with_rail_on_every_row ... ok
+test fresh_session_resets_the_scroll_ceiling ... ok
+test composer_caps_at_five_rows_showing_the_tail ... ok
+test menu_hits_answer_only_their_own_menu ... ok
+test interrupted_idle_badge_is_dim_like_plain_idle ... ok
+test paste_thresholds_measure_raw_utf16_units ... ok
+test overlong_composer_line_keeps_the_cursor_visible ... ok
+test stale_generation_envelopes_are_dropped_at_consumption ... ok
+test stale_idle_decay_never_lands_in_a_fresh_session ... ok
+test menu_body_renders_dim_on_the_menu_ground ... ok
+test newline_closes_the_palette_and_multiline_survives_the_transcript ... ok
+test tiny_frame_keeps_a_three_line_composer_visible ... ok
+test stale_hits_activate_the_carried_value_or_drop ... ok
+test wheel_before_first_frame_and_resize_never_bank_debt ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/review3_fix_tests.rs ($AGENTCLI_TARGET/debug/deps/review3_fix_tests-d8cc7fcf988e5556)
+
+running 9 tests
+test launcher_composer_tail_windows_at_tiny_heights ... ok
+test agent_pre_wrap_preserves_internal_runs_tabs_and_trailing_space ... ok
+test bottom_band_counts_unseen_and_click_returns_to_follow ... ok
+test menu_body_wraps_in_narrow_frames_and_options_follow ... ok
+test queue_panel_rows_render_and_act_with_the_held_revision ... ok
+test menu_options_stay_visible_and_clickable_at_ninety_by_ten ... ok
+test four_line_composer_at_ninety_by_ten_keeps_the_cursor_row ... ok
+test rail_survives_five_and_three_column_frames ... ok
+test sticky_jump_suppresses_the_bar_until_a_real_wheel ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/review4_fix_tests.rs ($AGENTCLI_TARGET/debug/deps/review4_fix_tests-2b81d5625c0c7f13)
+
+running 3 tests
+test wheel_notch_between_resize_and_redraw_is_honored ... ok
+test menu_options_survive_ninety_by_seven ... ok
+test streaming_cursor_never_leaves_the_rail ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/review5_fix_tests.rs ($AGENTCLI_TARGET/debug/deps/review5_fix_tests-cf58af14b2e620d3)
+
+running 5 tests
+test menu_options_survive_ninety_by_two_with_all_chrome_shed ... ok
+test one_row_floor_windows_options_with_markers ... ok
+test menu_options_survive_ninety_by_five_with_session_line_shed ... ok
+test menu_options_survive_ninety_by_six_with_status_shed ... ok
+test wheel_burst_reversal_moves_the_view_through_production_dispatch ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/review6_fix_tests.rs ($AGENTCLI_TARGET/debug/deps/review6_fix_tests-33214821d580d09d)
+
+running 4 tests
+test launcher_composer_survives_two_row_frames ... ok
+test ninety_by_one_session_has_no_out_of_frame_hits ... ok
+test ordinary_sizes_keep_their_hits_and_layout ... ok
+test answering_the_menu_at_ninety_by_five_restores_an_editable_composer ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/s2_ui_refinement_tests.rs ($AGENTCLI_TARGET/debug/deps/s2_ui_refinement_tests-708689e7f7c20abd)
+
+running 6 tests
+test header_mark_uses_halfblock_glyphs ... ok
+test header_mark_renders_in_both_new_palettes ... ok
+test one_blank_line_above_thinking_badge ... ok
+test child_view_renders_user_messages ... ok
+test composer_rests_at_one_line_and_grows ... ok
+test one_blank_line_before_composer_band ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/s3_subagent_timeline_tests.rs ($AGENTCLI_TARGET/debug/deps/s3_subagent_timeline_tests-f7330329fdb55435)
+
+running 6 tests
+test chip_composer_rides_the_steer_wire_and_flashes_daemon_receipt ... ok
+test demo_and_ungated_are_honest ... ok
+test timeline_order_spawned_messaged_report ... ok
+test chip_view_shows_steer_messages ... ok
+test chip_header_names_manifest_handoff_directory ... ok
+test agent_messaged_renders_in_main_timeline_with_delivery ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/s4_subagent_rows_tests.rs ($AGENTCLI_TARGET/debug/deps/s4_subagent_rows_tests-26e139897893e2bc)
+
+running 19 tests
+test chip_clock_is_monotone_and_stops_at_terminal ... ok
+test applied_envelopes_advance_the_render_clock ... ok
+test chip_row_tokens_is_truth_ordered ... ok
+test fmt_elapsed_is_law_pinned_h_m_s ... ok
+test a_live_chip_keeps_the_anim_clock_running ... ok
+test later_envelopes_never_move_a_frozen_final ... ok
+test metrics_snapshot_replaces_only_at_a_newer_child_head_seq ... ok
+test live_chip_elapsed_ticks_on_the_render_clock ... ok
+test mv5_oauth_api_and_mixed_costs_remain_separate_and_labeled ... ok
+test direct_metrics_render_subtree_detail_usage_and_plain_parity ... ok
+test mv4_unpriced_and_missing_usage_never_render_zero_truth ... ok
+test normalized_tokens_exclude_reasoning_and_missing_detail_stays_explicitly_na ... ok
+test legacy_width_degradation_drops_tokens_then_elapsed_whole ... ok
+test mv8_old_daemon_without_metrics_renders_legacy_elapsed_tokens_row ... ok
+test terminal_chip_elapsed_freezes_at_the_terminal_envelope ... ok
+test the_meta_wears_the_dim_slot ... ok
+test tokens_join_by_the_chips_own_child_session_id ... ok
+test unknown_tokens_render_no_token_segment ... ok
+test mv7_metrics_shedding_order_is_live_elapsed_cost_tools_tokens_last ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/sanctum_boot_tests.rs ($AGENTCLI_TARGET/debug/deps/sanctum_boot_tests-926b805f0fe2c9f3)
+
+running 6 tests
+test check_rows_walk_done_current_pending ... ok
+test sanctum_renders_whole_or_not_at_all ... ok
+test all_ok_checks_have_no_current ... ok
+test sanctum_tiers_expose_their_texts ... ok
+test sublines_match_the_sim_shapes ... ok
+test translit_tier_is_shaping_safe ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/session_browser_tests.rs ($AGENTCLI_TARGET/debug/deps/session_browser_tests-b43abc981d9b8383)
+
+running 11 tests
+test durable_activity_formats_cold_session_age ... ok
+test equal_recency_uses_creation_and_never_title ... ok
+test bare_sessions_command_opens_the_full_browser ... ok
+test rows_order_needs_you_then_unseen_then_recent ... ok
+test sessions_search_rejects_alt_text_and_preserves_global_ctrl_c ... ok
+test browser_searches_title_directory_model_and_id_as_you_type ... ok
+test the_browser_is_live_only ... ok
+test the_browser_opens_selects_attaches_and_returns ... ok
+test live_event_recency_beats_a_later_stale_summary ... ok
+test the_browser_pages_scrolls_and_clamps ... ok
+test fresh_connect_keeps_latest_cold_root_first_across_400_rows_and_hides_children ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/sim_parity_r2_tests.rs ($AGENTCLI_TARGET/debug/deps/sim_parity_r2_tests-0b29f75a8e5669db)
+
+running 19 tests
+test boot_checks_align_as_a_column_and_subline_is_gold ... ok
+test big_pastes_become_pill_tokens_and_render_gold ... ok
+test auto_title_uses_auto_blurb_and_notes_the_transcript ... ok
+test ctrl_g_toggles_the_token_panel_and_esc_closes_it ... ok
+test enter_on_a_partial_arg_command_enters_its_slot ... ok
+test exact_theme_enter_opens_the_picker_not_the_arg_slot ... ok
+test compaction_row_is_gold_and_honest ... ok
+test badge_renders_idle_dim_and_permission_warn_outline ... ok
+test help_carries_the_sim_menus_and_keys_explainers ... ok
+test palette_and_menu_selection_wrap_around ... ok
+test esc_mid_turn_interrupts_and_stays_on_the_session ... ok
+test ghost_completes_the_highlighted_row_inline ... ok
+test theme_arg_slot_offers_completes_and_runs ... ok
+test mid_turn_submit_flashes_and_echoes_a_note ... ok
+test pinned_todos_style_by_state_and_show_dep_tags ... ok
+test sticky_origin_line_pins_the_prompt_and_click_stays_at_it ... ok
+test wheel_clamps_to_the_rendered_scroll_range ... ok
+test transcript_typography_matches_the_sim ... ok
+test wheel_is_inert_under_the_help_overlay ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/smoke_tests.rs ($AGENTCLI_TARGET/debug/deps/smoke_tests-71b96b6b53e79295)
+
+running 1 test
+test crate_name_is_stable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/style_tests.rs ($AGENTCLI_TARGET/debug/deps/style_tests-9152f0ccae122563)
+
+running 4 tests
+test rgb_converts_to_ratatui_truecolor ... ok
+test badge_styles_follow_the_sim_state_vocabulary ... ok
+test text_style_grounds_on_the_theme_bg ... ok
+test selection_and_input_styles_use_their_soft_grounds ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/subagent_aura_tests.rs ($AGENTCLI_TARGET/debug/deps/subagent_aura_tests-d4dbac942bb0e94f)
+
+running 10 tests
+test child_scripts_are_verbatim_with_question_arms ... ok
+test auto_resume_and_aura_builders_are_verbatim ... ok
+test respond_chip_nested_dead_ends_exactly_as_the_shipped_sim_does ... ok
+test aura_stage_renders_bar_orb_columns_and_transcript ... ok
+test respond_chip_steers_queue_when_blocked_and_delegates_nested_when_asked ... ok
+test aura_orchestrates_spawn_and_status_with_talk_and_toggles ... ok
+test two_subagents_question_recovery_collect_and_auto_resume ... ok
+test docs_close_arm_runs_the_close_lifecycle_and_5s_removal ... ok
+test subtree_panel_and_subagent_view_render_the_sim_anatomy ... ok
+test subtree_sheds_after_todos_but_before_the_composer_at_90x10 ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/submit_preprocess_tests.rs ($AGENTCLI_TARGET/debug/deps/submit_preprocess_tests-5fa21b6665bd056d)
+
+running 17 tests
+test interrupt_drops_the_held_queue ... ok
+test a_zero_option_ask_consumes_the_composer_text_as_its_answer ... ok
+test esc_dismisses_non_blocking_cards_but_never_blocking_ones ... ok
+test queue_command_switches_modes_with_the_sim_notes ... ok
+test resolve_path_handles_home_dot_dotdot_with_a_floor ... ok
+test run_shell_matches_the_sim_outputs ... ok
+test say_guards_then_submits_a_voice_turn ... ok
+test launcher_shell_builtins_never_start_a_session_and_fill_the_shellout ... ok
+test slug_name_takes_three_words_lowercased_and_bounded ... ok
+test session_shell_builtins_render_transcript_rows_and_retarget_the_header_dir ... ok
+test steer_is_default_and_lands_the_row_with_the_note ... ok
+test status_bar_shows_q_turn_while_queue_mode_holds ... ok
+test queue_panel_renders_between_todos_and_composer_with_the_verbatim_header ... ok
+test tools_card_is_verbatim_and_registers_with_dispatch_notes ... ok
+test queue_panel_joins_the_sacred_ledger_at_90x10 ... ok
+test voice_chip_drops_whole_when_the_header_is_too_narrow ... ok
+test voice_card_is_verbatim_and_answers_apply ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/t2_talk_link_tests.rs ($AGENTCLI_TARGET/debug/deps/t2_talk_link_tests-49c34aba60baead4)
+
+running 7 tests
+test secret_commands_carry_no_durable_identity ... ok
+test secret_errors_are_operation_tagged ... ok
+test secret_responses_map_to_their_replies ... ok
+test request_bodies_match_the_t1_wire_goldens ... ok
+test the_link_and_the_client_helpers_agree ... ok
+test the_driver_routes_secret_requests_to_the_wire ... ok
+test apply_routes_the_secret_answer_into_the_reducer ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/t2_talk_setup_tests.rs ($AGENTCLI_TARGET/debug/deps/t2_talk_setup_tests-cfaaf7504f926a79)
+
+running 15 tests
+test deepgram_without_the_vault_feature_refuses_at_the_picker ... ok
+test a_corrupt_config_section_is_surfaced_not_defaulted ... ok
+test a_rejected_key_returns_to_entry_with_the_honest_reason ... ok
+test a_failed_download_lands_on_the_row_honestly ... ok
+test esc_closes_the_card ... ok
+test key_paste_validate_vault_models_language_flow ... ok
+test reusing_the_vaulted_key_skips_the_store ... ok
+test retype_leaves_the_reuse_path ... ok
+test selecting_an_absent_model_downloads_with_progress ... ok
+test selecting_an_installed_model_saves_local_config_through_the_store ... ok
+test slash_talk_setup_opens_and_loads_the_world ... ok
+test the_missing_runtime_row_drives_the_installer ... ok
+test the_card_debug_never_prints_the_key ... ok
+test the_snapshot_installs_catalog_rows_with_filesystem_truth ... ok
+test the_language_field_validates_before_saving ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/t2_talk_state_tests.rs ($AGENTCLI_TARGET/debug/deps/t2_talk_state_tests-8944395d666060bf)
+
+running 25 tests
+test a_finish_error_keeps_the_watched_words_and_reports ... ok
+test a_secret_read_failure_settles_the_start ... ok
+test deepgram_finals_accumulate_and_interims_replace ... ok
+test a_late_finished_after_cancel_is_dropped_whole ... ok
+test deepgram_start_reads_the_vaulted_key_first ... ok
+test deepgram_without_the_daemon_feature_refuses_honestly ... ok
+test deepgram_start_without_a_key_opens_setup ... ok
+test ending_the_session_commits_the_engine_result_without_sending ... ok
+test demo_slash_talk_refuses_honestly ... ok
+test local_frames_replace_the_ghost_cumulatively ... ok
+test esc_cancels_and_discards_everything ... ok
+test leaving_the_surface_cancels_the_session ... ok
+test live_chip_press_starts_a_local_session ... ok
+test mic_denied_surfaces_the_terminal_grant_hint ... ok
+test model_missing_opens_the_reinstall_surface ... ok
+test other_keys_are_inert_while_listening ... ok
+test pasting_commits_the_ghost_first ... ok
+test realized_transcripts_are_capped ... ok
+test slash_talk_toggles_like_the_chip ... ok
+test started_flips_to_listening_only_for_the_live_generation ... ok
+test the_capture_cap_finishes_into_the_composer_without_submitting ... ok
+test the_explicit_auto_send_opt_in_still_submits ... ok
+test the_listening_toggle_stops_into_the_composer_and_sends_nothing ... ok
+test the_ghost_row_is_chrome_never_content ... ok
+test typing_commits_the_ghost_and_keeps_editing ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/t2_wave_tests.rs ($AGENTCLI_TARGET/debug/deps/t2_wave_tests-14145e15af062157)
+
+running 11 tests
+test glyph_mapping_is_sqrt_and_total_over_the_unit_interval ... ok
+test decay_falls_at_thirteen_percent_per_sample ... ok
+test attack_rises_at_half_per_sample ... ok
+test noise_floor_calibration_flattens_ambient_and_rescales_speech ... ok
+test plain_fallback_keeps_the_same_indices_in_ascii ... ok
+test ring_is_fixed_width_with_newest_at_the_right_edge ... ok
+test hot_columns_split_at_the_speaking_threshold ... ok
+test stale_generation_envelopes_never_touch_the_ring ... ok
+test slash_talk_wave_toggles_the_plain_style ... ok
+test wave_renders_on_the_composer_band_next_to_the_chip ... ok
+test wave_yields_before_the_chip_on_a_narrow_band ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/theme_tests.rs ($AGENTCLI_TARGET/debug/deps/theme_tests-fe5a46dadff723e4)
+
+running 17 tests
+test dark_blends_match_hand_computed_goldens ... ok
+test desert_blends_match_hand_computed_goldens ... ok
+test desert_solid_tokens_match_the_design_hexes ... ok
+test dark_refresh_keeps_the_identity_hexes ... ok
+test every_theme_clears_wcag_contrast_floors ... ok
+test every_theme_keeps_ink_tokens_distinct_from_its_ground ... ok
+test hex_decodes_channels ... ok
+test labels_and_families_match_the_design ... ok
+test legacy_sim_names_migrate_instead_of_resetting ... ok
+test light_blends_match_hand_computed_goldens ... ok
+test light_solid_tokens_match_the_design_hexes ... ok
+test oasis_solid_tokens_match_the_design_hexes ... ok
+test oasis_blends_match_hand_computed_goldens ... ok
+test over_blends_extremes_exactly ... ok
+test picker_menu_covers_every_registry_theme_once ... ok
+test theme_choice_parses_system_and_fixed_names ... ok
+test theme_keys_parse_and_roundtrip_in_menu_order ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/tpsfix_estimator_tests.rs ($AGENTCLI_TARGET/debug/deps/tpsfix_estimator_tests-36dab0b7cc335f3e)
+
+running 19 tests
+test a_degenerate_generation_span_keeps_the_last_live_value ... ok
+test a_new_turn_epoch_starts_the_estimator_over ... ok
+test a_burst_never_reads_as_its_naive_instantaneous_rate ... ok
+test a_single_delta_inside_the_minimum_span_shows_nothing ... ok
+test a_sub_threshold_window_waits_for_the_window_to_age ... ok
+test a_thin_usage_frame_never_moves_the_ratio ... ok
+test a_realistic_turn_never_flaps_between_zero_and_a_four_figure_rate ... ok
+test an_exact_usage_frame_recalibrates_the_ratio_without_a_step ... ok
+test billed_but_unstreamed_reasoning_stays_in_warmup_and_still_counts_at_the_end ... ok
+test reasoning_deltas_are_output_tokens_and_carry_the_rate ... ok
+test no_exact_frame_keeps_the_approximate_marker ... ok
+test settling_a_turn_the_tracker_has_moved_past_is_a_no_op ... ok
+test reset_returns_the_idle_resting_shape ... ok
+test silent_thinking_shows_elapsed_and_never_zero_tps ... ok
+test steady_fifty_tokens_per_second_reads_as_fifty ... ok
+test the_settled_value_is_total_output_over_the_generation_span ... ok
+test time_to_first_token_is_excluded_from_the_final_rate ... ok
+test the_displayed_value_is_recomputed_at_most_a_few_times_a_second ... ok
+test the_rate_holds_its_shape_across_a_slow_and_a_fast_stream ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/tpsfix_widget_tests.rs ($AGENTCLI_TARGET/debug/deps/tpsfix_widget_tests-802e0afcc69d68c3)
+
+running 12 tests
+test a_usage_frame_from_the_previous_turn_is_not_this_turn_s_total ... ok
+test a_parked_turn_is_not_settled_early ... ok
+test every_theme_draws_the_same_glyphs ... ok
+test a_four_figure_rate_still_fits_the_field ... ok
+test golden_streaming_carries_the_measured_rate ... ok
+test note_throughput_observes_a_live_turn_and_settles_a_finished_one ... ok
+test golden_finalized_shows_the_turn_mean ... ok
+test golden_streaming_estimate_wears_the_tilde ... ok
+test the_widget_is_about_a_quarter_of_the_retired_row ... ok
+test the_widget_carries_no_mean_tail ... ok
+test golden_thinking_shows_elapsed_and_never_a_zero_rate ... ok
+test the_widget_is_a_fixed_cell_budget_that_never_scales_with_the_terminal ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/tui31_lifecycle_tests.rs ($AGENTCLI_TARGET/debug/deps/tui31_lifecycle_tests-533f503b59af00de)
+
+running 26 tests
+test a_card_answered_in_its_own_session_still_applies ... ok
+test a_session_interrupt_leaves_a_background_orchestration_running ... ok
+test a_second_message_to_a_chip_renders_in_full ... ok
+test a_fresh_session_cancels_chip_work ... ok
+test an_attach_hit_follows_its_session_when_the_list_reorders ... ok
+test a_stale_card_answer_cannot_reconfigure_a_replacement_session ... ok
+test a_talk_hold_cancelled_by_esc_never_starts_a_session ... ok
+test an_interrupted_think_window_burns_no_intro_and_no_callsign ... ok
+test aura_runs_survive_clear_but_reset_stops_them ... ok
+test each_card_open_mints_a_fresh_id ... ok
+test a_menu_option_hit_is_inert_once_its_surface_is_gone ... ok
+test closing_a_chip_stops_its_script_at_once ... ok
+test launcher_liveness_and_metas_follow_the_sim_seeds ... ok
+test stale_hits_from_another_surface_are_dropped ... ok
+test stale_mic_and_help_hits_respect_their_surfaces ... ok
+test the_auto_title_micro_call_lands_after_an_interrupt ... ok
+test chip_question_rows_answer_on_click_and_move_on_hover ... ok
+test interrupt_leaves_chips_running_and_their_card_still_resolves ... ok
+test the_launcher_mic_renders_but_does_nothing ... ok
+test the_auto_title_micro_call_never_names_a_replacement_session ... ok
+test token_counts_use_utf16_units_like_the_sim ... ok
+test two_manual_compactions_both_land_their_rows ... ok
+test the_aura_stage_never_hides_a_live_composer ... ok
+test the_voice_tag_clears_even_when_the_branch_parks_on_a_menu ... ok
+test two_rapid_aura_submits_cannot_interleave ... ok
+test trailing_word_boundaries_route_like_the_sim ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/tui3_visual_hover_tests.rs ($AGENTCLI_TARGET/debug/deps/tui3_visual_hover_tests-030c87cb13ad081f)
+
+running 8 tests
+test boot_plays_the_sim_script_verbatim ... ok
+test hover_lights_launcher_rows_and_clears_off_target ... ok
+test launcher_recent_rows_share_one_left_column_without_digits ... ok
+test hover_turns_talk_and_back_chip_chrome_gold ... ok
+test composer_band_is_the_exact_designed_blend_in_every_theme ... ok
+test launcher_typography_uses_exact_theme_inks ... ok
+test hover_moves_palette_and_menu_selection ... ok
+test session_header_dir_is_bright_and_back_chip_frame_chromed ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/tui41_fix_tests.rs ($AGENTCLI_TARGET/debug/deps/tui41_fix_tests-d9b7b903bcfd2d35)
+
+running 7 tests
+test a_persisted_nameless_session_id_rejects_the_file ... ok
+test a_persisted_scratch_generation_rejects_the_file ... ok
+test a_dead_sessions_auto_title_never_lands_on_its_replacement ... ok
+test a_foreign_version_rejects_the_whole_file_back_to_seeds ... ok
+test the_session_id_allocator_never_rewinds ... ok
+test a_v1_numeric_fixture_upcasts_without_reseeding_and_rewrites_as_v2 ... ok
+test a_structurally_partial_session_rejects_the_whole_file ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/tui4_owner_wave_tests.rs ($AGENTCLI_TARGET/debug/deps/tui4_owner_wave_tests-5c5bdc48e0ba5774)
+
+running 12 tests
+test an_untouched_launcher_never_plays_anything ... ok
+test attaching_a_session_replays_its_seed_and_starts_no_turn ... ok
+test the_banner_renders_whole_or_falls_back_to_the_text_mark ... ok
+test the_mark_maps_and_their_half_block_rendering_agree ... ok
+test the_launcher_column_is_capped_and_centered_at_a_wide_frame ... ok
+test the_composer_band_fills_its_whole_region_and_closes_with_a_rule ... ok
+test the_subtree_main_row_is_always_present_and_marks_the_current_node ... ok
+test the_session_header_mark_spans_both_lines_or_yields ... ok
+test the_subtree_main_row_takes_hover_chrome_like_a_chip_row ... ok
+test the_breathing_rows_shed_before_any_sacred_row ... ok
+test the_todos_panel_hovers_collapses_and_keeps_its_spacer ... ok
+test the_waiting_line_tracks_live_background_agents ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/tui4b_interaction_tests.rs ($AGENTCLI_TARGET/debug/deps/tui4b_interaction_tests-8b58c3a5fd1e95a2)
+
+running 14 tests
+test ctrl_c_quits_from_the_launcher_and_from_boot ... ok
+test ctrl_c_resets_the_view_state_on_its_way_out ... ok
+test ctrl_c_walks_a_session_back_to_the_launcher_and_touches_no_turn ... ok
+test a_drag_selects_copies_and_suppresses_the_click_hit ... ok
+test a_plain_click_still_dispatches_its_hit_on_release ... ok
+test selection_text_flows_linearly_and_trims_row_padding ... ok
+test selection_text_normalizes_an_upward_drag_and_bounds_to_the_frame ... ok
+test selection_text_skips_wide_glyph_continuation_cells ... ok
+test rendered_selection_text_reads_a_real_frame_not_the_swapped_buffer ... ok
+test same_cell_jitter_is_a_click_not_a_drag ... ok
+test the_highlight_clears_on_the_next_click_or_keypress ... ok
+test the_selection_highlight_paints_the_linear_range_only ... ok
+test the_sticky_band_is_visually_distinct_with_a_bottom_frame_edge ... ok
+test the_sticky_band_hovers_through_the_standard_path_and_reverts ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/tui4c_persistence_tests.rs ($AGENTCLI_TARGET/debug/deps/tui4c_persistence_tests-7f52af47450eea70)
+
+running 9 tests
+test corrupt_and_missing_files_keep_the_seeds ... ok
+test closed_chips_are_swept_and_callsigns_backfilled_on_load ... ok
+test answering_a_hydrated_card_lands_the_stale_menu_note ... ok
+test a_persisted_idle_i_survives_hydration_verbatim ... ok
+test reset_purges_the_state_file_and_restores_seeds ... ok
+test id_collision_bump_restores_card_seq_and_session_id_allocator ... ok
+test guarded_singles_restore_theme_vfs_dir_and_voice ... ok
+test seed_snapshot_hydrates_to_a_byte_identical_launcher ... ok
+test two_user_sessions_and_the_seeds_round_trip_through_the_file ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/tui4c_session_map_tests.rs ($AGENTCLI_TARGET/debug/deps/tui4c_session_map_tests-5a42fef077afee9d)
+
+running 5 tests
+test interrupt_marks_only_its_own_session_and_survives_a_round_trip ... ok
+test launcher_typing_starts_fresh_and_the_left_session_keeps_its_row ... ok
+test seeded_sessions_round_trip_through_the_map_like_user_ones ... ok
+test background_events_land_in_the_slot_and_reopen_restores_exactly ... ok
+test leaving_mid_turn_shows_idle_badge_and_a_running_row ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/tui4d_animation_tests.rs ($AGENTCLI_TARGET/debug/deps/tui4d_animation_tests-c8cbeda1c6964d45)
+
+running 6 tests
+test badge_pulse_set_matches_the_sim_vocabulary ... ok
+test phase_ticks_never_touch_the_persistence_snapshot ... ok
+test the_phase_clock_is_armed_iff_an_animated_state_exists ... ok
+test the_launcher_rail_shimmers_and_the_running_dot_pulses ... ok
+test phase_toggle_alternates_the_thinking_line ... ok
+test chip_glyphs_pulse_running_maroon_and_input_required_warn ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/tui5_cursor_tests.rs ($AGENTCLI_TARGET/debug/deps/tui5_cursor_tests-cd45b49c9a77bc4d)
+
+running 46 tests
+test backspace_and_delete_are_grapheme_aware ... ok
+test arabic_moves_in_logical_order ... ok
+test click_then_plain_arrow_never_fabricates_a_selection ... ok
+test arrow_history_recalls_submits_and_restores_the_draft ... ok
+test ctrl_c_with_selection_copies_instead_of_navigating ... ok
+test composer_drag_selects_and_autocopies_on_release ... ok
+test click_places_the_caret_at_the_clicked_grapheme ... ok
+test cursor_cell_is_themed_on_every_theme ... ok
+test drafts_travel_per_surface_with_cursor_and_selection ... ok
+test dto_carries_no_composer_cursor_or_draft_state ... ok
+test envelope_session_flip_swaps_the_aura_draft ... ok
+test esc_clears_the_selection_before_any_other_esc_meaning ... ok
+test flag_join_after_delete_normalizes_cursor_and_anchor ... ok
+test founding_message_recalls_in_the_new_session ... ok
+test held_drag_dies_with_the_surface_it_started_on ... ok
+test hidden_selection_never_eats_esc_when_a_menu_owns_input ... ok
+test hidden_selection_never_preempts_ctrl_c_when_a_menu_owns_input ... ok
+test history_ring_recalls_and_restores_the_draft ... ok
+test kill_commands_are_line_scoped ... ok
+test aura_and_arg_slot_composers_carry_the_cursor_cell ... ok
+test load_rejects_sentinel_max_and_duplicate_ids ... ok
+test launcher_band_closes_with_a_frame_rule ... ok
+test palette_owns_the_arrows_while_open ... ok
+test plain_up_with_selection_collapses_instead_of_going_dead ... ok
+test press_snaps_to_grapheme_boundaries ... ok
+test reset_purges_session_drafts_but_the_launcher_draft_survives ... ok
+test cursor_renders_reverse_video_mid_text ... ok
+test shift_movement_extends_and_plain_movement_collapses ... ok
+test shift_up_and_down_extend_to_the_buffer_edges ... ok
+test stale_composer_hit_is_dropped_not_misapplied ... ok
+test stale_hit_with_old_content_never_moves_the_caret ... ok
+test submit_clears_only_that_surfaces_draft ... ok
+test selection_band_renders_with_a_distinct_cursor_cell ... ok
+test cursor_row_follows_the_caret_through_the_vertical_window ... ok
+test typing_inserts_at_the_cursor_never_appends ... ok
+test typing_replaces_the_selection ... ok
+test transcript_selection_keeps_tui4_key_meanings_exactly ... ok
+test vertical_movement_counts_wide_cells ... ok
+test vertical_movement_is_column_sticky ... ok
+test wide_glyph_right_cell_rounds_the_caret_after_it ... ok
+test word_movement_and_word_backspace ... ok
+test up_moves_rows_first_and_recalls_only_at_the_edge ... ok
+test zwj_insert_normalizes_the_cursor_to_the_joined_cluster ... ok
+test wrap_rows_never_split_a_grapheme ... ok
+test overlong_line_wraps_around_a_mid_text_caret ... ok
+test transcript_drag_still_makes_a_screen_selection ... ok
+
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/tui6_softwrap_tests.rs ($AGENTCLI_TARGET/debug/deps/tui6_softwrap_tests-ab863c779193fa70)
+
+running 49 tests
+test arrows_walk_visual_rows_sticky_and_home_end_stay_logical ... ok
+test background_chip_close_under_the_login_card_aborts_it ... ok
+test async_session_open_under_the_login_card_aborts_it_and_keeps_the_ring ... ok
+test chip_close_from_aura_swaps_the_draft ... ok
+test aura_band_carries_both_rules ... ok
+test chip_view_scroll_never_carries_onto_the_session ... ok
+test arg_slot_band_carries_both_rules ... ok
+test caret_stays_visible_beyond_the_autogrow_cap ... ok
+test click_maps_through_the_wrapped_row_window ... ok
+test demo_driver_login_close_restores_through_the_one_method ... ok
+test cluster_families_price_and_wrap_consistently ... ok
+test fresh_empty_render_publishes_its_width ... ok
+test every_composer_surface_soft_wraps ... ok
+test header_mark_reads_as_letterforms_at_24_cols ... ok
+test launcher_band_carries_both_rules ... ok
+test login_card_band_carries_both_rules ... ok
+test composer_starts_at_one_row_and_grows_by_wrapping ... ok
+test login_card_is_modal_against_the_hits_beneath_it ... ok
+test login_close_restores_the_draft_and_its_history ... ok
+test modals_own_hover_and_wheel_too ... ok
+test header_mark_dignity_gate_holds_at_the_new_threshold ... ok
+test parked_draft_sticky_column_dies_with_its_budget ... ok
+test login_card_outranks_an_arriving_menu_on_the_band ... ok
+test newlines_and_wrap_compose_into_one_visual_row_walk ... ok
+test reserved_rule_sweeps_aura ... ok
+test question_card_never_sheds_its_title_while_options_render ... ok
+test reserved_rule_sweeps_launcher ... ok
+test reserved_rule_holds_on_the_session_menu ... ok
+test resize_reflows_navigation_before_any_queued_key ... ok
+test resize_reflows_the_wrap_from_the_current_width ... ok
+test resize_retires_the_previous_frames_composer_hits ... ok
+test restored_draft_wakes_to_the_current_width_not_its_parked_one ... ok
+test reserved_rule_sweeps_subagent_and_question_card ... ok
+test s2_aura_draft_wakes_at_current_width ... ok
+test s1_reverse_seam_session_draft_wakes_at_current_width ... ok
+test s3_double_resize_while_parked_last_width_wins ... ok
+test s5_fresh_draft_wakes_at_current_width ... ok
+test s4_login_seam_resize_while_card_open ... ok
+test s6_reset_purge_restores_at_current_width ... ok
+test session_band_carries_both_rules ... ok
+test shift_arrows_extend_across_visual_rows ... ok
+test session_menu_band_carries_both_rules ... ok
+test subagent_band_closes_with_a_rule_above_the_subtree ... ok
+test sticky_column_is_invalidated_by_a_budget_change ... ok
+test wrap_rows_partition_and_respect_wide_cells ... ok
+test subagent_question_card_band_closes_too ... ok
+test zero_width_leading_cluster_gets_one_cell_everywhere ... ok
+test reserved_rule_sweeps_session_with_chip ... ok
+test closing_rule_outranks_breathing_rows_under_pressure ... ok
+
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+
+     Running tests/tuivirt_golden_tests.rs ($AGENTCLI_TARGET/debug/deps/tuivirt_golden_tests-65c2ea6dd1944c00)
+
+running 21 tests
+test band_task_line_with_one_shell_and_one_monitor_frames ... ok
+test band_task_line_with_many_shells_and_monitors_frames ... ok
+test band_task_line_without_subagents_frames ... ok
+test band_closes_straight_into_the_subagents_panel_frames ... ok
+test cjk_emoji_combining_frames ... ok
+test demo_session_frames ... ok
+test composer_image_notice_frames ... ok
+test empty_session_frames ... ok
+test fenced_code_blocks_frames ... ok
+test extreme_logical_line_is_capped_with_raw_export_expander ... ok
+test input_required_ask_frames ... ok
+test input_required_menu_frames ... ok
+test markdown_headings_and_lists_frames ... ok
+test long_wrapped_lines_frames ... ok
+test monitors_overlay_firing_row_frames ... ok
+test monitors_overlay_states_frames ... ok
+test megabyte_reply_frames ... ok
+test streaming_tail_frames ... ok
+test scrolled_history_with_sticky_and_jump_chip_frames ... ok
+test tool_call_boxes_collapsed_and_expanded_frames ... ok
+test wide_tables_frames ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+
+     Running tests/tuivirt_memory_tests.rs ($AGENTCLI_TARGET/debug/deps/tuivirt_memory_tests-658955ca6382e096)
+
+running 3 tests
+test counting_allocator_balances_alloc_and_free ... ok
+test megabyte_entry_retains_only_a_viewport_window ... ok
+test render_side_retention_is_flat_from_1k_to_50k_rows ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.39s
+
+     Running tests/tuivirt_scroll_tests.rs ($AGENTCLI_TARGET/debug/deps/tuivirt_scroll_tests-eadf997fd4db1c00)
+
+running 7 tests
+test edits_appends_and_completions_never_render_stale_rows ... ok
+test follow_mode_and_jump_to_bottom_behave_as_today ... ok
+test theme_switch_rerenders_from_the_cache_like_a_fresh_render ... ok
+test resize_rewraps_like_a_fresh_render_and_keeps_the_tail_and_top_anchored ... ok
+test sticky_jump_lands_the_producing_prompt_on_the_transcripts_top_row ... ok
+test wheel_and_drag_steps_from_bottom_middle_and_top_of_10k_rows ... ok
+test a_scroll_position_renders_identically_warm_and_cold ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.11s
+
+     Running tests/tuivirt_shape_bench_tests.rs ($AGENTCLI_TARGET/debug/deps/tuivirt_shape_bench_tests-97c281afff95d52e)
+
+running 2 tests
+test shape_gate_arithmetic_is_pinned ... ok
+test first_frame_and_cached_p95_are_flat_from_10k_to_200k_rows has been running for over 60 seconds
+test first_frame_and_cached_p95_are_flat_from_10k_to_200k_rows ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 235.31s
+
+     Running tests/turn_activity_indicator_tests.rs ($AGENTCLI_TARGET/debug/deps/turn_activity_indicator_tests-086541957988ca6f)
+
+running 7 tests
+test chip_display_states_follow_the_same_law ... ok
+test indicator_covers_every_running_run_state ... ok
+test the_clock_runs_while_the_indicator_is_up ... ok
+test retrying_shows_its_own_row_and_never_two_indicators ... ok
+test the_owners_bug_a_streaming_turn_shows_the_indicator ... ok
+test indicator_renders_for_the_other_running_states ... ok
+test indicator_stays_dark_when_the_turn_is_not_running ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/turn_engine_tests.rs ($AGENTCLI_TARGET/debug/deps/turn_engine_tests-d1ddf1cc792a1c58)
+
+running 21 tests
+test compaction_beats_carry_the_numbers_and_reenter_the_turn_end_law ... ok
+test crash_branch_is_verbatim_with_three_arms ... ok
+test custom_tool_branch_parks_waiting_with_the_verbatim_reason ... ok
+test generic_rotation_post_increments_and_test_branch_reads_without_increment ... ok
+test crash_menu_errored_arm_holds_then_idles_without_compaction ... ok
+test paste_and_image_tokens_pick_the_default_branch_subpaths ... ok
+test generic_turn_plays_end_to_end_with_the_delayed_title_note ... ok
+test auto_compaction_fires_at_85_percent_and_drops_the_meter_to_6_percent ... ok
+test preamble_is_user_tokens_thinking_750_streaming_and_ends_with_turn_end ... ok
+test plan_todo_branch_pins_a_dep_chain_and_unpins_all_completed ... ok
+test prod_branch_permission_card_and_arms_are_verbatim ... ok
+test manual_compact_runs_1200ms_and_lands_the_numbers ... ok
+test rate_limit_branch_rotation_menu_and_arms_are_verbatim ... ok
+test roster_claims_draw_in_order_from_index_three_and_wrap_with_roman ... ok
+test stream_paces_word_tokens_at_22ms_with_9_tokens_per_char ... ok
+test routing_follows_the_sim_order_and_word_boundaries ... ok
+test title_note_is_the_sim_full_text ... ok
+test voice_turns_wrap_in_voice_tags_and_skip_the_user_row ... ok
+test stop_scripts_cancels_parked_menu_arms ... ok
+test queued_input_consumes_at_turn_end_without_passing_through_idle ... ok
+test talk_hold_fires_the_canned_phrase_through_the_voice_path ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/u1_opencode_presets_tests.rs ($AGENTCLI_TARGET/debug/deps/u1_opencode_presets_tests-c5fd3073d1f53061)
+
+running 4 tests
+test presets_gate_on_the_daemon_configure_feature ... ok
+test opencode_zen_preset_prefills_the_zen_gateway ... ok
+test opencode_go_preset_prefills_the_go_gateway ... ok
+test accounts_add_rows_offer_both_presets ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/u2_usage_screen_tests.rs ($AGENTCLI_TARGET/debug/deps/u2_usage_screen_tests-8f9cc9e3d83fd6bc)
+
+running 30 tests
+test heatmap_civil_date_algebra_round_trips_and_knows_its_weekdays ... ok
+test direct_usage_scope_arguments_land_and_keep_the_provider_filter ... ok
+test demo_usage_opens_an_honest_empty_state ... ok
+test api_key_accounts_render_tokens_and_cost_never_a_meter ... ok
+test identity_masking_keeps_first_chars_and_tld_only ... ok
+test left_right_tabs_cycle_the_cursor_groups_accounts_and_wrap ... ok
+test history_scope_renders_absence_zero_and_activity_distinctly ... ok
+test live_usage_entry_is_feature_gated_then_fetches ... ok
+test history_and_models_f_refresh_has_immediate_feedback ... ok
+test masked_runs_cap_at_eight_without_padding_short_runs ... ok
+test meter_reason_compaction_preserves_the_typed_mapping ... ok
+test live_replies_install_the_report_and_failures_land_typed ... ok
+test metered_accounts_render_bars_percent_and_resets ... ok
+test models_scope_names_empty_attribution_and_scrolls_long_tables ... ok
+test long_reports_scroll_to_reach_every_line ... ok
+test part_a_mixed_device_total_separates_metered_and_all_lane_api_rate ... ok
+test remaining_bar_math_clamps_and_floors ... ok
+test reset_times_format_by_tier ... ok
+test identities_render_masked_by_default_and_reveal_is_per_visit ... ok
+test part_a_oauth_usage_shows_labeled_api_rate_with_tokens_cache_and_hit_rate ... ok
+test models_scope_orders_and_folds_selectable_ledger_ranges ... ok
+test unavailable_meters_render_the_typed_reason_never_a_bar ... ok
+test usage_is_registered_and_enter_runs_it_without_arg_hijack ... ok
+test usage_owns_its_keys_esc_closes_and_enter_never_hijacks ... ok
+test usage_tone_thresholds_are_pinned ... ok
+test usage_wire_bodies_and_replies_map_onto_u1s_shapes ... ok
+test s_cycles_scope_and_global_renders_compact_overview ... ok
+test weekly_only_meter_row_pins_percent_label_and_reset ... ok
+test usage_filter_shows_only_the_named_provider ... ok
+test scope_strip_pins_every_active_scope_and_clicks_by_value ... ok
+
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/ui_polish_tests.rs ($AGENTCLI_TARGET/debug/deps/ui_polish_tests-f16c9e79ffeecd0a)
+
+running 4 tests
+test viewport_is_a_noop_when_everything_fits ... ok
+test throughput_pill_is_compact_and_carries_the_rate ... ok
+test listening_pulse_animates_across_the_clock_and_is_deterministic ... ok
+test viewport_follows_selection_without_scrolling_under_a_pinned_top ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ui_themes_tests.rs ($AGENTCLI_TARGET/debug/deps/ui_themes_tests-0296bd3f12cb5f49)
+
+running 10 tests
+test every_theme_clears_the_contrast_floors ... ok
+test narrow_boot_omits_the_shahada_whole ... ok
+test system_theme_follows_detection_fallback_dark ... ok
+test boot_splash_keeps_centered_shahada ... ok
+test theme_commit_persists_from_the_launcher_flow ... ok
+test theme_persists_and_reloads ... ok
+test launcher_renders_header_band_not_centered_art ... ok
+test theme_picker_lists_and_switches_instantly ... ok
+test every_surface_uses_theme_slots ... ok
+test theme_picker_opens_on_every_composer_surface ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/voicefix_frame_bench_tests.rs ($AGENTCLI_TARGET/debug/deps/voicefix_frame_bench_tests-d4118177e13701a6)
+
+running 1 test
+test a_listening_frame_stays_inside_the_thirty_fps_budget ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.13s
+
+     Running tests/voicefix_wave_tests.rs ($AGENTCLI_TARGET/debug/deps/voicefix_wave_tests-7339f9f7446ec1c6)
+
+running 11 tests
+test a_steady_tone_converges_and_holds ... ok
+test bursts_rise_fast_and_fall_slow ... ok
+test a_fed_ring_keeps_drawing_real_audio_through_a_quiet_passage ... ok
+test silence_decays_toward_zero ... ok
+test the_blink_is_one_hz_and_independent_of_level_ticks ... ok
+test the_rendered_listening_chip_follows_the_blink_clock ... ok
+test the_visualizer_is_half_its_old_width ... ok
+test wave_glyphs_are_borrowed_not_allocated ... ok
+test golden_listening_row_idle ... ok
+test golden_listening_row_speaking ... ok
+test golden_listening_row_stopped ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/w10b_management_tests.rs ($AGENTCLI_TARGET/debug/deps/w10b_management_tests-427a2fc6be5c4b03)
+
+running 11 tests
+test demo_account_removal_stays_local ... ok
+test edit_card_prefills_and_repoints_endpoint_with_locked_name ... ok
+test account_remove_arms_confirms_and_issues_the_durable_command ... ok
+test edit_card_submits_repointed_origin_under_the_same_name ... ok
+test live_chips_claim_roster_callsigns_when_the_wire_sends_none ... ok
+test huggingface_preset_prefills_the_router ... ok
+test models_refresh_failure_lands_on_the_provider_row_never_the_flash ... ok
+test provider_remove_issues_and_surfaces_the_typed_refusal ... ok
+test mid_backoff_retry_issues_the_wake_command ... ok
+test cards_opened_from_providers_render_on_the_providers_screen ... ok
+test providers_screen_offers_account_add_and_jumps_to_accounts ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/w3c31_fix_tests.rs ($AGENTCLI_TARGET/debug/deps/w3c31_fix_tests-3e0e21eb7d69645c)
+
+running 21 tests
+test a_created_session_attaches_exactly_once_through_the_loop ... ok
+test a_disconnect_mid_validation_recovers_the_card_and_retires_the_dead_login ... ok
+test a_fresh_attachs_first_envelope_is_gap_checked_against_the_cursor_it_asked_from ... ok
+test a_gap_produces_exactly_one_attach_through_the_loop_the_binary_runs ... ok
+test a_catch_up_short_of_its_high_water_mark_reattaches_instead_of_trusting_it ... ok
+test a_contiguous_first_envelope_after_a_seeded_cursor_still_applies ... ok
+test a_live_voice_submit_fabricates_no_row_on_the_session_screen_either ... ok
+test a_login_retry_restages_under_the_original_command_id ... ok
+test a_lagged_attachment_produces_exactly_one_attach_through_the_loop ... ok
+test a_login_that_never_answers_stops_saying_validating ... ok
+test dropped_frames_reattach_every_held_attachment_rather_than_vanishing ... ok
+test a_reconnect_produces_exactly_one_attach_per_working_set_member ... ok
+test live_bang_requires_the_typed_clients_complete_feature_set ... ok
+test live_bang_routes_one_exact_command_to_shell_exec_and_never_a_turn ... ok
+test live_mode_opens_no_local_card_it_has_no_way_to_close ... ok
+test live_tools_reads_the_daemon_inventory_and_opens_no_card ... ok
+test reset_reseeds_the_demo_world_with_generations_that_have_never_been_worn ... ok
+test the_loop_pass_hands_back_the_shell_owned_requests_and_translates_the_rest ... ok
+test sessions_lists_every_session_including_the_ones_past_the_launcher ... ok
+test live_mode_lists_and_reaches_the_cold_sessions_the_driver_tracks ... ok
+test a_live_launcher_row_is_clickable_although_it_has_no_display_name ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/w3c31_r2_tests.rs ($AGENTCLI_TARGET/debug/deps/w3c31_r2_tests-4bd80a1599505ec0)
+
+running 12 tests
+test demo_sessions_is_a_known_stub_not_a_typo ... ok
+test live_aura_door_is_closed_at_the_one_entrance ... ok
+test a_retryable_failure_on_the_attached_surface_retries_with_the_slot_reclaimed ... ok
+test live_compact_routes_to_the_daemon_and_fabricates_nothing ... ok
+test live_push_to_talk_never_wedges_listening ... ok
+test live_esc_mid_turn_paints_nothing_the_daemon_did_not_commit ... ok
+test live_shell_builtins_refuse_instead_of_painting_the_fake_vfs ... ok
+test sessions_opens_rows_past_the_digit_span_by_ordinal_and_id ... ok
+test the_login_deadline_is_exposed_to_the_shell_as_a_wakeup ... ok
+test the_driver_refuses_demo_vocabulary_aloud_and_unwinds_the_optimistic_state ... ok
+test live_subagent_steer_and_close_refuse_instead_of_destroying_the_text ... ok
+test a_failed_background_attach_never_starves_the_selected_session ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/w3c3_link_tests.rs ($AGENTCLI_TARGET/debug/deps/w3c3_link_tests-620adc09d8271aa6)
+
+running 13 tests
+test attach_caught_up_maps_to_the_catch_up_boundary ... ok
+test deferred_loss_publishes_only_after_the_barrier_drains ... ok
+test barrier_overflow_defers_loss_instead_of_publishing_mid_barrier ... ok
+test issue_awaits_the_send_before_it_spawns_the_wait ... ok
+test map_frame_translates_every_uncorrelated_frame_it_owns ... ok
+test map_response_interprets_attach_outcomes_through_their_context ... ok
+test attach_response_precedes_events_that_overtook_it_on_the_wire ... ok
+test menu_answers_reach_the_wire_uncorrelated ... ok
+test models_refresh_error_maps_to_the_row_scoped_reply ... ok
+test request_body_round_trips_the_attachment_commands ... ok
+test tui_session_create_carries_automode_overrides ... ok
+test detach_then_attach_reaches_the_wire_in_that_order ... ok
+test client_side_event_drops_surface_as_events_lost ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+
+     Running tests/w3c3_live_driver_tests.rs ($AGENTCLI_TARGET/debug/deps/w3c3_live_driver_tests-bca1448685b8d672)
+
+running 21 tests
+test a_failed_attach_releases_its_latch_so_the_session_is_not_wedged ... ok
+test a_cold_session_attaches_only_when_it_is_selected_and_only_once ... ok
+test a_gap_reattaches_exactly_once_through_the_single_authority ... ok
+test a_reconnect_resends_the_outbox_under_the_same_durable_command_ids ... ok
+test a_cold_session_is_listable_with_its_head_and_readable_by_selection ... ok
+test an_answer_for_a_menu_this_connection_never_saw_open_is_not_invented ... ok
+test events_for_an_unknown_attachment_are_rejected ... ok
+test esc_cancels_the_run_the_committed_stream_says_is_running_or_nothing ... ok
+test a_live_menu_answer_carries_the_exact_opening_sequence_and_generation ... ok
+test eviction_never_takes_the_attached_surface_or_a_session_awaiting_you ... ok
+test listing_the_same_sessions_again_neither_duplicates_rows_nor_regenerates_them ... ok
+test initial_session_opens_from_the_list_or_flashes_unknown ... ok
+test reconnect_restores_the_working_set_after_each_sessions_last_applied_cursor ... ok
+test live_mid_turn_input_reaches_the_daemon_instead_of_a_local_queue ... ok
+test resident_binding_announce_carries_the_launch_token_across_session_hops ... ok
+test resident_binding_announce_fires_on_bind ... ok
+test session_seen_acknowledgement_debounces_per_view_window ... ok
+test resident_binding_announce_fires_on_rebind ... ok
+test resident_binding_announce_fires_on_unbind ... ok
+test the_live_launcher_creates_no_row_or_session_until_the_daemon_answers ... ok
+test the_working_set_lru_detaches_before_the_seventeenth_attach ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/w3c3_login_tests.rs ($AGENTCLI_TARGET/debug/deps/w3c3_login_tests-0e7b517314f213b0)
+
+running 25 tests
+test at_deadline_stage_mints_nothing_in_its_own_pass ... ok
+test an_empty_card_cannot_be_submitted_and_esc_cancels_without_a_request ... ok
+test close_retires_the_queued_login_request_before_dispatch ... ok
+test cancelled_attempt_never_mints_and_a_stale_result_never_lands ... ok
+test committed_api_key_add_on_accounts_refreshes_the_roster_once ... ok
+test ctrl_c_closes_the_card_instead_of_navigating_with_a_key_in_memory ... ok
+test every_stable_login_code_gets_its_own_recovery_text ... ok
+test failed_api_key_add_on_accounts_does_not_refresh_or_clear_the_error ... ok
+test login_has_argument_slots_for_provider_then_method ... ok
+test a_committed_login_shows_the_descriptor_identity_and_no_secret ... ok
+test non_stage_noid_failure_never_shifts_stage_correlation ... ok
+test pasted_buffer_is_zeroizing_by_type ... ok
+test pasted_debug_is_redacted_end_to_end ... ok
+test retire_then_disconnect_clears_the_tags_and_the_next_attempt_works ... ok
+test reset_is_demo_only_and_never_reseeds_a_live_session_list ... ok
+test retired_failed_reply_is_silent_no_flash ... ok
+test stage_error_pops_its_tag_and_the_next_attempt_is_not_wedged ... ok
+test the_card_owns_the_keyboard_and_never_touches_the_composer ... ok
+test submitting_wipes_the_local_copy_before_the_request_is_even_drained ... ok
+test switch_abort_retires_the_inflight_attempt_too ... ok
+test the_demo_refuses_login_honestly_and_drops_the_key ... ok
+test timeout_retype_late_old_stage_never_mints ... ok
+test the_key_is_redacted_in_debug_and_absent_from_the_persisted_dto ... ok
+test a_failed_login_returns_the_card_to_entry_with_nothing_retained ... ok
+test typing_pasting_and_redrawing_never_put_the_key_on_screen ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/w3c3_render_bench_tests.rs ($AGENTCLI_TARGET/debug/deps/w3c3_render_bench_tests-ac2f17ff83ae2c6b)
+
+running 1 test
+test cached_viewport_render_stays_bounded_through_10k_rows ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.74s
+
+     Running tests/w3c3_router_tests.rs ($AGENTCLI_TARGET/debug/deps/w3c3_router_tests-89e06946a7d2ae6c)
+
+running 9 tests
+test a_duplicate_envelope_is_a_no_op_on_the_attached_session_too ... ok
+test a_non_ui_envelope_advances_the_cursor_without_painting ... ok
+test a_reattach_replay_lands_the_held_envelopes_and_clears_the_hole ... ok
+test a_gap_stops_reduction_and_requests_a_reattach_before_later_state_mutates ... ok
+test a_replayed_agent_spawn_never_doubles_the_chip ... ok
+test background_session_envelopes_route_by_opaque_session_id ... ok
+test a_session_scoped_close_still_reaches_the_subagents_card_that_opened_it ... ok
+test a_subagent_menu_answer_never_closes_the_sessions_own_card ... ok
+test agent_spawn_state_and_report_populate_nested_chips ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/w4a4_approval_card_tests.rs ($AGENTCLI_TARGET/debug/deps/w4a4_approval_card_tests-3358ebcc2ffc1889)
+
+running 1 test
+test approval_card_colors_the_patch_preview_by_diff_prefix ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/w5_wordmark_gate_tests.rs ($AGENTCLI_TARGET/debug/deps/w5_wordmark_gate_tests-fca050c257898c6d)
+
+running 2 tests
+test plain_terminals_never_query_graphics_capability ... ok
+test graphics_terminals_are_recognized ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/w5d_accounts_tests.rs ($AGENTCLI_TARGET/debug/deps/w5d_accounts_tests-a20cb894d98863de)
+
+running 14 tests
+test a_stale_set_active_result_cannot_regress_newer_rows ... ok
+test account_list_link_carries_sources_without_dropping_or_rederiving_them ... ok
+test cm3_account_switch_repeats_with_new_epoch_confirmation ... ok
+test esc_returns_to_launcher_and_reclick_reemits_the_message ... ok
+test accounts_screen_renders_linked_grok_and_kimi_source_rows ... ok
+test accounts_screen_renders_linked_and_unlinked_source_truth ... ok
+test normal_aliases_containing_probe_are_not_hidden ... ok
+test accounts_screen_renders_the_sim_hierarchy ... ok
+test expired_and_revoked_rows_refuse_selection_locally ... ok
+test seed_constants_match_the_seed_list ... ok
+test selection_moves_only_on_the_correlated_reply_never_on_click ... ok
+test probe_accounts_are_absent_from_the_rendered_roster ... ok
+test pending_select_renders_feedback_without_moving_the_dot ... ok
+test keychain_attention_rows_render_typed_actionable_remedies ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/w5d_providers_tests.rs ($AGENTCLI_TARGET/debug/deps/w5d_providers_tests-7f57757b71cff760)
+
+running 6 tests
+test default_marker_moves_only_on_the_correlated_reply ... ok
+test out_of_inventory_and_already_default_refuse_locally ... ok
+test esc_returns_to_launcher ... ok
+test a_stale_default_result_cannot_regress_newer_rows ... ok
+test revision_conflict_releases_the_gate_and_refreshes ... ok
+test providers_screen_renders_the_provisional_layout ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/w5e1b_daemon_capability_tests.rs ($AGENTCLI_TARGET/debug/deps/w5e1b_daemon_capability_tests-48ae66783003af1e)
+
+running 5 tests
+test a_daemon_without_the_oauth_feature_never_opens_the_card ... ok
+test demo_mode_is_always_capable ... ok
+test a_capable_daemon_opens_the_card ... ok
+test a_failed_start_reports_into_the_card_not_into_the_void ... ok
+test the_link_maps_a_failed_oauth_start_to_an_identity_tagged_reply ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/w5e3_picker_tests.rs ($AGENTCLI_TARGET/debug/deps/w5e3_picker_tests-8a01876c4f6ebeaa)
+
+running 8 tests
+test model_slot_follows_the_active_provider ... ok
+test model_slot_offers_the_active_providers_discovered_models ... ok
+test dynamic_slots_filter_by_prefix ... ok
+test model_picker_aggregate_uses_freshest_available_inventory_age ... ok
+test provider_and_account_slots_are_daemon_truth ... ok
+test model_without_the_feature_names_the_stale_daemon ... ok
+test opening_model_picker_refreshes_a_stale_selected_provider ... ok
+test selecting_a_model_requires_it_to_be_discovered ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/w5e_oauth_card_tests.rs ($AGENTCLI_TARGET/debug/deps/w5e_oauth_card_tests-a6375583f9ec9b89)
+
+running 5 tests
+test cancel_closes_and_late_replies_are_ghosts ... ok
+test demo_simulate_lands_the_account_and_selects_it ... ok
+test oauth_alias_derives_the_smallest_free_suffix ... ok
+test add_row_is_bottom_anchored_even_when_empty ... ok
+test card_renders_waiting_copy_above_the_add_row ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/w5f0_owner_bug_tests.rs ($AGENTCLI_TARGET/debug/deps/w5f0_owner_bug_tests-76b944d10e18e5b4)
+
+running 7 tests
+test browser_env_wins_and_the_scheme_is_allow_listed ... ok
+test an_interrupted_idle_session_is_not_busy_on_the_launcher ... ok
+test an_errored_turn_is_terminal_not_busy ... ok
+test the_oauth_authorize_hop_rides_to_the_shell_as_open_url ... ok
+test the_sessions_browser_never_names_an_errored_row_running ... ok
+test the_launcher_paints_an_errored_row_honestly ... ok
+]52;c;aHR0cHM6Ly9hdXRoLm9wZW5haS5jb20veA==test a_failed_browser_spawn_says_so_and_leaves_the_link_reachable ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/w5f2_identity_tests.rs ($AGENTCLI_TARGET/debug/deps/w5f2_identity_tests-86f775d8a80d8858)
+
+running 7 tests
+test an_unpinned_identity_follows_the_imported_active_account ... ok
+test an_active_oauth_account_with_no_catalog_triggers_discovery ... ok
+test a_refreshed_catalog_completes_the_bootstrap ... ok
+test a_pinned_choice_survives_every_later_snapshot ... ok
+test clicking_an_account_adopts_it_into_the_identity_and_pins ... ok
+test connecting_asks_for_account_and_provider_truth ... ok
+test session_create_requests_an_output_budget_not_the_context_window ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/w5g1_context_window_tests.rs ($AGENTCLI_TARGET/debug/deps/w5g1_context_window_tests-7c99d144d533de5a)
+
+running 4 tests
+test an_undeclared_window_keeps_the_seed_honest ... ok
+test adoption_takes_the_provider_declared_window ... ok
+test the_model_picker_adopts_the_picked_models_window ... ok
+test a_late_catalog_updates_even_a_pinned_identity ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/w5g2_alias_tests.rs ($AGENTCLI_TARGET/debug/deps/w5g2_alias_tests-97c7d253a003e6ad)
+
+running 6 tests
+test a_bad_alias_refuses_the_submit_and_keeps_the_key ... ok
+test a_failed_oauth_card_retries_under_the_edited_alias ... ok
+test tab_moves_the_keystrokes_between_fields ... ok
+test the_card_prefills_the_smallest_free_alias ... ok
+test the_slash_token_prefills_folded ... ok
+test the_submit_carries_the_edited_alias ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/w5g4_custom_provider_tests.rs ($AGENTCLI_TARGET/debug/deps/w5g4_custom_provider_tests-281e544d3167bfa3)
+
+running 8 tests
+test a_stale_daemon_gets_the_note_not_the_card ... ok
+test a_failed_configure_reopens_the_fields_with_the_reason ... ok
+test a_committed_configure_chains_into_the_key_card ... ok
+test a_selected_api_key_account_triggers_model_discovery ... ok
+test the_cards_are_mutually_exclusive ... ok
+test the_demo_card_is_the_sims_fabrication ... ok
+test the_live_card_edits_and_submits_under_the_snapshot_revision ... ok
+test the_chained_key_card_is_visible_on_the_accounts_screen ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/w5g6_owner_bugs_tests.rs ($AGENTCLI_TARGET/debug/deps/w5g6_owner_bugs_tests-ec59ab87f53c4d1f)
+
+running 3 tests
+test a_failed_run_writes_its_reason_into_the_transcript ... ok
+test the_live_launcher_caps_at_four_recent_sessions ... ok
+test a_resize_clears_the_stale_hover_highlight ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/w5g7_hover_tests.rs ($AGENTCLI_TARGET/debug/deps/w5g7_hover_tests-aeb17a861041574f)
+
+running 3 tests
+test a_target_that_moved_under_a_stationary_pointer_loses_its_highlight ... ok
+test a_target_still_under_the_pointer_keeps_its_highlight ... ok
+test settling_never_adopts_the_new_target_under_the_pointer ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/w6b_chip_wiring_tests.rs ($AGENTCLI_TARGET/debug/deps/w6b_chip_wiring_tests-ebdd01f827fa01f1)
+
+running 2 tests
+test the_manifest_task_labels_the_chip ... ok
+test the_durable_local_child_wait_badge_counts_the_tree ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/w7b_context_tests.rs ($AGENTCLI_TARGET/debug/deps/w7b_context_tests-011da6f9575401d6)
+
+running 5 tests
+test the_compaction_intent_becomes_the_preannounce_note ... ok
+test the_meter_drops_the_tilde_only_for_exact_truth ... ok
+test footprint_snapshots_feed_the_meter_and_never_the_transcript ... ok
+test the_token_panel_prints_footprint_splits_with_truth_honesty ... ok
+test tree_lists_the_main_line_turns_and_compactions ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/w8b_render_tests.rs ($AGENTCLI_TARGET/debug/deps/w8b_render_tests-15a1d1779a03bc91)
+
+running 5 tests
+test demo_bang_flashes_and_stays_out_of_the_vfs ... ok
+test the_tools_screen_renders_committed_snapshot_or_says_fetching ... ok
+test a_process_tool_calls_retained_output_tail_is_rendered ... ok
+test live_bang_draft_flips_the_sigil_to_the_command_glyph ... ok
+test computer_control_raises_the_sacred_banner_and_screenshot_does_not ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/w970_antigravity_tests.rs ($AGENTCLI_TARGET/debug/deps/w970_antigravity_tests-5c792dd9adb5e49f)
+
+running 25 tests
+test an_acknowledged_profile_skips_the_disclosure ... ok
+test a_daemon_supplied_google_source_is_not_badged_twice ... ok
+test antigravity_accounts_light_goldens_at_owner_widths ... ok
+test antigravity_consent_dark_goldens_at_owner_widths ... ok
+test antigravity_accounts_dark_goldens_at_owner_widths ... ok
+test declining_journals_nothing_and_starts_no_flow ... ok
+test antigravity_consent_light_goldens_at_owner_widths ... ok
+test login_google_antigravity_oauth_reaches_the_same_door ... ok
+test esc_declines_the_disclosure_without_leaving_the_screen ... ok
+test login_google_opens_the_disclosure_and_starts_nothing ... ok
+test login_google_api_is_refused_and_names_the_separate_gemini_account ... ok
+test proceeding_journals_the_acknowledgement_exactly_once ... ok
+test the_accounts_add_row_offers_google_antigravity ... ok
+test antigravity_meter_light_goldens_at_owner_widths ... ok
+test the_agent_owned_card_names_googles_agent_and_renders_no_url ... ok
+test the_calendar_plots_a_real_reset_but_never_infers_a_google_one ... ok
+test antigravity_meter_dark_goldens_at_owner_widths ... ok
+test the_accounts_screen_badges_google_and_carries_the_standing_warning ... ok
+test the_calendar_says_reset_unknown_for_a_google_account ... ok
+test the_journal_entry_carries_no_url_query_or_token ... ok
+test the_disclosure_names_googles_agent_its_terms_and_its_measured_cost ... ok
+test the_google_meter_renders_unavailable_with_its_reason_never_a_zero ... ok
+test the_standing_warning_is_absent_without_a_google_account ... ok
+test the_starting_phase_reports_the_install_instead_of_a_loopback ... ok
+test the_disclosure_shows_the_terms_warning_verbatim_at_every_width ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/w970_composerfix_tests.rs ($AGENTCLI_TARGET/debug/deps/w970_composerfix_tests-3aadaabe4ab85823)
+
+running 21 tests
+test a_fake_image_clipboard_encodes_a_real_png ... ok
+test an_empty_clipboard_raises_a_notice_and_never_panics ... ok
+test a_pair_without_vision_refuses_the_pasted_image_and_keeps_the_draft ... ok
+test a_forwarded_paste_chord_inserts_clipboard_text_once ... ok
+test a_clipboard_image_becomes_a_chip ... ok
+test any_clipboard_source_drives_the_same_handler ... ok
+test an_undeclared_pair_still_attaches_and_lets_the_daemon_answer ... ok
+test an_unreadable_clipboard_raises_a_notice_and_never_panics ... ok
+test ctrl_v_issues_a_clipboard_read ... ok
+test text_clipboard_paste_bypasses_all_image_only_gates ... ok
+test the_chord_reads_text_before_applying_image_only_vision_gates ... ok
+test attach_of_an_image_uses_the_very_same_notice ... ok
+test the_image_debug_never_dumps_pixels ... ok
+test the_loom_tab_keeps_its_own_ctrl_v ... ok
+test the_notice_clears_on_the_next_keystroke ... ok
+test the_platform_paste_chords_all_reach_the_same_read ... ok
+test the_refusal_names_the_model_and_both_ways_out ... ok
+test removing_the_breathing_row_gave_it_to_the_transcript ... ok
+test the_band_grows_by_exactly_one_row_for_the_notice ... ok
+test the_notice_renders_as_its_own_row_inside_the_band ... ok
+test the_session_band_reaches_subagents_through_the_rule_alone ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+
+     Running tests/w970_monitorui_tests.rs ($AGENTCLI_TARGET/debug/deps/w970_monitorui_tests-7d5a6d44576ba6ad)
+
+running 28 tests
+test a_pause_receipt_replaces_the_row_with_daemon_truth ... ok
+test a_bare_monitors_command_still_opens_the_overlay_against_fresh_truth ... ok
+test a_refusal_is_worded_never_dumped ... ok
+test a_remove_receipt_drops_the_row_and_clamps_the_cursor ... ok
+test a_subcommand_without_an_id_says_what_it_wanted ... ok
+test band_counts_carry_their_own_overlay_kind ... ok
+test band_counts_omit_zero_and_pluralise_one_and_many_separately ... ok
+test clicking_a_row_selects_it_without_acting_on_it ... ok
+test a_fired_monitor_leaves_an_ambient_note_and_never_a_modal ... ok
+test an_action_rect_wins_over_the_row_rect_that_contains_it ... ok
+test edit_with_agent_prefills_the_composer_and_closes_the_overlay ... ok
+test a_fired_row_reads_firing_until_the_woken_subturn_completes ... ok
+test keyboard_parity_selects_and_acts_exactly_as_the_clicks_do ... ok
+test live_shell_count_ignores_exited_and_closed_shells ... ok
+test monitors_subcommands_stop_pause_and_resume_one_row ... ok
+test pause_and_resume_are_chosen_by_the_rows_own_state ... ok
+test the_band_counts_click_through_to_their_overlays ... ok
+test stop_is_armed_then_confirmed_and_only_then_leaves_as_a_request ... ok
+test every_row_action_is_a_distinct_click_target_on_the_selected_row ... ok
+test the_e_key_hands_the_edit_to_the_agent_and_esc_closes ... ok
+test the_fired_note_names_what_the_monitor_actually_saw ... ok
+test the_overlay_swallows_hits_that_are_not_its_own ... ok
+test the_source_summary_says_what_each_kind_watches ... ok
+test the_x_key_arms_before_it_stops_and_a_cursor_move_disarms ... ok
+test trigger_and_copy_id_leave_as_their_own_requests ... ok
+test the_counts_row_stands_alone_when_nothing_is_delegated ... ok
+test each_band_count_is_its_own_click_target ... ok
+test the_band_row_carries_the_counts_right_aligned_at_every_width ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/w970_winclip_clipboard_tests.rs ($AGENTCLI_TARGET/debug/deps/w970_winclip_clipboard_tests-060b285a88738a73)
+
+running 4 tests
+test copy_flash_distinguishes_confirmed_local_osc_only_and_total_failure ... ok
+test local_writer_selects_windows_arboard_and_preserves_unix_behavior ... ok
+test read_text_is_zeroizing_and_redacted_before_reaching_the_reducer ... ok
+test osc52_remains_an_exact_utf8_remote_mirror ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/w970_winclip_input_tests.rs ($AGENTCLI_TARGET/debug/deps/w970_winclip_input_tests-e08d0803c2c55ccc)
+
+running 11 tests
+test ctrl_shift_c_copies_composer_and_is_harmless_without_selection ... ok
+test clipboard_and_terminal_pastes_normalize_crlf_and_preserve_utf16_round_trip ... ok
+test ctrl_shift_c_copies_transcript_for_both_character_cases_without_navigation ... ok
+test forwarded_paste_in_talk_setup_never_types_a_literal_v_or_edits_the_draft ... ok
+test shift_handoff_cancels_a_pending_app_drag_without_copy_or_click ... ok
+test clipboard_gestures_never_read_or_copy_hidden_composer_text ... ok
+test terminal_paste_inserts_once_without_requesting_an_os_read ... ok
+test forwarded_paste_and_captured_right_click_reach_the_masked_login_field_only ... ok
+test a_captured_right_click_requests_one_paste_and_never_a_left_click_action ... ok
+test shift_modified_mouse_is_terminal_owned_without_app_selection_scroll_click_or_paste ... ok
+test transcript_drag_highlights_extends_copies_wrapped_rows_and_clears ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/w970_winclip_windows_tests.rs ($AGENTCLI_TARGET/debug/deps/w970_winclip_windows_tests-5d906acd849a1a6b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/wa_task_rows_tests.rs ($AGENTCLI_TARGET/debug/deps/wa_task_rows_tests-4623213d8cb8b733)
+
+running 5 tests
+test e1a_task_cas_loss_keeps_tail_and_marks_full_output_unavailable ... ok
+test plain_mode_prints_the_same_task_lines ... ok
+test completion_without_started_still_lands_a_terminal_row ... ok
+test task_facts_paint_started_and_completion_notes_and_never_count_unknown ... ok
+test running_band_ticks_on_the_journal_clock_and_sheds_at_completion ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/wave_ui_tests.rs ($AGENTCLI_TARGET/debug/deps/wave_ui_tests-7741002886a9b7e8)
+
+running 9 tests
+test injection_is_refused_while_a_card_owns_the_keyboard ... ok
+test osc_session_announce_bytes_are_exact_and_sanitized ... ok
+test input_injection_applies_only_to_the_active_session_surface ... ok
+test launcher_rows_open_their_registry_panes ... ok
+test palette_registers_the_loom_split_surfaces ... ok
+test workflows_pane_lists_only_workflows_and_tab_hops_to_types ... ok
+test launcher_lists_workflows_and_loom_rows_with_hits ... ok
+test rollup_states_speak_the_dag_position ... ok
+test rollup_routes_to_the_chip_and_stays_out_of_the_transcript ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/wc_custom_commands_tests.rs ($AGENTCLI_TARGET/debug/deps/wc_custom_commands_tests-3f2d857e4d1788b7)
+
+running 18 tests
+test crlf_frontmatter_does_not_bleed_the_closing_fence_into_the_body ... ok
+test custom_command_expands_and_submits_a_user_turn ... ok
+test custom_command_model_override_reaches_the_turn ... ok
+test custom_command_unknown_model_is_ignored_with_a_note ... ok
+test launcher_custom_command_model_override_precedes_create_session ... ok
+test a_malformed_frontmatter_file_is_skipped_with_a_warning ... ok
+test a_giant_command_file_is_skipped_with_a_warning ... ok
+test malformed_frontmatter_line_is_rejected_not_silently_accepted ... ok
+test palette_lists_custom_commands_visually_distinct ... ok
+test parse_reads_cc_frontmatter_and_body ... ok
+test parse_rejects_unterminated_frontmatter_and_empty_body ... ok
+test malformed_file_is_skipped_with_a_surfaced_warning ... ok
+test set_custom_commands_surfaces_a_warning_flash ... ok
+test load_for_walks_up_to_the_project_root ... ok
+test substitution_covers_all_three_forms_and_empty_positionals ... ok
+test project_wins_over_global_on_name_collision ... ok
+test project_discovery_refuses_a_commands_symlink_escaping_the_repo ... ok
+test subdirectory_becomes_a_colon_namespace ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/wc_notifications_tests.rs ($AGENTCLI_TARGET/debug/deps/wc_notifications_tests-0eba7053c096e9b8)
+
+running 15 tests
+test attention_fires_on_terminal_and_park_states_only ... ok
+test fires_on_a_permission_park ... ok
+test debounce_one_notification_per_turn ... ok
+test background_session_terminal_fires_a_desktop_notification ... ok
+test masked_text_hides_an_email_via_the_one_authority ... ok
+test mask_text_hides_api_keys_and_bearer_tokens_not_just_emails ... ok
+test fires_on_a_terminal_transition_when_unfocused ... ok
+test non_tty_sink_emits_no_osc_bytes ... ok
+test focus_gate_suppresses_when_focused_but_fires_when_focus_unreported ... ok
+test osc9_wraps_and_strips_control_bytes ... ok
+test masked_title_never_leaks_a_secret ... ok
+test notification_osc9_bytes_mask_an_api_key_in_the_title ... ok
+test retry_wait_fires_no_notification ... ok
+test toggle_off_is_silent ... ok
+test settings_persist_the_toggle_and_preserve_the_theme ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/we_thinking_shimmer_tests.rs ($AGENTCLI_TARGET/debug/deps/we_thinking_shimmer_tests-598817689664a76f)
+
+running 7 tests
+test le4_idle_status_line_is_byte_identical_across_ticks ... ok
+test le5_every_theme_shimmer_ink_clears_the_contrast_floor ... ok
+test le1_shimmer_phase_is_a_pure_function ... ok
+test le7_plain_mode_carries_no_shimmer ... ok
+test le2_the_sweep_travels_and_wraps ... ok
+test le3_only_the_verb_glyphs_shimmer ... ok
+test le6_non_truecolor_degrades_to_two_tone_without_the_mid_code ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/wg_throughput_tests.rs ($AGENTCLI_TARGET/debug/deps/wg_throughput_tests-e4fb77b06ecb0171)
+
+running 7 tests
+test wg6_approx_readout_wears_the_tilde_in_plain_and_styled ... ok
+test wg6_plain_omits_the_row_when_idle ... ok
+test wg3_streaming_shows_the_pill_on_the_identity_line ... ok
+test wg3_idle_frames_are_byte_identical_across_ticks ... ok
+test wg3_off_stream_keeps_the_pill_visible ... ok
+test wg6_row_renders_legibly_in_every_theme ... ok
+test wg6_styled_pill_and_plain_share_the_rate ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/wh6_deepseek_add_flow_tests.rs ($AGENTCLI_TARGET/debug/deps/wh6_deepseek_add_flow_tests-9047d4d23c16fa89)
+
+running 1 test
+test wh6_deepseek_add_card_and_validate_flow ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/workflow_dag_tests.rs ($AGENTCLI_TARGET/debug/deps/workflow_dag_tests-32f80f1b4c5409aa)
+
+running 4 tests
+test an_unknown_dependency_is_ignored_for_layering_but_still_shown ... ok
+test a_single_node_renders_without_plural_or_connectors ... ok
+test a_linear_chain_never_claims_concurrency ... ok
+test a_diamond_lays_out_in_dependency_layers ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/workflow_live_view_tests.rs ($AGENTCLI_TARGET/debug/deps/workflow_live_view_tests-ba1fffa4e2156e93)
+
+running 12 tests
+test dark_waiting_node_and_reject_evidence_are_explicit ... ok
+test enter_opens_a_rejects_exact_evidence_coordinate_for_inspection ... ok
+test evidence_less_and_concurrent_rejects_are_each_inspectable ... ok
+test runtime_dag_lights_inputs_and_keeps_fork_join_visible ... ok
+test runtime_edges_do_not_invent_a_fork_for_unrelated_same_layer_nodes ... ok
+test rejected_watch_cursor_rebaselines_without_discarding_last_good_view ... ok
+test reconnect_resumes_the_retained_workflow_cursor_and_empty_state_rebaselines ... ok
+test stale_page_during_session_switch_resumes_the_new_sessions_retained_cursor ... ok
+test state_and_cursor_watch_cross_the_link_as_typed_rpc_variants ... ok
+test tab_into_workflows_resumes_the_retained_runtime_cursor ... ok
+test workflow_journal_facts_are_known_noops_in_active_and_background_sessions ... ok
+test feature_downgrade_never_renders_a_retained_projection_as_live ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/wsroot_tests.rs ($AGENTCLI_TARGET/debug/deps/wsroot_tests-86ba03cb9e4d26ec)
+
+running 2 tests
+test workspace_notice_is_visible_and_not_counted_unknown ... ok
+test retry_offers_current_cwd_then_maps_to_workspace_set_wire ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/x2_fleet_identity_tests.rs ($AGENTCLI_TARGET/debug/deps/x2_fleet_identity_tests-e2aa729111b55a5b)
+
+running 14 tests
+test a_foreign_member_refuses_the_destroy_honestly ... ok
+test a_row_click_activates_the_row_it_was_rendered_for ... ok
+test destroy_takes_two_presses_and_the_arm_names_its_target ... ok
+test navigation_disarms_a_pending_destroy ... ok
+test the_child_auth_label_comes_from_the_childs_own_usage ... ok
+test a_node_without_model_or_provider_renders_neither ... ok
+test the_detail_transcript_door_opens_the_members_own_session ... ok
+test a_list_row_carries_callsign_model_and_provider ... ok
+test the_grid_cell_truncates_one_marked_fact ... ok
+test a_child_without_a_model_renders_no_identity ... ok
+test the_list_tail_drops_whole_segments_in_order ... ok
+test the_composer_speaks_the_child_while_a_child_is_viewed ... ok
+test the_identity_yields_to_the_task_on_a_narrow_row ... ok
+test the_grid_identity_row_costs_no_cells ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+   Doc-tests haider_tui
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

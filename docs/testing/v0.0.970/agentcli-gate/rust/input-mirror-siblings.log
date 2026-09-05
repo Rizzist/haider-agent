@@ -1,0 +1,7 @@
+   Compiling haider-rpc v0.0.969 ($WORKTREE/crates/haider-rpc)
+   Compiling haider-client v0.0.969 ($WORKTREE/crates/haider-client)
+   Compiling haider-daemon v0.0.969 ($WORKTREE/crates/haider-daemon)
+   Compiling haider-tui v0.0.969 ($WORKTREE/crates/haider-tui)
+   Compiling haider-cli v0.0.969 ($WORKTREE/crates/haider-cli)
+   Compiling haider-daemond v0.0.969 ($WORKTREE/crates/haider-daemond)
+    Finished `dev` profile [unoptimized] target(s) in 1m 35s

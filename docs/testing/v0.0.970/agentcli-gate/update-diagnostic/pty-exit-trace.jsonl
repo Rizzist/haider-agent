@@ -1,0 +1,1 @@
+{"pid": 92382, "clean": false, "audit": "alt_enter=1 alt_leave=1 panic_free=true exit_clean=false", "reap": [{"pid": 92382, "kill_signal": 9}, {"pid": 92382, "wait_options": 0, "raw_status": 9, "exit_code": null, "signal": 9}]}

@@ -1,0 +1,270 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling num-traits v0.2.19
+   Compiling libc v0.2.189
+   Compiling syn v3.0.3
+   Compiling cc v1.4.0
+   Compiling serde_derive v1.0.229
+   Compiling blake3 v1.8.5
+   Compiling cpufeatures v0.2.17
+   Compiling serde v1.0.229
+   Compiling rmp v0.8.15
+   Compiling serde_json v1.0.151
+   Compiling rmp-serde v1.3.1
+   Compiling sha2 v0.10.9
+   Compiling haider-protocol v0.0.969 ($WORKTREE/crates/haider-protocol)
+    Finished `test` profile [unoptimized] target(s) in 16.02s
+     Running unittests src/lib.rs ($AGENTCLI_TARGET/debug/deps/haider_protocol-69c5d1f556bb9c1f)
+
+running 87 tests
+test cache::incremental_provider_view_tests::streamed_reply_with_an_unseeded_prefix_cannot_fall_back_to_a_full_pass ... ok
+test context::tests::marker_overhead_is_preserved_as_a_negative_signed_net ... ok
+test cache::incremental_provider_view_tests::per_delta_json_hash_matches_the_legacy_complete_canonical_bytes ... ok
+test context::tests::authoritative_output_event_rejects_disagreeing_child_coordinates ... ok
+test context::tests::output_and_conversation_share_one_additive_estimated_stream ... ok
+test cache::incremental_provider_view_tests::request_attempt_extensions_are_strict_while_legacy_cache_markers_still_decode ... ok
+test context_compaction::tests::context_compaction_scoped_payload_round_trips_with_explicit_count_units ... ok
+test error::tests::error_presentation_deserialize_rebounds_utf8_and_actions ... ok
+test envelope::tests::provider_opaque_reply_range_round_trips_without_a_second_text_owner ... ok
+test error::tests::error_presentation_never_exposes_empty_public_copy ... ok
+test error::tests::haider_error_display_uses_its_message ... ok
+test error::tests::provider_timeout_budget_survives_the_durable_presentation_wire ... ok
+test error::tests::workflow_unfinished_has_stable_typed_wire_names ... ok
+test graph::tests::activation_ast_rechecks_node_inputs_and_merged_terminal_outputs ... ok
+test graph::tests::back_edge_cannot_reopen_a_graph_that_never_received_external_input ... ok
+test graph::tests::activation_requires_typed_inputs_and_join_waits_for_every_branch ... ok
+test graph::tests::back_edge_reactivates_once_and_bounded_guard_records_the_next_rejection ... ok
+test graph::tests::convergence_gate_requires_a_stamp_or_an_inspectable_gate_rejection ... ok
+test graph::tests::evidence_normalization_is_bounded_and_fingerprint_stable ... ok
+test envelope::tests::chunked_json_and_messagepack_cover_every_reply_path_byte_for_byte ... ok
+test graph::tests::legacy_start_retry_still_invalidates_nodes_without_stamped_dependencies ... ok
+test graph::tests::incremental_reduction_keeps_run_set_and_root_projection_coherent ... ok
+test graph::tests::m2b_malformed_dags_have_distinct_typed_rejections ... ok
+test graph::tests::m2b_catalog_is_five_valid_immutable_templates ... ok
+test graph::tests::m2b_node_wire_and_ship_loop_digest_are_legacy_stable ... ok
+test graph::tests::m2d_legacy_single_graph_status_bytes_are_unchanged ... ok
+test graph::tests::m2d_child_graphs_apply_epoch_and_dag_laws_independently ... ok
+test graph::tests::m2d_aggregate_requires_all_k_terminal_child_contracts ... ok
+test graph::tests::m2d_plan_reorder_cannot_retarget_an_existing_child ... ok
+test graph::tests::m2e_child_templates_are_bounded_non_human_graphs ... ok
+test graph::tests::m2e_decision_gate_defaults_bare_and_requires_exact_triggers ... ok
+test graph::tests::m2d_retrying_one_child_preserves_its_siblings_green_state ... ok
+test graph::tests::registered_loom_workflow_ref_resolves_only_with_registry_and_trigger ... ok
+test graph::tests::m2e_child_attachment_is_not_a_cross_graph_edge ... ok
+test graph::tests::template_digest_is_stable_and_brief_is_bounded ... ok
+test graph::tests::oversized_graph_brief_keeps_both_ends_with_a_machine_marker ... ok
+test headless::tests::budget_decision_preserves_unknown_pricing_without_guessing ... ok
+test graph::tests::terminal_rejection_seals_waiting_sibling_activations ... ok
+test headless::tests::durable_terminal_classifier_preserves_blocked_cancellation_and_cause_precedence ... ok
+test headless::tests::budget_exhaustion_decodes_without_decision_detail ... ok
+test interaction::tests::autonomous_policy_auto_approves_haider_permission_gates ... ok
+test graph::tests::replay_reproduces_activation_order_and_rejects_an_order_mutation ... ok
+test headless::tests::legacy_headless_spec_omits_direct_spawn_and_new_pin_round_trips ... ok
+test interaction::tests::autonomous_policy_keeps_external_and_non_permission_gates_fail_closed ... ok
+test interaction::tests::autonomous_policy_resolves_only_the_four_audited_gates ... ok
+test interaction::tests::interactive_policy_preserves_existing_waits ... ok
+test loom::tests::agent_type_digest_moves_with_identity ... ok
+test loom::tests::conditional_self_loop_lowers_to_the_immutable_graph_target ... ok
+test loom::tests::compile_rejects_type_mismatch_and_unknown_agent_types ... ok
+test loom::tests::control_join_is_identity_on_merged_input ... ok
+test loom::tests::dependencies_must_be_unique_earlier_nodes ... ok
+test loom::tests::control_only_pipe_compiles_without_a_registry ... ok
+test loom::tests::digest_binds_resolved_type_signatures ... ok
+test loom::tests::digest_is_whitespace_insensitive_and_meaning_sensitive ... ok
+test loom::tests::explicit_fork_join_compiles_and_type_checks_merged_inputs ... ok
+test loom::tests::explicit_join_rejects_missing_and_extra_input_operands ... ok
+test loom::tests::parse_is_total_and_rejects_bad_lines_with_reasons ... ok
+test loom::tests::parse_rejects_duplicates_bounds_and_bad_headers ... ok
+test loom::tests::make_video_parses_and_compiles_onto_cg_vocabulary ... ok
+test mobile::tests::actions_use_their_exact_effect_classes ... ok
+test loom::tests::workflow_output_merges_all_terminal_branches ... ok
+test mobile::tests::mobile_wire_shapes_are_strict_and_snake_case ... ok
+test pipe::tests::compaction_boundary_appears_only_when_the_turn_settles ... ok
+test pipe::tests::a_row_carrying_reasoning_is_never_marked_compat ... ok
+test pipe::tests::a_row_without_reasoning_keeps_its_compat_status ... ok
+test pipe::tests::filtered_sequence_gaps_preserve_the_unresolved_tool_fact_bound ... ok
+test pipe::tests::instruct_evidence_ledger_binds_type_content_and_ordered_parents ... ok
+test pipe::tests::hostile_pipe_lines_pin_the_five_way_projection_and_line_law ... ok
+test pipe::tests::legacy_tool_node_recovers_rejected_status_from_completed_item ... ok
+test pipe::tests::multiple_compaction_passes_in_one_turn_emit_one_boundary ... ok
+test pipe::tests::peer_message_is_a_self_sufficient_non_user_pipe_row ... ok
+test pipe::tests::pipe_tool_result_status_wire_names_cover_the_daemon_set ... ok
+test pipe::tests::reasoning_deltas_are_never_carried ... ok
+test pipe::tests::reasoning_orphaned_by_a_non_assistant_row_never_attaches_later ... ok
+test pipe::tests::sealed_reasoning_attaches_to_the_correct_interleaved_turn ... ok
+test pipe::tests::sidecar_rows_pin_branch_and_ordinal_identity ... ok
+test pipe::tests::tool_result_status_decodes_unknown_future_values ... ok
+test pipe::tests::sealed_reasoning_reaches_the_assistant_row ... ok
+test pipe::tests::type_tag_peek_is_exactly_the_full_decode_relevance ... ok
+test pipe::tests::unresolved_compaction_is_a_global_row_ordering_barrier ... ok
+test envelope::tests::every_reply_path_matches_at_all_messagepack_string_headers ... ok
+test pipe::tests::unresolved_reasoning_is_a_global_row_ordering_barrier ... ok
+test reply::tests::legacy_json_and_messagepack_remain_string_scalars ... ok
+test pipe::tests::waiting_and_retrying_are_self_sufficient_pipe_rows ... ok
+test reply::tests::ranges_share_append_only_chunks_and_keep_utf8_boundaries ... ok
+test session_fork::tests::future_session_fork_event_decodes_as_unknown ... ok
+test reply::tests::one_mib_reply_has_one_chunk_allocation_and_releases_with_last_handle ... ok
+
+test result: ok. 87 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/ceiling_tests.rs ($AGENTCLI_TARGET/debug/deps/ceiling_tests-5d995620c55e5f87)
+
+running 1 test
+test internal_ceiling_requires_typed_consistent_terminal_evidence ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/compat_marker_tests.rs ($AGENTCLI_TARGET/debug/deps/compat_marker_tests-974b29548224e26a)
+
+running 2 tests
+test pre_item_journals_keep_their_exact_bytes ... ok
+test item_repeating_and_empty_assistant_rows_are_marked_compat ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/context_accounting_tests.rs ($AGENTCLI_TARGET/debug/deps/context_accounting_tests-a85c647e35610962)
+
+running 5 tests
+test ctx_era_conversation_event_without_layer_remains_decodable ... ok
+test legacy_context_footprint_without_accounting_remains_decodable ... ok
+test cumulative_savings_are_saturating_restart_coordinates_with_an_honest_unit ... ok
+test ctx_era_economy_decoder_ignores_output_child_without_choking ... ok
+test output_then_conversation_savings_telescope_without_double_counting ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/golden_tests.rs ($AGENTCLI_TARGET/debug/deps/golden_tests-f1542798acb0b467)
+
+running 58 tests
+test cm1_normalized_usage_fields_are_additive ... ok
+test additive_permission_grant_resolved_event_shape ... ok
+test credential_base_url_is_additive_optional_and_unknown_tolerant ... ok
+test additive_permission_grant_needed_event_shape ... ok
+test delivery_mode_subturn_round_trips_and_preserves_steer_default ... ok
+test golden_additive_hook_fired_fact_and_unknown_kind_tolerance ... ok
+test golden_additive_task_facts_and_unknown_kind_tolerance ... ok
+test golden_agent_family ... ok
+test additive_golden_convergence_graph_m2a_authority ... ok
+test golden_agent_messaged_fact ... ok
+test golden_branch_created_fact ... ok
+test golden_agent_metrics_snapshot_fact ... ok
+test golden_agent_spawned_handoff_coordinate_is_additive ... ok
+test golden_computer_effect_classes ... ok
+test golden_attachments ... ok
+test golden_context_footprint_exact_extension ... ok
+test golden_computer_actions ... ok
+test golden_credentials ... ok
+test golden_full_envelope ... ok
+test golden_gate_report_red ... ok
+test golden_effect_phases ... ok
+test golden_graph_human_confirm_menu ... ok
+test golden_harness_and_hooks ... ok
+test golden_convergence_graph_facts_and_old_decoder_tolerance ... ok
+test golden_hook_menu_answer_authority ... ok
+test golden_error_presentation_contract ... ok
+test golden_image_bearing_tool_result_is_additive_and_legacy_decodes_empty ... ok
+test golden_image_created_extension ... ok
+test golden_hook_menu_coordinate_and_trust_revision_are_additive ... ok
+test golden_project_instructions_loaded_fact ... ok
+test golden_menu_permission ... ok
+test golden_run_retried_contract ... ok
+test golden_rpc_family ... ok
+test golden_session_config_effort_and_fast_facts ... ok
+test golden_session_idle_interrupted ... ok
+test golden_item_lifecycle ... ok
+test golden_run_states ... ok
+test golden_session_renamed_fact ... ok
+test golden_tool_inventory_snapshot ... ok
+test golden_tree_nodes ... ok
+test golden_usage_account_tagged ... ok
+test golden_user_message_hook_event_projection ... ok
+test golden_user_message_queue_mode ... ok
+test golden_usage_report_v1 ... ok
+test invalid_tool_call_data_has_a_typed_round_trip_without_changing_legacy_results ... ok
+test oauth_wire_name_is_oauth ... ok
+test parked_never_terminal ... ok
+test golden_workspace_event_facts ... ok
+test permission_required_chip_state_is_an_additive_wire_value ... ok
+test golden_verify_verdicts ... ok
+test pre_w6_agent_manifest_decodes_without_task_label ... ok
+test raw_envelope_tolerates_unknown_payload ... ok
+test session_metadata_tuning_fields_are_additive_and_skip_defaults ... ok
+test unknown_error_code_tolerated ... ok
+test structured_search_result_wire_is_additive_and_legacy_decodes ... ok
+test unknown_fields_are_tolerated ... ok
+test usage_report_fields_are_tolerant_and_additive ... ok
+test ship_loop_template_and_graph_brief_are_bounded_contracts ... ok
+
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/pipe_preview_tests.rs ($AGENTCLI_TARGET/debug/deps/pipe_preview_tests-2e8e282aa824112b)
+
+running 2 tests
+test result_preview_is_bounded_and_absent_when_empty ... ok
+test args_preview_prefers_the_salient_argument_and_stays_bounded ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/request_budget_tests.rs ($AGENTCLI_TARGET/debug/deps/request_budget_tests-680f8592c7f5c3b5)
+
+running 3 tests
+test request_budget_defaults_allow_two_tranches_and_validate_order ... ok
+test legacy_run_budget_omits_request_policy_and_new_pin_roundtrips ... ok
+test request_budget_extension_retains_typed_coordinates_and_phase_specific_model_note ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/schema_changelog_tests.rs ($AGENTCLI_TARGET/debug/deps/schema_changelog_tests-b489ef15011946f7)
+
+running 2 tests
+test journalview_additions_are_documented_without_a_schema_bump ... ok
+test every_current_automation_kind_is_pinned_in_the_schema_changelog ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/smoke_tests.rs ($AGENTCLI_TARGET/debug/deps/smoke_tests-eb953839617f0ea1)
+
+running 1 test
+test crate_name_is_stable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/toolshape_tests.rs ($AGENTCLI_TARGET/debug/deps/toolshape_tests-a460b5b20b3f7139)
+
+running 10 tests
+test final_marker_is_idempotent_and_counts_payload_bytes_before_separator ... ok
+test legacy_result_and_event_are_byte_identical_with_additions_absent ... ok
+test fixture_write_golden_exposes_locked_effect_pointers_and_unchanged_text ... ok
+test all_effect_kinds_keep_receipt_order_instead_of_sorting_paths ... ok
+test payload_text_does_not_strip_unverified_or_non_utf8_boundary_suffixes ... ok
+test old_decoder_ignores_additive_fields_and_root_only_metadata_decodes ... ok
+test one_mib_stdout_golden_preserves_legacy_payload_and_pins_original_digest ... ok
+test raw_replay_keeps_unknown_additive_fields_at_every_toolshape_level ... ok
+test raw_tool_result_json_and_messagepack_live_replay_are_byte_identical ... ok
+test digest_changes_when_only_discarded_original_bytes_change ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/typed_agent_tests.rs ($AGENTCLI_TARGET/debug/deps/typed_agent_tests-29e6c112c8e4e864)
+
+running 4 tests
+test loom_type_derives_an_explicit_scoped_role_and_required_clis ... ok
+test install_jobs_reject_inconsistent_or_unbounded_progress ... ok
+test install_job_progress_and_state_transitions_are_monotonic ... ok
+test authored_shells_and_dispatchers_are_not_required_cli_contracts ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/workspace_jsonl_tests.rs ($AGENTCLI_TARGET/debug/deps/workspace_jsonl_tests-4987cfe52e1d45ac)
+
+running 1 test
+test workspace_unavailable_notice_jsonl_golden ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests haider_protocol
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

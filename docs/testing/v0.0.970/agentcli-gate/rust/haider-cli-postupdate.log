@@ -1,0 +1,875 @@
+   Compiling haider-cli v0.0.969 ($WORKTREE/crates/haider-cli)
+    Finished `test` profile [unoptimized] target(s) in 20.27s
+     Running unittests src/main.rs ($AGENTCLI_TARGET/debug/deps/haider-00397f7d0e8a0253)
+
+running 79 tests
+test account::account_custom_tests::direct_add_execution_without_auth_refuses_before_any_request ... ok
+test account::account_custom_tests::add_parser_accepts_every_secret_source_and_redacts_inline_keys ... ok
+test account::account_custom_tests::probe_preserves_the_typed_failure_class ... ok
+test account::account_custom_tests::parser_requires_one_explicit_auth_choice_on_add ... ok
+{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test account::account_custom_tests::update_accepts_auth_mode_changes_but_rejects_api_family_changes ... ok
+test account::account_custom_tests::probe_refreshes_alias_and_reports_exact_namespaced_models ... ok
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test account::account_custom_tests::keyed_add_reuses_one_stage_for_discovery_and_login ... ok
+test account::account_custom_tests::no_auth_add_skips_vault_and_login_and_discovers_empty_input ... ok
+test account::account_custom_tests::update_base_key_and_timeout_preserves_immutable_shape ... ok
+test account::account_custom_tests::update_to_no_auth_reuses_the_provider_and_removes_its_key ... ok
+test account::tests::account_list_projection_is_additive_and_preserves_legacy_absence ... ok
+test account::tests::account_use_resolves_alias_then_sets_the_profile_default ... ok
+test account::tests::import_and_refresh_parsing_are_explicit ... ok
+test account::tests::confirmed_remove_refuses_to_mutate_without_a_snapshot_revision ... ok
+test account::tests::confirmed_remove_is_list_first_and_revision_fenced ... ok
+test account::tests::source_add_accepts_every_enrolled_source_kind_vocabulary ... ok
+test account::tests::source_and_profile_default_commands_have_exact_grammar ... ok
+test account::tests::confirmed_import_sends_only_the_opaque_candidate ... ok
+test account::tests::unconfirmed_import_discovers_but_never_mutates ... ok
+test automation::tests::resume_parser_preserves_interactive_spelling ... ok
+test graph::tests::parses_all_graph_cli_surfaces ... ok
+test lockdown::lockdown_tests::lockdown_cli_parses_status_quota_and_json_without_signed_sizes ... ok
+test account::tests::source_add_sends_coordinates_without_credential_material ... ok
+test automation::tests::readiness_parser_requires_exact_named_count_and_finite_json ... ok
+test models::tests::automatic_refresh_starts_at_the_exact_ttl_boundary ... ok
+test models::tests::global_refresh_targets_every_fetched_provider ... ok
+test models::tests::refresh_parser_distinguishes_global_and_provider_scopes ... ok
+test peer::tests::peer_cli_parser_pins_all_surfaces ... ok
+test lockdown::lockdown_tests::lockdown_status_json_golden_is_exact ... ok
+test models::tests::models_json_publishes_fetch_time_and_age_without_fabrication ... ok
+test provider::provider_tests::provider_list_json_does_not_omit_full_trust ... ok
+test provider::provider_tests::provider_show_json_golden_includes_the_fixed_envelope_and_quota ... ok
+test provider::provider_tests::provider_trust_flags_are_mutually_exclusive ... ok
+test provider::provider_tests::provider_list_json_golden_exposes_lockdown_trust ... ok
+test run::tests::cli_model_is_not_duplicated_into_post_create_session_config ... ok
+test peer::tests::peer_json_contract_shapes_are_golden ... ok
+test observe::roster_scalar_tests::roster_scalars_ride_sessions_json_rows_additively ... ok
+test run::tests::jsonl_adapter_writes_accepted_before_any_envelope ... ok
+test run::tests::jsonl_adapter_flushes_a_queued_batch_at_acceptance_and_terminal ... ok
+test run::tests::jsonl_emitter_covers_unavailable_incompatible_and_no_default_failures ... ok
+test run::tests::jsonl_adapter_preserves_provider_wait_and_run_failed_payload_shapes ... ok
+test run::tests::journalview_replay_private_summary_never_becomes_final_response ... ok
+test run::tests::legacy_replay_preserves_unknown_retained_terminal_without_synthesis ... ok
+test run::tests::legacy_replay_preserves_first_blocker_on_cancelled_terminal ... ok
+test run::tests::replay_preserves_the_complete_permission_pin ... ok
+test run::tests::legacy_replay_projects_success_failure_and_cancellation_terminals ... ok
+test run::tests::legacy_replay_requires_global_sequence_adjacency_for_run_failure ... ok
+test run::tests::replay_preserves_known_retained_terminal_without_reclassification ... ok
+test run::tests::request_budget_flags_preserve_defaults_and_reject_invalid_or_duplicate_limits ... ok
+test run::tests::request_budget_exit_is_distinct_and_json_preserves_resume_instruction ... ok
+test run::tests::resume_parser_accepts_defaults_and_each_budget_without_prompt ... ok
+test run::tests::resume_parser_accepts_handle_and_budget_without_prompt ... ok
+test run::tests::resume_parser_rejects_explicit_permission_overrides_in_either_order ... ok
+test run::tests::run_daemon_linger_defaults_to_thirty_seconds_and_zero_restores_one_shot ... ok
+test run::tests::run_daemon_linger_rejects_unbounded_or_malformed_values ... ok
+test runtime_tests::footprint_hold_is_opt_in_and_bounded ... ok
+test runtime_tests::only_auto_hermetic_lockdown_suppresses_the_automatic_update ... ok
+test runtime_tests::startup_update_policy_checks_only_the_provider_this_door_activates ... ok
+test session_item::tests::collect_target_stops_once_a_plain_target_is_captured ... ok
+test runtime_tests::one_shot_commands_use_the_lean_current_thread_runtime ... ok
+test session_item::tests::item_not_found_names_the_head ... ok
+test runtime_tests::tui_and_non_wire_paths_keep_the_full_runtime ... ok
+test session_item::tests::parse_options_is_strict_and_typed ... ok
+test session_provider::tests::provider_rebind_cli_requires_explicit_target_and_rejects_ambiguous_flags ... ok
+test session_recover::tests::completion_requires_the_selected_actions_durable_follow_up ... ok
+test session_recover::tests::parse_accepts_one_action_and_refuses_combinations ... ok
+test session_recover::tests::recovery_command_ids_are_stable_for_lost_response_retries ... ok
+test session_recover::tests::recovery_menu_selects_the_crash_window_kind_only ... ok
+test session_workspace::tests::shorthand_requires_one_unambiguous_session ... ok
+test session_item::tests::collect_result_stops_at_the_call_seq_boundary ... ok
+test shell_registry::tests::shell_list_json_shape_is_stable_and_public ... ok
+test ssh::tests::cli_parser_distinguishes_interactive_pty_from_one_shot_exec ... ok
+test ssh::tests::cli_json_shapes_are_stable_and_secret_free ... ok
+test ssh::tests::cli_parser_requires_one_explicit_auth_method_and_has_no_jump_host ... ok
+test ssh::tests::typed_refusals_map_to_scriptable_exit_codes ... ok
+test update::tui::tests::cancelled_update_discovery_starts_no_curl_request ... ok
+test session_item::tests::collect_target_stops_once_the_tool_join_resolves ... ok
+test update::tui::tests::explicit_update_response_error_reaps_curl_and_joins_watcher ... ok
+test update::tui::tests::slow_explicit_update_check_cancels_and_reaps_curl_before_runtime_teardown ... ok
+
+test result: ok. 79 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running tests/agent_cli_tests.rs ($AGENTCLI_TARGET/debug/deps/agent_cli_tests-c5f670a3c4f1e196)
+
+running 11 tests
+test agent_and_workflow_no_spawn_leave_fresh_profile_without_daemon ... ok
+test agent_spawn_list_wait_publish_durable_child_result_and_exact_identities ... ok
+test agent_missing_target_and_malformed_cli_are_typed_errors ... ok
+test agent_message_to_idle_child_returns_new_run_delivery_receipt ... ok
+test agent_headless_input_is_rejected_and_provider_continues_to_child_result ... ok
+test agent_spawn_provider_without_published_default_retains_native_rejection ... ok
+test agent_spawn_prompt_flag_and_cwd_are_public_noninteractive_inputs ... ok
+test agent_spawn_provider_only_resolves_model_through_daemon_session_authority ... ok
+test agent_wait_failed_child_returns_durable_red_report_and_exit_one ... ok
+test agent_wait_timeout_observes_without_cancelling_then_cancel_is_terminal ... ok
+test workflow_list_run_status_expose_actual_child_graph_activation ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.15s
+
+     Running tests/autospawn_tests.rs ($AGENTCLI_TARGET/debug/deps/autospawn_tests-95a2c0dd23a5c5ca)
+
+running 12 tests
+test bounded_child_wait_failure_names_the_stuck_operation ... ok
+test bounded_child_wait_allows_a_prompt_exit ... ok
+test a_second_daemon_candidate_for_one_profile_exits_seventy_five ... ok
+test parent_exit_leaves_the_daemon_running ... ok
+test real_run_short_idle_ttl_terminalizes_spawned_daemon ... ok
+test idle_ttl_never_retires_a_daemon_with_a_nonterminal_run ... ok
+test clients_immediately_after_daemon_pid_publication_all_wait_and_succeed ... ok
+test stale_owner_socket_is_recovered_by_the_winning_daemon ... ok
+test two_simultaneous_launchers_elect_one_daemon_and_both_reach_ready ... ok
+test repeated_run_invocations_default_to_one_warm_daemon_until_operator_stop ... ok
+test real_status_tui_and_probe_autospawns_share_short_idle_ttl ... ok
+test launcher_readiness_pipe_stays_silent_until_positive_predicate ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.19s
+
+     Running tests/cli_tests.rs ($AGENTCLI_TARGET/debug/deps/cli_tests-ac4f7e71df7126e8)
+
+running 143 tests
+test account_parser_pins_list_and_remove_grammar ... ok
+test account_remove_without_confirm_cannot_reach_the_daemon_or_mutate ... ok
+test account_add_without_auth_refuses_with_typed_actionable_hint ... ok
+test attach_loader_sniffs_image_magic_not_extensions ... ok
+test attach_text_loader_validates_utf8_and_sanitizes_the_name ... ok
+test bare_import_dispatches_to_source_listing ... ok
+test cli_main::account::account_custom_tests::add_parser_accepts_every_secret_source_and_redacts_inline_keys ... ok
+test cli_main::account::account_custom_tests::direct_add_execution_without_auth_refuses_before_any_request ... ok
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::keyed_add_reuses_one_stage_for_discovery_and_login ... ok
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::no_auth_add_skips_vault_and_login_and_discovers_empty_input ... ok
+test cli_main::account::account_custom_tests::parser_requires_one_explicit_auth_choice_on_add ... ok
+test cli_main::account::account_custom_tests::probe_preserves_the_typed_failure_class ... ok
+{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::probe_refreshes_alias_and_reports_exact_namespaced_models ... ok
+test cli_main::account::account_custom_tests::update_accepts_auth_mode_changes_but_rejects_api_family_changes ... ok
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::update_base_key_and_timeout_preserves_immutable_shape ... ok
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::update_to_no_auth_reuses_the_provider_and_removes_its_key ... ok
+test cli_main::account::tests::account_list_projection_is_additive_and_preserves_legacy_absence ... ok
+test cli_main::account::tests::account_use_resolves_alias_then_sets_the_profile_default ... ok
+test cli_main::account::tests::confirmed_import_sends_only_the_opaque_candidate ... ok
+test cli_main::account::tests::confirmed_remove_is_list_first_and_revision_fenced ... ok
+test cli_main::account::tests::confirmed_remove_refuses_to_mutate_without_a_snapshot_revision ... ok
+test cli_main::account::tests::import_and_refresh_parsing_are_explicit ... ok
+test cli_main::account::tests::source_add_accepts_every_enrolled_source_kind_vocabulary ... ok
+test cli_main::account::tests::source_add_sends_coordinates_without_credential_material ... ok
+test cli_main::account::tests::source_and_profile_default_commands_have_exact_grammar ... ok
+test cli_main::account::tests::unconfirmed_import_discovers_but_never_mutates ... ok
+test cli_main::automation::tests::readiness_parser_requires_exact_named_count_and_finite_json ... ok
+test cli_main::automation::tests::resume_parser_preserves_interactive_spelling ... ok
+test cli_main::graph::tests::parses_all_graph_cli_surfaces ... ok
+test cli_main::lockdown::lockdown_tests::lockdown_cli_parses_status_quota_and_json_without_signed_sizes ... ok
+test cli_main::lockdown::lockdown_tests::lockdown_status_json_golden_is_exact ... ok
+test cli_main::models::tests::automatic_refresh_starts_at_the_exact_ttl_boundary ... ok
+test cli_main::models::tests::global_refresh_targets_every_fetched_provider ... ok
+test cli_main::models::tests::models_json_publishes_fetch_time_and_age_without_fabrication ... ok
+test cli_main::models::tests::refresh_parser_distinguishes_global_and_provider_scopes ... ok
+test cli_main::observe::roster_scalar_tests::roster_scalars_ride_sessions_json_rows_additively ... ok
+test cli_main::peer::tests::peer_cli_parser_pins_all_surfaces ... ok
+test cli_main::peer::tests::peer_json_contract_shapes_are_golden ... ok
+test cli_main::provider::provider_tests::provider_list_json_does_not_omit_full_trust ... ok
+test cli_main::provider::provider_tests::provider_list_json_golden_exposes_lockdown_trust ... ok
+test cli_main::provider::provider_tests::provider_show_json_golden_includes_the_fixed_envelope_and_quota ... ok
+test cli_main::provider::provider_tests::provider_trust_flags_are_mutually_exclusive ... ok
+test cli_main::run::tests::cli_model_is_not_duplicated_into_post_create_session_config ... ok
+test cli_main::run::tests::journalview_replay_private_summary_never_becomes_final_response ... ok
+test cli_main::run::tests::jsonl_adapter_flushes_a_queued_batch_at_acceptance_and_terminal ... ok
+test cli_main::run::tests::jsonl_adapter_preserves_provider_wait_and_run_failed_payload_shapes ... ok
+test cli_main::run::tests::jsonl_adapter_writes_accepted_before_any_envelope ... ok
+test cli_main::run::tests::jsonl_emitter_covers_unavailable_incompatible_and_no_default_failures ... ok
+test cli_main::run::tests::legacy_replay_preserves_first_blocker_on_cancelled_terminal ... ok
+test cli_main::run::tests::legacy_replay_preserves_unknown_retained_terminal_without_synthesis ... ok
+test cli_main::run::tests::legacy_replay_projects_success_failure_and_cancellation_terminals ... ok
+test cli_main::run::tests::legacy_replay_requires_global_sequence_adjacency_for_run_failure ... ok
+test cli_main::run::tests::replay_preserves_known_retained_terminal_without_reclassification ... ok
+test cli_main::run::tests::replay_preserves_the_complete_permission_pin ... ok
+test cli_main::run::tests::request_budget_exit_is_distinct_and_json_preserves_resume_instruction ... ok
+test cli_main::run::tests::request_budget_flags_preserve_defaults_and_reject_invalid_or_duplicate_limits ... ok
+test cli_main::run::tests::resume_parser_accepts_defaults_and_each_budget_without_prompt ... ok
+test cli_main::run::tests::resume_parser_accepts_handle_and_budget_without_prompt ... ok
+test cli_main::run::tests::resume_parser_rejects_explicit_permission_overrides_in_either_order ... ok
+test cli_main::run::tests::run_daemon_linger_defaults_to_thirty_seconds_and_zero_restores_one_shot ... ok
+test cli_main::run::tests::run_daemon_linger_rejects_unbounded_or_malformed_values ... ok
+test cli_main::runtime_tests::footprint_hold_is_opt_in_and_bounded ... ok
+test cli_main::runtime_tests::one_shot_commands_use_the_lean_current_thread_runtime ... ok
+test cli_main::runtime_tests::only_auto_hermetic_lockdown_suppresses_the_automatic_update ... ok
+test cli_main::runtime_tests::startup_update_policy_checks_only_the_provider_this_door_activates ... ok
+test cli_main::runtime_tests::tui_and_non_wire_paths_keep_the_full_runtime ... ok
+test cli_main::session_item::tests::collect_result_stops_at_the_call_seq_boundary ... ok
+test cli_main::session_item::tests::collect_target_stops_once_a_plain_target_is_captured ... ok
+test cli_main::session_item::tests::collect_target_stops_once_the_tool_join_resolves ... ok
+test cli_main::session_item::tests::item_not_found_names_the_head ... ok
+test cli_main::session_item::tests::parse_options_is_strict_and_typed ... ok
+test cli_main::session_provider::tests::provider_rebind_cli_requires_explicit_target_and_rejects_ambiguous_flags ... ok
+test cli_main::session_recover::tests::completion_requires_the_selected_actions_durable_follow_up ... ok
+test cli_main::session_recover::tests::parse_accepts_one_action_and_refuses_combinations ... ok
+test cli_main::session_recover::tests::recovery_command_ids_are_stable_for_lost_response_retries ... ok
+test cli_main::session_recover::tests::recovery_menu_selects_the_crash_window_kind_only ... ok
+test cli_main::session_workspace::tests::shorthand_requires_one_unambiguous_session ... ok
+test cli_main::shell_registry::tests::shell_list_json_shape_is_stable_and_public ... ok
+test cli_main::ssh::tests::cli_json_shapes_are_stable_and_secret_free ... ok
+test cli_main::ssh::tests::cli_parser_distinguishes_interactive_pty_from_one_shot_exec ... ok
+test cli_main::ssh::tests::cli_parser_requires_one_explicit_auth_method_and_has_no_jump_host ... ok
+test cli_main::ssh::tests::typed_refusals_map_to_scriptable_exit_codes ... ok
+test cli_main::update::tui::tests::cancelled_update_discovery_starts_no_curl_request ... ok
+test cli_main::update::tui::tests::explicit_update_response_error_reaps_curl_and_joins_watcher ... ok
+test account_remove_confirmed_uses_the_daemon_and_commits_removal ... ok
+test account_list_json_uses_daemon_rpc_and_exposes_only_the_safe_projection ... ok
+test anthropic_missing_credential_exits_65_without_network_access ... ok
+test daemon_time_budget_exhaustion_is_typed_and_exits_77 ... ok
+test cli_main::update::tui::tests::slow_explicit_update_check_cancels_and_reaps_curl_before_runtime_teardown ... ok
+test empty_prompt_flag_and_stdin_share_invalid_usage_exit ... ok
+test detached_run_lifecycle_is_addressable_by_run_id ... ok
+test hooks_parser_pins_list_trust_and_revoke_grammar ... ok
+test import_claude_code_dispatches_to_claude_source ... ok
+test import_codex_dispatches_to_codex_source ... ok
+test flagless_run_without_an_active_account_exits_65_with_remedy ... ok
+test fast_final_usage_is_budget_checked_before_done ... ok
+test jsonl_store_failure_emits_errored_and_returns_nonzero_without_hanging ... ok
+test one_shot_never_shuts_down_a_prestarted_incumbent ... ok
+test kill9_after_provider_admission_exposes_typed_probe_recovery ... ok
+test output_broken_pipe_is_a_typed_io_failure ... ok
+test print_and_json_outputs_pin_bytes_schema_and_nulls ... ok
+test configured_custom_model_reaches_chat_wire_verbatim_despite_catalog ... ok
+test one_shot_reaps_only_the_daemon_it_spawned_on_success_and_bootstrap_failure ... ok
+test replay_is_sealed_at_terminal_before_late_same_run_task_facts ... ok
+test run_exit_codes_are_table_driven ... ok
+test run_help_states_autonomous_default_and_explicit_denies ... ok
+test run_default_print_is_exact_under_redirected_no_term_io ... ok
+test run_json_reports_attachments_additively ... ok
+test replay_is_a_read_only_exact_durable_projection ... ok
+test run_json_is_one_stable_typed_stream_summary ... ok
+test run_jsonl_announces_acceptance_before_lf_framed_envelopes ... ok
+test run_jsonl_accepts_explicit_fake_provider_and_model ... ok
+test run_jsonl_cancelled_has_130_exit_and_terminal_envelope ... ok
+test run_jsonl_bounded_rate_limit_exhaustion_is_one_provider_terminal ... ok
+test run_jsonl_bootstrap_failures_always_end_in_a_typed_error_record ... ok
+test run_jsonl_exits_65_when_fake_provider_errors ... ok
+test live_jsonl_and_durable_replay_are_byte_identical_for_text_tool_error_and_cancel ... ok
+test run_jsonl_fragmented_tool_call_keeps_one_call_identity_and_cursor ... ok
+test run_jsonl_replays_every_envelope_to_a_slow_pipe_consumer ... ok
+test run_jsonl_unknown_pricing_has_one_distinct_budget_terminal_and_exits_77 ... ok
+test run_parser_pins_budgets_seed_and_lifecycle ... ok
+test run_parser_pins_outputs_timeouts_and_permission_flags ... ok
+test run_model_tool_argument_shape_error_is_rejected_and_continues ... ok
+test run_prompt_flag_and_stdin_have_identical_text ... ok
+test run_nonpermission_input_rejects_without_guessing_and_continues ... ok
+test run_timeout_emits_timeout_json_and_exits_124 ... ok
+test run_prompt_flag_and_piped_stdin_are_process_parity ... ok
+test self_test_reports_ok_json ... ok
+test sequential_ephemeral_cli_runs_advance_profile_owned_worker_generations ... ok
+test run_read_only_denial_is_typed_and_terminal ... ok
+test run_write_and_exec_permission_flags_journal_ordinary_allow ... ok
+test tui_demo_plain_flag_matches_piped_output ... ok
+test tui_demo_with_piped_stdout_renders_plain ... ok
+test tui_rejects_bad_theme ... ok
+test tui_without_demo_rejects_the_demo_only_plain_oracle ... ok
+test unknown_command_exits_2 ... ok
+test unknown_import_source_is_rejected ... ok
+test unknown_lifecycle_run_is_a_machine_readable_error ... ok
+test unknown_run_provider_surfaces_daemon_create_refusal ... ok
+test version_prints_workspace_version ... ok
+test staged_run_with_resident_daemon_has_two_steady_state_threads ... ok
+test session_readiness_and_resume_are_finite_event_driven_json_barriers ... ok
+test run_jsonl_timeout_has_one_distinct_timeout_terminal ... ok
+
+test result: ok. 143 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.59s
+
+     Running tests/observe_cli_tests.rs ($AGENTCLI_TARGET/debug/deps/observe_cli_tests-0e75dd8ce61c2800)
+
+running 91 tests
+test cli_main::account::account_custom_tests::add_parser_accepts_every_secret_source_and_redacts_inline_keys ... ok
+test cli_main::account::account_custom_tests::direct_add_execution_without_auth_refuses_before_any_request ... ok
+test cli_main::account::account_custom_tests::parser_requires_one_explicit_auth_choice_on_add ... ok
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test bare_fleet_lists_only_subagent_sessions_most_recent_first ... ok
+test cli_main::account::account_custom_tests::probe_preserves_the_typed_failure_class ... ok
+test cli_main::account::account_custom_tests::no_auth_add_skips_vault_and_login_and_discovers_empty_input ... ok
+{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::keyed_add_reuses_one_stage_for_discovery_and_login ... ok
+test cli_main::account::account_custom_tests::update_accepts_auth_mode_changes_but_rejects_api_family_changes ... ok
+test cli_main::account::account_custom_tests::probe_refreshes_alias_and_reports_exact_namespaced_models ... ok
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::update_base_key_and_timeout_preserves_immutable_shape ... ok
+test cli_main::account::account_custom_tests::update_to_no_auth_reuses_the_provider_and_removes_its_key ... ok
+test cli_main::account::tests::account_use_resolves_alias_then_sets_the_profile_default ... ok
+test cli_main::account::tests::account_list_projection_is_additive_and_preserves_legacy_absence ... ok
+test cli_main::account::tests::import_and_refresh_parsing_are_explicit ... ok
+test cli_main::account::tests::confirmed_remove_is_list_first_and_revision_fenced ... ok
+test cli_main::account::tests::confirmed_remove_refuses_to_mutate_without_a_snapshot_revision ... ok
+test cli_main::account::tests::source_add_accepts_every_enrolled_source_kind_vocabulary ... ok
+test cli_main::account::tests::source_and_profile_default_commands_have_exact_grammar ... ok
+test cli_main::account::tests::confirmed_import_sends_only_the_opaque_candidate ... ok
+test cli_main::account::tests::source_add_sends_coordinates_without_credential_material ... ok
+test cli_main::automation::tests::resume_parser_preserves_interactive_spelling ... ok
+test cli_main::account::tests::unconfirmed_import_discovers_but_never_mutates ... ok
+test cli_main::graph::tests::parses_all_graph_cli_surfaces ... ok
+test cli_main::automation::tests::readiness_parser_requires_exact_named_count_and_finite_json ... ok
+test cli_main::lockdown::lockdown_tests::lockdown_cli_parses_status_quota_and_json_without_signed_sizes ... ok
+test cli_main::models::tests::automatic_refresh_starts_at_the_exact_ttl_boundary ... ok
+test cli_main::models::tests::refresh_parser_distinguishes_global_and_provider_scopes ... ok
+test cli_main::lockdown::lockdown_tests::lockdown_status_json_golden_is_exact ... ok
+test cli_main::models::tests::global_refresh_targets_every_fetched_provider ... ok
+test cli_main::peer::tests::peer_cli_parser_pins_all_surfaces ... ok
+test cli_main::models::tests::models_json_publishes_fetch_time_and_age_without_fabrication ... ok
+test cli_main::provider::provider_tests::provider_list_json_does_not_omit_full_trust ... ok
+test cli_main::peer::tests::peer_json_contract_shapes_are_golden ... ok
+test cli_main::provider::provider_tests::provider_list_json_golden_exposes_lockdown_trust ... ok
+test cli_main::provider::provider_tests::provider_trust_flags_are_mutually_exclusive ... ok
+test cli_main::provider::provider_tests::provider_show_json_golden_includes_the_fixed_envelope_and_quota ... ok
+test cli_main::observe::roster_scalar_tests::roster_scalars_ride_sessions_json_rows_additively ... ok
+test cli_main::run::tests::cli_model_is_not_duplicated_into_post_create_session_config ... ok
+test cli_main::run::tests::jsonl_adapter_writes_accepted_before_any_envelope ... ok
+test cli_main::run::tests::jsonl_adapter_flushes_a_queued_batch_at_acceptance_and_terminal ... ok
+test cli_main::run::tests::jsonl_adapter_preserves_provider_wait_and_run_failed_payload_shapes ... ok
+test cli_main::run::tests::jsonl_emitter_covers_unavailable_incompatible_and_no_default_failures ... ok
+test cli_main::run::tests::journalview_replay_private_summary_never_becomes_final_response ... ok
+test cli_main::run::tests::legacy_replay_preserves_unknown_retained_terminal_without_synthesis ... ok
+test cli_main::run::tests::legacy_replay_projects_success_failure_and_cancellation_terminals ... ok
+test cli_main::run::tests::legacy_replay_requires_global_sequence_adjacency_for_run_failure ... ok
+test cli_main::run::tests::replay_preserves_the_complete_permission_pin ... ok
+test cli_main::run::tests::replay_preserves_known_retained_terminal_without_reclassification ... ok
+test cli_main::run::tests::request_budget_exit_is_distinct_and_json_preserves_resume_instruction ... ok
+test cli_main::run::tests::legacy_replay_preserves_first_blocker_on_cancelled_terminal ... ok
+test cli_main::run::tests::request_budget_flags_preserve_defaults_and_reject_invalid_or_duplicate_limits ... ok
+test cli_main::run::tests::resume_parser_accepts_defaults_and_each_budget_without_prompt ... ok
+test cli_main::run::tests::resume_parser_accepts_handle_and_budget_without_prompt ... ok
+test cli_main::run::tests::resume_parser_rejects_explicit_permission_overrides_in_either_order ... ok
+test cli_main::run::tests::run_daemon_linger_defaults_to_thirty_seconds_and_zero_restores_one_shot ... ok
+test cli_main::run::tests::run_daemon_linger_rejects_unbounded_or_malformed_values ... ok
+test cli_main::runtime_tests::footprint_hold_is_opt_in_and_bounded ... ok
+test cli_main::runtime_tests::only_auto_hermetic_lockdown_suppresses_the_automatic_update ... ok
+test cli_main::runtime_tests::startup_update_policy_checks_only_the_provider_this_door_activates ... ok
+test cli_main::runtime_tests::one_shot_commands_use_the_lean_current_thread_runtime ... ok
+test cli_main::runtime_tests::tui_and_non_wire_paths_keep_the_full_runtime ... ok
+test cli_main::session_item::tests::collect_target_stops_once_a_plain_target_is_captured ... ok
+test cli_main::session_item::tests::item_not_found_names_the_head ... ok
+test cli_main::session_item::tests::parse_options_is_strict_and_typed ... ok
+test cli_main::session_item::tests::collect_result_stops_at_the_call_seq_boundary ... ok
+test cli_main::session_provider::tests::provider_rebind_cli_requires_explicit_target_and_rejects_ambiguous_flags ... ok
+test cli_main::session_recover::tests::completion_requires_the_selected_actions_durable_follow_up ... ok
+test cli_main::session_recover::tests::parse_accepts_one_action_and_refuses_combinations ... ok
+test cli_main::session_recover::tests::recovery_command_ids_are_stable_for_lost_response_retries ... ok
+test cli_main::session_recover::tests::recovery_menu_selects_the_crash_window_kind_only ... ok
+test cli_main::session_item::tests::collect_target_stops_once_the_tool_join_resolves ... ok
+test cli_main::session_workspace::tests::shorthand_requires_one_unambiguous_session ... ok
+test cli_main::shell_registry::tests::shell_list_json_shape_is_stable_and_public ... ok
+test cli_main::ssh::tests::cli_json_shapes_are_stable_and_secret_free ... ok
+test cli_main::ssh::tests::cli_parser_requires_one_explicit_auth_method_and_has_no_jump_host ... ok
+test cli_main::ssh::tests::cli_parser_distinguishes_interactive_pty_from_one_shot_exec ... ok
+test cli_main::ssh::tests::typed_refusals_map_to_scriptable_exit_codes ... ok
+test cli_main::update::tui::tests::cancelled_update_discovery_starts_no_curl_request ... ok
+test exit_codes_match_the_headless_table ... ok
+test fixture_paths_remain_inside_the_cli_test_tree ... ok
+test human_views_include_the_scoped_observation_facts ... ok
+test fleet_snapshot_rendering_and_raw_json_are_append_only_goldens ... ok
+test observe_json_schemas_are_goldened_and_secret_free ... ok
+test observe_parsers_and_stream_help_are_explicit ... ok
+test sessions_json_projects_promoted_cache_rates_with_legacy_fallback ... ok
+test sessions_json_projects_top_level_provider_beside_last_model ... ok
+test status_update_view_reads_the_stamp_cache_without_network ... ok
+test watch_streams_are_lf_framed_raw_envelopes_and_tolerate_additive_kinds ... ok
+test no_daemon_no_spawn_paths_are_typed_69_and_do_not_start_a_daemon ... ok
+test cli_main::update::tui::tests::explicit_update_response_error_reaps_curl_and_joins_watcher ... ok
+test cli_main::update::tui::tests::slow_explicit_update_check_cancels_and_reaps_curl_before_runtime_teardown ... ok
+
+test result: ok. 91 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running tests/oneshot_boot_tests.rs ($AGENTCLI_TARGET/debug/deps/oneshot_boot_tests-ae9ab5ff5448d69b)
+
+running 10 tests
+test fresh_profile_models_catalog_matches_the_golden ... ok
+test fresh_daemon_lockdown_status_reports_defaults_without_a_policy ... ok
+test fresh_daemon_reconciles_seeded_lockdown_quota_before_its_first_command ... ok
+test custom_provider_delta_survives_daemon_restart_beside_the_builtin_catalog ... ok
+test fresh_profile_status_is_typed_without_a_daemon_and_reports_the_build_version_with_one ... ok
+test one_shot_attachment_is_durable_in_the_profile_cas ... ok
+test one_shot_boot_publishes_a_nonempty_daemon_log_and_bounds_log_history ... ok
+test one_shot_jsonl_stream_matches_the_normalized_golden ... ok
+test one_shot_run_state_is_visible_to_a_later_persistent_daemon ... ok
+test persistent_daemon_cache_diagnostic_key_is_durable_across_restart ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.03s
+
+     Running tests/projection_completeness_tests.rs ($AGENTCLI_TARGET/debug/deps/projection_completeness_tests-1b44c302bcf6cffe)
+
+running 2 tests
+test every_session_summary_wire_field_is_projected_or_deliberately_skipped ... ok
+test the_session_id_alias_is_emitted_and_never_drifts_from_id ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/release_workflow_tests.rs ($AGENTCLI_TARGET/debug/deps/release_workflow_tests-a6d74a9cfd137766)
+
+running 1 test
+test release_archives_daemon_symbols_without_publishing_them_as_distribution_files ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/session_config_cli_tests.rs ($AGENTCLI_TARGET/debug/deps/session_config_cli_tests-b6cc7895a4c7c146)
+
+running 85 tests
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::direct_add_execution_without_auth_refuses_before_any_request ... ok
+test cli_main::account::account_custom_tests::no_auth_add_skips_vault_and_login_and_discovers_empty_input ... ok
+test cli_main::account::account_custom_tests::add_parser_accepts_every_secret_source_and_redacts_inline_keys ... ok
+test cli_main::account::account_custom_tests::parser_requires_one_explicit_auth_choice_on_add ... ok
+test cli_main::account::account_custom_tests::update_accepts_auth_mode_changes_but_rejects_api_family_changes ... ok
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::keyed_add_reuses_one_stage_for_discovery_and_login ... ok
+test cli_main::account::account_custom_tests::probe_preserves_the_typed_failure_class ... ok
+test cli_main::account::account_custom_tests::probe_refreshes_alias_and_reports_exact_namespaced_models ... ok
+test cli_main::account::account_custom_tests::update_base_key_and_timeout_preserves_immutable_shape ... ok
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::tests::account_use_resolves_alias_then_sets_the_profile_default ... ok
+test cli_main::account::account_custom_tests::update_to_no_auth_reuses_the_provider_and_removes_its_key ... ok
+test cli_main::account::tests::account_list_projection_is_additive_and_preserves_legacy_absence ... ok
+test cli_main::account::tests::confirmed_import_sends_only_the_opaque_candidate ... ok
+test cli_main::account::tests::confirmed_remove_is_list_first_and_revision_fenced ... ok
+test cli_main::account::tests::confirmed_remove_refuses_to_mutate_without_a_snapshot_revision ... ok
+test cli_main::account::tests::import_and_refresh_parsing_are_explicit ... ok
+test cli_main::account::tests::source_add_accepts_every_enrolled_source_kind_vocabulary ... ok
+test cli_main::account::tests::source_add_sends_coordinates_without_credential_material ... ok
+test cli_main::automation::tests::resume_parser_preserves_interactive_spelling ... ok
+test cli_main::graph::tests::parses_all_graph_cli_surfaces ... ok
+test cli_main::account::tests::source_and_profile_default_commands_have_exact_grammar ... ok
+test cli_main::lockdown::lockdown_tests::lockdown_cli_parses_status_quota_and_json_without_signed_sizes ... ok
+test cli_main::automation::tests::readiness_parser_requires_exact_named_count_and_finite_json ... ok
+test cli_main::account::tests::unconfirmed_import_discovers_but_never_mutates ... ok
+test cli_main::models::tests::automatic_refresh_starts_at_the_exact_ttl_boundary ... ok
+test cli_main::models::tests::global_refresh_targets_every_fetched_provider ... ok
+test cli_main::models::tests::refresh_parser_distinguishes_global_and_provider_scopes ... ok
+test cli_main::peer::tests::peer_cli_parser_pins_all_surfaces ... ok
+test cli_main::models::tests::models_json_publishes_fetch_time_and_age_without_fabrication ... ok
+test cli_main::lockdown::lockdown_tests::lockdown_status_json_golden_is_exact ... ok
+test cli_main::peer::tests::peer_json_contract_shapes_are_golden ... ok
+test cli_main::observe::roster_scalar_tests::roster_scalars_ride_sessions_json_rows_additively ... ok
+test cli_main::provider::provider_tests::provider_list_json_does_not_omit_full_trust ... ok
+test cli_main::provider::provider_tests::provider_list_json_golden_exposes_lockdown_trust ... ok
+test cli_main::provider::provider_tests::provider_trust_flags_are_mutually_exclusive ... ok
+test cli_main::provider::provider_tests::provider_show_json_golden_includes_the_fixed_envelope_and_quota ... ok
+test cli_main::run::tests::cli_model_is_not_duplicated_into_post_create_session_config ... ok
+test cli_main::run::tests::jsonl_adapter_preserves_provider_wait_and_run_failed_payload_shapes ... ok
+test cli_main::run::tests::jsonl_emitter_covers_unavailable_incompatible_and_no_default_failures ... ok
+test cli_main::run::tests::legacy_replay_preserves_first_blocker_on_cancelled_terminal ... ok
+test cli_main::run::tests::legacy_replay_preserves_unknown_retained_terminal_without_synthesis ... ok
+test cli_main::run::tests::jsonl_adapter_flushes_a_queued_batch_at_acceptance_and_terminal ... ok
+test cli_main::run::tests::jsonl_adapter_writes_accepted_before_any_envelope ... ok
+test cli_main::run::tests::journalview_replay_private_summary_never_becomes_final_response ... ok
+test cli_main::run::tests::legacy_replay_projects_success_failure_and_cancellation_terminals ... ok
+test cli_main::run::tests::legacy_replay_requires_global_sequence_adjacency_for_run_failure ... ok
+test cli_main::run::tests::replay_preserves_the_complete_permission_pin ... ok
+test cli_main::run::tests::replay_preserves_known_retained_terminal_without_reclassification ... ok
+test cli_main::run::tests::request_budget_exit_is_distinct_and_json_preserves_resume_instruction ... ok
+test cli_main::run::tests::request_budget_flags_preserve_defaults_and_reject_invalid_or_duplicate_limits ... ok
+test cli_main::run::tests::resume_parser_accepts_defaults_and_each_budget_without_prompt ... ok
+test cli_main::run::tests::resume_parser_accepts_handle_and_budget_without_prompt ... ok
+test cli_main::run::tests::resume_parser_rejects_explicit_permission_overrides_in_either_order ... ok
+test cli_main::run::tests::run_daemon_linger_defaults_to_thirty_seconds_and_zero_restores_one_shot ... ok
+test cli_main::runtime_tests::footprint_hold_is_opt_in_and_bounded ... ok
+test cli_main::runtime_tests::only_auto_hermetic_lockdown_suppresses_the_automatic_update ... ok
+test cli_main::runtime_tests::startup_update_policy_checks_only_the_provider_this_door_activates ... ok
+test cli_main::runtime_tests::one_shot_commands_use_the_lean_current_thread_runtime ... ok
+test cli_main::session_item::tests::collect_result_stops_at_the_call_seq_boundary ... ok
+test cli_main::session_item::tests::collect_target_stops_once_a_plain_target_is_captured ... ok
+test cli_main::session_item::tests::item_not_found_names_the_head ... ok
+test cli_main::session_item::tests::parse_options_is_strict_and_typed ... ok
+test cli_main::session_item::tests::collect_target_stops_once_the_tool_join_resolves ... ok
+test cli_main::session_provider::tests::provider_rebind_cli_requires_explicit_target_and_rejects_ambiguous_flags ... ok
+test cli_main::session_recover::tests::parse_accepts_one_action_and_refuses_combinations ... ok
+test cli_main::session_recover::tests::completion_requires_the_selected_actions_durable_follow_up ... ok
+test cli_main::session_recover::tests::recovery_command_ids_are_stable_for_lost_response_retries ... ok
+test cli_main::session_recover::tests::recovery_menu_selects_the_crash_window_kind_only ... ok
+test cli_main::session_workspace::tests::shorthand_requires_one_unambiguous_session ... ok
+test cli_main::shell_registry::tests::shell_list_json_shape_is_stable_and_public ... ok
+test cli_main::ssh::tests::cli_json_shapes_are_stable_and_secret_free ... ok
+test cli_main::ssh::tests::cli_parser_distinguishes_interactive_pty_from_one_shot_exec ... ok
+test cli_main::ssh::tests::cli_parser_requires_one_explicit_auth_method_and_has_no_jump_host ... ok
+test cli_main::ssh::tests::typed_refusals_map_to_scriptable_exit_codes ... ok
+test cli_main::update::tui::tests::cancelled_update_discovery_starts_no_curl_request ... ok
+test cli_main::run::tests::run_daemon_linger_rejects_unbounded_or_malformed_values ... ok
+test config_flag_vocabulary_is_exact ... ok
+test cli_main::runtime_tests::tui_and_non_wire_paths_keep_the_full_runtime ... ok
+test confirm_epoch_flag_parses_once_and_defaults_off ... ok
+test model_selector_splits_only_on_registered_providers ... ok
+test models_json_vocabulary_is_stable ... ok
+test partial_failure_discloses_what_committed ... ok
+test setter_feature_preconditions_are_per_flag ... ok
+test cli_main::update::tui::tests::explicit_update_response_error_reaps_curl_and_joins_watcher ... ok
+test cli_main::update::tui::tests::slow_explicit_update_check_cancels_and_reaps_curl_before_runtime_teardown ... ok
+
+test result: ok. 85 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+     Running tests/status_discovery_smoke_tests.rs ($AGENTCLI_TARGET/debug/deps/status_discovery_smoke_tests-2312af0c172b729b)
+
+running 4 tests
+test built_status_fails_loudly_for_an_overlong_explicit_unix_root ... ok
+test built_status_honors_a_short_explicit_runtime_root ... ok
+test built_status_reports_non_private_xdg_fallback_to_home ... ok
+test built_status_json_honors_private_xdg_with_enabled_discovery ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
+
+     Running tests/turnhygiene_pin_tests.rs ($AGENTCLI_TARGET/debug/deps/turnhygiene_pin_tests-da1c494e2686883d)
+
+running 11 tests
+test detached_run_journals_the_same_envelopes_as_an_attached_run ... ok
+test journalview_json_and_replay_pin_both_narrative_sides_per_request ... ok
+test custom_provider_binds_from_explicit_flags_a_model_selector_and_the_profile_default ... ok
+test capped_run_retains_terminal_progress_for_untouched_and_mutated_workspaces ... ok
+test replay_of_a_tool_call_turn_equals_the_live_run_scoped_jsonl ... ok
+test provider_request_body_is_budget_independent_and_matches_the_golden_ledger ... ok
+test resident_daemon_discovers_a_hook_installed_between_runs_and_scopes_it_by_cwd ... ok
+test run_jsonl_text_turn_matches_the_normalized_golden ... ok
+test jsonl_envelopes_reach_stdout_before_a_later_provider_delay_elapses ... ok
+test run_jsonl_tool_turn_matches_the_normalized_golden ... ok
+test resident_daemon_rediscovers_project_instructions_across_runs_and_cwds ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.16s
+
+     Running tests/update_cli_tests.rs ($AGENTCLI_TARGET/debug/deps/update_cli_tests-407e5a167cc95500)
+
+running 91 tests
+test automatic_update_check_opt_out_honors_exact_env_and_flag_twins ... ok
+test background_check_silences_network_failure_and_non_new_release ... ok
+test bare_session_flag_refuses_a_flag_shaped_value ... ok
+test bare_tui_update_opt_out_flag_preserves_session_arguments ... ok
+test cli_main::account::account_custom_tests::add_parser_accepts_every_secret_source_and_redacts_inline_keys ... ok
+test cli_main::account::account_custom_tests::parser_requires_one_explicit_auth_choice_on_add ... ok
+test cli_main::account::account_custom_tests::direct_add_execution_without_auth_refuses_before_any_request ... ok
+test cli_main::account::account_custom_tests::probe_preserves_the_typed_failure_class ... ok
+test cli_main::account::account_custom_tests::update_accepts_auth_mode_changes_but_rejects_api_family_changes ... ok
+{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::probe_refreshes_alias_and_reports_exact_namespaced_models ... ok
+test cli_main::account::account_custom_tests::no_auth_add_skips_vault_and_login_and_discovers_empty_input ... ok
+test cli_main::account::account_custom_tests::keyed_add_reuses_one_stage_for_discovery_and_login ... ok
+test cli_main::account::account_custom_tests::update_base_key_and_timeout_preserves_immutable_shape ... ok
+test cli_main::account::tests::account_list_projection_is_additive_and_preserves_legacy_absence ... ok
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::update_to_no_auth_reuses_the_provider_and_removes_its_key ... ok
+test cli_main::account::tests::account_use_resolves_alias_then_sets_the_profile_default ... ok
+test cli_main::account::tests::confirmed_remove_is_list_first_and_revision_fenced ... ok
+test cli_main::account::tests::confirmed_remove_refuses_to_mutate_without_a_snapshot_revision ... ok
+test cli_main::account::tests::import_and_refresh_parsing_are_explicit ... ok
+test cli_main::account::tests::source_add_accepts_every_enrolled_source_kind_vocabulary ... ok
+test cli_main::account::tests::confirmed_import_sends_only_the_opaque_candidate ... ok
+test cli_main::account::tests::source_and_profile_default_commands_have_exact_grammar ... ok
+test cli_main::account::tests::source_add_sends_coordinates_without_credential_material ... ok
+test cli_main::automation::tests::resume_parser_preserves_interactive_spelling ... ok
+test cli_main::account::tests::unconfirmed_import_discovers_but_never_mutates ... ok
+test cli_main::graph::tests::parses_all_graph_cli_surfaces ... ok
+test cli_main::lockdown::lockdown_tests::lockdown_cli_parses_status_quota_and_json_without_signed_sizes ... ok
+test cli_main::models::tests::automatic_refresh_starts_at_the_exact_ttl_boundary ... ok
+test cli_main::models::tests::global_refresh_targets_every_fetched_provider ... ok
+test cli_main::automation::tests::readiness_parser_requires_exact_named_count_and_finite_json ... ok
+test cli_main::models::tests::refresh_parser_distinguishes_global_and_provider_scopes ... ok
+test cli_main::peer::tests::peer_cli_parser_pins_all_surfaces ... ok
+test cli_main::lockdown::lockdown_tests::lockdown_status_json_golden_is_exact ... ok
+test cli_main::models::tests::models_json_publishes_fetch_time_and_age_without_fabrication ... ok
+test cli_main::provider::provider_tests::provider_list_json_does_not_omit_full_trust ... ok
+test cli_main::provider::provider_tests::provider_list_json_golden_exposes_lockdown_trust ... ok
+test cli_main::peer::tests::peer_json_contract_shapes_are_golden ... ok
+test cli_main::provider::provider_tests::provider_trust_flags_are_mutually_exclusive ... ok
+test cli_main::provider::provider_tests::provider_show_json_golden_includes_the_fixed_envelope_and_quota ... ok
+test cli_main::run::tests::cli_model_is_not_duplicated_into_post_create_session_config ... ok
+test cli_main::observe::roster_scalar_tests::roster_scalars_ride_sessions_json_rows_additively ... ok
+test cli_main::run::tests::jsonl_adapter_flushes_a_queued_batch_at_acceptance_and_terminal ... ok
+test cli_main::run::tests::jsonl_adapter_writes_accepted_before_any_envelope ... ok
+test cli_main::run::tests::jsonl_adapter_preserves_provider_wait_and_run_failed_payload_shapes ... ok
+test cli_main::run::tests::jsonl_emitter_covers_unavailable_incompatible_and_no_default_failures ... ok
+test cli_main::run::tests::journalview_replay_private_summary_never_becomes_final_response ... ok
+test cli_main::run::tests::legacy_replay_preserves_unknown_retained_terminal_without_synthesis ... ok
+test cli_main::run::tests::legacy_replay_projects_success_failure_and_cancellation_terminals ... ok
+test cli_main::run::tests::legacy_replay_requires_global_sequence_adjacency_for_run_failure ... ok
+test cli_main::run::tests::replay_preserves_the_complete_permission_pin ... ok
+test cli_main::run::tests::request_budget_flags_preserve_defaults_and_reject_invalid_or_duplicate_limits ... ok
+test cli_main::run::tests::replay_preserves_known_retained_terminal_without_reclassification ... ok
+test cli_main::run::tests::legacy_replay_preserves_first_blocker_on_cancelled_terminal ... ok
+test cli_main::run::tests::request_budget_exit_is_distinct_and_json_preserves_resume_instruction ... ok
+test cli_main::run::tests::resume_parser_accepts_defaults_and_each_budget_without_prompt ... ok
+test cli_main::run::tests::resume_parser_accepts_handle_and_budget_without_prompt ... ok
+test cli_main::run::tests::resume_parser_rejects_explicit_permission_overrides_in_either_order ... ok
+test cli_main::run::tests::run_daemon_linger_defaults_to_thirty_seconds_and_zero_restores_one_shot ... ok
+test cli_main::run::tests::run_daemon_linger_rejects_unbounded_or_malformed_values ... ok
+test cli_main::runtime_tests::footprint_hold_is_opt_in_and_bounded ... ok
+test cli_main::runtime_tests::only_auto_hermetic_lockdown_suppresses_the_automatic_update ... ok
+test cli_main::runtime_tests::startup_update_policy_checks_only_the_provider_this_door_activates ... ok
+test cli_main::session_item::tests::collect_target_stops_once_a_plain_target_is_captured ... ok
+test cli_main::runtime_tests::one_shot_commands_use_the_lean_current_thread_runtime ... ok
+test cli_main::session_item::tests::collect_result_stops_at_the_call_seq_boundary ... ok
+test cli_main::runtime_tests::tui_and_non_wire_paths_keep_the_full_runtime ... ok
+test cli_main::session_item::tests::item_not_found_names_the_head ... ok
+test cli_main::session_item::tests::parse_options_is_strict_and_typed ... ok
+test cli_main::session_provider::tests::provider_rebind_cli_requires_explicit_target_and_rejects_ambiguous_flags ... ok
+test cli_main::session_recover::tests::completion_requires_the_selected_actions_durable_follow_up ... ok
+test cli_main::session_recover::tests::parse_accepts_one_action_and_refuses_combinations ... ok
+test cli_main::session_recover::tests::recovery_command_ids_are_stable_for_lost_response_retries ... ok
+test cli_main::session_recover::tests::recovery_menu_selects_the_crash_window_kind_only ... ok
+test cli_main::session_workspace::tests::shorthand_requires_one_unambiguous_session ... ok
+test cli_main::shell_registry::tests::shell_list_json_shape_is_stable_and_public ... ok
+test cli_main::ssh::tests::cli_parser_distinguishes_interactive_pty_from_one_shot_exec ... ok
+test cli_main::ssh::tests::cli_json_shapes_are_stable_and_secret_free ... ok
+test cli_main::ssh::tests::typed_refusals_map_to_scriptable_exit_codes ... ok
+test cli_main::session_item::tests::collect_target_stops_once_the_tool_join_resolves ... ok
+test cli_main::ssh::tests::cli_parser_requires_one_explicit_auth_method_and_has_no_jump_host ... ok
+test cli_main::update::tui::tests::cancelled_update_discovery_starts_no_curl_request ... ok
+test invalid_update_cli_arm_exits_usage_without_discovery ... ok
+test on_open_check_due_is_a_pure_six_hour_clock_policy ... ok
+test explicit_check_bypasses_rate_limit_and_refreshes_stamp ... ok
+test cli_main::update::tui::tests::explicit_update_response_error_reaps_curl_and_joins_watcher ... ok
+test resume_opens_the_picker_or_attaches_the_named_session ... ok
+test tui_restart_plans_preserve_original_argv_for_both_process_strategies ... ok
+test update_error_classes_have_stable_exit_codes ... ok
+test update_parser_accepts_only_bare_or_check ... ok
+test on_open_check_reservation_writes_fresh_stamp_then_skips_within_six_hours ... ok
+test cli_main::update::tui::tests::slow_explicit_update_check_cancels_and_reaps_curl_before_runtime_teardown ... ok
+
+test result: ok. 91 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/update_restart_tests.rs ($AGENTCLI_TARGET/debug/deps/update_restart_tests-fc108d3385d07180)
+
+running 86 tests
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::add_parser_accepts_every_secret_source_and_redacts_inline_keys ... ok
+test cli_main::account::account_custom_tests::keyed_add_reuses_one_stage_for_discovery_and_login ... ok
+test cli_main::account::account_custom_tests::direct_add_execution_without_auth_refuses_before_any_request ... ok
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::no_auth_add_skips_vault_and_login_and_discovers_empty_input ... ok
+test cli_main::account::account_custom_tests::parser_requires_one_explicit_auth_choice_on_add ... ok
+{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::probe_preserves_the_typed_failure_class ... ok
+test cli_main::account::account_custom_tests::update_accepts_auth_mode_changes_but_rejects_api_family_changes ... ok
+test cli_main::account::account_custom_tests::probe_refreshes_alias_and_reports_exact_namespaced_models ... ok
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::update_base_key_and_timeout_preserves_immutable_shape ... ok
+test cli_main::account::account_custom_tests::update_to_no_auth_reuses_the_provider_and_removes_its_key ... ok
+test cli_main::account::tests::account_list_projection_is_additive_and_preserves_legacy_absence ... ok
+test cli_main::account::tests::account_use_resolves_alias_then_sets_the_profile_default ... ok
+test cli_main::account::tests::confirmed_remove_is_list_first_and_revision_fenced ... ok
+test cli_main::account::tests::confirmed_import_sends_only_the_opaque_candidate ... ok
+test cli_main::account::tests::confirmed_remove_refuses_to_mutate_without_a_snapshot_revision ... ok
+test cli_main::account::tests::import_and_refresh_parsing_are_explicit ... ok
+test cli_main::account::tests::source_add_accepts_every_enrolled_source_kind_vocabulary ... ok
+test cli_main::account::tests::source_add_sends_coordinates_without_credential_material ... ok
+test cli_main::account::tests::source_and_profile_default_commands_have_exact_grammar ... ok
+test cli_main::account::tests::unconfirmed_import_discovers_but_never_mutates ... ok
+test cli_main::automation::tests::readiness_parser_requires_exact_named_count_and_finite_json ... ok
+test cli_main::automation::tests::resume_parser_preserves_interactive_spelling ... ok
+test cli_main::graph::tests::parses_all_graph_cli_surfaces ... ok
+test cli_main::lockdown::lockdown_tests::lockdown_cli_parses_status_quota_and_json_without_signed_sizes ... ok
+test cli_main::lockdown::lockdown_tests::lockdown_status_json_golden_is_exact ... ok
+test cli_main::models::tests::automatic_refresh_starts_at_the_exact_ttl_boundary ... ok
+test cli_main::models::tests::global_refresh_targets_every_fetched_provider ... ok
+test cli_main::models::tests::models_json_publishes_fetch_time_and_age_without_fabrication ... ok
+test cli_main::models::tests::refresh_parser_distinguishes_global_and_provider_scopes ... ok
+test cli_main::peer::tests::peer_cli_parser_pins_all_surfaces ... ok
+test cli_main::observe::roster_scalar_tests::roster_scalars_ride_sessions_json_rows_additively ... ok
+test cli_main::peer::tests::peer_json_contract_shapes_are_golden ... ok
+test cli_main::provider::provider_tests::provider_list_json_does_not_omit_full_trust ... ok
+test cli_main::provider::provider_tests::provider_list_json_golden_exposes_lockdown_trust ... ok
+test cli_main::provider::provider_tests::provider_show_json_golden_includes_the_fixed_envelope_and_quota ... ok
+test cli_main::provider::provider_tests::provider_trust_flags_are_mutually_exclusive ... ok
+test cli_main::run::tests::cli_model_is_not_duplicated_into_post_create_session_config ... ok
+test cli_main::run::tests::jsonl_adapter_flushes_a_queued_batch_at_acceptance_and_terminal ... ok
+test cli_main::run::tests::jsonl_adapter_preserves_provider_wait_and_run_failed_payload_shapes ... ok
+test cli_main::run::tests::journalview_replay_private_summary_never_becomes_final_response ... ok
+test cli_main::run::tests::jsonl_adapter_writes_accepted_before_any_envelope ... ok
+test cli_main::run::tests::jsonl_emitter_covers_unavailable_incompatible_and_no_default_failures ... ok
+test cli_main::run::tests::legacy_replay_preserves_unknown_retained_terminal_without_synthesis ... ok
+test cli_main::run::tests::legacy_replay_projects_success_failure_and_cancellation_terminals ... ok
+test cli_main::run::tests::legacy_replay_preserves_first_blocker_on_cancelled_terminal ... ok
+test cli_main::run::tests::legacy_replay_requires_global_sequence_adjacency_for_run_failure ... ok
+test cli_main::run::tests::replay_preserves_the_complete_permission_pin ... ok
+test cli_main::run::tests::replay_preserves_known_retained_terminal_without_reclassification ... ok
+test cli_main::run::tests::request_budget_exit_is_distinct_and_json_preserves_resume_instruction ... ok
+test cli_main::run::tests::request_budget_flags_preserve_defaults_and_reject_invalid_or_duplicate_limits ... ok
+test cli_main::run::tests::resume_parser_accepts_defaults_and_each_budget_without_prompt ... ok
+test cli_main::run::tests::resume_parser_accepts_handle_and_budget_without_prompt ... ok
+test cli_main::run::tests::resume_parser_rejects_explicit_permission_overrides_in_either_order ... ok
+test cli_main::run::tests::run_daemon_linger_defaults_to_thirty_seconds_and_zero_restores_one_shot ... ok
+test cli_main::run::tests::run_daemon_linger_rejects_unbounded_or_malformed_values ... ok
+test cli_main::runtime_tests::footprint_hold_is_opt_in_and_bounded ... ok
+test cli_main::runtime_tests::one_shot_commands_use_the_lean_current_thread_runtime ... ok
+test cli_main::runtime_tests::startup_update_policy_checks_only_the_provider_this_door_activates ... ok
+test cli_main::runtime_tests::only_auto_hermetic_lockdown_suppresses_the_automatic_update ... ok
+test cli_main::session_item::tests::collect_target_stops_once_a_plain_target_is_captured ... ok
+test cli_main::session_item::tests::collect_result_stops_at_the_call_seq_boundary ... ok
+test cli_main::session_item::tests::collect_target_stops_once_the_tool_join_resolves ... ok
+test cli_main::session_item::tests::item_not_found_names_the_head ... ok
+test cli_main::runtime_tests::tui_and_non_wire_paths_keep_the_full_runtime ... ok
+test cli_main::session_item::tests::parse_options_is_strict_and_typed ... ok
+test cli_main::session_provider::tests::provider_rebind_cli_requires_explicit_target_and_rejects_ambiguous_flags ... ok
+test cli_main::session_recover::tests::completion_requires_the_selected_actions_durable_follow_up ... ok
+test cli_main::session_recover::tests::parse_accepts_one_action_and_refuses_combinations ... ok
+test cli_main::session_recover::tests::recovery_command_ids_are_stable_for_lost_response_retries ... ok
+test cli_main::session_recover::tests::recovery_menu_selects_the_crash_window_kind_only ... ok
+test cli_main::session_workspace::tests::shorthand_requires_one_unambiguous_session ... ok
+test cli_main::shell_registry::tests::shell_list_json_shape_is_stable_and_public ... ok
+test cli_main::ssh::tests::cli_json_shapes_are_stable_and_secret_free ... ok
+test cli_main::ssh::tests::cli_parser_distinguishes_interactive_pty_from_one_shot_exec ... ok
+test cli_main::ssh::tests::cli_parser_requires_one_explicit_auth_method_and_has_no_jump_host ... ok
+test cli_main::ssh::tests::typed_refusals_map_to_scriptable_exit_codes ... ok
+test cli_main::update::tui::tests::cancelled_update_discovery_starts_no_curl_request ... ok
+test cli_main::update::tui::tests::explicit_update_response_error_reaps_curl_and_joins_watcher ... ok
+test cli_main::update::tui::tests::slow_explicit_update_check_cancels_and_reaps_curl_before_runtime_teardown ... ok
+test drain_timeout_signals_once_and_retains_recovery_assets ... ok
+test absent_daemon_log_evidence_lists_names_and_captured_bounded_stderr_tail ... ok
+test restart_spy_observes_exact_new_pair_as_the_first_restart_action ... ok
+test health_version_mismatch_stops_child_rolls_back_pair_and_restarts_old ... ok
+test no_daemon_case_commits_and_remains_stopped ... ok
+test real_daemon_drains_once_releases_lock_and_restarts_exact_version ... ok
+test truncated_archive_http_leaves_pair_and_live_daemon_unchanged ... ok
+
+test result: ok. 86 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.09s
+
+     Running tests/update_tests.rs ($AGENTCLI_TARGET/debug/deps/update_tests-8b0473cb886069ce)
+
+running 102 tests
+test bad_checksums_stop_before_extraction_and_verification ... ok
+test cli_main::account::account_custom_tests::add_parser_accepts_every_secret_source_and_redacts_inline_keys ... ok
+test cli_main::account::account_custom_tests::direct_add_execution_without_auth_refuses_before_any_request ... ok
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::keyed_add_reuses_one_stage_for_discovery_and_login ... ok
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::no_auth_add_skips_vault_and_login_and_discovers_empty_input ... ok
+test cli_main::account::account_custom_tests::parser_requires_one_explicit_auth_choice_on_add ... ok
+test cli_main::account::account_custom_tests::probe_preserves_the_typed_failure_class ... ok
+{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::probe_refreshes_alias_and_reports_exact_namespaced_models ... ok
+test cli_main::account::account_custom_tests::update_accepts_auth_mode_changes_but_rejects_api_family_changes ... ok
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::update_base_key_and_timeout_preserves_immutable_shape ... ok
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+test cli_main::account::account_custom_tests::update_to_no_auth_reuses_the_provider_and_removes_its_key ... ok
+test cli_main::account::tests::account_list_projection_is_additive_and_preserves_legacy_absence ... ok
+test cli_main::account::tests::account_use_resolves_alias_then_sets_the_profile_default ... ok
+test cli_main::account::tests::confirmed_import_sends_only_the_opaque_candidate ... ok
+test cli_main::account::tests::confirmed_remove_is_list_first_and_revision_fenced ... ok
+test cli_main::account::tests::confirmed_remove_refuses_to_mutate_without_a_snapshot_revision ... ok
+test cli_main::account::tests::import_and_refresh_parsing_are_explicit ... ok
+test cli_main::account::tests::source_add_accepts_every_enrolled_source_kind_vocabulary ... ok
+test cli_main::account::tests::source_add_sends_coordinates_without_credential_material ... ok
+test cli_main::account::tests::source_and_profile_default_commands_have_exact_grammar ... ok
+test cli_main::account::tests::unconfirmed_import_discovers_but_never_mutates ... ok
+test cli_main::automation::tests::readiness_parser_requires_exact_named_count_and_finite_json ... ok
+test cli_main::automation::tests::resume_parser_preserves_interactive_spelling ... ok
+test cli_main::graph::tests::parses_all_graph_cli_surfaces ... ok
+test cli_main::lockdown::lockdown_tests::lockdown_cli_parses_status_quota_and_json_without_signed_sizes ... ok
+test cli_main::lockdown::lockdown_tests::lockdown_status_json_golden_is_exact ... ok
+test cli_main::models::tests::automatic_refresh_starts_at_the_exact_ttl_boundary ... ok
+test cli_main::models::tests::global_refresh_targets_every_fetched_provider ... ok
+test cli_main::models::tests::models_json_publishes_fetch_time_and_age_without_fabrication ... ok
+test cli_main::models::tests::refresh_parser_distinguishes_global_and_provider_scopes ... ok
+test cli_main::observe::roster_scalar_tests::roster_scalars_ride_sessions_json_rows_additively ... ok
+test cli_main::peer::tests::peer_cli_parser_pins_all_surfaces ... ok
+test cli_main::peer::tests::peer_json_contract_shapes_are_golden ... ok
+test cli_main::provider::provider_tests::provider_list_json_does_not_omit_full_trust ... ok
+test cli_main::provider::provider_tests::provider_list_json_golden_exposes_lockdown_trust ... ok
+test cli_main::provider::provider_tests::provider_show_json_golden_includes_the_fixed_envelope_and_quota ... ok
+test cli_main::provider::provider_tests::provider_trust_flags_are_mutually_exclusive ... ok
+test cli_main::run::tests::cli_model_is_not_duplicated_into_post_create_session_config ... ok
+test cli_main::run::tests::journalview_replay_private_summary_never_becomes_final_response ... ok
+test cli_main::run::tests::jsonl_adapter_flushes_a_queued_batch_at_acceptance_and_terminal ... ok
+test cli_main::run::tests::jsonl_adapter_preserves_provider_wait_and_run_failed_payload_shapes ... ok
+test cli_main::run::tests::jsonl_adapter_writes_accepted_before_any_envelope ... ok
+test cli_main::run::tests::jsonl_emitter_covers_unavailable_incompatible_and_no_default_failures ... ok
+test cli_main::run::tests::legacy_replay_preserves_first_blocker_on_cancelled_terminal ... ok
+test cli_main::run::tests::legacy_replay_preserves_unknown_retained_terminal_without_synthesis ... ok
+test cli_main::run::tests::legacy_replay_projects_success_failure_and_cancellation_terminals ... ok
+test cli_main::run::tests::legacy_replay_requires_global_sequence_adjacency_for_run_failure ... ok
+test cli_main::run::tests::replay_preserves_known_retained_terminal_without_reclassification ... ok
+test cli_main::run::tests::replay_preserves_the_complete_permission_pin ... ok
+test cli_main::run::tests::request_budget_exit_is_distinct_and_json_preserves_resume_instruction ... ok
+test cli_main::run::tests::request_budget_flags_preserve_defaults_and_reject_invalid_or_duplicate_limits ... ok
+test cli_main::run::tests::resume_parser_accepts_defaults_and_each_budget_without_prompt ... ok
+test cli_main::run::tests::resume_parser_accepts_handle_and_budget_without_prompt ... ok
+test cli_main::run::tests::resume_parser_rejects_explicit_permission_overrides_in_either_order ... ok
+test cli_main::run::tests::run_daemon_linger_defaults_to_thirty_seconds_and_zero_restores_one_shot ... ok
+test cli_main::run::tests::run_daemon_linger_rejects_unbounded_or_malformed_values ... ok
+test cli_main::runtime_tests::footprint_hold_is_opt_in_and_bounded ... ok
+test cli_main::runtime_tests::one_shot_commands_use_the_lean_current_thread_runtime ... ok
+test cli_main::runtime_tests::only_auto_hermetic_lockdown_suppresses_the_automatic_update ... ok
+test cli_main::runtime_tests::startup_update_policy_checks_only_the_provider_this_door_activates ... ok
+test cli_main::runtime_tests::tui_and_non_wire_paths_keep_the_full_runtime ... ok
+test cli_main::session_item::tests::collect_result_stops_at_the_call_seq_boundary ... ok
+test cli_main::session_item::tests::collect_target_stops_once_a_plain_target_is_captured ... ok
+test cli_main::session_item::tests::collect_target_stops_once_the_tool_join_resolves ... ok
+test cli_main::session_item::tests::item_not_found_names_the_head ... ok
+test cli_main::session_item::tests::parse_options_is_strict_and_typed ... ok
+test cli_main::session_provider::tests::provider_rebind_cli_requires_explicit_target_and_rejects_ambiguous_flags ... ok
+test cli_main::session_recover::tests::completion_requires_the_selected_actions_durable_follow_up ... ok
+test cli_main::session_recover::tests::parse_accepts_one_action_and_refuses_combinations ... ok
+test cli_main::session_recover::tests::recovery_command_ids_are_stable_for_lost_response_retries ... ok
+test cli_main::session_recover::tests::recovery_menu_selects_the_crash_window_kind_only ... ok
+test cli_main::session_workspace::tests::shorthand_requires_one_unambiguous_session ... ok
+test cli_main::shell_registry::tests::shell_list_json_shape_is_stable_and_public ... ok
+test cli_main::ssh::tests::cli_json_shapes_are_stable_and_secret_free ... ok
+test cli_main::ssh::tests::cli_parser_distinguishes_interactive_pty_from_one_shot_exec ... ok
+test cli_main::ssh::tests::cli_parser_requires_one_explicit_auth_method_and_has_no_jump_host ... ok
+test cli_main::ssh::tests::typed_refusals_map_to_scriptable_exit_codes ... ok
+test cli_main::update::tui::tests::cancelled_update_discovery_starts_no_curl_request ... ok
+test cli_main::update::tui::tests::explicit_update_response_error_reaps_curl_and_joins_watcher ... ok
+test altered_staged_capability_is_refused_before_marker_or_backup ... ok
+test authenticated_asset_redirect_is_validated_before_tokenless_fetch ... ok
+test discovery_includes_prereleases_orders_semver_and_selects_both_targets ... ok
+test downgrade_malformed_and_asset_mismatch_refuse_before_download ... ok
+test equal_version_is_list_only_and_build_metadata_has_semver_equality ... ok
+test authenticated_release_request_does_not_follow_or_forward_redirects ... ok
+test cli_main::update::tui::tests::slow_explicit_update_check_cancels_and_reaps_curl_before_runtime_teardown ... ok
+test corrupt_recovery_backup_refuses_and_retains_marker ... ok
+test every_staged_verification_failure_leaves_installed_pair_exact ... ok
+test failed_staging_cannot_enter_transaction_or_recover_a_pending_marker ... ok
+test partial_download_cannot_escape_immutable_staging ... ok
+test reacquire_succeeds_while_a_stale_duplicate_of_the_released_lock_survives ... ok
+test installed_pair_verifier_failure_rolls_back_without_restart_capability ... ok
+test semver_parser_enforces_semver_two_precedence ... ok
+test staging_accepts_exact_workflow_checksum_basename ... ok
+test status_reports_update_availability_without_mutating ... ok
+test recovery_completes_a_partially_restored_pair ... ok
+test transaction_refuses_concurrency_symlinks_and_read_only_layouts ... ok
+test truncated_local_http_response_has_no_local_mutation ... ok
+test wrong_content_digest_with_valid_checksum_refuses_before_extraction ... ok
+test strict_archive_rejects_every_forbidden_member_shape ... ok
+test every_commit_boundary_fault_restores_exact_old_pair ... ok
+test every_marker_phase_recovers_to_a_never_mixed_old_pair ... ok
+
+test result: ok. 102 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.90s
+
+     Running tests/wc_export_tests.rs ($AGENTCLI_TARGET/debug/deps/wc_export_tests-27a34a58daee84e7)
+
+running 20 tests
+test codex_pair_rolls_back_the_rollout_when_history_fails ... ok
+test codex_rollout_id_equals_filename_uuid ... ok
+test codex_export_is_deterministic ... ok
+test codex_session_meta_source_is_an_accepted_interactive_value ... ok
+test claude_code_slug_and_uuid_chain ... ok
+test markdown_renders_from_a_fixture_journal ... ok
+test codex_tool_turn_emits_a_paired_call_and_output ... ok
+test json_renders_a_stable_public_schema ... ok
+test masked_hides_identity ... ok
+test never_overwrites_an_existing_foreign_file ... ok
+test opencode_refuses_a_missing_db ... ok
+test opencode_requires_confirmation ... ok
+test parse_defaults_to_markdown_and_reads_flags ... ok
+test opencode_refuses_a_locked_db ... ok
+test replay_buffer_is_bounded ... ok
+test pipe_export_holds_the_line_law_and_is_append_only ... ok
+test since_cursor_yields_the_exact_suffix ... ok
+test opencode_refuses_a_session_collision ... ok
+test write_new_file_refuses_to_follow_a_symlink ... ok
+test opencode_inserts_and_reads_back ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

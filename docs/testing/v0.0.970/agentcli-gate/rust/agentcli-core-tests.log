@@ -1,0 +1,16 @@
+   Compiling haider-platform v0.0.969 ($WORKTREE/crates/haider-platform)
+   Compiling haider-protocol v0.0.969 ($WORKTREE/crates/haider-protocol)
+   Compiling haider-accounts v0.0.969 ($WORKTREE/crates/haider-accounts)
+   Compiling haider-provider v0.0.969 ($WORKTREE/crates/haider-provider)
+   Compiling haider-tools v0.0.969 ($WORKTREE/crates/haider-tools)
+   Compiling haider-store v0.0.969 ($WORKTREE/crates/haider-store)
+   Compiling haider-core v0.0.969 ($WORKTREE/crates/haider-core)
+    Finished `test` profile [unoptimized] target(s) in 33.22s
+     Running tests/agent_spawn_tests.rs ($AGENTCLI_TARGET/debug/deps/agent_spawn_tests-4d44f5f893d6078e)
+
+running 2 tests
+test public_spawn_commits_one_child_result_without_a_parent_provider_request ... ok
+test public_spawn_red_child_result_is_a_failed_operation_without_provider_work ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

@@ -131,6 +131,7 @@ fn envelope(seq: u64, run_id: &RunId, payload: serde_json::Value) -> RawEnvelope
 
 fn headless_spec() -> HeadlessRunSpecV1 {
     HeadlessRunSpecV1 {
+        agent_spawn: None,
         continuation_of: None,
         cwd: "budget-workspace".to_owned(),
         provider: "fake".to_owned(),
@@ -933,6 +934,7 @@ async fn run_provider_budget_case_inner(
     .await
     .expect("create session");
     let spec = HeadlessRunSpecV1 {
+        agent_spawn: None,
         continuation_of: None,
         cwd,
         provider: provider_name.to_owned(),
@@ -1809,6 +1811,7 @@ async fn supervisor_idle_retirement_preserves_durable_root_budget_spend() {
     .await
     .expect("create parent session");
     let spec = HeadlessRunSpecV1 {
+        agent_spawn: None,
         continuation_of: None,
         cwd,
         provider: "openai".into(),
@@ -2117,6 +2120,7 @@ async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
     .expect("test epoch milliseconds fit u64")
     .saturating_add(3_000);
     let spec = HeadlessRunSpecV1 {
+        agent_spawn: None,
         continuation_of: None,
         cwd,
         provider: "fake".into(),

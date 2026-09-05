@@ -182,6 +182,7 @@ class LoaderContractTests(unittest.TestCase):
     def test_shipped_check_budget_sums_cover_every_nested_bound(self):
         expected = {
             "t0.account.alias_selects": 253_000,
+            "t0.agent.spawn_result": 288_000,
             "t0.budget.max_cost_binds_before_request": 252_000,
             "t0.budget.max_tokens_binds": 252_000,
             "t0.daemon.status_stop": 310_000,
@@ -209,7 +210,7 @@ class LoaderContractTests(unittest.TestCase):
         self.assertEqual(
             {check.id: check.budget.milliseconds for check in checks}, expected
         )
-        self.assertEqual(sum(check.budget.milliseconds for check in checks), 29_604_500)
+        self.assertEqual(sum(check.budget.milliseconds for check in checks), 29_892_500)
         by_id = {check.id: check for check in checks}
         for check_id in (
             "t0.budget.max_cost_binds_before_request",
@@ -651,6 +652,10 @@ class ReportAndPathTests(unittest.TestCase):
                 os.environ["NO_COLOR"] = previous
 
     def test_spawn_tracking_covers_new_headless_command_families(self):
+        for family in ("agent", "workflow"):
+            self.assertTrue(CheckContext._may_spawn((family, "list", "--json")))
+            self.assertTrue(CheckContext._may_spawn((family, "run", "--json")))
+            self.assertFalse(CheckContext._may_spawn((family, "list", "--json", "--no-spawn")))
         self.assertTrue(CheckContext._may_spawn(("account", "add")))
         self.assertTrue(CheckContext._may_spawn(("resume", "session-id")))
         self.assertTrue(CheckContext._may_spawn(("session", "session-id", "--json")))

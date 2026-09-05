@@ -17,6 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 pub(crate) mod account;
+pub(crate) mod agent;
 pub(crate) mod automation;
 pub(crate) mod daemon;
 pub(crate) mod export;
@@ -74,8 +75,8 @@ impl RuntimeProfile {
     fn for_args(args: &[String]) -> Self {
         match args.first().map(String::as_str) {
             Some(
-                "run" | "status" | "sessions" | "session" | "fleet" | "events" | "daemon"
-                | "--ready",
+                "run" | "status" | "sessions" | "session" | "fleet" | "events" | "daemon" | "agent"
+                | "workflow" | "--ready",
             ) => Self::EphemeralHeadless,
             Some("resume") if args.iter().any(|argument| argument == "--json") => {
                 Self::EphemeralHeadless
@@ -259,6 +260,8 @@ mod runtime_tests {
     fn one_shot_commands_use_the_lean_current_thread_runtime() {
         for arguments in [
             args(&["run", "hello"]),
+            args(&["agent", "spawn", "hello", "--json"]),
+            args(&["workflow", "list", "--json"]),
             args(&["status", "--json"]),
             args(&["sessions", "wait-ready", "--count", "1", "--json"]),
             args(&["sessions", "--json"]),
@@ -387,6 +390,9 @@ async fn dispatch(args: &[String]) -> ExitCode {
         // door (bare `haider` on a TTY enters the live TUI instead).
         [command] if command == "--ready" => front_door(FrontDoor::Report).await,
         [command, rest @ ..] if command == "run" => run::run_command(rest).await,
+        [command, rest @ ..] if command == "agent" || command == "workflow" => {
+            agent::command(command, rest).await
+        }
         [command, rest @ ..] if command == "status" => observe::status_command(rest).await,
         [command, subcommand, rest @ ..] if command == "sessions" && subcommand == "wait-ready" => {
             automation::sessions_wait_ready_command(rest).await
@@ -503,6 +509,7 @@ async fn dispatch(args: &[String]) -> ExitCode {
                  models [--json] [--refresh [<alias>]], \
                  fleet [<session-id>] [--json] [--no-spawn], \
                  events [--follow] [--no-spawn], \
+                 agent spawn|list|message|cancel|wait (agent --help), workflow run|status|list (workflow --help), \
                  graph status <session-id> [--json], graph pin <session-id>, \
                  graph abandon <session-id> [why], \
                  export <session-id> [--format markdown|json|codex|claude-code|opencode|pipe] [--out PATH] [--masked] [--confirm], \

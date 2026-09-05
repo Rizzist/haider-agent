@@ -223,6 +223,7 @@ pub enum LiveCommand {
     /// W-INP: watch the latest volatile composer for one session.
     SurfaceWatch {
         session: SessionId,
+        epoch: u64,
     },
     /// Foreground resident-TUI binding. This is the typed replacement channel
     /// for clients that currently scrape OSC 7791; the OSC emission remains
@@ -971,7 +972,10 @@ impl LiveDriver {
                 .entry(session.clone())
                 .or_default();
             state.adopting = true;
-            return vec![LiveCommand::SurfaceWatch { session }];
+            return vec![LiveCommand::SurfaceWatch {
+                session,
+                epoch: self.connection_epoch,
+            }];
         }
 
         let text = model.composer.text();
@@ -1013,9 +1017,22 @@ impl LiveDriver {
         model: &mut AppModel,
         session: SessionId,
         input: Option<haider_rpc::SurfaceInputWire>,
+        caller_owner: Option<String>,
+        epoch: u64,
     ) {
-        if self.input_mirror.binding.as_ref() != Some(&session) {
+        if epoch != self.connection_epoch
+            || self.input_mirror.epoch != epoch
+            || self.input_mirror.binding.as_ref() != Some(&session)
+        {
             return;
+        }
+        // The existing adoption barrier prevents any local publication until
+        // this ack applies. Learn the actual caller before releasing it; an
+        // asynchronously delivered old echo can then never become a foreign
+        // replacement merely because another key was typed in the meantime.
+        if let Some(owner) = caller_owner {
+            self.input_mirror.self_owner = Some(owner);
+            self.input_mirror.owner_is_authoritative = true;
         }
         let state = self
             .input_mirror
@@ -1061,17 +1078,16 @@ impl LiveDriver {
             .sessions
             .entry(session.clone())
             .or_default();
-        // Self-echo (P1-1): the daemon broadcasts every accepted publish to
-        // ALL watchers, publisher included, stamping the publisher's
-        // connection id as `owner`. Our own accepted publish arriving back —
-        // revision AND text both matching — names us; that learned identity
-        // is the discriminator, never cross-lane revision comparison.
+        // Modern watch acks authoritatively name our owner before publishing.
+        // Preserve the old revision+text inference only for owner-less legacy
+        // daemons; a modern foreign collision must never rename our identity.
         let attachments = if model.daemon_serves(haider_rpc::FEATURE_INPUT_MIRROR_ATTACHMENTS_V1) {
             input.attachments.clone()
         } else {
             Vec::new()
         };
-        if state.last_published_revision == Some(input.revision)
+        if !self.input_mirror.owner_is_authoritative
+            && state.last_published_revision == Some(input.revision)
             && state.published.as_ref().is_some_and(|published| {
                 published.text == input.text && published.attachments == attachments
             })
@@ -1228,6 +1244,8 @@ pub enum LiveReply {
     SurfaceWatching {
         session: SessionId,
         input: Option<haider_rpc::SurfaceInputWire>,
+        caller_owner: Option<String>,
+        epoch: u64,
     },
     /// A watched session's latest volatile input snapshot changed.
     SurfaceInput {
@@ -2077,12 +2095,13 @@ struct InputMirrorState {
     epoch: u64,
     binding: Option<SessionId>,
     publish_revision: u64,
-    /// Learned own daemon connection identity. The daemon mints connection
-    /// ids and never sends ours (Welcome carries none), so the only honest
-    /// self-discriminator is our own publish echoed back: a frame matching
-    /// our last accepted publish — revision AND text — names us. Re-learned
-    /// on every match; reset with the connection epoch.
+    /// Own daemon connection identity from the watch-adoption ack. Owner-less
+    /// older daemons retain exact-echo inference as compatibility behavior.
+    /// Identity and its authority flag reset with the connection epoch.
     self_owner: Option<String>,
+    /// Modern watch acks name the actual caller before local publishing.
+    /// Only owner-less legacy acks use the former exact-echo inference.
+    owner_is_authoritative: bool,
     sessions: HashMap<SessionId, InputMirrorSession>,
 }
 
@@ -2763,8 +2782,13 @@ impl LiveDriver {
     #[allow(clippy::too_many_lines)]
     pub fn apply(&mut self, model: &mut AppModel, reply: LiveReply) -> Vec<LiveCommand> {
         match reply {
-            LiveReply::SurfaceWatching { session, input } => {
-                self.surface_watching(model, session, input);
+            LiveReply::SurfaceWatching {
+                session,
+                input,
+                caller_owner,
+                epoch,
+            } => {
+                self.surface_watching(model, session, input, caller_owner, epoch);
                 Vec::new()
             }
             LiveReply::SurfaceInput { session, input } => {

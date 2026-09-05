@@ -1,0 +1,512 @@
+   Compiling rmp-serde v1.3.1
+   Compiling reqwest v0.13.4
+   Compiling haider-protocol v0.0.969 ($WORKTREE/crates/haider-protocol)
+   Compiling haider-accounts v0.0.969 ($WORKTREE/crates/haider-accounts)
+   Compiling haider-provider v0.0.969 ($WORKTREE/crates/haider-provider)
+    Finished `test` profile [unoptimized] target(s) in 19.21s
+     Running unittests src/lib.rs ($AGENTCLI_TARGET/debug/deps/haider_provider-0f2893f32402f7cb)
+
+running 264 tests
+test acp_tests::a_flat_model_select_option_publishes_the_session_catalog ... ok
+test acp_tests::a_grouped_model_select_option_is_flattened_in_wire_order ... ok
+test acp_tests::a_request_cancelled_rpc_error_is_a_cancellation_outcome_not_a_failure ... ok
+test acp_tests::a_config_option_update_refreshes_the_cached_catalog ... ok
+test acp_tests::an_unknown_session_update_variant_decodes_to_the_catch_all ... ok
+test acp_tests::a_terminal_typed_oauth_personal_method_is_never_passed_to_authenticate ... ok
+test acp_tests::auth_method_without_a_type_field_defaults_to_agent_and_is_selectable ... ok
+test acp_tests::authenticate_refuses_when_oauth_personal_is_not_advertised_and_names_advertised_ids ... ok
+test acp_tests::capabilities_declare_agent_owned_tools_and_visible_thinking ... ok
+test acp_tests::child_environment_strips_ambient_google_credentials_and_contains_exactly_the_expected_keys ... ok
+test acp_tests::cancellation_answers_pending_permission_requests_and_ends_with_one_terminal ... ok
+test acp_tests::agent_executed_tool_calls_surface_as_server_tool_events_never_local_tool_calls ... ok
+test acp_tests::every_stop_reason_maps_to_one_finish_reason ... ok
+test acp_tests::framer_reassembles_one_message_split_across_reads ... ok
+test acp_tests::framer_rejects_an_over_long_line_without_unbounded_buffering ... ok
+test acp_tests::framer_reports_malformed_json_as_a_recoverable_error_without_frame_content ... ok
+test acp_tests::framer_skips_empty_and_whitespace_only_lines ... ok
+test acp_tests::framer_yields_every_message_coalesced_in_one_read ... ok
+test acp_tests::outbound_frames_are_one_line_and_never_contain_an_embedded_newline ... ok
+test acp_tests::child_stdout_closing_mid_turn_produces_exactly_one_terminal_error ... ok
+test acp_tests::no_model_selector_means_no_catalog_and_modes_are_never_models ... ok
+test acp_tests::protocol_version_mismatch_is_refused_with_a_typed_error ... ok
+test acp_tests::happy_path_turn_streams_text_and_reasoning_then_one_finish ... ok
+test acp_tests::pending_request_bound_is_refused_with_a_typed_error ... ok
+test acp_tests::selecting_a_model_without_a_selector_is_refused_rather_than_faked ... ok
+test acp_tests::selecting_the_model_already_in_force_writes_no_frame ... ok
+test acp_tests::selecting_a_non_current_model_writes_set_config_option_with_the_string_variant ... ok
+test acp_tests::the_default_handler_refuses_every_filesystem_and_terminal_request ... ok
+test acp_tests::the_model_category_wins_over_an_option_merely_named_model ... ok
+test acp_tests::the_provider_name_is_a_builtin_provider ... ok
+test acp_tests::the_model_id_is_the_fallback_when_no_category_is_published ... ok
+test acp_tests::the_stderr_tail_never_retains_an_oauth_url ... ok
+test acp_tests::unknown_and_duplicate_response_ids_do_not_corrupt_the_pending_map ... ok
+test acp_tests::the_stderr_ring_bounds_a_child_that_never_emits_a_newline ... ok
+test acp_tests::unknown_fields_categories_and_option_types_never_fail_the_catalog ... ok
+test acp_tests::usage_update_does_not_produce_a_billing_usage_event ... ok
+test acp_tests::unknown_session_update_variant_and_unknown_fields_are_ignored ... ok
+test anthropic::oauth_cache_tests::oauth_real_model_uses_one_hour_cache_betas_without_changing_api_key ... ok
+test anthropic_tests::anthropic_error_body_read_is_bounded_to_64kib ... ok
+test anthropic_tests::anthropic_native_computer_model_table_is_documented_and_fail_closed ... ok
+test acp_tests::spawned_child_round_trips_initialize_and_is_reaped_without_an_orphan ... ok
+test anthropic_tests::anthropic_oauth_subscription_is_bearer_beta_without_api_key_and_fixed_origin ... ok
+test anthropic_tests::anthropic_request_has_locked_correlation_headers_without_body_mutation ... ok
+test anthropic_tests::api_key_payload_keeps_plain_system_and_matches_oauth_outside_system ... ok
+test anthropic_tests::api_key_system_only_marker_preserves_legacy_diagnostic_shape_semantics ... ok
+test anthropic_tests::cm1a_anthropic_separate_read_write_decode ... ok
+test anthropic_tests::cm2a_anthropic_final_wire_system_and_tool_digests_are_stable ... ok
+test anthropic_tests::anthropic_credential_client_ignores_inherited_proxy_environment ... ok
+test anthropic_tests::cm2c_anthropic_cache_ttl_requires_long_gap_and_two_reads ... ok
+test anthropic_tests::cm2b_anthropic_four_breakpoints_oauth_identity_first_golden ... ok
+test anthropic_tests::cm2g_anthropic_annotations_do_not_change_model_visible_content ... ok
+test anthropic_tests::cm2f_unverified_anthropic_oauth_is_byte_exact_full_history ... ok
+test anthropic_tests::cm2g_anthropic_api_key_system_text_and_signed_opaque_are_unchanged ... ok
+test anthropic_tests::custom_anthropic_keyed_and_no_auth_headers_are_exact ... ok
+test anthropic_tests::effort_rides_output_config_and_never_thinking_or_sampling_params ... ok
+test anthropic_tests::completed_anthropic_5xx_with_reset_body_keeps_http_status_not_network_class ... ok
+test anthropic_tests::fast_mode_sets_speed_body_and_comma_joined_beta_header ... ok
+test anthropic_tests::lb1_bedrock_mantle_golden_url_headers_body_and_sse ... ok
+test anthropic_tests::lb2_new_endpoint_refuses_non_mantle_url_shapes ... ok
+test anthropic_tests::lv1_vertex_golden_model_in_url_version_in_body_bearer_header ... ok
+test anthropic_tests::native_computer_action_translation_covers_supported_anthropic_vocabulary ... ok
+test anthropic_tests::native_computer_advertisement_uses_latest_admitted_screenshot_and_replays_actions ... ok
+test anthropic_tests::native_computer_beta_composes_with_fast_and_oauth_headers ... ok
+test anthropic_tests::native_computer_beta_is_sent_on_bedrock_and_vertex_only_when_advertised ... ok
+test anthropic_tests::native_computer_initial_size_is_xga_and_generic_fallback_is_unchanged ... ok
+test anthropic_tests::native_computer_sse_translates_action_envelope_before_dispatch ... ok
+test anthropic_tests::oauth_payload_opens_system_with_claude_code_identity_block ... ok
+test acp_tests::stderr_flood_does_not_block_stdout_progress_and_the_retained_tail_is_bounded ... ok
+test anthropic_tests::single_render_cas_digests_match_legacy_whole_fragment_serialization ... ok
+test anthropic_tests::hanging_mid_turn_fixture_times_out_only_the_idle_chunk_await ... ok
+test anthropic_tests::tool_schemas_drop_top_level_combinators_for_both_auth_modes ... ok
+test anthropic_tests::usage_lane_dimensions_are_adapter_owned_and_api_keys_omit_speed ... ok
+test anthropic_tests::user_command_record_reaches_anthropic_as_labeled_user_text ... ok
+test anthropic_tests::vertex_base_url_shape_is_pinned_global_or_matching_regional ... ok
+test cache::tests::absent_telemetry_never_becomes_a_measured_zero ... ok
+test cache::tests::documented_minimums_are_provider_and_model_specific ... ok
+test cache::tests::positive_provider_telemetry_proves_a_hit_without_a_known_minimum ... ok
+test cache::tests::present_zero_at_minimum_is_a_miss_but_shorter_is_below_minimum ... ok
+test cache::tests::undocumented_provider_or_model_minimum_stays_unknown ... ok
+test cache::tests::zero_with_unknown_minimum_stays_unavailable ... ok
+test cachemaxxing::planner::tests::anthropic_uses_four_slots_without_entering_live_zone ... ok
+test cachemaxxing::planner::tests::below_minimum_and_unverified_openai_models_receive_no_markers ... ok
+test cachemaxxing::planner::tests::deepseek_is_automatic_and_never_receives_markers ... ok
+test cachemaxxing::planner::tests::tool_call_and_result_are_an_atomic_boundary ... ok
+test cachemaxxing::planner::tests::tool_schema_cache_abi_has_golden_bytes ... ok
+test cachemaxxing::provider_view::tests::append_only_growth_and_declared_header_change_are_allowed ... ok
+test cachemaxxing::provider_view::tests::same_epoch_middle_mutation_fails_closed ... ok
+test cachemaxxing::telemetry::tests::incomplete_provider_telemetry_is_not_a_zero ... ok
+test cachemaxxing::telemetry::tests::lifecycle_writes_and_reads_stay_in_the_denominator ... ok
+test catalog_tests::catalog_auth_mode_is_source_specific_and_existing_sources_are_identical ... ok
+test catalog_tests::catalog_without_a_credential_keeps_auth_headers_absent ... ok
+test catalog_tests::custom_anthropic_discovery_uses_standard_keyed_models_get ... ok
+test catalog_tests::custom_catalog_discovery_uses_its_injected_resolver_for_the_request ... ok
+test catalog_tests::custom_catalog_reports_unauthorized_invalid_body_and_empty_list ... ok
+test catalog_tests::customprov_catalog_fixture_success_preserves_order_and_advertised_default ... ok
+test catalog_tests::customprov_catalog_fixture_unreachable_and_404_are_actionable ... ok
+test catalog_tests::customprov_catalog_reflected_key_never_becomes_a_model_id ... ok
+test catalog_tests::customprov_catalog_rejects_control_obfuscated_key_ids ... ok
+test catalog_tests::grok_oauth_catalog_parses_proxy_model_metadata ... ok
+test catalog_tests::haider_code_catalog_source_builds_fixed_bearer_models_get ... ok
+test catalog_tests::invalid_gemini_catalog_header_is_sanitized ... ok
+test catalog_tests::unpinned_compatible_catalog_still_discovers ... ok
+test catalog_tests::wh3_deepseek_catalog_source_builds_fixed_models_get ... ok
+test e2_contract_tests::absolute_deadline_fires_while_blame_clocks_are_paused ... ok
+test e2_contract_tests::body_metadata_mirror_is_explicit_and_keeps_default_body_unchanged ... ok
+test e2_contract_tests::builtin_provider_roster_appends_google_antigravity_without_moving_a_name ... ok
+test e2_contract_tests::builtin_provider_roster_includes_both_xai_lanes ... ok
+test e2_contract_tests::e2a_provider_429_presentation_carries_retry_metadata_and_safe_explanation ... ok
+test e2_contract_tests::e2b_every_provider_error_kind_has_expected_presentation ... ok
+test e2_contract_tests::explicit_prewarm_uses_a_warmup_wire_identity ... ok
+test e2_contract_tests::haider_code_plan_pricing_is_separate_from_token_rates ... ok
+test e2_contract_tests::heartbeat_bytes_cannot_keep_a_semantically_dead_stream_alive ... ok
+test e2_contract_tests::local_endpoints_never_trust_default_route_absence ... ok
+test e2_contract_tests::loopback_connection_refusal_without_negative_route_is_transport ... ok
+test e2_contract_tests::periodic_semantic_chunks_can_outlive_a_naive_total_timeout ... ok
+test e2_contract_tests::provider_request_identity_has_locked_shape_and_rejects_ambiguous_coordinates ... ok
+test e2_contract_tests::streaming_tool_digest_matches_legacy_canonical_dom_bytes ... ok
+test e2_contract_tests::turn_trace_transaction_ordinal_is_shared_by_batch_identity ... ok
+test e2_contract_tests::user_command_json_fields_cannot_forge_the_record_boundary ... ok
+test effort_tests::anthropic_effort_clamp_falls_down_the_documented_ladder ... ok
+test effort_tests::anthropic_fast_gate_is_opus5_and_opus48_only ... ok
+test effort_tests::anthropic_static_ladders_match_the_documented_families ... ok
+test effort_tests::gemini_static_ladders_are_name_gated_to_3x ... ok
+test effort_tests::le_enterprise_model_names_resolve_their_family_rows ... ok
+test gemini_tests::cache_diagnostic_gemini_hashes_current_wire_through_previous_history_length ... ok
+test gemini_tests::cm1b_cm1c_gemini_subset_and_missing_cache_telemetry ... ok
+test gemini_tests::cm2e_gemini_cached_content_create_reuse_and_delete_superseded ... ok
+test gemini_tests::cm2e_gemini_expired_resource_is_deleted_and_recreated ... ok
+test gemini_tests::cm2e_gemini_refreshes_when_cached_coverage_falls_below_eighty_percent ... ok
+test gemini_tests::cm2e_gemini_switch_away_deletes_session_resource ... ok
+test gemini_tests::cm2f_unknown_gemini_model_is_byte_exact_implicit_cache_fallback ... ok
+test gemini_tests::cm2g_gemini_cached_prefix_plus_suffix_equals_full_model_input ... ok
+test gemini_tests::cm2g_gemini_cached_prefix_preserves_signed_parts_byte_exact ... ok
+test gemini_tests::constructor_transport_config_disables_retries_and_pins_all_timeouts ... ok
+test gemini_tests::gemini_credential_client_ignores_inherited_proxy_environment ... ok
+test gemini_tests::gemini_explicit_cache_gate_uses_documented_model_minimums ... ok
+test gemini_tests::gemini_request_has_locked_correlation_headers_without_body_mutation ... ok
+test gemini_tests::hanging_mid_turn_fixture_times_out_only_the_idle_chunk_await ... ok
+test anthropic_tests::single_render_prepare_peaks_at_one_transient_prompt_view ... ok
+test gemini_tests::private_or_special_dns_answers_fail_before_api_key_request_building ... ok
+test gemini_tests::retry_info_protobuf_durations_are_millisecond_exact_and_bounded ... ok
+test gemini_tests::synthesized_call_ids_are_deterministic_and_accept_a_history_offset ... ok
+test gemini_tests::user_command_record_reaches_gemini_as_labeled_user_text ... ok
+test gemini_tests::x_goog_api_key_is_sensitive_and_request_consumes_fixed_origin_guard ... ok
+test oauth_identity::tests::every_registered_oauth_provider_has_an_explicit_identity_source ... ok
+test oauth_identity::tests::oauth_token_debug_reports_presence_only ... ok
+test oauth_identity::tests::openai_nested_claims_are_informational_and_unverified ... ok
+test oauth_identity::tests::public_claim_fields_are_control_stripped_and_bounded ... ok
+test openai::tests::alpha_search_request_body_is_golden ... ok
+test openai::tests::api_key_payload_keeps_max_output_tokens_and_no_lite_fields ... ok
+test openai::tests::assistant_history_replays_as_output_text ... ok
+test openai::tests::azure_origin_predicate_and_constructor_agree_both_directions ... ok
+test openai::tests::cache_diagnostic_openai_hashes_current_wire_through_previous_history_length ... ok
+test openai::tests::changed_effort_provider_view_and_prompt_cache_keys_differ ... ok
+test openai::tests::changed_fast_mode_provider_view_and_prompt_cache_keys_differ ... ok
+test openai::tests::changed_max_tokens_provider_view_and_prompt_cache_keys_differ ... ok
+test openai::tests::changed_model_provider_view_and_prompt_cache_keys_differ ... ok
+test openai::tests::changed_request_header_provider_view_and_prompt_cache_keys_differ ... ok
+test openai::tests::changed_system_policy_provider_view_and_prompt_cache_keys_differ ... ok
+test openai::tests::cm1b_cm1c_cm1d_openai_subset_availability_and_malformed_laws ... ok
+test openai::tests::cm1b_kimi_top_level_cached_tokens_are_shape_driven ... ok
+test openai::tests::cm2d_gpt56_uses_explicit_breakpoints_before_the_volatile_suffix ... ok
+test openai::tests::cm2d_openai_prompt_cache_key_is_stable_and_domain_sensitive ... ok
+test openai::tests::cm2f_openai_lite_moves_instructions_to_input_and_omits_https_retention ... ok
+test openai::tests::cm2f_openai_oauth_omits_https_retention_and_is_separate_from_api_key ... ok
+test openai::tests::cm2f_unknown_compatible_endpoint_is_byte_exact_without_annotations ... ok
+test openai::tests::cm2g_kimi_cache_key_preserves_thinking_tools_and_arguments ... ok
+test openai::tests::cm2g_openai_cache_keys_do_not_change_model_visible_content ... ok
+test openai::tests::codex_lite_payload_meets_the_subscription_contract ... ok
+test openai::tests::compatible_credential_client_ignores_inherited_proxy_environment ... ok
+test openai::tests::configured_endpoint_probe_rejects_redirects ... ok
+test openai::tests::configured_endpoint_probe_rejects_remote_plain_http_with_guard_vocabulary ... ok
+test openai::tests::custom_no_auth_get_and_post_have_no_credential_headers ... ok
+test openai::tests::custom_openai_compatible_uses_v4_prompt_cache_cohort ... ok
+test openai::tests::different_account_provider_view_and_prompt_cache_keys_differ ... ok
+test openai::tests::direct_deepseek_does_not_fall_back_to_openai_cache_details ... ok
+test openai::tests::dropping_openai_stream_aborts_its_hanging_source ... ok
+test openai::tests::e1e_invalid_endpoint_is_permanent_connection_configuration ... ok
+test openai::tests::effective_request_budget_obeys_provider_and_run_deadlines ... ok
+test openai::tests::effort_merges_into_reasoning_preserving_the_lite_contract ... ok
+test openai::tests::exact_fork_provider_view_and_prompt_cache_keys_are_equal ... ok
+test openai::tests::exhausted_run_deadline_is_an_immediate_terminal_provider_timeout ... ok
+test openai::tests::generic_compatible_keeps_absent_cache_telemetry_absent ... ok
+test openai::tests::generic_compatible_reads_deepseek_hit_and_miss_usage ... ok
+test openai::tests::generic_compatible_reads_nested_openai_cache_usage ... ok
+test openai::tests::grok_oauth_402_and_426_are_actionable_version_gate_errors ... ok
+test openai::tests::grok_oauth_proxy_request_pins_complete_header_contract ... ok
+test openai::tests::haider953_openai_lite_cache_breakpoint_is_explicitly_gated ... ok
+test openai::tests::haider_code_openai_usage_is_normalized ... ok
+test openai::tests::haider_code_reads_recorded_deepseek_cache_usage ... ok
+test openai::tests::haider_code_request_uses_fixed_chat_completions_bearer_and_model ... ok
+test openai::tests::haider_code_without_a_recognized_cache_shape_is_unavailable ... ok
+test openai::tests::hanging_openai_fixture_times_out_only_the_idle_chunk_await ... ok
+test openai::tests::hosted_web_search_declares_on_api_key_and_never_on_lite ... ok
+test openai::tests::hostile_probe_and_http_error_body_sources_are_bounded ... ok
+test openai::tests::hostname_resolution_rejects_every_forbidden_answer_before_bearer_construction ... ok
+test openai::tests::ipv6_literal_compatible_base_url_is_classified_as_a_literal_not_a_hostname ... ok
+test openai::tests::kimi_capabilities_are_derived_only_from_catalog_flags ... ok
+test openai::tests::kimi_fixed_origin_allows_exact_chat_and_models_endpoints ... ok
+test openai::tests::kimi_reads_recorded_openai_nested_cache_usage ... ok
+test openai::tests::kimi_reasoning_effort_is_top_level_and_kimi_only ... ok
+test openai::tests::kimi_requests_use_bearer_and_max_completion_tokens ... ok
+test gemini_tests::prepared_gemini_wire_bytes_match_legacy_final_render ... ok
+test openai::tests::lk3_custom_lan_hostname_resolution_matrix_pins_both_directions ... ok
+test openai::tests::lz1_azure_request_rides_api_key_header_and_deployment_model ... ok
+test openai::tests::m5_classifier_blocks_added_special_use_ranges_both_directions ... ok
+test openai::tests::malformed_kimi_top_level_cache_usage_does_not_fall_back ... ok
+test openai::tests::metadata_origin_guard_prevents_credential_bearing_request ... ok
+test openai::tests::native_computer_action_translation_covers_the_supported_openai_vocabulary ... ok
+test openai::tests::native_computer_call_decodes_preview_and_ga_batches_to_singular_actions ... ok
+test openai::tests::native_computer_negotiation_pins_preview_ga_generic_and_lite_shapes ... ok
+test openai::tests::native_computer_result_shaping_does_not_hide_denied_or_failed_actions ... ok
+test openai::tests::native_computer_results_group_under_provider_call_and_preserve_contract ... ok
+test openai::tests::native_openai_declares_opt_in_metadata_support_but_compatibles_do_not ... ok
+test openai::tests::native_openai_request_has_locked_correlation_headers_without_body_mutation ... ok
+test openai::tests::non_reconciling_deepseek_cache_usage_is_unavailable_for_direct_and_proxy ... ok
+test openai::tests::one_prefix_byte_change_provider_view_key_differs ... ok
+test openai::tests::openai_http_errors_preserve_safe_provider_explanations ... ok
+test openai::tests::openai_oauth_subscription_is_codex_bearer_lite_and_fixed_origin ... ok
+test openai::tests::openai_prompt_cache_key_is_omitted_without_account_scope ... ok
+test openai::tests::openai_prompt_cache_key_is_stable_across_turns_in_one_session ... ok
+test openai::tests::openai_prompt_cache_key_isolates_sessions_and_shares_only_an_inherited_fork_root ... ok
+test openai::tests::openai_rendered_prefix_bytes_are_stable_across_turns ... ok
+test openai::tests::openai_silent_phase_default_contract_is_deliberate_ordered_and_bounded ... ok
+test openai::tests::openai_stream_errors_preserve_enveloped_and_raw_explanations ... ok
+test openai::tests::partial_deepseek_cache_usage_is_unavailable_for_direct_and_proxy ... ok
+test openai::tests::pinned_compatible_capabilities_do_not_discover_models ... ok
+test openai::tests::pinned_subscription_capabilities_use_cached_catalog_without_discovery ... ok
+test openai::tests::plain_http_hostname_requires_every_resolved_address_to_be_loopback ... ok
+test openai::tests::prepared_openai_and_compatible_wire_bytes_match_legacy_final_render ... ok
+test openai::tests::prepared_openai_cache_control_uses_the_provider_view_header_epoch ... ok
+test openai::tests::prompt_cache_key_is_omitted_when_cache_epoch_is_uncertain ... ok
+test openai::tests::prompt_cache_key_is_omitted_when_max_tokens_is_uncertain ... ok
+test openai::tests::response_open_budget_accepts_a_mock_upstream_that_opens_at_twenty_seconds ... ok
+test openai::tests::response_open_budget_fails_typed_after_sixty_one_seconds ... ok
+test openai::tests::retry_requires_one_complete_provider_budget_after_the_margin ... ok
+test openai::tests::routed_adapters_finalize_their_rendered_system_base_into_the_cohort ... ok
+test openai::tests::shared_provider_builder_pins_idle_h2_and_tcp_keep_alive ... ok
+test openai::tests::shorter_silent_phase_overrides_are_honored_for_every_openai_clock ... ok
+test openai::tests::unrelated_session_prompt_cache_key_differs_despite_equal_provider_view ... ok
+test openai::tests::user_command_record_reaches_both_openai_wires_as_labeled_user_text ... ok
+test openai::tests::validated_hostname_addresses_are_pinned_through_connection_establishment ... ok
+test openai::tests::wh2_deepseek_request_golden_uses_chat_completions_bearer_and_model ... ok
+test openai::tests::wh4_deepseek_cache_usage_maps_hit_and_miss_tokens ... ok
+test openai::tests::wh5_deepseek_reasoning_content_surfaces_as_reasoning ... ok
+test openai::tests::xai_cached_prompt_details_map_to_normalized_usage ... ok
+test openai::tests::xai_inference_uses_stable_opaque_cohort_cache_route ... ok
+test pricing::xai_tests::xai_base_tier_pricing_pins_all_seed_models ... ok
+test pricing::xai_tests::xai_cache_policy_is_api_lane_only ... ok
+test usage::grok_billing_tests::grok_billing_parses_credits_legacy_and_omission_shapes ... ok
+test usage::grok_billing_tests::grok_meter_endpoint_pins_identity_url_and_floor ... ok
+test webfetch::retry_tests::client_reuse_key_changes_when_the_dns_pin_policy_changes ... ok
+test webfetch::retry_tests::idempotent_web_fetch_transient_failure_retries_exactly_once ... ok
+test webfetch::retry_tests::scoped_fetch_refuses_hosts_outside_the_grant ... ok
+test webfetch::retry_tests::unchanged_refetch_sends_both_validators_and_reuses_the_304_body ... ok
+test webfetch_tests::entity_decode_does_not_panic_on_multibyte_boundary ... ok
+test openai::tests::large_compatible_reply_uses_segmented_cas_and_exact_final_wire ... ok
+test webfetch_tests::html_reduction_drops_script_style_nav_and_keeps_readable_structure ... ok
+test webfetch_tests::origin_matrix_allows_public_and_refuses_hostile_targets_both_directions ... ok
+test webfetch_tests::public_chain_refuses_a_downgrade_redirect_to_non_public ... ok
+test wire::cache_usage_tests::explicit_zero_cache_counters_stay_present_while_absent_stays_absent ... ok
+test webfetch_tests::html_reducer_is_bounded_on_adversarial_nested_drop_tags ... ok
+test anthropic_tests::cache_diagnostic_provider_prepare_added_cpu_cost_is_measured ... ok
+test anthropic_tests::prepared_anthropic_wire_bytes_match_legacy_final_render ... ok
+
+test result: ok. 264 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.89s
+
+     Running tests/anthropic_live_tests.rs ($AGENTCLI_TARGET/debug/deps/anthropic_live_tests-636fce8d4f0e12ea)
+
+running 5 tests
+test live_anthropic_second_turn_reads_cached_prompt_prefix ... ignored, live Anthropic cache assertion; requires HAIDER_LIVE_PROVIDER_TESTS=1
+test live_anthropic_text_smoke_is_explicitly_gated ... ignored, live Anthropic smoke; requires HAIDER_LIVE_PROVIDER_TESTS=1
+test promote_sanitized_real_anthropic_captures ... ignored, promotes fixtures; requires both live and explicit promotion gates
+test small_capture_cannot_pass_the_usage_heavy_gate ... ok
+test text_capture_cannot_pass_the_image_gate ... ok
+
+test result: ok. 2 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/anthropic_provider_tests.rs ($AGENTCLI_TARGET/debug/deps/anthropic_provider_tests-b44d84aacdcb051c)
+
+running 24 tests
+test constructor_transport_config_disables_retries_and_bounds_connects_and_chunk_idle ... ok
+test e1c_anthropic_billing_exhaustion_is_non_retryable_quota ... ok
+test explicit_hosted_web_tool_rejection_has_the_one_shot_fallback_discriminator ... ok
+test event_name_and_data_type_mismatch_is_malformed ... ok
+test http_auth_permission_overload_and_server_failures_are_classified ... ok
+test context_exceeded_http_and_sse_fixtures_are_distinct_from_max_tokens ... ok
+test missing_image_data_is_a_typed_invalid_request ... ok
+test image_bearing_tool_result_uses_native_nested_content_or_named_placeholder ... ok
+test capability_table_is_model_specific_and_conservative_for_unknown_ids ... ok
+test provider_catalog_declares_the_pdf_capability_split ... ok
+test pause_turn_stop_reason_normalizes_to_a_continuation_finish ... ok
+test provider_catalog_declares_the_vision_capability_split ... ok
+test provider_debug_never_exposes_resolved_secret ... ok
+test request_payload_maps_system_tools_tool_results_and_a2_images ... ok
+test search_error_object_and_success_list_decode_tolerantly ... ok
+test server_tool_blocks_and_cited_text_are_captured_verbatim_for_replay ... ok
+test server_tool_facts_replay_verbatim_and_cited_text_dedups_normalized_history ... ok
+test thinking_facts_replay_verbatim_in_order_and_normalized_reasoning_stays_rejected ... ok
+test signed_thinking_and_redacted_blocks_are_captured_for_replay ... ok
+test thinking_start_content_is_buffered_and_only_deltas_are_emitted ... ok
+test unknown_future_sse_events_are_ignored_without_weakening_known_validation ... ok
+test web_tools_declaration_is_exact_and_absent_without_the_flag ... ok
+test manifest_replays_every_declared_wire_fixture_in_either_promotion_state ... ok
+test native_pdf_enforces_anthropics_complete_request_size_limit ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.93s
+
+     Running tests/catalog_tests.rs ($AGENTCLI_TARGET/debug/deps/catalog_tests-46df59c036504af7)
+
+running 20 tests
+test catalog_parses_models_with_context_windows ... ok
+test anthropic_context_window_is_always_none ... ok
+test anthropic_shape_parses_without_inventing_efforts ... ok
+test absent_codex_context_window_stays_none ... ok
+test codex_declared_context_window_is_preserved ... ok
+test codex_shape_parses_with_its_effort_ladder ... ok
+test deepseek_catalog_golden_preserves_only_discovered_model_facts ... ok
+test endpoints_are_the_vendor_paths ... ok
+test haider_code_catalog_preserves_only_discovered_model_facts ... ok
+test display_name_falls_back_to_the_slug ... ok
+test legacy_catalog_rows_serialize_byte_identically ... ok
+test malformed_openai_compatible_catalog_is_typed_and_not_substituted ... ok
+test malformed_payloads_are_unavailable_not_substituted ... ok
+test custom_catalog_origin_policy_rejects_remote_http_before_fetch ... ok
+test lk3_catalog_backstop_obeys_the_custom_lan_matrix ... ok
+test models_catalog_parses_context_length_and_skips_anthropic_protocol ... ok
+test openai_compatible_ids_are_models_without_invented_metadata ... ok
+test the_openai_models_request_carries_client_version ... ok
+test zero_codex_context_window_is_absent ... ok
+test provider_visibility_and_priority_drive_the_picker ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/fake_provider_tests.rs ($AGENTCLI_TARGET/debug/deps/fake_provider_tests-3869fee995f3d885)
+
+running 7 tests
+test dropping_an_owned_stream_aborts_its_producer ... ok
+test fake_capabilities_are_explicit ... ok
+test request_recording_can_be_disabled_for_process_measurements ... ok
+test malformed_frame_is_a_typed_stream_error ... ok
+test script_segments_are_consumed_one_request_at_a_time ... ok
+test json_fixture_drives_events_and_records_request ... ok
+test split_utf8_is_reassembled_without_replacement_characters ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/gemini_live_tests.rs ($AGENTCLI_TARGET/debug/deps/gemini_live_tests-898676d5df3d86ed)
+
+running 2 tests
+test live_gemini_text_smoke_is_explicitly_gated ... ignored, live Gemini smoke; requires HAIDER_LIVE_PROVIDER_TESTS=1
+test promote_sanitized_real_gemini_captures ... ignored, captures Gemini fixtures; requires live, promotion, and output-dir gates
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/gemini_provider_tests.rs ($AGENTCLI_TARGET/debug/deps/gemini_provider_tests-3e2ae8956646101a)
+
+running 18 tests
+test constructor_policy_and_fixture_eof_are_stable ... ok
+test e1c_gemini_billing_resource_exhausted_is_non_retryable_quota ... ok
+test gemini_plain_text_frames_share_one_incrementally_hashed_arena ... ok
+test gemini_opaque_roundtrips_and_foreign_provider_opaque_is_rejected ... ok
+test effort_injects_thinking_level_for_3x_models_only ... ok
+test capability_backstop_is_native_where_the_api_is_native ... ok
+test http_errors_classify_typed_without_leaking_bodies ... ok
+test gemini_stream_decodes_text_reasoning_toolcall_usage_finish ... ok
+test grounding_metadata_decodes_into_rows_and_sources_tolerantly ... ok
+test missing_or_ambiguous_call_id_to_name_mapping_is_rejected_locally ... ok
+test image_bearing_function_response_appends_inline_data_or_named_placeholder ... ok
+test provider_debug_never_exposes_resolved_secret ... ok
+test request_payload_maps_system_tools_results_and_inline_images ... ok
+test synthesized_call_ids_are_deterministic_and_replay_maps_to_names ... ok
+test sparse_history_call_index_continues_past_the_greatest_not_the_count ... ok
+test web_builtins_declare_on_3x_beside_function_declarations_and_never_on_25 ... ok
+test two_turn_tool_roundtrip_continuation_payload_is_stable ... ok
+test manifest_replays_every_declared_gemini_fixture_in_either_promotion_state ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/openai_live_tests.rs ($AGENTCLI_TARGET/debug/deps/openai_live_tests-d6c8edad766cc8d0)
+
+running 1 test
+test live_openai_responses_text_smoke_is_explicitly_gated ... ignored, live OpenAI smoke; requires HAIDER_LIVE_PROVIDER_TESTS=1
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/openai_provider_tests.rs ($AGENTCLI_TARGET/debug/deps/openai_provider_tests-03165870a671123c)
+
+running 35 tests
+test chat_max_tokens_drops_partial_tool_call_before_actor_sees_it ... ok
+test api_key_request_keeps_top_level_instructions ... ok
+test codex_https_lite_request_keeps_prompt_cache_key ... ok
+test codex_https_lite_request_omits_prompt_cache_retention ... ok
+test codex_https_lite_request_leads_with_developer_instructions ... ok
+test compatible_base_url_and_fake_v1_models_response_produce_a_capability_doc ... ok
+test compatible_payload_uses_chat_completions_lingua_franca ... ok
+test compatible_chat_orders_tool_then_user_image_or_named_placeholder ... ok
+test e1c_openai_insufficient_quota_is_non_retryable_quota_exhausted ... ok
+test context_exceeded_http_fixture_has_a_distinct_non_retryable_kind ... ok
+test compatible_origin_policy_rejects_credential_ssrf_and_accepts_safe_origins ... ok
+test e1e_openai_empty_stream_is_retryable_stream_interruption ... ok
+test hosted_web_search_call_captures_verbatim_and_citations_surface_as_sources ... ok
+test lk4_chat_stream_missing_done_sentinel_completes_on_eof ... ok
+test encrypted_reasoning_continuation_reconstructs_exact_next_responses_input ... ok
+test lk3_custom_origin_matrix_allows_rfc1918_and_keeps_metadata_and_public_http_blocked ... ok
+test compatible_chat_fixture_maps_to_the_same_shared_stream_events ... ok
+test lk5_chat_stream_ignores_sse_comment_ping_lines ... ok
+test lk6_chat_stream_without_usage_still_completes ... ok
+test lk7_chat_tool_calls_without_ids_synthesize_stable_per_index_ids ... ok
+test lk8_chat_finish_stop_with_tool_calls_still_completes_the_calls ... ok
+test lk9_chat_unknown_extra_fields_are_ignored ... ok
+test native_capability_doc_is_model_specific ... ok
+test provider_debug_never_exposes_openai_secrets ... ok
+test openai_http_errors_are_typed_without_leaking_bodies ... ok
+test responses_max_tokens_drops_partial_tool_call_before_actor_sees_it ... ok
+test responses_image_result_is_an_immediately_following_input_image_or_placeholder ... ok
+test responses_payload_carries_daemon_extracted_pdf_as_plain_input_text ... ok
+test native_responses_fixture_maps_to_the_shared_stream_events ... ok
+test responses_payload_uses_native_input_tools_and_reasoning_summary ... ok
+test transport_config_disables_reqwest_retries_and_bounds_stream_waits ... ok
+test unknown_coded_overload_prose_classifies_retryable_overloaded ... ok
+test two_image_results_keep_each_image_message_adjacent_to_its_result ... ok
+test streamed_overloaded_error_is_retryable_overload ... ok
+test manifest_replays_every_declared_openai_fixture_with_provenance ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/prompt_cache_prefix_tests.rs ($AGENTCLI_TARGET/debug/deps/prompt_cache_prefix_tests-660ea314d16f7d84)
+
+running 3 tests
+test anthropic_prefix_detector_reports_early_message_divergence ... ok
+test openai_compatible_append_only_turn_preserves_wire_prefix ... ok
+test anthropic_append_only_turn_preserves_wire_prefix_and_breakpoint_limit ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/smoke_tests.rs ($AGENTCLI_TARGET/debug/deps/smoke_tests-35ad7c817f2c69cd)
+
+running 1 test
+test crate_name_is_stable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/tool_result_image_budget_tests.rs ($AGENTCLI_TARGET/debug/deps/tool_result_image_budget_tests-8c8fea26f97c1f61)
+
+running 3 tests
+test byte_budget_drops_whole_oldest_images_until_both_limits_fit ... ok
+test count_budget_drops_the_oldest_prefix_and_keeps_durable_source_unchanged ... ok
+test same_result_cutoff_and_placeholder_labels_are_hard_bounded ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/usage_collector_tests.rs ($AGENTCLI_TARGET/debug/deps/usage_collector_tests-1cf8a92f776b935b)
+
+running 17 tests
+test anthropic_meter_request_carries_the_required_header_values ... ok
+test cm1_model_registry_prices_gpt56_kimi_deepseek_and_explicit_storage ... ok
+test cm1b_subset_pricing_does_not_double_count_openai_or_gemini_reads ... ok
+test cm1e_anthropic_one_hour_write_premium_is_priced ... ok
+test anthropic_seven_day_only_is_a_valid_meter_reading ... ok
+test anthropic_fraction_fixture_reads_identically_to_the_percent_scale ... ok
+test cm3b_registry_estimates_invalidated_prefix_rewarm_cost ... ok
+test custom_provider_model_slug_collision_stays_unpriced ... ok
+test endpoint_coordinates_headers_and_poll_floors_are_pinned ... ok
+test failures_are_typed_unavailable_never_a_fabricated_reading ... ok
+test normalize_utilization_accepts_both_scales_and_clamps ... ok
+test kimi_fixture_reads_string_counters_and_names_rolling_windows ... ok
+test openai_wham_fixture_yields_primary_secondary_and_named_extra_windows ... ok
+test anthropic_live_fixture_normalizes_percent_scale_and_rfc3339_resets ... ok
+test pricing_estimates_known_families_and_refuses_unknown_models ... ok
+test rfc3339_parser_is_exact_to_the_millisecond_and_total ... ok
+test openai_optional_window_matrix_keeps_every_window_that_exists ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/usage_live_tests.rs ($AGENTCLI_TARGET/debug/deps/usage_live_tests-e972ab4fdbbebe1e)
+
+running 1 test
+test live_anthropic_oauth_meter_parses_and_normalizes ... ignored, live anthropic-oauth usage poll; requires HAIDER_LIVE_USAGE_TESTS=1 + HAIDER_ANTHROPIC_OAUTH_TOKEN
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/webfetch_tests.rs ($AGENTCLI_TARGET/debug/deps/webfetch_tests-7b246f8e86012337)
+
+running 9 tests
+test loopback_fetch_follows_redirects_and_reduces_html ... ok
+test content_types_gate_to_text_and_json_only ... ok
+test redirect_hops_are_revalidated_through_the_origin_fence ... ok
+test redirect_chains_cap_at_five_hops ... ok
+test output_caps_with_an_honest_truncation_marker ... ok
+test truncated_invalid_utf8_response_hashes_original_body_bytes ... ok
+test oversized_source_is_capped_before_reduction_even_when_it_reduces_small ... ok
+test slow_drip_body_is_aborted_by_the_overall_deadline ... ok
+test source_cap_boundary_truncation_is_off_by_one_honest ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+
+   Doc-tests haider_provider
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

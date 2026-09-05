@@ -419,6 +419,7 @@ async fn start_bounded_run(
             text: "exercise bounded upstream retry".into(),
             attachments: Vec::new(),
             spec: HeadlessRunSpecV1 {
+                agent_spawn: None,
                 continuation_of: None,
                 cwd: workspace.to_string_lossy().into_owned(),
                 provider: "upstretry-http".into(),
