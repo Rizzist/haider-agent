@@ -5,6 +5,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 concurrency:
   # Static workflow name avoids sharing the caller's group when release.yml
   # invokes this reusable workflow.
@@ -17,7 +20,24 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
+  evidence:
+    name: exact-SHA cross-platform and CI evidence
+    runs-on: ubuntu-latest
+    # 2 workflows * 120 polls * 60 s = 240 min, plus 5 min setup/API margin.
+    timeout-minutes: 245
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: require completed successful evidence for the caller SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_SHA: ${{ github.sha }}
+        run: bash scripts/release/require-evidence.sh "$EVIDENCE_SHA"
+
   behaviour:
+    needs: evidence
     name: probe ladder (demo + live, CI profile)
     runs-on: macos-15
     steps:
@@ -43,6 +63,7 @@ jobs:
               "$GITHUB_WORKSPACE/target/ci/haiderd"
 
   render-benchmark:
+    needs: evidence
     name: render benchmark (true release profile)
     runs-on: macos-15
     steps:
@@ -63,6 +84,7 @@ jobs:
         run: cargo test --release -p haider-tui --test tuivirt_shape_bench_tests --locked -- --nocapture
 
   daemon-footprint:
+    needs: evidence
     name: daemon footprint budget (release profile)
     runs-on: macos-15
     steps:
@@ -101,6 +123,7 @@ jobs:
           retention-days: 14
 
   client-footprint:
+    needs: evidence
     name: client footprint (settled macOS release)
     # Registry #80: typed run terminality is distinct from aggregate session
     # settlement. TODO(2026-09-02): after three consecutive green runs of this
