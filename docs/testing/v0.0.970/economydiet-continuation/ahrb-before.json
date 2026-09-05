@@ -1,0 +1,29 @@
+{
+  "command": [
+    "env",
+    "PATH=/Users/rizzist/haider-run/lane-970-economydiet/.economydiet-upstream-baseline:/Users/rizzist/.nvm/versions/node/v24.12.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/rizzist/.nvm/versions/node/v24.12.0/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/pkg/env/global/bin:/Library/Apple/usr/bin:/Users/rizzist/.codex/tmp/arg0/codex-arg0o68bCU:/Users/rizzist/.nvm/versions/node/v24.12.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/rizzist/.local/bin:/Users/rizzist/.nvm/versions/node/v24.12.0/bin:/Users/rizzist/.claude/plugins/cache/claude-plugins-official/swift-lsp/1.0.0/bin",
+    "/Users/rizzist/Documents/CODING/harness-bench/target/debug/ahrb",
+    "run",
+    "--pillar",
+    "economy",
+    "--manifest",
+    "/Users/rizzist/Documents/CODING/harness-bench/adapters/haider-agent/manifest.toml",
+    "--profile",
+    "quick",
+    "--output",
+    "/Users/rizzist/haider-run/lane-970-economydiet/docs/testing/v0.0.970/economydiet-continuation/ahrb-before",
+    "--no-save"
+  ],
+  "exit": 0,
+  "duration_seconds": 4.498366117477417,
+  "environment": {
+    "RUST_MIN_STACK": "8388608",
+    "HAIDER_DISCOVERY_DISABLED": "1",
+    "HAIDER_TEST_DEVICE_NAME": "test-mac",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_TARGET_DIR": "/private/tmp/haider-economydiet-target",
+    "CARGO_BUILD_JOBS": "2",
+    "HAIDER_TEST_SIBLINGS_PREBUILT": "1"
+  }
+}

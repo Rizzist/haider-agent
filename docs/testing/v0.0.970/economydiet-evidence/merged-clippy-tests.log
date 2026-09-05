@@ -1,0 +1,183 @@
+    Checking libm v0.2.16
+    Checking log v0.4.33
+    Checking mio v1.2.2
+    Checking tokio v1.53.1
+    Checking num-traits v0.2.19
+    Checking rmp v0.8.15
+    Checking rmp-serde v1.3.1
+    Checking haider-protocol v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-protocol)
+    Checking rustix v1.1.4
+    Checking haider-platform v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-platform)
+    Checking allocator-api2 v0.2.21
+    Checking zerocopy v0.8.55
+    Checking tempfile v3.27.0
+    Checking hashbrown v0.17.1
+    Checking bytemuck v1.25.2
+    Checking zune-core v0.5.3
+    Checking zune-jpeg v0.5.15
+    Checking half v2.7.1
+    Checking quick-error v2.0.1
+    Checking fax v0.2.7
+    Checking tiff v0.11.3
+    Checking moxcms v0.8.1
+    Checking image v0.25.10
+    Checking indexmap v2.14.0
+    Checking hashbrown v0.16.1
+    Checking rustls v0.23.42
+    Checking tokio-util v0.7.19
+    Checking h2 v0.4.15
+    Checking tokio-rustls v0.26.4
+    Checking tower v0.5.3
+    Checking hyper v1.11.0
+    Checking tower-http v0.6.11
+    Checking rustls-platform-verifier v0.7.0
+    Checking hyper-util v0.1.20
+    Checking crossbeam-utils v0.8.22
+    Checking crossbeam-epoch v0.9.20
+    Checking crossbeam-deque v0.8.7
+    Checking haider-accounts v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-accounts)
+    Checking hyper-rustls v0.27.9
+    Checking reqwest v0.13.4
+    Checking haider-rpc v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-rpc)
+    Checking haider-provider v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-provider)
+    Checking ppv-lite86 v0.2.21
+    Checking rand_core v0.9.5
+    Checking lopdf v0.42.0
+    Checking zopfli v0.8.3
+    Checking rand_chacha v0.9.0
+    Checking euclid v0.20.14
+    Checking zip v2.4.2
+    Checking pdf-extract v0.12.0
+    Checking rand v0.9.5
+    Checking coreaudio-sys v0.2.18
+    Checking haider-pdf v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-pdf)
+    Checking webpki-roots v1.0.9
+    Checking sha1 v0.10.7
+    Checking num_threads v0.1.7
+    Checking bitflags v1.3.2
+    Checking utf-8 v0.7.6
+    Checking time v0.3.54
+    Checking tungstenite v0.26.2
+    Checking coreaudio-rs v0.11.3
+    Checking webpki-roots v0.26.11
+    Checking mach2 v0.4.3
+    Checking dasp_sample v0.11.0
+    Checking cpal v0.15.3
+    Checking tokio-tungstenite v0.26.2
+    Checking haider-client v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-client)
+    Checking getrandom v0.2.17
+    Checking either v1.17.0
+    Checking haider-stt v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-stt)
+    Checking scopeguard v1.2.0
+    Checking lock_api v0.4.14
+    Checking signal-hook v0.3.18
+    Checking parking_lot_core v0.9.12
+    Checking itertools v0.14.0
+    Checking castaway v0.2.4
+    Checking unicode-width v0.2.2
+    Checking static_assertions v1.1.0
+    Checking ryu v1.0.23
+    Checking unicode-segmentation v1.13.3
+    Checking compact_str v0.9.1
+    Checking unicode-truncate v2.0.1
+    Checking parking_lot v0.12.5
+    Checking signal-hook-mio v0.2.5
+    Checking strum v0.28.0
+    Checking kasuari v0.4.12
+    Checking lru v0.18.1
+    Checking critical-section v1.2.0
+    Checking objc2-encode v4.1.0
+    Checking ratatui-core v0.1.2
+    Checking objc2 v0.6.4
+    Checking tap v1.0.1
+    Checking wyz v0.5.1
+    Checking derive_more v2.1.1
+    Checking objc2-core-foundation v0.3.2
+    Checking radium v0.7.0
+    Checking rayon-core v1.13.0
+    Checking safe_arch v0.9.3
+    Checking line-clipping v0.3.7
+    Checking funty v2.0.0
+    Checking predicates-core v1.0.10
+    Checking fast-srgb8 v1.0.0
+    Checking palette v0.7.6
+    Checking bitvec v1.1.1
+    Checking ref-cast v1.0.26
+    Checking ratatui-widgets v0.3.2
+    Checking wide v0.8.3
+    Checking rayon v1.12.0
+    Checking crossterm v0.29.0
+    Checking rustix v0.38.44
+    Checking rand_core v0.6.4
+    Checking rand_xoshiro v0.7.0
+    Checking ordered-float v5.3.0
+    Checking termtree v0.5.1
+    Checking anstyle v1.0.14
+    Checking quantette v0.5.1
+    Checking predicates v3.1.4
+    Checking predicates-tree v1.0.13
+    Checking rand_chacha v0.3.1
+    Checking ratatui-crossterm v0.1.2
+    Checking ratatui-macros v0.7.2
+    Checking objc2-core-graphics v0.3.2
+    Checking objc2-foundation v0.3.2
+    Checking fragile v2.1.0
+    Checking downcast v0.11.0
+    Checking vsimd v0.8.0
+    Checking outref v0.5.2
+    Checking termcolor v1.4.1
+    Checking simplelog v0.12.2
+    Checking base64-simd v0.8.0
+    Checking mockall v0.13.1
+    Checking thiserror v1.0.69
+    Checking icy_sixel v0.5.0
+    Checking objc2-app-kit v0.3.2
+    Checking ratatui v0.30.2
+    Checking rand v0.8.7
+    Checking crossterm v0.28.1
+    Checking self_cell v1.3.0
+    Checking ratatui-image v11.0.6
+    Checking termbg v0.6.2
+    Checking arboard v3.6.1
+    Checking hashlink v0.11.1
+    Checking haider-tui v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-tui)
+    Checking rusqlite v0.38.0
+    Checking haider-store v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-store)
+    Checking globset v0.4.20
+    Checking ignore v0.4.33
+    Checking haider-tools v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-tools)
+    Checking crypto-bigint v0.7.5
+    Checking elliptic-curve v0.14.1
+    Checking primefield v0.14.0
+    Checking rfc6979 v0.6.0
+    Checking ecdsa v0.17.0
+    Checking primeorder v0.14.0
+    Checking num-integer v0.1.46
+    Checking haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-core)
+    Checking ssh-encoding v0.3.0
+    Checking num-bigint v0.4.8
+    Checking crypto-primes v0.7.2
+    Checking ssh-cipher v0.3.0
+    Checking rsa v0.10.0-rc.18
+    Checking ring v0.17.14
+    Checking p384 v0.14.0
+    Checking p521 v0.14.0
+    Checking p256 v0.14.0
+    Checking module-lattice v0.2.3
+    Checking ml-kem v0.3.2
+    Checking simple_asn1 v0.6.4
+    Checking russh-cryptovec v0.62.0
+    Checking internal-russh-num-bigint v0.5.0
+    Checking russh-util v0.52.0
+   Compiling haider-daemon v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-daemon)
+    Checking jsonwebtoken v9.3.1
+    Checking gethostname v1.1.0
+    Checking ssh-key v0.7.0-rc.11
+    Checking x11rb-protocol v0.13.2
+    Checking russh v0.63.1
+    Checking x11rb v0.13.2
+    Checking haider-verify v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-verify)
+    Checking haider-cli v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-cli)
+    Checking haider-daemond v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-daemond)
+    Checking xtask v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/xtask)
+    Finished `dev` profile [unoptimized] target(s) in 4m 33s

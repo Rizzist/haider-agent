@@ -1,0 +1,67 @@
+   Compiling mio v1.2.2
+   Compiling num-traits v0.2.19
+   Compiling tokio v1.53.1
+   Compiling syn v3.0.3
+   Compiling typenum v1.20.1
+   Compiling generic-array v0.14.7
+   Compiling log v0.4.33
+   Compiling serde_derive v1.0.229
+   Compiling nix v0.31.3
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling hashbrown v0.17.1
+   Compiling futures-task v0.3.33
+   Compiling futures-util v0.3.33
+   Compiling serde v1.0.229
+   Compiling tokio-util v0.7.19
+   Compiling indexmap v2.14.0
+   Compiling digest v0.10.7
+   Compiling rustix v1.1.4
+   Compiling rmp v0.8.15
+   Compiling subtle v2.6.1
+   Compiling h2 v0.4.15
+   Compiling rustls v0.23.42
+   Compiling sha2 v0.10.9
+   Compiling rmp-serde v1.3.1
+   Compiling futures-channel v0.3.33
+   Compiling hyper v1.11.0
+   Compiling haider-platform v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-platform)
+   Compiling haider-protocol v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-protocol)
+   Compiling crossbeam-utils v0.8.22
+   Compiling getrandom v0.4.3
+   Compiling hashbrown v0.16.1
+   Compiling tower v0.5.3
+   Compiling hyper-util v0.1.20
+   Compiling moxcms v0.8.1
+   Compiling crossbeam-epoch v0.9.20
+   Compiling tokio-rustls v0.26.4
+   Compiling bytemuck v1.25.2
+   Compiling image v0.25.10
+   Compiling globset v0.4.20
+   Compiling hyper-rustls v0.27.9
+   Compiling crossbeam-deque v0.8.7
+   Compiling tower-http v0.6.11
+   Compiling hashlink v0.11.1
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling async-trait v0.1.91
+   Compiling tempfile v3.27.0
+   Compiling rusqlite v0.38.0
+   Compiling reqwest v0.13.4
+   Compiling ignore v0.4.33
+   Compiling haider-accounts v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-accounts)
+   Compiling haider-provider v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-provider)
+   Compiling haider-tools v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-tools)
+   Compiling haider-store v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-store)
+   Compiling haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-core)
+    Finished `test` profile [unoptimized] target(s) in 34.45s
+     Running unittests src/lib.rs (/private/tmp/haider-economydiet-target/debug/deps/haider_core-6f6c84edb67529ea)
+
+running 5 tests
+test actor::tool_exposure::tests::default_coding_surface_and_catalog_read_do_not_promote ... ok
+test actor::tool_exposure::tests::discovery_cannot_promote_outside_catalog_or_from_rejected_results ... ok
+test actor::tool_exposure::tests::discovery_promotes_once_in_catalog_order_and_keeps_policy_byte_stable ... ok
+test actor::tool_exposure::tests::provider_refresh_and_fallback_preserve_the_discovery_tier ... ok
+test actor::tool_exposure::tests::discovery_is_committed_before_the_next_request_advertises_it ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 73 filtered out; finished in 0.01s
+

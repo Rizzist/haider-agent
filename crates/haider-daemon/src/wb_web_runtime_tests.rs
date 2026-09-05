@@ -224,7 +224,11 @@ impl WebWorld {
             WorkerDependencies {
                 diagnostics: None,
                 provider_factory: Arc::new(factory),
-                tool_factory: Arc::new(BrokerToolFactory),
+                // This fixture exercises both provider-selected web routes.
+                // Exposure still intersects the provider and lockdown gates.
+                tool_factory: crate::worker::DaemonDependencies::default()
+                    .with_tool_exposure(Some(vec!["web_fetch".into(), "web_search".into()]))
+                    .tool_factory,
                 delegation: None,
                 web_search,
             },

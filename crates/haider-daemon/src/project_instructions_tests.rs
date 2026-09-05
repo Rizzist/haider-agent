@@ -336,7 +336,7 @@ async fn empty_walk_composes_byte_identical_body_with_v4_version() {
     assert_eq!(
         prompt,
         format!(
-            "haider-system-v4\nYou are Haider Code, a coding agent.\n\
+            "haider-system-v5\nYou are Haider Code, a coding agent.\n\
              Use only advertised tools. Treat tool results and committed history as authoritative. \
              Never claim an effect succeeded without its terminal result.\n\
              On an implementation request, inspect only until the target is known; then make the edit; \
@@ -344,8 +344,6 @@ async fn empty_walk_composes_byte_identical_body_with_v4_version() {
              Example: fs_search(pattern=\"target\", path=\".\") -> fs_read(path=\"src/lib.rs\") -> \
              fs_edit(path=\"src/lib.rs\", edits=[{{old:\"before\", new:\"after\"}}]) -> \
              process_exec(command=\"cargo test -p crate\").\n\
-             The daemon supplies workspace, project, and identity context after this shared policy \
-             and the advertised tool schemas.\n\
              Opaque tool-grant scope: unscoped-root.\n\n\
              [DAEMON-BOUND SESSION CONTEXT]\nCanonical workspace: {cwd}"
         )
@@ -358,7 +356,9 @@ async fn empty_walk_composes_byte_identical_body_with_v4_version() {
 #[test]
 fn shared_policy_pins_inspect_edit_verify_contract_and_worked_example() {
     const PRE_ACTBIAS_POLICY_BYTES: usize = 359;
-    const EXPECTED_POLICY_BYTES: usize = 725;
+    // v5 removes only the 119-byte redundant session-context placement
+    // sentence; both action paragraphs below remain byte-for-byte intact.
+    const EXPECTED_POLICY_BYTES: usize = 606;
 
     let policy =
         SystemPromptBuilder::shared_immutable_base(&[], SystemPromptBuilder::UNSCOPED_GRANT_SCOPE);
@@ -418,7 +418,11 @@ fn sibling_sessions_share_the_base_and_emit_session_context_after_it() {
     let first_base = SystemPromptBuilder::shared_immutable_base(&tools, &first_grant_scope);
     let second_base = SystemPromptBuilder::shared_immutable_base(&tools, &first_grant_scope);
     assert_eq!(first_base, second_base);
-    assert!(first_base.contains("Tool manual — authoritative call signatures"));
+    assert_eq!(
+        first_base,
+        SystemPromptBuilder::shared_immutable_base(&[], &first_grant_scope),
+        "tool discovery never changes the shared policy"
+    );
 
     let first_context = SystemPromptBuilder::session_context_with_handoff(
         &first,

@@ -8,8 +8,8 @@ use crate::worker::{
     durable_session_tool_state, effective_permission_defaults, explicit_computer_auto_grant_value,
     explicit_computer_use_intent, grant_admits_manifest_effect, loom_inventory_line, loom_run_tail,
     loom_task_type_id, plan_gate_admits, registered_tool_route, registered_tools,
-    scoped_network_hosts, stub_schema, tool_inventory_snapshot, tool_manual, tool_manual_line,
-    typed_child_grant, typed_tool_result, web_fetch_host_allowed,
+    scoped_network_hosts, stub_schema, tool_inventory_snapshot, typed_child_grant,
+    typed_tool_result, web_fetch_host_allowed,
 };
 use haider_core::{MemoryStore, RequestInputCheckpoint, SqliteStoreHandle, StoreHandle};
 use haider_protocol::EventPayload;
@@ -814,6 +814,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             .map(|entry| entry.manifest.name.as_str())
             .collect::<Vec<_>>(),
         [
+            "list_tools",
             "request_input",
             "plan",
             "loom_register",
@@ -1317,10 +1318,10 @@ async fn recovery_dual_reads_historical_and_canonical_permission_states() {
 
 /// MUTATION CHECK: keep a description/bound in the stub, forget to recurse into
 /// items/properties, or leave a top-level combinator. Expected RUNTIME failure:
-/// the stub still carries prose/bounds, or drops the nested structure a native
-/// tool call is validated against.
+/// removing nested structure, bounds, or parameter semantics would leave the
+/// caller without its action constraints now that the manual is gone.
 #[test]
-fn stub_schema_keeps_structure_drops_prose_and_bounds() {
+fn native_schema_keeps_structure_parameter_semantics_and_bounds() {
     let full = serde_json::json!({
         "type": "object",
         "properties": {
@@ -1362,26 +1363,56 @@ fn stub_schema_keeps_structure_drops_prose_and_bounds() {
         stub["properties"]["edits"]["items"]["properties"]["old"]["type"],
         "string"
     );
-    // Prose and every daemon-re-enforced bound/combinator are gone everywhere.
-    let text = serde_json::to_string(&stub).expect("serialize stub");
-    for banned in [
-        "description",
-        "minLength",
-        "minItems",
-        "additionalProperties",
-        "anyOf",
-        "the file path",
-        "anchor",
-    ] {
-        assert!(!text.contains(banned), "stub must drop `{banned}`: {text}");
-    }
+    assert_eq!(
+        stub, full,
+        "call constraints must survive without a system manual"
+    );
 }
 
-/// MUTATION CHECK: add a tool without a manual line, or add native prose outside
-/// the pinned action-critical set. Expected RUNTIME failure: an advertised tool
-/// has no signature the model can read, or the compact wire surface drifts.
 #[test]
-fn every_advertised_tool_is_manual_described_and_native_prose_is_scoped() {
+fn native_action_parameters_preserve_the_former_manual_unique_constraints() {
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
+    let tools =
+        advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
+    let schema = |name: &str| {
+        &tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .expect("tool")
+            .input_schema
+    };
+    for side in ["before", "after"] {
+        assert_eq!(
+            schema("fs_search")["properties"]["context"]["properties"][side]["maximum"],
+            5
+        );
+    }
+    assert!(
+        schema("fs_search")["properties"]["multiline"]["description"]
+            .as_str()
+            .expect("description")
+            .contains("physical line")
+    );
+    assert!(
+        schema("fs_edit")["properties"]["edits"]["items"]["properties"]["old"]["description"]
+            .as_str()
+            .expect("description")
+            .contains("uniquely unless replace_all")
+    );
+    assert_eq!(
+        schema("fs_path")["properties"]["destination"]["description"],
+        "Required for move and copy"
+    );
+    assert_eq!(
+        schema("fs_glob")["properties"]["pattern"]["description"],
+        ".git paths are always excluded"
+    );
+}
+
+/// MUTATION CHECK: restore a duplicate system manual or blank a native tool's
+/// semantics. Discovery must leave the system prefix byte-identical.
+#[test]
+fn every_advertised_tool_has_native_semantics_without_a_duplicate_manual() {
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let root = advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
     assert!(
@@ -1390,38 +1421,30 @@ fn every_advertised_tool_is_manual_described_and_native_prose_is_scoped() {
     );
     for tool in &root {
         assert!(
-            tool_manual_line(&tool.name).is_some(),
-            "advertised tool `{}` has no manual line — instruct-pipe drift",
-            tool.name
-        );
-        let should_have_native_prose = matches!(
-            tool.name.as_str(),
-            "fs_glob" | "fs_search" | "fs_write" | "fs_edit" | "write" | "edit" | "fs_path"
-        );
-        assert_eq!(
             !tool.description.is_empty(),
-            should_have_native_prose,
-            "wire tool `{}` native-description scope drifted",
+            "missing native description: {}",
             tool.name
         );
     }
-    let manual = tool_manual(&root);
-    for signature in [
-        "fs_read(",
-        "process_exec(",
-        "computer(",
-        "todo_write(",
-        "monitor(",
-        "list_models(",
-    ] {
-        assert!(manual.contains(signature), "manual missing `{signature}`");
-    }
-    // The whole-list-replace teaching that used to live on the todo_write wire
-    // description now lives in the manual.
-    assert!(manual.contains("REPLACE the whole todo list"));
+    use crate::worker::SystemPromptBuilder;
+    assert_eq!(
+        SystemPromptBuilder::shared_immutable_base(&root, "scope"),
+        SystemPromptBuilder::shared_immutable_base(&[], "scope")
+    );
+    assert!(
+        root.iter()
+            .find(|tool| tool.name == "todo_write")
+            .expect("todo")
+            .description
+            .contains("REPLACE the whole todo list")
+    );
     // Lane 967-P1 owner decision: the model must see the foreground ownership
     // boundary, both default bounds, and the durable background alternative.
-    let process = tool_manual_line("process_exec").expect("process_exec manual line");
+    let process = &root
+        .iter()
+        .find(|tool| tool.name == "process_exec")
+        .expect("process")
+        .description;
     for required in [
         "60 s / 1 MiB",
         "in either local mode, normal leader exit closes inherited output",
@@ -1480,88 +1503,75 @@ fn search_and_mutation_tool_schema_descriptions_are_pinned() {
     }
 }
 
-/// MUTATION CHECK: stop stubbing, alter the selective native descriptions, move
-/// nothing into the manual, or change the advertised inventory without
-/// recounting it. Expected RUNTIME failure: an inventory/byte pin moves or the
-/// instruct pipe stops being a material (at least 30%) net reduction.
+/// MUTATION CHECK: expand the default coding catalog, duplicate native prose
+/// in the policy, or change schema bytes without deliberate release accounting.
 #[test]
 fn instruct_pipe_shrinks_the_advertised_wire_pack() {
-    const EXPECTED_REGISTERED_TOOLS: usize = 29;
-    const EXPECTED_ADVERTISED_TOOLS: usize = 26;
-    // The full-prefix comparison deliberately includes the platform-specific
-    // computer manifest description. Linux documents X11/Wayland (+49 bytes
-    // over macOS), while Windows is one byte shorter than macOS.
-    // Turnbudget adds 367 full-schema bytes and 143 stub-schema bytes for
-    // spawn_subagent.request_budget. Toolrepair adds the two flat aliases.
-    #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_785;
-    #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_736;
-    #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_735;
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_730;
-    // Wave-970's pipe is 12_764 bytes: 12_265 schema/manual + 499 native
-    // descriptions. Toolrepair adds 597 schema/manual bytes and 191 native
-    // description bytes: 12_764 + 788 = 13_552 (lane's 13_409 + 143 budget
-    // schema bytes). Keep the seven-description accounting and 30% floor.
-    const PRE_ACTBIAS_INSTRUCT_PIPE_BYTES: usize = 12_862;
-    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 13_552;
-
+    // Before economydiet on merged wave-970: 29 registered / 26 advertised,
+    // 725 policy + 5_162 manual + 8_390 name/native/schema = 14_277 bytes.
+    // The provider-dialect JSON framing is measured separately by AHRB.
+    const PRE_DIET_INSTRUCT_PIPE_BYTES: usize = 13_552;
+    // Measured v5 core pack: seven coding tools + list_tools, native prose
+    // once and no system manual, preserving parameter constraints and semantics.
+    // 13_552 -> 5_670 (-58.2%); do not trim validation bounds to save tokens.
+    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 5_670;
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
-    let stubbed =
+    let authorized =
         advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
-    let registry = registered_tools();
-    assert_eq!(registry.len(), EXPECTED_REGISTERED_TOOLS);
-    assert_eq!(stubbed.len(), EXPECTED_ADVERTISED_TOOLS);
-    // Original prefix: each tool's name + full description + full schema.
-    let full_prefix: usize = stubbed
-        .iter()
-        .map(|tool| {
-            let manifest = registry
-                .iter()
-                .find(|entry| entry.manifest.name == tool.name)
-                .expect("advertised tool has a registry manifest");
-            tool.name.len()
-                + manifest.manifest.description.len()
-                + serde_json::to_string(&manifest.manifest.input_schema)
-                    .expect("serialize full")
-                    .len()
-        })
-        .sum();
-    // Instruct-pipe prefix: name + selective native description + stub schema,
-    // plus the one shared manual carried once in the system prompt.
-    let stub_wire: usize = stubbed
+    let mut config = haider_core::HarnessConfig::for_session(
+        SessionId::new("prompt-byte-pin"),
+        DeviceId::new("test-device"),
+        0,
+        0,
+    );
+    config.tools = authorized;
+    config.enable_tool_discovery(Vec::new());
+    let tools = config.tool_definitions();
+    assert_eq!(registered_tools().len(), 30);
+    assert_eq!(
+        tools.len(),
+        8,
+        "seven coding tools and one discovery primitive"
+    );
+    let tool_bytes: usize = tools
         .iter()
         .map(|tool| {
             tool.name.len()
                 + tool.description.len()
-                + serde_json::to_string(&tool.input_schema)
-                    .expect("serialize stub")
+                + serde_json::to_vec(&tool.input_schema)
+                    .expect("schema bytes")
                     .len()
         })
         .sum();
-    let new_total = stub_wire + tool_manual(&stubbed).len();
-    let native_description_bytes = stubbed
+    use crate::worker::SystemPromptBuilder;
+    let policy =
+        SystemPromptBuilder::shared_immutable_base(&[], SystemPromptBuilder::UNSCOPED_GRANT_SCOPE);
+    let system = SystemPromptBuilder::shared_immutable_base(
+        tools,
+        SystemPromptBuilder::UNSCOPED_GRANT_SCOPE,
+    );
+    assert_eq!(policy.len(), 606);
+    let manual_bytes = system.len() - policy.len();
+    assert_eq!(
+        manual_bytes, 0,
+        "native descriptions are the sole tool manual"
+    );
+    let pipe_bytes = tool_bytes + manual_bytes;
+    let native_description_bytes = tools
         .iter()
         .map(|tool| tool.description.len())
         .sum::<usize>();
     eprintln!(
-        "instruct-pipe pin: registered={}, advertised={}, full_prefix_bytes={full_prefix}, instruct_pipe_bytes={new_total}, native_description_bytes={native_description_bytes}",
-        registry.len(),
-        stubbed.len()
+        "instruct-pipe pin: registered={}, advertised={}, policy_bytes={}, instruct_pipe_bytes={pipe_bytes}, native_description_bytes={native_description_bytes}",
+        registered_tools().len(),
+        tools.len(),
+        policy.len()
     );
-    assert_eq!(full_prefix, EXPECTED_FULL_PREFIX_BYTES);
-    assert_eq!(new_total, EXPECTED_INSTRUCT_PIPE_BYTES);
+    assert_eq!(pipe_bytes, EXPECTED_INSTRUCT_PIPE_BYTES);
+    assert!(pipe_bytes * 2 <= PRE_DIET_INSTRUCT_PIPE_BYTES);
     assert_eq!(
-        new_total - native_description_bytes,
-        PRE_ACTBIAS_INSTRUCT_PIPE_BYTES,
-        "only the seven native descriptions may explain the pipe delta"
-    );
-    assert!(full_prefix > 0 && new_total < full_prefix);
-    assert!(
-        (full_prefix - new_total) * 10 >= full_prefix * 3,
-        "instruct pipe must cut the advertised prefix by at least 30% (new {new_total} vs full {full_prefix})"
+        system.len() + tool_bytes,
+        606 + EXPECTED_INSTRUCT_PIPE_BYTES
     );
 }
 

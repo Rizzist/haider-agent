@@ -1,0 +1,56 @@
+{
+  "source": "scripts/tui-probes/probelib.py:36 ANSI_RE OSC arm accepts only BEL, swallowing ST-terminated OSC plus following visible paint until later BEL.",
+  "captures": [
+    {
+      "file": "attach-1.raw",
+      "raw_has_placeholder": true,
+      "old_stripped_raw_has_placeholder": false,
+      "screen_rows_has_placeholder": true,
+      "erasing_osc_matches": [
+        {
+          "span": [
+            9430,
+            13302
+          ],
+          "bytes": 3872,
+          "start_hex": "1b5d373739313b6861696465723b61747461636865643d73657373696f6e2d63306363326433303436396533353561366239306633613539626461373437381b5c1b5b313b31481b5b33383b323b36383b36383b36",
+          "end_hex": "34396d1b5b35396d1b5b306d1b5b3f32356c1b5d393b6861696465723a207475726e20646f6e6507"
+        }
+      ]
+    },
+    {
+      "file": "attach-2.raw",
+      "raw_has_placeholder": true,
+      "old_stripped_raw_has_placeholder": false,
+      "screen_rows_has_placeholder": true,
+      "erasing_osc_matches": [
+        {
+          "span": [
+            9430,
+            13302
+          ],
+          "bytes": 3872,
+          "start_hex": "1b5d373739313b6861696465723b61747461636865643d73657373696f6e2d63306363326433303436396533353561366239306633613539626461373437381b5c1b5b313b31481b5b33383b323b36383b36383b36",
+          "end_hex": "34396d1b5b35396d1b5b306d1b5b3f32356c1b5d393b6861696465723a207475726e20646f6e6507"
+        }
+      ]
+    },
+    {
+      "file": "attach-3.raw",
+      "raw_has_placeholder": true,
+      "old_stripped_raw_has_placeholder": false,
+      "screen_rows_has_placeholder": true,
+      "erasing_osc_matches": [
+        {
+          "span": [
+            9430,
+            13288
+          ],
+          "bytes": 3858,
+          "start_hex": "1b5d373739313b6861696465723b61747461636865643d73657373696f6e2d63306363326433303436396533353561366239306633613539626461373437381b5c1b5b313b31481b5b33383b323b36383b36383b36",
+          "end_hex": "34396d1b5b35396d1b5b306d1b5b3f32356c1b5d393b6861696465723a207475726e20646f6e6507"
+        }
+      ]
+    }
+  ]
+}

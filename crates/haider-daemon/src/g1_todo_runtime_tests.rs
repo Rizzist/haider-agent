@@ -66,6 +66,21 @@ struct World {
 
 impl World {
     async fn boot(prefix: &str, provider: Arc<FakeProvider>) -> Self {
+        Self::boot_with_scope(
+            prefix,
+            provider,
+            vec!["graph_evidence".into(), "spawn_subagent".into()],
+            false,
+        )
+        .await
+    }
+
+    async fn boot_with_scope(
+        prefix: &str,
+        provider: Arc<FakeProvider>,
+        tools: Vec<String>,
+        allow_exec: bool,
+    ) -> Self {
         let root = tempfile::tempdir().expect("temp profile");
         let store = SqliteStoreHandle::open(root.path()).await.expect("store");
         // The OS reclaims the leaked profile tree, matching sibling runtime
@@ -77,7 +92,11 @@ impl World {
             WorkerDependencies {
                 diagnostics: None,
                 provider_factory: Arc::new(FixedProviderFactory { provider }),
-                tool_factory: Arc::new(BrokerToolFactory),
+                // This suite scripts graph/delegation operations. Its scope
+                // is explicit; coding discovery has dedicated runtime pins.
+                tool_factory: crate::worker::DaemonDependencies::default()
+                    .with_tool_exposure(Some(tools))
+                    .tool_factory,
                 delegation: None,
                 web_search: None,
             },
@@ -100,7 +119,12 @@ impl World {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
-            permission_overrides: None,
+            permission_overrides: allow_exec.then_some(
+                haider_protocol::session::SessionPermissionOverridesV1 {
+                    allow_exec: true,
+                    ..Default::default()
+                },
+            ),
             effort: None,
             fast: false,
             cache_policy: Default::default(),
@@ -486,6 +510,108 @@ async fn graph_evidence_tool_dispatches_to_daemon_gate_authority() {
     }));
 }
 
+/// Economydiet: daemon-verified slots remain usable after receipts leave the
+/// model context, and journal reconstruction uses the same slim projection.
+#[tokio::test]
+async fn verified_slot_resolves_journal_provenance_with_slim_live_and_replayed_results() {
+    let mut script = Vec::new();
+    for (id, name, args) in [
+        (
+            "discover-evidence",
+            "list_tools",
+            serde_json::json!({"filter":"graph_evidence"}),
+        ),
+        (
+            "build-evidence",
+            "graph_evidence",
+            serde_json::json!({"node":"BUILD", "verdict":"green", "detail":"implementation ready"}),
+        ),
+        (
+            "verify-command",
+            "process_exec",
+            serde_json::json!({"command":"echo verified"}),
+        ),
+        (
+            "verify-evidence",
+            "graph_evidence",
+            serde_json::json!({"node":"VERIFY", "slot":"tests", "verdict":"green", "detail":"verification succeeded", "evidence_from":"latest_process"}),
+        ),
+    ] {
+        script.extend([
+            FakeStep::EmitToolCall {
+                call_id: id.into(),
+                name: name.into(),
+                args,
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::ExpectToolResult { call_id: id.into() },
+        ]);
+    }
+    script.extend((0..3).map(|_| FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }));
+    let provider = Arc::new(FakeProvider::new(script));
+    let world =
+        World::boot_with_scope("economydiet-evidence", provider.clone(), Vec::new(), true).await;
+    world
+        .hub
+        .pin_graph(GraphPinCommand {
+            command_id: "pin-economydiet-evidence".into(),
+            request_digest: "pin-economydiet-evidence".into(),
+            request_json: r#"{"template":"ship-loop"}"#.into(),
+            session_id: world.session_id.clone(),
+            worker_generation: world.store.worker_generation(),
+            graph_id: GraphId::new("economydiet-evidence"),
+            template: SHIP_LOOP_TEMPLATE.into(),
+            device_id: world.device_id.clone(),
+        })
+        .await
+        .expect("pin graph");
+    let run = world
+        .run_turn_with_explicit_graph_abandon("economydiet-evidence", "verify the implementation")
+        .await;
+    let payloads = world.typed_payloads().await;
+    assert!(payloads.iter().any(|(payload, _)| matches!(payload,
+        EventPayload::EvidenceRecorded(recorded) if recorded.slot.as_deref() == Some("tests")
+        && matches!(&recorded.source, haider_protocol::graph::GraphEvidenceSource::ProcessSignal {run_id, call_id, ..}
+            if run_id == &run && call_id == "verify-command"))));
+    let journal_result = payloads
+        .iter()
+        .find_map(|(payload, _)| match payload {
+            EventPayload::ToolResult { call_id, result } if call_id == "verify-command" => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("durable process result");
+    assert!(journal_result.preview.contains("process_signal"));
+    assert!(journal_result.preview.contains("subject_digest"));
+    world
+        .run_turn("economydiet-evidence-replay", "recall the result")
+        .await;
+    let requests = provider.requests();
+    let model_results = requests
+        .iter()
+        .flat_map(|request| &request.messages)
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::ToolResult {
+                call_id, preview, ..
+            } if call_id == "verify-command" => Some(preview),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(model_results.len() >= 2);
+    for preview in &model_results {
+        assert!(preview.contains("verified"));
+        assert!(!preview.contains("process_signal"));
+        assert!(!preview.contains("subject_digest"));
+        assert_eq!(preview, &model_results[0], "first-send/replay model bytes");
+    }
+}
+
 /// CG-M2c LAW: outstanding VERIFY testimony remains graph-local, but the
 /// provider turn reaches Done only after an explicit guardrail exit.
 #[tokio::test]
@@ -594,7 +720,11 @@ fn todo_write_is_registered_advertised_and_routable() {
     // Instruct pipe: the wire definition is description-free; the whole-list-
     // replace teaching lives in the authored manifest (and, at turn time, the
     // system-prompt tool manual), not on the advertised ToolDefinition.
-    assert!(definition.description.is_empty());
+    assert!(
+        definition
+            .description
+            .contains("REPLACE the whole todo list")
+    );
     assert!(
         entry
             .manifest

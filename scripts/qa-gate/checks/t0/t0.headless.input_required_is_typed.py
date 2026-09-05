@@ -89,6 +89,9 @@ def run(ctx) -> list[Evidence]:
             "request operator input",
         ],
         timeout=DAEMON_STARTUP + HEADLESS_TWO_SECONDS + RUN_TERMINAL_GRACE,
+        # This scripted fixture intentionally calls a non-core tool. Select
+        # its named surface without changing permission or terminal pins.
+        env_overrides={"HAIDER_TOOL_EXPOSURE": "request_input"},
     )
     failures = []
     try:

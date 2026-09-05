@@ -1,0 +1,17 @@
+1/4 A warm: starting existing proof harness
+1/4 A warm: proof accepted
+1/4 A one_shot: starting existing proof harness
+Traceback (most recent call last):
+  File "/Users/rizzist/haider-run/lane-970-economydiet/scripts/qa-gate/economydiet_abba.py", line 93, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "/Users/rizzist/haider-run/lane-970-economydiet/scripts/qa-gate/economydiet_abba.py", line 44, in main
+    report = runner(bins[label], commit_label=f"economydiet-{label}-{index}")
+  File "/Users/rizzist/haider-run/lane-970-economydiet/scripts/qa-gate/turn_wall_harness.py", line 366, in run_one_shot_harness
+    one_case(index, False)
+    ~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/rizzist/haider-run/lane-970-economydiet/scripts/qa-gate/turn_wall_harness.py", line 241, in one_case
+    raise ProofError(
+    ...<2 lines>...
+    )
+turnperf_support.ProofError: one-shot case=1 process failed exit=76 timed_out=False stderr='haider: profile runtime endpoint is not usable: endpoint path /private/var/folders/y2/zrvhkfz54lj3gsw2czwxdmsh0000gn/T/htp-one-shot-c03fyl1o/warmup-001/r/c502da628ce0414a7707/.hd-AAAAAAAAAAAAAAAA is 133 bytes; platform IPC limit is 103 bytes; set HAIDER_RUNTIME_DIR to a shorter owner-private directory\n'

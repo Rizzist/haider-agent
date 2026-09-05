@@ -1,0 +1,15 @@
+{
+  "commit": "7431f8e6e9500729362cc4eb3cfb2bbc62cf462a",
+  "label": "merge-forward upstream baseline including ceilingdecl",
+  "profile": "dev opt-level=0 debug=0 incremental=0",
+  "binaries": {
+    "haider": {
+      "bytes": 111345200,
+      "sha256": "208f7bf8acb795c6be0311268e0583b027c923fac9fb8a28944aaf3a9c9c364f"
+    },
+    "haiderd": {
+      "bytes": 200942448,
+      "sha256": "17d631a072a217244b3fbde550f0aca61f64a48e1c2edae49c5d0218395cf4dd"
+    }
+  }
+}

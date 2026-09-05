@@ -1,0 +1,88 @@
+   Compiling haider-tools v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-tools)
+   Compiling haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-core)
+    Finished `test` profile [unoptimized] target(s) in 10.65s
+     Running unittests src/lib.rs (/private/tmp/haider-economydiet-target/debug/deps/haider_core-6f6c84edb67529ea)
+
+running 79 tests
+test actor::actor_request_attempt_tests::automatic_rate_limit_retry_preserves_the_terminal_deadline_margin ... ok
+test actor::actor_context_economy_tests::context_accounting_reports_headroom_and_the_next_mode_specific_tier ... ok
+test actor::actor_request_attempt_tests::deadline_terminal_class_is_derived_from_provider_retry_state ... ok
+test actor::actor_context_economy_tests::structural_trim_keeps_an_image_bearing_exchange_whole ... ok
+test actor::actor_context_economy_tests::structural_trim_drops_only_old_complete_pairs_and_preserves_other_blocks ... ok
+test actor::actor_request_attempt_tests::provider_timeout_retry_requires_a_full_post_backoff_budget ... ok
+test actor::actor_request_attempt_tests::provider_view_and_request_attempt_share_one_ordered_append ... ok
+test actor::actor_request_attempt_tests::rejected_combined_append_does_not_publish_or_advance_state ... ok
+test actor::actor_request_attempt_tests::rejected_hard_request_checkpoint_exposes_neither_handle_nor_terminal ... ok
+test actor::actor_request_attempt_tests::no_boundary_post_stream_facts_share_one_ordered_append ... ok
+test actor::actor_request_attempt_tests::production_request_path_batches_provider_view_with_attempt_facts ... ok
+test actor::actor_request_attempt_tests::terminal_fence_reports_an_unresolved_promotion_without_waiting ... ok
+test actor::actor_request_attempt_tests::hard_request_checkpoint_and_named_terminal_share_one_atomic_append ... ok
+test actor::actor_journalview_tests::journalview_admission_refusal_never_invents_a_physical_request ... ok
+test actor::actor_tool_result_tests::envelope_shaped_command_output_and_file_contents_are_opaque ... ok
+test actor::actor_tool_result_tests::declared_process_footer_changes_only_cost_and_preserves_omission_disclosures ... ok
+test actor::actor_tool_result_tests::every_bounded_tool_truncation_gets_a_machine_marker_at_the_model_boundary ... ok
+test actor::actor_request_attempt_tests::rejected_request_boundary_publishes_neither_half_and_never_opens_provider ... ok
+test actor::actor_tool_result_tests::local_process_output_keeps_its_existing_model_adapter ... ok
+test actor::actor_request_attempt_tests::tool_call_response_does_not_batch_usage_with_done ... ok
+test actor::actor_journalview_tests::recovered_child_settlement_keeps_its_source_request_before_next_provider_round ... ok
+test actor::actor_tool_result_tests::process_without_exit_code_retains_terminal_failure_diagnosis ... ok
+test actor::actor_journalview_tests::journalview_rebind_failure_closes_recovered_items_under_the_source_request ... ok
+test actor::actor_tool_result_tests::filesystem_model_result_drops_receipt_and_preserves_journal_effects ... ok
+test actor::actor_tool_result_tests::process_model_envelope_is_output_and_only_nonzero_exit_with_journal_unchanged ... ok
+test actor::actor_tool_result_tests::shell_text_cannot_forge_a_trusted_process_savings_detail ... ok
+test actor::actor_context_economy_tests::structural_measurement_reports_comparable_before_and_after_estimates ... ok
+test actor::actor_tool_result_tests::typed_filesystem_text_cannot_impersonate_trusted_process_savings ... ok
+test actor::actor_tool_result_tests::ssh_inventory_is_compacted_only_for_the_model_boundary ... ok
+test actor::actor_tool_result_tests::repaired_tool_name_preserves_declared_json_and_text_result_provenance ... ok
+test actor::cu1_actor_tests::admission_validates_all_refs_without_caching_then_resolution_caches_only_budget ... ok
+test actor::actor_journalview_tests::narrative_items_keep_request_correlation_and_exact_live_journal_parity ... ok
+test actor::actor_tool_result_tests::remote_shell_output_is_compacted_only_for_the_model_boundary ... ok
+test actor::actor_tool_result_tests::typed_process_savings_is_journal_only_and_recosted_for_model_output ... ok
+test actor::cu1_actor_tests::completed_tool_arguments_reuse_one_parsed_value ... ok
+test actor::cu1_actor_tests::malformed_tool_argument_buffer_is_a_typed_provider_failure ... ok
+test actor::cu1_actor_tests::provider_timeout_presentation_maps_to_existing_timeout_error_code ... ok
+test actor::cu1_actor_tests::root_workflow_rejects_a_forged_unadvertised_actor_tool ... ok
+test actor::cu1_actor_tests::shared_pair_switch_retains_fallback_when_requested_web_tool_is_unauthorized ... ok
+test actor::cu1_actor_tests::transport_fault_classifier_is_narrow ... ok
+test actor::cu1_actor_tests::standalone_mutable_tool_vectors_never_retain_cached_digests ... ok
+test actor::cu1_actor_tests::unsupported_actor_without_reader_degrades_refs_before_provider_projection ... ok
+test actor::cu1_actor_tests::provider_rebind_epoch_reaches_real_cache_metadata_and_is_stable_between_turns ... ok
+test actor::peer_prompt_tests::peer_message_appends_without_rewriting_the_cached_prefix ... ok
+test actor::peer_prompt_tests::peer_message_is_a_tail_block_with_an_explicit_untrusted_boundary ... ok
+test actor::actor_tool_result_tests::escaping_heavy_output_uses_the_serialized_provider_projection_unit ... ok
+test actor::tool_exposure::tests::default_coding_surface_and_catalog_read_do_not_promote ... ok
+test actor::tool_exposure::tests::discovery_cannot_promote_outside_catalog_or_from_rejected_results ... ok
+test actor::tool_exposure::tests::broad_discovery_promotes_only_described_rows_with_honest_truncation ... ok
+test actor::tool_exposure::tests::discovery_promotes_once_in_catalog_order_and_keeps_policy_byte_stable ... ok
+test actor::usage_tests::cache_diagnostic_changed_system_is_first_differing_breakpoint ... ok
+test actor::usage_tests::cache_diagnostic_old_length_proves_grown_prefix_contains_previous_entry ... ok
+test actor::actor_tool_result_tests::profile_targeted_process_output_uses_the_same_model_only_cap ... ok
+test actor::usage_tests::cache_diagnostic_planned_rewarm_is_distinct_from_unexpected_miss ... ok
+test actor::tool_exposure::tests::provider_refresh_and_fallback_preserve_the_discovery_tier ... ok
+test actor::usage_tests::cache_diagnostic_records_never_contain_prompt_or_secret_content ... ok
+test actor::usage_tests::cache_diagnostic_stable_prefix_has_identical_keyed_breakpoints ... ok
+test actor::usage_tests::cumulative_usage_saturates_each_counter_without_failing_the_turn ... ok
+test actor::usage_tests::provider_retry_wake_discards_a_stale_notify_permit_between_events ... ok
+test actor::usage_tests::unbudgeted_provider_request_skips_projection_estimator ... ok
+test actor::usage_tests::cm2a_system_and_tool_digests_are_stable_across_append_only_history ... ok
+test prompt_history::cache_bound_tests::body_cap_retains_replay_cursors_while_dropping_lru_bodies ... ok
+test prompt_history::cache_bound_tests::session_limit_evicts_the_least_recently_touched_entry ... ok
+test prompt_history::prompt_history_cache_tests::explicit_idle_eviction_drops_bodies_but_keeps_replay_correct ... ok
+test actor::actor_tool_result_tests::remote_model_output_keeps_nonzero_exit_and_bounds_after_envelope_removal ... ok
+test actor::tool_exposure::tests::discovery_is_committed_before_the_next_request_advertises_it ... ok
+test actor::actor_tool_result_tests::typed_filesystem_truncation_preserves_savings_and_first_send_replay_footer_bytes ... ok
+test prompt_history::prompt_history_cache_tests::idle_compaction_keeps_cross_run_prefix_and_replays_only_the_new_suffix ... ok
+test recovery::reducer_filter_tests::recovery_evidence_reducer_matches_unfiltered_output ... ok
+test recovery::reducer_filter_tests::startup_recovery_reducer_matches_unfiltered_output ... ok
+test actor::peer_prompt_tests::peer_list_model_view_compacts_without_rewriting_the_raw_journal_value ... ok
+test sqlite_store::error_wave_tests::e5a_swallowed_store_write_still_surfaces_and_names_failed_id ... ok
+test sqlite_store::error_wave_tests::e5a_swallowed_profile_write_surfaces_stable_lost_id ... ok
+test sqlite_store::error_wave_tests::schema_zero_proof_is_open_scoped_and_generations_still_advance ... ok
+test prompt_history::prompt_history_cache_tests::reply_arena_remains_canonical_across_history_page_boundaries ... ok
+test actor::actor_tool_result_tests::typed_large_tool_results_keep_legacy_model_prefix_suffix_cap_and_replay_bytes ... ok
+test actor::actor_context_economy_tests::structural_benchmark_reports_cumulative_estimated_savings_per_million ... ok
+test prompt_history::prompt_history_cache_tests::retained_value_trees_evict_and_the_next_hit_recompiles ... ok
+test actor::usage_tests::cache_diagnostic_record_size_and_cpu_cost_are_bounded ... ok
+
+test result: ok. 79 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
