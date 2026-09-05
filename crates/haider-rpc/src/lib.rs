@@ -24,6 +24,7 @@ mod command;
 mod frame;
 mod negotiation;
 
+pub mod binary_artifact;
 pub mod uds_codec;
 pub mod ws_codec;
 

@@ -1,0 +1,57 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling num-traits v0.2.19
+   Compiling subtle v2.6.1
+   Compiling rustls v0.23.42
+   Compiling rmp v0.8.15
+   Compiling futures-util v0.3.33
+   Compiling moxcms v0.8.1
+   Compiling rmp-serde v1.3.1
+   Compiling time-macros v0.2.32
+   Compiling haider-protocol v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-protocol)
+   Compiling image v0.25.10
+   Compiling haider-platform v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-platform)
+   Compiling futures-channel v0.3.33
+   Compiling time v0.3.54
+   Compiling hyper v1.11.0
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-util v0.1.20
+   Compiling tower v0.5.3
+   Compiling tower-http v0.6.11
+   Compiling hyper-rustls v0.27.9
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling lopdf v0.42.0
+   Compiling ratatui-widgets v0.3.2
+   Compiling reqwest v0.13.4
+   Compiling ordered-float v5.3.0
+   Compiling euclid v0.20.14
+   Compiling sha1 v0.10.7
+   Compiling pdf-extract v0.12.0
+   Compiling tungstenite v0.26.2
+   Compiling quantette v0.5.1
+   Compiling ratatui-macros v0.7.2
+   Compiling simplelog v0.12.2
+   Compiling ratatui v0.30.2
+   Compiling tokio-tungstenite v0.26.2
+   Compiling haider-pdf v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-pdf)
+   Compiling haider-accounts v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-accounts)
+   Compiling icy_sixel v0.5.0
+   Compiling haider-rpc v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-rpc)
+   Compiling ratatui-image v11.0.6
+   Compiling haider-provider v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-provider)
+   Compiling haider-client v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-client)
+   Compiling haider-tools v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-tools)
+   Compiling termbg v0.6.2
+   Compiling haider-stt v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-stt)
+   Compiling arboard v3.6.1
+   Compiling haider-store v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-store)
+   Compiling haider-tui v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-tui)
+   Compiling haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-core)
+   Compiling haider-cli v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-cli)
+    Finished `test` profile [unoptimized] target(s) in 2m 49s
+     Running tests/turnhygiene_pin_tests.rs (target/debug/deps/turnhygiene_pin_tests-a0499b453628cad3)
+
+running 1 test
+test provider_request_body_is_budget_independent_and_matches_the_golden_ledger ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 2.76s
+

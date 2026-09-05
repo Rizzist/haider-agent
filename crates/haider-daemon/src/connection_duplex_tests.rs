@@ -364,3 +364,179 @@ async fn shell_cancel_settles_and_keeps_the_duplex_connection_open() {
     hub.shutdown().await.expect("duplex hub shuts down");
     store.close().await.expect("duplex store closes");
 }
+
+async fn casstream_pair(
+    hub: crate::session_hub::SessionHub,
+) -> (
+    DuplexClient,
+    tokio::task::JoinHandle<Result<ConnectionExit, DaemonError>>,
+    tokio::task::JoinHandle<()>,
+    watch::Sender<Option<DrainNotice>>,
+) {
+    let (server, client) = tokio::io::duplex(4 * FRAME_LIMIT);
+    let (reader, writer) = tokio::io::split(server);
+    let (writers, mut registered) = mpsc::unbounded_channel();
+    let joined = tokio::spawn(async move {
+        while let Some(writer) = registered.recv().await {
+            let _ = writer.await;
+        }
+    });
+    let (drain, drain_rx) = watch::channel(None);
+    let task = tokio::spawn(serve_io(
+        reader,
+        writer,
+        connection_context(hub, writers),
+        drain_rx,
+    ));
+    let mut client = DuplexClient::new(client);
+    client.handshake().await;
+    (client, task, joined, drain)
+}
+
+impl DuplexClient {
+    async fn binary(&mut self, frame: &haider_rpc::binary_artifact::Frame) -> ResponseBody {
+        let encoded =
+            haider_rpc::binary_artifact::encode(frame, FRAME_LIMIT).expect("binary encodes");
+        self.stream
+            .write_all(&encoded)
+            .await
+            .expect("binary writes");
+        // Each chunk uses the production request budget, including disk work.
+        tokio::time::timeout(
+            haider_client::ClientConfig::default().request_timeout,
+            async {
+                loop {
+                    if let WireFrame::Response { body, .. } = self.next().await.expect("response") {
+                        return body;
+                    }
+                }
+            },
+        )
+        .await
+        .expect("binary frame acknowledged within request budget")
+    }
+}
+
+#[tokio::test]
+async fn casstream_partial_frame_abort_reconnect_digest_and_length_integrity() {
+    use haider_rpc::binary_artifact::Frame;
+    let root = tempfile::tempdir().expect("profile");
+    let store = haider_core::SqliteStoreHandle::open(root.path())
+        .await
+        .expect("store");
+    let hub = crate::session_hub::SessionHub::new(store.clone(), Default::default()).expect("hub");
+    let bytes = vec![0_u8, 255, 1, 2, b'{', b'\n'];
+    let digest =
+        haider_protocol::ids::ArtifactRef::new(format!("blake3:{}", blake3::hash(&bytes).to_hex()));
+    // Disconnect inside prefix and inside body; neither is an acknowledged
+    // chunk. Reconnect retries the immutable whole artifact, receipt-free.
+    for cut in [2, 16] {
+        let (mut client, server, writer, _drain) = casstream_pair(hub.clone()).await;
+        assert!(matches!(
+            client
+                .binary(&Frame::Begin {
+                    request_id: RequestId::new("begin"),
+                    bytes: bytes.len() as u64,
+                    digest: digest.clone()
+                })
+                .await,
+            ResponseBody::ArtifactPutProgress { bytes: 0 }
+        ));
+        let encoded = haider_rpc::binary_artifact::encode(
+            &Frame::Chunk {
+                request_id: RequestId::new("chunk"),
+                offset: 0,
+                bytes: Zeroizing::new(bytes.clone()),
+            },
+            FRAME_LIMIT,
+        )
+        .expect("chunk");
+        client
+            .stream
+            .write_all(&encoded[..cut])
+            .await
+            .expect("partial writes");
+        drop(client);
+        server.await.expect("server joins").expect("server exits");
+        writer.await.expect("writer joins");
+        assert!(!store.verify(&digest).await.expect("verify"));
+    }
+    let (mut client, server, writer, _drain) = casstream_pair(hub.clone()).await;
+    // Full content with the wrong digest and a short body both fail before
+    // publication. The same connection remains usable for a new attempt.
+    for (expected_len, expected_digest) in [
+        (bytes.len() as u64 + 1, digest.clone()),
+        (
+            bytes.len() as u64,
+            haider_protocol::ids::ArtifactRef::new(format!("blake3:{}", "0".repeat(64))),
+        ),
+    ] {
+        assert!(matches!(
+            client
+                .binary(&Frame::Begin {
+                    request_id: RequestId::new("b"),
+                    bytes: expected_len,
+                    digest: expected_digest
+                })
+                .await,
+            ResponseBody::ArtifactPutProgress { bytes: 0 }
+        ));
+        assert!(matches!(
+            client
+                .binary(&Frame::Chunk {
+                    request_id: RequestId::new("c"),
+                    offset: 0,
+                    bytes: Zeroizing::new(bytes.clone())
+                })
+                .await,
+            ResponseBody::ArtifactPutProgress { .. }
+        ));
+        assert!(matches!(
+            client
+                .binary(&Frame::Finish {
+                    request_id: RequestId::new("f")
+                })
+                .await,
+            ResponseBody::Error { .. }
+        ));
+        assert!(!store.verify(&digest).await.expect("verify"));
+    }
+    // Replaying a completed artifact returns the same digest, not a second
+    // application mutation. Binary payload may contain arbitrary octets.
+    for _ in 0..2 {
+        assert!(matches!(
+            client
+                .binary(&Frame::Begin {
+                    request_id: RequestId::new("b"),
+                    bytes: bytes.len() as u64,
+                    digest: digest.clone()
+                })
+                .await,
+            ResponseBody::ArtifactPutProgress { bytes: 0 }
+        ));
+        assert!(matches!(
+            client
+                .binary(&Frame::Chunk {
+                    request_id: RequestId::new("c"),
+                    offset: 0,
+                    bytes: Zeroizing::new(bytes.clone())
+                })
+                .await,
+            ResponseBody::ArtifactPutProgress { bytes: 6 }
+        ));
+        client.send(&WireFrame::Ping { nonce: 970 }).await;
+        loop {
+            if matches!(client.next().await, Some(WireFrame::Pong { nonce: 970 })) {
+                break;
+            }
+        }
+        assert!(
+            matches!(client.binary(&Frame::Finish { request_id: RequestId::new("f") }).await, ResponseBody::ArtifactPut { artifact, bytes: 6 } if artifact == digest)
+        );
+        assert_eq!(store.get(&digest).await.expect("get"), bytes);
+    }
+    drop(client);
+    server.await.expect("server joins").expect("server exits");
+    writer.await.expect("writer joins");
+    hub.shutdown().await.expect("hub shutdown");
+}

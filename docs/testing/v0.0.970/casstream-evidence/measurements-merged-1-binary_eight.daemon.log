@@ -1,0 +1,13 @@
+haiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1
+haiderd: ephemeral-lifecycle event=connection_retired reason=error attached_clients=0 error_class=io raw_os_error=Some(57)
+haiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/hcs-19xiiszu/r/h.sock
+haiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/hcs-19xiiszu/r/h.sock
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=completed barrier_breached=false
+haiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/hcs-19xiiszu/r/h.sock
+haiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/hcs-19xiiszu/r/.haiderd-pid-652f1143c368f20f3886f20e
+haiderd: ephemeral-lifecycle event=cleanup step=remove daemon-private temporary directory outcome=removed_exact_owned_directory path=/private/tmp/hcs-19xiiszu/r/tmp/.haiderd-tmp-a1e8fa550a0807e764124271
+haiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/hcs-19xiiszu/r/tmp
+haiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=retained_unowned_directory reason=directory_not_created_by_this_daemon path=/private/tmp/hcs-19xiiszu/r retained_entries=[]
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=completed barrier_breached=false

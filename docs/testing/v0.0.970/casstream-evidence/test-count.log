@@ -1,0 +1,4 @@
+    Blocking waiting for file lock on artifact directory
+    Finished `dev` profile [unoptimized] target(s) in 1m 01s
+     Running `target/debug/xtask test-count --update`
+test-count: baseline updated to 4886

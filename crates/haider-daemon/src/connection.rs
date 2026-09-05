@@ -1349,6 +1349,10 @@ where
     // connection task cancels its sole in-flight handler.
     let mut grant = Option::<ConnectionGrant>::None;
     let mut hub_connection = Option::<HubConnection>::None;
+    let mut binary_upload = None;
+    let mut binary_job: Option<
+        std::pin::Pin<Box<dyn std::future::Future<Output = crate::binary_upload::Outcome> + Send>>,
+    > = None;
     let mut outbound_limit = context.frame_limit;
     let mut encoding = WireEncoding::Json;
     let mut close = false;
@@ -1384,6 +1388,16 @@ where
     let processing = async {
         while !close {
             tokio::select! {
+                (upload, request_id, body) = async {
+                    match binary_job.as_mut() {
+                        Some(job) => job.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    binary_job = None;
+                    binary_upload = upload;
+                    enqueue(&lane, &WireFrame::Response { request_id, body }, outbound_limit, encoding)?;
+                }
                 outcome = &mut peer_exit => {
                     let reason = outcome.map_err(|error| {
                         DaemonError::io(
@@ -1469,6 +1483,27 @@ where
                     while cursor < read && !close {
                         let step = decoder.push_one(&buffer[cursor..read]);
                         cursor = cursor.saturating_add(step.consumed);
+                        if let Some(frame) = step.binary_artifact {
+                            if binary_job.is_some() {
+                                enqueue_fatal(&lane, "invalid_frame", "binary frame requires prior acknowledgment", outbound_limit, encoding)?;
+                                close = true;
+                                retirement_reason = ConnectionRetirementReason::Error;
+                                continue;
+                            }
+                            let connection = hub_connection.as_ref().ok_or_else(|| DaemonError::Protocol { message: "binary upload before Hello".into() })?;
+                            match connection.binary_artifact_store() {
+                                Ok(store) => binary_job = Some(Box::pin(crate::binary_upload::apply(frame, binary_upload.take(), store))),
+                                Err(body) => {
+                                    let request_id = match frame {
+                                        haider_rpc::binary_artifact::Frame::Begin { request_id, .. } |
+                                        haider_rpc::binary_artifact::Frame::Chunk { request_id, .. } |
+                                        haider_rpc::binary_artifact::Frame::Finish { request_id } => request_id,
+                                    };
+                                    binary_upload = None;
+                                    enqueue(&lane, &WireFrame::Response { request_id, body }, outbound_limit, encoding)?;
+                                }
+                            }
+                        }
                         if let Some(artifact_put) = step.artifact_put {
                             let Some(connection) = hub_connection.as_ref() else {
                                 enqueue_fatal(
@@ -1509,6 +1544,7 @@ where
                             // negotiated encoding therefore applies to an
                             // unread coalesced suffix, never a partial frame.
                             decoder.set_encoding(encoding);
+                            decoder.set_binary_artifacts(grant.as_ref().is_some_and(|grant| grant.features.contains(haider_rpc::binary_artifact::FEATURE)));
                         }
                         if let Some(error) = step.error {
                             decode_error = Some(error);
@@ -1544,6 +1580,10 @@ where
     }
     .await;
 
+    // Dropping the pending future/stage removes unpublished bytes, including
+    // when EOF occurs halfway through a length-prefixed binary frame.
+    drop(binary_job);
+    drop(binary_upload);
     if let Some(connection) = hub_connection.as_ref() {
         let _ = connection.close().await;
     }
@@ -2256,6 +2296,7 @@ fn welcome_features() -> BTreeSet<String> {
         haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1.to_owned(),
         FEATURE_ACCOUNT_ROTATION_V1.to_owned(),
         FEATURE_ARTIFACT_PUT_V1.to_owned(),
+        haider_rpc::binary_artifact::FEATURE.to_owned(),
         FEATURE_BRANCH_CREATE_V1.to_owned(),
         FEATURE_SESSION_FORK_V1.to_owned(),
         FEATURE_SESSION_PROMPT_FORK_V1.to_owned(),
