@@ -465,13 +465,15 @@ fn two_aliases_build_two_independent_supervised_adapters() {
         !std::sync::Arc::ptr_eq(&work_adapter, &personal_adapter),
         "two aliases must not share one supervised session"
     );
-    assert!(
-        format!("{work_adapter:?}").contains(&root.profile_dir(&work).display().to_string()),
+    assert_eq!(
+        work_adapter.profile_dir(),
+        root.profile_dir(&work),
         "each adapter is bound to its own alias profile"
     );
-    assert!(
-        format!("{personal_adapter:?}")
-            .contains(&root.profile_dir(&personal).display().to_string())
+    assert_eq!(
+        personal_adapter.profile_dir(),
+        root.profile_dir(&personal),
+        "each adapter is bound to its own alias profile"
     );
 
     // Same alias, same model, same workspace: the SAME adapter, so a second

@@ -104,10 +104,10 @@ fn mobile_authorized_definitions_omit_inactive_include_active() {
 }
 
 #[tokio::test]
-async fn mobile_inactive_has_no_manual_or_inventory_trace() {
+async fn mobile_inactive_has_no_native_description_or_inventory_trace() {
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let inactive = authorized_tool_definitions(&factory, None, false);
-    assert!(!tool_manual(&inactive).contains("\n- mobile("));
+    assert!(!inactive.iter().any(|tool| tool.name == "mobile"));
 
     let store = MemoryStore::new();
     let session_id = SessionId::new("mobile-inventory-gate");
@@ -138,7 +138,12 @@ async fn mobile_inactive_has_no_manual_or_inventory_trace() {
             .any(|entry| entry.manifest.name == "mobile")
     );
     let active = authorized_tool_definitions(&factory, None, true);
-    assert!(tool_manual(&active).contains("\n- mobile("));
+    assert!(active.iter().any(|tool| {
+        tool.name == "mobile"
+            && tool
+                .description
+                .contains("explicitly activated mobile capability")
+    }));
 }
 
 #[tokio::test]

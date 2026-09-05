@@ -1,0 +1,144 @@
+[
+  {
+    "step": "merged-turnhygiene-regenerate",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "haider-cli",
+      "--test",
+      "turnhygiene_pin_tests",
+      "--",
+      "--test-threads=2"
+    ],
+    "extra_env": {
+      "UPDATE_FIXTURES": "1"
+    },
+    "exit_code": 0,
+    "wall_seconds": 54.216
+  },
+  {
+    "step": "merged-oneshot-regenerate",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "haider-cli",
+      "--test",
+      "oneshot_boot_tests",
+      "one_shot_jsonl_stream_matches_the_normalized_golden"
+    ],
+    "extra_env": {
+      "HAIDER_ONESHOT_GOLDEN_UPDATE": "1"
+    },
+    "exit_code": 0,
+    "wall_seconds": 5.033
+  },
+  {
+    "step": "merged-test-count-update",
+    "command": [
+      "cargo",
+      "run",
+      "-p",
+      "xtask",
+      "--",
+      "test-count",
+      "--update"
+    ],
+    "extra_env": {},
+    "exit_code": 0,
+    "wall_seconds": 0.806
+  },
+  {
+    "step": "merged-workspace-test",
+    "command": [
+      "cargo",
+      "test",
+      "--workspace",
+      "--no-fail-fast",
+      "--",
+      "--test-threads=2"
+    ],
+    "extra_env": {},
+    "exit_code": 0,
+    "wall_seconds": 1453.682
+  },
+  {
+    "step": "merged-clippy-tests",
+    "command": [
+      "cargo",
+      "clippy",
+      "--workspace",
+      "--tests",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "extra_env": {},
+    "exit_code": 0,
+    "wall_seconds": 273.681
+  },
+  {
+    "step": "merged-fmt-check",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "extra_env": {},
+    "exit_code": 0,
+    "wall_seconds": 6.484
+  },
+  {
+    "step": "merged-test-count",
+    "command": [
+      "cargo",
+      "run",
+      "-p",
+      "xtask",
+      "--",
+      "test-count"
+    ],
+    "extra_env": {},
+    "exit_code": 0,
+    "wall_seconds": 1.048
+  },
+  {
+    "step": "merged-xtask-check",
+    "command": [
+      "cargo",
+      "run",
+      "-p",
+      "xtask",
+      "--",
+      "check"
+    ],
+    "extra_env": {},
+    "exit_code": 0,
+    "wall_seconds": 1.267
+  },
+  {
+    "step": "merged-python-gate",
+    "command": [
+      "scripts/qa-gate/run.sh",
+      "test"
+    ],
+    "extra_env": {},
+    "exit_code": 0,
+    "wall_seconds": 0.87
+  },
+  {
+    "step": "merged-diff-check",
+    "command": [
+      "git",
+      "--git-dir=/private/tmp/economydiet-git",
+      "diff",
+      "--check"
+    ],
+    "extra_env": {},
+    "exit_code": 0,
+    "wall_seconds": 0.018
+  }
+]

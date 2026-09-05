@@ -1,0 +1,21 @@
+{
+  "definitions": [
+    {
+      "description": "read the daemon's cached model/provider catalog; filter matches model, provider, or alias without a network refresh",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "filter": {
+            "description": "Optional case-insensitive model/provider/alias substring",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "list_models"
+    }
+  ],
+  "digest": "a2fbd21177aa83ac1f8b7ba1a34883beb987ae9f76fe7624e897e17291b2a217"
+}

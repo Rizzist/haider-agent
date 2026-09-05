@@ -3605,7 +3605,10 @@ The pin identifies an operator-authored tool invocation, not an assistant
 provider response. The coordinator executes one canonical `spawn_subagent`
 through the broker and deferred-child machinery; it makes no parent provider
 request. Existing model/type validation, grants, provider ceilings, durable
-effect ordering, and recursion limits apply. The original delegation returns
+effect ordering, and recursion limits apply. The coordinator also retains
+the daemon's advertised tool ceiling: `spawn_subagent` must be explicitly
+exposed in the daemon configuration. An unexposed invocation is refused before
+child creation or a provider request. The original delegation returns
 the existing `AgentSpawned`, `ChildSpawn`, `AgentReport`, and completed
 `ChildResult` facts, followed by the coordinator's terminal. Results and IDs
 are read from durable envelopes, never parsed from assistant prose or derived

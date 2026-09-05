@@ -1,0 +1,386 @@
+{
+  "summary": {
+    "env_blocked": 0,
+    "fail": 1,
+    "pass": 13,
+    "skip": 0,
+    "total": 14
+  },
+  "measurement_accepted": true,
+  "cleanup": [
+    {
+      "id": "t0.account.alias_selects",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=56994 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "id": "t0.budget.max_cost_binds_before_request",
+      "artefacts": [],
+      "evidence_line": "isolated_subcase=cost-above-bound no_orphan_daemons pids=57002 stop=stopped_cleanly alive_after=false",
+      "label": "cost-above-bound_no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "id": "t0.budget.max_cost_binds_before_request",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=57007 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "id": "t0.budget.max_tokens_binds",
+      "artefacts": [],
+      "evidence_line": "isolated_subcase=tokens-above-bound no_orphan_daemons pids=57012 stop=stopped_cleanly alive_after=false",
+      "label": "tokens-above-bound_no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "id": "t0.budget.max_tokens_binds",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=57016 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "id": "t0.daemon.status_stop",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=57029 stop=not_running alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "id": "t0.headless.input_required_is_typed",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=57037 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "id": "t0.run.exit_codes",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=57041 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "id": "t0.run.jsonl_contract",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=57054 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "id": "t0.run.replay_resume_recover",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=57058 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "id": "t0.sessions.wait_ready_n",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=57069 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "id": "t0.tui.catalog_help_command_list_pin",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=57086 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "id": "t0.tui.login_paths",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=57097 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "id": "t0.tui.model_picker_cardinality",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=57334 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "id": "t0.tui.palette_activation_closure",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=69801 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "id": "t0.tui.three_door_parity",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=78219 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    }
+  ],
+  "palette": [
+    {
+      "artefacts": [],
+      "evidence_line": "/help activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=false surface='esc closes + commands' refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "help",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/model activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true arg_stage=target='claude-opus-4-8' stage_offered=true one_action_effect=true committed=false account_truth=false action_events=() action_receipts=() local_settings_delta=false journal_delta(events=0,receipts=0,sessions=0) alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "model",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/provider activation_closure expected=true actual=true mode=live next_slot=true screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true arg_stage=target='qa-second' stage_offered=true one_action_effect=true committed=true account_truth=false action_events=('model_selected',) action_receipts=('session.select_model:committed',) local_settings_delta=true journal_delta(events=1,receipts=1,sessions=0) alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "provider",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/effort activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true arg_stage=target='xhigh' stage_offered=true one_action_effect=true committed=true account_truth=false action_events=('effort_selected',) action_receipts=('session.select_effort:committed',) local_settings_delta=false journal_delta(events=1,receipts=1,sessions=0) alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "effort",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/fast activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=true remedy=None flash_only=false action_events=('fast_mode_selected',) action_receipts=('session.select_fast:committed',) journal_delta(events=1,receipts=1,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "fast",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/theme activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true arg_stage=target='light' stage_offered=true one_action_effect=false committed=false account_truth=false action_events=() action_receipts=() local_settings_delta=true journal_delta(events=0,receipts=0,sessions=0) alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "theme",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/tree activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "tree",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/fork activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=false surface='\u2191\u2193 / digits choose + f fork into a new session' refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "fork",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/branch activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=false surface='branch \u2014 switch the displayed branch + menu.answer' refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "branch",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/undo activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=false semantic=true surface=None refusal='not_found \u2014 no matching checkpoint exists on this branch' rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "undo",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/redo activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=false semantic=true surface=None refusal='not_found \u2014 no matching checkpoint exists on this branch' rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "redo",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/checkpoints activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=false semantic=true surface=None refusal='no durable file checkpoints on this branch' rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "checkpoints",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/rollback activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=false semantic=true surface=None refusal='no matching durable turn on this branch' rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "rollback",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/attach activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=false semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy='give ' flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "attach",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/sessions activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "sessions",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/aura activation_closure expected=true actual=true mode=demo next_slot=false screen_card_change=true semantic=false surface='native duplex + hold to talk' refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "aura",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/peer activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "peer",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/ssh activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "ssh",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/shells activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "shells",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/monitors activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=false surface='monitors  \u2191\u2193/jk select + x stop + p pause + t trigger + y copy id' refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "monitors",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/accounts activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "accounts",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/account activation_closure expected=true actual=true mode=live next_slot=true screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true arg_stage=target='qa-second-account' stage_offered=true one_action_effect=true committed=false account_truth=true action_events=() action_receipts=('account.set_active:committed',) local_settings_delta=false journal_delta(events=0,receipts=1,sessions=0) alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "account",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/providers activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "providers",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/usage activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true arg_stage=target='qa-second' stage_offered=true one_action_effect=true committed=false account_truth=false action_events=() action_receipts=() local_settings_delta=false journal_delta(events=0,receipts=0,sessions=0) alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "usage",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/login activation_closure expected=true actual=true mode=live next_slot=true screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true arg_stage=stage0_provider_preserved=true stage1_key_card=true actual_composer_lines=[] local_settings_delta=false journal_delta(events=0,receipts=0,sessions=0) alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "login",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/clear activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "clear",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/back activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "back",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/compact activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=('item', 'item', 'run_state', 'item', 'item', 'item', 'item', 'run_failed', 'run_state') action_receipts=('session.compact:pending',) journal_delta(events=9,receipts=1,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "compact",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/tokens activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "tokens",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/history activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=false surface='\u2191\u2193 / digits choose + \u23ce load' refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "history",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/hooks activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "hooks",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/voice activation_closure expected=true actual=true mode=demo next_slot=false screen_card_change=true semantic=false surface=None refusal=None rpc_catalog_owned=true durable=false remedy='session only' flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "voice",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/say activation_closure expected=true actual=true mode=demo next_slot=false screen_card_change=true semantic=false surface=None refusal=None rpc_catalog_owned=true durable=false remedy='session only' flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "say",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/talk activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=false semantic=false surface=None refusal='talk failed \u2014' rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "talk",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/tools activation_closure expected=true actual=true mode=demo next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy='session only' flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "tools",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/queue activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "queue",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/graph activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "graph",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/workflows activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "workflows",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/loom activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "loom",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [
+        "/private/tmp/haider-probe-qa-5umy1se5/artefacts/palette-update.txt"
+      ],
+      "evidence_line": "/update activation_closure expected=true actual=false mode=live next_slot=false screen_card_change=false semantic=true surface='checking for updates' refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=false",
+      "label": "update",
+      "status": "FAIL"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/rename activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=false semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy='give ' flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "rename",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/reset activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=false semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy='demo only' flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "reset",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=69801 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    }
+  ]
+}

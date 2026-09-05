@@ -1,0 +1,16 @@
+{
+  "haider": {
+    "path": "/private/tmp/agentcli-merge-wave-970-bins/haider",
+    "sha256": "cf67a13f48f11bfdea008b362ea324094c51215506dc4cc2ef0da4fb21df8259",
+    "version_output": "haider 0.0.969",
+    "version": "0.0.969",
+    "bytes": 112613664
+  },
+  "haiderd": {
+    "path": "/private/tmp/agentcli-merge-wave-970-bins/haiderd",
+    "sha256": "f2eca3c50b9418f4fe9e9d2278f7cbc24c128f827b3a2d819a3e5740db19423d",
+    "version_output": "haiderd 0.0.969",
+    "version": "0.0.969",
+    "bytes": 201706240
+  }
+}

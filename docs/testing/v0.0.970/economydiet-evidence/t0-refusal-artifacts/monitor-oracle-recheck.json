@@ -1,0 +1,11 @@
+{
+  "captured_sizes": [
+    "118x36",
+    "80x24"
+  ],
+  "accepted_signatures": [
+    "monitors  \u2191\u2193/jk select + x stop + p pause + t trigger + y copy id",
+    "monitors  \u2191\u2193/jk select + x stop + p pause + t trigger + y copy id"
+  ],
+  "renderer": "crates/haider-tui/src/render.rs:13100"
+}

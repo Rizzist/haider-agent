@@ -785,7 +785,15 @@ declaration, and observed proxy/provider usage on the corresponding row.
 These commands are noninteractive. `spawn` and `run` create a coordinator
 session and delegate one actual child through the daemon's tool engine:
 
+The daemon must expose `spawn_subagent`, for example by starting it with
+`HAIDER_TOOL_EXPOSURE=spawn_subagent`. Setting this variable on a later CLI
+invocation does not reconfigure an already-running daemon. The default coding
+catalog leaves delegation unexposed; spawn/run then return exit 70 and typed
+`spawn_failed` with the native grant-ceiling refusal and parent coordinates,
+without creating a child or making a provider request.
+
 ```sh
+export HAIDER_TOOL_EXPOSURE=spawn_subagent
 haider agent spawn "inspect the failing tests" --task investigation --json
 haider agent list <parent-session-id> --json
 haider agent message <parent-session-id> <agent-id> "inspect the new failure" --json

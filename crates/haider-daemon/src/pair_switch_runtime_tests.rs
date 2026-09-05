@@ -225,7 +225,11 @@ impl PairSwitchWorld {
                     cache_reconciliations: Arc::clone(&cache_reconciliations),
                     fallback_enabled,
                 }),
-                tool_factory: Arc::new(BrokerToolFactory),
+                // Pair-switch scripts explicitly include delegation; retain
+                // its declaration across provider changes.
+                tool_factory: crate::worker::DaemonDependencies::default()
+                    .with_tool_exposure(Some(vec!["spawn_subagent".into()]))
+                    .tool_factory,
                 delegation: None,
                 web_search: None,
             },

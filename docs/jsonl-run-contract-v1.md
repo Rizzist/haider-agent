@@ -184,6 +184,18 @@ footer overhead without changing source-omission facts. Additional model-boundar
 projection keeps the former cap and prefix/suffix bytes and remeasures
 `payload_bytes` for its own final footer. No marker or typed mirror is added to an untruncated result.
 
+The model-facing view omits the process and filesystem mutation receipt
+envelopes: it carries command output or mutation confirmation, a non-zero exit
+code when present, and the truncation marker when applicable. A process that
+fails without an exit code retains its terminal diagnosis. Output text is opaque;
+receipt-shaped JSON read from a file or printed by a command is not unwrapped.
+Digests, run/effect coordinates, limits and receipts remain in these durable
+events and replay unchanged. Provider output-cost accounting measures the slim
+view while preserving the journal's source-omission facts. Graph tools can use
+`evidence_from=latest_process|latest_mutation|latest_subject` to resolve this run's
+terminal journal facts without copying receipt coordinates into model context;
+the store still validates graph authority, freshness and successful exit.
+
 Applied filesystem write/create/edit/delete results carry `/effects` in the
 same order as the workspace receipt and change ledger paths:
 

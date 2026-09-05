@@ -1,0 +1,72 @@
+   Compiling num-traits v0.2.19
+   Compiling futures-util v0.3.33
+   Compiling crypto-bigint v0.7.5
+   Compiling rmp v0.8.15
+   Compiling rmp-serde v1.3.1
+   Compiling haider-protocol v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-protocol)
+   Compiling elliptic-curve v0.14.1
+   Compiling haider-platform v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-platform)
+   Compiling rfc6979 v0.6.0
+   Compiling primefield v0.14.0
+   Compiling rustls v0.23.42
+   Compiling primeorder v0.14.0
+   Compiling hyper v1.11.0
+   Compiling ecdsa v0.17.0
+   Compiling num-integer v0.1.46
+   Compiling hyper-util v0.1.20
+   Compiling moxcms v0.8.1
+   Compiling tower v0.5.3
+   Compiling tokio-rustls v0.26.4
+   Compiling ssh-encoding v0.3.0
+   Compiling image v0.25.10
+   Compiling lopdf v0.42.0
+   Compiling hyper-rustls v0.27.9
+   Compiling tower-http v0.6.11
+   Compiling num-bigint v0.4.8
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling crypto-primes v0.7.2
+   Compiling euclid v0.20.14
+   Compiling getrandom v0.2.17
+   Compiling pdf-extract v0.12.0
+   Compiling time v0.3.54
+   Compiling tempfile v3.27.0
+   Compiling ring v0.17.14
+   Compiling ssh-cipher v0.3.0
+   Compiling rsa v0.10.0-rc.18
+   Compiling reqwest v0.13.4
+   Compiling haider-accounts v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-accounts)
+   Compiling p521 v0.14.0
+   Compiling p384 v0.14.0
+   Compiling p256 v0.14.0
+   Compiling futures-executor v0.3.33
+   Compiling module-lattice v0.2.3
+   Compiling haider-provider v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-provider)
+   Compiling ml-kem v0.3.2
+   Compiling zopfli v0.8.3
+   Compiling ssh-key v0.7.0-rc.11
+   Compiling futures v0.3.33
+   Compiling haider-tools v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-tools)
+   Compiling simple_asn1 v0.6.4
+   Compiling haider-store v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-store)
+   Compiling haider-pdf v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-pdf)
+   Compiling russh-cryptovec v0.62.0
+   Compiling haider-rpc v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-rpc)
+   Compiling internal-russh-num-bigint v0.5.0
+   Compiling russh-util v0.52.0
+   Compiling russh v0.63.1
+   Compiling jsonwebtoken v9.3.1
+   Compiling haider-client v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-client)
+   Compiling haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-core)
+   Compiling zip v2.4.2
+   Compiling haider-daemon v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-daemon)
+    Finished `test` profile [unoptimized] target(s) in 2m 32s
+     Running unittests src/lib.rs (/private/tmp/haider-economydiet-target/debug/deps/haider_daemon-2a1fd606b5d2ec76)
+
+running 4 tests
+test worker::worker_tool_exposure_tests::discovery_survives_cold_journal_and_turn_setup_reduction ... ok
+test worker::worker_tool_exposure_tests::durable_discovery_requires_correlated_success_and_resets_at_new_consent_boundary ... ok
+test worker::worker_tool_exposure_tests::tier_configuration_preserves_explicit_grants_and_lockdown_allowlists ... ok
+test worker::worker_tool_exposure_tests::production_coding_surface_and_explicit_names_remain_authorized ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1072 filtered out; finished in 0.02s
+

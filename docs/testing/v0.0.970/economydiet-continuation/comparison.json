@@ -1,0 +1,59 @@
+{
+  "per_turn_fixed_overhead_tokens": {
+    "before": 14222,
+    "after": 6031,
+    "reduction_percent": 57.59386865419772
+  },
+  "system_side_tokens": {
+    "before": 5481,
+    "after": 605,
+    "reduction_percent": 88.9618682722131
+  },
+  "tool_side_tokens": {
+    "before": 8741,
+    "after": 5426,
+    "reduction_percent": 37.924722571788124
+  },
+  "manual_bytes": {
+    "before": 5162,
+    "after": 0,
+    "reduction_percent": 100.0
+  },
+  "policy_bytes": {
+    "before": 725,
+    "after": 606,
+    "reduction_percent": 16.413793103448278
+  },
+  "tool_schema_array_bytes": {
+    "before": 10705,
+    "after": 6383,
+    "reduction_percent": 40.37365716954694
+  },
+  "combined_stable_prefix_bytes": {
+    "before": 16698,
+    "after": 7062,
+    "reduction_percent": 57.70750988142292
+  },
+  "tool_result_envelope_overhead_bytes_per_result": {
+    "before": 1099.3529411764705,
+    "after": 84.11764705882354,
+    "reduction_percent": 92.34844025897587
+  },
+  "wasted_tool_call_count": {
+    "before": 0,
+    "after": 0,
+    "reduction_percent": 0
+  },
+  "task": "ahrb-harness-economy-mvp-v1",
+  "reference_tokenizer": {
+    "encoding": "o200k_base-style",
+    "version": "ahrb-o200k-base-style-bpe-v1",
+    "vocabulary_entries": 272,
+    "vocabulary_sha256": "bca069c1ed9a057d9adfd579bcaefeac940a799d27a7fd427eb83eac778fc826"
+  },
+  "model_turns": 8,
+  "unique_tool_results": 17,
+  "official_completion_before": "terminal-without-effect",
+  "official_completion_after": "terminal-without-effect",
+  "independent_effect_checks_both_pass": true
+}

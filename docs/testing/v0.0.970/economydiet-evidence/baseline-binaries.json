@@ -1,0 +1,14 @@
+{
+  "commit": "368f093c6aab5c90b408d9f9206071eb74234c77",
+  "profile": "dev opt-level=0 debug=0 incremental=0",
+  "binaries": {
+    "haider": {
+      "bytes": 110732752,
+      "sha256": "bef25e105ad1144a25081c9e91ffe802fce21a4846bc52c54ed8ebc6b9bb4f8b"
+    },
+    "haiderd": {
+      "bytes": 200566368,
+      "sha256": "80ddae4d276fd349fccf51d22134dd1e6c70d01daaf59565e45760ccf5cb38d3"
+    }
+  }
+}

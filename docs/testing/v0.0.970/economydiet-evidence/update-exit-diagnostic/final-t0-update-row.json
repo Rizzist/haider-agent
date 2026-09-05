@@ -1,0 +1,8 @@
+{
+  "artefacts": [
+    "/private/tmp/haider-probe-qa-5umy1se5/artefacts/palette-update.txt"
+  ],
+  "evidence_line": "/update activation_closure expected=true actual=false mode=live next_slot=false screen_card_change=false semantic=true surface='checking for updates' refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=false",
+  "label": "update",
+  "status": "FAIL"
+}

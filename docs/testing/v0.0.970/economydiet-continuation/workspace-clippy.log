@@ -1,0 +1,9 @@
+    Checking haider-provider v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-provider)
+    Checking haider-rpc v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-rpc)
+    Checking haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-core)
+    Checking haider-client v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-client)
+    Checking haider-tui v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-tui)
+    Checking haider-daemon v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-daemon)
+    Checking haider-cli v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-cli)
+    Checking haider-daemond v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-daemond)
+    Finished `dev` profile [unoptimized] target(s) in 2m 53s

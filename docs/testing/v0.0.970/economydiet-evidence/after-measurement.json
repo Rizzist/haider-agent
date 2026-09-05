@@ -1,0 +1,195 @@
+{
+  "combined_stable_prefix_bytes": 7062,
+  "completion": "terminal-without-effect",
+  "context_token_curve": [
+    6576,
+    22351,
+    27754,
+    30935,
+    31936,
+    32820,
+    33936,
+    35047
+  ],
+  "context_token_curve_slope": 2103.5,
+  "default_tool_names": [
+    "list_tools",
+    "todo_write",
+    "fs_read",
+    "fs_glob",
+    "fs_search",
+    "fs_write",
+    "fs_edit",
+    "process_exec"
+  ],
+  "effects_verified": false,
+  "independent_effect_evidence": {
+    "all_verified": true,
+    "available": true,
+    "checks": {
+      "captured_edit_content_sha256_matches": true,
+      "captured_edit_path_matches": true,
+      "captured_read_path_matches": true,
+      "correlated_model_readback_sha256_matches": true,
+      "external_output_sha256_matches": true,
+      "output_absent_before": true,
+      "workspace_receipt_changed": true
+    },
+    "label": "independent captured-call/model-readback/filesystem join; does not replace AHRB completion or waste metrics"
+  },
+  "independent_side_framing_note": "system/tools side counts each include their own JSON object framing; combined frames once",
+  "manual_bytes": 0,
+  "model_turns": 8,
+  "per_turn_fixed_overhead_tokens": 6031,
+  "policy_bytes": 606,
+  "python_unicode_version": "16.0.0",
+  "reference_tokenizer": {
+    "encoding": "o200k_base-style",
+    "version": "ahrb-o200k-base-style-bpe-v1",
+    "vocabulary_entries": 272,
+    "vocabulary_sha256": "bca069c1ed9a057d9adfd579bcaefeac940a799d27a7fd427eb83eac778fc826"
+  },
+  "report_sha256": "70624a6d31e56d1c6b0ffffc5976bb91ac7dfaccaf8d31a1ee0d45f73ea1b56e",
+  "schema": "haider.economydiet.measure.v1",
+  "stable_combined_sha256": "326546ab4187036d50060d6ec2fccd684e328670adc4ff4b265618dfce8852ac",
+  "stable_system_sha256": "028c78e6ce4b0a0cab97b094fb219131533f855999f0627707478cd7f9b6346c",
+  "stable_tools_sha256": "f48c03179318a619f10f1e5c14301bbb02482b4e1ce930731c52b21f21f85b63",
+  "system_content_bytes": 606,
+  "system_envelope_bytes": 670,
+  "system_identical_every_request": true,
+  "system_side_tokens": 605,
+  "task": "ahrb-harness-economy-mvp-v1",
+  "tokenizer_crosscheck": "all primary request counts and exact-prefix total match AHRB",
+  "tool_envelope_bytes": 6393,
+  "tool_result_content_bytes_per_result": 265.11764705882354,
+  "tool_result_content_bytes_total": 4507,
+  "tool_result_envelope_overhead_bytes_per_result": 84.11764705882354,
+  "tool_result_envelope_overhead_bytes_total": 1430,
+  "tool_result_envelopes": [
+    {
+      "call_id": "economy-bootstrap-a",
+      "content_bytes": 132,
+      "envelope_overhead_bytes": 0,
+      "output_bytes": 132,
+      "wire_message_bytes": 198
+    },
+    {
+      "call_id": "economy-bootstrap-b",
+      "content_bytes": 132,
+      "envelope_overhead_bytes": 0,
+      "output_bytes": 132,
+      "wire_message_bytes": 198
+    },
+    {
+      "call_id": "economy-bootstrap-c",
+      "content_bytes": 132,
+      "envelope_overhead_bytes": 0,
+      "output_bytes": 132,
+      "wire_message_bytes": 198
+    },
+    {
+      "call_id": "economy-bootstrap-d",
+      "content_bytes": 132,
+      "envelope_overhead_bytes": 0,
+      "output_bytes": 132,
+      "wire_message_bytes": 198
+    },
+    {
+      "call_id": "economy-bootstrap-e",
+      "content_bytes": 132,
+      "envelope_overhead_bytes": 0,
+      "output_bytes": 132,
+      "wire_message_bytes": 198
+    },
+    {
+      "call_id": "economy-context-a",
+      "content_bytes": 369,
+      "envelope_overhead_bytes": 143,
+      "output_bytes": 226,
+      "wire_message_bytes": 449
+    },
+    {
+      "call_id": "economy-context-b",
+      "content_bytes": 368,
+      "envelope_overhead_bytes": 143,
+      "output_bytes": 225,
+      "wire_message_bytes": 448
+    },
+    {
+      "call_id": "economy-context-c",
+      "content_bytes": 369,
+      "envelope_overhead_bytes": 143,
+      "output_bytes": 226,
+      "wire_message_bytes": 449
+    },
+    {
+      "call_id": "economy-context-d",
+      "content_bytes": 367,
+      "envelope_overhead_bytes": 143,
+      "output_bytes": 224,
+      "wire_message_bytes": 447
+    },
+    {
+      "call_id": "economy-context-e",
+      "content_bytes": 368,
+      "envelope_overhead_bytes": 143,
+      "output_bytes": 225,
+      "wire_message_bytes": 448
+    },
+    {
+      "call_id": "economy-probe-a",
+      "content_bytes": 369,
+      "envelope_overhead_bytes": 143,
+      "output_bytes": 226,
+      "wire_message_bytes": 447
+    },
+    {
+      "call_id": "economy-probe-c",
+      "content_bytes": 369,
+      "envelope_overhead_bytes": 143,
+      "output_bytes": 226,
+      "wire_message_bytes": 447
+    },
+    {
+      "call_id": "economy-probe-e",
+      "content_bytes": 368,
+      "envelope_overhead_bytes": 143,
+      "output_bytes": 225,
+      "wire_message_bytes": 446
+    },
+    {
+      "call_id": "economy-edit",
+      "content_bytes": 136,
+      "envelope_overhead_bytes": 0,
+      "output_bytes": 136,
+      "wire_message_bytes": 195
+    },
+    {
+      "call_id": "economy-verify",
+      "content_bytes": 29,
+      "envelope_overhead_bytes": 0,
+      "output_bytes": 29,
+      "wire_message_bytes": 90
+    },
+    {
+      "call_id": "economy-iterate-one",
+      "content_bytes": 368,
+      "envelope_overhead_bytes": 143,
+      "output_bytes": 225,
+      "wire_message_bytes": 450
+    },
+    {
+      "call_id": "economy-iterate-two",
+      "content_bytes": 367,
+      "envelope_overhead_bytes": 143,
+      "output_bytes": 224,
+      "wire_message_bytes": 449
+    }
+  ],
+  "tool_schema_array_bytes": 6383,
+  "tool_side_tokens": 5426,
+  "tools_identical_every_request": true,
+  "unique_tool_results": 17,
+  "wasted_tool_call_count": 0,
+  "wasted_tool_call_label": "wasted tool calls (deterministic task-proven only)"
+}

@@ -1,0 +1,30 @@
+{
+  "captures_checked": 3,
+  "all_pass": true,
+  "captures": [
+    {
+      "file": "attach-1.raw",
+      "raw_bytes": 13827,
+      "composer_preserved": true,
+      "attached_osc_removed": true,
+      "notification_osc_removed": true,
+      "no_osc_introducers": true
+    },
+    {
+      "file": "attach-2.raw",
+      "raw_bytes": 13827,
+      "composer_preserved": true,
+      "attached_osc_removed": true,
+      "notification_osc_removed": true,
+      "no_osc_introducers": true
+    },
+    {
+      "file": "attach-3.raw",
+      "raw_bytes": 13850,
+      "composer_preserved": true,
+      "attached_osc_removed": true,
+      "notification_osc_removed": true,
+      "no_osc_introducers": true
+    }
+  ]
+}

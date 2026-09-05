@@ -1,0 +1,12 @@
+{
+  "haider": {
+    "path": "/private/tmp/haider-agentcli-target/debug/haider",
+    "bytes": 112549168,
+    "sha256": "2cc8658337270716a5cd82fb4e0e3bb85e68a442739e528c72a834e53a71ddf2"
+  },
+  "haiderd": {
+    "path": "/private/tmp/haider-agentcli-target/debug/haiderd",
+    "bytes": 201719920,
+    "sha256": "4518463715f3bf9b7f3dd49926da5f5ae2abc7e61205124d56258d83d51a628c"
+  }
+}

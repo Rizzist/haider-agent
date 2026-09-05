@@ -22,6 +22,9 @@
 //! (`rescan_needed`); the durable `Queued`+`UserMessage` pair is the overflow
 //! buffer.
 
+#[path = "worker_evidence.rs"]
+mod evidence_selection;
+
 #[cfg(test)]
 #[path = "cu1_image_runtime_tests.rs"]
 mod cu1_image_runtime_tests;
@@ -46,6 +49,9 @@ mod wd_pdf_runtime_tests;
 #[cfg(test)]
 #[path = "worker_tool_catalog_tests.rs"]
 mod worker_tool_catalog_tests;
+#[cfg(test)]
+#[path = "worker_tool_exposure_tests.rs"]
+mod worker_tool_exposure_tests;
 #[cfg(test)]
 #[path = "worker_turn_setup_reduction_tests.rs"]
 mod worker_turn_setup_reduction_tests;
@@ -452,6 +458,7 @@ fn lockdown_pair_switch_allowed(
     switch.from_provider == switch.to_provider || (!source_lockdown && !target_lockdown)
 }
 
+#[derive(Clone)]
 struct DaemonContextCompactor {
     store: HubStoreHandle,
     provider: Arc<dyn Provider>,
@@ -1459,6 +1466,19 @@ fn workflow_unfinished_error(graph_id: &GraphId, state_digest: &str) -> HaiderEr
 
 #[async_trait]
 impl ContextCompactor for DaemonContextCompactor {
+    fn with_tool_definitions(
+        &self,
+        tools: Arc<[ToolDefinition]>,
+    ) -> Option<Arc<dyn ContextCompactor>> {
+        let mut rebound = self.clone();
+        rebound.post_compaction_tool_digest = canonical_tool_definitions_digest(&tools);
+        if let Some(boundaries) = &mut rebound.usage_scope.cache_boundaries {
+            boundaries.tool_pack = rebound.post_compaction_tool_digest.clone();
+        }
+        rebound.post_compaction_tools = tools;
+        Some(Arc::new(rebound))
+    }
+
     async fn plan(
         &self,
         run_id: &RunId,
@@ -2533,6 +2553,13 @@ pub struct WorkerToolContext {
 pub trait TurnToolFactory: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
 
+    /// An injected factory's declared surface is explicit configuration.
+    /// The production broker opts into coding-tier discovery; `Some(names)`
+    /// adds names to that tier, while `None` exposes the authorized catalog.
+    fn initial_tool_exposure(&self) -> Option<Vec<String>> {
+        None
+    }
+
     /// Immutable definition storage for turn-time filtering. Injected
     /// factories retain the owned compatibility hook above; the production
     /// registry overrides this so nested schemas are not rebuilt before every
@@ -2631,6 +2658,59 @@ impl Default for DaemonDependencies {
     }
 }
 
+impl DaemonDependencies {
+    /// Configures the provider-facing surface without changing any tool
+    /// grant or permission. `None` selects the full authorized catalog.
+    #[must_use]
+    pub fn with_tool_exposure(mut self, names: Option<Vec<String>>) -> Self {
+        self.tool_factory = Arc::new(ConfiguredToolExposureFactory {
+            inner: self.tool_factory,
+            names,
+        });
+        self
+    }
+}
+
+struct ConfiguredToolExposureFactory {
+    inner: Arc<dyn TurnToolFactory>,
+    names: Option<Vec<String>>,
+}
+
+#[async_trait]
+impl TurnToolFactory for ConfiguredToolExposureFactory {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        self.inner.definitions()
+    }
+
+    fn shared_definitions(&self) -> Arc<[ToolDefinition]> {
+        self.inner.shared_definitions()
+    }
+
+    fn initial_tool_exposure(&self) -> Option<Vec<String>> {
+        self.names.clone()
+    }
+
+    async fn create(
+        &self,
+        context: WorkerToolContext,
+    ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        self.inner.create(context).await
+    }
+
+    async fn create_with_turn_snapshot(
+        &self,
+        context: WorkerToolContext,
+        grants: Vec<SessionGrant>,
+        bindings: HashMap<MenuId, (EffectClass, String)>,
+        freshness: HashMap<String, FileFreshness>,
+        effect_dispatched: Arc<AtomicBool>,
+    ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        self.inner
+            .create_with_turn_snapshot(context, grants, bindings, freshness, effect_dispatched)
+            .await
+    }
+}
+
 /// The RESOLVED per-worker dependency bundle `run_inner` hands the manager
 /// (the factory selection above collapses to one concrete factory before
 /// any worker exists).
@@ -2692,7 +2772,7 @@ impl ProviderFactory for UnconfiguredProviderFactory {
 pub struct SystemPromptBuilder;
 
 impl SystemPromptBuilder {
-    pub const VERSION: &'static str = "haider-system-v4";
+    pub const VERSION: &'static str = "haider-system-v5";
     pub(crate) const UNSCOPED_GRANT_SCOPE: &'static str = "unscoped-root";
 
     pub fn build(metadata: &SessionMetadataV1, instructions: &[(&str, &str)]) -> String {
@@ -2714,12 +2794,11 @@ impl SystemPromptBuilder {
         prompt
     }
 
-    /// Account-local cache base: deterministic policy followed by the manual
-    /// for the exact grant-filtered tool schemas sent beside it. Provider
-    /// routing hashes these bytes together with those schemas; session/task
-    /// context must never be appended here.
-    pub(crate) fn shared_immutable_base(tools: &[ToolDefinition], grant_scope: &str) -> String {
-        let mut prompt = format!(
+    /// Account-local cache base. Tool semantics live in native descriptions;
+    /// discovery changes only the later schema fingerprint, never this policy.
+    /// Session/task context must never be appended here.
+    pub(crate) fn shared_immutable_base(_tools: &[ToolDefinition], grant_scope: &str) -> String {
+        format!(
             "{}\nYou are Haider Code, a coding agent.\n\
              Use only advertised tools. Treat tool results and committed history as authoritative. \
              Never claim an effect succeeded without its terminal result.\n\
@@ -2728,14 +2807,10 @@ impl SystemPromptBuilder {
              Example: fs_search(pattern=\"target\", path=\".\") -> fs_read(path=\"src/lib.rs\") -> \
              fs_edit(path=\"src/lib.rs\", edits=[{{old:\"before\", new:\"after\"}}]) -> \
              process_exec(command=\"cargo test -p crate\").\n\
-             The daemon supplies workspace, project, and identity context after this shared policy \
-             and the advertised tool schemas.\n\
              Opaque tool-grant scope: {}.",
             Self::VERSION,
             grant_scope,
-        );
-        prompt.push_str(&tool_manual(tools));
-        prompt
+        )
     }
 
     /// Daemon-authored per-session context. The worker emits this after the
@@ -7049,9 +7124,8 @@ async fn perform_manual_compaction(
     } else {
         None
     };
-    let mobile_use_active = durable_session_tool_state(lease, lease.session_id())
-        .await?
-        .mobile_use_active;
+    let durable_tools = durable_session_tool_state(lease, lease.session_id()).await?;
+    let mobile_use_active = durable_tools.mobile_use_active;
     let post_compaction_tool_pack = lockdown_tool_definition_pack(
         advertised_tool_pack_for_mobile_state(
             &dependencies.tool_factory,
@@ -7062,8 +7136,23 @@ async fn perform_manual_compaction(
         ),
         lockdown.as_ref().map(|turn| turn.tools_allowed.as_slice()),
     );
-    let post_compaction_tools = Arc::clone(&post_compaction_tool_pack.definitions);
-    let post_compaction_tool_digest = post_compaction_tool_pack.digest.clone();
+    let mut post_compaction_config = HarnessConfig::for_session(
+        lease.session_id().clone(),
+        device_id.clone(),
+        0,
+        lease.worker_generation(),
+    );
+    post_compaction_config.tools = post_compaction_tool_pack.definitions.as_ref().to_vec();
+    if let Some(configured) = initial_tool_exposure_for_turn(
+        dependencies.tool_factory.as_ref(),
+        grant,
+        lockdown.is_some(),
+        durable_tools.promoted_tools,
+    ) {
+        post_compaction_config.enable_tool_discovery(configured);
+    }
+    let post_compaction_tools = post_compaction_config.shared_tool_definitions();
+    let post_compaction_tool_digest = post_compaction_config.canonical_tool_pack_digest();
     let post_compaction_grant_scope = cache_grant_scope_digest(grant)?;
     let post_compaction_system_prompt = SystemPromptBuilder::shared_immutable_base(
         post_compaction_tools.as_ref(),
@@ -8794,6 +8883,7 @@ async fn start_turn(
         bindings: durable_bindings,
         freshness: durable_freshness,
         mobile_use_active,
+        promoted_tools,
     } = setup_reduction.durable_tool_state();
     let effect_dispatched = Arc::new(AtomicBool::new(false));
     let dispatcher = if let Some(unavailable) = workspace_unavailable.clone() {
@@ -8979,8 +9069,16 @@ async fn start_turn(
         },
     );
     config.install_shared_tool_packs(shared_tool_packs.as_ref().clone(), &provider_request_state);
-    // Cache prefix law: common policy + the manual for the exact advertised
-    // schema pack are the complete system prompt. Session/task/identity state
+    if let Some(configured) = initial_tool_exposure_for_turn(
+        dependencies.tool_factory.as_ref(),
+        provider_grant,
+        lockdown.is_some(),
+        promoted_tools,
+    ) {
+        config.enable_tool_discovery(configured);
+    }
+    // Cache prefix law: common policy is the complete system prompt; native
+    // semantics follow in the advertised schemas. Session/task/identity state
     // follows as a volatile user message, after providers have rendered the
     // tool schemas. Sibling sessions may retain a byte-identical base, while
     // the provider cache route remains session-isolated unless C3 proves an
@@ -9392,6 +9490,7 @@ const TURN_SETUP_REDUCTION_PAYLOAD_KINDS: &[&str] = &[
     "usage",
     "node_committed",
     "item",
+    "tool_result",
     "session_forked",
 ];
 
@@ -9658,6 +9757,7 @@ impl TurnSetupReduction {
                     | "usage"
                     | "node_committed"
                     | "item"
+                    | "tool_result"
             )
         ) {
             return Ok(());
@@ -13116,6 +13216,7 @@ impl BrokerToolFactory {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RegisteredToolRoute {
     RequestInput,
+    ListTools,
     Plan,
     LoomRegister,
     TodoWrite,
@@ -13385,6 +13486,21 @@ fn registered_manifest(
 fn build_registered_tools() -> Vec<RegisteredTool> {
     vec![
         registered_tool(
+            ToolDefinition {
+                name: "list_tools".into(),
+                description: "Discover the authorized tool catalog. With no filter, list tool names. With a name or keyword filter, describe matching tools and enable them for the rest of this session; one call is sufficient. Does not grant permissions.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"filter": {"type": "string", "maxLength": 128}},
+                    "additionalProperties": false
+                }),
+            },
+            vec![],
+            DispatchMode::Await,
+            ToolPermissionDefault::NotApplicable,
+            RegisteredToolRoute::ListTools,
+        ),
+        registered_tool(
             request_input_definition(),
             vec![],
             DispatchMode::Await,
@@ -13601,6 +13717,38 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
             RegisteredToolRoute::SshShell,
         ),
     ]
+}
+
+fn configured_tool_exposure(value: Option<&str>) -> Option<Vec<String>> {
+    let names = value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if names
+        .iter()
+        .any(|name| name == "*" || name.eq_ignore_ascii_case("all"))
+    {
+        None
+    } else {
+        Some(names)
+    }
+}
+
+fn initial_tool_exposure_for_turn(
+    factory: &dyn TurnToolFactory,
+    grant: Option<&Grant>,
+    lockdown: bool,
+    promoted: Vec<String>,
+) -> Option<Vec<String>> {
+    if grant.is_some() || lockdown {
+        return None;
+    }
+    let mut configured = factory.initial_tool_exposure()?;
+    configured.extend(promoted);
+    Some(configured)
 }
 
 /// The single daemon-owned public tool registry. Provider definitions,
@@ -14368,21 +14516,36 @@ fn bounded_search_preview(text: String) -> (String, bool) {
     }
 }
 
-/// Instruct-pipe stub of a tool's JSON Schema (LW-IP). Native tool-calling
-/// still needs the STRUCTURE — object-ness, property types, `required`, and
-/// `enum` value sets are what a provider validates a tool call against — so
-/// those are kept; everything a provider merely DISPLAYS to the model
-/// (per-property `description`s) and every bound the daemon re-enforces server
-/// side (`minLength`/`maxLength`/`minimum`/`pattern`/`additionalProperties`/
-/// combinators) is dropped from the wire and moved, in compact prose, into the
-/// system-prompt tool manual. The recursion keeps nested `properties`/`items`
-/// so array-of-object and nested-object shapes still guide the model.
+/// Compact native schema. Keep call constraints and parameter semantics:
+/// with no duplicate manual these are the model's only bound disclosures.
+/// Presentation metadata such as titles/examples is omitted.
 pub(crate) fn stub_schema(schema: &serde_json::Value) -> serde_json::Value {
     let serde_json::Value::Object(map) = schema else {
         return schema.clone();
     };
     let mut out = serde_json::Map::new();
-    for key in ["type", "enum", "required"] {
+    for key in [
+        "type",
+        "enum",
+        "required",
+        "description",
+        "minimum",
+        "maximum",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "pattern",
+        "default",
+        "additionalProperties",
+        "anyOf",
+        "oneOf",
+        "allOf",
+        "not",
+        "if",
+        "then",
+        "else",
+    ] {
         if let Some(value) = map.get(key) {
             out.insert(key.to_owned(), value.clone());
         }
@@ -14400,14 +14563,9 @@ pub(crate) fn stub_schema(schema: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
-/// The one authoritative line for a tool in the system-prompt manual: a typed
-/// signature (`?` = optional, `∈` lists an enum's values) plus only the
-/// semantics a caller cannot infer from the argument name. Deliberately terse
-/// — the point of the instruct pipe is to carry meaning without JSON-Schema
-/// syntax tax. `None` only guards an unknown name — every advertised tool is
-/// described here (including `computer`, whose stub schema the generic/Gemini
-/// path leans on this manual to explain; native providers substitute their own
-/// computer tool and ignore both).
+/// Compact usage source retained from the former manual. Only the semantic
+/// suffix is sent as a native description; signatures are never duplicated in
+/// the system prompt. Actbias tools keep their original native descriptions.
 pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
     // Enum-valued arguments are NOT enumerated here — the stub schema still
     // carries their allowed values, so listing them again would be dead weight.
@@ -14483,7 +14641,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
             "todo_write(items:[{id, text, state, dep?}]) — REPLACE the whole todo list with the complete plan; keep exactly one item processing; dep = id this item is blocked on"
         }
         "graph_evidence" => {
-            "graph_evidence(graph_id, node, verdict, detail, slot?, subject_digest?, signal?, workspace_mutation?) — attest an open obligation; node must equal an open obligation; signal/workspace_mutation carry daemon provenance for verified slots"
+            "graph_evidence(graph_id, node, verdict, detail, slot?, evidence_from?, subject_digest?, signal?, workspace_mutation?) — attest an open obligation; use evidence_from=latest_process or latest_mutation for verified slots, latest_subject for model testimony; the daemon resolves this run's latest durable evidence and validates freshness; explicit references cannot be combined with evidence_from"
         }
         "workflow_author" => {
             "workflow_author(template) — replace this workflow child's initial graph with one bounded validated DAG (template: name, version, start_node, nodes)"
@@ -14501,11 +14659,6 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
     })
 }
 
-/// Builds the system-prompt tool manual for exactly the tools advertised this
-/// turn (the grant/provider-filtered set), so a child or a provider that sheds
-/// a tool never sees a signature for one it cannot call. Returns `""` when no
-/// advertised tool is manual-described (e.g. a computer-only child), leaving
-/// the base prompt byte-identical.
 /// C1 — compact metadata for a pinned Loom workflow. Typed-node selection is
 /// performed by the daemon before provider dispatch; this volatile tail is
 /// only an honest description of the frozen node/type map.
@@ -14538,42 +14691,19 @@ pub(crate) fn loom_run_tail(workflow: &haider_protocol::loom::LoomWorkflow) -> S
         .map_or(tail, |elided| elided.text)
 }
 
-pub(crate) fn tool_manual(tools: &[ToolDefinition]) -> String {
-    let lines: Vec<&str> = tools
-        .iter()
-        .filter_map(|tool| tool_manual_line(&tool.name))
-        .collect();
-    if lines.is_empty() {
-        return String::new();
-    }
-    let mut manual = String::from(
-        "\n\nTool manual — authoritative call signatures (? marks an optional argument). \
-         Each tool's schema lists any enum values and the daemon enforces every argument bound; \
-         call tools through the native tool interface:",
-    );
-    for line in lines {
-        manual.push_str("\n- ");
-        manual.push_str(line);
-    }
-    manual
-}
-
 fn provider_definition(manifest: &ToolManifest) -> ToolDefinition {
-    // Instruct pipe: the wire carries a tool's NAME, a minimal stub schema
-    // (structure + enums), and concise native prose only for the action-critical
-    // search/mutation surface. Detailed semantics and every per-property
-    // description live in the single system-prompt tool manual, avoiding the
-    // full JSON-Schema syntax tax on every tool, every turn. `computer` remains
-    // stubbed: Anthropic/OpenAI substitute their native computer tool, while
-    // generic/Gemini is covered by the manual and daemon argument checks.
+    // One native description per tool, with structural schemas. Preserve the
+    // actbias what/when descriptions verbatim. Other tools inherit the former
+    // manual's semantics without repeating signatures already in the schema.
     let description = match manifest.name.as_str() {
         // Act-bias: keep the model-native discovery and mutation affordances
-        // self-explanatory. The manual remains the authority for signatures,
-        // bounds, and less common semantics.
+        // self-explanatory. These descriptions are pinned verbatim.
         "fs_glob" | "fs_search" | "fs_write" | "fs_edit" | "write" | "edit" | "fs_path" => {
             manifest.description.clone()
         }
-        _ => String::new(),
+        _ => tool_manual_line(&manifest.name)
+            .and_then(|line| line.split_once(" — ").map(|(_, usage)| usage.to_owned()))
+            .unwrap_or_else(|| manifest.description.clone()),
     };
     ToolDefinition {
         name: manifest.name.clone(),
@@ -15118,6 +15248,10 @@ impl ToolDispatcher for WorkspaceUnavailableToolDispatcher {
 
 #[async_trait]
 impl TurnToolFactory for BrokerToolFactory {
+    fn initial_tool_exposure(&self) -> Option<Vec<String>> {
+        configured_tool_exposure(std::env::var("HAIDER_TOOL_EXPOSURE").ok().as_deref())
+    }
+
     fn definitions(&self) -> Vec<ToolDefinition> {
         registered_provider_definitions().as_ref().to_vec()
     }
@@ -15137,6 +15271,7 @@ impl TurnToolFactory for BrokerToolFactory {
             bindings,
             freshness,
             mobile_use_active: _,
+            ..
         } = durable_tool_state;
         self.create_with_turn_snapshot(
             context,
@@ -15194,6 +15329,7 @@ impl TurnToolFactory for InjectedComputerBrokerToolFactory {
             bindings,
             freshness,
             mobile_use_active: _,
+            ..
         } = durable_tool_state;
         self.create_with_turn_snapshot(
             context,
@@ -15249,6 +15385,7 @@ impl TurnToolFactory for InjectedMobileBrokerToolFactory {
             bindings,
             freshness,
             mobile_use_active: _,
+            ..
         } = durable_tool_state;
         self.create_with_turn_snapshot(
             context,
@@ -18023,6 +18160,23 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 };
                 request.graph_id = Some(status.graph_id);
             }
+            if let Err(error) = evidence_selection::resolve(
+                &self.output.store,
+                &self.session_id,
+                run_id,
+                &mut request,
+            )
+            .await
+            {
+                if error.code != ErrorCode::InvalidArgument {
+                    return Err(error);
+                }
+                return Ok(ToolDispatchResult::Completed(graph_evidence_rejection(
+                    error.code,
+                    &error.message,
+                    Some("evidence_source_unavailable"),
+                )));
+            }
             let request_json = serde_json::to_string(&request).map_err(|error| {
                 HaiderError::new(
                     ErrorCode::Internal,
@@ -20070,6 +20224,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 .await
             }
             RegisteredToolRoute::RequestInput
+            | RegisteredToolRoute::ListTools
             | RegisteredToolRoute::Plan
             | RegisteredToolRoute::TodoWrite
             | RegisteredToolRoute::GraphEvidence
@@ -20365,6 +20520,7 @@ pub(crate) struct DurableToolState {
     pub(crate) bindings: HashMap<MenuId, (EffectClass, String)>,
     pub(crate) freshness: HashMap<String, FileFreshness>,
     pub(crate) mobile_use_active: bool,
+    pub(crate) promoted_tools: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -20376,6 +20532,8 @@ struct DurableToolStateReduction {
     freshness: HashMap<String, FileFreshness>,
     explicit_computer_intent: bool,
     mobile_use_active: bool,
+    discovery_calls: HashSet<String>,
+    promoted_tools: BTreeSet<String>,
 }
 
 impl DurableToolStateReduction {
@@ -20386,21 +20544,55 @@ impl DurableToolStateReduction {
     /// `SessionMetadataV1` and are applied separately by
     /// `effective_permission_defaults`.
     fn reset_at_session_fork(&mut self) {
+        self.reset_workspace_consent();
+        self.promoted_tools.clear();
+    }
+
+    fn reset_workspace_consent(&mut self) {
         self.intents.clear();
         self.opened.clear();
         self.grants.clear();
         self.bindings.clear();
         self.explicit_computer_intent = false;
         self.mobile_use_active = false;
+        self.discovery_calls.clear();
     }
 
     fn reset_at_workspace_selection(&mut self) {
-        self.reset_at_session_fork();
+        // Discovery changes presentation only and lasts for this session.
+        // The new root still requires fresh permission/capability consent.
+        self.reset_workspace_consent();
         self.freshness.clear();
     }
 
     fn observe(&mut self, agent_id: Option<&AgentId>, payload: &EventPayload) {
         match payload {
+            EventPayload::Item(ItemEvent::Started {
+                item: TurnItem::ToolCall { call_id, name, .. },
+                ..
+            }) if name == "list_tools" => {
+                self.discovery_calls.insert(call_id.clone());
+            }
+            EventPayload::ToolResult { call_id, result } => {
+                if self.discovery_calls.remove(call_id)
+                    && result.status == ToolResultStatus::Completed
+                    && let Some(haider_protocol::tool::ToolResultData::ToolsDiscovered { promoted }) =
+                        &result.data
+                {
+                    self.promoted_tools.extend(
+                        promoted
+                            .iter()
+                            .filter(|name| registered_tool_by_name(name).is_some())
+                            .cloned(),
+                    );
+                }
+            }
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::ToolCall { call_id, .. },
+                ..
+            }) => {
+                self.discovery_calls.remove(call_id);
+            }
             EventPayload::Effect(EffectPhase::Intent(intent)) => {
                 self.intents.insert(intent.effect.clone(), intent.clone());
             }
@@ -20459,6 +20651,13 @@ impl DurableToolStateReduction {
 
     fn snapshot(&self) -> DurableToolState {
         let mut grants = self.grants.clone();
+        let mut promoted_tools = self.promoted_tools.clone();
+        if self.explicit_computer_intent {
+            promoted_tools.insert("computer".to_owned());
+        }
+        if self.mobile_use_active {
+            promoted_tools.insert("mobile".to_owned());
+        }
         if self.explicit_computer_intent && explicit_computer_auto_grant_enabled() {
             add_explicit_computer_session_grants(&mut grants);
         }
@@ -20467,6 +20666,7 @@ impl DurableToolStateReduction {
             bindings: self.bindings.clone(),
             freshness: self.freshness.clone(),
             mobile_use_active: self.mobile_use_active,
+            promoted_tools: promoted_tools.into_iter().collect(),
         }
     }
 }
@@ -20539,6 +20739,19 @@ pub(crate) async fn durable_session_tool_state(
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
         for envelope in page {
+            if envelope
+                .payload
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                == Some("workspace_selected")
+                && matches!(
+                    WorkspaceEventPayload::from_payload_value(&envelope.payload),
+                    Some(WorkspaceEventPayload::WorkspaceSelected(_))
+                )
+            {
+                reduction.reset_at_workspace_selection();
+                continue;
+            }
             if envelope
                 .payload
                 .get("type")

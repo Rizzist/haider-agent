@@ -40,8 +40,8 @@ class AgentCliCheckTests(unittest.TestCase):
         documents = [spawn or self.spawn, wait or self.wait]
         commands = []
 
-        def run_haider(args, *, timeout):
-            commands.append((args, timeout))
+        def run_haider(args, *, timeout, env_overrides=None):
+            commands.append((args, timeout, env_overrides))
             return SimpleNamespace(
                 stdout=json.dumps(documents.pop(0)) + "\n", stderr="", returncode=0, timed_out=False
             )
@@ -60,9 +60,11 @@ class AgentCliCheckTests(unittest.TestCase):
         self.assertEqual(self.check.budget.milliseconds, 288_000)
         self.assertEqual(len(commands), 2)
         self.assertEqual(commands[0][0][:2], ["agent", "spawn"])
+        self.assertEqual(commands[0][2], {"HAIDER_TOOL_EXPOSURE": "spawn_subagent"})
         self.assertEqual(commands[1][0][:4], ["agent", "wait", "parent-session", "child-agent"])
+        self.assertIsNone(commands[1][2])
         self.assertIn("--no-spawn", commands[1][0])
-        self.assertTrue(all(timeout.seconds == 102 for _, timeout in commands))
+        self.assertTrue(all(timeout.seconds == 102 for _, timeout, _ in commands))
 
     def test_result_without_durable_anchors_or_nonce_cannot_pass(self):
         mutations = [

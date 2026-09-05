@@ -278,6 +278,26 @@ class LoaderContractTests(unittest.TestCase):
         self.assertTrue(all("pty" in check.needs for check in checks))
         self.assertEqual(checks[-1].expected_fail_until, "0.0.968")
 
+    def test_monitor_activation_requires_new_command_owned_controls(self):
+        check = load_check(
+            runner.CHECK_ROOT / "t0" / "t0.tui.palette_activation_closure.py", "t0"
+        )
+        module = check.module
+        baseline = "message haider"
+        overlay = (
+            "monitors  ↑↓/jk select · x stop · p pause · t trigger · e edit · y copy id · esc\n"
+            "no active monitors"
+        )
+        self.assertIsNotNone(module._signature(
+            "monitors", baseline, overlay, module.SURFACE_SIGNATURES
+        ))
+        self.assertIsNone(module._signature(
+            "monitors", baseline, baseline + "\nmonitors", module.SURFACE_SIGNATURES
+        ))
+        self.assertIsNone(module._signature(
+            "monitors", overlay, overlay, module.SURFACE_SIGNATURES
+        ))
+
     def test_tui_body_diff_excludes_only_footer_and_snapshot_names_actual_deltas(self):
         before = Frame(80, 4, b"", {1: "card", 2: "composer", 4: "old flash"})
         footer_only = Frame(80, 4, b"", {1: "card", 2: "composer", 4: "new flash"})

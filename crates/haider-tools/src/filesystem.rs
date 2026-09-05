@@ -414,7 +414,7 @@ pub fn fs_glob_manifest() -> ToolManifest {
         input_schema: json!({
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "minLength": 1, "maxLength": GLOB_PATTERN_MAX_BYTES},
+                "pattern": {"type": "string", "minLength": 1, "maxLength": GLOB_PATTERN_MAX_BYTES, "description": ".git paths are always excluded"},
                 "path": {"type": "string", "minLength": 1},
                 "respect_gitignore": {"type": "boolean", "default": true},
                 "include_hidden": {"type": "boolean", "default": false}
@@ -515,7 +515,7 @@ pub fn fs_edit_manifest() -> ToolManifest {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "old": {"type": "string", "minLength": 1},
+                            "old": {"type": "string", "minLength": 1, "description": "Must match uniquely unless replace_all is true"},
                             "new": {"type": "string"},
                             "replace_all": {"type": "boolean"}
                         },
@@ -541,7 +541,7 @@ pub fn fs_path_manifest() -> ToolManifest {
             "properties": {
                 "operation": {"type": "string", "enum": ["move", "delete", "copy"]},
                 "source": {"type": "string", "minLength": 1},
-                "destination": {"type": "string", "minLength": 1},
+                "destination": {"type": "string", "minLength": 1, "description": "Required for move and copy"},
                 "overwrite": {"type": "boolean"}
             },
             "required": ["operation", "source"],

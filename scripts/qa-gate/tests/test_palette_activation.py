@@ -76,6 +76,7 @@ class PaletteActivationTests(unittest.TestCase):
             ("session ready", "session ready\n/monitors"),
             ("session ready", "session ready\nno active monitors"),
             ("session ready", "monitors · x stop · p pause · t trigger"),
+            ("session ready", card),
             (card, card),
         ):
             with self.subTest(before=before, after=after):

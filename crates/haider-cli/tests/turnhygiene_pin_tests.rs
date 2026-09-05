@@ -986,10 +986,24 @@ fn provider_request_body_is_budget_independent_and_matches_the_golden_ledger() {
     let body: serde_json::Value = serde_json::from_slice(&bodies[0]).expect("chat body JSON");
     assert_eq!(body["model"], PROXY_MODEL);
     assert_eq!(body["stream"], true);
-    assert!(
+    assert_eq!(
         body["tools"]
             .as_array()
-            .is_some_and(|tools| tools.len() > 10)
+            .expect("native tool array")
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().expect("tool name"))
+            .collect::<Vec<_>>(),
+        [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec",
+        ],
+        "cold, warm and budgeted coding turns retain the exact core tier"
     );
     assert_golden(
         "provider_request_no_budget.json",

@@ -1,0 +1,60 @@
+[ ← main ]     ▄▄  ██   ▄▄  ▀▀▀▀▀██▄  haider v0.0.969 · /private/tmp/haider-probe-qa-yndl_t_m/w                       
+            ▄▄█▀  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀  session ▸   · branch main · test-mac                                            
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+─────────────────────────────────────────────────────────────────────────────────────────────── claude-opus-5 · api ──
+monitors  ↑↓/jk select · x stop · p pause · t trigger · e edit · y copy id · esc                                      
+  no active monitors                                                                                                  
+                                                                                                                      
+ [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 4.1k  · main                                                                      
+[ ← main ]     ▄▄  ██   ▄▄  ▀▀▀▀▀██▄  haider v0.0.969 · /private/tmp/haider-prob
+            ▄▄█▀  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀  session ▸   · branch main · test-mac      
+────────────────────────────────────────────────────────────────────────────────
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+───────────────────────────────────────────────────────── claude-opus-5 · api ──
+monitors  ↑↓/jk select · x stop · p pause · t trigger · e edit · y copy id · esc
+  no active monitors                                                            
+                                                                                
+ [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 4.1k  · main                                

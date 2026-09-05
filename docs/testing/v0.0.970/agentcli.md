@@ -274,3 +274,112 @@ noise**. It independently confirms the final 15/15 T0 report, all 15 daemon
 cleanup proofs, 105 unique naturally exited TUI processes, matching frozen
 binary hashes, all 49 source hashes, and the Rust gate totals. No blocker
 remains. All lane changes and supplied evidence remain uncommitted.
+
+## Merge with local wave-970
+
+The orchestrator began this merge from agentcli `3b2293e9` into the local
+wave-970 integration tip `471b9d68` (economydiet, xplatfix, and gitignore).
+Resolution uses file edits only; the merge index and commit remain owned by
+the orchestrator. No Git mutation command was run. The following five files
+were resolved:
+
+- `crates/haider-daemon/src/subagent_core_tests.rs`: retain all agentcli public
+  workflow/restart tests and the wave's explicit delegation tool factory,
+  including its callers and the surrounding platform guards. Helper signatures
+  were reread; a union audit finds all 49 ours / 45 theirs named free functions
+  among the 50 merged functions.
+- `scripts/qa-gate/CI_REGISTRY_WALK_QAGATE3.md`: retain every row from both
+  sides, sorting the combined conflicting walks by first registry number.
+  Historical lane gate evidence remains labeled separately.
+- `scripts/qa-gate/checks/t0/t0.tui.palette_activation_closure.py`: require the
+  native monitor selector header, stop/pause/trigger controls, and empty-state
+  content. Narrow cards legitimately clip the trailing copy-ID control. The
+  existing positive wide/narrow cases remain, with a new negative subcase for
+  a lookalike card lacking the native selector header.
+- `scripts/tui-probes/probelib.py`: preserve BEL/ST and multiline OSC handling,
+  and refuse to consume a later painted frame after an unterminated OSC.
+  Both sides' parser regression tests remain present.
+- `test-baseline.txt`: select the ours baseline, then regenerate with
+  `cargo run -q -p xtask -- test-count --update`: ours 4,995 / theirs 4,997
+  becomes **5,026**. No JSON or JSONL golden was conflicted or hand-merged.
+
+The additional CLI-test-only cleanup correction captures a retained kernel
+process identity while the status-owned daemon is still live, then awaits its
+exit within the remainder of the existing 20s stop + 2s observation bound.
+The same-PID `stopped_cleanly` and `process_exited` receipts remain required;
+Windows additionally checks xplatfix's `haider_platform::process_exists`.
+An initial missing-PID recapture candidate exposed macOS's wrapped ESRCH error
+and was replaced, rather than treating arbitrary query failures as absence.
+Windows/Linux behavior is by inspection; execution here is macOS arm64.
+
+The first verifier suggestion to explicitly expose `request_input` in the
+agentcli fixture was rejected after tracing the delegated child's grant: it
+already receives the granted tool catalog. No `request_input` override remains.
+
+The first full workspace run failed only the agentcli integration target
+(1/11 passed): nine scenarios hit the incoming default `spawn_subagent`
+exposure ceiling, and one hit the initial cleanup helper's wrapped ESRCH.
+All other workspace targets passed; the failed log is retained. Following
+the wave's authority, successful CLI and T0 fixtures explicitly start their
+daemons with `HAIDER_TOOL_EXPOSURE=spawn_subagent`. Product code is unchanged.
+The public contracts now document this daemon startup prerequisite and that
+changing a later CLI's environment does not reconfigure a running daemon.
+A new twelfth CLI test pins the unconfigured daemon's exact exit-70 typed
+refusal, preserved parent coordinates, no child, and zero provider requests.
+The corrected suite passes **12/12**, preserving all original 11 scenarios.
+The authoritative recount after this new regression is **5,026 → 5,027**.
+The T0 unit fixture also pins the explicit exposure setting; its initial
+missing-keyword-argument failure is retained with the corrected rerun.
+
+Fresh verification evidence is retained in
+[agentcli-merge-wave-970](agentcli-merge-wave-970/). Build-capable commands use
+`RUST_MIN_STACK=8388608 HAIDER_DISCOVERY_DISABLED=1
+HAIDER_TEST_DEVICE_NAME=test-mac CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
+HAIDER_TEST_SIBLINGS_PREBUILT=1 CARGO_BUILD_JOBS=4`, preserving
+`CARGO_TARGET_DIR=/private/tmp/haider-agentcli-target`; local test threads are
+four and `TMPDIR=/tmp`. Every command records `df -m /` with the 700 MiB floor.
+The initial prebuild `haiderd` was 201,719,920 bytes, exceeding 10 MiB.
+Cargo's subsequent workspace build produced different sibling hashes, so
+fresh binaries were frozen after all Cargo steps for the live T0 checks.
+The final frozen/current `haiderd` is **201,706,240 bytes**. Both frozen
+binaries match the final target executables; their hashes and actual inherited
+0.0.969 version output are retained in
+[the final binary manifest](agentcli-merge-wave-970/t0/binaries.json).
+
+All required final gates pass:
+
+| Executed command/check | Final result |
+| --- | --- |
+| `cargo test -q --workspace --no-fail-fast` | Exit 0; 5,459 summed libtest passes, 0 failures, 13 pre-existing ignores. |
+| `cargo clippy --workspace --tests -- -D warnings` | Exit 0. |
+| `cargo test -q -p haider-cli --test agent_cli_tests` | Exit 0; 12/12, comprising the original 11 plus the default-exposure refusal regression. |
+| `cargo run -q -p xtask -- test-count --update` | Exit 0; final authoritative baseline 5,027. |
+| `instruct_pipe_shrinks_the_advertised_wire_pack` with `--nocapture` | Exit 0; merged pin 5,670 → 5,670 bytes (pre-diet history: 13,552 → 5,670), 30 registered / 8 advertised, 606 policy bytes, 1,490 native-description bytes. |
+| `python3 scripts/qa-gate/runner.py test` | Exit 0; 77/77, including both sides' OSC and palette cases plus the explicit spawn-exposure pin. |
+| `python3 scripts/tui-probes/probelib_tests.py` | Exit 0; 4/4. |
+| `t0.agent.spawn_result` | PASS; child done, ChildResult seq 30 / terminal seq 20; owned daemon PID 90573 stopped cleanly and absent. |
+| `t0.tui.palette_activation_closure` | PASS; all 43 evidence rows, including exact native monitor anatomy at 118×36 and 80×24; owned daemon PID 90578 stopped cleanly and absent. |
+| `cargo fmt --all -- --check`, `git diff --check`, unsafe-count gate | Exit 0; unsafe totals remain production=189 / test=20. |
+| `grep -rl '^<<<<<<<' crates docs scripts test-baseline.txt` | No output (grep exit 1, meaning no matches). |
+
+The workspace totals include nested subprocess summaries and multiply included
+modules; they are not the unique source-test baseline. Live T0 checks are
+focused correctness checks, not a full-tier rerun or a latency measurement.
+The [command ledgers and logs](agentcli-merge-wave-970/) retain exact arguments,
+ENV LAW, disk checks, exits, failed first attempts, source hashes, and both
+focused T0 rows. The scripts used to execute the ledgers and focused checks
+are copied there for reproducibility. No incoming JSON/JSONL golden needed
+conflict regeneration; the full workspace tests validate the merged fixtures.
+
+Independent merge-verifier tally: **findings=3, real=2, noise=1**. The real
+findings changed the test cleanup to retain process identity through exit and
+restored the monitor's exact native selector header with a negative regression.
+The rejected `request_input` exposure suggestion is noise because the child
+already carries an explicit grant. The parent `spawn_subagent` fixture mismatch
+was found by the full gate and is recorded separately from verifier findings.
+No product authority, tool-result projection, timeout, or failing assertion was
+weakened. Resolution edits remain unstaged; the merge remains uncommitted
+for the orchestrator. Independent final review returns **SHIP**; the
+[completion audit](agentcli-merge-wave-970/completion-audit.json) confirms
+1,147 matching source hashes, matching final binaries, unchanged HEAD and
+MERGE_HEAD, empty marker scan, and both status-owned daemon cleanup proofs.

@@ -272,6 +272,11 @@ pub(crate) mod tool_result_payload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolResultData {
+    /// Actor-authored discovery receipt. Only a successful, correlated
+    /// `list_tools` result promotes these names into a session's tool view.
+    ToolsDiscovered {
+        promoted: Vec<String>,
+    },
     InvalidToolCall {
         tool: String,
         message: String,

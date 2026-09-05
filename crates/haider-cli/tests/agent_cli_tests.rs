@@ -21,6 +21,7 @@ struct Profile {
     runtime: PathBuf,
     workspace: PathBuf,
     script: String,
+    tool_exposure: &'static str,
 }
 
 impl Profile {
@@ -57,6 +58,7 @@ impl Profile {
             runtime,
             workspace,
             script: script.to_string(),
+            tool_exposure: "spawn_subagent",
         }
     }
 
@@ -79,6 +81,8 @@ impl Profile {
             .env("HAIDER_NO_UPDATE_CHECK", "1")
             .env("HAIDER_TEST_DEVICE_NAME", "test-mac")
             .env("HAIDER_TEST_FAKE_PROVIDER", &self.script)
+            // Direct CLI delegation still obeys the daemon's tool ceiling.
+            .env("HAIDER_TOOL_EXPOSURE", self.tool_exposure)
             .env("RUST_MIN_STACK", "8388608")
             .env("NO_COLOR", "1")
             .stdin(Stdio::null());
@@ -246,6 +250,11 @@ impl Profile {
         )
         .expect("OS PID fits u32");
         assert!(pid > 0);
+        let monitor = haider_platform::ProcessExitMonitor::capture(
+            haider_platform::process_id(Some(pid)).expect("valid owned daemon PID"),
+        )
+        .expect("pin the live status-owned daemon before stopping it");
+        let stop_deadline = Instant::now() + STOP_BOUND;
         let output = self
             .invoke(&["daemon", "stop", "--json"], STOP_BOUND)
             .expect("bounded clean stop");
@@ -258,10 +267,24 @@ impl Profile {
         assert_eq!(stopped["outcome"], "stopped_cleanly", "{stopped}");
         assert_eq!(stopped["daemon"]["pid"], pid);
         assert_eq!(stopped["daemon"]["process_exited"], true);
-        assert!(
-            !process_alive(pid),
-            "no-orphan proof: owned PID {pid} must disappear"
-        );
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("exit observation runtime")
+            .block_on(async {
+                // Share the existing 20s stop + 2s exit observation bound;
+                // retaining the kernel identity avoids PID reuse and wrapped
+                // missing-process errors from recapturing an exited daemon.
+                tokio::time::timeout(
+                    stop_deadline.saturating_duration_since(Instant::now()),
+                    monitor.wait(),
+                )
+                .await
+                .expect("owned daemon exits within the remaining stop bound")
+                .expect("authoritative owned daemon exit observation");
+            });
+        #[cfg(windows)]
+        assert!(!haider_platform::process_exists(pid));
         let absent = self.run(&["status", "--json", "--no-spawn"]);
         assert_eq!(absent.status.code(), Some(69));
     }
@@ -282,12 +305,6 @@ fn field<'a>(value: &'a Value, key: &str) -> &'a str {
         .expect(key)
 }
 
-fn process_alive(pid: u32) -> bool {
-    haider_platform::process_id(Some(pid))
-        .and_then(|id| haider_platform::ProcessExitMonitor::capture(id).ok())
-        .is_some()
-}
-
 fn report_script(text: &str) -> Value {
     json!([{"step":"emit_text","text":text},{"step":"finish","reason":"end_turn"}])
 }
@@ -303,6 +320,57 @@ fn provider_requests(events: &[Value]) -> usize {
                 && payload["item"]["kind"] == "cache_request_attempt_v1"
         })
         .count()
+}
+
+#[test]
+fn agent_spawn_without_tool_exposure_retains_native_refusal() {
+    let mut profile = Profile::new(report_script("MUST_NOT_REACH_PROVIDER"));
+    profile.tool_exposure = "";
+    let rejected = profile.json(
+        &[
+            "agent",
+            "spawn",
+            "not exposed",
+            "--provider",
+            "fake",
+            "--model",
+            "fake-model",
+            "--json",
+            "--timeout",
+            "10s",
+        ],
+        "haider.agent.spawn.v1",
+        70,
+    );
+    assert_eq!(rejected["error"]["code"], "spawn_failed");
+    assert_eq!(rejected["error"]["retryable"], false);
+    assert_eq!(
+        rejected["error"]["message"],
+        "grant ceiling violation: session is not allowed to use `spawn_subagent`; call list_tools with a matching filter to discover and enable authorized tools"
+    );
+    let parent = &rejected["result"];
+    let _ = field(parent, "run_id");
+    assert!(parent.get("agent_id").is_none());
+    let events = profile.journal(field(parent, "session_id"));
+    assert_eq!(provider_requests(&events), 0);
+    let listed = profile.json(
+        &[
+            "agent",
+            "list",
+            field(parent, "session_id"),
+            "--json",
+            "--no-spawn",
+        ],
+        "haider.agent.list.v1",
+        0,
+    );
+    assert!(
+        listed["result"]["roots"]
+            .as_array()
+            .expect("native fleet roots")
+            .is_empty()
+    );
+    profile.stop();
 }
 
 #[test]

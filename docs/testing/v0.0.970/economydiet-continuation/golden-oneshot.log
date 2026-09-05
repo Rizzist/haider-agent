@@ -1,0 +1,14 @@
+   Compiling haider-rpc v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-rpc)
+   Compiling haider-provider v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-provider)
+   Compiling haider-client v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-client)
+   Compiling haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-core)
+   Compiling haider-tui v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-tui)
+   Compiling haider-cli v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-cli)
+    Finished `test` profile [unoptimized] target(s) in 31.71s
+     Running tests/oneshot_boot_tests.rs (/private/tmp/haider-economydiet-target/debug/deps/oneshot_boot_tests-ae9ab5ff5448d69b)
+
+running 1 test
+test one_shot_jsonl_stream_matches_the_normalized_golden ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 7.71s
+

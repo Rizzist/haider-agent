@@ -71,6 +71,9 @@ def run(ctx) -> list[Evidence]:
             ["agent", "spawn", "return the QA child report", "--task", "qa-spawn-result",
              "--provider", "fake", "--model", "fake-model", "--json", "--timeout", "10s"],
             timeout=SPAWN_BOUND,
+            # Explicitly select delegation in the daemon's coding-tier catalog.
+            # Its grant ceiling remains authoritative for operator CLI calls.
+            env_overrides={"HAIDER_TOOL_EXPOSURE": "spawn_subagent"},
         )
         commands.append(("agent-spawn", spawned))
         child = _document(spawned, "spawn")
