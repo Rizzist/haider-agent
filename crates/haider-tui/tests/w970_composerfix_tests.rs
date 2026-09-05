@@ -261,12 +261,12 @@ fn a_clipboard_image_becomes_a_chip() {
 }
 
 #[test]
-fn a_text_clipboard_leaves_the_draft_alone() {
-    // The terminal's own bracketed paste owns text; ⌃V must not double it.
+fn a_forwarded_paste_chord_inserts_clipboard_text_once() {
+    // A forwarded key was not answered by the terminal. Read and insert once.
     let mut model = live_model(Some(true));
     model.composer.set_text("keep me".to_owned());
     clipboard_paste_effects(&mut model, &FakeClipboard::text());
-    assert_eq!(model.composer.text(), "keep me");
+    assert_eq!(model.composer.text(), "keep meclipboard text");
     assert!(model.composer.attachments().is_empty(), "no chip for text");
     assert!(model.composer_notice.is_none(), "no notice for text");
 }
@@ -429,16 +429,18 @@ fn the_platform_paste_chords_all_reach_the_same_read() {
 }
 
 #[test]
-fn the_chord_refuses_before_the_read_on_a_pair_without_vision() {
+fn the_chord_reads_text_before_applying_image_only_vision_gates() {
     let mut model = live_model(Some(false));
     model.handle(chord(KeyCode::Char('v'), KeyModifiers::CONTROL));
     assert!(
-        !model
+        model
             .requests
             .iter()
             .any(|request| matches!(request, AppRequest::ClipboardRead)),
-        "a declared-no-vision pair never pays for a clipboard round trip"
+        "a nonvision model can still receive text"
     );
+    assert!(model.composer_notice.is_none());
+    clipboard_paste_effects(&mut model, &FakeClipboard::image(2, 2));
     assert_eq!(
         model.composer_notice,
         Some(ImageNotice::NoVision {
@@ -451,6 +453,7 @@ fn the_chord_refuses_before_the_read_on_a_pair_without_vision() {
 fn the_notice_clears_on_the_next_keystroke() {
     let mut model = live_model(Some(false));
     model.handle(chord(KeyCode::Char('v'), KeyModifiers::CONTROL));
+    clipboard_paste_effects(&mut model, &FakeClipboard::image(2, 2));
     assert!(model.composer_notice.is_some());
     model.handle(AppEvent::Key(KeyEvent::new(
         KeyCode::Char('a'),
@@ -486,6 +489,7 @@ fn the_notice_renders_as_its_own_row_inside_the_band() {
     let mut model = live_model(Some(false));
     model.composer.set_text("look".to_owned());
     model.handle(chord(KeyCode::Char('v'), KeyModifiers::CONTROL));
+    clipboard_paste_effects(&mut model, &FakeClipboard::image(2, 2));
     for width in [80_u16, 118, 160] {
         let frame = rows(&model, width, 30);
         let notice = frame
@@ -529,6 +533,7 @@ fn the_band_grows_by_exactly_one_row_for_the_notice() {
     let mut noticed = live_model(Some(false));
     noticed.composer.set_text("look".to_owned());
     noticed.handle(chord(KeyCode::Char('v'), KeyModifiers::CONTROL));
+    clipboard_paste_effects(&mut noticed, &FakeClipboard::image(2, 2));
     let after = rows(&noticed, 90, 30);
     let draft_after = after
         .iter()
@@ -573,4 +578,41 @@ fn any_clipboard_source_drives_the_same_handler() {
     let mut model = live_model(Some(true));
     clipboard_paste_effects(&mut model, &AlwaysEmpty);
     assert_eq!(model.composer_notice, Some(ImageNotice::ClipboardEmpty));
+}
+
+#[test]
+fn text_clipboard_paste_bypasses_all_image_only_gates() {
+    for gate in ["no vision", "old daemon", "full", "demo"] {
+        let mut model = live_model(Some(gate != "no vision"));
+        match gate {
+            "old daemon" => model.daemon_features.clear(),
+            "full" => {
+                for _ in 0..5 {
+                    clipboard_paste_effects(&mut model, &FakeClipboard::image(1, 1));
+                }
+                assert_eq!(model.composer.attachments().len(), 5);
+            }
+            "demo" => model.mode = RuntimeMode::Demo,
+            _ => {}
+        }
+        model.requests.clear();
+        model.handle(chord(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            model.requests.as_slice(),
+            [AppRequest::ClipboardRead]
+        ));
+        model.requests.clear();
+        clipboard_paste_effects(&mut model, &FakeClipboard::text_with("text 🪟"));
+        assert_eq!(model.composer.text(), "text 🪟", "{gate}");
+        assert!(model.composer_notice.is_none(), "{gate}");
+        assert!(model.requests.is_empty(), "text does not upload or submit");
+        let count = model.composer.attachments().len();
+        clipboard_paste_effects(&mut model, &FakeClipboard::image(1, 1));
+        assert_eq!(
+            model.composer.attachments().len(),
+            count,
+            "images still respect {gate}"
+        );
+        assert!(model.composer_notice.is_some() || model.flash.is_some());
+    }
 }

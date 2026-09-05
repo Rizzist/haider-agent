@@ -723,7 +723,9 @@ pub async fn run_demo(
                         // longer exists — a queued Moved must not re-arm a
                         // hover from dead geometry (W5g-7).
                         Event::Resize(..) => hit_map.clear(),
-                        Event::Mouse(mouse) => pointer = Some((mouse.column, mouse.row)),
+                        Event::Mouse(mouse) if !terminal_owned_mouse(mouse) => {
+                            pointer = Some((mouse.column, mouse.row));
+                        }
                         _ => {}
                     }
                     dispatch_input(&mut model, &hit_map, event);
@@ -785,9 +787,12 @@ pub async fn run_demo(
                     }
                 }
                 // TUI5 items 4+5: model-known text (the composer
-                // selection) — same pbcopy + OSC 52 + honest-flash path,
+                // selection) — same local writer + OSC 52 + honest-flash path,
                 // no frame extraction needed.
                 AppRequest::CopyText(text) => copy_selection_effects(&mut model, &text),
+                AppRequest::ClipboardRead => {
+                    clipboard_paste_effects(&mut model, &crate::clipboard::OsClipboard);
+                }
                 request => driver.handle_request(&mut model, request),
             }
         }
@@ -1013,6 +1018,18 @@ pub fn dispatch_input(
             model.handle_terminal_resize(cols, rows);
         }
         Event::Mouse(mouse) => {
+            // Windows Terminal handles Shift+drag itself. If a terminal
+            // forwards a modified report anyway, it must not select, click,
+            // scroll, paste, or move hover in the app. This is not a way to
+            // replay an already delivered report into the terminal.
+            if terminal_owned_mouse(&mouse) {
+                model.mouse_down = None;
+                model.composer_drag = false;
+                if let Some(selection) = &mut model.selection {
+                    selection.dragging = false;
+                }
+                return;
+            }
             let hit_at = |column: u16, row: u16| {
                 hit_map
                     .iter()
@@ -1025,6 +1042,10 @@ pub fn dispatch_input(
                     .map(|(_, action)| action.clone())
             };
             match mouse.kind {
+                // A terminal-owned right-click sends paste input instead
+                // of this report. Under capture, service a delivered right
+                // press ourselves; release/drag never paste a second time.
+                MouseEventKind::Down(MouseButton::Right) => model.request_clipboard_paste(),
                 // Owner item 9: Down is only a POTENTIAL anchor — the click
                 // dispatches on Up, because only Up knows whether the press
                 // was a click or a drag-selection. A previous selection's
@@ -1134,7 +1155,9 @@ pub fn dispatch_input(
                         return;
                     }
                     let down = model.mouse_down.take();
-                    if let Some(selection) = &mut model.selection {
+                    if let Some(selection) = &mut model.selection
+                        && down.is_some()
+                    {
                         selection.dragging = false;
                         model.requests.push(crate::app::AppRequest::CopySelection);
                         model.dirty = true;
@@ -1164,6 +1187,13 @@ pub fn dispatch_input(
         Event::FocusLost => model.set_focus(false),
         _ => {}
     }
+}
+
+/// Modified mouse gestures belong to the terminal. Also used before
+/// recording the pointer, so a later redraw cannot turn them into hover.
+#[must_use]
+pub fn terminal_owned_mouse(mouse: &event::MouseEvent) -> bool {
+    mouse.modifiers.contains(KeyModifiers::SHIFT)
 }
 
 /// The first hit-map entry containing the cell, WITH its rect (TUI5
@@ -2975,7 +3005,7 @@ pub fn rendered_selection_text(
 }
 
 /// Auto-copy side effects for a finished selection (owner item 9), in the
-/// documented order: pbcopy (authoritative local clipboard), then OSC 52
+/// documented order: platform writer (confirmed local clipboard), then OSC 52
 /// (best-effort mirror for remote/embedded terminals — always emitted, but
 /// unverifiable, so it never upgrades the flash: the flash reports the
 /// channel we can actually observe).
@@ -3066,9 +3096,8 @@ pub fn attach_read_effects(model: &mut AppModel, path: &str) {
 /// * an IMAGE — re-checked against the session's vision capability (the
 ///   reducer issued the read before knowing what was on the clipboard),
 ///   then chipped and uploaded through the very seam `/attach` uses;
-/// * TEXT — nothing happens. The terminal's own bracketed paste already
-///   owns text, and inserting it here would double the draft on every
-///   terminal that forwards the chord as well as answering it;
+/// * TEXT — insert through the same reducer as terminal bracketed paste.
+///   A forwarded chord has not been answered by the terminal;
 /// * EMPTY, or an unreadable clipboard — a notice on the band, never a
 ///   crash and never a silent no-op.
 pub fn clipboard_paste_effects(
@@ -3077,8 +3106,7 @@ pub fn clipboard_paste_effects(
 ) {
     match source.read() {
         Ok(crate::clipboard::ClipboardContent::Image(image)) => {
-            if let Some(notice) = model.image_refusal() {
-                model.set_composer_notice(notice);
+            if !model.accepts_clipboard_image() {
                 return;
             }
             let kib = image.png.len().div_ceil(1024);
@@ -3091,8 +3119,7 @@ pub fn clipboard_paste_effects(
                 label,
             );
         }
-        // The bracketed-paste path owns text; ⌃V adds nothing to it.
-        Ok(crate::clipboard::ClipboardContent::Text) => {}
+        Ok(crate::clipboard::ClipboardContent::Text(text)) => model.handle(AppEvent::Paste(text)),
         Ok(crate::clipboard::ClipboardContent::Empty) => {
             model.set_composer_notice(crate::app::ImageNotice::ClipboardEmpty);
         }
@@ -3123,20 +3150,11 @@ pub fn open_url_effects(
 fn copy_selection_effects(model: &mut AppModel, text: &str) {
     let confirmed = crate::clipboard::copy_local(text);
     let mut out = stdout();
-    let _ = out.write_all(crate::clipboard::osc52(text).as_bytes());
-    let _ = out.flush();
-    // Honest wording (review TUI4.1 P3-5): `· copied` only on a CONFIRMED
-    // local copy (pbcopy exit 0). Otherwise the OSC 52 mirror already
-    // went out — best-effort remains, and the flash says exactly that
-    // instead of claiming a copy nobody verified.
-    model.flash = Some(
-        if confirmed {
-            "· copied"
-        } else {
-            "· copy unconfirmed — sent via OSC 52 only"
-        }
-        .to_owned(),
-    );
+    let osc52_sent = out
+        .write_all(crate::clipboard::osc52(text).as_bytes())
+        .and_then(|()| out.flush())
+        .is_ok();
+    model.flash = Some(crate::clipboard::copy_confirmation(confirmed, osc52_sent).to_owned());
     model.dirty = true;
 }
 
@@ -3819,7 +3837,9 @@ pub async fn run_live(
                         // longer exists — a queued Moved must not re-arm a
                         // hover from dead geometry (W5g-7).
                         Event::Resize(..) => hit_map.clear(),
-                        Event::Mouse(mouse) => pointer = Some((mouse.column, mouse.row)),
+                        Event::Mouse(mouse) if !terminal_owned_mouse(mouse) => {
+                            pointer = Some((mouse.column, mouse.row));
+                        }
                         _ => {}
                     }
                     // rev933b finding 3: while the update transaction holds

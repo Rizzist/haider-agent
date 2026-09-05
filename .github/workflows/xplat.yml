@@ -71,6 +71,17 @@ jobs:
         # ci-test.sh preserves the 8 MiB stack, hermetic discovery/device env,
         # sibling-binary compile phase, and the Windows-only streamed test.
         run: bash scripts/ci-test.sh
+      - name: native Windows clipboard write and paste gate (no terminal)
+        if: matrix.phase == 'test' && runner.os == 'Windows'
+        env:
+          RUST_MIN_STACK: 8388608
+          HAIDER_DISCOVERY_DISABLED: 1
+          HAIDER_TEST_DEVICE_NAME: test-mac
+          HAIDER_TEST_SIBLINGS_PREBUILT: 1
+        # No ignore/env escape hatch: a missing clipboard fails this gate.
+        # This also runs in the normal suite; naming it here keeps native
+        # Windows clipboard execution visible in the cross-platform gate.
+        run: cargo test -p haider-tui --locked --test w970_winclip_windows_tests -- --test-threads=1
       - name: upload failing test logs
         if: failure() && matrix.phase == 'test'
         uses: actions/upload-artifact@v4
