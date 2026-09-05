@@ -7,10 +7,10 @@ use haider_core::{
     HarnessHandle, MemoryStore, PromptHistoryCompiler, ProviderAttemptDecision,
     ProviderAttemptResolver, ProviderBudgetGuard, ProviderBudgetGuardError, ProviderBudgetPermit,
     ProviderPairSwitch, ProviderPairSwitchCause, ProviderPairSwitchCommitter,
-    ProviderPairSwitchTarget, ResolvedProviderAttempt, RouteWaitCheckpoint,
-    RouteWaitTextCheckpoint, RouteWaitToolCheckpoint, StoreHandle, SubmitCommittedTurn,
-    SubmitRouteWaitTurn, SubmitTurn, ToolDispatchResult, ToolDispatcher,
-    VISION_IMAGE_ESTIMATE_TOKENS, estimate_provider_request_input_tokens,
+    ProviderPairSwitchTarget, ProviderRebindResolver, ProviderRebindTarget,
+    ResolvedProviderAttempt, RouteWaitCheckpoint, RouteWaitTextCheckpoint, RouteWaitToolCheckpoint,
+    StoreHandle, SubmitCommittedTurn, SubmitRouteWaitTurn, SubmitTurn, ToolDispatchResult,
+    ToolDispatcher, VISION_IMAGE_ESTIMATE_TOKENS, estimate_provider_request_input_tokens,
 };
 use haider_platform::RouteStatus;
 use haider_protocol::EventPayload;
@@ -4868,6 +4868,195 @@ async fn rotation_is_once_pre_first_event_and_durable_before_the_alternate() {
             .collect::<Vec<_>>(),
         vec![("usage-a", 10, 4), ("usage-b", 6, 3)]
     );
+}
+
+/// Rebind factory-time rotation obeys the same durable-before-POST law as a
+/// turn's initial account resolution, including publishing pending Thinking.
+#[tokio::test]
+async fn provider_rebind_initial_rotation_is_durable_before_target_request() {
+    let store = Arc::new(MemoryStore::new());
+    let target = Arc::new(RotationAwareFinishProvider {
+        store: store.clone(),
+        requests: AtomicUsize::new(0),
+        saw_rotation_before_request: AtomicBool::new(false),
+        cache_account: Mutex::new(None),
+    });
+    let rotation = RotationEvent {
+        provider: "fake".into(),
+        from: CredentialAlias::new("rebind-a"),
+        to: CredentialAlias::new("rebind-b"),
+        cause: RotationCause::RateLimit,
+    };
+    let original = Arc::new(FakeProvider::new(Vec::new()));
+    let mut cfg = config();
+    cfg.usage_account = Some(rotation.from.clone());
+    cfg.provider_rebind_resolver = Some(Arc::new(OneRebindResolver(Mutex::new(Some(
+        ProviderRebindTarget {
+            provider: target.clone(),
+            provider_name: "fake".into(),
+            account: Some(rotation.to.clone()),
+            context_window: None,
+            cached_input_is_subset: false,
+            provider_request_state: Default::default(),
+            auth_scope: "api_key".into(),
+            attempt_resolver: None,
+            route_epoch: "factory-rotated-rebind".into(),
+            initial_rotation: Some(rotation.clone()),
+            // The Rotation itself also spends the budget; these two facts
+            // need not be redundant for every resolver implementation.
+            rotation_budget_consumed: false,
+        },
+    )))));
+    let handle = HarnessActor::spawn(cfg, original.clone(), store.clone());
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("rebind factory rotated"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert!(original.requests().is_empty());
+    assert_eq!(target.requests.load(Ordering::SeqCst), 1);
+    assert!(target.saw_rotation_before_request.load(Ordering::SeqCst));
+    assert_eq!(
+        *target.cache_account.lock().expect("cache scope"),
+        Some(("rebind-b".into(), None))
+    );
+    let events = store.events(&SessionId::new(SESSION)).await;
+    let rotations: Vec<_> = events
+        .iter()
+        .filter_map(|event| match typed(event) {
+            EventPayload::Rotation(value) => Some((event.seq, value)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rotations.len(), 1);
+    assert_eq!(rotations[0].1, rotation);
+    assert!(
+        events.iter().any(|event| event.seq < rotations[0].0
+            && matches!(typed(event), EventPayload::RunState(RunState::Thinking))),
+        "pending Thinking must be committed before the rebind Rotation"
+    );
+    handle.stop().await.expect("actor stops");
+}
+
+/// The target's consumed flag, its factory rotation, and the turn's prior
+/// consumed flag independently forbid another automatic rotation on auth
+/// failure. A fresh-budget control proves the target resolver is reachable.
+#[tokio::test]
+async fn provider_rebind_cannot_refund_or_drop_consumed_rotation_budget() {
+    for (prior_consumed, target_consumed, with_rotation) in [
+        (false, true, false),
+        (false, false, true),
+        (true, false, false),
+        (false, false, false),
+    ] {
+        let store = Arc::new(MemoryStore::new());
+        let failed_target = Arc::new(CountingOpeningErrorProvider::inspecting(
+            ProviderError::new(
+                ProviderErrorKind::Authentication,
+                "rebound account rejects auth",
+            ),
+            store.clone(),
+        ));
+        let alternate = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        }]));
+        let resolver = Arc::new(ScriptedRotationResolver {
+            calls: AtomicUsize::new(0),
+            first: alternate.clone(),
+            first_alias: CredentialAlias::new("rebind-c"),
+            second: alternate.clone(),
+            second_alias: CredentialAlias::new("rebind-d"),
+        });
+        let rotation = with_rotation.then(|| RotationEvent {
+            provider: "fake".into(),
+            from: CredentialAlias::new("rebind-a"),
+            to: CredentialAlias::new("rebind-b"),
+            cause: RotationCause::Error,
+        });
+        let mut cfg = config();
+        cfg.usage_account = Some(CredentialAlias::new("rebind-a"));
+        cfg.rotation_budget_consumed = prior_consumed;
+        cfg.provider_rebind_resolver = Some(Arc::new(OneRebindResolver(Mutex::new(Some(
+            ProviderRebindTarget {
+                provider: failed_target.clone(),
+                provider_name: "fake".into(),
+                account: Some(CredentialAlias::new("rebind-b")),
+                context_window: None,
+                cached_input_is_subset: false,
+                provider_request_state: Default::default(),
+                auth_scope: "api_key".into(),
+                attempt_resolver: Some(resolver.clone()),
+                route_epoch: "rebind-budget".into(),
+                initial_rotation: rotation,
+                rotation_budget_consumed: target_consumed,
+            },
+        )))));
+        let handle =
+            HarnessActor::spawn(cfg, Arc::new(FakeProvider::new(Vec::new())), store.clone());
+        let outcome = handle
+            .submit_turn(SubmitTurn::new("rebind auth failure"))
+            .await
+            .expect("turn accepted")
+            .wait()
+            .await
+            .expect("turn outcome");
+        let consumed = prior_consumed || target_consumed || with_rotation;
+        assert_eq!(
+            outcome.state,
+            if consumed {
+                RunState::Errored
+            } else {
+                RunState::Done
+            },
+            "prior={prior_consumed} target={target_consumed} rotation={with_rotation}"
+        );
+        assert_eq!(
+            resolver.calls.load(Ordering::SeqCst),
+            usize::from(!consumed)
+        );
+        assert_eq!(alternate.requests().len(), usize::from(!consumed));
+        assert_eq!(failed_target.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            failed_target
+                .saw_rotation_before_request
+                .load(Ordering::SeqCst),
+            with_rotation
+        );
+        assert_eq!(
+            store
+                .events(&SessionId::new(SESSION))
+                .await
+                .iter()
+                .filter(|event| matches!(typed(event), EventPayload::Rotation(_)))
+                .count(),
+            usize::from(with_rotation) + usize::from(!consumed)
+        );
+        handle.stop().await.expect("actor stops");
+    }
+}
+
+struct OneRebindResolver(Mutex<Option<ProviderRebindTarget>>);
+
+impl std::fmt::Debug for OneRebindResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OneRebindResolver")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl ProviderRebindResolver for OneRebindResolver {
+    async fn refresh(
+        &self,
+        _model: &str,
+        _reasoning: &str,
+    ) -> Result<Option<ProviderRebindTarget>, HaiderError> {
+        Ok(self.0.lock().expect("one rebind snapshot").take())
+    }
 }
 
 /// H2: a resolver that decides `Retry` (credential refresh) on EVERY 401 must

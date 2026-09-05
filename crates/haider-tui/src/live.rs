@@ -5840,6 +5840,13 @@ impl LiveDriver {
                 ));
                 model.dirty = true;
             }
+            haider_protocol::session::SessionConfigEventPayload::SessionProviderRebound(rebound) => {
+                if model.identity.provider != rebound.provider {
+                    model.identity.provider = rebound.provider;
+                    model.refresh_context_window();
+                    model.dirty = true;
+                }
+            }
             // G2 renames land through the correlated `session.rename` reply
             // and `session.list` summaries, never this raw-fact lane.
             haider_protocol::session::SessionConfigEventPayload::SessionRenamed { .. }

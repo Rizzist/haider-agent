@@ -86,11 +86,14 @@ mismatch returns `ssh_host_key_changed { expected, actual }`; there is no
 interactive acceptance prompt. Editing the host or port clears the prior pin
 because it names a different endpoint.
 
-Remote execution is its own permission effect and defaults to **Ask**. The
-permission copy names the remote machine and says its output is untrusted
-input. Deadlines are bounded by the enclosing run; stdout/stderr use the same
-bounded capture rules as the local process tool. Journal command and result
-records remain raw; prompt-only compaction never rewrites receipts.
+Remote execution is its own permission effect and defaults to **Ask** in an
+interactive session. Autonomous sessions resolve that Ask to ordinary
+journaled Allow; `--read-only` explicitly denies it because the remote target
+could alias or mutate the workspace. The permission copy names the remote
+machine and says its output is untrusted input. Deadlines are bounded by the
+enclosing run; stdout/stderr use the same bounded capture rules as the local
+process tool. Journal command and result records remain raw; prompt-only
+compaction never rewrites receipts.
 
 ## Platform matrix
 

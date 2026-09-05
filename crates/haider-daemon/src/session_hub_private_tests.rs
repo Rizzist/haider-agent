@@ -1392,6 +1392,7 @@ async fn fork_resets_remembered_grants_but_keeps_creation_permission_policy() {
     let run_id = RunId::new("permission-fork-run");
     let mut create = create_command(&source, "permission-fork");
     create.permission_overrides = Some(haider_protocol::session::SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: true,
         allow_exec: false,
         allow_mobile: false,
@@ -1579,6 +1580,7 @@ async fn fork_resets_remembered_grants_but_keeps_creation_permission_policy() {
         "prompt-derived mobile consent must not cross the fork audit boundary"
     );
     let expected_overrides = haider_protocol::session::SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: true,
         allow_exec: false,
         allow_mobile: false,
@@ -1708,21 +1710,28 @@ async fn status_snapshot_counts_sessions_without_listing_summaries() {
                         providers_loaded,
                         idle_ttl_ms,
                         warm,
+                        caching,
                     },
-            } if request_id.as_str() == "status-scalars" => Some((
-                active_account.clone(),
-                *session_count,
-                *waiting_for_route_count,
-                adoption_available.clone(),
-                *daemon_pid,
-                socket_path.clone(),
-                pid_file_path.clone(),
-                *ready,
-                *ready_since,
-                *providers_loaded,
-                *idle_ttl_ms,
-                *warm,
-            )),
+            } if request_id.as_str() == "status-scalars" => {
+                assert_eq!(
+                    caching.as_ref(),
+                    Some(&super::rpc::status_caching(None, None, &[]))
+                );
+                Some((
+                    active_account.clone(),
+                    *session_count,
+                    *waiting_for_route_count,
+                    adoption_available.clone(),
+                    *daemon_pid,
+                    socket_path.clone(),
+                    pid_file_path.clone(),
+                    *ready,
+                    *ready_since,
+                    *providers_loaded,
+                    *idle_ttl_ms,
+                    *warm,
+                ))
+            }
             _ => None,
         })
         .expect("status response");
@@ -1748,6 +1757,64 @@ async fn status_snapshot_counts_sessions_without_listing_summaries() {
     drop(connection);
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
+}
+
+/// Regimes follow the registered adapter family even for custom provider IDs;
+/// switching the daemon active account never changes the per-provider map.
+#[test]
+fn status_caching_reports_adapter_regimes_and_effective_reuse_policy() {
+    use haider_rpc::{ProviderApiFamilyWire, ProviderCacheRegimeWire, SessionReuseWire};
+    let providers = [
+        ("openai", ProviderApiFamilyWire::OpenAiResponses),
+        ("custom-proxy", ProviderApiFamilyWire::OpenAiChatCompletions),
+        ("anthropic", ProviderApiFamilyWire::AnthropicMessages),
+        ("custom-anthropic", ProviderApiFamilyWire::AnthropicMessages),
+        ("gemini", ProviderApiFamilyWire::GeminiGenerateContent),
+        ("agent", ProviderApiFamilyWire::AcpAgent),
+        ("unknown", ProviderApiFamilyWire::Unknown),
+    ]
+    .map(|(id, family)| {
+        let mut provider = provider_summary(id);
+        provider.api_family = family;
+        provider
+    });
+    let resident = super::rpc::status_caching(Some(30_000), Some("openai"), &providers);
+    assert!(resident.prompt_cache && resident.provider_view_cas);
+    assert_eq!(resident.session_reuse, SessionReuseWire::Resident);
+    assert_eq!(resident.idle_ttl_ms, Some(30_000));
+    assert_eq!(
+        resident.cache_regime,
+        Some(ProviderCacheRegimeWire::AutomaticPrefix)
+    );
+    assert_eq!(
+        resident.cache_regimes_by_provider["custom-proxy"],
+        resident.cache_regime
+    );
+    let one_shot = super::rpc::status_caching(Some(0), Some("anthropic"), &providers);
+    assert_eq!(one_shot.session_reuse, SessionReuseWire::OneShot);
+    assert_eq!(one_shot.idle_ttl_ms, Some(0));
+    assert_eq!(
+        one_shot.cache_regime,
+        Some(ProviderCacheRegimeWire::ExplicitBreakpoints)
+    );
+    assert_eq!(
+        one_shot.cache_regimes_by_provider["custom-anthropic"],
+        one_shot.cache_regime
+    );
+    assert_eq!(
+        resident.cache_regimes_by_provider,
+        one_shot.cache_regimes_by_provider
+    );
+    for provider in ["gemini", "agent", "unknown", "not-registered"] {
+        assert_eq!(
+            super::rpc::status_caching(None, Some(provider), &providers).cache_regime,
+            None
+        );
+    }
+    let unbounded = super::rpc::status_caching(None, None, &providers);
+    assert_eq!(unbounded.session_reuse, SessionReuseWire::Resident);
+    assert_eq!(unbounded.idle_ttl_ms, None);
+    assert_eq!(unbounded.cache_regime, None);
 }
 
 /// MUTATION CHECK: resolve the active account instead of the requested alias,

@@ -47,6 +47,47 @@ use tokio::time::{MissedTickBehavior, interval_at};
 use zeroize::Zeroizing;
 
 const MAX_ATTACHMENTS_PER_TURN: usize = 5;
+
+pub(super) fn status_caching(
+    idle_ttl_ms: Option<u64>,
+    active_provider: Option<&str>,
+    providers: &[ProviderSummaryWire],
+) -> haider_rpc::DaemonCachingWire {
+    use haider_rpc::{ProviderApiFamilyWire, ProviderCacheRegimeWire, SessionReuseWire};
+    let cache_regimes_by_provider: BTreeMap<_, _> = providers
+        .iter()
+        .map(|provider| {
+            let regime = match provider.api_family {
+                ProviderApiFamilyWire::AnthropicMessages => {
+                    Some(ProviderCacheRegimeWire::ExplicitBreakpoints)
+                }
+                ProviderApiFamilyWire::OpenAiResponses
+                | ProviderApiFamilyWire::OpenAiChatCompletions => {
+                    Some(ProviderCacheRegimeWire::AutomaticPrefix)
+                }
+                _ => None,
+            };
+            (provider.provider.clone(), regime)
+        })
+        .collect();
+    haider_rpc::DaemonCachingWire {
+        // The daemon always prepares cache-aware prompts and persists the
+        // provider-view CAS when the adapter emits a view. These are support
+        // declarations, not guarantees of a cacheable request or remote hit.
+        prompt_cache: true,
+        provider_view_cas: true,
+        session_reuse: if idle_ttl_ms == Some(0) {
+            SessionReuseWire::OneShot
+        } else {
+            SessionReuseWire::Resident
+        },
+        idle_ttl_ms,
+        cache_regime: active_provider
+            .and_then(|provider| cache_regimes_by_provider.get(provider).copied())
+            .flatten(),
+        cache_regimes_by_provider,
+    }
+}
 const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES_PER_TURN: usize = 16 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES_PER_PDF_TURN: usize = 64 * 1024 * 1024;
@@ -4791,6 +4832,46 @@ impl HubConnection {
                 }
                 self.session_compact(request_id, command_id, session_id, worker_generation, None)
                     .await
+            }
+            RequestBody::SessionProviderRebind {
+                command_id,
+                session_id,
+                worker_generation,
+                provider,
+                base_url,
+                account,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "provider rebind requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.session_provider_rebind(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    provider,
+                    base_url,
+                    account,
+                )
+                .await
             }
             RequestBody::SessionSelectModel {
                 command_id,
@@ -16138,13 +16219,20 @@ impl HubConnection {
     }
 
     async fn status_snapshot(&self, request_id: RequestId) -> Result<(), SessionHubError> {
-        let (active_account, adoption_available) = match self.hub.accounts()? {
+        let (active_account, adoption_available, caching) = match self.hub.accounts()? {
             Some(facade) => {
-                let Some(active) = facade.management.inspect(|view| {
-                    view.descriptors
+                let Some((active, caching)) = facade.management.inspect(|view| {
+                    let active = view
+                        .descriptors
                         .iter()
                         .find(|descriptor| descriptor.active)
-                        .cloned()
+                        .cloned();
+                    let caching = status_caching(
+                        self.daemon_idle_ttl_ms,
+                        active.as_ref().map(|account| account.provider.as_str()),
+                        &view.providers,
+                    );
+                    (active, caching)
                 }) else {
                     return self.respond_error(
                         request_id,
@@ -16154,9 +16242,13 @@ impl HubConnection {
                         None,
                     );
                 };
-                (active, facade.status_adoption_snapshot())
+                (active, facade.status_adoption_snapshot(), caching)
             }
-            None => (None, Vec::new()),
+            None => (
+                None,
+                Vec::new(),
+                status_caching(self.daemon_idle_ttl_ms, None, &[]),
+            ),
         };
         let session_count = self.hub.roster_session_count().await?;
         let session_ids = self.hub.roster_session_ids().await?;
@@ -16188,6 +16280,7 @@ impl HubConnection {
                     .map(|(_, pid_file_path)| pid_file_path.display().to_string()),
                 idle_ttl_ms: self.daemon_idle_ttl_ms,
                 warm: self.daemon_warm,
+                caching: Some(caching),
                 ready: readiness.is_some_and(|snapshot| snapshot.ready),
                 ready_since: readiness.and_then(|snapshot| snapshot.ready_since_unix_ms),
                 providers_loaded: readiness.is_some_and(|snapshot| snapshot.providers_loaded),
@@ -19825,3 +19918,6 @@ mod run_identity_tests {
         assert!(summary.run_id.is_none(), "absent decodes as no active run");
     }
 }
+
+#[path = "provider_rebind.rs"]
+mod provider_rebind;

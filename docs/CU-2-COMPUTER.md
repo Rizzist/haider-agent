@@ -19,7 +19,7 @@ The provider tool name is `computer`. Its input is a top-level tagged action:
 {"action":"wait","ms":250}
 ```
 
-`screenshot` and `cursor_position` use `EffectClass::ScreenObserve` (`screen_observe` on the wire). Every other action, including `wait`, uses `EffectClass::ScreenControl` (`screen_control`). Both registry defaults are fail-closed `Ask`: no action dispatches until an existing permission menu is approved. (`Deny` is an irrevocable policy refusal in this broker and therefore cannot mint a session grant.) The menu-minted session grants are named `allow_screen` and `allow_screen_control`; the latter implies observation, while observation never implies control. `allow_exec` implies neither.
+`screenshot` and `cursor_position` use `EffectClass::ScreenObserve` (`screen_observe` on the wire). Every other action, including `wait`, uses `EffectClass::ScreenControl` (`screen_control`). Both registry defaults are `Ask`: interactive sessions open the existing permission menu, while autonomous sessions resolve Ask to ordinary journaled `Allow`. (`Deny` is an irrevocable explicit policy refusal in this broker and therefore cannot mint a session grant.) The menu-minted interactive session grants are named `allow_screen` and `allow_screen_control`; the latter implies observation, while observation never implies control. `allow_exec` implies neither. Operating-system Screen Recording or Accessibility authorization remains a separate external prerequisite and is never fabricated by autonomous mode.
 
 `computer` is root-only by default. It and both screen effects are excluded from `default_child_grant`; a delegated child needs an explicit tool/effect ceiling.
 

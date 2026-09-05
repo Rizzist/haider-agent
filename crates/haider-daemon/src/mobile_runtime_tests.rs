@@ -256,6 +256,7 @@ async fn mobile_dispatcher_fixture_with_grant(
     let session_id = SessionId::new(format!("{label}-session"));
     let run_id = RunId::new(format!("{label}-run"));
     let overrides = Some(SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: false,
         allow_exec: false,
         allow_mobile: false,
@@ -314,6 +315,8 @@ async fn mobile_dispatcher_fixture_with_grant(
             lockdown: None,
             diagnostics: None,
             metadata: SessionMetadataV1 {
+                provider_base_url: None,
+                provider_rebind_id: None,
                 cwd,
                 provider: "fake".into(),
                 account_alias: None,

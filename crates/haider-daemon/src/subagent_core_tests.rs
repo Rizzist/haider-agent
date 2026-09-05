@@ -166,12 +166,7 @@ fn e1a_worker_maps_denial_anchor_miss_and_nonzero_process_to_failure_status() {
     })
     .expect("typed denial");
     assert_eq!(denied.status, ToolResultStatus::Rejected);
-    assert!(
-        denied
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("denied"))
-    );
+    assert_eq!(denied.reason.as_deref(), Some("policy says no"));
 
     let anchor = crate::worker::typed_tool_result(&haider_tools::ToolError::EditAnchor(
         FsEditAnchorMismatch {
@@ -532,6 +527,8 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
     .await
     .expect("create parent");
     let metadata = SessionMetadataV1 {
+        provider_base_url: None,
+        provider_rebind_id: None,
         cwd,
         provider: "fake".into(),
         account_alias: None,
@@ -984,6 +981,8 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    provider_base_url: None,
+                    provider_rebind_id: None,
                     cwd: workspace_text.clone(),
                     provider: "fake".into(),
                     account_alias: None,
@@ -1235,6 +1234,8 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    provider_base_url: None,
+                    provider_rebind_id: None,
                     cwd: workspace.clone(),
                     provider: "fake".into(),
                     account_alias: None,
@@ -1285,6 +1286,8 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             lockdown: None,
             diagnostics: None,
             metadata: SessionMetadataV1 {
+                provider_base_url: None,
+                provider_rebind_id: None,
                 cwd: workspace,
                 provider: "fake".into(),
                 account_alias: None,
@@ -1494,6 +1497,8 @@ async fn message_subagent_resumes_hard_bound_child_with_retained_tool_history() 
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    provider_base_url: None,
+                    provider_rebind_id: None,
                     cwd: workspace.clone(),
                     provider: "fake".into(),
                     account_alias: None,
@@ -1673,6 +1678,8 @@ async fn only_own_children_are_messageable_with_typed_error() {
                 lockdown: false,
                 auto_hermetic: false,
                 metadata: SessionMetadataV1 {
+                    provider_base_url: None,
+                    provider_rebind_id: None,
                     cwd: workspace,
                     provider: "fake".into(),
                     account_alias: None,
@@ -2344,10 +2351,9 @@ async fn wait_for_wall_clock_after(
     .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
 }
 
-/// A headless/autonomous parent and its delegated child use one admission
-/// contract: the root remains Autonomous, while the child is Interactive so
-/// a projected request_input stays pending until the parent-side answer is
-/// durably forwarded.
+/// A headless/autonomous parent projects automatic permission approval into
+/// its delegated child while preserving the child's parent-answerable
+/// request_input lifecycle.
 #[cfg(unix)]
 #[tokio::test]
 async fn autonomous_parent_keeps_delegated_request_input_answerable() {
@@ -2448,6 +2454,11 @@ async fn autonomous_parent_keeps_delegated_request_input_answerable() {
     assert_eq!(
         child_metadata.interaction_mode,
         haider_protocol::session::SessionInteractionModeV1::Interactive
+    );
+    assert!(
+        child_metadata
+            .permission_overrides
+            .is_some_and(|overrides| overrides.auto_allow)
     );
     let (parent_menu, request_seq, worker_generation) =
         wait_for_parent_delegated_menu(&store, &parent_session, &child.agent_id).await;

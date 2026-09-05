@@ -367,6 +367,8 @@ fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
     let legacy = r#"{"cwd":"/tmp","provider":"anthropic","model":"claude-test","max_tokens":4096,"created_at_ms":1}"#;
     let decoded: SessionMetadataV1 = serde_json::from_str(legacy).expect("legacy metadata decodes");
     assert_eq!(decoded.effort, None);
+    assert_eq!(decoded.provider_base_url, None);
+    assert_eq!(decoded.provider_rebind_id, None);
     assert!(!decoded.fast);
     assert_eq!(
         decoded.interaction_mode,
@@ -378,6 +380,8 @@ fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
     );
     let encoded = serde_json::to_string(&decoded).expect("re-encode");
     assert!(!encoded.contains("effort"));
+    assert!(!encoded.contains("provider_base_url"));
+    assert!(!encoded.contains("provider_rebind_id"));
     assert!(!encoded.contains("fast"));
     assert!(!encoded.contains("cache_policy"));
     assert!(!encoded.contains("interaction_mode"));

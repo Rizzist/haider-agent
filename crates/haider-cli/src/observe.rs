@@ -90,6 +90,7 @@ pub(crate) struct DaemonView {
     pub providers_loaded: bool,
     pub idle_ttl_ms: Option<u64>,
     pub warm: bool,
+    pub caching: Option<haider_rpc::DaemonCachingWire>,
 }
 
 pub(crate) struct UpdateView {
@@ -132,6 +133,7 @@ struct StatusDaemonWire<'a> {
     providers_loaded: bool,
     idle_ttl_ms: Option<u64>,
     warm: bool,
+    caching: Option<&'a haider_rpc::DaemonCachingWire>,
     socket_path: &'a str,
     version: &'a str,
 }
@@ -263,6 +265,7 @@ impl ObserveJson for StatusDocument {
                 "providers_loaded": self.daemon.providers_loaded,
                 "idle_ttl_ms": self.daemon.idle_ttl_ms,
                 "warm": self.daemon.warm,
+                "caching": self.daemon.caching,
                 "pipe_dir": std::path::Path::new(&self.profile_path)
                     .join("pipe")
                     .display()
@@ -616,6 +619,7 @@ JSON filesystem paths are canonical absolute paths; daemon.socket_path is a Wind
             providers_loaded: snapshot.providers_loaded,
             idle_ttl_ms: snapshot.idle_ttl_ms,
             warm: snapshot.warm,
+            caching: snapshot.caching,
         },
         update,
         features: welcome.features.into_iter().collect(),
@@ -1194,7 +1198,11 @@ fn write_document(document: &impl ObserveJson) -> ExitCode {
 }
 
 fn write_status_document(document: &StatusDocument) -> ExitCode {
-    let wire = StatusDocumentWire {
+    write_serializable(&status_document_wire(document))
+}
+
+pub(crate) fn status_document_wire(document: &StatusDocument) -> impl serde::Serialize + '_ {
+    StatusDocumentWire {
         schema: document.schema,
         kind: document.kind,
         daemon: StatusDaemonWire {
@@ -1208,6 +1216,7 @@ fn write_status_document(document: &StatusDocument) -> ExitCode {
             providers_loaded: document.daemon.providers_loaded,
             idle_ttl_ms: document.daemon.idle_ttl_ms,
             warm: document.daemon.warm,
+            caching: document.daemon.caching.as_ref(),
             pipe_dir: std::path::Path::new(&document.profile_path)
                 .join("pipe")
                 .display()
@@ -1231,8 +1240,7 @@ fn write_status_document(document: &StatusDocument) -> ExitCode {
         runtime_dir_resolution: &document.runtime_dir_resolution,
         account_adoption_available: (!document.adoption_available.is_empty())
             .then_some(document.adoption_available.as_slice()),
-    };
-    write_serializable(&wire)
+    }
 }
 
 fn write_serializable(document: &impl serde::Serialize) -> ExitCode {

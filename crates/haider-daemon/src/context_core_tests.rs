@@ -165,6 +165,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
         model: "fake-model".into(),
         max_tokens: 4096,
         permission_overrides: Some(haider_protocol::session::SessionPermissionOverridesV1 {
+            read_only: false,
             allow_writes: false,
             allow_exec: true,
             allow_mobile: false,

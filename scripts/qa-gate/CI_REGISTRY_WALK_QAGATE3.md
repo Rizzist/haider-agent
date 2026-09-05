@@ -251,3 +251,26 @@ Read against the final uncommitted tree before verification. “checked: none”
 - #77 checked — no unsafe code was added; `cargo clippy --workspace -- -D warnings` passes
 - #78-#93 checked: none — no affected surface
 - #94-#96 checked — no deadline, negotiated-connection wait, or turn-performance policy changed
+
+## v0.0.970 providerrebind delta walk
+
+- #1-#18 checked — no new dependency, platform backend, global credential mutation or secret-bearing output; typed CLI/RPC validation and registry guards are covered by focused tests.
+- #19 checked — Rust formatting and whitespace checks apply to the merged tree.
+- #20 checked — test baseline is regenerated with `xtask test-count --update` after the added regressions.
+- #21-#28 checked — additive serde fields preserve absent legacy bytes; status golden and event-schema changelog pins exercise the contract.
+- #29-#30 checked — real daemon/proxy tests retain exact session/run identity, receipt replay and owned cleanup.
+- #31-#40 checked — journal/event/receipt commit shape remains atomic; no dependency or collection ownership policy changes.
+- #41 checked — hermetic profiles and short temporary IPC roots are retained.
+- #42-#43 checked — benchmark siblings are frozen by build; no installed user daemon is reused.
+- #44 checked — native UDS and real loopback HTTP tests exercise the serving path on macOS; Windows/Linux are by inspection.
+- #45-#56 checked — no TUI layout/backend change; the exhaustive session event projection recognizes the new additive kind.
+- #57 checked — CLI usage, client RPC/feature tables, automation contract and advertised feature pin are updated together.
+- #58-#63 checked — no packaging, credential-store format, OAuth or asset changes.
+- #64 checked — prebuilt debug `haiderd` is 199,140,464 bytes, exceeding 10 MiB; benchmark artifacts are reported in the lane evidence.
+- #65-#70 checked — no changed external agent or device workflow.
+- #71 checked — production account factory, registry validation, wire RPC and HTTP adapters are exercised together.
+- #72 checked — discovery disabled and deterministic test-device identity used for builds/tests.
+- #73-#93 checked — sandbox roots/permission ceilings retained; provider-view CAS and durable request markers were not moved or weakened.
+- #94 checked — new integration wait bound is configured provider-open budget plus the shared RPC/journal observation budget; no production deadline was added.
+- #95 checked — negotiated clients service Ping/Pong while waiting; request snapshots retain in-flight adapter ownership.
+- #96 checked — warm ABBA uses the existing harness, exact provider ledger/cardinality gates, 5+25 samples and its load gate. Results and any environmental rejection are recorded in `docs/testing/v0.0.970/providerrebind.md`; no outlier deletion or relaxed correctness gates.

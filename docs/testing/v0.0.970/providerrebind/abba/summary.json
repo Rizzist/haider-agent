@@ -1,0 +1,319 @@
+{
+  "binary_order": "A B B A",
+  "baseline_commit": "7694ef9cbd2fbbcedb24fee14dbf4b12b1c4cd39",
+  "profile": "release (fat LTO, 1 codegen unit)",
+  "comparison_rule": "candidate median <= baseline median + max(baseline MAD,candidate MAD); no outliers removed",
+  "measurement_accepted": true,
+  "correctness_passed": true,
+  "legs": [
+    {
+      "leg": "1-A",
+      "load": {
+        "end": 2.3515625,
+        "mid": 2.3515625,
+        "start": 2.29541015625
+      },
+      "accepted": true,
+      "reasons": [],
+      "summary": {
+        "single": {
+          "budget_ms": null,
+          "budget_pass": null,
+          "client_peak_rss_kib": 13824,
+          "combined_cpu_ms": {
+            "mad": 0.19487299999996655,
+            "median": 5.118485999999988
+          },
+          "combined_peak_rss_kib": 58432,
+          "conservative_component_peak_sum_rss_kib": 58832,
+          "cpu_regression_pass": null,
+          "daemon_peak_rss_kib": 45008,
+          "owner_target_ms": 40.0,
+          "owner_target_pass": true,
+          "peak_rss_kib": 58432,
+          "peak_rss_regression_pass": null,
+          "resource_baseline": {
+            "combined_cpu_mad_ms": 0.0,
+            "combined_cpu_ms": null,
+            "combined_cpu_tolerance_ms": 0.19487299999996655,
+            "combined_peak_rss_kib": null,
+            "combined_peak_rss_tolerance_kib": 0.0
+          },
+          "wall_ms": {
+            "mad": 3.306999999999995,
+            "median": 39.153792
+          }
+        },
+        "tool": {
+          "budget_ms": null,
+          "budget_pass": null,
+          "client_peak_rss_kib": 14256,
+          "combined_cpu_ms": {
+            "mad": 0.2745309999999961,
+            "median": 5.959800000000007
+          },
+          "combined_peak_rss_kib": 59216,
+          "conservative_component_peak_sum_rss_kib": 59264,
+          "cpu_regression_pass": null,
+          "daemon_peak_rss_kib": 45008,
+          "owner_target_ms": 60.0,
+          "owner_target_pass": false,
+          "peak_rss_kib": 59216,
+          "peak_rss_regression_pass": null,
+          "resource_baseline": {
+            "combined_cpu_mad_ms": 0.0,
+            "combined_cpu_ms": null,
+            "combined_cpu_tolerance_ms": 0.2745309999999961,
+            "combined_peak_rss_kib": null,
+            "combined_peak_rss_tolerance_kib": 0.0
+          },
+          "wall_ms": {
+            "mad": 3.6310009999999977,
+            "median": 61.398959
+          }
+        }
+      },
+      "failures": []
+    },
+    {
+      "leg": "2-B",
+      "load": {
+        "end": 2.3232421875,
+        "mid": 2.3232421875,
+        "start": 2.3515625
+      },
+      "accepted": true,
+      "reasons": [],
+      "summary": {
+        "single": {
+          "budget_ms": null,
+          "budget_pass": null,
+          "client_peak_rss_kib": 14112,
+          "combined_cpu_ms": {
+            "mad": 0.21036900000000536,
+            "median": 5.048915000000003
+          },
+          "combined_peak_rss_kib": 58128,
+          "conservative_component_peak_sum_rss_kib": 59200,
+          "cpu_regression_pass": null,
+          "daemon_peak_rss_kib": 45088,
+          "owner_target_ms": 40.0,
+          "owner_target_pass": false,
+          "peak_rss_kib": 58128,
+          "peak_rss_regression_pass": null,
+          "resource_baseline": {
+            "combined_cpu_mad_ms": 0.0,
+            "combined_cpu_ms": null,
+            "combined_cpu_tolerance_ms": 0.21036900000000536,
+            "combined_peak_rss_kib": null,
+            "combined_peak_rss_tolerance_kib": 0.0
+          },
+          "wall_ms": {
+            "mad": 2.953541999999999,
+            "median": 40.763542
+          }
+        },
+        "tool": {
+          "budget_ms": null,
+          "budget_pass": null,
+          "client_peak_rss_kib": 14480,
+          "combined_cpu_ms": {
+            "mad": 0.2273590000000043,
+            "median": 5.9709370000000135
+          },
+          "combined_peak_rss_kib": 59552,
+          "conservative_component_peak_sum_rss_kib": 59568,
+          "cpu_regression_pass": null,
+          "daemon_peak_rss_kib": 45088,
+          "owner_target_ms": 60.0,
+          "owner_target_pass": true,
+          "peak_rss_kib": 59552,
+          "peak_rss_regression_pass": null,
+          "resource_baseline": {
+            "combined_cpu_mad_ms": 0.0,
+            "combined_cpu_ms": null,
+            "combined_cpu_tolerance_ms": 0.2273590000000043,
+            "combined_peak_rss_kib": null,
+            "combined_peak_rss_tolerance_kib": 0.0
+          },
+          "wall_ms": {
+            "mad": 2.6138329999999996,
+            "median": 59.821792
+          }
+        }
+      },
+      "failures": []
+    },
+    {
+      "leg": "3-B",
+      "load": {
+        "end": 2.296875,
+        "mid": 2.296875,
+        "start": 2.3232421875
+      },
+      "accepted": true,
+      "reasons": [],
+      "summary": {
+        "single": {
+          "budget_ms": null,
+          "budget_pass": null,
+          "client_peak_rss_kib": 14128,
+          "combined_cpu_ms": {
+            "mad": 0.16425399999996682,
+            "median": 4.983414000000044
+          },
+          "combined_peak_rss_kib": 58576,
+          "conservative_component_peak_sum_rss_kib": 59200,
+          "cpu_regression_pass": null,
+          "daemon_peak_rss_kib": 45072,
+          "owner_target_ms": 40.0,
+          "owner_target_pass": false,
+          "peak_rss_kib": 58576,
+          "peak_rss_regression_pass": null,
+          "resource_baseline": {
+            "combined_cpu_mad_ms": 0.0,
+            "combined_cpu_ms": null,
+            "combined_cpu_tolerance_ms": 0.16425399999996682,
+            "combined_peak_rss_kib": null,
+            "combined_peak_rss_tolerance_kib": 0.0
+          },
+          "wall_ms": {
+            "mad": 3.370332999999995,
+            "median": 41.739667
+          }
+        },
+        "tool": {
+          "budget_ms": null,
+          "budget_pass": null,
+          "client_peak_rss_kib": 14432,
+          "combined_cpu_ms": {
+            "mad": 0.11621899999995478,
+            "median": 5.772102000000057
+          },
+          "combined_peak_rss_kib": 59280,
+          "conservative_component_peak_sum_rss_kib": 59504,
+          "cpu_regression_pass": null,
+          "daemon_peak_rss_kib": 45072,
+          "owner_target_ms": 60.0,
+          "owner_target_pass": true,
+          "peak_rss_kib": 59280,
+          "peak_rss_regression_pass": null,
+          "resource_baseline": {
+            "combined_cpu_mad_ms": 0.0,
+            "combined_cpu_ms": null,
+            "combined_cpu_tolerance_ms": 0.11621899999995478,
+            "combined_peak_rss_kib": null,
+            "combined_peak_rss_tolerance_kib": 0.0
+          },
+          "wall_ms": {
+            "mad": 2.5821659999999937,
+            "median": 58.637542
+          }
+        }
+      },
+      "failures": []
+    },
+    {
+      "leg": "4-A",
+      "load": {
+        "end": 2.35302734375,
+        "mid": 2.35302734375,
+        "start": 2.296875
+      },
+      "accepted": true,
+      "reasons": [],
+      "summary": {
+        "single": {
+          "budget_ms": null,
+          "budget_pass": null,
+          "client_peak_rss_kib": 13840,
+          "combined_cpu_ms": {
+            "mad": 0.10121900000009987,
+            "median": 5.125528000000044
+          },
+          "combined_peak_rss_kib": 58320,
+          "conservative_component_peak_sum_rss_kib": 58848,
+          "cpu_regression_pass": null,
+          "daemon_peak_rss_kib": 45008,
+          "owner_target_ms": 40.0,
+          "owner_target_pass": true,
+          "peak_rss_kib": 58320,
+          "peak_rss_regression_pass": null,
+          "resource_baseline": {
+            "combined_cpu_mad_ms": 0.0,
+            "combined_cpu_ms": null,
+            "combined_cpu_tolerance_ms": 0.10121900000009987,
+            "combined_peak_rss_kib": null,
+            "combined_peak_rss_tolerance_kib": 0.0
+          },
+          "wall_ms": {
+            "mad": 2.568334,
+            "median": 39.177666
+          }
+        },
+        "tool": {
+          "budget_ms": null,
+          "budget_pass": null,
+          "client_peak_rss_kib": 14256,
+          "combined_cpu_ms": {
+            "mad": 0.18479299999998489,
+            "median": 6.080001000000012
+          },
+          "combined_peak_rss_kib": 58912,
+          "conservative_component_peak_sum_rss_kib": 59264,
+          "cpu_regression_pass": null,
+          "daemon_peak_rss_kib": 45008,
+          "owner_target_ms": 60.0,
+          "owner_target_pass": true,
+          "peak_rss_kib": 58912,
+          "peak_rss_regression_pass": null,
+          "resource_baseline": {
+            "combined_cpu_mad_ms": 0.0,
+            "combined_cpu_ms": null,
+            "combined_cpu_tolerance_ms": 0.18479299999998489,
+            "combined_peak_rss_kib": null,
+            "combined_peak_rss_tolerance_kib": 0.0
+          },
+          "wall_ms": {
+            "mad": 3.207166000000001,
+            "median": 57.069583
+          }
+        }
+      },
+      "failures": []
+    }
+  ],
+  "comparison": {
+    "single": {
+      "A": {
+        "count": 50,
+        "median_ms": 39.165729,
+        "mad_ms": 2.6973335000000027
+      },
+      "B": {
+        "count": 50,
+        "median_ms": 40.974166999999994,
+        "mad_ms": 2.794228499999999
+      },
+      "delta_ms": 1.8084379999999953,
+      "tolerance_ms": 2.794228499999999,
+      "within_mad": true
+    },
+    "tool": {
+      "A": {
+        "count": 50,
+        "median_ms": 58.404708,
+        "mad_ms": 3.788125000000001
+      },
+      "B": {
+        "count": 50,
+        "median_ms": 59.374083,
+        "mad_ms": 2.3454789999999974
+      },
+      "delta_ms": 0.9693749999999994,
+      "tolerance_ms": 3.788125000000001,
+      "within_mad": true
+    }
+  },
+  "passed": true
+}

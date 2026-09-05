@@ -96,6 +96,8 @@ pub fn transcript() -> Vec<WireFrame> {
         end_seq: 9,
     };
     let fork_metadata = SessionMetadataV1 {
+        provider_base_url: None,
+        provider_rebind_id: None,
         cwd: "/tmp/workspace".into(),
         provider: "anthropic".into(),
         account_alias: None,
@@ -407,6 +409,8 @@ pub fn transcript() -> Vec<WireFrame> {
                 created_seq: 1,
                 worker_generation: 7,
                 metadata: SessionMetadataV1 {
+                    provider_base_url: None,
+                    provider_rebind_id: None,
                     cwd: "/tmp/workspace".into(),
                     provider: "anthropic".into(),
                     account_alias: None,
@@ -1028,6 +1032,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 model: "claude-test".into(),
                 max_tokens: 4096,
                 permission_overrides: Some(SessionPermissionOverridesV1 {
+                    read_only: false,
                     allow_writes: true,
                     allow_exec: true,
                     allow_mobile: false,
@@ -2070,6 +2075,34 @@ pub fn transcript() -> Vec<WireFrame> {
     append_agent_cancel_contract_tail(&mut frames);
     append_acp_agent_family_tail(&mut frames);
     frames
+}
+
+/// Additive provider-route request/receipt pair, separate from frozen history.
+pub fn provider_rebind_transcript() -> Vec<WireFrame> {
+    vec![
+        WireFrame::Request {
+            request_id: RequestId::new("request-provider-rebind"),
+            body: RequestBody::SessionProviderRebind {
+                command_id: CommandId::new("command-provider-rebind"),
+                session_id: SessionId::new("session-1"),
+                worker_generation: 3,
+                provider: "benchmark-proxy".into(),
+                base_url: Some("http://127.0.0.1:8000/v1".into()),
+                account: Some("benchmark-account".into()),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-provider-rebind"),
+            body: ResponseBody::SessionProviderRebind {
+                session_id: SessionId::new("session-1"),
+                provider: "benchmark-proxy".into(),
+                base_url: Some("http://127.0.0.1:8000/v1".into()),
+                account: Some("benchmark-account".into()),
+                selected_seq: 17,
+                worker_generation: 3,
+            },
+        },
+    ]
 }
 
 /// v0.0.970 source-registry request/success pairs. Kept separate from the

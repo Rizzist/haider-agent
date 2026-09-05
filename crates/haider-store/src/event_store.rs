@@ -94,7 +94,7 @@ use haider_protocol::reply::{ReplyArenaWriter, ReplyText};
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::session::{
     EffortSelected, FastModeSelected, ModelSelected, SessionInteractionModeV1, SessionMetadataV1,
-    SessionPermissionOverridesV1,
+    SessionPermissionOverridesV1, SessionProviderRebound,
 };
 use haider_protocol::session_fork::{
     ForkCacheSegmentV1, ForkContextEpoch, SessionForkDraft, SessionForkInvalidCutReason,
@@ -1310,6 +1310,46 @@ pub enum SessionSelectFastOutcome {
     },
     IdempotentReplay {
         selected: SelectedFast,
+    },
+}
+
+/// Validated secret-free coordinates for one session endpoint rebind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionProviderRebindCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub provider: String,
+    pub base_url: Option<String>,
+    pub account: Option<String>,
+    pub event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Stable response stored in the `session.provider.rebind` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReboundSessionProvider {
+    pub session_id: SessionId,
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    pub selected_seq: u64,
+    pub worker_generation: u64,
+}
+
+/// Atomic metadata/event/receipt outcome for one session provider rebind.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionProviderRebindOutcome {
+    Committed {
+        selected: ReboundSessionProvider,
+        envelope: Box<RawEnvelope>,
+    },
+    IdempotentReplay {
+        selected: ReboundSessionProvider,
     },
 }
 
@@ -8138,6 +8178,8 @@ impl Store {
         )?;
 
         let metadata = SessionMetadataV1 {
+            provider_base_url: None,
+            provider_rebind_id: None,
             cwd: command.cwd.clone(),
             provider: command.provider.clone(),
             account_alias,
@@ -9279,6 +9321,16 @@ impl Store {
                 false,
             ));
         }
+        if metadata.provider != command.provider {
+            // A route override belongs to its selected provider. A later
+            // ordinary model selection must never carry that endpoint or a
+            // rebind-pinned account into a different adapter.
+            if metadata.provider_rebind_id.is_some() {
+                metadata.account_alias = None;
+            }
+            metadata.provider_base_url = None;
+            metadata.provider_rebind_id = None;
+        }
         metadata.provider = command.provider.clone();
         metadata.model = command.model.clone();
         let updated_metadata = serde_json::to_string(&metadata).map_err(|error| {
@@ -10096,6 +10148,81 @@ impl Store {
             }
             SessionConfigOutcome::IdempotentReplay { selected } => {
                 SessionSelectFastOutcome::IdempotentReplay { selected }
+            }
+        })
+    }
+
+    /// Preflight a committed receipt before registry or generation validation.
+    pub fn session_provider_rebind_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<ReboundSessionProvider>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            "session.provider.rebind",
+            request_digest,
+            request_json,
+            "session-provider-rebind",
+        )
+    }
+
+    /// Commit a daemon-validated route and its replayable fact in one transaction.
+    /// The provider registry is validated by the daemon; the store fences the
+    /// session generation and preserves the selected model and conversation.
+    pub fn rebind_session_provider(
+        &self,
+        command: &SessionProviderRebindCommand,
+    ) -> StoreResult<SessionProviderRebindOutcome> {
+        let rebound = SessionProviderRebound {
+            rebind_id: command.command_id.clone(),
+            provider: command.provider.clone(),
+            base_url: command.base_url.clone(),
+            account: command.account.clone(),
+        };
+        let fact = rebound.to_payload_value().map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize session-provider-rebound payload: {error}"),
+                false,
+            )
+        })?;
+        let session_id = command.session_id.clone();
+        let generation = self.worker_generation;
+        let outcome = self.select_session_config(
+            SessionConfigSelection {
+                command_id: &command.command_id,
+                request_digest: &command.request_digest,
+                request_json: &command.request_json,
+                session_id: &command.session_id,
+                worker_generation: command.worker_generation,
+                method: "session.provider.rebind",
+                description: "session-provider-rebind",
+                event_id: command.event_id.clone(),
+                device_id: command.device_id.clone(),
+            },
+            fact,
+            |_| Ok(()),
+            |metadata| rebound.apply_to_metadata(metadata),
+            |selected_seq| ReboundSessionProvider {
+                session_id,
+                provider: command.provider.clone(),
+                base_url: command.base_url.clone(),
+                account: command.account.clone(),
+                selected_seq,
+                worker_generation: generation,
+            },
+        )?;
+        Ok(match outcome {
+            SessionConfigOutcome::Committed { selected, envelope } => {
+                SessionProviderRebindOutcome::Committed { selected, envelope }
+            }
+            SessionConfigOutcome::IdempotentReplay { selected } => {
+                SessionProviderRebindOutcome::IdempotentReplay { selected }
             }
         })
     }
@@ -21350,7 +21477,7 @@ struct DurableHeadlessRunFacts {
     request_deadline_unix_ms: Option<u64>,
     cancellation_intent_at_ms: Option<u64>,
     blocking_error_code: Option<&'static str>,
-    pending_permission_rejects: HashMap<MenuId, (String, u32)>,
+    pending_permission_allows: HashMap<MenuId, (String, u32)>,
 }
 
 fn record_headless_menu(facts: &mut DurableHeadlessRunFacts, menu: &Menu) {
@@ -21362,24 +21489,24 @@ fn record_headless_menu(facts: &mut DurableHeadlessRunFacts, menu: &Menu) {
         return;
     }
     if let MenuKind::Permission { .. } = menu.kind {
-        let reject_once = menu
+        let allow_once = menu
             .options
             .iter()
             .enumerate()
-            .find(|(_, option)| option.decision == Some(DecisionKind::RejectOnce))
+            .find(|(_, option)| option.decision == Some(DecisionKind::AllowOnce))
             .and_then(|(index, option)| {
                 u32::try_from(index)
                     .ok()
                     .map(|index| (option.key.clone(), index))
             });
-        if let Some(reject_once) = reject_once {
+        if let Some(allow_once) = allow_once {
             facts
-                .pending_permission_rejects
-                .insert(menu.id.clone(), reject_once);
+                .pending_permission_allows
+                .insert(menu.id.clone(), allow_once);
         } else {
             facts
                 .blocking_error_code
-                .get_or_insert("permission_reject_unavailable");
+                .get_or_insert("permission_allow_unavailable");
         }
     } else if menu.blocking {
         facts.blocking_error_code.get_or_insert("input_required");
@@ -21387,7 +21514,7 @@ fn record_headless_menu(facts: &mut DurableHeadlessRunFacts, menu: &Menu) {
 }
 
 fn record_headless_menu_answer(facts: &mut DurableHeadlessRunFacts, answer: &MenuAnswer) {
-    let Some((option_key, option_index)) = facts.pending_permission_rejects.remove(&answer.menu)
+    let Some((option_key, option_index)) = facts.pending_permission_allows.remove(&answer.menu)
     else {
         return;
     };
@@ -21404,7 +21531,7 @@ fn record_headless_menu_answer(facts: &mut DurableHeadlessRunFacts, answer: &Men
 }
 
 fn record_headless_menu_closed(facts: &mut DurableHeadlessRunFacts, menu: &MenuId) {
-    if facts.pending_permission_rejects.remove(menu).is_some()
+    if facts.pending_permission_allows.remove(menu).is_some()
         && !facts.deadline_exceeded
         && facts.cancellation_intent_at_ms.is_none()
         && facts.blocking_error_code.is_none()

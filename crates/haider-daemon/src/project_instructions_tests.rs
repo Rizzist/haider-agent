@@ -142,6 +142,7 @@ impl TestWorker {
             model: "fake-model".into(),
             max_tokens,
             permission_overrides: Some(SessionPermissionOverridesV1 {
+                read_only: false,
                 allow_writes: false,
                 allow_exec: true,
                 allow_mobile: false,
@@ -302,6 +303,8 @@ fn project_facts(
 
 fn metadata(cwd: String) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        provider_base_url: None,
+        provider_rebind_id: None,
         cwd,
         provider: "fake".into(),
         account_alias: None,

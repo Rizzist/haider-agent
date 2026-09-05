@@ -66,9 +66,9 @@ use haider_rpc::{
     FEATURE_SESSION_FLEET_IDENTITY_V1, FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_FORK_V1,
     FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_OBSERVE_BATCH_V1, FEATURE_SESSION_OBSERVE_V1,
     FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SESSION_PROMPT_FORK_V1,
-    FEATURE_SESSION_RUN_ID_V1, FEATURE_SESSION_WORKFLOW_STATE_V1, FEATURE_SHELL_EXEC_V1,
-    FEATURE_SHELL_REGISTRY_V1, FEATURE_SSH_PROFILES_V1, FEATURE_TOOL_INVENTORY_V1,
-    FEATURE_TURN_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1,
+    FEATURE_SESSION_READ_ONLY_V1, FEATURE_SESSION_RUN_ID_V1, FEATURE_SESSION_WORKFLOW_STATE_V1,
+    FEATURE_SHELL_EXEC_V1, FEATURE_SHELL_REGISTRY_V1, FEATURE_SSH_PROFILES_V1,
+    FEATURE_TOOL_INVENTORY_V1, FEATURE_TURN_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1,
     FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_V1,
     FEATURE_USER_COMMAND_V1, FEATURE_VAULT_STAGE_V1, FEATURE_WORKFLOW_CATALOG_V1,
     FEATURE_WORKFLOW_GRAPH_V1, Hello, LifecyclePhase, ProtocolError, RequestBody, RequestId,
@@ -2310,6 +2310,7 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_REQUEST_BUDGET_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned(),
+        haider_rpc::FEATURE_SESSION_PROVIDER_REBIND_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned(),
         FEATURE_SESSION_CONFIG_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_CREATE_ADMISSION_V1.to_owned(),
@@ -2326,6 +2327,7 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_SESSION_OBSERVE_V1.to_owned(),
         FEATURE_SESSION_OBSERVE_BATCH_V1.to_owned(),
         FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
+        FEATURE_SESSION_READ_ONLY_V1.to_owned(),
         FEATURE_AUTONOMOUS_INTERACTION_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_ACCOUNT_SELECT_V1.to_owned(),
         haider_rpc::FEATURE_STATUS_SEGMENT_STRUCTURED_V1.to_owned(),
@@ -2379,6 +2381,8 @@ fn encode_welcome_for_peer(
                     features: welcome.features,
                 });
             }
+            Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
+                if welcome.features.remove(FEATURE_SESSION_READ_ONLY_V1) => {}
             Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
                 if welcome.features.remove(haider_rpc::FEATURE_AGENT_CANCEL_V1) => {}
             Err(haider_rpc::CodecError::FrameLimitExceeded { .. })

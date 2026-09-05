@@ -644,6 +644,11 @@ pub struct HarnessConfig {
     pub rotation_budget_consumed: bool,
     /// Daemon-owned resolver consulted only at a pre-first-event boundary.
     pub provider_attempt_resolver: Option<Arc<dyn ProviderAttemptResolver>>,
+    /// Checks committed session routing before preparing each request. The
+    /// returned adapter is immutable for the lifetime of that request.
+    pub provider_rebind_resolver: Option<Arc<dyn ProviderRebindResolver>>,
+    /// Persisted route identity separates cache domains across explicit rebinds.
+    pub provider_route_epoch: Option<String>,
     /// Daemon-owned durable pair-selection seam. Automatic fallback and
     /// promotion refuse to switch unless this is installed.
     pub provider_pair_switch_committer: Option<Arc<dyn ProviderPairSwitchCommitter>>,
@@ -786,6 +791,8 @@ impl HarnessConfig {
             initial_rotation: None,
             rotation_budget_consumed: false,
             provider_attempt_resolver: None,
+            provider_rebind_resolver: None,
+            provider_route_epoch: None,
             provider_pair_switch_committer: None,
             compaction_promotion: None,
             retry_sleeper: Arc::new(RealRetrySleeper),
@@ -1491,6 +1498,32 @@ pub trait ProviderAttemptResolver: Send + Sync + std::fmt::Debug {
     }
 }
 
+/// A route already durably committed by `session.provider.rebind`.
+/// The model is unchanged; all other provider-derived request state travels
+/// with the adapter so preparation and transport observe one snapshot.
+pub struct ProviderRebindTarget {
+    pub provider: Arc<dyn Provider>,
+    pub provider_name: String,
+    pub account: Option<CredentialAlias>,
+    pub context_window: Option<u64>,
+    pub cached_input_is_subset: bool,
+    pub provider_request_state: ProviderDerivedRequestState,
+    pub auth_scope: String,
+    pub attempt_resolver: Option<Arc<dyn ProviderAttemptResolver>>,
+    pub route_epoch: String,
+    pub initial_rotation: Option<RotationEvent>,
+    pub rotation_budget_consumed: bool,
+}
+
+#[async_trait]
+pub trait ProviderRebindResolver: Send + Sync + std::fmt::Debug {
+    async fn refresh(
+        &self,
+        current_model: &str,
+        reasoning_settings: &str,
+    ) -> Result<Option<ProviderRebindTarget>, HaiderError>;
+}
+
 /// Injectable backoff wait for the provider-retry seam (W-C M4). Production
 /// installs [`RealRetrySleeper`] (a real `tokio` sleep); laws inject a sleeper
 /// that returns immediately and records the requested delays, so the retry
@@ -1667,6 +1700,28 @@ pub trait ToolDispatcher: Send + Sync {
     async fn refresh_volatile_context_tail(&self) -> Result<Option<String>, HaiderError> {
         Ok(None)
     }
+
+    /// Returns a latched terminal failure after any typed tool result that had
+    /// to be shown to the model first. This lets a dispatcher preserve both
+    /// model-readable refusal detail and an honest non-successful run outcome.
+    async fn terminal_failure_after_tool_results(
+        &self,
+    ) -> Result<Option<HaiderError>, HaiderError> {
+        Ok(None)
+    }
+
+    /// Observes a typed tool result only after its journal settlement is
+    /// durable. Dispatchers use this to arm a terminal policy cause without
+    /// masking a failure that occurred before the refusal itself committed.
+    async fn note_committed_tool_result(&self, _result: &BoundedResult) -> Result<(), HaiderError> {
+        Ok(())
+    }
+
+    /// Marks that a provider request carrying any previously committed tool
+    /// results has completed its open attempt. A dispatcher may use this to
+    /// make a pending terminal cause eligible only after the model-facing
+    /// request has actually been issued.
+    async fn note_provider_request_after_tool_results(&self) {}
 
     /// Activates work owned by a newly committed approval checkpoint.
     ///
@@ -3375,6 +3430,75 @@ impl HarnessActor {
             }
         }
         'requests: loop {
+            // Snapshot BEFORE provider-specific history projection, cache/CAS
+            // preparation and transport. A rebind never mutates an Arc used
+            // by an earlier in-flight request.
+            if let Some(resolver) = self.config.provider_rebind_resolver.clone() {
+                match resolver
+                    .refresh(&self.config.model, &self.config.reasoning_settings)
+                    .await
+                {
+                    Ok(Some(target)) => {
+                        // Factory-time alternate selection has the same
+                        // durable-before-provider law as initial turn setup.
+                        // An explicit rebind never refunds the logical turn's
+                        // previously consumed automatic-rotation allowance.
+                        rotation_budget_consumed |= target.rotation_budget_consumed;
+                        if let Some(rotation) = target.initial_rotation {
+                            if let Err(error) = self
+                                .commit_pending_thinking(&run_id, &mut thinking_pending)
+                                .await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            if let Err(error) = self
+                                .commit_payload(
+                                    &run_id,
+                                    EventPayload::Rotation(rotation),
+                                    prompt_omit_render(),
+                                )
+                                .await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            rotation_budget_consumed = true;
+                        }
+                        remap_after_provider_opaque_strip(
+                            &mut messages,
+                            &target.provider_name,
+                            &mut stable_history_end,
+                            &mut current_turn_start,
+                            &mut latest_compaction_summary_end,
+                        );
+                        self.config.context_window = target.context_window;
+                        self.config.cached_input_is_subset = target.cached_input_is_subset;
+                        self.config
+                            .install_provider_derived_request_state(&target.provider_request_state);
+                        self.config.usage_account = target.account.clone();
+                        self.config.usage_scope.provider = target.provider_name;
+                        self.config.usage_scope.account_scope = target.account.clone();
+                        self.config.usage_scope.auth_scope = target.auth_scope;
+                        let dimensions = target.provider.usage_lane_dimensions();
+                        self.config.usage_scope.api_family = dimensions.api_family;
+                        self.config.usage_scope.effort = dimensions.effort;
+                        self.config.usage_scope.speed = dimensions.speed;
+                        self.config.provider_route_epoch = Some(target.route_epoch);
+                        self.config.cache_reuse_gap_ms = None;
+                        self.config.context_compactor = None;
+                        self.config.compaction_promotion = None;
+                        self.config.provider_attempt_resolver = target.attempt_resolver;
+                        provider = target.provider;
+                        usage_account = target.account;
+                        previous_cache_request = None;
+                        previous_provider_view = None;
+                        pending_previous_cache_request = None;
+                        previous_cache_request_sent_at = None;
+                        cache_rewarm_pending = Some(CacheRewarmReasonV1::ConfigurationChange);
+                    }
+                    Ok(None) => {}
+                    Err(error) => return self.errored_state_outcome(&run_id, error).await,
+                }
+            }
             if provider_attempt == 0 {
                 let budget = self.request_budget();
                 if !soft_bound_emitted && provider_request_count >= budget.tranche {
@@ -4225,6 +4349,9 @@ impl HarnessActor {
                         .await;
                 }
                 drop(opening);
+                if let Some(dispatcher) = self.dispatcher.as_ref() {
+                    dispatcher.note_provider_request_after_tool_results().await;
+                }
                 let mut restored_messages = std::mem::take(&mut provider_request.messages);
                 if volatile_user_tail.is_some() && snapshot_insert_at < restored_messages.len() {
                     restored_messages.remove(snapshot_insert_at);
@@ -5641,36 +5768,6 @@ impl HarnessActor {
                                 )
                                 .await;
                         }
-                        if reason == FinishReason::Error {
-                            if let Err(error) = self
-                                .commit_pending_usage(&run_id, &mut pending_usage_commit)
-                                .await
-                            {
-                                return self
-                                    .drive_error_outcome_with_items(
-                                        &run_id,
-                                        &mut message,
-                                        &mut reasoning,
-                                        &mut tools,
-                                        DriveError::from(error),
-                                    )
-                                    .await;
-                            }
-                            let error = HaiderError::new(
-                                ErrorCode::ProviderError,
-                                "provider finished the turn with an error",
-                                false,
-                            );
-                            return self
-                                .errored_outcome_with_items(
-                                    &run_id,
-                                    &mut message,
-                                    &mut reasoning,
-                                    &mut tools,
-                                    error,
-                                )
-                                .await;
-                        }
                         let mut post_stream_batch = reason == FinishReason::EndTurn
                             && pending_usage_commit.is_some()
                             && message.is_some()
@@ -5766,6 +5863,69 @@ impl HarnessActor {
                                     &mut message,
                                     &mut reasoning,
                                     &mut tools,
+                                )
+                                .await;
+                        }
+                        // A dispatcher may have returned a typed denial to the
+                        // model on the preceding request while latching the
+                        // run's required terminal cause. Once the model has
+                        // observed it, that cause wins over provider refusal,
+                        // provider error, and continuation exhaustion. An
+                        // explicit cancellation above still wins immediately.
+                        if let Some(dispatcher) = self.dispatcher.as_ref() {
+                            let terminal_failure =
+                                match dispatcher.terminal_failure_after_tool_results().await {
+                                    Ok(failure) => failure,
+                                    Err(error) => {
+                                        return self
+                                            .errored_outcome_with_items(
+                                                &run_id,
+                                                &mut message,
+                                                &mut reasoning,
+                                                &mut tools,
+                                                error,
+                                            )
+                                            .await;
+                                    }
+                                };
+                            if let Some(error) = terminal_failure {
+                                if let Err(usage_error) =
+                                    finalize_request_usage(&mut completed_usage, &mut request_usage)
+                                {
+                                    return self
+                                        .drive_error_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            usage_error,
+                                        )
+                                        .await;
+                                }
+                                return self
+                                    .errored_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
+                            }
+                        }
+                        if reason == FinishReason::Error {
+                            let error = HaiderError::new(
+                                ErrorCode::ProviderError,
+                                "provider finished the turn with an error",
+                                false,
+                            );
+                            return self
+                                .errored_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    error,
                                 )
                                 .await;
                         }
@@ -7776,6 +7936,10 @@ impl HarnessActor {
             let call_id = tools[index].call_id.clone();
             self.commit_tool_settlement_and_streaming(run_id, &tools[index], &result)
                 .await?;
+            dispatcher
+                .note_committed_tool_result(&result)
+                .await
+                .map_err(DriveError::Store)?;
             let projection = model_tool_result_projection(&tools[index].name, &result);
             tools.remove(index);
             return Ok(Some(Message::tool_result_with_images(
@@ -9610,6 +9774,11 @@ impl HarnessActor {
         tools: &mut Vec<ToolAccumulator>,
         mut provider_error: ProviderError,
     ) -> TurnOutcome {
+        if let Some(error) = self.latched_terminal_failure().await {
+            return self
+                .errored_outcome_with_items(run_id, message, reasoning, tools, error)
+                .await;
+        }
         // This is the single deadline-to-terminal classifier. The durable
         // state wins over whichever timer happened to wake the actor: expiry
         // during provider backoff/admission is bounded retry exhaustion, while
@@ -9700,6 +9869,7 @@ impl HarnessActor {
         tools: &mut Vec<ToolAccumulator>,
         error: HaiderError,
     ) -> TurnOutcome {
+        let error = self.latched_terminal_failure().await.unwrap_or(error);
         if let Err(cleanup_error) = self
             .complete_open_items(run_id, message, reasoning, tools, ToolStatus::Failed)
             .await
@@ -9729,6 +9899,7 @@ impl HarnessActor {
 
     /// Commits `Errored` (best effort) and reports the original error.
     async fn errored_state_outcome(&mut self, run_id: &RunId, error: HaiderError) -> TurnOutcome {
+        let error = self.latched_terminal_failure().await.unwrap_or(error);
         if let Err(commit_error) = self.commit_terminal_error(run_id, &error).await {
             return errored_outcome(commit_error);
         }
@@ -9736,6 +9907,14 @@ impl HarnessActor {
             state: RunState::Errored,
             finish_reason: FinishReason::Error,
             error: Some(error),
+        }
+    }
+
+    async fn latched_terminal_failure(&self) -> Option<HaiderError> {
+        let dispatcher = self.dispatcher.as_ref()?;
+        match dispatcher.terminal_failure_after_tool_results().await {
+            Ok(failure) => failure,
+            Err(error) => Some(error),
         }
     }
 
@@ -12419,6 +12598,12 @@ fn prompt_cache_metadata(
         "compaction_epoch": compaction_epoch,
         "volatile_context_epoch": volatile_context_epoch,
     }));
+    let cache_epoch = config.provider_route_epoch.as_ref().map_or_else(
+        || cache_epoch.clone(),
+        |route| {
+            digest_json(&serde_json::json!({"request_epoch": cache_epoch, "provider_route": route}))
+        },
+    );
     let stable_prefix_tokens =
         estimated_request_input_tokens(config, &messages[..cacheable_history_end]);
     PromptCacheMetadata {
@@ -14168,5 +14353,41 @@ mod cu1_actor_tests {
         };
         assert_eq!(retained, &images[1..]);
         assert!(preview.contains(images[0].artifact.as_str()));
+    }
+    #[test]
+    fn provider_rebind_epoch_reaches_real_cache_metadata_and_is_stable_between_turns() {
+        let mut config =
+            HarnessConfig::for_session(SessionId::new("route-cache"), DeviceId::new("test"), 0, 0);
+        let messages = vec![Message::user_text("stable prompt")];
+        let epoch = |config: &HarnessConfig| {
+            prompt_cache_metadata(
+                config,
+                &messages,
+                PromptCacheBoundaries {
+                    stable_history_end: 0,
+                    cacheable_history_end: 0,
+                    current_user_start: 0,
+                    previous_stable_history_end: None,
+                    latest_compaction_summary_end: None,
+                },
+                usage_prefix_digests(config, &[]),
+                None,
+                None,
+            )
+            .cache_epoch
+        };
+        let unbound = epoch(&config);
+        config.provider_route_epoch = Some("rebind-a".into());
+        let first = epoch(&config);
+        assert_ne!(unbound, first);
+        assert_eq!(first, epoch(&config.clone()));
+        config.provider_route_epoch = Some("rebind-b".into());
+        assert_ne!(first, epoch(&config));
+        config.provider_route_epoch = None;
+        assert_eq!(
+            unbound,
+            epoch(&config),
+            "ordinary request cache bytes stay unchanged"
+        );
     }
 }

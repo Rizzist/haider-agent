@@ -130,7 +130,7 @@ use haider_protocol::provider::{
 };
 use haider_protocol::queue::QueueChange;
 use haider_protocol::retry::RunRetryEventPayload;
-use haider_protocol::session::SessionMetadataV1;
+use haider_protocol::session::{SessionInteractionModeV1, SessionMetadataV1};
 use haider_protocol::session_fork::{ForkCacheSegmentV1, ForkContextEpoch, SessionForked};
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::{
@@ -7793,11 +7793,13 @@ async fn start_turn(
         refresh_context_economy(lease, &pinned_metadata.context_economy).await?;
     if let Some(context) = headless.as_ref() {
         let spec = &context.spec;
-        pinned_metadata.provider.clone_from(&spec.provider);
-        pinned_metadata.model.clone_from(&spec.model);
-        pinned_metadata.max_tokens = spec.max_output_tokens;
-        pinned_metadata.effort.clone_from(&spec.effort);
-        pinned_metadata.fast = spec.fast;
+        provider_rebind::pin_headless_turn_metadata(
+            &mut pinned_metadata,
+            spec,
+            lease,
+            &accepted.run_id,
+        )
+        .await?;
         let exhaustion = match context.exhausted.clone() {
             Some(exhausted) => Some(exhausted),
             None => check_run_budget(lease, &accepted.run_id, spec, context.accepted_at_ms).await?,
@@ -8138,10 +8140,11 @@ async fn start_turn(
         .hub()
         .provider_lockdown_policy_for_active(&resolved.provider_name, resolved.active_no_auth)
         .map_err(hub_error)?;
-    let lockdown = lockdown_turn_snapshot(
+    let lockdown = provider_rebind::rebound_turn_lockdown_snapshot(
         lease.hub(),
         lease.session_id(),
         &accepted.run_id,
+        metadata.provider_rebind_id.is_some(),
         &resolved.provider_name,
         provider_policy,
     )?;
@@ -8572,6 +8575,7 @@ async fn start_turn(
     )
     .with_event_ids(Arc::clone(&event_ids));
     config.turn_trace = turn_trace.clone();
+    config.provider_route_epoch = metadata.provider_rebind_id.clone();
     config.provider_deadline = provider_deadline;
     let provider_request_state = provider_derived_request_state(
         &resolved.provider_name,
@@ -8799,6 +8803,14 @@ async fn start_turn(
     }
     config.rotation_budget_consumed = resolved.rotation_budget_consumed;
     config.initial_rotation = resolved.initial_rotation;
+    config.provider_rebind_resolver = Some(Arc::new(
+        provider_rebind::DaemonProviderRebindResolver::new(
+            lease.clone(),
+            Arc::clone(&dependencies.provider_factory),
+            metadata.clone(),
+            web_degrade,
+        ),
+    ));
     config.provider_attempt_resolver = resolved.attempt_resolver;
     config.compaction_promotion = resolved.compaction_promotion;
     config.provider_pair_switch_committer = Some(Arc::new(DaemonProviderPairSwitchCommitter {
@@ -13180,8 +13192,8 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
         },
         {
             // W-A: killing a task IS an effect under the existing process
-            // ceiling; same Ask default as process_exec, and the same
-            // session override (`allow_exec`) lifts both together.
+            // ceiling. Its interactive default is Ask; autonomous mode
+            // promotes it to ordinary Allow with every other Ask class.
             let manifest = haider_tools::task_kill_manifest();
             RegisteredTool {
                 manifest,
@@ -13191,10 +13203,9 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
         },
         {
             // W-B: the universal LOCAL web fetch IS an effect under the
-            // `Network { host }` class — Ask by default, per-host grants
-            // from the menu, auto-allowed under the exec override (a
-            // process can reach the network anyway, so `allow_exec` is the
-            // honest auto-mode gate; delegated children carry it).
+            // `Network { host }` class — Ask for interactive sessions, with
+            // per-host grants from the menu. Autonomous mode promotes it to
+            // ordinary Allow; the legacy exec override does the same.
             let manifest = haider_tools::web_fetch_manifest();
             RegisteredTool {
                 manifest,
@@ -13216,8 +13227,8 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
         },
         {
             // CU-2: observation and control are independently brokered. Ask
-            // is fail-closed while preserving the existing permission-menu
-            // path; neither class is lifted by `allow_exec`.
+            // opens the existing permission menu only for interactive
+            // sessions; autonomous mode promotes it to ordinary Allow.
             let manifest = haider_tools::computer_manifest();
             RegisteredTool {
                 manifest,
@@ -13226,8 +13237,8 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
             }
         },
         {
-            // Mobile-use is both capability-gated and effect-brokered. Ask is
-            // fail-closed once the session has explicitly activated it.
+            // Mobile-use is both capability-gated and effect-brokered. Its
+            // interactive Ask becomes ordinary Allow in autonomous mode.
             let manifest = haider_tools::mobile_manifest();
             RegisteredTool {
                 manifest,
@@ -14962,6 +14973,17 @@ async fn create_broker_tool_dispatcher(
     screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
 ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
     let session_id = context.store.session_id().clone();
+    let durable_terminal_failure = durable_read_only_terminal_failure(
+        &context.store,
+        context.store.session_id(),
+        &context.run_id,
+        context
+            .metadata
+            .permission_overrides
+            .as_ref()
+            .is_some_and(|overrides| overrides.read_only),
+    )
+    .await?;
     let active_tool_name = Arc::new(StdMutex::new(None));
     let journal = HubJournalSink::new(&context, Arc::clone(&active_tool_name), effect_dispatched);
     let mut broker = EffectBroker::new_canonical(
@@ -14988,14 +15010,13 @@ async fn create_broker_tool_dispatcher(
             ToolPermissionDefault::Allow => policy.allow(class),
             ToolPermissionDefault::Ask => policy.ask(class),
             ToolPermissionDefault::Deny => policy.deny(
-                class,
-                if context.metadata.interaction_mode
-                    == haider_protocol::session::SessionInteractionModeV1::Autonomous
-                {
-                    "no_human_available: autonomous mode does not approve effects"
-                } else {
-                    "denied by daemon default policy"
-                },
+                class.clone(),
+                context
+                    .metadata
+                    .permission_overrides
+                    .filter(|overrides| overrides.read_only)
+                    .and_then(|_| read_only_denial_reason(&class))
+                    .unwrap_or("denied by explicit permission policy rule"),
             ),
             ToolPermissionDefault::NotApplicable => {}
         }
@@ -15003,15 +15024,11 @@ async fn create_broker_tool_dispatcher(
     for grant in durable_grants {
         policy.allow_session_grant(grant).map_err(tool_error)?;
     }
-    let interaction_policy =
-        haider_core::InteractionResolutionPolicy::new(context.metadata.interaction_mode);
-    if interaction_policy.resolve(haider_core::InteractionGate::EffectBrokerAsk)
-        == haider_core::InteractionResolution::FailClosed
-        && interaction_policy.resolve(haider_core::InteractionGate::MobileOrDeviceGrant)
-            == haider_core::InteractionResolution::FailClosed
+    if haider_core::InteractionResolutionPolicy::new(context.metadata.interaction_mode)
+        .resolve(haider_core::InteractionGate::EffectBrokerAsk)
+        == haider_core::InteractionResolution::AutoApprove
     {
-        policy
-            .deny_unresolved_asks("no_human_available: autonomous mode cannot approve this effect");
+        policy.auto_allow_asks();
     }
     if context.lockdown.is_some() {
         for class in LOCKDOWN_HARD_DENIED_EFFECTS.iter().cloned() {
@@ -15038,6 +15055,8 @@ async fn create_broker_tool_dispatcher(
         mobile,
         screenshot_redaction,
         active_computer_turn_cancel: StdMutex::new(None),
+        pending_terminal_failure_after_tool_results: Mutex::new(durable_terminal_failure),
+        terminal_failure_after_tool_results: Mutex::new(None),
         os_permission_menus: Mutex::new(HashMap::new()),
         pending_computer_permissions: Mutex::new(HashMap::new()),
         parsed_tool_operations: StdMutex::new(HashMap::new()),
@@ -15085,15 +15104,111 @@ const LOCKDOWN_HARD_DENIED_EFFECTS: &[EffectClass] = &[
     EffectClass::PeerMessage,
 ];
 
+pub(crate) const READ_ONLY_WRITE_DENIAL: &str = "write denied: run is --read-only";
+pub(crate) const READ_ONLY_EXEC_DENIAL: &str = "process execution denied: run is --read-only";
+pub(crate) const READ_ONLY_REMOTE_EXEC_DENIAL: &str = "remote execution denied: run is --read-only";
+pub(crate) const READ_ONLY_GIT_DENIAL: &str = "git operation denied: run is --read-only";
+pub(crate) const READ_ONLY_COMPUTER_CONTROL_DENIAL: &str =
+    "computer control denied: run is --read-only";
+pub(crate) const READ_ONLY_PEER_MESSAGE_DENIAL: &str = "peer message denied: run is --read-only";
+pub(crate) const READ_ONLY_REGISTRY_DENIAL: &str = "registry mutation denied: run is --read-only";
+const READ_ONLY_DENIED_EFFECTS: &[EffectClass] = &[
+    EffectClass::FsWrite,
+    EffectClass::ProcessExec,
+    EffectClass::RemoteExecution,
+    EffectClass::GitOp,
+    EffectClass::GuiAct,
+    EffectClass::ScreenControl,
+    EffectClass::PeerMessage,
+];
+
+fn read_only_denial_reason(class: &EffectClass) -> Option<&'static str> {
+    match class {
+        EffectClass::FsWrite => Some(READ_ONLY_WRITE_DENIAL),
+        EffectClass::ProcessExec => Some(READ_ONLY_EXEC_DENIAL),
+        EffectClass::RemoteExecution => Some(READ_ONLY_REMOTE_EXEC_DENIAL),
+        EffectClass::GitOp => Some(READ_ONLY_GIT_DENIAL),
+        EffectClass::GuiAct | EffectClass::ScreenControl => Some(READ_ONLY_COMPUTER_CONTROL_DENIAL),
+        EffectClass::PeerMessage => Some(READ_ONLY_PEER_MESSAGE_DENIAL),
+        _ => None,
+    }
+}
+
+fn is_read_only_denial(reason: &str) -> bool {
+    [
+        READ_ONLY_WRITE_DENIAL,
+        READ_ONLY_EXEC_DENIAL,
+        READ_ONLY_REMOTE_EXEC_DENIAL,
+        READ_ONLY_GIT_DENIAL,
+        READ_ONLY_COMPUTER_CONTROL_DENIAL,
+        READ_ONLY_PEER_MESSAGE_DENIAL,
+        READ_ONLY_REGISTRY_DENIAL,
+    ]
+    .contains(&reason)
+}
+
+pub(crate) fn autonomous_permission_resolution_command(
+    session_id: &SessionId,
+    device_id: &DeviceId,
+    current_generation: u64,
+    checkpoint: &RequestInputCheckpoint,
+) -> Result<MenuResolutionCommand, HaiderError> {
+    let (option_index, option) = checkpoint
+        .menu
+        .options
+        .iter()
+        .enumerate()
+        .find(|(_, option)| option.decision == Some(DecisionKind::AllowOnce))
+        .ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::PermissionDenied,
+                format!(
+                    "autonomous permission menu {} has no AllowOnce resolution",
+                    checkpoint.menu.id
+                ),
+                false,
+            )
+        })?;
+    let option_index = u32::try_from(option_index).map_err(|_| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            "autonomous permission option index exceeds protocol bounds",
+            false,
+        )
+    })?;
+    Ok(MenuResolutionCommand {
+        command_id: format!("autonomous-permission-allow-{}", checkpoint.menu.id),
+        session_id: session_id.clone(),
+        request_seq: checkpoint.request_seq,
+        worker_generation: checkpoint.opening_generation,
+        allow_prior_generation: checkpoint.opening_generation != current_generation,
+        answer: MenuAnswer {
+            menu: checkpoint.menu.id.clone(),
+            option_key: Some(option.key.clone()),
+            option_index,
+            value: None,
+            via: AnswerVia::Hook,
+        },
+        device_id: device_id.clone(),
+        input_is_secret_reference: false,
+    })
+}
+
 pub(crate) fn effective_permission_defaults(
     metadata: &SessionMetadataV1,
 ) -> Vec<(EffectClass, ToolPermissionDefault)> {
     let overrides = metadata.permission_overrides.unwrap_or_default();
-    registered_tools()
+    let autonomous_permissions =
+        haider_core::InteractionResolutionPolicy::new(metadata.interaction_mode)
+            .resolve(haider_core::InteractionGate::EffectBrokerAsk)
+            == haider_core::InteractionResolution::AutoApprove;
+    let mut defaults = registered_tools()
         .iter()
         .flat_map(|entry| {
             entry.manifest.effects.iter().cloned().map(move |class| {
-                let base = if (overrides.allow_writes && class == EffectClass::FsWrite)
+                let base = if overrides.read_only && read_only_denial_reason(&class).is_some() {
+                    ToolPermissionDefault::Deny
+                } else if (overrides.allow_writes && class == EffectClass::FsWrite)
                     || (overrides.allow_exec && class == EffectClass::ProcessExec)
                     // W-B: the exec override is the honest auto-mode gate for
                     // network fetches too — an allowed process can already
@@ -15107,7 +15222,8 @@ pub(crate) fn effective_permission_defaults(
                             EffectClass::ReadSms
                                 | EffectClass::MobileObserve
                                 | EffectClass::MobileControl
-                        )) {
+                        ))
+                {
                     ToolPermissionDefault::Allow
                 } else {
                     entry.default
@@ -15122,7 +15238,9 @@ pub(crate) fn effective_permission_defaults(
                 // TCC gate for computer actions remains independent, and every
                 // effect is still journaled. Autonomous sessions fail that OS
                 // gate closed instead of opening a blocking grant card.
-                let default = if overrides.auto_allow && base == ToolPermissionDefault::Ask {
+                let default = if (autonomous_permissions || overrides.auto_allow)
+                    && base == ToolPermissionDefault::Ask
+                {
                     ToolPermissionDefault::Allow
                 } else {
                     base
@@ -15130,7 +15248,18 @@ pub(crate) fn effective_permission_defaults(
                 (class, default)
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    // Read-only is an explicit policy rule, not a registry default. Install
+    // every covered class even when no currently advertised tool names it, so
+    // a specialized or future route cannot fall through to autonomous Allow.
+    if overrides.read_only {
+        for class in READ_ONLY_DENIED_EFFECTS.iter().cloned() {
+            if !defaults.iter().any(|(listed, _)| listed == &class) {
+                defaults.push((class, ToolPermissionDefault::Deny));
+            }
+        }
+    }
+    defaults
 }
 
 struct BrokerToolDispatcher {
@@ -15147,6 +15276,8 @@ struct BrokerToolDispatcher {
     /// execute future, allowing `close` to distinguish ESC from a panic or
     /// transport failure and preserve honest Cancelled vs Unknown outcomes.
     active_computer_turn_cancel: StdMutex<Option<CancelToken>>,
+    pending_terminal_failure_after_tool_results: Mutex<Option<HaiderError>>,
+    terminal_failure_after_tool_results: Mutex<Option<HaiderError>>,
     os_permission_menus: Mutex<HashMap<MenuId, Menu>>,
     pending_computer_permissions: Mutex<HashMap<MenuId, PendingComputerPermission>>,
     parsed_tool_operations: StdMutex<HashMap<ParsedToolOperationKey, Arc<ParsedToolOperation>>>,
@@ -15935,6 +16066,19 @@ impl BrokerToolDispatcher {
             .await
     }
 
+    async fn resolve_autonomous_permission_menu(
+        output: &HubCommandOutputContext,
+        checkpoint: &RequestInputCheckpoint,
+    ) -> Result<MenuResolutionOutcome, HaiderError> {
+        let command = autonomous_permission_resolution_command(
+            output.store.session_id(),
+            &output.device_id,
+            output.store.worker_generation(),
+            checkpoint,
+        )?;
+        output.store.hub().resolve_hook_menu(command).await
+    }
+
     async fn activate_computer_permission(
         &self,
         run_id: &RunId,
@@ -16585,6 +16729,14 @@ impl BrokerToolDispatcher {
             });
     }
 
+    async fn permission_denial_result(&self, reason: String) -> ToolDispatchResult {
+        let error = ToolError::PermissionDenied { reason };
+        let Some(result) = typed_tool_result(&error) else {
+            unreachable!("permission denial is typed");
+        };
+        ToolDispatchResult::Completed(result)
+    }
+
     async fn dispatch_ssh_shell(
         &self,
         broker: &mut EffectBroker,
@@ -16643,7 +16795,7 @@ impl BrokerToolDispatcher {
                 return Ok((ToolDispatchResult::ApprovalRequired(menu), true));
             }
             AuthorizationVerdict::Deny { reason } => {
-                return Err(tool_error(ToolError::PermissionDenied { reason }));
+                return Ok((self.permission_denial_result(reason).await, false));
             }
         }
         // Scope is mutable while a permission menu is open. This second check
@@ -17040,6 +17192,17 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 )));
             }
         };
+        if self
+            .metadata
+            .permission_overrides
+            .is_some_and(|overrides| overrides.read_only)
+            && route == RegisteredToolRoute::LoomRegister
+        {
+            self.clear_cached_call(run_id, item_id, call_id);
+            return Ok(self
+                .permission_denial_result(READ_ONLY_REGISTRY_DENIAL.into())
+                .await);
+        }
         let operation_key = ParsedToolOperationKey {
             run_id: run_id.clone(),
             item_id: item_id.clone(),
@@ -17172,7 +17335,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     return Ok(ToolDispatchResult::ApprovalRequired(menu));
                 }
                 AuthorizationVerdict::Deny { reason } => {
-                    return Err(tool_error(broker.denial_error(&policy, &intent, reason)));
+                    let error = broker.denial_error(&policy, &intent, reason);
+                    if let ToolError::PermissionDenied { reason } = error {
+                        return Ok(self.permission_denial_result(reason).await);
+                    }
+                    return Err(tool_error(error));
                 }
             }
             let status = match crate::lockdown::global().and_then(|manager| {
@@ -17415,7 +17582,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         return Ok(ToolDispatchResult::ApprovalRequired(menu));
                     }
                     AuthorizationVerdict::Deny { reason } => {
-                        return Err(tool_error(broker.denial_error(&policy, &intent, reason)));
+                        let error = broker.denial_error(&policy, &intent, reason);
+                        if let ToolError::PermissionDenied { reason } = error {
+                            return Ok(self.permission_denial_result(reason).await);
+                        }
+                        return Err(tool_error(error));
                     }
                 }
                 let result = self
@@ -17866,6 +18037,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     operation_lease.retain_for_approval();
                     return Ok(ToolDispatchResult::ApprovalRequired(menu));
                 }
+                Err(ToolError::PermissionDenied { reason }) => {
+                    return Ok(self.permission_denial_result(reason).await);
+                }
                 Err(error) => return Err(tool_error(error)),
             };
             let established = match self
@@ -18204,7 +18378,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     return Ok(ToolDispatchResult::ApprovalRequired(menu));
                 }
                 AuthorizationVerdict::Deny { reason } => {
-                    return Err(tool_error(broker.denial_error(&policy, &intent, reason)));
+                    let error = broker.denial_error(&policy, &intent, reason);
+                    if let ToolError::PermissionDenied { reason } = error {
+                        return Ok(self.permission_denial_result(reason).await);
+                    }
+                    return Err(tool_error(error));
                 }
             }
             let delivery = match self.output.store.hub().peer_service() {
@@ -19648,6 +19826,12 @@ impl ToolDispatcher for BrokerToolDispatcher {
         run_id: &RunId,
         checkpoint: &RequestInputCheckpoint,
     ) -> Result<(), HaiderError> {
+        if self.metadata.interaction_mode == SessionInteractionModeV1::Autonomous
+            && checkpoint.menu.origin != COMPUTER_PERMISSION_MENU_ORIGIN
+        {
+            Self::resolve_autonomous_permission_menu(&self.output, checkpoint).await?;
+            return Ok(());
+        }
         self.activate_computer_permission(run_id, checkpoint).await
     }
 
@@ -19691,6 +19875,56 @@ impl ToolDispatcher for BrokerToolDispatcher {
             broker.restore_permission(menu, answer, class, args_digest, &mut policy)
         }
         .map_err(tool_error)
+    }
+
+    async fn terminal_failure_after_tool_results(
+        &self,
+    ) -> Result<Option<HaiderError>, HaiderError> {
+        Ok(self
+            .terminal_failure_after_tool_results
+            .lock()
+            .await
+            .clone())
+    }
+
+    async fn note_committed_tool_result(&self, result: &BoundedResult) -> Result<(), HaiderError> {
+        if !self
+            .metadata
+            .permission_overrides
+            .as_ref()
+            .is_some_and(|overrides| overrides.read_only)
+        {
+            return Ok(());
+        }
+        let Some(reason) = result
+            .reason
+            .as_deref()
+            .filter(|reason| is_read_only_denial(reason))
+        else {
+            return Ok(());
+        };
+        let delivered = self.terminal_failure_after_tool_results.lock().await;
+        if delivered.is_none() {
+            let mut pending = self
+                .pending_terminal_failure_after_tool_results
+                .lock()
+                .await;
+            if pending.is_none() {
+                *pending = Some(HaiderError::new(ErrorCode::PermissionDenied, reason, false));
+            }
+        }
+        Ok(())
+    }
+
+    async fn note_provider_request_after_tool_results(&self) {
+        let mut delivered = self.terminal_failure_after_tool_results.lock().await;
+        if delivered.is_none() {
+            let mut pending = self
+                .pending_terminal_failure_after_tool_results
+                .lock()
+                .await;
+            *delivered = pending.take();
+        }
     }
 
     async fn close(&self) -> Result<(), HaiderError> {
@@ -19894,6 +20128,42 @@ pub(crate) async fn durable_session_tool_state(
     }
 }
 
+pub(crate) async fn durable_read_only_terminal_failure(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    run_id: &RunId,
+    read_only: bool,
+) -> Result<Option<HaiderError>, HaiderError> {
+    if !read_only {
+        return Ok(None);
+    }
+    let mut cursor = 0;
+    loop {
+        let page = store.read(session_id, cursor, 256).await?;
+        if page.is_empty() {
+            return Ok(None);
+        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        for envelope in page {
+            if envelope.run_id.as_ref() != Some(run_id) {
+                continue;
+            }
+            let Ok(EventPayload::ToolResult { result, .. }) = envelope.payload.decode_event()
+            else {
+                continue;
+            };
+            let Some(reason) = result.reason.filter(|reason| is_read_only_denial(reason)) else {
+                continue;
+            };
+            return Ok(Some(HaiderError::new(
+                ErrorCode::PermissionDenied,
+                reason,
+                false,
+            )));
+        }
+    }
+}
+
 pub(crate) async fn tool_inventory_snapshot(
     store: &dyn StoreHandle,
     session_id: &SessionId,
@@ -19989,12 +20259,22 @@ pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<Bound
             }),
         ));
     }
+    if let haider_tools::ToolError::PermissionDenied { reason } = error {
+        let mut result = typed_error_result(
+            "denied",
+            "permission_denied",
+            error,
+            serde_json::Value::Null,
+        );
+        result.reason = Some(bounded_failure_reason(reason));
+        return Some(result);
+    }
     let (status, kind) = match error {
         haider_tools::ToolError::RefusedByLockdown { .. } => ("rejected", "refused_by_lockdown"),
         haider_tools::ToolError::LockdownQuotaExceeded { .. } => {
             ("rejected", "lockdown_quota_exceeded")
         }
-        haider_tools::ToolError::PermissionDenied { .. } => ("denied", "permission_denied"),
+        haider_tools::ToolError::PermissionDenied { .. } => unreachable!("handled above"),
         haider_tools::ToolError::WorkspaceBoundary { .. } => ("rejected", "workspace_boundary"),
         haider_tools::ToolError::PathChanged { .. } => ("rejected", "path_changed"),
         haider_tools::ToolError::UnreadFile { .. } => ("rejected", "unread_file"),
@@ -21848,9 +22128,21 @@ impl JournalSink for HubJournalSink {
 }
 
 fn tool_error(error: haider_tools::ToolError) -> HaiderError {
-    HaiderError::new(ErrorCode::ProviderError, error.to_string(), false)
+    let code = if matches!(
+        &error,
+        haider_tools::ToolError::PermissionDenied { .. }
+            | haider_tools::ToolError::RefusedByLockdown { .. }
+    ) {
+        ErrorCode::PermissionDenied
+    } else {
+        ErrorCode::ProviderError
+    };
+    HaiderError::new(code, error.to_string(), false)
 }
 
 fn computer_error(error: ComputerError) -> HaiderError {
     HaiderError::new(ErrorCode::ProviderError, error.to_string(), false)
 }
+
+#[path = "provider_rebind.rs"]
+mod provider_rebind;

@@ -21,6 +21,20 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.970 — per-session provider rebind
+
+New supplemental kind: `session_config:session_provider_rebound`. The
+prompt-omitted fact carries `rebind_id` (the command identity), `provider`,
+optional `base_url`, and optional `account`; credentials are never included.
+The event, session metadata update, and `session.provider.rebind` command
+receipt commit atomically. Omitted endpoint/account coordinates clear the
+previous session override. The selected model and conversation are preserved.
+`SessionProviderRebound::apply_to_metadata` reconstructs the same route and
+version from journal replay; an already admitted request retains its captured
+adapter. Legacy metadata omits the additive `provider_base_url` and
+`provider_rebind_id` fields. Raw readers preserve this additive kind without
+changing schema version 1.
+
 ### v0.0.970 — recoverable invalid tool calls
 
 `tool_result.result.data` adds `kind: "invalid_tool_call"` with `tool` and
