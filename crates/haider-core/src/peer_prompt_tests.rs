@@ -62,6 +62,8 @@ fn peer_list_model_view_compacts_without_rewriting_the_raw_journal_value() {
     let result = BoundedResult {
         preview: raw.clone(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),

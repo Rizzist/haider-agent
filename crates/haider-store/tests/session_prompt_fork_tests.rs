@@ -271,6 +271,8 @@ fn completed_agent_facts(
                         result: BoundedResult {
                             preview: format!("result {index}"),
                             truncated: false,
+                            truncation: None,
+                            effects: Vec::new(),
                             data: None,
                             artifact: None,
                             images: Vec::new(),
@@ -986,6 +988,8 @@ fn incomplete_tool_fact(
                 result: BoundedResult {
                     preview: "orphan".into(),
                     truncated: false,
+                    truncation: None,
+                    effects: Vec::new(),
                     data: None,
                     artifact: None,
                     images: Vec::new(),
@@ -1125,6 +1129,8 @@ fn tool_result_fact(
             result: BoundedResult {
                 preview: "contents".into(),
                 truncated: false,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: Vec::new(),

@@ -1419,6 +1419,7 @@ fn workspace_revisions_advance_only_on_mutations_and_rebuild_uniformly() {
             state: TaskTerminalState::Completed { exit_code: Some(0) },
             elapsed_ms: 1,
             output_bytes: 0,
+            output_sha256: None,
             tail: String::new(),
             artifact: None,
             full_output_unavailable: false,
@@ -4926,6 +4927,8 @@ fn append_tool_attempt(
                 result: BoundedResult {
                     preview: format!("{tool_name} result"),
                     truncated: false,
+                    truncation: None,
+                    effects: Vec::new(),
                     data: None,
                     artifact: None,
                     images: Vec::new(),

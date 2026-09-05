@@ -65,6 +65,7 @@ fn completed(task: &str, name: &str, state: TaskTerminalState, tail: &str) -> Ta
         state,
         elapsed_ms: 42_000,
         output_bytes: 512,
+        output_sha256: None,
         tail: tail.to_owned(),
         artifact: None,
         truncated: false,

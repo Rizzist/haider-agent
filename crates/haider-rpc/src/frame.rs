@@ -1697,6 +1697,8 @@ pub struct SshShellResultWire {
     #[serde(default, skip_serializing_if = "is_false")]
     pub stderr_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<haider_protocol::tool::ToolTruncation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     pub timed_out: bool,
 }

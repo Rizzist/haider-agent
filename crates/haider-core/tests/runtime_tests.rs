@@ -2240,6 +2240,8 @@ impl ToolDispatcher for CompletingDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "done".into(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -2270,6 +2272,8 @@ impl ToolDispatcher for CountingCompletingDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "done once".into(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -2300,6 +2304,8 @@ impl ToolDispatcher for DelayedCompletingDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "done after a long tool wait".into(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -2404,6 +2410,8 @@ impl ToolDispatcher for LargeResultDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: self.preview.clone(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -2433,6 +2441,8 @@ impl ToolDispatcher for ForgedImageDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "forged image".into(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: vec![self.image.clone()],
@@ -4108,6 +4118,8 @@ async fn recovered_route_wait_restores_completed_effect_without_redispatch() {
                     result: Some(BoundedResult {
                         preview: "done once".into(),
                         truncated: false,
+                        truncation: None,
+                        effects: Vec::new(),
                         data: None,
                         artifact: None,
                         images: Vec::new(),
@@ -5538,6 +5550,8 @@ impl ToolDispatcher for BoundaryRecordingDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "done".into(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -6083,6 +6097,8 @@ impl ToolDispatcher for TruncatedToolDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: format!("HEAD:{}:TAIL_FAILURE", "x".repeat(10_000)),
             truncated: true,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -6117,6 +6133,8 @@ impl ToolDispatcher for DurableRunningToolDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "atomic result".into(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -7271,3 +7289,160 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
 
 #[path = "support/request_budget_laws.rs"]
 mod request_budget_laws;
+
+struct AppliedFailureDispatcher {
+    calls: AtomicUsize,
+    effects: Vec<haider_protocol::tool::ToolFileEffect>,
+}
+
+#[async_trait]
+impl ToolDispatcher for AppliedFailureDispatcher {
+    async fn execute(
+        &self,
+        _run_id: &RunId,
+        _item_id: &ItemId,
+        _call_id: &str,
+        _name: &str,
+        _args: serde_json::Value,
+        _cancel: &haider_core::CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut error = HaiderError::new(
+            ErrorCode::Internal,
+            "change ledger failed: injected post-apply evidence failure",
+            false,
+        );
+        error.details = Some(serde_json::json!({"applied_effects": self.effects}));
+        Err(error)
+    }
+}
+
+/// A fatal post-apply failure remains fatal, while the already-applied file
+/// effects are journaled once before the failed tool closes and the run ends.
+#[tokio::test]
+async fn toolshape_fatal_applied_effects_are_journaled_once_before_errored_and_replay() {
+    use haider_protocol::tool::{ToolFileEffect, ToolFileEffectKind, ToolResultStatus};
+    let effects = vec![
+        ToolFileEffect {
+            kind: ToolFileEffectKind::Delete,
+            name: "before.txt".into(),
+            path: "before.txt".into(),
+            absolute_path: "/workspace/before.txt".into(),
+            bytes: 14,
+        },
+        ToolFileEffect {
+            kind: ToolFileEffectKind::Create,
+            name: "after.txt".into(),
+            path: "after.txt".into(),
+            absolute_path: "/workspace/after.txt".into(),
+            bytes: 14,
+        },
+    ];
+    let dispatcher = Arc::new(AppliedFailureDispatcher {
+        calls: AtomicUsize::new(0),
+        effects: effects.clone(),
+    });
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "applied-fixture".into(),
+            name: "fs_path".into(),
+            args: serde_json::json!({"operation":"move","source":"before.txt","destination":"after.txt"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(MemoryStore::new());
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        config(),
+        provider.clone(),
+        store.clone(),
+        Some(dispatcher.clone()),
+    );
+    let actor_task = tokio::spawn(actor.run());
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("move fixture"))
+        .await
+        .expect("accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    let error = outcome.error.expect("original fatal error");
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(
+        error.message,
+        "change ledger failed: injected post-apply evidence failure"
+    );
+    assert!(!error.retryable);
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "fatal failure cannot request another provider response"
+    );
+    assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+    let events = store.events(&SessionId::new(SESSION)).await;
+    assert_items_closed_before_terminal(&events);
+    let results: Vec<_> = events
+        .iter()
+        .filter_map(|event| match typed(event) {
+            EventPayload::ToolResult { call_id, result } => Some((event, call_id, result)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 1);
+    let (envelope, call_id, result) = &results[0];
+    assert_eq!(call_id, "applied-fixture");
+    assert_eq!(result.status, ToolResultStatus::Failed);
+    assert_eq!(result.effects, effects);
+    assert!(result.truncation.is_none());
+    let payload = envelope.payload.to_json_value();
+    assert_eq!(
+        payload
+            .pointer("/effects/0/path")
+            .and_then(serde_json::Value::as_str),
+        Some("before.txt")
+    );
+    assert_eq!(
+        payload
+            .pointer("/effects/1/name")
+            .and_then(serde_json::Value::as_str),
+        Some("after.txt")
+    );
+    let failed_item = events.iter().find(|event| matches!(typed(event), EventPayload::Item(ItemEvent::Completed { item: TurnItem::ToolCall { ref call_id, status: ToolStatus::Failed, .. }, .. }) if call_id == "applied-fixture")).expect("failed item closes");
+    assert!(envelope.seq < failed_item.seq);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(typed(event), EventPayload::RunState(RunState::Errored)))
+            .count(),
+        1
+    );
+    let mut replay = Vec::new();
+    let mut cursor = 0;
+    loop {
+        let page = store
+            .read(&SessionId::new(SESSION), cursor, 7)
+            .await
+            .expect("replay page");
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().expect("nonempty page").seq;
+        replay.extend(page);
+    }
+    assert_eq!(
+        serde_json::to_vec(&replay).expect("replay JSON"),
+        serde_json::to_vec(&events).expect("live journal JSON")
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "replay has no provider effects"
+    );
+    handle.stop().await.expect("stop actor");
+    actor_task.await.expect("join actor");
+}
