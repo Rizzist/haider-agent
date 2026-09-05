@@ -2856,7 +2856,8 @@ async fn cross_provider_subagent_returns_to_parent_and_fleet_is_truthful() {
             ("child-provider".into(), child_provider),
         ],
         [],
-    );
+    )
+    .with_tool_exposure(Some(vec!["spawn_subagent".into()]));
     let config = DaemonConfig::new(
         "core-loop-cross-agent",
         root.path().join("store"),
@@ -2971,7 +2972,8 @@ async fn child_spend_crossing_parent_cap_is_counted_once_and_child_is_reaped() {
                 ("anthropic".into(), child_provider),
             ],
             [],
-        ),
+        )
+        .with_tool_exposure(Some(vec!["spawn_subagent".into()])),
     )
     .await;
     let mut client = UdsClient::connect_control(
@@ -3115,7 +3117,8 @@ async fn delegated_question_surfaces_before_later_child_spend_exhausts_budget() 
                 ("anthropic".into(), child_provider),
             ],
             [],
-        ),
+        )
+        .with_tool_exposure(Some(vec!["spawn_subagent".into(), "request_input".into()])),
     )
     .await;
     let mut client = UdsClient::connect_control(
@@ -3266,7 +3269,8 @@ async fn subagent_launch_failure_returns_to_parent_instead_of_hanging() {
     let dependencies = dependencies(
         [("parent-provider".into(), parent_provider)],
         ["missing-provider".into()],
-    );
+    )
+    .with_tool_exposure(Some(vec!["spawn_subagent".into()]));
     let config = DaemonConfig::new(
         "core-loop-agent-launch-failure",
         root.path().join("store"),
@@ -3368,7 +3372,8 @@ async fn manually_cancelled_running_child_releases_parent() {
                 ("child-provider".into(), child_provider),
             ],
             [],
-        ),
+        )
+        .with_tool_exposure(Some(vec!["spawn_subagent".into()])),
     )
     .await;
     let mut client = UdsClient::connect_control(
@@ -3876,7 +3881,8 @@ async fn terminal_child_run_without_session_idle_still_releases_parent() {
                 ("child-provider".into(), child_provider),
             ],
             [],
-        ),
+        )
+        .with_tool_exposure(Some(vec!["spawn_subagent".into()])),
     )
     .await;
     let mut client = UdsClient::connect_control(
@@ -4043,11 +4049,37 @@ async fn terminal_child_run_without_session_idle_still_releases_parent() {
         }),
         "child emitted Idle after the first run terminal, invalidating the regression shape"
     );
+    // Both control attachments are still live. Keep consuming their final
+    // checkpoint traffic while joining: an unread socket can park the writer
+    // before ServerDraining, legitimately consuming the daemon's entire drain
+    // deadline. That backpressure is unrelated to the no-Idle delegation law.
+    async fn consume_shutdown(client: &mut UdsClient, label: &str) {
+        let mut notices = 0;
+        // The entire isolated fixture is bounded by eight seconds, below
+        // the ten-second keepalive cadence (this shutdown phase adds no time
+        // outside that bound). Read EOF directly rather than treating a failed
+        // late Ping as EOF while a drain notice may still be buffered.
+        while let Some(frame) = client.try_receive().await {
+            if matches!(frame, WireFrame::ServerDraining { .. }) {
+                notices += 1;
+            }
+        }
+        assert_eq!(notices, 1, "{label} receives exactly one drain notice");
+    }
     task.shutdown_handle().request("test complete");
-    tokio::time::timeout(std::time::Duration::from_secs(2), task.join())
-        .await
-        .expect("daemon shutdown stays bounded")
-        .expect("daemon joins");
+    let (outcome, (), ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::join!(
+            task.join(),
+            consume_shutdown(&mut client, "parent"),
+            consume_shutdown(&mut child_client, "child"),
+        )
+    })
+    .await
+    .expect("daemon shutdown stays bounded while both clients consume their final traffic");
+    assert_eq!(
+        outcome.expect("daemon joins"),
+        haider_daemon::ShutdownOutcome::Graceful
+    );
 }
 
 // ---------------------------------------------------------------------------

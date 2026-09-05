@@ -307,3 +307,130 @@ These are successful test identifiers in historical captured logs, not capabilit
 | `vaultless_platforms_answer_the_stable_vault_unsupported_code` | `docs/testing/v0.0.970/providerrebind/workspace-tests.log:2679`; `docs/testing/v0.0.970/casstream-evidence/merged-tests.log:2643` | Historical passing test-name evidence; current source definitions were found with `rg -n "fn <name>" crates/`; the unsupported condition is deliberate and scoped. |
 | `vision_unsupported_provider_refuses_locally_with_typed_error` | `docs/testing/v0.0.970/providerrebind/workspace-tests.log:2813`; `docs/testing/v0.0.970/casstream-evidence/merged-tests.log:2776` | Historical passing test-name evidence; current source definitions were found with `rg -n "fn <name>" crates/`; the unsupported condition is deliberate and scoped. |
 | `worker::cu1_image_runtime_tests::replay_rejects_conflicting_metadata_and_unsupported_vision_gets_a_placeholder` | `docs/testing/v0.0.970/providerrebind/workspace-tests.log:2399`; `docs/testing/v0.0.970/casstream-evidence/daemon-core-feature-pin-fixed.log:1303`; `docs/testing/v0.0.970/casstream-evidence/merged-tests.log:2372`; `docs/testing/v0.0.970/casstream-evidence/premerge/daemon-core-tests.log:1305` | Historical passing test-name evidence; current source definitions were found with `rg -n "fn <name>" crates/`; the unsupported condition is deliberate and scoped. |
+
+## Merge with local wave-970
+
+This continuation starts from committed docsync `0510d4b8` with the
+orchestrator's local integration merge already in progress:
+`MERGE_HEAD=471b9d68` (local `wave-970`, including economydiet, xplatfix,
+and gitignore). Only working-tree files are edited here. The orchestrator owns
+staging and recording the merge; no Git mutation was attempted in this
+continuation. The earlier report's Git-related NO_SHIP is historical and does
+not impose a commit requirement on this file-only handoff. Supplied LANE and
+turnperf/turnperf2 evidence is retained without edits.
+
+Read `cb1b209a` and the earlier `b6e8aaf6` design. The former removed the shared
+`tool_manual` and moved its semantic suffixes into native tool descriptions;
+`stub_schema` now retains argument prose and constraints, and the default
+provider pack is seven coding tools plus `list_tools`. The initial conflict
+resolution had retained docsync's entire older permission-test block, losing
+wave's schema/native-description/discovery regressions. Restored those wave
+regressions, including `native_action_parameters_preserve_the_former_manual_unique_constraints`
+and the `list_tools` inventory entry, while retaining the docsync regression.
+The monitor/spawn regression now reads the provider definitions after explicit
+promotion through `HarnessConfig::enable_tool_discovery`; it checks all six
+source classes, both source and operation enums, argument requirements,
+wake/coalescing, ProcessExec/FsRead authorization, and AgentSpawn/report semantics.
+There is no replacement implementation of the retired helper.
+
+Manual TEXT survival was checked with exact grep for each of ten corrected
+clauses, and both obsolete monitor claims were absent
+(`/tmp/docsync-merge-manual-text.log`). The complete corrected monitor and spawn
+lines remain at `worker.rs:14579` and `:14617`; native projection is at `:14691`,
+policy composition at `:2800`, and the exact spawn source-line pin remains at
+`worker_tool_catalog_tests.rs:879`. These coordinates were re-grepped, rather
+than copied from the older brief. Account pin/rebind statements are still in
+`client-contract-v1.md:1152` and remain covered by
+`client_contract_account_pins_and_rebind_match_typed_requests` at
+`automation_contract_doc_tests.rs:290`. The affected monitor/spawn manifests,
+protocol/RPC Rustdoc, account regression, client/automation contracts and
+OPTIMIZATIONS ledger are byte-identical to `0510d4b8`. Historical turnperf
+manual-allocation proposals describe the superseded composition; their presence
+does not justify recreating the removed helper or changing durable envelopes.
+
+The test's own failed assertion in `/tmp/docsync-merge-pins-before.log` produced
+`left: (20770, 5670)` against `right: (19962, 13856)` for
+`(full_manifest, default_instruct_pipe)`. Pins were changed only after this
+measurement, with rationale beside the assertions:
+
+| Byte accounting | Old → new | Rationale / evidence |
+| --- | --- | --- |
+| macOS full authorized manifest | 19,962 → 20,770 | Executed: +808 = +337 `list_tools`, +153 parameter descriptions, +318 net `graph_evidence` schema/description change. |
+| Linux full authorized manifest | 20,011 → 20,819 | By inspection: same +808; computer prose remains +49 versus macOS. |
+| Windows full authorized manifest | 19,961 → 20,769 | By inspection: same +808; computer prose +2 and process command parameter prose −3 give net −1 versus macOS. |
+| Other Unix full authorized manifest | 19,956 → 20,764 | By inspection: same +808; computer prose remains −6 versus macOS. |
+| Default instruct pipe, macOS | 13,856 → 5,670 | Executed: eight default tools, native semantics once, no system manual. Monitor/spawn remain available through promotion. Other Unix uses the same value by inspection. |
+| Default instruct pipe, Windows | 13,856 → 5,667 | By inspection: retained process command parameter prose is 75 bytes versus Unix's 78; this pack excludes computer. Corrects wave's platform-independent 5,670 → 5,667 Windows pin. |
+| Native-description accounting | 690 → 1,490 | Executed: the old seven selective descriptions across the full pack are superseded by native descriptions for all eight default tools. |
+| Bytes excluding native descriptions | 13,166 → 4,180 | Executed subtraction: the smaller catalog and removal of the duplicated system manual replace the old schema/manual subtotal. |
+
+The no-duplicate-manual assertion remains exact. Wave's stricter 50% reduction
+comparison against its pre-docsync 13,552-byte baseline and docsync's original
+30% full-manifest floor both remain. No assertion is ignored or platform-disabled;
+Windows gets a derived expected value. The full-manifest comparator and the
+actual default provider pack are explicitly distinct; provider-dialect JSON
+framing is outside these sums. No cross-platform execution or new latency,
+RSS, live-model, or crash-matrix measurement is claimed.
+
+Executed before the full gate: sibling prebuild
+`cargo build -q -p haider-cli -p haider-daemond --bin haider --bin haiderd`
+passed, and the resulting `haiderd` is 201,508,944 bytes (>10 MiB).
+The intermediate permission suite passed 34/34 after repinning; the final
+six-source strengthening was made while that build was running, so the full
+workspace gate below is the authoritative final-source run. The targeted
+account-contract regression passed 1/1. `cargo run -q -p xtask -- test-count
+--update` updated the wave baseline **4,997 → 4,999**, incorporating the two
+retained docsync regressions with wave's argument-constraint regression restored.
+The requested `grep -rl '^<<<<<<<' crates docs scripts test-baseline.txt`
+printed nothing (exit 1 means no matches).
+
+Every Cargo build/test/recount/lint step uses:
+`RUST_MIN_STACK=8388608 HAIDER_DISCOVERY_DISABLED=1
+HAIDER_TEST_DEVICE_NAME=test-mac CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
+HAIDER_TEST_SIBLINGS_PREBUILT=1 CARGO_BUILD_JOBS=4`.
+`df -m /` is recorded before each such step, with a stop below 700 MiB.
+The orchestrator-regenerated goldens and unioned CI registry walk are retained;
+fixture regeneration provenance belongs to the orchestrator, while the full
+workspace execution below checks those merged fixtures.
+
+Independent verifier findings in this continuation:
+
+1. **Real:** wave's single Unix instruct-pipe pin would fail on Windows after
+   argument descriptions became model-visible. Added the derived Windows
+   **5,670 → 5,667** pin and documented the −3-byte command description.
+2. **Real:** substring checks could still claim the `file` source after it was
+   removed from the source list, because “external files” satisfied the check.
+   Required the explicit six-class clause and exact source-kind enums in both
+   the promoted native description/schema and full manifest/schema. The
+   verifier demonstrated the old false positive with a read-only string
+   mutation and confirmed the strengthened assertion closes it.
+
+No substantive finding was rejected as noise. This continuation's count is
+separate from the original docsync verifier's one historical finding.
+
+Final merged-tree verification, executed on macOS against the final Rust source:
+
+- `cargo test -q --workspace --no-fail-fast`: **exit 0**; all **337** libtest
+  summaries report zero failures, including nested subprocess probes. This is
+  the authoritative run for the strengthened six-source regression and retained
+  merged goldens, not the intermediate permission-only run.
+- `cargo clippy --workspace --tests -- -D warnings`: **exit 0**.
+- `cargo fmt --all -- --check` and `git diff --check`: **exit 0**.
+- Final `cargo run -q -p xtask -- test-count`: **4,999 / 4,999**, exit 0.
+- Final conflict-marker grep: empty output, exit 1 (no matches). No unresolved
+  index entries were reported by the read-only diff check. HEAD and MERGE_HEAD
+  remain `0510d4b8` and `471b9d68`; the orchestrator records the merge.
+
+Logs are `/tmp/docsync-merge-workspace-tests.log`,
+`/tmp/docsync-merge-clippy.log`, `/tmp/docsync-merge-count-final.log`,
+`/tmp/docsync-merge-recount.log`, `/tmp/docsync-merge-contract.log`,
+`/tmp/docsync-merge-prebuild.log`, `/tmp/docsync-merge-fmt.log`,
+`/tmp/docsync-merge-diff-check.log`, and
+`/tmp/docsync-merge-conflict-markers.log`, with adjacent `.exit` files and
+`.disk` files for Cargo build/test/recount/lint steps. The intentional stale-pin
+failure remains in `/tmp/docsync-merge-pins-before.log`; it is superseded by the
+passing full gate. No new ignores, weakened deadlines, runtime behavior changes,
+or cross-platform execution claims were introduced by this continuation.
+
+VERIFIER: findings=2 real=2 noise=0 — corrected the Windows native-pipe pin for retained parameter prose; strengthened the six-source regression so external-file authorization cannot mask a missing file source
+SHIP

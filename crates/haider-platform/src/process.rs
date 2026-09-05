@@ -360,6 +360,29 @@ pub fn windows_process_state(pid: u32) -> std::io::Result<Option<WindowsProcessS
     }))
 }
 
+/// Reports whether a Windows PID may still be running. An exited process is
+/// absent even while another owner retains its process handle. Query failures
+/// conservatively report presence so an inaccessible process is never mistaken
+/// for completed cleanup; use [`windows_process_state`] for typed diagnostics.
+#[cfg(windows)]
+#[must_use]
+pub fn process_exists(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    windows_process_result_may_be_alive(windows_process_state(pid))
+}
+
+#[cfg(windows)]
+fn windows_process_result_may_be_alive(
+    result: std::io::Result<Option<WindowsProcessState>>,
+) -> bool {
+    match result {
+        Ok(state) => state.is_some_and(|state| state.alive),
+        Err(error) => !process_error_is_missing(&error),
+    }
+}
+
 /// Reports whether `pid` belongs to the exact registered Job Object.
 #[cfg(windows)]
 #[doc(hidden)]

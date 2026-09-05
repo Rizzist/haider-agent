@@ -1,0 +1,61 @@
+{
+  "combined_stable_prefix_bytes": {
+    "after": 7062,
+    "before": 16698,
+    "reduction_percent": 57.70750988142292
+  },
+  "context_token_curve_slope": {
+    "after": 2103.5,
+    "before": 4584.666666666666,
+    "reduction_percent": 54.118801803111815
+  },
+  "independent_effects_verified_both": true,
+  "manual_bytes": {
+    "after": 0,
+    "before": 5162,
+    "reduction_percent": 100.0
+  },
+  "model_turns_per_side": 8,
+  "per_turn_fixed_overhead_tokens": {
+    "after": 6031,
+    "before": 14222,
+    "reduction_percent": 57.59386865419772
+  },
+  "policy_bytes": {
+    "after": 606,
+    "before": 725,
+    "reduction_percent": 16.413793103448278
+  },
+  "same_reference_tokenizer": true,
+  "same_task": true,
+  "system_side_tokens": {
+    "after": 605,
+    "before": 5481,
+    "reduction_percent": 88.9618682722131
+  },
+  "tool_result_content_bytes_per_result": {
+    "after": 265.11764705882354,
+    "before": 1280.5882352941176,
+    "reduction_percent": 79.29719797887
+  },
+  "tool_result_envelope_overhead_bytes_per_result": {
+    "after": 84.11764705882354,
+    "before": 1099.3529411764705,
+    "reduction_percent": 92.34844025897587
+  },
+  "tool_schema_array_bytes": {
+    "after": 6383,
+    "before": 10705,
+    "reduction_percent": 40.37365716954694
+  },
+  "tool_side_tokens": {
+    "after": 5426,
+    "before": 8741,
+    "reduction_percent": 37.92472257178813
+  },
+  "wasted_tool_call_count": {
+    "after": 0,
+    "before": 0,
+    "reduction_percent": 0
+  }
+}

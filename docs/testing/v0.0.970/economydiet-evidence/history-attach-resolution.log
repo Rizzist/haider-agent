@@ -1,0 +1,3 @@
+{"isolated_root": "/private/tmp/haider-probe-qa-1om1ljzc", "source": "/private/tmp/haider-probe-qa-yndl_t_m/p", "binary_dir": "/Users/rizzist/haider-run/lane-970-economydiet/.economydiet-merged-candidate"}
+{"attempt": 1, "constructor_error": null, "wall_seconds": 1.313, "raw_bytes": 14572, "old_stripped_raw_has_placeholder": true, "screen_rows_has_placeholder": true, "raw_has_alternate_screen": true}
+{"cleanup": "no_orphan_daemons pids=43810 stop=stopped_cleanly alive_after=false", "status": "PASS"}

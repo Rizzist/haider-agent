@@ -1,0 +1,170 @@
+{
+  "report": "docs/testing/v0.0.970/economydiet-evidence/qa-t0-retry/qa-gate-t0-Syeds-MacBook-Air.local-20260905T090540Z.json",
+  "exit": 0,
+  "summary": {
+    "env_blocked": 0,
+    "fail": 0,
+    "pass": 14,
+    "skip": 0,
+    "total": 14
+  },
+  "measurement_accepted": true,
+  "load": {
+    "logical_cpus": 10,
+    "one_minute": 2.86767578125
+  },
+  "cleanup_rows": 16,
+  "all_cleanup_pass": true,
+  "cleanup": [
+    {
+      "check": "t0.account.alias_selects",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=87007 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "check": "t0.budget.max_cost_binds_before_request",
+      "artefacts": [],
+      "evidence_line": "isolated_subcase=cost-above-bound no_orphan_daemons pids=87014 stop=stopped_cleanly alive_after=false",
+      "label": "cost-above-bound_no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "check": "t0.budget.max_cost_binds_before_request",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=87018 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "check": "t0.budget.max_tokens_binds",
+      "artefacts": [],
+      "evidence_line": "isolated_subcase=tokens-above-bound no_orphan_daemons pids=87022 stop=stopped_cleanly alive_after=false",
+      "label": "tokens-above-bound_no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "check": "t0.budget.max_tokens_binds",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=87026 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "check": "t0.daemon.status_stop",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=87031 stop=not_running alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "check": "t0.headless.input_required_is_typed",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=87038 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "check": "t0.run.exit_codes",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=87062 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "check": "t0.run.jsonl_contract",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=87361 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "check": "t0.run.replay_resume_recover",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=87405 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "check": "t0.sessions.wait_ready_n",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=87480 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "check": "t0.tui.catalog_help_command_list_pin",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=87547 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "check": "t0.tui.login_paths",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=87726 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "check": "t0.tui.model_picker_cardinality",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=89624 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "check": "t0.tui.palette_activation_closure",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=92048 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    },
+    {
+      "check": "t0.tui.three_door_parity",
+      "artefacts": [],
+      "evidence_line": "no_orphan_daemons pids=95137 stop=stopped_cleanly alive_after=false",
+      "label": "no_orphan_daemons",
+      "status": "PASS"
+    }
+  ],
+  "palette": [
+    {
+      "artefacts": [],
+      "evidence_line": "/fork activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=false surface='\u2191\u2193 / digits choose + f fork into a new session' refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "fork",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/undo activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=false semantic=true surface=None refusal='not_found \u2014 no matching checkpoint exists on this branch' rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "undo",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/monitors activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=false surface='monitors  \u2191\u2193/jk select + x stop + p pause + t trigger + y copy id' refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "monitors",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/compact activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=true surface=None refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=('item', 'item', 'run_state', 'item', 'item', 'item', 'item', 'run_failed', 'run_state') action_receipts=('session.compact:pending',) journal_delta(events=9,receipts=1,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "compact",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/history activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=true semantic=false surface='\u2191\u2193 / digits choose + \u23ce load' refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "history",
+      "status": "PASS"
+    },
+    {
+      "artefacts": [],
+      "evidence_line": "/update activation_closure expected=true actual=true mode=live next_slot=false screen_card_change=false semantic=true surface='checking for updates' refusal=None rpc_catalog_owned=true durable=false remedy=None flash_only=false action_events=() action_receipts=() journal_delta(events=0,receipts=0,sessions=0) sizes=118x36,80x24 alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "label": "update",
+      "status": "PASS"
+    }
+  ]
+}

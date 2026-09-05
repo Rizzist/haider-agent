@@ -1,0 +1,36 @@
+    ▄▄  ██   ▄▄  ▀▀▀▀▀██▄  haider v0.0.969 · the lion · test-mac                          [ ◉ voice · whisper→openai ][ ← main ]  ▄▄  ██   ▄ ▀▀▀▀▀██▄  haiderv0.0.969 · /private/tmp/haider-probe-qa-1om1ljzc/w                       
+ ▄▄█▀  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀  provider anthropic · model claude-opus-5 · account none · /login · dir /private/tmp/haider…         ▄▄█▀  ▀▀▀▀▀▀▀▀▀▀▀▀▀  seed-palette-cosure ▸   · branch mai · test-mac                               
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                                      
+                         recent sessions — click to attach · /sessions for all                                                                                             ❯ seed palette closure history
+                        ──────────────────────────────────────────────────────────────────────                                                                                                requests 1 / tranche 32 / hard cap 64 — in progress
+                         ◉ Aura  voice session · orchestrator — spawns & steers local session…                                                                                             
+                        ──────────────────────────────────────────────────────────────────────                                                                                              ■ haider
+                         ⚿ Accounts  provider credentials — OAuth & API keys, harness-owned ·…                                                                                             ▏ ▮QA_PALETTE_HISTORY_READY
+                        ──────────────────────────────────────────────────────────────────────                                                                                              
+                         ⇄ Peers  remote placement — not supported · Haider runs local-only                                                                                             ◌ thinking…           
+                        ──────────────────────────────────────────────────────────────────────                                                                                              
+                         ≡ All sessions  every session on this machine — unseen + needs-you ·…                                                                                             
+                        ──────────────────────────────────────────────────────────────────────                                                                                              
+                         ⌘ Workflows  typed pipe DAGs — nodes, gates, conditional edges · /wo…                                                                                             
+                        ──────────────────────────────────────────────────────────────────────                                                                                              
+                         ✦ Loom  Agent Types — capability-scoped specialists · @type to use                                                                                             
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                      
+                                                                                                                              ⋯ 47m15         ~1 tps
+                                                                                                                      ───────────────────────────────────────────────────────────────────────────────────────────────────── claude-opus-5 ── claude-ops-5 · api
+───────────────────────────────────────────────────────────────────────────────────────────────────── claude-opus-5 ──  ❯   message haider — ⏎ send · ⇧⏎ newline · / commands · paste images/text                               [ ◉ talk ]  
+  ❯   start a session — describe the task, or / for commands                                              [ ◉ talk ]  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────                                                                                                                      
+ [ IDLE ]  0 tok · ▱▱▱▱▱▱▱▱▱▱ 0% of 4.1k                                                           /help · theme dark ·main                   [ ▮ STREAMING ] ~1.7k tok ·▰▰▰▰▱▱▱▱▱▱42% of 4.1k  ·main[ IDLE ]  ~1.7ktok · ▰▰▰▰▱▱▱▱▱▱ 42% of.1k  · main      

@@ -1,0 +1,27 @@
+{
+  "command": [
+    "env",
+    "UPDATE_FIXTURES=1",
+    "cargo",
+    "test",
+    "-p",
+    "haider-cli",
+    "--test",
+    "turnhygiene_pin_tests",
+    "provider_request_body_is_budget_independent_and_matches_the_golden_ledger",
+    "--",
+    "--exact"
+  ],
+  "exit": 0,
+  "duration_seconds": 3.2583179473876953,
+  "environment": {
+    "RUST_MIN_STACK": "8388608",
+    "HAIDER_DISCOVERY_DISABLED": "1",
+    "HAIDER_TEST_DEVICE_NAME": "test-mac",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_TARGET_DIR": "/private/tmp/haider-economydiet-target",
+    "CARGO_BUILD_JOBS": "2",
+    "HAIDER_TEST_SIBLINGS_PREBUILT": "1"
+  }
+}

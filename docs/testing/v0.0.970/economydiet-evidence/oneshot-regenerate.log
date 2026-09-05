@@ -1,0 +1,9 @@
+   Compiling haider-cli v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-cli)
+    Finished `test` profile [unoptimized] target(s) in 2.14s
+     Running tests/oneshot_boot_tests.rs (/private/tmp/haider-economydiet-target/debug/deps/oneshot_boot_tests-590444b663920343)
+
+running 1 test
+test one_shot_jsonl_stream_matches_the_normalized_golden ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 2.85s
+

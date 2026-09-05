@@ -1,0 +1,13 @@
+    Finished `dev` profile [unoptimized] target(s) in 0.10s
+     Running `/private/tmp/haider-economydiet-target/debug/xtask check`
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-economydiet/crates/haider-store/src/event_store.rs has 27704 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-economydiet/crates/haider-core/src/actor.rs has 14984 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-economydiet/crates/haider-daemon/tests/session_hub_tests.rs has 10918 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-economydiet/crates/haider-daemon/src/session_hub/rpc.rs has 19975 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-economydiet/crates/haider-daemon/src/accounts.rs has 11895 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-economydiet/crates/haider-daemon/src/worker.rs has 22878 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-economydiet/crates/haider-daemon/src/accounts_tests.rs has 13846 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-economydiet/crates/haider-tui/src/render.rs has 14539 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-economydiet/crates/haider-tui/src/app.rs has 19204 lines (soft cap 10000)
+loc-lint: 736 files scanned, 9 over the soft cap
+test-count: 4969 tests (baseline 4969) — ok

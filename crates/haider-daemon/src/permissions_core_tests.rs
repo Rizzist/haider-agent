@@ -8,8 +8,8 @@ use crate::worker::{
     durable_session_tool_state, effective_permission_defaults, explicit_computer_auto_grant_value,
     explicit_computer_use_intent, grant_admits_manifest_effect, loom_inventory_line, loom_run_tail,
     loom_task_type_id, plan_gate_admits, registered_tool_route, registered_tools,
-    scoped_network_hosts, stub_schema, tool_inventory_snapshot, tool_manual, tool_manual_line,
-    typed_child_grant, typed_tool_result, web_fetch_host_allowed,
+    scoped_network_hosts, stub_schema, tool_inventory_snapshot, typed_child_grant,
+    typed_tool_result, web_fetch_host_allowed,
 };
 use haider_core::{MemoryStore, RequestInputCheckpoint, SqliteStoreHandle, StoreHandle};
 use haider_protocol::EventPayload;
@@ -814,6 +814,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             .map(|entry| entry.manifest.name.as_str())
             .collect::<Vec<_>>(),
         [
+            "list_tools",
             "request_input",
             "plan",
             "loom_register",
@@ -1315,12 +1316,12 @@ async fn recovery_dual_reads_historical_and_canonical_permission_states() {
     recovered.close().await.expect("close store");
 }
 
-/// MUTATION CHECK: keep a description/bound in the stub, forget to recurse into
-/// items/properties, or leave a top-level combinator. Expected RUNTIME failure:
-/// the stub still carries prose/bounds, or drops the nested structure a native
-/// tool call is validated against.
+/// MUTATION CHECK: remove a description/bound, forget to recurse into
+/// items/properties, or drop a top-level combinator. Expected RUNTIME failure:
+/// removing nested structure, bounds, or parameter semantics would leave the
+/// caller without its action constraints now that the system manual is gone.
 #[test]
-fn stub_schema_keeps_structure_drops_prose_and_bounds() {
+fn native_schema_keeps_structure_parameter_semantics_and_bounds() {
     let full = serde_json::json!({
         "type": "object",
         "properties": {
@@ -1362,26 +1363,56 @@ fn stub_schema_keeps_structure_drops_prose_and_bounds() {
         stub["properties"]["edits"]["items"]["properties"]["old"]["type"],
         "string"
     );
-    // Prose and every daemon-re-enforced bound/combinator are gone everywhere.
-    let text = serde_json::to_string(&stub).expect("serialize stub");
-    for banned in [
-        "description",
-        "minLength",
-        "minItems",
-        "additionalProperties",
-        "anyOf",
-        "the file path",
-        "anchor",
-    ] {
-        assert!(!text.contains(banned), "stub must drop `{banned}`: {text}");
-    }
+    assert_eq!(
+        stub, full,
+        "call constraints must survive without a system manual"
+    );
 }
 
-/// MUTATION CHECK: add a tool without a manual line, or add native prose outside
-/// the pinned action-critical set. Expected RUNTIME failure: an advertised tool
-/// has no signature the model can read, or the compact wire surface drifts.
 #[test]
-fn every_advertised_tool_is_manual_described_and_native_prose_is_scoped() {
+fn native_action_parameters_preserve_the_former_manual_unique_constraints() {
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
+    let tools =
+        advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
+    let schema = |name: &str| {
+        &tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .expect("tool")
+            .input_schema
+    };
+    for side in ["before", "after"] {
+        assert_eq!(
+            schema("fs_search")["properties"]["context"]["properties"][side]["maximum"],
+            5
+        );
+    }
+    assert!(
+        schema("fs_search")["properties"]["multiline"]["description"]
+            .as_str()
+            .expect("description")
+            .contains("physical line")
+    );
+    assert!(
+        schema("fs_edit")["properties"]["edits"]["items"]["properties"]["old"]["description"]
+            .as_str()
+            .expect("description")
+            .contains("uniquely unless replace_all")
+    );
+    assert_eq!(
+        schema("fs_path")["properties"]["destination"]["description"],
+        "Required for move and copy"
+    );
+    assert_eq!(
+        schema("fs_glob")["properties"]["pattern"]["description"],
+        ".git paths are always excluded"
+    );
+}
+
+/// MUTATION CHECK: restore a duplicate system manual or blank a native tool's
+/// semantics. Discovery must leave the system prefix byte-identical.
+#[test]
+fn every_advertised_tool_has_native_semantics_without_a_duplicate_manual() {
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let root = advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
     assert!(
@@ -1390,38 +1421,30 @@ fn every_advertised_tool_is_manual_described_and_native_prose_is_scoped() {
     );
     for tool in &root {
         assert!(
-            tool_manual_line(&tool.name).is_some(),
-            "advertised tool `{}` has no manual line — instruct-pipe drift",
-            tool.name
-        );
-        let should_have_native_prose = matches!(
-            tool.name.as_str(),
-            "fs_glob" | "fs_search" | "fs_write" | "fs_edit" | "write" | "edit" | "fs_path"
-        );
-        assert_eq!(
             !tool.description.is_empty(),
-            should_have_native_prose,
-            "wire tool `{}` native-description scope drifted",
+            "missing native description: {}",
             tool.name
         );
     }
-    let manual = tool_manual(&root);
-    for signature in [
-        "fs_read(",
-        "process_exec(",
-        "computer(",
-        "todo_write(",
-        "monitor(",
-        "list_models(",
-    ] {
-        assert!(manual.contains(signature), "manual missing `{signature}`");
-    }
-    // The whole-list-replace teaching that used to live on the todo_write wire
-    // description now lives in the manual.
-    assert!(manual.contains("REPLACE the whole todo list"));
+    use crate::worker::SystemPromptBuilder;
+    assert_eq!(
+        SystemPromptBuilder::shared_immutable_base(&root, "scope"),
+        SystemPromptBuilder::shared_immutable_base(&[], "scope")
+    );
+    assert!(
+        root.iter()
+            .find(|tool| tool.name == "todo_write")
+            .expect("todo")
+            .description
+            .contains("REPLACE the whole todo list")
+    );
     // Lane 967-P1 owner decision: the model must see the foreground ownership
     // boundary, both default bounds, and the durable background alternative.
-    let process = tool_manual_line("process_exec").expect("process_exec manual line");
+    let process = &root
+        .iter()
+        .find(|tool| tool.name == "process_exec")
+        .expect("process")
+        .description;
     for required in [
         "60 s / 1 MiB",
         "in either local mode, normal leader exit closes inherited output",
@@ -1439,16 +1462,44 @@ fn every_advertised_tool_is_manual_described_and_native_prose_is_scoped() {
     }
 }
 
-/// DOCSYNC: keep the compact manual and full manifests honest about the
-/// landed monitor runners, boundary wake delivery, and broker authorization.
+/// DOCSYNC: keep the promoted native descriptions and full manifests honest
+/// about landed monitor runners, boundary wake delivery, and authorization.
+/// Mutating the semantic-suffix projection must fail even if the source manual
+/// line still contains the right words.
 #[test]
 fn monitor_and_spawn_descriptions_match_runtime_capabilities() {
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
+    let mut config = haider_core::HarnessConfig::for_session(
+        SessionId::new("docsync-capabilities"),
+        DeviceId::new("test-device"),
+        0,
+        0,
+    );
+    config.tools =
+        advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
+    config.enable_tool_discovery(vec!["monitor".into(), "spawn_subagent".into()]);
+    let tools = config.tool_definitions();
+    let monitor = tools
+        .iter()
+        .find(|tool| tool.name == "monitor")
+        .expect("promoted monitor");
     let manifest = haider_tools::monitor_manifest();
-    let manual = tool_manual_line("monitor").expect("monitor manual");
-    for source in ["sms", "process", "file", "poll", "timer", "cli"] {
-        for text in [manual, manifest.description.as_str()] {
-            assert!(text.contains(source), "missing monitor source {source}");
-        }
+    let manual = monitor.description.as_str();
+    // A bare contains("file") also matches the separate "external files"
+    // authorization clause. Removing /file from the supported-source list
+    // must fail, even while that authorization guidance remains present.
+    for text in [manual, manifest.description.as_str()] {
+        assert!(
+            text.contains("durable sms/process/file/poll/timer/cli watches"),
+            "monitor description must advertise all six supported source classes: {text}"
+        );
+    }
+    for schema in [&manifest.input_schema, &monitor.input_schema] {
+        assert_eq!(
+            schema["properties"]["source"]["properties"]["kind"]["enum"],
+            serde_json::json!(["sms", "process", "file", "poll", "timer", "cli"]),
+            "monitor source schema must expose all six supported classes"
+        );
     }
     for operation in [
         "register", "list", "update", "pause", "resume", "trigger", "remove",
@@ -1460,13 +1511,15 @@ fn monitor_and_spawn_descriptions_match_runtime_capabilities() {
                 .contains(operation),
             "monitor description missing operation {operation}"
         );
-        assert!(
-            manifest.input_schema["properties"]["operation"]["enum"]
-                .as_array()
-                .expect("monitor operations")
-                .iter()
-                .any(|value| value == operation)
-        );
+        for schema in [&manifest.input_schema, &monitor.input_schema] {
+            assert!(
+                schema["properties"]["operation"]["enum"]
+                    .as_array()
+                    .expect("monitor operations")
+                    .iter()
+                    .any(|value| value == operation)
+            );
+        }
     }
     for text in [manual, manifest.description.as_str()] {
         for required in [
@@ -1492,7 +1545,12 @@ fn monitor_and_spawn_descriptions_match_runtime_capabilities() {
     assert!(manual.contains("timeout needs timeout_ms"));
     let spawn = haider_tools::spawn_subagent_manifest();
     for text in [
-        tool_manual_line("spawn_subagent").expect("spawn manual"),
+        tools
+            .iter()
+            .find(|tool| tool.name == "spawn_subagent")
+            .expect("promoted spawn_subagent")
+            .description
+            .as_str(),
         spawn.description.as_str(),
     ] {
         assert!(text.contains("AgentSpawn policy"));
@@ -1542,91 +1600,121 @@ fn search_and_mutation_tool_schema_descriptions_are_pinned() {
     }
 }
 
-/// MUTATION CHECK: stop stubbing, alter the selective native descriptions, move
-/// nothing into the manual, or change the advertised inventory without
-/// recounting it. Expected RUNTIME failure: an inventory/byte pin moves or the
-/// instruct pipe stops being a material (at least 30%) net reduction.
+/// MUTATION CHECK: expand the default coding catalog, duplicate native prose
+/// in the policy, or change schema bytes without deliberate release accounting.
 #[test]
 fn instruct_pipe_shrinks_the_advertised_wire_pack() {
-    const EXPECTED_REGISTERED_TOOLS: usize = 29;
-    const EXPECTED_ADVERTISED_TOOLS: usize = 26;
-    // The full-prefix comparison deliberately includes the platform-specific
-    // computer manifest description. Linux documents X11/Wayland (+49 bytes
-    // over macOS), while Windows is one byte shorter than macOS.
-    // Turnbudget adds 367 full-schema bytes and 143 stub-schema bytes for
-    // spawn_subagent.request_budget. Toolrepair adds the two flat aliases.
-    #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 20_011;
-    #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_962;
+    // Keep wave's stricter pre-diet comparator (before docsync's +304 bytes).
+    // Provider-dialect JSON framing is measured separately by AHRB.
+    const PRE_DIET_INSTRUCT_PIPE_BYTES: usize = 13_552;
+    // Merge measurement: docsync's 13_856 -> 5_670 on macOS. The default pack
+    // now has seven coding tools + list_tools, native semantics once and no
+    // system manual. Monitor/spawn semantics survive in promoted descriptions.
+    // Windows is 5_670 -> 5_667 by inspection: process_exec.command's retained
+    // parameter description is 75 bytes there versus 78 on Unix. Computer is
+    // absent from this coding pack, so its platform prose cannot offset -3.
+    #[cfg(not(target_os = "windows"))]
+    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 5_670;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_961;
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_956;
-    // Wave-970's pipe is 12_764 bytes: 12_265 schema/manual + 499 native
-    // descriptions. Toolrepair adds 597 schema/manual bytes and 191 native
-    // description bytes: 12_764 + 788 = 13_552 (lane's 13_409 + 143 budget
-    // schema bytes). Keep the seven-description accounting and 30% floor.
-    // Docsync: monitor source/wake/authorization truth and spawn wait/policy
-    // add 304 manual bytes: 13_552 -> 13_856. Full manifests add
-    // 226 bytes (macOS 19_736 -> 19_962); schemas/native prose unchanged.
-    const PRE_ACTBIAS_INSTRUCT_PIPE_BYTES: usize = 13_166;
-    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 13_856;
-
+    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 5_667;
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
-    let stubbed =
+    let authorized =
         advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
+    let mut config = haider_core::HarnessConfig::for_session(
+        SessionId::new("prompt-byte-pin"),
+        DeviceId::new("test-device"),
+        0,
+        0,
+    );
     let registry = registered_tools();
-    assert_eq!(registry.len(), EXPECTED_REGISTERED_TOOLS);
-    assert_eq!(stubbed.len(), EXPECTED_ADVERTISED_TOOLS);
-    // Original prefix: each tool's name + full description + full schema.
-    let full_prefix: usize = stubbed
+    assert_eq!(authorized.len(), 27, "26 former tools plus list_tools");
+    let full_prefix: usize = authorized
         .iter()
         .map(|tool| {
-            let manifest = registry
+            let entry = registry
                 .iter()
                 .find(|entry| entry.manifest.name == tool.name)
-                .expect("advertised tool has a registry manifest");
+                .expect("authorized tool has a manifest");
             tool.name.len()
-                + manifest.manifest.description.len()
-                + serde_json::to_string(&manifest.manifest.input_schema)
-                    .expect("serialize full")
+                + entry.manifest.description.len()
+                + serde_json::to_vec(&entry.manifest.input_schema)
+                    .expect("full schema")
                     .len()
         })
         .sum();
-    // Instruct-pipe prefix: name + selective native description + stub schema,
-    // plus the one shared manual carried once in the system prompt.
-    let stub_wire: usize = stubbed
+    // Full authorized manifest comparison: macOS 19_962 -> 20_770, measured
+    // by this test. +808 = +337 list_tools +153 parameter prose +318 net
+    // graph_evidence evidence_from/schema prose. This is the full catalog,
+    // distinct from the default eight-tool provider pack measured below.
+    // Other hosts are derived from unchanged platform deltas: Linux +49;
+    // Windows computer +2 and process command -3 = -1; other Unix -6.
+    // Thus Linux 20_011 -> 20_819, Windows 19_961 -> 20_769, other
+    // Unix 19_956 -> 20_764. Only macOS was executed for this merge.
+    #[cfg(target_os = "linux")]
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 20_819;
+    #[cfg(target_os = "macos")]
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 20_770;
+    #[cfg(target_os = "windows")]
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 20_769;
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 20_764;
+    config.tools = authorized;
+    config.enable_tool_discovery(Vec::new());
+    let tools = config.tool_definitions();
+    assert_eq!(registered_tools().len(), 30);
+    assert_eq!(
+        tools.len(),
+        8,
+        "seven coding tools and one discovery primitive"
+    );
+    let tool_bytes: usize = tools
         .iter()
         .map(|tool| {
             tool.name.len()
                 + tool.description.len()
-                + serde_json::to_string(&tool.input_schema)
-                    .expect("serialize stub")
+                + serde_json::to_vec(&tool.input_schema)
+                    .expect("schema bytes")
                     .len()
         })
         .sum();
-    let new_total = stub_wire + tool_manual(&stubbed).len();
-    let native_description_bytes = stubbed
+    use crate::worker::SystemPromptBuilder;
+    let policy =
+        SystemPromptBuilder::shared_immutable_base(&[], SystemPromptBuilder::UNSCOPED_GRANT_SCOPE);
+    let system = SystemPromptBuilder::shared_immutable_base(
+        tools,
+        SystemPromptBuilder::UNSCOPED_GRANT_SCOPE,
+    );
+    assert_eq!(policy.len(), 606);
+    let manual_bytes = system.len() - policy.len();
+    assert_eq!(
+        manual_bytes, 0,
+        "native descriptions are the sole tool manual"
+    );
+    let pipe_bytes = tool_bytes + manual_bytes;
+    let native_description_bytes = tools
         .iter()
         .map(|tool| tool.description.len())
         .sum::<usize>();
     eprintln!(
-        "instruct-pipe pin: registered={}, advertised={}, full_prefix_bytes={full_prefix}, instruct_pipe_bytes={new_total}, native_description_bytes={native_description_bytes}",
-        registry.len(),
-        stubbed.len()
+        "instruct-pipe pin: registered={}, advertised={}, full_prefix_bytes={full_prefix}, policy_bytes={}, instruct_pipe_bytes={pipe_bytes}, native_description_bytes={native_description_bytes}",
+        registered_tools().len(),
+        tools.len(),
+        policy.len()
     );
-    assert_eq!(full_prefix, EXPECTED_FULL_PREFIX_BYTES);
-    assert_eq!(new_total, EXPECTED_INSTRUCT_PIPE_BYTES);
     assert_eq!(
-        new_total - native_description_bytes,
-        PRE_ACTBIAS_INSTRUCT_PIPE_BYTES,
-        "only the seven native descriptions may explain the pipe delta"
+        (full_prefix, pipe_bytes),
+        (EXPECTED_FULL_PREFIX_BYTES, EXPECTED_INSTRUCT_PIPE_BYTES),
+        "full-manifest and default instruct-pipe byte pins"
     );
-    assert!(full_prefix > 0 && new_total < full_prefix);
+    assert!(pipe_bytes * 2 <= PRE_DIET_INSTRUCT_PIPE_BYTES);
+    assert!(full_prefix > 0 && pipe_bytes < full_prefix);
     assert!(
-        (full_prefix - new_total) * 10 >= full_prefix * 3,
-        "instruct pipe must cut the advertised prefix by at least 30% (new {new_total} vs full {full_prefix})"
+        (full_prefix - pipe_bytes) * 10 >= full_prefix * 3,
+        "instruct pipe must retain the full-manifest reduction floor of 30%"
+    );
+    assert_eq!(
+        system.len() + tool_bytes,
+        606 + EXPECTED_INSTRUCT_PIPE_BYTES
     );
 }
 

@@ -21,6 +21,21 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.970 — durable tool discovery and slim provider results
+
+`tool_result.result.data` adds `kind: "tools_discovered"` with `promoted`,
+an ordered array of tool names. A successful actor-authored `list_tools` result
+promotes only tools in the authorized catalog, after its result is committed.
+Session reconstruction requires the matching started discovery call and a
+completed result. Promotion survives turns, compaction and workspace selection;
+a fork begins a new session scope. Discovery changes presentation, not permission.
+
+Process and filesystem mutation receipts remain unchanged in durable results,
+including `/effects[n]` and typed truncation provenance. Only the provider view
+reduces them to output, non-zero exit and any required truncation marker; live
+and history projections share that implementation. This changes no journal or
+JSONL envelope shape and adds no schema-version bump.
+
 ### v0.0.970 — durable narrative correlation and compaction announcement
 
 A primary emitted Finish with separate post-stream commits adds a prompt-omitted

@@ -1,0 +1,85 @@
+   Compiling num-traits v0.2.19
+   Compiling futures-util v0.3.33
+   Compiling rmp v0.8.15
+   Compiling rustls v0.23.42
+   Compiling block-padding v0.3.3
+   Compiling moxcms v0.8.1
+   Compiling inout v0.1.4
+   Compiling rmp-serde v1.3.1
+   Compiling time-macros v0.2.32
+   Compiling image v0.25.10
+   Compiling haider-protocol v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-protocol)
+   Compiling haider-platform v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-platform)
+   Compiling cipher v0.4.4
+   Compiling time v0.3.54
+   Compiling hyper v1.11.0
+   Compiling tokio-rustls v0.26.4
+   Compiling tower v0.5.3
+   Compiling hyper-util v0.1.20
+   Compiling chacha20 v0.10.1
+   Compiling rand v0.10.2
+   Compiling tower-http v0.6.11
+   Compiling hyper-rustls v0.27.9
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling aes v0.8.4
+   Compiling ecb v0.1.2
+   Compiling cbc v0.1.2
+   Compiling md-5 v0.10.6
+   Compiling lopdf v0.42.0
+   Compiling ratatui-widgets v0.3.2
+   Compiling reqwest v0.13.4
+   Compiling ordered-float v5.3.0
+   Compiling euclid v0.20.14
+   Compiling sha1 v0.10.7
+   Compiling pdf-extract v0.12.0
+   Compiling tungstenite v0.26.2
+   Compiling quantette v0.5.1
+   Compiling ratatui-macros v0.7.2
+   Compiling simplelog v0.12.2
+   Compiling ratatui v0.30.2
+   Compiling tokio-tungstenite v0.26.2
+   Compiling haider-pdf v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-pdf)
+   Compiling haider-rpc v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-rpc)
+   Compiling icy_sixel v0.5.0
+   Compiling haider-accounts v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-accounts)
+   Compiling haider-provider v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-provider)
+   Compiling haider-client v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-client)
+   Compiling ratatui-image v11.0.6
+   Compiling haider-tools v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-tools)
+   Compiling termbg v0.6.2
+   Compiling haider-stt v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-stt)
+   Compiling arboard v3.6.1
+   Compiling haider-store v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-store)
+   Compiling haider-tui v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-tui)
+   Compiling haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-core)
+   Compiling haider-cli v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-cli)
+    Finished `test` profile [unoptimized] target(s) in 56.94s
+     Running tests/turnhygiene_pin_tests.rs (/private/tmp/haider-economydiet-target/debug/deps/turnhygiene_pin_tests-ca968eae241d1a57)
+
+running 10 tests
+test detached_run_journals_the_same_envelopes_as_an_attached_run ... ok
+test custom_provider_binds_from_explicit_flags_a_model_selector_and_the_profile_default ... ok
+test journalview_json_and_replay_pin_both_narrative_sides_per_request ... ok
+test provider_request_body_is_budget_independent_and_matches_the_golden_ledger ... FAILED
+test replay_of_a_tool_call_turn_equals_the_live_run_scoped_jsonl ... ok
+test resident_daemon_discovers_a_hook_installed_between_runs_and_scopes_it_by_cwd ... ok
+test jsonl_envelopes_reach_stdout_before_a_later_provider_delay_elapses ... ok
+test resident_daemon_rediscovers_project_instructions_across_runs_and_cwds ... ok
+test run_jsonl_text_turn_matches_the_normalized_golden ... ok
+test run_jsonl_tool_turn_matches_the_normalized_golden ... ok
+
+failures:
+
+---- provider_request_body_is_budget_independent_and_matches_the_golden_ledger stdout ----
+
+thread 'provider_request_body_is_budget_independent_and_matches_the_golden_ledger' (34880358) panicked at crates/haider-cli/tests/turnhygiene_pin_tests.rs:890:5:
+assertion failed: body["tools"].as_array().is_some_and(|tools| tools.len() > 10)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    provider_request_body_is_budget_independent_and_matches_the_golden_ledger
+
+test result: FAILED. 9 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.35s
+
+error: test failed, to rerun pass `-p haider-cli --test turnhygiene_pin_tests`

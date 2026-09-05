@@ -1,0 +1,12 @@
+    Blocking waiting for file lock on build directory
+    Checking haider-tools v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-tools)
+    Checking haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-core)
+    Checking haider-daemon v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-daemon)
+error[E0433]: cannot find type `ToolStatus` in this scope
+  --> crates/haider-daemon/src/worker_tool_exposure_tests.rs:14:69
+   |
+14 |             args: serde_json::json!({"filter": "monitor"}), status: ToolStatus::InProgress,
+   |                                                                     ^^^^^^^^^^ use of undeclared type `ToolStatus`
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `haider-daemon` (lib test) due to 1 previous error

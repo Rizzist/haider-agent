@@ -1,5 +1,17 @@
 #![allow(clippy::expect_used)]
 
+// These scripts exercise delegation lifecycle and authority directly. Declare
+// that feature surface explicitly while retaining the normal coding tier.
+fn delegation_tool_factory() -> std::sync::Arc<dyn crate::worker::TurnToolFactory> {
+    crate::worker::DaemonDependencies::default()
+        .with_tool_exposure(Some(vec![
+            "spawn_subagent".into(),
+            "message_subagent".into(),
+            "request_input".into(),
+        ]))
+        .tool_factory
+}
+
 #[cfg(unix)]
 use crate::connection::{ConnectionContext, DrainNotice, serve};
 #[cfg(unix)]
@@ -981,7 +993,7 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: delegation_tool_factory(),
             delegation: None,
             web_search: None,
         },
@@ -1236,7 +1248,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: delegation_tool_factory(),
             delegation: None,
             web_search: None,
         },
@@ -1499,7 +1511,7 @@ async fn message_subagent_resumes_hard_bound_child_with_retained_tool_history() 
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: delegation_tool_factory(),
             delegation: None,
             web_search: None,
         },
@@ -1835,7 +1847,7 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: delegation_tool_factory(),
             delegation: None,
             web_search: None,
         },
@@ -2451,7 +2463,7 @@ async fn autonomous_parent_keeps_delegated_request_input_answerable() {
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: delegation_tool_factory(),
             delegation: Some(DelegationHandle::with_stall_deadline(
                 hub.clone(),
                 Duration::from_secs(3),
@@ -2669,7 +2681,7 @@ async fn start_parked_child_with_wait_budgets(
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: delegation_tool_factory(),
             delegation: Some(DelegationHandle::with_wait_budgets(
                 hub.clone(),
                 stall_deadline,
@@ -3330,7 +3342,7 @@ async fn durable_parent_answer_replays_into_child_after_coordinator_restart() {
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: delegation_tool_factory(),
             delegation: Some(DelegationHandle::new(hub.clone())),
             web_search: None,
         },
@@ -3564,7 +3576,7 @@ async fn cancellation_mirror_handoff_survives_crash_until_durable_completion() {
         WorkerDependencies {
             diagnostics: None,
             provider_factory: Arc::new(FixedProviderFactory { provider }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: delegation_tool_factory(),
             delegation: None,
             web_search: None,
         },
@@ -3812,7 +3824,7 @@ async fn stalled_child_is_nudged_once_cancelled_and_settles_the_parent_report() 
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: delegation_tool_factory(),
             delegation: Some(delegation),
             web_search: None,
         },
@@ -3927,7 +3939,7 @@ async fn committed_child_progress_resets_the_stall_deadline() {
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: delegation_tool_factory(),
             delegation: Some(DelegationHandle::with_stall_deadline(
                 hub.clone(),
                 Duration::from_millis(500),
@@ -4039,7 +4051,7 @@ async fn a_child_that_recovers_after_the_nudge_is_never_cancelled() {
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: delegation_tool_factory(),
             delegation: Some(delegation),
             web_search: None,
         },
@@ -4253,7 +4265,7 @@ async fn cancel_while_terminal_tail_is_mirroring_completes_within_bound() {
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: delegation_tool_factory(),
             delegation: None,
             web_search: None,
         },
@@ -4523,7 +4535,7 @@ async fn recursion_chains_ancestry_and_depth_four_is_a_typed_continuable_error()
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: delegation_tool_factory(),
             delegation: None,
             web_search: None,
         },
@@ -4725,7 +4737,7 @@ async fn global_subagent_cap_is_a_typed_tool_rejection_and_parent_continues() {
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: delegation_tool_factory(),
             delegation: None,
             web_search: None,
         },
@@ -4832,7 +4844,7 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: delegation_tool_factory(),
             delegation: None,
             web_search: None,
         },
@@ -4897,7 +4909,7 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
-            tool_factory: Arc::new(BrokerToolFactory),
+            tool_factory: delegation_tool_factory(),
             delegation: Some(DelegationHandle::with_stall_deadline(
                 hub.clone(),
                 Duration::from_millis(30),

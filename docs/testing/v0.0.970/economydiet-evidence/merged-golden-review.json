@@ -1,0 +1,115 @@
+{
+  "baseline": "7431f8e6",
+  "total_records": 116,
+  "fixtures": [
+    {
+      "file": "crates/haider-cli/tests/fixtures/oneshot_run_golden.jsonl",
+      "lines_before": 28,
+      "lines_after": 28,
+      "changed": [
+        {
+          "line": 23,
+          "differences": [
+            {
+              "path": "/payload/scope/cache_boundaries/system_version",
+              "before": "haider-system-v4",
+              "after": "haider-system-v5"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "file": "crates/haider-cli/tests/fixtures/turnhygiene/provider_request_no_budget.json",
+      "lines_before": 1,
+      "lines_after": 1,
+      "changed": [
+        {
+          "line": 1,
+          "differences": [
+            {
+              "path": "/messages/0/content",
+              "before_bytes": 5887,
+              "after_bytes": 606
+            },
+            {
+              "path": "/tools",
+              "before_names": [
+                "request_input",
+                "plan",
+                "loom_register",
+                "todo_write",
+                "graph_evidence",
+                "fs_read",
+                "fs_glob",
+                "fs_search",
+                "fs_write",
+                "fs_edit",
+                "write",
+                "edit",
+                "fs_path",
+                "process_exec",
+                "spawn_subagent",
+                "message_subagent",
+                "task_output",
+                "task_kill",
+                "web_fetch",
+                "computer",
+                "monitor",
+                "list_models",
+                "peer_list",
+                "peer_send",
+                "ssh_list",
+                "ssh_shell"
+              ],
+              "after_names": [
+                "list_tools",
+                "todo_write",
+                "fs_read",
+                "fs_glob",
+                "fs_search",
+                "fs_write",
+                "fs_edit",
+                "process_exec"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "file": "crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_text_turn.jsonl",
+      "lines_before": 28,
+      "lines_after": 28,
+      "changed": [
+        {
+          "line": 23,
+          "differences": [
+            {
+              "path": "/payload/scope/cache_boundaries/system_version",
+              "before": "haider-system-v4",
+              "after": "haider-system-v5"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "file": "crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_tool_turn.jsonl",
+      "lines_before": 59,
+      "lines_after": 59,
+      "changed": [
+        {
+          "line": 54,
+          "differences": [
+            {
+              "path": "/payload/scope/cache_boundaries/system_version",
+              "before": "haider-system-v4",
+              "after": "haider-system-v5"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

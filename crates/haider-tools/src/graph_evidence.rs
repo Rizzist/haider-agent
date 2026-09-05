@@ -31,6 +31,10 @@ pub struct GraphEvidence {
     pub signal: Option<ProcessSignalRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_mutation: Option<WorkspaceMutationRef>,
+    /// Select existing daemon evidence without copying durable receipt IDs
+    /// into model context. This is a lookup, not an authority declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_from: Option<String>,
 }
 
 impl GraphEvidence {
@@ -106,6 +110,24 @@ impl GraphEvidence {
                 "graph_evidence accepts either signal or workspace_mutation provenance, not both",
             ));
         }
+        if let Some(selector) = request.evidence_from.as_deref() {
+            if !matches!(
+                selector,
+                "latest_process" | "latest_mutation" | "latest_subject"
+            ) {
+                return Err(ToolError::invalid_argument(
+                    "graph_evidence evidence_from must be latest_process, latest_mutation, or latest_subject",
+                ));
+            }
+            if request.signal.is_some()
+                || request.workspace_mutation.is_some()
+                || request.subject_digest.is_some()
+            {
+                return Err(ToolError::invalid_argument(
+                    "graph_evidence evidence_from cannot be combined with explicit provenance or subject_digest",
+                ));
+            }
+        }
         Ok(request)
     }
 }
@@ -114,7 +136,7 @@ impl GraphEvidence {
 pub fn graph_evidence_manifest() -> ToolManifest {
     ToolManifest {
         name: "graph_evidence".into(),
-        description: "Record bounded green or red evidence for the CURRENT open Convergence Graph obligation. Declared slots replace their own frontier. Daemon-verified slots require a durable process signal reference and matching subject digest; model-attested slots remain explicit testimony. The daemon alone decides whether the gate advances."
+        description: "Record green or red evidence for the current open graph obligation. Use evidence_from=latest_process or latest_mutation for daemon-verified slots, latest_subject for model testimony. The daemon resolves this run's durable provenance and checks freshness and authority before advancing the gate."
             .into(),
         effects: vec![],
         dispatch: DispatchMode::Await,
@@ -146,6 +168,11 @@ pub fn graph_evidence_manifest() -> ToolManifest {
                     "minLength": 1,
                     "maxLength": 64,
                     "description": "Required when the pinned all-of-N node declares evidence slots"
+                },
+                "evidence_from": {
+                    "type": "string",
+                    "enum": ["latest_process", "latest_mutation", "latest_subject"],
+                    "description": "Resolve the latest terminal process or applied mutation in this run from the journal; latest_subject supplies only the subject for model testimony. Cannot combine with explicit references. All freshness and authority checks still apply."
                 },
                 "subject_digest": {
                     "type": "string",
@@ -233,5 +260,35 @@ mod tests {
                     .contains("daemon-owned")
             );
         }
+    }
+
+    #[test]
+    fn evidence_selector_is_explicit_and_cannot_overwrite_provenance() {
+        for selector in ["latest_process", "latest_mutation", "latest_subject"] {
+            let args = serde_json::json!({"node":"VERIFY", "verdict":"green", "detail":"checked", "evidence_from":selector});
+            assert_eq!(
+                GraphEvidence::from_tool_args(args.clone())
+                    .expect("selector")
+                    .evidence_from
+                    .as_deref(),
+                Some(selector)
+            );
+            for (field, value) in [
+                ("subject_digest", serde_json::json!("blake3:claimed")),
+                (
+                    "signal",
+                    serde_json::json!({"run_id":"r", "call_id":"c", "effect_id":"e"}),
+                ),
+                (
+                    "workspace_mutation",
+                    serde_json::json!({"run_id":"r", "effect_id":"e"}),
+                ),
+            ] {
+                let mut mixed = args.clone();
+                mixed[field] = value;
+                assert!(GraphEvidence::from_tool_args(mixed).is_err());
+            }
+        }
+        assert!(GraphEvidence::from_tool_args(serde_json::json!({"node":"VERIFY", "verdict":"green", "detail":"checked", "evidence_from":"anything"})).is_err());
     }
 }
