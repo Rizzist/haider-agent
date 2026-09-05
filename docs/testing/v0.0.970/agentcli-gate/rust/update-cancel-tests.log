@@ -1,0 +1,30 @@
+   Compiling haider-cli v0.0.969 ($WORKTREE/crates/haider-cli)
+    Finished `test` profile [unoptimized] target(s) in 6.42s
+     Running unittests src/main.rs ($AGENTCLI_TARGET/debug/deps/haider-00397f7d0e8a0253)
+
+running 3 tests
+test update::tui::tests::cancelled_update_discovery_starts_no_curl_request ... ok
+test update::tui::tests::explicit_update_response_error_reaps_curl_and_joins_watcher ... FAILED
+test update::tui::tests::slow_explicit_update_check_cancels_and_reaps_curl_before_runtime_teardown ... FAILED
+
+failures:
+
+---- update::tui::tests::explicit_update_response_error_reaps_curl_and_joins_watcher stdout ----
+
+thread 'update::tui::tests::explicit_update_response_error_reaps_curl_and_joins_watcher' (35940171) panicked at crates/haider-cli/src/update/tui_tests.rs:134:21:
+runtime exited within TUI_EXIT: Timeout
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- update::tui::tests::slow_explicit_update_check_cancels_and_reaps_curl_before_runtime_teardown stdout ----
+
+thread 'update::tui::tests::slow_explicit_update_check_cancels_and_reaps_curl_before_runtime_teardown' (35940278) panicked at crates/haider-cli/src/update/tui_tests.rs:147:10:
+exact child PID audit: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
+
+
+failures:
+    update::tui::tests::explicit_update_response_error_reaps_curl_and_joins_watcher
+    update::tui::tests::slow_explicit_update_check_cancels_and_reaps_curl_before_runtime_teardown
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 76 filtered out; finished in 2.81s
+
+error: test failed, to rerun pass `-p haider-cli --bin haider`

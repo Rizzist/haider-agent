@@ -417,6 +417,8 @@ pub const FEATURE_AGENT_CANCEL_V1: &str = "agent_cancel_v1";
 /// routing changes (`session.provider.rebind`) at the next request boundary.
 pub const FEATURE_SESSION_PROVIDER_REBIND_V1: &str = "session_provider_rebind_v1";
 
+/// Headless execution pins support one direct, durable operator delegation.
+pub const FEATURE_AGENT_CLI_V1: &str = "agent_cli_v1";
 /// Daemon implements receipted live-session model selection
 /// (`session.select_model`), including cross-provider rows: the request's
 /// optional `provider` names the selected model row's provider attribute,
@@ -4515,6 +4517,9 @@ impl RequestBody {
     #[must_use]
     pub const fn additive_shape_feature(&self) -> Option<&'static str> {
         match self {
+            Self::HeadlessRunStart { spec, .. } if spec.agent_spawn.is_some() => {
+                Some(FEATURE_AGENT_CLI_V1)
+            }
             Self::ProviderModelsProbe { .. } => Some(FEATURE_PROVIDER_MODELS_PROBE_V1),
             Self::SessionFork {
                 prompt: Some(_), ..
@@ -4637,6 +4642,11 @@ pub enum ResponseBody {
     #[serde(rename = "session.surface_watch")]
     SessionSurfaceWatching {
         session_id: SessionId,
+        /// The caller's daemon-minted connection identity. This is distinct
+        /// from the publisher of the adopted input snapshot. Missing on older
+        /// daemons, where clients retain their legacy echo compatibility.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_owner: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input: Option<SurfaceInputWire>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

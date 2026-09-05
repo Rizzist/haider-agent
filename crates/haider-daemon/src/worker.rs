@@ -8978,6 +8978,9 @@ async fn start_turn(
     )
     .with_event_ids(Arc::clone(&event_ids));
     config.turn_trace = turn_trace.clone();
+    config.agent_spawn = headless
+        .as_ref()
+        .and_then(|context| context.spec.agent_spawn.clone());
     config.provider_route_epoch = metadata.provider_rebind_id.clone();
     config.provider_deadline = provider_deadline;
     let provider_request_state = provider_derived_request_state(

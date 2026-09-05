@@ -1,0 +1,107 @@
+{
+  "report": "qa-gate-t0-Syeds-MacBook-Air.local-20260905T142423Z.json",
+  "summary": {
+    "env_blocked": 0,
+    "fail": 0,
+    "pass": 15,
+    "skip": 0,
+    "total": 15
+  },
+  "measurement_accepted": true,
+  "measurement_reasons": [],
+  "summed_check_wall_ms": 887634,
+  "no_orphan_proofs": [
+    {
+      "check": "t0.account.alias_selects",
+      "proof": "no_orphan_daemons pids=72112 stop=stopped_cleanly alive_after=false"
+    },
+    {
+      "check": "t0.agent.spawn_result",
+      "proof": "no_orphan_daemons pids=72119 stop=stopped_cleanly alive_after=false"
+    },
+    {
+      "check": "t0.budget.max_cost_binds_before_request",
+      "proof": "no_orphan_daemons pids=72129 stop=stopped_cleanly alive_after=false"
+    },
+    {
+      "check": "t0.budget.max_tokens_binds",
+      "proof": "no_orphan_daemons pids=72137 stop=stopped_cleanly alive_after=false"
+    },
+    {
+      "check": "t0.daemon.status_stop",
+      "proof": "no_orphan_daemons pids=72142 stop=not_running alive_after=false"
+    },
+    {
+      "check": "t0.headless.input_required_is_typed",
+      "proof": "no_orphan_daemons pids=72149 stop=stopped_cleanly alive_after=false"
+    },
+    {
+      "check": "t0.run.exit_codes",
+      "proof": "no_orphan_daemons pids=72153 stop=stopped_cleanly alive_after=false"
+    },
+    {
+      "check": "t0.run.jsonl_contract",
+      "proof": "no_orphan_daemons pids=72162 stop=stopped_cleanly alive_after=false"
+    },
+    {
+      "check": "t0.run.replay_resume_recover",
+      "proof": "no_orphan_daemons pids=72166 stop=stopped_cleanly alive_after=false"
+    },
+    {
+      "check": "t0.sessions.wait_ready_n",
+      "proof": "no_orphan_daemons pids=72177 stop=stopped_cleanly alive_after=false"
+    },
+    {
+      "check": "t0.tui.catalog_help_command_list_pin",
+      "proof": "no_orphan_daemons pids=72193 stop=stopped_cleanly alive_after=false"
+    },
+    {
+      "check": "t0.tui.login_paths",
+      "proof": "no_orphan_daemons pids=72204 stop=stopped_cleanly alive_after=false"
+    },
+    {
+      "check": "t0.tui.model_picker_cardinality",
+      "proof": "no_orphan_daemons pids=72480 stop=stopped_cleanly alive_after=false"
+    },
+    {
+      "check": "t0.tui.palette_activation_closure",
+      "proof": "no_orphan_daemons pids=79485 stop=stopped_cleanly alive_after=false"
+    },
+    {
+      "check": "t0.tui.three_door_parity",
+      "proof": "no_orphan_daemons pids=83326 stop=stopped_cleanly alive_after=false"
+    }
+  ],
+  "tui_exits": 105,
+  "all_tui_exits_natural_zero": true,
+  "sessions": {
+    "pid": 81200,
+    "command": "sessions",
+    "clean": true,
+    "audit": "alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+    "reap": [
+      {
+        "pid": 81200,
+        "wait_options": 1,
+        "raw_status": 0,
+        "exit_code": 0,
+        "signal": null
+      }
+    ]
+  },
+  "update": {
+    "pid": 83220,
+    "command": "update",
+    "clean": true,
+    "audit": "alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+    "reap": [
+      {
+        "pid": 83220,
+        "wait_options": 1,
+        "raw_status": 0,
+        "exit_code": 0,
+        "signal": null
+      }
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+   Compiling haider-cli v0.0.969 ($WORKTREE/crates/haider-cli)
+    Finished `test` profile [unoptimized] target(s) in 16.76s
+     Running unittests src/main.rs ($AGENTCLI_TARGET/debug/deps/haider-00397f7d0e8a0253)
+
+running 3 tests
+test update::tui::tests::cancelled_update_discovery_starts_no_curl_request ... ok
+test update::tui::tests::explicit_update_response_error_reaps_curl_and_joins_watcher ... ok
+test update::tui::tests::slow_explicit_update_check_cancels_and_reaps_curl_before_runtime_teardown ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 76 filtered out; finished in 0.32s
+

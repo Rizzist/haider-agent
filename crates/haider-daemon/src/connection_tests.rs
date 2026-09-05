@@ -362,8 +362,8 @@ fn welcome_features_pin_served_management_families() {
     );
     assert_eq!(
         welcome_features().len(),
-        116,
-        "custom-provider model probes extend the merged 115-feature set"
+        117,
+        "public agent CLI extends the merged 116-feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -397,6 +397,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_HOOKS_V1.to_owned(),
             haider_rpc::FEATURE_FALLBACK_CHAIN_V1.to_owned(),
             haider_rpc::FEATURE_HEADLESS_RUN_V1.to_owned(),
+            haider_rpc::FEATURE_AGENT_CLI_V1.to_owned(),
             haider_rpc::FEATURE_HAIDER_CODE_PLAN_STATUS_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_AUTHORING_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_CLI_PRESENCE_V1.to_owned(),
@@ -578,7 +579,24 @@ fn tight_welcome_restores_each_pre_feature_frame_before_older_withholding() {
             if features == &welcome.features && !user_command_withheld
     ));
 
-    let mut pre_read_only_welcome = welcome.clone();
+    let mut pre_agent_cli_welcome = welcome.clone();
+    assert!(
+        pre_agent_cli_welcome
+            .features
+            .remove(haider_rpc::FEATURE_AGENT_CLI_V1)
+    );
+    let pre_agent_cli = uds_codec::encode(
+        &WireFrame::Welcome(pre_agent_cli_welcome.clone()),
+        usize::MAX,
+    )
+    .expect("pre-agent-CLI Welcome encodes");
+    let pre_agent_cli_body_len = pre_agent_cli.len() - 4;
+    let agent_cli_tight = encode_welcome_for_peer(welcome.clone(), full_body_len - 1)
+        .expect("tight peer first withholds only the new agent CLI shape");
+    assert_eq!(agent_cli_tight.bytes.as_slice(), pre_agent_cli.as_slice());
+    assert_eq!(agent_cli_tight.features, pre_agent_cli_welcome.features);
+
+    let mut pre_read_only_welcome = pre_agent_cli_welcome.clone();
     assert!(
         pre_read_only_welcome
             .features
@@ -590,7 +608,7 @@ fn tight_welcome_restores_each_pre_feature_frame_before_older_withholding() {
     )
     .expect("pre-read-only Welcome encodes");
     let pre_read_only_body_len = pre_read_only.len() - 4;
-    let read_only_tight = encode_welcome_for_peer(welcome.clone(), full_body_len - 1)
+    let read_only_tight = encode_welcome_for_peer(welcome.clone(), pre_agent_cli_body_len - 1)
         .expect("tight peer retains the exact pre-read-only handshake");
     assert_eq!(read_only_tight.bytes.as_slice(), pre_read_only.as_slice());
     assert_eq!(read_only_tight.features, pre_read_only_welcome.features);
@@ -706,6 +724,11 @@ fn tight_welcome_restores_each_pre_feature_frame_before_older_withholding() {
     assert!(
         selected_unmarked
             .features
+            .remove(haider_rpc::FEATURE_AGENT_CLI_V1)
+    );
+    assert!(
+        selected_unmarked
+            .features
             .remove(FEATURE_SESSION_READ_ONLY_V1)
     );
     assert!(
@@ -727,6 +750,11 @@ fn tight_welcome_restores_each_pre_feature_frame_before_older_withholding() {
     let selected_unmarked = uds_codec::encode(&WireFrame::Welcome(selected_unmarked), usize::MAX)
         .expect("selected-encoding unmarked Welcome encodes");
     let mut selected_pre_prompt = selected_encoding.clone();
+    assert!(
+        selected_pre_prompt
+            .features
+            .remove(haider_rpc::FEATURE_AGENT_CLI_V1)
+    );
     assert!(
         selected_pre_prompt
             .features

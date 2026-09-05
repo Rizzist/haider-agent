@@ -1,0 +1,7 @@
+{"pid": 67232, "clean": true, "audit": "alt_enter=1 alt_leave=1 panic_free=true exit_clean=true", "reap": [{"pid": 67232, "wait_options": 1, "raw_status": 0, "exit_code": 0, "signal": null}]}
+{"pid": 67234, "clean": true, "audit": "alt_enter=1 alt_leave=1 panic_free=true exit_clean=true", "reap": [{"pid": 67234, "wait_options": 1, "raw_status": 0, "exit_code": 0, "signal": null}]}
+{"pid": 67248, "clean": true, "audit": "alt_enter=1 alt_leave=1 panic_free=true exit_clean=true", "reap": [{"pid": 67248, "wait_options": 1, "raw_status": 0, "exit_code": 0, "signal": null}]}
+{"pid": 67278, "clean": true, "audit": "alt_enter=1 alt_leave=1 panic_free=true exit_clean=true", "reap": [{"pid": 67278, "wait_options": 1, "raw_status": 0, "exit_code": 0, "signal": null}]}
+{"pid": 67335, "clean": true, "audit": "alt_enter=1 alt_leave=1 panic_free=true exit_clean=true", "reap": [{"pid": 67335, "wait_options": 1, "raw_status": 0, "exit_code": 0, "signal": null}]}
+{"pid": 67362, "clean": true, "audit": "alt_enter=1 alt_leave=1 panic_free=true exit_clean=true", "reap": [{"pid": 67362, "wait_options": 1, "raw_status": 0, "exit_code": 0, "signal": null}]}
+{"pid": 67563, "clean": true, "audit": "alt_enter=1 alt_leave=1 panic_free=true exit_clean=true", "reap": [{"pid": 67563, "wait_options": 1, "raw_status": 0, "exit_code": 0, "signal": null}]}

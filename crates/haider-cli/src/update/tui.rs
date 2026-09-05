@@ -5,7 +5,8 @@ use super::check_policy::{
     reserve_check, unix_timestamp_now,
 };
 use super::{
-    UpdateAvailability, UpdateOptions, UpdateRunOutcome, check_update_availability, run_update,
+    UpdateAvailability, UpdateError, UpdateOptions, UpdateRunOutcome,
+    check_update_availability_cancellable, run_update,
 };
 use haider_tui::app::AppEvent;
 use haider_tui::runtime::{LiveUpdateBridge, LiveUpdateEvent};
@@ -22,29 +23,11 @@ pub(crate) fn live_update_bridge(profile_dir: PathBuf, no_update_check: bool) ->
     let check_tx = events_tx.clone();
     let check_profile = profile_dir;
     let check_now = move || {
-        let tx = check_tx.clone();
-        let profile = check_profile.clone();
-        let _task = tokio::task::spawn_blocking(move || {
-            if let Err(error) = reserve_check(&profile, unix_timestamp_now(), true) {
-                send_app(
-                    &tx,
-                    AppEvent::UpdateFailed {
-                        message: format!("could not record update check: {error}"),
-                    },
-                );
-                return;
-            }
-            let event = match check_update_availability() {
-                Ok(UpdateAvailability::Current { version }) => AppEvent::UpdateCurrent { version },
-                Ok(UpdateAvailability::Available { latest, .. }) => {
-                    AppEvent::UpdateAvailable { version: latest }
-                }
-                Err(error) => AppEvent::UpdateFailed {
-                    message: error.to_string(),
-                },
-            };
-            send_app(&tx, event);
-        });
+        let _worker = spawn_explicit_check(
+            check_profile.clone(),
+            check_tx.clone(),
+            check_update_availability_cancellable,
+        );
     };
 
     let update_tx = events_tx;
@@ -86,6 +69,45 @@ pub(crate) fn live_update_bridge(profile_dir: PathBuf, no_update_check: bool) ->
     LiveUpdateBridge::new(events_rx, check_now, run_now)
 }
 
+fn spawn_explicit_check(
+    profile_dir: PathBuf,
+    events: mpsc::UnboundedSender<LiveUpdateEvent>,
+    check: impl FnOnce(
+        super::discovery::DiscoveryCancellation,
+    ) -> Result<UpdateAvailability, UpdateError>
+    + Send
+    + 'static,
+) -> tokio::task::JoinHandle<()> {
+    let cancellation_events = events.clone();
+    let cancellation = std::sync::Arc::new(move || cancellation_events.is_closed());
+    // Retain runtime ownership until discovery has killed/reaped its curl and
+    // joined its cancellation watcher. Receiver closure cancels the request.
+    tokio::task::spawn_blocking(move || {
+        if events.is_closed() {
+            return;
+        }
+        if let Err(error) = reserve_check(&profile_dir, unix_timestamp_now(), true) {
+            send_app(
+                &events,
+                AppEvent::UpdateFailed {
+                    message: format!("could not record update check: {error}"),
+                },
+            );
+            return;
+        }
+        let event = match check(cancellation) {
+            Ok(UpdateAvailability::Current { version }) => AppEvent::UpdateCurrent { version },
+            Ok(UpdateAvailability::Available { latest, .. }) => {
+                AppEvent::UpdateAvailable { version: latest }
+            }
+            Err(error) => AppEvent::UpdateFailed {
+                message: error.to_string(),
+            },
+        };
+        send_app(&events, event);
+    })
+}
+
 fn spawn_startup_check(
     profile_dir: PathBuf,
     no_update_check: bool,
@@ -110,3 +132,7 @@ fn spawn_startup_check(
 fn send_app(events: &mpsc::UnboundedSender<LiveUpdateEvent>, event: AppEvent) {
     let _ = events.send(LiveUpdateEvent::App(event));
 }
+
+#[cfg(test)]
+#[path = "tui_tests.rs"]
+mod tests;

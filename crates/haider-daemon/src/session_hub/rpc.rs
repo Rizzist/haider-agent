@@ -14629,6 +14629,19 @@ impl HubConnection {
             request.insert("trust_hooks".into(), serde_json::Value::Bool(true));
         }
         if let Some(spec) = headless_spec.as_ref() {
+            if let Some(spawn) = spec.agent_spawn.as_ref() {
+                let args = serde_json::to_value(spawn)
+                    .map_err(|error| SessionHubError::Task(error.to_string()))?;
+                if let Err(error) = haider_tools::SpawnSubagent::from_tool_args(args) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        &error.to_string(),
+                        false,
+                        None,
+                    );
+                }
+            }
             if let Some(budget) = spec.budget.request_budget
                 && let Err(message) = budget.validate()
             {
@@ -16907,6 +16920,7 @@ impl HubConnection {
             request_id,
             body: ResponseBody::SessionSurfaceWatching {
                 session_id: session_id.clone(),
+                caller_owner: Some(self.connection_id.clone()),
                 input: snapshot.input,
                 status: snapshot.status,
             },

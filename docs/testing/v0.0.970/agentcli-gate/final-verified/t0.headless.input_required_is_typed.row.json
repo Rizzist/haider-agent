@@ -1,0 +1,66 @@
+{
+  "id": "t0.headless.input_required_is_typed",
+  "area": "headless",
+  "status": "PASS",
+  "evidence": [
+    {
+      "label": "input_required_typed",
+      "status": "PASS",
+      "evidence_line": "installed_0.0.967_pin exit=0 input_resolution=no_human_available typed_terminals=1 terminal_kind=success run_state=done continuation=true",
+      "artefacts": []
+    },
+    {
+      "label": "no_orphan_daemons",
+      "status": "PASS",
+      "evidence_line": "no_orphan_daemons pids=93042 stop=stopped_cleanly alive_after=false",
+      "artefacts": []
+    }
+  ],
+  "wall_ms": 228,
+  "artefacts": [],
+  "timed": false,
+  "measurement_accepted": null,
+  "budget": {
+    "total_ms": 118000,
+    "parts": [
+      {
+        "name": "daemon startup deadline",
+        "milliseconds": 30000,
+        "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+      },
+      {
+        "name": "headless input resolution timeout",
+        "milliseconds": 2000,
+        "source": "haider run --timeout 2s; crates/haider-cli/src/run.rs:216-223"
+      },
+      {
+        "name": "terminal cancellation grace",
+        "milliseconds": 2000,
+        "source": "crates/haider-client/src/headless.rs:67-75 DEFAULT_TERMINAL_GRACE"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "daemon stop timeout",
+        "milliseconds": 20000,
+        "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+      },
+      {
+        "name": "post-stop process-exit observation grace",
+        "milliseconds": 2000,
+        "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+      },
+      {
+        "name": "post-stop process-exit observation grace",
+        "milliseconds": 2000,
+        "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+      }
+    ]
+  },
+  "segments": 2,
+  "turns_expected": 2,
+  "expected_fail_until": null
+}

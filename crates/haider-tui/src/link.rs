@@ -700,6 +700,8 @@ pub struct CommandContext {
     /// id, so without this a failure cannot be correlated back to the
     /// session it wedged (review P1-5).
     attach: Option<haider_protocol::ids::SessionId>,
+    /// Owns the watch-adoption barrier across reconnects to the same session.
+    surface_watch: Option<(haider_protocol::ids::SessionId, u64)>,
     checkpoint_list: Option<CheckpointListContext>,
     /// The provider a `provider.models_refresh` was for — the request has
     /// no durable id, and its failure must land on the PROVIDER ROW, not
@@ -800,6 +802,10 @@ impl CommandContext {
             },
             attach: match command {
                 LiveCommand::Attach { session, .. } => Some(session.clone()),
+                _ => None,
+            },
+            surface_watch: match command {
+                LiveCommand::SurfaceWatch { session, epoch } => Some((session.clone(), *epoch)),
                 _ => None,
             },
             checkpoint_list: match command {
@@ -1022,7 +1028,7 @@ pub fn request_body_for_features(
                 }
             }),
         },
-        LiveCommand::SurfaceWatch { session } => RequestBody::SessionSurfaceWatch {
+        LiveCommand::SurfaceWatch { session, .. } => RequestBody::SessionSurfaceWatch {
             session_id: session,
         },
         LiveCommand::Submit {
@@ -1812,11 +1818,22 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             attachment: attachment_id,
         }],
         ResponseBody::SessionSurfaceWatching {
-            session_id, input, ..
-        } => vec![LiveReply::SurfaceWatching {
-            session: session_id,
+            session_id,
             input,
-        }],
+            caller_owner,
+            ..
+        } => context
+            .surface_watch
+            .as_ref()
+            .filter(|(session, _)| *session == session_id)
+            .map_or_else(Vec::new, |(_, epoch)| {
+                vec![LiveReply::SurfaceWatching {
+                    session: session_id,
+                    input,
+                    caller_owner,
+                    epoch: *epoch,
+                }]
+            }),
         // W-INP: the publish ack carries nothing the composer needs.
         ResponseBody::SessionSurfacePublished { .. } => Vec::new(),
         ResponseBody::SessionDiagnostic { .. } => context

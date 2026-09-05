@@ -5391,7 +5391,7 @@ async fn surface_watch_delivers_on_change_and_stays_silent_when_idle() {
         .await
         .expect("surface watch routes");
     let WireFrame::Response {
-        body: ResponseBody::SessionSurfaceWatching { .. },
+        body: ResponseBody::SessionSurfaceWatching { caller_owner, .. },
         ..
     } = sink.next().await
     else {
@@ -5429,9 +5429,12 @@ async fn surface_watch_delivers_on_change_and_stays_silent_when_idle() {
         panic!("expected surface delta, got {delta:?}");
     };
     assert_eq!(delta_session, session_id);
+    let input = input.expect("published input surface");
+    assert_eq!(input.text, "draft in flight");
     assert_eq!(
-        input.expect("published input surface").text,
-        "draft in flight"
+        caller_owner.as_deref(),
+        Some(input.owner.as_str()),
+        "watch ack names the actual caller before any own input echo"
     );
 
     // Idle ticks (50ms period) compare generations under the lock and must

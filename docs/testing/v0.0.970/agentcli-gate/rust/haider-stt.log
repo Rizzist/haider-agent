@@ -1,0 +1,174 @@
+   Compiling rustls v0.23.42
+   Compiling zerocopy v0.8.55
+   Compiling tracing v0.1.44
+   Compiling h2 v0.4.15
+   Compiling ppv-lite86 v0.2.21
+   Compiling simd-adler32 v0.3.10
+   Compiling rand_chacha v0.9.0
+   Compiling tokio-rustls v0.26.4
+   Compiling miniz_oxide v0.8.9
+   Compiling tower v0.5.3
+   Compiling hyper v1.11.0
+   Compiling rand v0.9.5
+   Compiling hyper-util v0.1.20
+   Compiling tungstenite v0.26.2
+   Compiling hyper-rustls v0.27.9
+   Compiling zopfli v0.8.3
+   Compiling tower-http v0.6.11
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling flate2 v1.1.9
+   Compiling reqwest v0.13.4
+   Compiling zip v2.4.2
+   Compiling tokio-tungstenite v0.26.2
+   Compiling haider-stt v0.0.969 ($WORKTREE/crates/haider-stt)
+    Finished `test` profile [unoptimized] target(s) in 8.35s
+     Running unittests src/lib.rs ($AGENTCLI_TARGET/debug/deps/haider_stt-b3bc85d2b61a4525)
+
+running 1 test
+test capture::capture_worker_compile_tests::non_android_capture_worker_constructor_is_available ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/capture_tests.rs ($AGENTCLI_TARGET/debug/deps/capture_tests-3b8246a7ab7187da)
+
+running 14 tests
+test capture_constants_are_ade_parity ... ok
+test digital_zero_is_exact_zero_only ... ok
+test audio_stats_and_dbfs_pin_known_values ... ok
+test capture_cap_stops_accumulation_and_reports_once ... ok
+test digital_zero_watchdog_hints_once_and_recovers ... ok
+test envelope_level_pins_the_ade_blend ... ok
+test linear16_encoding_pins_asymmetric_scaling ... ok
+test frames_are_emitted_only_while_recording ... ok
+test mono_mix_averages_channels_and_clamps ... ok
+test resample_pins_identity_and_interpolation ... ok
+test stall_watchdog_reports_a_dead_callback_stream_once ... ok
+test wav_encoder_is_byte_identical_to_the_ade ... ok
+test envelope_cadence_is_60ms_recording_and_1s_standby ... ok
+test record_start_seeds_exactly_the_preroll_tail ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/catalog_tests.rs ($AGENTCLI_TARGET/debug/deps/catalog_tests-8a15da38e6372af6)
+
+running 5 tests
+test catalog_is_byte_identical_to_the_ade_table ... ok
+test model_lookup_trims_and_ignores_ascii_case ... ok
+test installed_models_reflect_live_filesystem_truth ... ok
+test effective_model_prefers_own_selection_then_hint_then_default ... ok
+test selected_model_is_a_read_only_hint ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/chunker_tests.rs ($AGENTCLI_TARGET/debug/deps/chunker_tests-6008b7cfe5991320)
+
+running 7 tests
+test chunker_thresholds_are_ade_parity ... ok
+test finish_flushes_a_short_speech_tail ... ok
+test silence_alone_never_cuts_before_ten_seconds ... ok
+test quiet_gap_cuts_after_750ms_silence_past_ten_seconds ... ok
+test continuous_speech_force_cuts_at_35_seconds ... ok
+test speechless_audio_yields_no_chunk_even_at_the_force_ceiling ... ok
+test consecutive_chunks_carry_increasing_indices_and_contiguous_ranges ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/config_tests.rs ($AGENTCLI_TARGET/debug/deps/config_tests-48713376ecadac50)
+
+running 5 tests
+test engine_serde_tags_are_locked ... ok
+test absent_config_loads_defaults ... ok
+test a_section_without_auto_send_reads_as_off ... ok
+test corrupt_section_is_a_typed_error_never_silent_defaults ... ok
+test save_preserves_foreign_keys_and_roundtrips ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/deepgram_tests.rs ($AGENTCLI_TARGET/debug/deps/deepgram_tests-5e59b27c717fb87b)
+
+running 11 tests
+test deepgram_constants_are_pinned ... ok
+test api_key_hygiene_is_enforced_without_echoing_the_key ... ok
+test error_body_precedence_is_err_msg_then_message_then_error ... ok
+test flux_detection_covers_architecture_and_names ... ok
+test language_hygiene_matches_the_ade ... ok
+test realtime_text_semantics_accumulate_finals_and_overwrite_interims ... ok
+test realtime_url_pins_the_exact_query ... ok
+test model_fetch_filters_streaming_true_and_excludes_flux ... ok
+test key_validation_maps_statuses_to_typed_errors ... ok
+test ws_session_streams_audio_and_assembles_joined_finals ... ok
+test abandoned_session_self_finalizes_at_the_cap_with_keepalives ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+     Running tests/download_tests.rs ($AGENTCLI_TARGET/debug/deps/download_tests-9ca8e1b797709ffb)
+
+running 4 tests
+test existing_model_short_circuits_without_network ... ok
+test http_error_status_is_a_typed_download_error ... ok
+test corrupted_download_is_refused_and_leaves_nothing ... ok
+test verified_download_streams_progress_and_installs_atomically ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/local_tests.rs ($AGENTCLI_TARGET/debug/deps/local_tests-8fe2a8079b5afe14)
+
+running 9 tests
+test build_args_pins_the_exact_ade_argv ... ok
+test oversized_wav_is_refused_before_spawn ... ok
+test cancel_kills_the_inflight_spawn ... ok
+test partial_session_error_surfaces_only_without_assembled_text ... ok
+test failing_cli_reports_filtered_stderr ... ok
+test thread_counts_clamp_to_ade_ranges ... ok
+test evicted_model_is_typed_model_missing_per_spawn ... ok
+test partial_session_emits_cumulative_frames_and_assembles ... ok
+test stub_cli_roundtrip_returns_stdout_and_receives_pinned_args ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.59s
+
+     Running tests/model_dir_tests.rs ($AGENTCLI_TARGET/debug/deps/model_dir_tests-2fc2e5e9f048adc2)
+
+running 9 tests
+test empty_env_values_are_unset ... ok
+test home_lookup_falls_back_to_userprofile ... ok
+test home_env_override_is_second_and_verbatim ... ok
+test data_dir_env_override_wins_verbatim_on_every_platform ... ok
+test linux_default_is_lowercase_diffforge_via_xdg_then_local_share ... ok
+test macos_default_is_the_literal_application_support_diffforge ... ok
+test no_home_and_no_override_resolves_to_none ... ok
+test whisper_subdir_is_literal ... ok
+test windows_default_prefers_appdata_then_localappdata ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/policy_tests.rs ($AGENTCLI_TARGET/debug/deps/policy_tests-559c2763b2799f72)
+
+running 5 tests
+test drop_reasons_carry_stable_labels ... ok
+test normalization_filters_warmup_noise_and_collapses_whitespace ... ok
+test drop_table_matches_the_ade_rules ... ok
+test partial_join_removes_word_overlap ... ok
+test policy_defaults_are_ade_parity ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/runtime_tests.rs ($AGENTCLI_TARGET/debug/deps/runtime_tests-75c46cb3b1adde5c)
+
+running 8 tests
+test macos_well_known_paths_are_the_ade_literals ... ok
+test name_order_prefers_whisper_cli_then_main_then_whisper ... ok
+test archive_without_runtime_executable_is_typed_runtime_missing ... ok
+test discovery_order_is_managed_dir_then_path_then_well_known ... ok
+test zip_entry_guard_refuses_escaping_names ... ok
+test runtime_archive_format_detection_is_magic_byte_driven ... ok
+test runtime_zip_extraction_is_screened_and_lands_in_runtime_dir ... ok
+test homebrew_driver_maps_exit_status_and_first_output_line ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s
+
+   Doc-tests haider_stt
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

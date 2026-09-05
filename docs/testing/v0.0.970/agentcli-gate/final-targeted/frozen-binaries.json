@@ -1,0 +1,14 @@
+{
+  "haider": {
+    "path": "/private/tmp/agentcli-qa-final-bins/haider",
+    "sha256": "e781ffdc90d52b13003d57253fabd9fe2f2306fae8f0e09f96a9525a05a21b0e",
+    "version_output": "haider 0.0.969",
+    "version": "0.0.969"
+  },
+  "haiderd": {
+    "path": "/private/tmp/agentcli-qa-final-bins/haiderd",
+    "sha256": "51e676678c3d7fc2f5cadbca1665d1302269ba0025ab94ce7c8024fa5f59cc6d",
+    "version_output": "haiderd 0.0.969",
+    "version": "0.0.969"
+  }
+}

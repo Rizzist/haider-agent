@@ -1,0 +1,377 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling rustix v1.1.4
+   Compiling haider-protocol v0.0.969 ($WORKTREE/crates/haider-protocol)
+   Compiling haider-platform v0.0.969 ($WORKTREE/crates/haider-platform)
+   Compiling tempfile v3.27.0
+   Compiling gethostname v1.1.0
+   Compiling x11rb v0.13.2
+   Compiling haider-tools v0.0.969 ($WORKTREE/crates/haider-tools)
+    Finished `test` profile [unoptimized] target(s) in 54.52s
+     Running unittests src/lib.rs ($AGENTCLI_TARGET/debug/deps/haider_tools-dcf96d5bcd385668)
+
+running 85 tests
+test broker::broker_tests::peer_send_hard_ceiling_wins_over_user_allow ... ok
+test broker::broker_tests::hard_ceiling_wins_even_after_user_allow ... ok
+test checkpoint_tests::freeze_checkpoint_marks_absent_and_over_limit_preimages_explicitly ... ok
+test checkpoint_tests::restore_preflights_every_path_before_changing_any_file ... ok
+test computer::linux::tests::delivered_cu1_pixels_map_to_x11_root_without_assuming_native_size ... ok
+test computer::linux::tests::held_button_only_allows_move_or_release ... ok
+test computer::linux::tests::x11_masks_scale_color_channels_to_rgb8 ... ok
+test computer::linux::tests::linux_key_names_and_unicode_follow_x11_keysym_rules ... ok
+test computer::macos::tests::accessibility_bounds_map_back_to_the_delivered_cu1_viewport ... ok
+test computer::linux::tests::x11_scanline_stride_ignores_only_final_wire_padding ... ok
+test computer::macos::tests::held_left_button_only_allows_drag_motion_or_release ... ok
+test computer::macos::tests::delivered_cu1_pixels_map_to_quartz_points_without_hardcoded_retina_scale ... ok
+test computer::macos::tests::manual_real_hardware_screenshot ... ignored, requires an interactive macOS display and Screen Recording permission
+test computer::tests::passthrough_redaction_borrows_exact_original_bytes ... ok
+test computer::tests::platform_backends_are_dispatcher_local ... ok
+test computer::tests::redaction_rejects_source_bytes_before_decoding ... ok
+test computer::tests::unavailable_backend_is_typed_on_every_platform ... ok
+test computer::wayland::tests::initialization_requires_capture_and_both_input_grants ... ok
+test computer::wayland::tests::portal_response_dimensions_are_bounded_to_nonzero_u32 ... ok
+test computer::wayland::tests::response_identity_and_denial_are_fail_closed ... ok
+test computer::wayland::tests::wayland_detection_is_positive_and_does_not_depend_on_display ... ok
+test filesystem::read_memo_tests::read_memo_lru_never_exceeds_its_byte_cap ... ok
+test checkpoint_tests::unsupported_checkpoint_sink_fails_before_filesystem_mutation ... ok
+test computer::tests::exclude_region_blacks_only_the_clipped_source_pixels ... ok
+test filesystem::tests::hidden_sensitive_non_utf8_accounting_remains_best_effort ... ok
+test filesystem::tests::external_leaf_replacement_before_edit_rename_is_typed_path_change ... ok
+test checkpoint_tests::filesystem_checkpoint_freezes_preimage_before_atomic_terminal_publication ... ok
+test filesystem::tests::parent_move_after_final_revalidation_is_refused_by_atomic_rename_resolution ... ok
+test filesystem::tests::path_parent_escape_before_commit_is_typed_and_mutates_neither_location ... ok
+test filesystem::tests::rename_time_parent_escape_is_typed_path_change ... ok
+test filesystem::tests::same_inode_concurrent_edit_is_typed_path_change ... ok
+test filesystem::read_memo_tests::repeated_read_and_search_reuse_results_until_a_workspace_mutation ... ok
+test filesystem::w4a12_tests::leaf_replacement_after_content_verify_is_typed_path_change ... ok
+test filesystem::w4a13_tests::clone_unavailable_degrades_to_metadata_guarded_best_effort ... ok
+test filesystem::w4a12_tests::mid_read_in_place_edit_never_false_passes_a_torn_content_hash ... ok
+test filesystem::w4a13_tests::apfs_clone_snapshot_never_false_passes_a_map_shared_torn_read ... ok
+test graph_evidence::tests::manifest_and_parser_accept_a_bounded_general_node ... ok
+test graph_evidence::tests::model_cannot_claim_computer_observation_or_daemon_authority ... ok
+test mobile::tests::fake_backend_returns_canned_observations_and_acks ... ok
+test mobile::tests::parser_covers_every_action_and_effect_exactly ... ok
+test mobile::tests::parser_rejects_unknown_fields_and_invalid_runtime_shapes ... ok
+test monitor::tests::cli_presets_expand_to_exact_argv_and_missing_binary_is_typed ... ok
+test monitor::tests::every_tagged_monitor_variant_still_parses ... ok
+test monitor::tests::external_file_monitor_uses_fs_read_approval_while_workspace_file_does_not ... ok
+test monitor::tests::nested_and_top_level_unknown_fields_are_rejected ... ok
+test monitor::tests::source_filter_action_and_duration_cross_checks_are_enforced ... ok
+test monitor::tests::strict_register_list_remove_parsing ... ok
+test plan::tests::args_validation_rejects_empty_and_oversized ... ok
+test plan::tests::plan_presentation_is_nonblocking_and_auto_accepts ... ok
+test process::shell_command_tests::adapter_transcript_keeps_deterministic_quarter_head_three_quarter_tail ... ok
+test process::shell_command_tests::unix_shell_command_prefers_zsh_with_sh_fallback_and_preserves_script_bytes ... ok
+test process::shell_command_tests::unix_shell_resolution_falls_back_to_path_sh_when_bin_shells_are_absent ... ok
+test filesystem::wildcard_match_tests::long_wildcard_search_survives_a_small_worker_stack ... ok
+test redact::lockdown_tests::lockdown_redaction_is_unconditional ... ok
+test redact::redact_tests::bounded_redaction_is_the_exact_full_redaction_prefix ... ok
+test redact::redact_tests::known_and_high_entropy_tokens_are_redacted_deterministically ... ok
+test redact::redact_tests::sensitive_paths_cover_key_and_state_families ... ok
+test repo::repo_tests::dot_git_is_always_excluded_and_noncanonical_roots_are_rejected ... ok
+test repo::repo_tests::hidden_entries_consume_the_enumeration_cap ... ok
+test repo::repo_tests::hidden_policy_and_file_cap_are_deterministic ... ok
+test repo::repo_tests::ignore_controls_precede_caps_and_strip_utf8_bom ... ok
+test repo::repo_tests::repository_root_and_nested_ignore_rules_remain_workspace_confined ... ok
+test repo::repo_tests::repository_walk_reports_an_aggregate_ignore_control_byte_limit ... ok
+test repo::repo_tests::streamed_walk_preserves_empty_exact_cap_and_over_cap_results ... ok
+test repo::repo_tests::symlinked_git_metadata_ancestors_are_never_opened ... ok
+test repo::repo_tests::symlinked_gitignore_controls_are_never_followed ... ok
+test request_input::tests::declared_choice_default_names_an_existing_key ... ok
+test request_input::tests::declared_question_default_resolves_without_invention ... ok
+test request_input::tests::malformed_defaults_are_rejected_instead_of_guessed ... ok
+test filesystem::wildcard_match_tests::long_wildcard_search_keeps_correct_results ... ok
+test tasks::toolshape_tests::toolshape_task_buffer_hashes_original_bytes_after_retention_cap ... ok
+test workspace_receipt::workspace_receipt_tests::an_interleaved_known_filesystem_mutation_invalidates_a_live_process_comparison ... ok
+test workspace_receipt::workspace_receipt_tests::available_git_overlays_porcelain_on_the_bounded_anchored_walk ... ok
+test workspace_receipt::workspace_receipt_tests::entry_limit_prevents_git_from_being_invoked ... ok
+test workspace_receipt::workspace_receipt_tests::invalidated_complete_receipt_skips_the_after_walk_and_assumes_mutation ... ok
+test workspace_receipt::workspace_receipt_tests::linked_worktree_metadata_outside_the_workspace_uses_the_anchored_fallback ... ok
+test workspace_receipt::workspace_receipt_tests::non_repository_receipt_is_explicitly_unknown_without_enumeration ... ok
+test filesystem::w4a12_tests::cooperating_edits_serialize_across_verify_and_rename ... ok
+test workspace_receipt::workspace_receipt_tests::porcelain_parser_keeps_both_rename_paths_and_untracked_paths ... ok
+test workspace_receipt::workspace_receipt_tests::repository_fallback_does_not_follow_a_symlink_cycle ... ok
+test workspace_receipt::workspace_receipt_tests::unavailable_git_falls_back_without_failing_the_receipt ... ok
+test workspace_receipt::workspace_receipt_tests::unknown_before_receipt_skips_the_after_walk_and_assumes_mutation ... ok
+test process::supervisor_tests::exit_observer_failure_sweeps_the_owned_process_group ... ok
+test workspace_receipt::workspace_receipt_tests::observed_length_content_budget_is_explicitly_elided ... ok
+test tasks::supervisor_tests::exit_observer_failure_sweeps_the_background_process_group ... ok
+
+test result: ok. 84 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.74s
+
+     Running tests/background_tasks_tests.rs ($AGENTCLI_TARGET/debug/deps/background_tasks_tests-15adf8b6fe569304)
+
+running 8 tests
+test background_spawn_respects_ask_policy ... ok
+test background_process_reports_post_completion_workspace_mutation ... ok
+test background_output_is_bounded_with_honest_truncation ... ok
+test background_spawn_returns_immediately_and_survives_broker_close ... ok
+test task_names_default_from_the_command_and_validate ... ok
+test orphan_reap_honors_the_liveness_seam_and_kills_stale_groups ... ok
+test task_kill_ladder_kills_the_whole_process_group ... ok
+test natural_exit_leaves_lingering_group_members_alone ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s
+
+     Running tests/c1_filesystem_tools_tests.rs ($AGENTCLI_TARGET/debug/deps/c1_filesystem_tools_tests-ac87ce30730ea915)
+
+running 19 tests
+test edit_refuses_non_utf8_without_mutating_bytes ... ok
+test failed_terminal_append_never_advances_freshness ... ok
+test file_read_range_is_line_numbered_bounded_and_tracks_the_full_digest ... ok
+test existing_read_and_create_write_results_remain_byte_exact ... ok
+test child_edit_trips_parent_stale_without_sharing_session_state ... ok
+test edit_requires_exactly_one_anchor_or_nonempty_replace_all ... ok
+test multi_edit_rejects_atomically_when_a_later_anchor_is_bad ... ok
+test landed_write_with_ledger_failure_still_updates_freshness ... ok
+test path_copy_move_and_delete_are_workspace_scoped_mutations ... ok
+test path_copy_overwrite_is_staged_and_destination_guards_are_typed ... ok
+test recovery_rebuilds_both_fresh_and_stale_verdicts_from_outcomes ... ok
+test search_caps_preview_at_200_and_cas_preserves_every_match ... ok
+test search_preview_is_eight_kib_utf8_safe_with_full_cas_overflow ... ok
+test search_modes_case_and_glob_filters_are_effective ... ok
+test unread_existing_edit_and_write_are_typed_refusals ... ok
+test stale_mutation_is_typed_and_requires_a_reread ... ok
+test write_creates_all_missing_parent_directories ... ok
+test self_edit_and_write_chains_never_retrip_freshness ... ok
+test search_and_glob_are_root_confined_sorted_and_bounded ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/computer_tools_tests.rs ($AGENTCLI_TARGET/debug/deps/computer_tools_tests-d4c75e736620fd91)
+
+running 4 tests
+test action_parser_is_strict_and_wait_is_control_gated ... ok
+test computer_manifest_matches_additive_golden_and_parameter_schemas_are_live ... ok
+test ordinary_close_does_not_fabricate_computer_cancellation ... ok
+test screen_permissions_fail_closed_and_control_session_grant_implies_observe ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/effect_broker_tests.rs ($AGENTCLI_TARGET/debug/deps/effect_broker_tests-5f6866f8f71d6c12)
+
+running 19 tests
+test an_ordinary_close_still_reconciles_a_residual_dispatch_as_unknown ... ok
+test allow_once_resolution_grants_a_single_retry ... ok
+test always_allow_is_bound_to_class_and_exact_argument_digest ... ok
+test an_orderly_cancel_terminalizes_a_residual_dispatch_as_cancelled ... ok
+test authorization_rejects_any_substitute_for_the_journaled_intent ... ok
+test approve_for_session_menu_resolution_creates_a_class_rule ... ok
+test autonomous_ask_promotion_allows_residual_classes_but_never_explicit_deny ... ok
+test autonomous_fallback_honors_exact_one_shot_user_rejection ... ok
+test explicit_deny_is_higher_priority_than_session_grants ... ok
+test dispatched_effect_can_be_reconciled_as_unknown ... ok
+test dispatch_cannot_follow_a_blocked_authorization ... ok
+test out_of_range_permission_index_fails_closed_and_keeps_menu_answerable ... ok
+test frozen_clock_restarts_use_generation_stamped_effect_and_menu_ids ... ok
+test deny_is_journaled_and_blocks_filesystem_apply ... ok
+test failed_dispatched_append_blocks_filesystem_apply ... ok
+test reject_once_resolution_denies_a_single_retry ... ok
+test unknown_permission_key_fails_closed_and_keeps_menu_answerable ... ok
+test process_session_grant_is_exact_command_shape_and_never_class_wide ... ok
+test successful_dispatch_has_strict_four_phase_order ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/filesystem_tools_tests.rs ($AGENTCLI_TARGET/debug/deps/filesystem_tools_tests-9ec44be1f3bfe589)
+
+running 35 tests
+test ambiguous_preimage_returns_typed_conflict_without_writing ... ok
+test anchor_miss_reports_nearest_whitespace_candidate_without_applying_it ... ok
+test cancelled_terminal_caller_leaves_owned_append_for_close_to_drain ... ok
+test applied_write_is_ledgered_before_a_failed_outcome_append ... ok
+test caller_cancellation_cannot_sever_a_dispatched_terminal_append ... ok
+test cancelling_before_the_blocking_worker_starts_is_clean ... ok
+test cancelling_apply_cannot_leave_a_write_without_ledger_evidence ... ok
+test anchor_miss_diagnostics_are_bounded_and_preserve_read_redaction ... ok
+test cancelling_apply_during_ledger_failure_still_journals_failed_outcome ... ok
+test canonical_path_aliases_share_a_digest_but_distinct_files_do_not ... ok
+test component_swapped_to_outside_symlink_after_authorization_is_refused ... ok
+test directory_read_and_search_are_sorted_bounded_read_effects ... ok
+test file_read_limit_without_offset_starts_at_the_first_numbered_line ... ok
+test failed_terminal_append_is_keyed_and_never_appends_a_fallback ... ok
+test finalizer_and_unknown_race_forces_the_loser_before_the_winner_append ... ok
+test flat_aliases_preserve_unread_stale_anchor_and_workspace_refusals ... ok
+test flat_filesystem_aliases_reject_mixed_shapes_unknown_fields_and_invalid_types ... ok
+test close_waits_for_a_cancelled_callers_failing_finalizer ... ok
+test fs_write_creates_and_overwrites_with_ledgered_four_phase_effects ... ok
+test genuinely_unique_preimage_still_applies ... ok
+test ledger_append_failure_becomes_a_failed_effect_outcome ... ok
+test mixed_close_error_keeps_successful_reconciliations_visible ... ok
+test ledger_attributes_successful_writes_to_the_exact_turn ... ok
+test mutating_paths_reject_parent_and_absolute_workspace_escapes ... ok
+test mutating_paths_reject_leaf_and_parent_symlink_escapes ... ok
+test oversized_result_keeps_preview_and_freezes_full_payload_in_cas ... ok
+test preimage_mismatch_returns_typed_conflict_and_failed_outcome ... ok
+test toolshape_fixture_write_result_golden_is_additive_and_replays ... ok
+test flat_edit_and_write_round_trip_matches_transactional_tools_and_receipts ... ok
+test toolshape_search_and_glob_hash_original_spool_before_preview_reduction ... ok
+test toolshape_post_apply_failure_preserves_effects_and_original_failure_receipt ... ok
+test workspace_traversal_is_rejected_before_authorization_or_read ... ok
+test workspace_symlink_escape_is_rejected_before_authorization_or_read ... ok
+test toolshape_file_effects_match_receipts_and_ledger_in_effect_order ... ok
+test concurrent_patches_cannot_both_apply_the_same_stale_preimage ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/linux_computer_e2e.rs ($AGENTCLI_TARGET/debug/deps/linux_computer_e2e-2cfba083f70383fd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/linux_wayland_computer_e2e.rs ($AGENTCLI_TARGET/debug/deps/linux_wayland_computer_e2e-db820d4e6a541740)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/list_models_tests.rs ($AGENTCLI_TARGET/debug/deps/list_models_tests-b4f41eb8fd9f5f89)
+
+running 2 tests
+test list_models_manifest_is_an_effectless_cached_catalog_read ... ok
+test list_models_filter_is_trimmed_optional_and_bounded ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/message_subagent_tests.rs ($AGENTCLI_TARGET/debug/deps/message_subagent_tests-7ca82decfbefecfc)
+
+running 2 tests
+test message_manifest_is_awaited_effectless_and_advertises_ephemeral_handoff ... ok
+test message_arguments_are_opaque_trimmed_and_bounded ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/mobile_tools_tests.rs ($AGENTCLI_TARGET/debug/deps/mobile_tools_tests-3170cd5568038400)
+
+running 4 tests
+test mobile_manifest_and_parser_pin_all_dynamic_effects ... ok
+test ordinary_close_does_not_fabricate_mobile_cancellation ... ok
+test mobile_cancellation_ownership_and_unavailable_stub_are_typed ... ok
+test mobile_authorize_and_dispatch_keep_the_durable_boundary_separate ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/output_diet_tests.rs ($AGENTCLI_TARGET/debug/deps/output_diet_tests-d8f5120ca8891017)
+
+running 3 tests
+test output_type_adapters_keep_semantics_and_drop_deterministic_noise ... ok
+test head_tail_elision_is_deterministic_utf8_safe_and_tail_weighted ... ok
+test fixture_token_estimates_cover_listing_grep_cargo_and_three_kib_read ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/process_tools_tests.rs ($AGENTCLI_TARGET/debug/deps/process_tools_tests-29dd797b4120512d)
+
+running 29 tests
+test a_commit_that_leaves_git_status_clean_is_detected_by_content_receipt ... ok
+test cwd_identity_change_after_authorization_is_refused_before_spawn ... ok
+test dropping_process_execution_cancels_and_kills_the_child_group ... ok
+test cancellation_wins_over_output_sink_and_cas_failures ... ok
+
+running 1 test
+test env_view_redacts_secret_names_and_preserves_non_secret_values ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 28 filtered out; finished in 0.00s
+
+test env_view_redacts_secret_names_and_preserves_non_secret_values ... ok
+test git_index_visibility_flags_cannot_hide_real_source_mutations ... ok
+test cancellation_waits_for_grace_then_kills_the_group_and_is_not_a_failure ... ok
+test gitignored_only_change_is_deliberately_not_a_workspace_mutation ... ok
+test hard_output_cap_terminates_the_process_group_and_reports_the_ledgered_limit ... ok
+test late_cancellation_during_failed_cas_preserves_the_cas_failure ... ok
+test non_repository_source_mutation_is_conservatively_detected_without_a_walk ... ok
+test output_flood_spills_while_streaming_and_completes ... ok
+test entry_bound_is_reported_and_source_mutation_still_registers ... ok
+test prior_after_receipt_is_the_next_sequential_before_receipt ... ok
+test broker_teardown_sweeps_a_live_process_group ... ok
+test process_digest_is_exactly_command_canonical_cwd_and_sorted_env_allowlist ... ok
+
+running 1 test
+test process_exec_repository_without_a_git_binary_still_detects_source_mutation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 28 filtered out; finished in 0.00s
+
+test process_exec_repository_without_a_git_binary_still_detects_source_mutation ... ok
+test late_cancellation_during_cas_preserves_natural_completion_and_descendant ... ok
+test process_exec_streams_exact_bytes_freezes_overflow_and_journals_four_phases ... ok
+test same_inode_cwd_moved_outside_and_symlinked_back_is_refused_before_spawn ... ok
+test shell_builtins_do_not_spawn_and_escaped_commands_are_user_preauthorized ... ok
+test process_control_kill_is_brokered_and_cancels_the_original_as_an_outcome ... ok
+test overlapping_process_receipts_are_conservatively_unknown_for_both_commands ... ok
+test stdin_process_control_is_a_second_effect_bound_to_the_live_execution ... ok
+test toolshape_one_mib_stdout_hashes_original_before_model_truncation ... ok
+test workspace_mutation_fact_fires_only_when_process_changes_the_tree ... ok
+test process_exec_runs_and_returns_output_with_a_huge_workspace_file ... ok
+test wall_timeout_terminates_the_process_group_and_reports_the_ledgered_limit ... ok
+test shell_exit_leaves_background_members_of_its_process_group_alone ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.25s
+
+     Running tests/search_safety_tests.rs ($AGENTCLI_TARGET/debug/deps/search_safety_tests-df89267c14f6c24b)
+
+running 7 tests
+test regex_dfa_limit_is_wired_into_the_builder ... ok
+test overlong_lines_are_reported_instead_of_silently_omitted ... ok
+test repository_ignore_hidden_and_sensitive_glob_policies_are_stable ... ok
+test typed_reason_names_remain_wire_stable ... ok
+test search_and_read_redact_without_spilling_inline_results ... ok
+test regex_search_is_limited_structured_contextual_and_file_filtered ... ok
+test directory_read_collapses_extensions_and_reports_its_entry_cap ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/smoke_tests.rs ($AGENTCLI_TARGET/debug/deps/smoke_tests-b56ffe41490e9251)
+
+running 1 test
+test crate_name_is_stable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/spawn_subagent_tests.rs ($AGENTCLI_TARGET/debug/deps/spawn_subagent_tests-bcf24496b102b316)
+
+running 6 tests
+test m2e_legacy_spawn_arguments_remain_byte_for_byte_plain ... ok
+test agent_type_rides_the_spawn_args ... ok
+test spawn_arguments_are_trimmed_and_bounded ... ok
+test child_request_budget_is_validated_and_preserved_in_spawn_arguments ... ok
+test spawn_manifest_is_deferred_and_agent_spawn_effectful ... ok
+test spawn_effect_terminalizes_at_establishment_not_child_completion ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/todo_write_tests.rs ($AGENTCLI_TARGET/debug/deps/todo_write_tests-dd758833cb6c3f6a)
+
+running 8 tests
+test claude_code_vocabulary_is_accepted_and_normalized ... ok
+test duplicate_ids_are_rejected ... ok
+test cyclic_deps_are_rejected ... ok
+test canonical_keys_win_and_mixed_id_presence_is_rejected ... ok
+test empty_list_validates_and_text_and_dep_bounds_hold ... ok
+test result_echo_counts_states ... ok
+test todo_write_manifest_is_awaited_and_effect_free ... ok
+test fifty_one_items_are_rejected ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/web_fetch_tool_tests.rs ($AGENTCLI_TARGET/debug/deps/web_fetch_tool_tests-81e350e66e88071b)
+
+running 3 tests
+test web_fetch_manifest_declares_the_network_family_and_url_schema ... ok
+test web_fetch_journals_intent_and_outcome_with_the_url ... ok
+test web_fetch_asks_by_default_and_the_empty_host_rule_is_the_family_wildcard ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/windows_background_tasks_tests.rs ($AGENTCLI_TARGET/debug/deps/windows_background_tasks_tests-f8a98a824d498bc9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests haider_tools
+
+running 1 test
+test crates/haider-tools/src/shell.rs - shell::UserProcessExec (line 758) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+

@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized] target(s) in 0.67s
+     Running unittests src/lib.rs ($AGENTCLI_TARGET/debug/deps/haider_daemon-a026225e55aa3ca6)
+
+running 1 test
+test permissions_core_tests::instruct_pipe_shrinks_the_advertised_wire_pack ... instruct-pipe pin: registered=29, advertised=26, full_prefix_bytes=19736, instruct_pipe_bytes=13552, native_description_bytes=690
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1082 filtered out; finished in 0.08s
+

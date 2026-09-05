@@ -117,7 +117,9 @@ SURFACE_SIGNATURES = {
     "aura": ("native duplex", "hold to talk"),
     "history": ("↑↓ / digits choose", "⏎ load"),
     "sessions": ("session-", "turns"),
-    "monitors": ("monitors  ↑↓/jk select", "x stop", "p pause", "t trigger", "y copy id"),
+    # The native selector header and empty-state body are present at both
+    # widths; the trailing "y copy id" control is clipped on narrow cards.
+    "monitors": ("monitors  ↑↓/jk select", "x stop", "p pause", "t trigger", "no active monitors"),
     "update": ("checking for updates",),
 }
 

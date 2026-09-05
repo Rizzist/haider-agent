@@ -1,0 +1,82 @@
+[
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/agent_cli_tests-c5f670a3c4f1e196",
+    "bytes": 49615840
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/autospawn_tests-95a2c0dd23a5c5ca",
+    "bytes": 49895472
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/cli_tests-ac4f7e71df7126e8",
+    "bytes": 29832064
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/haider-00397f7d0e8a0253",
+    "bytes": 15935056
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/haider_daemon-a026225e55aa3ca6",
+    "bytes": 223937264
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/observe_cli_tests-0e75dd8ce61c2800",
+    "bytes": 16806128
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/oneshot_boot_tests-ae9ab5ff5448d69b",
+    "bytes": 50337984
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/projection_completeness_tests-1b44c302bcf6cffe",
+    "bytes": 1043808
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/release_workflow_tests-a6d74a9cfd137766",
+    "bytes": 996160
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/session_config_cli_tests-b6cc7895a4c7c146",
+    "bytes": 16134224
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/session_hub_tests-cb7cab95cc4fb2bf",
+    "bytes": 107552592
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/smoke_tests-b4f946c0194da835",
+    "bytes": 926912
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/state_machine_tests-c9eeb5ee6bf01b09",
+    "bytes": 1694032
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/status_discovery_smoke_tests-2312af0c172b729b",
+    "bytes": 2098128
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/turnhygiene_pin_tests-da1c494e2686883d",
+    "bytes": 2155856
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/update_cli_tests-407e5a167cc95500",
+    "bytes": 16063616
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/update_restart_tests-fc108d3385d07180",
+    "bytes": 59491440
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/update_tests-8b0473cb886069ce",
+    "bytes": 16686592
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/wc_export_tests-27a34a58daee84e7",
+    "bytes": 13478288
+  },
+  {
+    "path": "$AGENTCLI_TARGET/debug/deps/xtask-402ade8409095217",
+    "bytes": 998304
+  }
+]

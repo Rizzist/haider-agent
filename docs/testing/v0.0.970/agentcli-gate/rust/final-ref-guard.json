@@ -1,0 +1,34 @@
+[
+  {
+    "command": [
+      "git",
+      "-C",
+      "/private/tmp/haider-agentcli-merge",
+      "fetch",
+      "origin",
+      "wave-970"
+    ],
+    "exit": 0,
+    "output": "From https://github.com/Rizzist/haider-agent\n * branch              wave-970   -> FETCH_HEAD\n"
+  },
+  {
+    "command": [
+      "git",
+      "-C",
+      "/private/tmp/haider-agentcli-merge",
+      "rev-parse",
+      "origin/wave-970"
+    ],
+    "exit": 0,
+    "output": "9270f40286d3181fd22c20600b4ae4f9586b8c1d\n"
+  },
+  {
+    "command": [
+      "git",
+      "rev-parse",
+      "HEAD"
+    ],
+    "exit": 0,
+    "output": "9270f40286d3181fd22c20600b4ae4f9586b8c1d\n"
+  }
+]
