@@ -4398,6 +4398,17 @@ fn render_journal_with_facts(
                         | haider_protocol::item::ToolStatus::Failed
                         | haider_protocol::item::ToolStatus::Unknown,
                 } => {
+                    // A malformed call retains its raw bytes in the journal,
+                    // but providers require tool-call arguments to be objects.
+                    // Match the live repair continuation's empty placeholder.
+                    let args = if pending_tool_results
+                        .get(&call_id)
+                        .is_some_and(crate::actor::invalid_tool_call_result)
+                    {
+                        serde_json::json!({})
+                    } else {
+                        args
+                    };
                     let model_result = pending_tool_results.remove(&call_id).map(|result| {
                         let (preview, truncated) = model_tool_result_preview(&name, &result);
                         (result, preview, truncated)

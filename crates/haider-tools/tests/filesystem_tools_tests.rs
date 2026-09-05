@@ -537,6 +537,297 @@ fn restore_file_freshness(broker: &mut EffectBroker, workspace_root: &Path, path
         .expect("restore test freshness");
 }
 
+#[test]
+fn flat_filesystem_aliases_reject_mixed_shapes_unknown_fields_and_invalid_types() {
+    for args in [
+        serde_json::json!({"file_path":"a", "old_string":"x", "new_string":"y", "edits":[]}),
+        serde_json::json!({"file_path":"a", "old_string":"x", "new_string":"y", "path":"b"}),
+        serde_json::json!({"file_path":"a", "old_string":"", "new_string":"y"}),
+        serde_json::json!({"file_path":"", "old_string":"x", "new_string":"y"}),
+        serde_json::json!({"file_path":"a", "old_string":"x", "new_string":"y", "replace_all":null}),
+        serde_json::json!({"file_path":"a", "old_string":"x", "new_string":"y", "replace_all":"true"}),
+    ] {
+        assert!(
+            matches!(
+                FsEdit::from_edit_args(&args),
+                Err(ToolError::InvalidArgument { .. })
+            ),
+            "{args}"
+        );
+    }
+    for args in [
+        serde_json::json!({"file_path":"a", "content":"x", "path":"b"}),
+        serde_json::json!({"file_path":"a", "content":null}),
+        serde_json::json!({"file_path":"", "content":"x"}),
+    ] {
+        assert!(
+            matches!(
+                FsWrite::from_write_args(&args),
+                Err(ToolError::InvalidArgument { .. })
+            ),
+            "{args}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn flat_edit_and_write_round_trip_matches_transactional_tools_and_receipts() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let policy = allow(EffectClass::FsWrite);
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("alias-turn"));
+    let mut previous = None;
+    for aliases in [false, true] {
+        let mut broker = broker_at(RecordingJournal::default(), directory.path());
+        let ledger = ChangeLedger::new();
+        let write = if aliases {
+            FsWrite::from_write_args(
+                &serde_json::json!({"file_path":"nested/test.txt", "content":"old old\n"}),
+            )
+            .expect("flat write")
+        } else {
+            FsWrite::new("nested/test.txt", "old old\n")
+        };
+        let created = broker
+            .fs_write(&write, &policy, &attribution, &ledger)
+            .await
+            .expect("create");
+        let edit = if aliases {
+            FsEdit::from_edit_args(&serde_json::json!({"file_path":"nested/test.txt", "old_string":"old", "new_string":"new", "replace_all":true})).expect("flat edit")
+        } else {
+            FsEdit::new("nested/test.txt", "old", "new").replace_all(true)
+        };
+        let edited = broker
+            .fs_edit(&edit, &policy, &attribution, &ledger)
+            .await
+            .expect("replace all");
+        let delete = FsEdit::from_edit_args(&serde_json::json!({"file_path":"nested/test.txt", "old_string":"new new", "new_string":""})).expect("empty replacement");
+        broker
+            .fs_edit(&delete, &policy, &attribution, &ledger)
+            .await
+            .expect("delete text");
+        let empty = FsWrite::from_write_args(
+            &serde_json::json!({"file_path":"nested/test.txt", "content":""}),
+        )
+        .expect("empty content");
+        broker
+            .fs_write(&empty, &policy, &attribution, &ledger)
+            .await
+            .expect("overwrite fresh file");
+        let bytes = fs::read(directory.path().join("nested/test.txt")).expect("final bytes");
+        assert!(bytes.is_empty());
+        let phases = broker.journal_snapshot();
+        assert_eq!(phases.len(), 16);
+        assert_eq!(terminal_phases(&phases).len(), 4);
+        let changes = ledger
+            .changes_for(&attribution.session, &attribution.turn)
+            .expect("ledger");
+        assert_eq!(changes.writes.len(), 4);
+        let result = (created, edited, changes);
+        if let Some(previous) = previous {
+            assert_eq!(
+                result, previous,
+                "aliases must preserve result and ledger evidence"
+            );
+        }
+        previous = Some(result);
+        broker.close().await.expect("drain finalizers");
+        fs::remove_file(directory.path().join("nested/test.txt")).expect("reset fixture");
+    }
+}
+
+#[tokio::test]
+async fn flat_aliases_preserve_unread_stale_anchor_and_workspace_refusals() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let workspace = directory.path().join("workspace");
+    fs::create_dir(&workspace).expect("isolated workspace");
+    let outside = directory.path().join("escaped.txt");
+    // Editing requires an existing target before the canonical boundary check.
+    // A missing sibling instead exercises the unchanged NotFound refusal.
+    fs::write(&outside, "outside sentinel").expect("outside fixture");
+    let path = workspace.join("guarded.txt");
+    fs::write(&path, "same same\n").expect("seed");
+    let mut broker = broker_at(RecordingJournal::default(), &workspace);
+    let policy = allow(EffectClass::FsWrite);
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("alias-safety"));
+    let ledger = ChangeLedger::new();
+    let edit = FsEdit::from_edit_args(
+        &serde_json::json!({"file_path":"guarded.txt", "old_string":"same", "new_string":"x"}),
+    )
+    .expect("flat edit");
+    let write =
+        FsWrite::from_write_args(&serde_json::json!({"file_path":"guarded.txt", "content":"new"}))
+            .expect("flat write");
+    assert!(matches!(
+        broker.fs_edit(&edit, &policy, &attribution, &ledger).await,
+        Err(ToolError::UnreadFile { .. })
+    ));
+    assert!(matches!(
+        broker
+            .fs_write(&write, &policy, &attribution, &ledger)
+            .await,
+        Err(ToolError::UnreadFile { .. })
+    ));
+    broker
+        .fs_read(
+            &FsRead::new("guarded.txt"),
+            &allow(EffectClass::FsRead),
+            &mut RecordingCas::default(),
+            ResultBounds::default(),
+        )
+        .await
+        .expect("fresh read");
+    assert!(
+        matches!(broker.fs_edit(&edit, &policy, &attribution, &ledger).await, Err(ToolError::EditAnchor(mismatch)) if mismatch.matches == 2)
+    );
+    let missing = FsEdit::from_edit_args(&serde_json::json!({"file_path":"guarded.txt", "old_string":"absent", "new_string":"x", "replace_all":true})).expect("missing replace all");
+    assert!(
+        matches!(broker.fs_edit(&missing, &policy, &attribution, &ledger).await, Err(ToolError::EditAnchor(mismatch)) if mismatch.matches == 0)
+    );
+    fs::write(&path, "external\n").expect("external writer");
+    assert!(matches!(
+        broker.fs_edit(&edit, &policy, &attribution, &ledger).await,
+        Err(ToolError::StaleRead { .. })
+    ));
+    assert!(matches!(
+        broker
+            .fs_write(&write, &policy, &attribution, &ledger)
+            .await,
+        Err(ToolError::StaleRead { .. })
+    ));
+    let escaped_write =
+        FsWrite::from_write_args(&serde_json::json!({"file_path":"../escaped.txt", "content":"x"}))
+            .expect("decode path");
+    let escaped_edit = FsEdit::from_edit_args(
+        &serde_json::json!({"file_path":"../escaped.txt", "old_string":"x", "new_string":"y"}),
+    )
+    .expect("decode path");
+    assert!(matches!(
+        broker
+            .fs_write(&escaped_write, &policy, &attribution, &ledger)
+            .await,
+        Err(ToolError::WorkspaceBoundary { .. })
+    ));
+    assert!(matches!(
+        broker
+            .fs_edit(&escaped_edit, &policy, &attribution, &ledger)
+            .await,
+        Err(ToolError::WorkspaceBoundary { .. })
+    ));
+    assert_eq!(fs::read_to_string(&path).expect("unchanged"), "external\n");
+    assert_eq!(
+        fs::read_to_string(&outside).expect("outside unchanged"),
+        "outside sentinel"
+    );
+    assert!(
+        ledger
+            .changes_for(&attribution.session, &attribution.turn)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn anchor_miss_reports_nearest_whitespace_candidate_without_applying_it() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("candidate.rs");
+    let contents = "// unrelated\nlet answer =  42;\n// tail\n";
+    fs::write(&path, contents).expect("seed");
+    let mut broker = broker_at(RecordingJournal::default(), directory.path());
+    restore_file_freshness(&mut broker, directory.path(), &path);
+    let ledger = ChangeLedger::new();
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("near-match"));
+    let error = broker
+        .fs_edit(
+            &FsEdit::new("candidate.rs", "let answer = 42;", "changed"),
+            &allow(EffectClass::FsWrite),
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect_err("exact anchor missing");
+    let message = error.to_string();
+    assert!(
+        message.contains("no exact byte-for-byte match"),
+        "{message}"
+    );
+    assert!(message.contains("nearest candidate at line 2"), "{message}");
+    assert!(message.contains("whitespace differs"), "{message}");
+    assert!(message.contains("let answer =  42;"), "{message}");
+    assert_eq!(fs::read_to_string(path).expect("unchanged"), contents);
+    assert!(
+        ledger
+            .changes_for(&attribution.session, &attribution.turn)
+            .is_none()
+    );
+    assert!(matches!(
+        broker.journal_snapshot().last(),
+        Some(EffectPhase::Outcome {
+            outcome: EffectOutcome::Failed { .. },
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn anchor_miss_diagnostics_are_bounded_and_preserve_read_redaction() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let policy = allow(EffectClass::FsWrite);
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("safe-candidate"));
+    for (name, contents, expected, hidden) in [
+        ("long.txt", "é".repeat(2_000), "preview truncated", None),
+        (
+            "config.txt",
+            "token = sk-abcdefghijklmnopqrstuv\n".into(),
+            "REDACTED",
+            Some("sk-abcdefghijklmnopqrstuv"),
+        ),
+        (
+            ".env",
+            "CUSTOM_SECRET=private-value\n".into(),
+            "sensitive path",
+            Some("private-value"),
+        ),
+        (
+            "empty.txt",
+            String::new(),
+            "no nearest candidate exists",
+            None,
+        ),
+        (
+            "key.txt",
+            "-----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----\n".into(),
+            "REDACTED:private_key",
+            Some("private-material"),
+        ),
+    ] {
+        let path = directory.path().join(name);
+        fs::write(&path, &contents).expect("seed candidate");
+        let mut broker = broker_at(RecordingJournal::default(), directory.path());
+        restore_file_freshness(&mut broker, directory.path(), &path);
+        let error = broker
+            .fs_edit(
+                &FsEdit::new(name, "missing anchor", "changed"),
+                &policy,
+                &attribution,
+                &ChangeLedger::new(),
+            )
+            .await
+            .expect_err("missing anchor");
+        let message = error.to_string();
+        assert!(message.contains(expected), "{message}");
+        assert!(
+            message.len() < 3_000,
+            "diagnostic preview must stay bounded"
+        );
+        if let Some(hidden) = hidden {
+            assert!(
+                !message.contains(hidden),
+                "diagnostic must preserve read redaction"
+            );
+        }
+        assert_eq!(fs::read_to_string(path).expect("unchanged"), contents);
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn fs_write_creates_and_overwrites_with_ledgered_four_phase_effects() {

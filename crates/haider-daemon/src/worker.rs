@@ -13131,6 +13131,16 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
             RegisteredToolRoute::FsEdit,
         ),
         registered_manifest(
+            haider_tools::write_manifest(),
+            ToolPermissionDefault::Ask,
+            RegisteredToolRoute::FsWrite,
+        ),
+        registered_manifest(
+            haider_tools::edit_manifest(),
+            ToolPermissionDefault::Ask,
+            RegisteredToolRoute::FsEdit,
+        ),
+        registered_manifest(
             haider_tools::fs_path_manifest(),
             ToolPermissionDefault::Ask,
             RegisteredToolRoute::FsPath,
@@ -13397,6 +13407,8 @@ pub(crate) fn typed_child_grant(record: &haider_protocol::loom::LoomAgentType) -
         "fs_search",
         "fs_write",
         "fs_edit",
+        "write",
+        "edit",
         "fs_path",
     ]
     .into_iter()
@@ -13785,6 +13797,8 @@ fn loom_provider_grant(inherited_grant: Option<&Grant>) -> Grant {
             "fs_search",
             "fs_write",
             "fs_edit",
+            "write",
+            "edit",
             "fs_path",
             "process_exec",
             "task_output",
@@ -14093,6 +14107,12 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
         "fs_edit" => {
             "fs_edit(path, edits:[{old, new, replace_all?}]) — atomic anchored replacements on a fresh file; each `old` must be unique unless replace_all"
         }
+        "write" => {
+            "write(file_path, content) — create or replace one UTF-8 file; an existing file requires a fresh read"
+        }
+        "edit" => {
+            "edit(file_path, old_string, new_string, replace_all?) — atomic exact replacement after a fresh read; old_string must be unique unless replace_all"
+        }
         "fs_path" => {
             "fs_path(operation, source, destination?, overwrite?) — move/delete/copy; destination is required for move and copy"
         }
@@ -14219,7 +14239,7 @@ fn provider_definition(manifest: &ToolManifest) -> ToolDefinition {
         // Act-bias: keep the model-native discovery and mutation affordances
         // self-explanatory. The manual remains the authority for signatures,
         // bounds, and less common semantics.
-        "fs_glob" | "fs_search" | "fs_write" | "fs_edit" | "fs_path" => {
+        "fs_glob" | "fs_search" | "fs_write" | "fs_edit" | "write" | "edit" | "fs_path" => {
             manifest.description.clone()
         }
         _ => String::new(),
@@ -16381,6 +16401,7 @@ impl BrokerToolDispatcher {
     }
 
     fn parse_tool_operation(
+        name: &str,
         route: RegisteredToolRoute,
         call_id: &str,
         args: &serde_json::Value,
@@ -16576,6 +16597,12 @@ impl BrokerToolDispatcher {
                     timeout_s,
                 }))
             }
+            RegisteredToolRoute::FsWrite if name == "write" => {
+                FsWrite::from_write_args(args).map(ParsedToolOperation::FsWrite)
+            }
+            RegisteredToolRoute::FsEdit if name == "edit" => {
+                FsEdit::from_edit_args(args).map(ParsedToolOperation::FsEdit)
+            }
             RegisteredToolRoute::FsWrite => {
                 let path = required_string(args, "path")?;
                 let content = required_string_allow_empty(args, "content")?;
@@ -16629,6 +16656,7 @@ impl BrokerToolDispatcher {
 
     fn cached_tool_operation(
         &self,
+        name: &str,
         key: &ParsedToolOperationKey,
         args: &serde_json::Value,
     ) -> ToolResult<Arc<ParsedToolOperation>> {
@@ -16637,7 +16665,7 @@ impl BrokerToolDispatcher {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache_parsed_operation(&mut operations, key.clone(), || {
-            Self::parse_tool_operation(key.route, &key.call_id, args)
+            Self::parse_tool_operation(name, key.route, &key.call_id, args)
         })
     }
 
@@ -17172,7 +17200,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
         let mut operation_lease =
             ParsedToolOperationLease::new(&self.parsed_tool_operations, operation_key.clone());
         let parsed_operation = if route_uses_cached_tool_operation(route) {
-            match self.cached_tool_operation(&operation_key, args.as_ref()) {
+            match self.cached_tool_operation(name, &operation_key, args.as_ref()) {
                 Ok(operation) => Some(operation),
                 Err(error) => return model_tool_argument_failure(error),
             }

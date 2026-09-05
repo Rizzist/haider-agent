@@ -85,6 +85,90 @@ fn request_input_provider_schema_matches_pinned_wire_bytes() {
 }
 
 #[test]
+fn flat_filesystem_aliases_are_advertised_with_identical_routes_and_permission_defaults() {
+    for (alias, canonical, route, required) in [
+        (
+            "write",
+            "fs_write",
+            RegisteredToolRoute::FsWrite,
+            vec!["file_path", "content"],
+        ),
+        (
+            "edit",
+            "fs_edit",
+            RegisteredToolRoute::FsEdit,
+            vec!["file_path", "old_string", "new_string"],
+        ),
+    ] {
+        let alias_entry = registered_tool_by_name(alias).expect("registered alias");
+        let canonical_entry =
+            registered_tool_by_name(canonical).expect("registered canonical tool");
+        assert_eq!(alias_entry.route, route);
+        assert_eq!(alias_entry.route, canonical_entry.route);
+        assert_eq!(alias_entry.default, canonical_entry.default);
+        assert_eq!(alias_entry.default, ToolPermissionDefault::Ask);
+        assert_eq!(
+            alias_entry.manifest.effects,
+            canonical_entry.manifest.effects
+        );
+        assert_eq!(
+            alias_entry.manifest.dispatch,
+            canonical_entry.manifest.dispatch
+        );
+        assert_eq!(
+            alias_entry.manifest.input_schema["required"],
+            serde_json::json!(required)
+        );
+        assert_eq!(
+            alias_entry.manifest.input_schema["additionalProperties"],
+            false
+        );
+        let provider = registered_provider_definitions()
+            .iter()
+            .find(|tool| tool.name == alias)
+            .cloned()
+            .expect("advertised alias");
+        assert_eq!(
+            provider.input_schema["required"],
+            serde_json::json!(required)
+        );
+        assert!(provider.input_schema["properties"].get("path").is_none());
+        assert!(provider.input_schema["properties"].get("edits").is_none());
+        assert!(!provider.description.is_empty());
+        assert!(tool_manual_line(alias).is_some());
+    }
+}
+
+#[test]
+fn flat_alias_dispatch_decodes_to_the_exact_existing_cached_operations() {
+    let write = BrokerToolDispatcher::parse_tool_operation(
+        "write",
+        RegisteredToolRoute::FsWrite,
+        "write-alias",
+        &serde_json::json!({"file_path":"file.txt", "content":"hello"}),
+    )
+    .expect("write alias route");
+    let ParsedToolOperation::FsWrite(write) = write else {
+        panic!("write route")
+    };
+    assert_eq!(write, FsWrite::new("file.txt", "hello"));
+    let edit = BrokerToolDispatcher::parse_tool_operation("edit", RegisteredToolRoute::FsEdit, "edit-alias", &serde_json::json!({"file_path":"file.txt", "old_string":"hello", "new_string":"", "replace_all":true})).expect("edit alias route");
+    let ParsedToolOperation::FsEdit(edit) = edit else {
+        panic!("edit route")
+    };
+    assert_eq!(edit, FsEdit::new("file.txt", "hello", "").replace_all(true));
+    assert!(
+        BrokerToolDispatcher::parse_tool_operation(
+            "write",
+            RegisteredToolRoute::FsWrite,
+            "mixed-shape",
+            &serde_json::json!({"file_path":"file.txt", "path":"other.txt", "content":"hello"})
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn shared_filtered_tool_view_preserves_legacy_wire_bytes() {
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let grant = default_child_grant();
@@ -413,6 +497,7 @@ fn spawn_model_refusal_preview_schema_includes_bounded_suggestions() {
 #[test]
 fn parser_missing_required_path_becomes_typed_rejected_tool_result() {
     let error = match BrokerToolDispatcher::parse_tool_operation(
+        "fs_read",
         RegisteredToolRoute::FsRead,
         "missing-path",
         &serde_json::json!({"message": "..."}),
@@ -456,6 +541,7 @@ fn approval_retry_cache_reuses_typed_operation_and_fences_full_call_identity() {
     let first = cache_parsed_operation(&mut operations, key.clone(), || {
         parses.set(parses.get() + 1);
         BrokerToolDispatcher::parse_tool_operation(
+            "fs_write",
             key.route,
             &key.call_id,
             &serde_json::json!({"path": "one.txt", "content": "first"}),
@@ -465,6 +551,7 @@ fn approval_retry_cache_reuses_typed_operation_and_fences_full_call_identity() {
     let second = cache_parsed_operation(&mut operations, key.clone(), || {
         parses.set(parses.get() + 1);
         BrokerToolDispatcher::parse_tool_operation(
+            "fs_write",
             key.route,
             &key.call_id,
             &serde_json::json!({"path": "two.txt", "content": "must-not-reparse"}),
@@ -486,6 +573,7 @@ fn approval_retry_cache_reuses_typed_operation_and_fences_full_call_identity() {
     let third = cache_parsed_operation(&mut operations, distinct, || {
         parses.set(parses.get() + 1);
         BrokerToolDispatcher::parse_tool_operation(
+            "fs_write",
             key.route,
             &key.call_id,
             &serde_json::json!({"path": "three.txt", "content": "new-call-identity"}),

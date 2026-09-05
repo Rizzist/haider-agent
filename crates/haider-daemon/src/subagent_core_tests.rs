@@ -173,6 +173,7 @@ fn e1a_worker_maps_denial_anchor_miss_and_nonzero_process_to_failure_status() {
             path: "missing.txt".into(),
             matches: 0,
             replace_all: false,
+            nearest_candidate: None,
         },
     ))
     .expect("typed anchor conflict");
