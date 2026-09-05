@@ -525,6 +525,26 @@ fn enterprise_login_target(
     Some((origin, profile.default_model))
 }
 
+fn accept_configured_custom_key(
+    provider: &str,
+    secret: &[u8],
+) -> Result<ValidatedIdentity, ValidationError> {
+    let key = std::str::from_utf8(secret).map_err(|_| ValidationError {
+        kind: ValidationFailureKind::Unauthorized,
+        message: "custom provider API key is not valid UTF-8".to_owned(),
+    })?;
+    if key.trim().is_empty() || key.chars().any(char::is_control) {
+        return Err(ValidationError {
+            kind: ValidationFailureKind::Unauthorized,
+            message: "custom provider API key must be non-empty and contain no control characters"
+                .to_owned(),
+        });
+    }
+    Ok(ValidatedIdentity {
+        identity: format!("{provider} api key"),
+    })
+}
+
 /// Authenticates a custom provider through its guarded model catalog. Login
 /// must not require an inference side effect: a valid compatible server may
 /// intentionally expose only discovery until an actual user turn arrives.
@@ -1278,6 +1298,15 @@ pub(crate) struct SetDefaultModelJob {
     pub route: LoginRoute,
 }
 
+pub(crate) struct ProviderModelsProbeJob {
+    pub provider: String,
+    pub origin: String,
+    pub api_family: ProviderApiFamilyWire,
+    pub keyless: bool,
+    pub probe_secret: Option<Zeroizing<Vec<u8>>>,
+    pub route: LoginRoute,
+}
+
 pub(crate) struct ProviderConfigureJob {
     pub command_id: String,
     pub input: ProviderConfigureInput,
@@ -1363,6 +1392,7 @@ pub(crate) enum AccountCommand {
     Remove(Box<RemoveAccountJob>),
     SetDefaultModel(Box<SetDefaultModelJob>),
     ConfigureProvider(Box<ProviderConfigureJob>),
+    ProbeProviderModels(Box<ProviderModelsProbeJob>),
     RemoveProvider(Box<ProviderRemoveJob>),
     SetProviderTrust(Box<ProviderSetTrustJob>),
     RefreshProviderModels {
@@ -1674,10 +1704,12 @@ async fn run_account_actor(
                         Err(error) => {
                             let task_id = error.id();
                             tracing::warn!(%task_id, "provider model refresh worker was lost");
-                            if let Some((provider, route)) =
+                            if let Some((provider, route, refresh)) =
                                 model_refresh_routes.remove(&task_id)
                             {
-                                refreshing_providers.remove(&provider);
+                                if refresh {
+                                    refreshing_providers.remove(&provider);
+                                }
                                 respond_model_refresh_error(
                                     &route,
                                     ERROR_CODE_PROVIDER_ERROR,
@@ -2160,6 +2192,26 @@ async fn run_account_actor(
                 )
                 .await;
             }
+            AccountCommand::ProbeProviderModels(job) => {
+                if draining {
+                    respond_error(
+                        &job.route,
+                        ERROR_CODE_BUSY,
+                        "account actor is shutting down",
+                        true,
+                    );
+                    continue;
+                }
+                begin_provider_models_probe(
+                    &accounts,
+                    vault.as_ref(),
+                    &providers,
+                    &model_discoverer,
+                    &mut model_refreshes,
+                    &mut model_refresh_routes,
+                    *job,
+                );
+            }
             AccountCommand::RefreshProviderModels {
                 provider,
                 completed,
@@ -2483,6 +2535,175 @@ fn account_identities_match(candidate: &AccountIdentity, existing: &AccountIdent
         && candidate.issuer == existing.issuer
 }
 
+/// A probe lives in the same bounded catalog transport as a refresh, but
+/// publishes only its reply. The actor and connection keepalive keep running
+/// while the network worker waits; cancellation drops its zeroizing key copy.
+fn begin_provider_models_probe(
+    accounts: &AccountStore<Box<dyn StoreLike>>,
+    vault: &dyn Vault,
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    discoverer: &Arc<dyn ProviderModelDiscoverer>,
+    tasks: &mut JoinSet<()>,
+    routes: &mut HashMap<tokio::task::Id, (String, ProviderModelsRefreshCompletion, bool)>,
+    mut job: ProviderModelsProbeJob,
+) {
+    job.origin = job.origin.trim().trim_end_matches('/').to_owned();
+    if let Some(profile) = providers.get(&job.provider)
+        && matches!(profile.provenance, ProviderProvenance::Custom)
+        && profile.base_url.as_deref() != Some(job.origin.as_str())
+        && let Err(error) = providers.validate_repoint_origin_claim(&job.provider, &job.origin)
+    {
+        respond_management_error(&job.route, &error);
+        return;
+    }
+    let source = match job.api_family {
+        ProviderApiFamilyWire::OpenAiChatCompletions => CatalogSource::OpenAiCompatible {
+            origin: job.origin.clone(),
+        },
+        ProviderApiFamilyWire::AnthropicMessages => CatalogSource::AnthropicCompatible {
+            origin: job.origin.clone(),
+        },
+        _ => {
+            respond_error(
+                &job.route,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "custom provider model discovery requires the openai or anthropic API family",
+                false,
+            );
+            return;
+        }
+    };
+    if let Some(profile) = providers.get(&job.provider)
+        && !matches!(profile.provenance, ProviderProvenance::Custom)
+    {
+        respond_error(
+            &job.route,
+            ERROR_CODE_INVALID_ARGUMENT,
+            "model probes cannot override release-owned provider origins",
+            false,
+        );
+        return;
+    }
+    if job.keyless && job.probe_secret.is_some() {
+        respond_error(
+            &job.route,
+            ERROR_CODE_INVALID_ARGUMENT,
+            "a no-auth provider must not carry a probe credential",
+            false,
+        );
+        return;
+    }
+    if !job.keyless && job.probe_secret.is_none() {
+        let Some(descriptor) = accounts.active_for_provider(&job.provider) else {
+            respond_provider_probe_error(&job.route, &job.provider, CatalogError::Unauthorized);
+            return;
+        };
+        if descriptor.auth_method != AuthMethod::ApiKey {
+            respond_provider_probe_error(&job.route, &job.provider, CatalogError::Unauthorized);
+            return;
+        }
+        match vault.resolve(&descriptor.alias) {
+            Ok(credential) => {
+                job.probe_secret = Some(Zeroizing::new(credential.expose_secret().to_vec()));
+            }
+            Err(_) => {
+                respond_provider_probe_error(&job.route, &job.provider, CatalogError::Unauthorized);
+                return;
+            }
+        }
+    }
+    let route = ProviderModelsRefreshCompletion::Wire(job.route.clone());
+    let provider = job.provider.clone();
+    let discoverer = Arc::clone(discoverer);
+    let task = tasks.spawn(async move {
+        let secret = match job
+            .probe_secret
+            .as_deref()
+            .map(|secret| std::str::from_utf8(secret))
+            .transpose()
+        {
+            Ok(secret) => secret,
+            Err(_) => {
+                respond_provider_probe_error(&job.route, &job.provider, CatalogError::Unauthorized);
+                return;
+            }
+        };
+        match discoverer.discover(source, secret, None).await {
+            Ok(catalog) => {
+                let models = catalog
+                    .models
+                    .into_iter()
+                    .map(|model| model.slug)
+                    .collect::<Vec<_>>();
+                if models
+                    .iter()
+                    .any(|model| !haider_provider::compatible_model_id_is_display_safe(model))
+                {
+                    respond_provider_probe_error(
+                        &job.route,
+                        &job.provider,
+                        CatalogError::InvalidBody {
+                            reason: "model catalog id contains characters that cannot be displayed safely".to_owned(),
+                        },
+                    );
+                    return;
+                }
+                if secret
+                    .filter(|key| !key.is_empty())
+                    .is_some_and(|key| models.iter().any(|model| model.contains(key)))
+                {
+                    respond_provider_probe_error(
+                        &job.route,
+                        &job.provider,
+                        CatalogError::InvalidBody {
+                            reason: "model catalog response contains credential material"
+                                .to_owned(),
+                        },
+                    );
+                    return;
+                }
+                if models.is_empty() {
+                    respond_provider_probe_error(&job.route, &job.provider, CatalogError::Empty);
+                    return;
+                }
+                let default_model = models.first().cloned();
+                respond(
+                    &job.route,
+                    ResponseBody::ProviderModelsProbe {
+                        provider: job.provider,
+                        models,
+                        default_model,
+                    },
+                );
+            }
+            Err(error) => respond_provider_probe_error(
+                &job.route,
+                &job.provider,
+                redact_probe_error(error, secret),
+            ),
+        }
+    });
+    routes.insert(task.id(), (provider, route, false));
+}
+
+fn redact_probe_error(error: CatalogError, secret: Option<&str>) -> CatalogError {
+    let Some(secret) = secret.filter(|secret| !secret.is_empty()) else {
+        return error;
+    };
+    match error {
+        CatalogError::Transport { reason } => CatalogError::Transport {
+            reason: reason.replace(secret, "<redacted>"),
+        },
+        CatalogError::Unavailable { reason } => CatalogError::Unavailable {
+            reason: reason.replace(secret, "<redacted>"),
+        },
+        CatalogError::InvalidBody { reason } => CatalogError::InvalidBody {
+            reason: reason.replace(secret, "<redacted>"),
+        },
+        other => other,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn begin_provider_models_refresh(
     store: &SqliteStoreHandle,
@@ -2492,7 +2713,7 @@ async fn begin_provider_models_refresh(
     model_discoverer: &Arc<dyn ProviderModelDiscoverer>,
     commands: &mpsc::Sender<AccountCommand>,
     refresh_tasks: &mut JoinSet<()>,
-    refresh_routes: &mut HashMap<tokio::task::Id, (String, ProviderModelsRefreshCompletion)>,
+    refresh_routes: &mut HashMap<tokio::task::Id, (String, ProviderModelsRefreshCompletion, bool)>,
     refreshing_providers: &mut HashSet<String>,
     provider: String,
     completed: ProviderModelsRefreshCompletion,
@@ -2643,7 +2864,7 @@ async fn begin_provider_models_refresh(
             })
             .await;
     });
-    refresh_routes.insert(refresh_task.id(), (provider, completed));
+    refresh_routes.insert(refresh_task.id(), (provider, completed, true));
 }
 
 struct ProviderModelsRefreshContext<'a> {
@@ -4648,8 +4869,15 @@ async fn handle_provider_configure(
             return;
         }
         let origin = origin.to_owned();
-        let validation =
-            tokio::spawn(async move { endpoint_validator.validate(&origin).await }).await;
+        let configured_inventory = !job.input.models.is_empty() && job.probe_secret.is_none();
+        let validation = tokio::spawn(async move {
+            if configured_inventory {
+                endpoint_validator.validate_configured_origin(&origin).await
+            } else {
+                endpoint_validator.validate(&origin).await
+            }
+        })
+        .await;
         match validation {
             Ok(Ok(canonical_origin)) => job.input.origin = Some(canonical_origin),
             Ok(Err(error)) if error.code == ErrorCode::ProviderError => {
@@ -4695,6 +4923,34 @@ async fn handle_provider_configure(
                 .and_then(|profile| profile.base_url.as_deref())
         });
         let should_discover = job.probe_secret.is_some() || job.input.models.is_empty();
+        if !should_discover
+            && existing
+                .as_ref()
+                .is_none_or(|profile| matches!(profile.provenance, ProviderProvenance::Custom))
+        {
+            // The card has already probed, or explicitly chosen a manual
+            // fallback. Preserve its complete stated inventory through the
+            // same durable cache/recovery path; do not require a second GET
+            // that could turn a successful picker into a dead end.
+            let models = job
+                .input
+                .models
+                .iter()
+                .map(|slug| haider_provider::DiscoveredModel {
+                    slug: slug.clone(),
+                    display_name: slug.clone(),
+                    context_window: None,
+                    description: None,
+                    default_effort: None,
+                    supported_efforts: Vec::new(),
+                    visible: true,
+                    priority: None,
+                    extensions: None,
+                })
+                .collect();
+            discovered_slugs = Some(job.input.models.clone());
+            discovered_catalog = Some(DiscoveredCatalog { models, etag: None });
+        }
         if should_discover {
             let Some(origin) = origin else {
                 respond_error(
@@ -4867,6 +5123,11 @@ async fn handle_provider_configure(
     // a pending-receipt window for an operation with no profile side effect.
     let mut revision_unchanged = accepted_revision_unchanged
         .unwrap_or(fresh_command && custom_repoint && !configuration_changed);
+    if revision_unchanged {
+        // A repeated explicit inventory is a true no-op: retain its model
+        // metadata and fetched timestamp along with the management revision.
+        discovered_catalog = None;
+    }
     let revision_unchanged_response = if revision_unchanged {
         match providers.summary(&job.input.provider, &provider_has_credential(accounts)) {
             Some(provider) => Some(ProviderReceipt {
@@ -5863,6 +6124,20 @@ async fn handle_login(
     };
 
     let validation = match &custom_target {
+        Some(_)
+            if providers.get(&provider).is_some_and(|profile| {
+                matches!(profile.provenance, ProviderProvenance::Custom)
+                    && profile.enabled
+                    && profile.configured_models.contains(&identity.resolved_model)
+            }) =>
+        {
+            // A confirmed custom model is an explicit choice to proceed
+            // even when /models is absent or separately permissioned. That
+            // advisory endpoint cannot veto storing the user's key, and a
+            // second probe could strand a just-confirmed picker. This
+            // accepts key syntax only; inference still owns authentication.
+            accept_configured_custom_key(&provider, &secret)
+        }
         Some((origin, _, api_family)) => {
             validate_custom_provider_key(origin, &provider, *api_family, &secret).await
         }

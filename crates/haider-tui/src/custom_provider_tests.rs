@@ -35,8 +35,8 @@ fn open_custom(model: &mut AppModel) {
 }
 
 fn focus_key(model: &mut AppModel) {
-    // alias → base URL → auth → API family → masked key
-    for _ in 0..4 {
+    // name → origin → masked key
+    for _ in 0..2 {
         key(model, KeyCode::Tab);
     }
     assert_eq!(
@@ -98,7 +98,7 @@ fn custom_server_key_paste_is_masked_and_debug_redacted() {
     key(&mut model, KeyCode::Enter);
     assert!(
         !format!("{:?}", model.requests).contains(SENTINEL),
-        "the queued configure request's Debug is redacted"
+        "the queued discovery request's Debug is redacted"
     );
     assert_eq!(
         model
@@ -117,8 +117,7 @@ fn custom_server_key_paste_is_masked_and_debug_redacted() {
     focus_key(&mut model);
     model.handle(AppEvent::Paste(SENTINEL.to_owned().into()));
 
-    key(&mut model, KeyCode::BackTab); // API family
-    key(&mut model, KeyCode::BackTab); // auth
+    key(&mut model, KeyCode::Tab); // auth
     key(&mut model, KeyCode::Char(' ')); // no auth
     assert_eq!(
         model
@@ -131,97 +130,36 @@ fn custom_server_key_paste_is_masked_and_debug_redacted() {
     );
 }
 
-#[test]
-fn no_auth_and_anthropic_choices_configure_without_a_secret_or_placeholder_model() {
-    let mut model = live_accounts();
-    let mut driver = LiveDriver::new("custom-no-auth-test");
-    open_custom(&mut model);
-    key(&mut model, KeyCode::Tab); // base URL
-    key(&mut model, KeyCode::Tab); // auth
-    key(&mut model, KeyCode::Char(' ')); // no auth
-    key(&mut model, KeyCode::Tab); // API family
-    key(&mut model, KeyCode::Right); // anthropic
-    key(&mut model, KeyCode::Enter);
-
-    let pass = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
-    let command = pass
-        .commands
-        .into_iter()
-        .find(|command| matches!(command, LiveCommand::ConfigureProvider { .. }))
-        .expect("no-auth configure is direct");
-    match &command {
-        LiveCommand::ConfigureProvider {
-            keyless,
-            family,
-            model,
-            models,
-            probe_vault_reference,
-            ..
-        } => {
-            assert!(*keyless);
-            assert_eq!(
-                *family,
-                haider_rpc::ProviderApiFamilyWire::AnthropicMessages
-            );
-            assert!(model.is_empty());
-            assert!(models.is_empty());
-            assert!(probe_vault_reference.is_none());
-        }
-        _ => unreachable!(),
-    }
-    match request_body(command) {
-        haider_rpc::RequestBody::ProviderConfigure {
-            auth_requirement,
-            models,
-            default_model,
-            probe_vault_reference,
-            ..
-        } => {
-            assert_eq!(
-                auth_requirement,
-                Some(haider_rpc::ProviderAuthRequirementWire::None)
-            );
-            assert!(models.is_empty(), "live discovery receives no fake model");
-            assert!(default_model.is_none());
-            assert!(probe_vault_reference.is_none());
-        }
-        other => panic!("unexpected body: {other:?}"),
-    }
-}
-
-#[test]
-fn keyed_custom_server_stages_configures_discovers_and_consumes_one_reference() {
-    const SENTINEL: &str = "CUSTOM_TUI_STAGE_SENTINEL_b718";
-    let mut model = live_accounts();
-    let mut driver = LiveDriver::new("custom-key-test");
+/// The read-only probe owns a staged reference; no provider or account is
+/// configured before a user accepts a model.
+fn staged_probe(model: &mut AppModel, driver: &mut LiveDriver, secret: &str) -> LiveCommand {
+    open_custom(model);
+    focus_key(model);
+    type_text(model, secret);
+    key(model, KeyCode::Enter);
     let now = std::time::Instant::now();
-    open_custom(&mut model);
-    focus_key(&mut model);
-    type_text(&mut model, SENTINEL);
-    key(&mut model, KeyCode::Enter);
-
-    let staged = live_pass(&mut driver, &mut model, None, now);
-    let stage = staged
+    let staged = live_pass(driver, model, None, now);
+    assert!(staged.commands.iter().all(|command| !matches!(
+        command,
+        LiveCommand::ConfigureProvider { .. } | LiveCommand::LoginApi { .. }
+    )));
+    let (provider, alias, attempt) = staged
         .commands
         .iter()
-        .find(|command| matches!(command, LiveCommand::Stage { .. }))
-        .expect("key is staged before configure");
-    assert!(!format!("{stage:?}").contains(SENTINEL));
-    let (provider, alias, attempt) = match stage {
-        LiveCommand::Stage {
-            provider,
-            alias,
-            attempt,
-            ..
-        } => (provider.clone(), alias.clone(), *attempt),
-        _ => unreachable!(),
-    };
-    assert_eq!(provider, "custom");
-    assert_eq!(alias.as_deref(), Some("custom"));
-
-    let configured = live_pass(
-        &mut driver,
-        &mut model,
+        .find_map(|command| match command {
+            LiveCommand::Stage {
+                provider,
+                alias,
+                attempt,
+                ..
+            } => Some((provider.clone(), alias.clone(), *attempt)),
+            _ => None,
+        })
+        .expect("credential staged");
+    assert!(!format!("{:?}", staged.commands).contains(secret));
+    let probing = live_pass(
+        driver,
+        model,
         Some(LiveReply::Staged {
             vault_reference: "vault-ref-custom-1".to_owned(),
             provider,
@@ -230,36 +168,119 @@ fn keyed_custom_server_stages_configures_discovers_and_consumes_one_reference() 
         }),
         now,
     );
+    assert!(probing.commands.iter().all(|command| !matches!(
+        command,
+        LiveCommand::ConfigureProvider { .. } | LiveCommand::LoginApi { .. }
+    )));
+    probing
+        .commands
+        .into_iter()
+        .find(|command| matches!(command, LiveCommand::ProbeCustomModels { .. }))
+        .expect("probe after staging")
+}
+
+#[test]
+fn no_auth_and_anthropic_choices_probe_before_configuring_without_a_secret() {
+    let mut model = live_accounts();
+    let mut driver = LiveDriver::new("custom-no-auth-test");
+    open_custom(&mut model);
+    for _ in 0..3 {
+        key(&mut model, KeyCode::Tab);
+    }
+    assert_eq!(
+        model.custom_add.as_ref().expect("card").focus,
+        CustomField::Auth
+    );
+    key(&mut model, KeyCode::Char(' '));
+    key(&mut model, KeyCode::Tab);
+    key(&mut model, KeyCode::Right);
+    key(&mut model, KeyCode::Enter);
+    let pass = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
+    assert!(pass.commands.iter().all(|command| !matches!(
+        command,
+        LiveCommand::Stage { .. }
+            | LiveCommand::ConfigureProvider { .. }
+            | LiveCommand::LoginApi { .. }
+    )));
+    let probe = pass
+        .commands
+        .into_iter()
+        .find(|command| matches!(command, LiveCommand::ProbeCustomModels { .. }))
+        .expect("read-only probe");
+    assert!(
+        probe.command_id().is_none(),
+        "discovery is not a durable mutation"
+    );
+    assert!(matches!(
+        request_body(probe),
+        haider_rpc::RequestBody::ProviderModelsProbe {
+            keyless: true,
+            api_family: haider_rpc::ProviderApiFamilyWire::AnthropicMessages,
+            probe_vault_reference: None,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn keyed_custom_server_stages_discovers_picks_then_configures_and_consumes_one_reference() {
+    const SENTINEL: &str = "CUSTOM_TUI_STAGE_SENTINEL_b718";
+    let mut model = live_accounts();
+    let mut driver = LiveDriver::new("custom-key-test");
+    let now = std::time::Instant::now();
+    let probe = staged_probe(&mut model, &mut driver, SENTINEL);
+    let context = CommandContext::of(&probe);
+    assert!(
+        matches!(request_body(probe), haider_rpc::RequestBody::ProviderModelsProbe {
+        provider, probe_vault_reference: Some(reference), ..
+    } if provider == "custom" && reference == "vault-ref-custom-1")
+    );
+    let mapped = map_response(
+        &context,
+        haider_rpc::ResponseBody::ProviderModelsProbe {
+            provider: "custom".to_owned(),
+            models: vec!["router-fast".to_owned(), "router-deep".to_owned()],
+            default_model: Some("router-deep".to_owned()),
+        },
+    );
+    let choosing = live_pass(&mut driver, &mut model, mapped.into_iter().next(), now);
+    assert!(choosing.commands.iter().all(|command| !matches!(
+        command,
+        LiveCommand::ConfigureProvider { .. } | LiveCommand::LoginApi { .. }
+    )));
+    assert!(
+        model.providers.providers.is_empty(),
+        "probe cannot create a provider"
+    );
+    let card = model.custom_add.as_ref().expect("picker");
+    assert_eq!(card.model, "router-deep", "advertised default selected");
+    assert!(
+        matches!(&card.phase, CustomPhase::Choosing { models, selection: 1, error: None }
+        if models.len() == 2)
+    );
+    assert_eq!(card.masked_key_len(), 0);
+    assert!(!rendered_text(&model, 118, 36).contains(SENTINEL));
+    assert!(
+        !format!(
+            "{:?}{:?}{:?}",
+            model.flash, model.accounts.message, model.providers.message
+        )
+        .contains(SENTINEL)
+    );
+
+    key(&mut model, KeyCode::Enter);
+    let configured = live_pass(&mut driver, &mut model, None, now);
     let configure = configured
         .commands
         .into_iter()
         .find(|command| matches!(command, LiveCommand::ConfigureProvider { .. }))
-        .expect("stage reply mints configure");
+        .expect("one Enter creates");
     let configure_id = configure.command_id().expect("durable configure").clone();
-    match request_body(configure) {
-        haider_rpc::RequestBody::ProviderConfigure {
-            api_family,
-            auth_requirement,
-            models,
-            default_model,
-            probe_vault_reference,
-            ..
-        } => {
-            assert_eq!(
-                api_family,
-                Some(haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions)
-            );
-            assert_eq!(
-                auth_requirement,
-                Some(haider_rpc::ProviderAuthRequirementWire::ApiKey)
-            );
-            assert!(models.is_empty());
-            assert!(default_model.is_none());
-            assert_eq!(probe_vault_reference.as_deref(), Some("vault-ref-custom-1"));
-        }
-        other => panic!("unexpected body: {other:?}"),
-    }
-
+    assert!(
+        matches!(request_body(configure), haider_rpc::RequestBody::ProviderConfigure {
+        models, default_model, probe_vault_reference: None, ..
+    } if models == ["router-fast", "router-deep"] && default_model.as_deref() == Some("router-deep"))
+    );
     let login = live_pass(
         &mut driver,
         &mut model,
@@ -270,24 +291,9 @@ fn keyed_custom_server_stages_configures_discovers_and_consumes_one_reference() 
         }),
         now,
     );
-    let login = login
-        .commands
-        .iter()
-        .find(|command| matches!(command, LiveCommand::LoginApi { .. }))
-        .expect("configure chains account login");
-    match login {
-        LiveCommand::LoginApi {
-            provider,
-            alias,
-            vault_reference,
-            ..
-        } => {
-            assert_eq!(provider, "custom");
-            assert_eq!(alias.as_deref(), Some("custom"));
-            assert_eq!(vault_reference, "vault-ref-custom-1");
-        }
-        _ => unreachable!(),
-    }
+    assert!(login.commands.iter().any(|command| matches!(command, LiveCommand::LoginApi {
+        provider, alias, vault_reference, ..
+    } if provider == "custom" && alias.as_deref() == Some("custom") && vault_reference == "vault-ref-custom-1")));
     assert!(matches!(
         model.login.as_ref().map(|card| &card.stage),
         Some(LoginStage::Submitting)
@@ -340,50 +346,16 @@ fn typed_stage_failure_reopens_the_exact_card_and_requires_a_key_retype() {
 }
 
 #[test]
-fn typed_probe_failure_class_survives_link_mapping_and_surfaces_on_the_card() {
+fn typed_probe_failure_class_survives_link_mapping_and_allows_manual_fallback() {
     let mut model = live_accounts();
     let mut driver = LiveDriver::new("custom-probe-error-test");
     let now = std::time::Instant::now();
-    open_custom(&mut model);
-    focus_key(&mut model);
-    type_text(&mut model, "throw-away-key");
-    key(&mut model, KeyCode::Enter);
-    let staged = live_pass(&mut driver, &mut model, None, now);
-    let (provider, alias, attempt) = staged
-        .commands
-        .iter()
-        .find_map(|command| match command {
-            LiveCommand::Stage {
-                provider,
-                alias,
-                attempt,
-                ..
-            } => Some((provider.clone(), alias.clone(), *attempt)),
-            _ => None,
-        })
-        .expect("stage issued");
-    let configured = live_pass(
-        &mut driver,
-        &mut model,
-        Some(LiveReply::Staged {
-            vault_reference: "vault-ref-probe-error".to_owned(),
-            provider,
-            alias,
-            attempt,
-        }),
-        now,
-    );
-    let configure = configured
-        .commands
-        .into_iter()
-        .find(|command| matches!(command, LiveCommand::ConfigureProvider { .. }))
-        .expect("configure issued");
-    let context = CommandContext::of(&configure);
+    let probe = staged_probe(&mut model, &mut driver, "throw-away-key");
     let mapped = map_response(
-        &context,
+        &CommandContext::of(&probe),
         haider_rpc::ResponseBody::Error {
             code: "provider_error".to_owned(),
-            message: "GET /v1/models returned 401".to_owned(),
+            message: "server returned 401 for /models".to_owned(),
             retryable: false,
             data: Some(haider_rpc::ErrorData::ProviderProbeFailed {
                 provider: "custom".to_owned(),
@@ -393,22 +365,153 @@ fn typed_probe_failure_class_survives_link_mapping_and_surfaces_on_the_card() {
     );
     assert!(matches!(
         mapped.as_slice(),
-        [LiveReply::ProviderProbeFailed {
-            provider,
+        [LiveReply::CustomModelsProbeFailed {
             failure: haider_rpc::ProviderProbeFailureWire::Unauthorized,
             ..
-        }] if provider == "custom"
+        }]
     ));
+    let pass = live_pass(&mut driver, &mut model, mapped.into_iter().next(), now);
+    assert!(pass.commands.iter().all(|command| !matches!(
+        command,
+        LiveCommand::ConfigureProvider { .. } | LiveCommand::LoginApi { .. }
+    )));
+    let card = model.custom_add.as_ref().expect("fallback");
+    assert_eq!(card.focus, CustomField::Model);
+    assert!(
+        matches!(&card.phase, CustomPhase::Choosing { models, error: Some(error), .. }
+        if models.is_empty() && error.contains("API key unauthorized") && error.contains("401")
+            && error.contains("type the model id"))
+    );
+    assert!(model.flash.is_none(), "discovery errors stay on the card");
+    key(&mut model, KeyCode::Enter);
+    assert!(
+        model.requests.is_empty(),
+        "empty manual id cannot configure"
+    );
+    type_text(&mut model, "llama3.1:8b");
+    key(&mut model, KeyCode::Enter);
+    let pass = live_pass(&mut driver, &mut model, None, now);
+    let configure = pass
+        .commands
+        .into_iter()
+        .find(|command| matches!(command, LiveCommand::ConfigureProvider { .. }))
+        .expect("fallback creates");
+    assert!(
+        matches!(request_body(configure), haider_rpc::RequestBody::ProviderConfigure {
+        models, default_model, probe_vault_reference: None, ..
+    } if models == ["llama3.1:8b"] && default_model.as_deref() == Some("llama3.1:8b"))
+    );
+}
 
-    let reply = mapped.into_iter().next().expect("one typed reply");
-    live_pass(&mut driver, &mut model, Some(reply), now);
-    let card = model.custom_add.as_ref().expect("card reopens");
-    assert_eq!(card.focus, CustomField::Key);
+/// The provider fixture separately pins rejection of control-bearing ids.
+/// Only the resulting typed document error crosses into this rendering path;
+/// a server's attempted reflection of the key never becomes a display string.
+#[test]
+fn noncompatible_discovery_error_renders_without_the_staged_key() {
+    const SENTINEL: &str = "CUSTOM_CONTROL_REFLECTION_SECRET_81fa";
+    let mut model = live_accounts();
+    let mut driver = LiveDriver::new("custom-invalid-body");
+    let probe = staged_probe(&mut model, &mut driver, SENTINEL);
+    let mapped = map_response(
+        &CommandContext::of(&probe),
+        haider_rpc::ResponseBody::Error {
+            code: "provider_error".to_owned(),
+            message: "model discovery returned a non-compatible document".to_owned(),
+            retryable: false,
+            data: Some(haider_rpc::ErrorData::ProviderProbeFailed {
+                provider: "custom".to_owned(),
+                failure: haider_rpc::ProviderProbeFailureWire::NonOpenAiCompatibleBody,
+            }),
+        },
+    );
     assert!(matches!(
-        &card.phase,
-        CustomPhase::Editing { error: Some(error) }
-            if error.contains("API key unauthorized") && error.contains("401")
+        mapped.as_slice(),
+        [LiveReply::CustomModelsProbeFailed {
+            failure: haider_rpc::ProviderProbeFailureWire::NonOpenAiCompatibleBody,
+            ..
+        }]
     ));
+    assert!(!format!("{mapped:?}").contains(SENTINEL));
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        mapped.into_iter().next(),
+        std::time::Instant::now(),
+    );
+    assert!(pass.commands.iter().all(|command| !matches!(
+        command,
+        LiveCommand::ConfigureProvider { .. } | LiveCommand::LoginApi { .. }
+    )));
+    for (width, height) in [(80, 24), (118, 36), (160, 50)] {
+        let rendered = rendered_text(&model, width, height);
+        assert!(
+            !rendered.contains(SENTINEL),
+            "terminal cells must not reconstruct the key"
+        );
+        assert!(rendered.contains("type the model id"));
+    }
+    assert!(model.flash.is_none());
+    assert!(
+        !format!(
+            "{:?}{:?}{:?}",
+            model.requests, model.accounts.message, model.providers.message
+        )
+        .contains(SENTINEL)
+    );
+}
+
+#[test]
+fn abandoned_probe_replies_cannot_overwrite_an_edited_connection_or_create_provider() {
+    let mut model = live_accounts();
+    let mut driver = LiveDriver::new("custom-abandoned-probe");
+    let now = std::time::Instant::now();
+    let probe = staged_probe(&mut model, &mut driver, "ephemeral-secret");
+    let LiveCommand::ProbeCustomModels { attempt, .. } = probe else {
+        panic!("probe");
+    };
+    live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::CustomModelsProbed {
+            attempt,
+            provider: "custom".to_owned(),
+            models: vec!["old-model".to_owned()],
+            default_model: None,
+        }),
+        now,
+    );
+    key(&mut model, KeyCode::Tab);
+    assert_ne!(
+        model
+            .custom_add
+            .as_ref()
+            .expect("connection fields")
+            .attempt,
+        attempt
+    );
+    let pass = live_pass(
+        &mut driver,
+        &mut model,
+        Some(LiveReply::CustomModelsProbed {
+            attempt,
+            provider: "custom".to_owned(),
+            models: vec!["stale-model".to_owned()],
+            default_model: None,
+        }),
+        now,
+    );
+    assert!(matches!(
+        model.custom_add.as_ref().expect("card").phase,
+        CustomPhase::Editing { .. }
+    ));
+    assert_ne!(
+        model.custom_add.as_ref().expect("card").model,
+        "stale-model"
+    );
+    assert!(pass.commands.iter().all(|command| !matches!(
+        command,
+        LiveCommand::ConfigureProvider { .. } | LiveCommand::LoginApi { .. }
+    )));
 }
 
 fn rendered_text(model: &AppModel, width: u16, height: u16) -> String {
