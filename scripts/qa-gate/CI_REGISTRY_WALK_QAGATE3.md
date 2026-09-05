@@ -340,7 +340,6 @@ Scope: the uncommitted `session_provider.rs` initializer correction and two
 - #94/#95 checked: no product deadline or negotiated-connection wait is added or changed.
 - #96 checked: no performance claim. Execution is macOS only; Linux/Windows behavior is by inspection. Historical lens citations are treated as drifted: for example, the old actor budget-projection location near 3549 is now near 3988; cap-before-refresh and narrative ownership are audited by construct in the merged source.
 - Final gates: `cargo test -q --workspace --no-fail-fast` exits 0 (5350 top-level passes, 0 failures, 13 pre-existing ignores; 12 additional nested subprocess probes pass), and `cargo clippy --workspace --tests -- -D warnings` exits 0. Final `xtask test-count` confirms 4944/4944. Independent verifier: findings=1 real=1 noise=0, the corrected empty handshake selector; final code/golden/gate verdict SHIP.
-<<<<<<< HEAD
 
 ## v0.0.970 customprov delta walk, merged through 7431f8e6
 
@@ -363,5 +362,4 @@ Scope: the uncommitted `session_provider.rs` initializer correction and two
 
 - Final customprov gates: workspace exit 0 (5372 top-level passes +12 nested probes, 0 failures, 13 existing ignores); strict Clippy with tests exit 0; test baseline 4966/4966. Gated-source hashes remain unchanged after both commands.
 - Independent customprov verifier: findings=6 real=5 noise=1; all five real findings fixed, stale completion-wording report rejected as noise; code verdict SHIP. Original Git ref is read-only; the writable isolated lane checkout and bundle carry the commit.
-=======
->>>>>>> origin/wave-970
+
