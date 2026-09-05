@@ -3125,7 +3125,7 @@ pub fn clipboard_paste_effects(
         }
         Err(error) => {
             model.set_composer_notice(crate::app::ImageNotice::ClipboardUnreadable {
-                note: error.0,
+                note: error.to_string(),
             });
         }
     }

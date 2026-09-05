@@ -2484,6 +2484,8 @@ mod supervisor_tests {
 
 #[cfg(all(test, windows))]
 mod windows_monitor_command_tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
     use std::sync::{Arc, Mutex};
 
@@ -2499,15 +2501,24 @@ mod windows_monitor_command_tests {
             .expect("prepare anchored monitor command");
         let rename_result = Arc::new(Mutex::new(None));
         let recorded = Arc::clone(&rename_result);
-        let output = prepared
+        let child = prepared
             .spawn_with_before_spawn(|| {
                 *recorded.lock().expect("record rename") = Some(std::fs::rename(&parent, &moved));
             })
-            .expect("spawn anchored monitor command")
-            .wait_with_output()
-            .await
-            .expect("wait for anchored monitor command");
-        assert!(output.status.success());
+            .expect("spawn anchored monitor command");
+        // Match MonitorChild::spawn: Windows group configuration starts the
+        // child suspended, and registration assigns its job before resuming it.
+        let group = haider_platform::register_process_group(child.id().expect("monitor child PID"))
+            .expect("register and resume anchored monitor command");
+        let output = child.wait_with_output().await;
+        haider_platform::release_process_group(group);
+        let output = output.expect("wait for anchored monitor command");
+        assert!(
+            output.status.success(),
+            "anchored monitor command failed: status={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(
             rename_result
                 .lock()
