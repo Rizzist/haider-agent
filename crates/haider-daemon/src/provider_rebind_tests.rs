@@ -497,7 +497,7 @@ async fn provider_rebind_cross_provider_active_recovery_preserves_route_run_mode
                             _ => None,
                         }
                     })
-                    .last()
+                    .next_back()
                 {
                     break state;
                 }
@@ -569,8 +569,7 @@ async fn provider_rebind_recovery_rejects_changed_frozen_permissions_and_lockdow
             .expect("freeze source");
         let error =
             rebound_turn_lockdown_snapshot(&hub, &session_id, &run_id, true, target, proposed)
-                .err()
-                .expect("frozen mismatch must reject recovery");
+                .expect_err("frozen mismatch must reject recovery");
         assert_eq!(error.code, ErrorCode::Busy);
         assert!(error.retryable);
         assert_eq!(

@@ -1,6 +1,6 @@
 //! Per-session provider routing for automation and proxy-backed benchmarks.
 use super::run::{EX_IOERR, EX_PROTOCOL, EX_UNAVAILABLE, EX_USAGE};
-use haider_client::{EnsureOptions, ProfileEnv, resolve_profile};
+use haider_client::{ClientConfig, EnsureOptions, ProfileEnv, resolve_profile};
 use haider_protocol::ids::SessionId;
 use haider_rpc::{
     AttachMode, Capability, CapabilitySet, ClientKind, CommandId, RequestBody, ResponseBody,
@@ -67,11 +67,16 @@ pub(crate) async fn command(args: &[String]) -> ExitCode {
             return ExitCode::from(EX_PROTOCOL);
         }
     };
-    let mut ensure = EnsureOptions::default();
-    ensure.required_features = [haider_rpc::FEATURE_SESSION_PROVIDER_REBIND_V1.to_owned()].into();
-    ensure.client.client_name = "haider-session-provider-rebind".into();
-    ensure.client.client_kind = ClientKind::Headless;
-    ensure.client.capabilities = CapabilitySet::from([Capability::View, Capability::Control]);
+    let ensure = EnsureOptions {
+        required_features: [haider_rpc::FEATURE_SESSION_PROVIDER_REBIND_V1.to_owned()].into(),
+        client: ClientConfig {
+            client_name: "haider-session-provider-rebind".into(),
+            client_kind: ClientKind::Headless,
+            capabilities: CapabilitySet::from([Capability::View, Capability::Control]),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let ensured = match haider_client::ensure_daemon(&profile, ensure).await {
         Ok(ensured) => ensured,
         Err(error) => {

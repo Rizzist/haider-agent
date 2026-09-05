@@ -1,0 +1,4 @@
+    Checking haider-daemon v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-daemon)
+    Checking xtask v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/xtask)
+    Checking haider-verify v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-verify)
+    Finished `dev` profile [unoptimized] target(s) in 56.41s
