@@ -22,6 +22,7 @@ mod fake_store;
 mod prompt_history;
 mod recovery;
 mod sqlite_store;
+mod turn_workspace;
 
 pub use actor::{
     COMPACTION_MIN_FREED_PERCENT, CacheDiagnosticKey, CancelToken, ChildWaitCheckpoint,

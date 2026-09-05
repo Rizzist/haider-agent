@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use haider_rpc::haider_protocol::EventPayload;
+use haider_rpc::haider_protocol::ceiling::InternalCeilingTerminalV1;
 use haider_rpc::haider_protocol::effect::{AuthorizationVerdict, EffectPhase};
 use haider_rpc::haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_rpc::haider_protocol::error::{ErrorCode, ErrorPresentation};
@@ -637,6 +638,8 @@ pub struct HeadlessBackgroundTask {
 /// Correlated result of one accepted daemon run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeadlessRunResult {
+    /// Original durable cap evidence; replay never recomputes workspace state.
+    pub terminal: Option<InternalCeilingTerminalV1>,
     pub session_id: SessionId,
     pub run_id: RunId,
     pub provider: String,
@@ -3263,6 +3266,7 @@ async fn run_headless_inner(
     if request.detached {
         let events = HeadlessRunEvents::empty(run_id.clone());
         let result = HeadlessRunResult {
+            terminal: None,
             session_id,
             run_id,
             provider,
@@ -5026,6 +5030,11 @@ fn finalize(
             |terminal| (terminal.outcome, terminal.failure, Some(terminal.seq)),
         ),
     };
+    let ceiling_terminal = terminal_envelope.as_ref().and_then(|envelope| {
+        InternalCeilingTerminalV1::from_payload(&envelope.payload).filter(|terminal| {
+            terminal.continuation.session_id == session_id && terminal.continuation.run_id == run_id
+        })
+    });
     if let Some(envelope) = terminal_envelope {
         let kind = terminal_kind(outcome, failure.as_ref());
         let error_code = failure
@@ -5047,6 +5056,7 @@ fn finalize(
         })
         .collect();
     Ok(HeadlessRunResult {
+        terminal: ceiling_terminal,
         session_id,
         run_id,
         provider,

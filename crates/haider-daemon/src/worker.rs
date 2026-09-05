@@ -8592,6 +8592,9 @@ async fn start_turn(
     config.interaction_policy =
         haider_core::InteractionResolutionPolicy::new(metadata.interaction_mode);
     config.provider_requests_already_made = provider_requests_already_made;
+    config.ceiling_workspace = headless
+        .as_ref()
+        .map(|_| std::path::PathBuf::from(&metadata.cwd));
     config.provider_request_ordinal_already_made = provider_request_ordinal_already_made;
     config.turn_ordinal = accepted.turn_ordinal;
     config.provider_request_ordinals = Some(request_ordinals.clone());

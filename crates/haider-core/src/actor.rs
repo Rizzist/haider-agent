@@ -376,6 +376,9 @@ mod actor_tool_result_tests;
 #[path = "actor_context_economy_tests.rs"]
 mod actor_context_economy_tests;
 
+#[path = "actor_ceiling.rs"]
+mod actor_ceiling;
+
 // Two soft tranches cover the reported 53-round solved benchmark with 11
 // requests of headroom, while preserving a finite guard against runaway work.
 const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 64;
@@ -711,6 +714,9 @@ pub struct HarnessConfig {
     /// Warn the model once after this many logical requests. Transport retries
     /// do not spend another request. A fresh continuation turn resets the budget.
     pub provider_request_tranche: usize,
+    /// Headless workspace for durable pre/post tree receipts at the hard cap.
+    /// Embedders without a workspace leave this absent.
+    pub ceiling_workspace: Option<std::path::PathBuf>,
     /// Logical requests already spent before a restart-safe continuation was
     /// reconstructed. Ordinary accepted turns start at zero.
     pub provider_requests_already_made: usize,
@@ -834,6 +840,7 @@ impl HarnessConfig {
             broadcast_capacity: 128,
             max_provider_requests_per_turn: DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN,
             provider_request_tranche: 32,
+            ceiling_workspace: None,
             provider_requests_already_made: 0,
             provider_request_ordinal_already_made: 0,
             turn_ordinal: 1,
@@ -3278,6 +3285,23 @@ impl HarnessActor {
             }
         }
         let mut continuation_count = 0usize;
+        let (workspace_before, mut pending_workspace_receipt) = match self
+            .prepare_ceiling_workspace(&run_id, restore_budget, &cancel)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(_) if cancel.is_cancelled() => {
+                return self
+                    .cancelled_outcome_with_items(&run_id, &mut message, &mut reasoning, &mut tools)
+                    .await;
+            }
+            Err(error) => return self.errored_state_outcome(&run_id, error).await,
+        };
+        if cancel.is_cancelled() {
+            return self
+                .cancelled_outcome_with_items(&run_id, &mut message, &mut reasoning, &mut tools)
+                .await;
+        }
         let mut forced_compaction_used = false;
         // Once an ineffective compaction promotes this turn, later request
         // rounds may use the larger hard budget but must never compact again.
@@ -3460,13 +3484,33 @@ impl HarnessActor {
                         provider_request_count,
                         RequestBudgetPhaseV1::HardBound,
                     );
+                    let mut error = request_budget_error(&status);
+                    if let Some(before) = &workspace_before {
+                        match self
+                            .ceiling_terminal(
+                                &run_id,
+                                &status,
+                                before,
+                                request_ordinals.current(),
+                                &cancel,
+                            )
+                            .await
+                        {
+                            Ok(terminal) => {
+                                if let Some(details) = error.details.as_mut() {
+                                    details["terminal"] = serde_json::json!(terminal);
+                                }
+                            }
+                            Err(error) => return self.errored_state_outcome(&run_id, error).await,
+                        }
+                    }
                     return self
                         .errored_outcome_with_items(
                             &run_id,
                             &mut message,
                             &mut reasoning,
                             &mut tools,
-                            request_budget_error(&status),
+                            error,
                         )
                         .await;
                 }
@@ -4037,6 +4081,7 @@ impl HarnessActor {
                         provider_view: provider_view_attempt_data,
                         cache: request_attempt_data,
                         response_epoch: replay.response_epoch,
+                        workspace_receipt: pending_workspace_receipt.take(),
                         request_budget: (provider_attempt == 1).then(|| {
                             self.request_budget_status(
                                 &run_id,
@@ -9966,6 +10011,12 @@ impl HarnessActor {
                 prompt_omit_render(),
             )?,
         ]);
+        if error.code == ErrorCode::RequestBudgetExceeded
+            && let Some(terminal) = error.details.as_ref().and_then(|data| data.get("terminal"))
+            && let Some(envelope) = envelopes.last_mut()
+        {
+            envelope.payload["terminal"] = terminal.clone();
+        }
         self.flush_pending_item_delta().await?;
         self.append_and_publish_owned(envelopes).await?;
         self.state.send_replace(Some(RunState::Errored));
@@ -10306,11 +10357,20 @@ impl HarnessActor {
             cache: cache_attempt_data,
             response_epoch,
             request_budget,
+            workspace_receipt,
         } = markers;
         self.flush_pending_item_delta().await?;
         let mut envelopes = Vec::with_capacity(
             usize::from(provider_view_data.is_some()) * 2 + usize::from(*thinking_pending) + 4,
         );
+        for receipt in workspace_receipt.into_iter().flatten() {
+            envelopes.extend(self.uncommitted_extension_marker(
+                run_id,
+                actor_ceiling::WORKSPACE_RECEIPT_KIND,
+                receipt,
+                hidden_prompt_omit_render(),
+            )?);
+        }
         if let Some(data) = provider_view_data {
             envelopes.extend(self.uncommitted_extension_marker(
                 run_id,
@@ -11494,6 +11554,7 @@ struct PendingUsageCommit {
 }
 
 struct RequestAttemptMarkers {
+    workspace_receipt: Option<Vec<serde_json::Value>>,
     provider_view: Option<serde_json::Value>,
     cache: serde_json::Value,
     response_epoch: u64,

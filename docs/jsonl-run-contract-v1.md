@@ -284,7 +284,8 @@ Every logical provider dispatch carries a durable `provider_request_budget_v1`
 extension status with used requests, soft tranche, and hard cap. The default
 is 32 / 64. The soft-bound note is both model-readable and visible; the hard
 checkpoint commits with `run_failed { code: request_budget_exceeded }` and the
-single `errored` terminal. CLI exit is 77, with continuation instructions.
+single `errored` terminal. CLI exit is **78**, the stable dedicated internal
+request-ceiling code (previously shared blocked code 77), with continuation instructions.
 These facts replay unchanged and do not discard prior text or tool results.
 
 `haider run --request-tranche 32 --max-requests 96 -p 'task'` pins per-run
@@ -294,3 +295,40 @@ source policy unless explicitly overridden. Its stream correlates the new
 run and retains the ordinary contiguous cursor contract. The source run and
 its terminal remain immutable. Interactive timelines and delegated children
 continue through their existing new-turn and `message_subagent` surfaces.
+
+Headless hard-cap terminals additionally retain `payload.terminal`, also exposed
+as `terminal` in `haider.run.v1` JSON and `haider.run.replay.v1`. Its typed
+`end_reason` is `harness_internal_ceiling`, `internal_cap_detected` is true,
+and `exit_code` is 78. `ceilings` has `soft`, `hard`, and `used` logical requests;
+`continuation` retains session/run and optional branch/agent coordinates.
+`workspace_state` is `mutated` or `untouched`, computed by comparing pre/post
+tree receipts, never by tool names or Git's dirty flag. `workspace_before` and
+`workspace_after` retain their BLAKE3 identities. `partial_progress` contains
+sorted `files_written` and `files_deleted`, `tool_calls` with a durable
+result, and `last_request_ordinal` (physical requests, including retries).
+File lists describe net changes, including process-created files, not authorship
+or transient writes that were reverted. Receipt scope includes ignored/hidden
+files and symlink targets without following them; Git administrative `.git`
+directories/files are excluded. The baseline travels as a hidden, prompt-omitted
+`turn_workspace_before_v1` extension in the first request-attempt transaction.
+The final block shares the cap checkpoint/failure/terminal transaction. Replay
+uses those retained bytes and does not rescan today's workspace.
+
+The baseline is encoded in ordered 16 KiB chunks with a complete-content digest,
+so no individual receipt event grows with the tree. Both observations stream
+every included regular-file byte; the path map and total journal storage grow
+with tree size. Capture runs off the async executor. It is a sequential receipt,
+not an atomic filesystem snapshot; detected concurrent changes, unsupported
+special files, or read failures make the observation unavailable. These errors
+do not prevent a plain chat run or erase a known cap: the cap still exits 78 and
+retains counts and continuation. In this exceptional case `workspace_state`,
+`workspace_after`, and both file lists are omitted, with a typed
+`workspace_receipt_error {phase: before|after, detail}`. No third workspace-state
+value or false `untouched` claim is emitted. Legacy recovery without a baseline
+uses the same explicit unavailability. Old capped journals have no terminal
+receipt block; replay never fabricates one.
+
+The adapter-manifest declaration, including its workspace template, is supplied
+in [ceilingdecl evidence](testing/v0.0.970/ceilingdecl.md). Only typed terminal
+evidence or the manifest-declared code may establish an internal cap; free-text
+messages and a soft-tranche warning do not.

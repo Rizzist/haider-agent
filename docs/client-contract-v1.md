@@ -2921,7 +2921,8 @@ Absence laws:
 - Replay never re-executes a provider or tool. Unknown future raw events remain
   in structured output and are part of the returned durable projection.
 - Exit codes retain the existing headless mapping: provider failure `65`,
-  protocol/feature skew `76`, blocked or budget-exhausted `77`, and explicit
+  protocol/feature skew `76`, blocked or token/cost/time budget-exhausted `77`,
+  logical request-ceiling `78`, and explicit
   user cancellation `130`.
 
 ### 15.4 v0.0.964 checkpoint contract
