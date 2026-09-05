@@ -99,11 +99,10 @@ and MUST NOT build a substitute, even when the substitute appears to work.
   precedence rule, let the poorer projection win, and destroyed a metric
   across every row.
 
-Per-session account identity was considered for this list but is not a
-published fact today: `SessionSummary.account_alias` is currently always
-absent. There is therefore no authoritative value to tell a client to read.
-Clients must render it unknown and must not substitute the profile-global
-active account; see §16.
+`SessionSummary.account_alias` publishes the explicit session account pin.
+Absence means no explicit pin, a legacy row, or an older daemon; it does not
+identify the account used by a provider request. Never substitute the
+profile-global active account; see §9.2.2.
 
 ## 2. Profile identity and daemon discovery
 
@@ -328,6 +327,8 @@ is §4.1.
 | `provider_models_probe_v1` | `provider.models_probe`, ephemeral custom-provider discovery before create/edit |
 | `models_list_v1` | headless model enumeration composed from `provider.list` and `account.list`; it is not another RPC method |
 | `session_provider_rebind_v1` | `session.provider.rebind` |
+| `session_account_select_v1` | exact `session.create.account_alias` pin |
+| `session_create_admission_v1` | daemon resolution of create provider/default model and initial tuning |
 | `session_model_select_v1` | `session.select_model` |
 | `session_rename_v1` | `session.rename`, `SessionSummary.title` |
 | `session_workspace_set_v1` | receipt-backed `session.workspace.set`; additive `workspace_unavailable` and `workspace_selected` raw facts |
@@ -1121,7 +1122,7 @@ empty collection wins over an older fallback.
 | `agent_type` | plain session or old daemon; do not infer a Loom identity |
 | `effort` | provider default or old daemon; do not invent a named effort |
 | `fast` | old daemon. `Some(false)` is real normal mode |
-| `account_alias` | no per-session account seam exists yet; it is currently always absent. Never substitute the global active account |
+| `account_alias` | no explicit account pin, legacy row, or old daemon; never substitute the global active account. See §9.2.2 |
 
 #### 9.2.1 Ordering sessions by activity
 
@@ -1156,6 +1157,47 @@ activity coordinate they do not have.
 
 `head_seq = 0` is the actual empty journal head. `worker_generation = 0` is not
 a general absence sentinel; generation comparisons use the supplied integer.
+
+#### 9.2.2 Exact account pins and provider rebind
+
+`session.create` accepts optional `account_alias` when
+`session_account_select_v1` is advertised. `haider run --account` uses this
+field. The alias must exist and belong to the selected provider. With
+`session_create_admission_v1`, `resolve_provider=true` resolves the provider
+from that alias, and `resolve_model=true` resolves its provider's default
+model inside create; the corresponding input strings must be empty. The
+create receipt and `SessionMetadataV1.account_alias` retain the exact pin.
+`SessionSummary.account_alias` promotes that metadata value for list/watch
+clients. A pin bypasses mutable active-account selection and prevents
+rotation or fallback to another account; an unavailable pin fails rather
+than silently selecting another credential.
+
+`session.provider.rebind` (`session_provider_rebind_v1`) accepts `command_id`,
+`session_id`, `worker_generation`, `provider`, optional `base_url`, and
+optional `account`. It requires Control capability and a control attachment
+to that session. The alias must belong to the requested registered, enabled
+provider, whose model policy must accept the session's current model.
+Omitting `account` clears the explicit pin; omitting `base_url` clears the
+session endpoint override. The provider then uses normal account/endpoint
+resolution, including registered no-auth mode where applicable. No other
+session or profile registry changes.
+
+Success atomically commits the `session_provider_rebound` event, metadata,
+and durable receipt. Retrying the same command and coordinates returns the
+original receipt; conflicting coordinates or a new command with a stale worker
+generation are typed refusals. The new route applies at the next provider
+request boundary, including a tool-result continuation or retry; an in-flight
+request retains
+its original adapter. Model, effort, and speed are unchanged. An active run
+must retain its frozen provider trust policy or rebind returns `busy`; retry
+when idle. Later `session.select_model` selection of a different provider
+clears a prior rebind's account and endpoint overrides. URL overrides remain
+restricted to supported custom/proxy and enterprise endpoints; see the
+[automation rebind contract](automation-contract-v1.md#per-session-provider-rebind)
+for endpoint validation and error codes.
+
+An absent summary pin remains unknown as request-account identity. It never
+licenses deriving an account from `account.list` defaults or active aliases.
 
 ### 9.3 Observe/read/attach optionals
 
@@ -3184,17 +3226,10 @@ most dangerous thing in the room precisely because it resembles the missing one.
 - **[STRUCTURAL]** a checkpoint with `truncated_reason` has no restorable
   pre-image. Clients may display the durable limitation but must not fetch a
   substitute, reconstruct bytes from diffs, or bypass the freshness guard;
-- **[STRUCTURAL]** `SessionSummary.account_alias` is not populated because
-  **there is no per-session account binding to report**. `RequestBody` carries
-  no account-selection request, session creation accepts only provider/model,
-  and turn setup resolves the alias from the globally-resolved account. The
-  field is empty because the fact does not exist, not because a publisher
-  dropped it — so "unknown" is permanently correct until per-session binding is
-  built. It must not be replaced with the global active account, which would be
-  right for the current session by luck and silently wrong for every historical
-  one. For the same reason `haider run --account` cannot work: it gated on
-  `session_account_select_v1`, a feature string with zero daemon-side
-  definitions, and now refuses honestly instead;
+- **[STRUCTURAL]** a session without an explicit account pin has no pinned
+  account to report. `SessionSummary.account_alias` publishes exact pins from
+  creation or receipt-backed rebind as described in §9.2.2; an unpinned session
+  must not be assigned the global active account as roster truth;
 - **[STRUCTURAL]** old account/provider/usage payloads that omit `availability` retain their
   old ambiguous zero/empty sentinels. The new client can say “unknown,” but
   cannot reconstruct whether an old daemon measured an empty value;
@@ -3204,9 +3239,8 @@ most dangerous thing in the room precisely because it resembles the missing one.
   combine an old-daemon case with a real domain absence. This document records
   the ambiguity instead of inventing a discriminator.
 
-No additional precedence, latency guarantee, provider default, daemon-minted
-pane identity, or per-session account binding could be established from
-source, so none is claimed here.
+No additional precedence, latency guarantee, provider default, or daemon-minted
+pane identity could be established from source, so none is claimed here.
 
 ## 17. `session_descendant_stream_v1`
 

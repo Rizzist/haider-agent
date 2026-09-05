@@ -336,14 +336,16 @@ durable permission facts.
 C1 keeps prompt-visible search/glob output bounded without shelling out. Search
 spools the complete matched output to a private file so CAS overflow remains
 complete; glob retains only the lexicographically first 500 matching paths.
-The workspace has no direct regex/glob dependency and this wave forbids a
-Cargo.lock change, so search advertises literal matching plus a documented
-dependency-free `simple` mode (`*` and `?`), not full regular expressions.
+The original C1 regex and streaming deferrals below are superseded in v0.0.970:
+search now supports `literal`, `simple` (`*` and `?`), and `regex` modes through
+the bounded Rust regex engine, with bounded line-streamed input and explicit
+truncation reasons. Regex syntax follows that engine, including its rejection
+of look-around and backreferences.
 
 | Where | Deferred design / optimization | Exact trigger / DO-NOT-DO |
 |---|---|---|
-| `crates/haider-tools/src/filesystem.rs` (`collect_file_matches`, `SearchCollector`) | Search result memory is bounded and full output is spooled, but each candidate regular file is still read wholly before UTF-8 validation and line matching. | Trigger: a workspace contains a searchable file over 64 MiB or search RSS exceeds 32 MiB above baseline. Stream bounded line buffers into the existing spool. DO-NOT-DO: truncate a matching line silently, follow a symlink, invoke an external `rg`, or let a streaming reader weaken the descriptor-relative `O_NOFOLLOW` walk. |
-| `crates/haider-tools/src/filesystem.rs` (`FsSearchMode::Simple`, `wildcard_matches`) | Full regex syntax is deferred; C1 supports literal search and the explicitly advertised `*`/`?` simple pattern grammar. | Trigger: a shipped provider workflow requires alternation, captures, character classes, or anchors that simple mode cannot express, and the dependency can land without violating the lockfile/version lane. DO-NOT-DO: call simple mode “regex”, accept unsupported syntax with changed meaning, or delegate matching to a subprocess. |
+| `crates/haider-tools/src/filesystem.rs` (`collect_streamed_file_matches`, `read_bounded_search_line`) | Landed: bounded line streaming replaces whole-file search reads; scan, line, and result bounds report truncation. | Preserve explicit truncation reasons, descriptor-relative `O_NOFOLLOW` traversal, and in-process matching. |
+| `crates/haider-tools/src/filesystem.rs` (`FsSearchMode::Regex`, `CompiledSearch::new`) | Landed: linear-time regex supports alternation, character classes, and anchors; simple wildcard mode remains distinct. | Preserve regex size limits and typed invalid-pattern errors; do not silently reinterpret unsupported syntax or delegate matching to a subprocess. |
 | `crates/haider-tools/src/broker.rs`, `crates/haider-daemon/src/worker.rs` (freshness reduction) | The journal is the authoritative per-session freshness source and is replayed for every turn dispatcher; no mutable side database is maintained. | Trigger: the W8a reconstruction threshold above fires. DO-NOT-DO: share freshness across sessions/agents, update memory before the terminal append commits, or persist a cache separately from the terminal effect outcome. |
 
 ## W6d child-visibility efficiency ledger (2026-08-01)

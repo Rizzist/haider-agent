@@ -1105,7 +1105,7 @@ fn bounded_nonempty(value: &str, maximum: usize, name: &str) -> ToolResult<()> {
 pub fn monitor_manifest() -> ToolManifest {
     ToolManifest {
         name: "monitor".into(),
-        description: "Register, inspect, update, pause, resume, trigger, or remove a durable session monitor. Timer, file, poll, process, CLI preset, and SMS sources wake the agent when their condition is reached.".into(),
+        description: "Register, list, update, pause, resume, trigger, or remove durable sms/process/file/poll/timer/cli watches. Matches coalesce per monitor: idle wakes as a subturn; busy queues to the next turn boundary. Command registration/update requires ProcessExec authorization for exact argv/cwd/env names; external files require FsRead authorization.".into(),
         effects: vec![],
         dispatch: DispatchMode::Await,
         input_schema: serde_json::json!({

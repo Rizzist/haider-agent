@@ -104,9 +104,9 @@ pub struct SessionMetadataV1 {
     /// Ordinary model selection does not advance this request-boundary marker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_rebind_id: Option<String>,
-    /// Optional account alias pinned by an automation-created session. When
-    /// present, provider resolution uses this exact credential rather than
-    /// the provider's mutable active-account selection.
+    /// Optional account alias pinned by `session.create` or
+    /// `session.provider.rebind`. When present, provider resolution uses this
+    /// exact credential rather than the provider's mutable active-account selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_alias: Option<String>,
     /// Full provider model identifier — the current model selection.

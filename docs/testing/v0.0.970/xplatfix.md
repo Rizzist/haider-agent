@@ -378,9 +378,11 @@ editing; source lines shift with these repairs.
 
 ### Round 2 verification
 
-All Cargo commands use the ENV LAW, rustup Rust 1.95.0, two build jobs, four test
-threads, and `df -m /` checked before each build-capable command with a 700 MiB
-minimum. CLI/daemon siblings are prebuilt before daemon/workspace tests and
+All Cargo commands use rustup Rust 1.95.0 and the ENV LAW:
+`RUST_MIN_STACK=8388608 HAIDER_DISCOVERY_DISABLED=1
+HAIDER_TEST_DEVICE_NAME=test-mac CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`.
+Builds use two jobs; test runs use four threads. `df -m /` is checked before
+each build-capable command with a 700 MiB minimum. CLI/daemon siblings are prebuilt before daemon/workspace tests and
 `HAIDER_TEST_SIBLINGS_PREBUILT=1` is set only afterward. Logs are under
 `/tmp/xplatfix-round2-evidence/`; raw Windows job log is
 `/tmp/xplatfix-windows-job.log`.
@@ -410,7 +412,10 @@ CLI/daemon/tools Windows paths.
 These exact default and pure-platform commands were repeated on the resolved
 `f211be0e` forward merge in the integration clone: default check/Clippy again
 exit 101 in native dependencies, while both platform-only commands exit 0.
-Their logs have the `merged-windows-` prefix.
+Their logs have the `merged-windows-` prefix. The same four commands were
+repeated after the subsequent `6c6164c9` docsync merge: affected-crate check
+and Clippy again exit 101 (missing ml64/Windows SDK); platform-only pure-Rust
+check and Clippy exit 0. Those logs/status files use `docsync-windows-`.
 
 The first focused G1 run found a new diagnostic-helper defect: blanket
 `decode_event` rejected daemon-owned `project_instructions_loaded` facts outside
@@ -435,7 +440,30 @@ On the resolved forward merge, the named instruct-pipe test passed again at
 **5,670 → 5,670 POSIX bytes** (derived Windows expectation 5,667). The provider
 golden was regenerated and its named test passed again; its SHA-256 stayed
 identical to the pre-regeneration merged fixture, so there was no additional
-golden drift after the merge. Final workspace gate results follow below.
+golden drift after either forward merge. On the final docsync snapshot, the
+full-manifest pin also passed at **20,770 Mac bytes**; its inspected Windows
+expectation is 20,769. The added monitor/spawn capability test and exact
+spawn-manual pin both passed.
+
+Final macOS gate on the resolved `6c6164c9` merge, with the ENV LAW and symbol
+stripping described above:
+
+- `cargo build -q -p haider-cli -p haider-daemond`: PASS; fresh siblings were
+  81,357,104 and 144,318,992 bytes, both above the 10 MiB guard.
+- `cargo test -q --workspace --no-fail-fast`: PASS, exit 0. The long TUI
+  two-test group passed in 418.09s; it was not skipped or weakened.
+- `cargo clippy --workspace --tests -- -D warnings`: PASS, exit 0, both before
+  the test run and afterward (final pass 1.07s).
+- `cargo run -q -p xtask -- test-count --update`: PASS, **5,033**.
+  `cargo run -q -p xtask -- check`: PASS; its nine existing soft LOC warnings
+  are non-fatal, and the source count matches the baseline.
+- `cargo fmt --all --check`, `python3 scripts/check-unsafe-counts.py`, and
+  `git diff --check`: PASS. Unsafe counts remain **189 production / 20 test**.
+
+The final statuses are in `host-gate-status.tsv`; final logs retain the plain
+step names (`workspace-test.log`, `workspace-clippy.log`, etc.). All 2,693
+tracked files had zero content changes throughout the gate. Only this report
+was updated afterward to record the completed results.
 
 The first merged workspace test command returned zero, but its following
 Clippy pass exposed stale pre-merge metadata: it reported missing upstream
@@ -453,8 +481,9 @@ fresh strict Clippy pass returned **0** in 3m 30s, with no source change needed.
 The baseline before this round is
 4,997 source test markers; the first `xtask test-count --update` produced
 5,001. The forward merge supplies upstream's 5,027 baseline; recounting the
-resolved tree produces **5,031**. Moving the sidecar test preserves its count,
-while one normalizer, one missing-parent and two Windows directory tests add
+resolved tree produces **5,031**. Docsync subsequently supplies upstream
+5,029; the actual recount of that merged tree produces **5,033**. Moving the
+sidecar test preserves its count, while one normalizer, one missing-parent and two Windows directory tests add
 four. This is distinct from the number of tests executed on Mac.
 
 ### Round 2 merge, commit and acceptance
@@ -471,9 +500,28 @@ actual forward merge. The shared session-hub test file merged cleanly, preservin
 both the input-owner acknowledgement assertions and this lane's moved sidecar
 regression. Registry-walk additions were unioned; the baseline conflict was
 resolved by the repository test-count tool, not by choosing either side's number.
-All 557 paths changed from the original base were copied back before the final
+All 557 paths changed from the original base were copied back before the f211
 host gate; all 2,691 tracked files matched the resolved clone byte-for-byte. The clone is the
 commit location; source changes remain present in the original worktree. No push.
+
+The remote then advanced to `6c6164c9` (docsync) while the fresh f211 gate was
+running. The first forward merge was committed locally as `d67ce24f`, followed
+by another actual `git merge --no-commit origin/wave-970`. The overlap in
+`permissions_core_tests.rs` retains the derived 5,592 + actual-description
+core pin and every new upstream capability/full-manifest/30% reduction
+assertion. Registry entries were unioned again; xtask produced 5,033.
+Independent review found no new material issue. A source-string byte count
+confirmed the new full-manifest Windows arithmetic: computer description
+126 Mac / 128 Windows (+2), process command 78 / 75 (−3), neither needing
+additional JSON escapes. Full catalog 20,770 + 2 − 3 = 20,769; the core pack
+excludes computer, so 5,592 + 75 = 5,667. Python byte counting was executed;
+registration/filtering was inspected, with no Windows execution. The fresh f211 gate kept
+its source frozen and completed with workspace tests, strict Clippy, xtask,
+formatting and unsafe-count PASS (189 production / 20 test unsafe sites); its
+long TUI group passed in 581.62s. These logs use `f211-fresh-`. The final
+docsync snapshot copied 16 changed paths with fresh timestamps before its
+full gate; all 2,693 tracked files matched the resolved clone. The source
+manifest is `docsync-source-before-gate.json`.
 
 A stop attempt for the superseded pre-merge TUI benchmark was refused by the
 sandbox (`operation not permitted`); it was not stopped or disabled and completed
@@ -492,6 +540,13 @@ A final read-only review against the forward-merged upstream found no new
 material issues: all six repairs remained, and the shared session-hub file
 preserved upstream assertions.
 Round 2 aggregate: **findings=3, real=2, noise=1**.
+
+The handoff is the `lane-970-xplatfix` branch in the writable integration clone
+and `/tmp/xplatfix-round2.bundle`, including both forward merges from the
+original `471b9d68` base. Commit messages have no trailers. The original
+worktree’s Git metadata stays unchanged; its source files match the committed
+result. Supplied LANE-COMMON, LANE-BRIEF, turnperf and turnperf2 inputs are not
+included in the lane delta. No push is performed.
 
 **Release acceptance is proven only when xplat-check is green on the landed
 `wave-970` commit.** A local Mac pass or Windows source inspection does not prove
