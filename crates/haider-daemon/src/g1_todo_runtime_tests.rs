@@ -176,7 +176,12 @@ impl World {
         run_id
     }
 
-    async fn run_turn_with_explicit_graph_abandon(&self, label: &str, text: &str) -> RunId {
+    async fn run_turn_with_explicit_graph_abandon(
+        &self,
+        label: &str,
+        text: &str,
+        foreground_processes: u32,
+    ) -> RunId {
         let run_id = RunId::new(format!("{label}-run"));
         let accepted = self
             .hub
@@ -204,35 +209,117 @@ impl World {
             .submit(accepted)
             .await
             .expect("submit turn");
-        let (menu, request_seq) = timeout(Duration::from_secs(10), async {
+        // Registry #94 BudgetSum: retain this suite's 10s graph/journal
+        // observation allowance, then add each real foreground process's
+        // nested budgets. The 30s process-start allowance is the existing
+        // cold-PowerShell fixture policy in daemond/tests/support/mod.rs,
+        // not a measured latency claim. ProcessBounds supplies 60s wall +
+        // 2s termination + 2s post-termination pipe drain. Two workspace
+        // receipts each have a 500ms wall cap (tools/workspace_receipt.rs).
+        // Thus one process is 10 + 30 + 60 + 2 + 2 + 2*0.5 = 105s;
+        // graph-only fixtures retain 10s. Passing waits never spend a delay.
+        let graph_journal_observation = Duration::from_secs(10);
+        let process_start_allowance = Duration::from_secs(30);
+        let workspace_receipts = Duration::from_millis(500) * 2;
+        let process_bounds = haider_tools::ProcessBounds::default();
+        let per_process = process_start_allowance
+            + process_bounds.wall_timeout
+            + process_bounds.kill_grace * 2
+            + workspace_receipts;
+        let budget_sum = graph_journal_observation + per_process * foreground_processes;
+        let started = std::time::Instant::now();
+        let mut cursor = 0;
+        let mut progress = Vec::new();
+        let observed = timeout(budget_sum, async {
             loop {
                 let events = self
                     .store
-                    .read(&self.session_id, 0, 2048)
+                    .read(&self.session_id, cursor, 2048)
                     .await
-                    .expect("read journal");
-                if let Some(opening) = events.into_iter().find(|event| {
-                    event.run_id.as_ref() == Some(&run_id)
-                        && event.payload.decode_event().is_ok_and(|payload| {
-                            matches!(
-                                payload,
-                                EventPayload::MenuOpened(ref menu)
-                                    if matches!(menu.kind, MenuKind::GraphAbandonConfirm { .. })
-                            )
-                        })
-                }) {
-                    let EventPayload::MenuOpened(menu) =
-                        serde_json::from_value(opening.payload.into()).expect("typed menu")
-                    else {
-                        unreachable!();
-                    };
-                    break (menu, opening.seq);
+                    .map_err(|error| format!("read journal: {error}"))?;
+                for event in events {
+                    cursor = event.seq;
+                    if event.run_id.as_ref() != Some(&run_id) {
+                        continue;
+                    }
+                    // The journal also carries daemon-owned facts such as
+                    // project_instructions_loaded, outside EventPayload's enum.
+                    // Decode only observed kinds; malformed relevant facts fail.
+                    if !matches!(
+                        event
+                            .payload
+                            .get("type")
+                            .and_then(serde_json::Value::as_str),
+                        Some(
+                            "run_state"
+                                | "run_failed"
+                                | "menu_opened"
+                                | "tool_result"
+                                | "process_signal_recorded"
+                                | "graph_finalization_deferred"
+                        )
+                    ) {
+                        continue;
+                    }
+                    let payload = event
+                        .payload
+                        .decode_event()
+                        .map_err(|error| format!("decode journal seq {cursor}: {error}"))?;
+                    let stage = format!("after {:?}, seq {cursor}: {payload:?}", started.elapsed());
+                    eprintln!("graph abandonment {label}: {stage}");
+                    progress.push(stage);
+                    match payload {
+                        EventPayload::MenuOpened(menu)
+                            if matches!(menu.kind, MenuKind::GraphAbandonConfirm { .. }) =>
+                        {
+                            return Ok((menu, event.seq));
+                        }
+                        EventPayload::MenuOpened(menu) => {
+                            return Err(format!("unexpected blocking menu: {menu:?}"));
+                        }
+                        EventPayload::RunFailed { code, message, .. } => {
+                            return Err(format!(
+                                "run failed before confirmation: {code:?}: {message}"
+                            ));
+                        }
+                        EventPayload::RunState(
+                            state @ (RunState::Done | RunState::Errored | RunState::Cancelled),
+                        ) => {
+                            return Err(format!("run terminalized before confirmation: {state:?}"));
+                        }
+                        EventPayload::ToolResult { call_id, result }
+                            if !result.status.is_completed() =>
+                        {
+                            return Err(format!("tool {call_id} did not complete: {result:?}"));
+                        }
+                        _ => {}
+                    }
                 }
                 tokio::task::yield_now().await;
             }
         })
-        .await
-        .expect("guard opens abandonment confirmation");
+        .await;
+        let (menu, request_seq) = match observed {
+            Ok(Ok(opened)) => opened,
+            failure => {
+                // The timeout owns only the observer, never the worker. Queue
+                // a best-effort drain wake; this is not an awaited shutdown.
+                // The World's existing abort-on-drop backstop still owns
+                // teardown when the assertion unwinds.
+                self.manager.handle().begin_draining();
+                let reason = match failure {
+                    Ok(Err(reason)) => reason,
+                    Err(_) => format!("observation budget {budget_sum:?} exhausted"),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                panic!(
+                    "guard did not open abandonment confirmation for {run_id}: {reason}; \
+                     elapsed={:?}; last_seq={cursor}; journal progress:\n{}",
+                    started.elapsed(),
+                    progress.join("\n")
+                );
+            }
+        };
         self.hub
             .resolve_hook_menu(MenuResolutionCommand {
                 command_id: format!("abandon-{label}"),
@@ -364,7 +451,7 @@ async fn active_graph_brief_reaches_the_provider_but_not_durable_history() {
         .await
         .expect("pin graph");
     world
-        .run_turn_with_explicit_graph_abandon("graph-brief-runtime", "continue the work")
+        .run_turn_with_explicit_graph_abandon("graph-brief-runtime", "continue the work", 0)
         .await;
 
     let requests = provider.requests();
@@ -432,7 +519,11 @@ async fn graph_evidence_tool_dispatches_to_daemon_gate_authority() {
         .await
         .expect("pin graph");
     let run_id = world
-        .run_turn_with_explicit_graph_abandon("graph-evidence-runtime", "build and record evidence")
+        .run_turn_with_explicit_graph_abandon(
+            "graph-evidence-runtime",
+            "build and record evidence",
+            0,
+        )
         .await;
     let status = world
         .hub
@@ -570,7 +661,11 @@ async fn verified_slot_resolves_journal_provenance_with_slim_live_and_replayed_r
         .await
         .expect("pin graph");
     let run = world
-        .run_turn_with_explicit_graph_abandon("economydiet-evidence", "verify the implementation")
+        .run_turn_with_explicit_graph_abandon(
+            "economydiet-evidence",
+            "verify the implementation",
+            1,
+        )
         .await;
     let payloads = world.typed_payloads().await;
     assert!(payloads.iter().any(|(payload, _)| matches!(payload,
@@ -666,6 +761,7 @@ async fn outstanding_verify_evidence_allows_a_normal_provider_turn_to_finish() {
         .run_turn_with_explicit_graph_abandon(
             "graph-verify-nonblocking",
             "ordinary interactive followup",
+            0,
         )
         .await;
     let payloads = world.typed_payloads().await;

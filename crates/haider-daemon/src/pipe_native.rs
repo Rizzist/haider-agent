@@ -1720,6 +1720,33 @@ async fn inspect_sidecar(
         })?
 }
 
+/// Windows can report ERROR_PATH_NOT_FOUND (Rust NotFound) when `pipe`
+/// is occupied by a regular file. That obstruction is an I/O failure, not a
+/// missing generation-zero sidecar. Inspect the parent only on a failed open;
+/// ordinary existing-sidecar maintenance pays no additional filesystem read.
+fn classify_root_open_error(
+    path: &Path,
+    error: std::io::Error,
+) -> Result<SidecarState, PipeNativeError> {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return Err(error.into());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| PipeNativeError::other("sidecar path has no parent".into()))?;
+    match std::fs::metadata(parent) {
+        Ok(metadata) if !metadata.is_dir() => Err(PipeNativeError::other(format!(
+            "sidecar parent is not a directory: {}",
+            parent.display()
+        ))),
+        Ok(_) => Ok(SidecarState::Missing),
+        Err(parent_error) if parent_error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(SidecarState::Missing)
+        }
+        Err(parent_error) => Err(parent_error.into()),
+    }
+}
+
 fn inspect_sidecar_blocking(
     path: &Path,
     session_id: &SessionId,
@@ -1731,8 +1758,8 @@ fn inspect_sidecar_blocking(
     loop {
         let mut file = match open_sidecar_for_inspection(&current_path) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && expected_segment == 0 => {
-                return Ok(SidecarState::Missing);
+            Err(error) if expected_segment == 0 => {
+                return classify_root_open_error(&current_path, error);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(SidecarState::Corrupt {
