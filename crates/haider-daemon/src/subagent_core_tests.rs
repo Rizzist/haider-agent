@@ -5282,6 +5282,8 @@ async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_jo
         context_economy: Default::default(),
         created_at_ms: 1,
         agent_type: None,
+        provider_base_url: None,
+        provider_rebind_id: None,
     };
     // The production collector derives its one fallback deadline from the
     // accepted parent's first durable run fact. Keep this direct coordinator
