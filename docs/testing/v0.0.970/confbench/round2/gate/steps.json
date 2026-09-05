@@ -1,0 +1,187 @@
+[
+  {
+    "name": "siblings",
+    "args": [
+      "cargo",
+      "build",
+      "-p",
+      "haider-cli",
+      "-p",
+      "haider-daemond"
+    ],
+    "exit_code": 0,
+    "seconds": 83.49
+  },
+  {
+    "name": "protocol",
+    "args": [
+      "cargo",
+      "test",
+      "-q",
+      "-p",
+      "haider-protocol",
+      "--test",
+      "golden_tests",
+      "invalid_tool_call"
+    ],
+    "exit_code": 0,
+    "seconds": 9.57
+  },
+  {
+    "name": "malformed",
+    "args": [
+      "cargo",
+      "test",
+      "-q",
+      "-p",
+      "haider-core",
+      "--test",
+      "runtime_tests",
+      "malformed"
+    ],
+    "exit_code": 0,
+    "seconds": 27.35
+  },
+  {
+    "name": "core-exposure",
+    "args": [
+      "cargo",
+      "test",
+      "-q",
+      "-p",
+      "haider-core",
+      "--lib",
+      "tool_exposure"
+    ],
+    "exit_code": 0,
+    "seconds": 7.35
+  },
+  {
+    "name": "pipe-pin",
+    "args": [
+      "cargo",
+      "test",
+      "-q",
+      "-p",
+      "haider-daemon",
+      "--lib",
+      "instruct_pipe_shrinks_the_advertised_wire_pack",
+      "--",
+      "--nocapture"
+    ],
+    "exit_code": 0,
+    "seconds": 140.72
+  },
+  {
+    "name": "jsonl-replay",
+    "args": [
+      "cargo",
+      "test",
+      "-q",
+      "-p",
+      "haider-cli",
+      "--test",
+      "cli_tests",
+      "malformed_attempt_stays_failed_after_successful_repair_in_jsonl_and_replay"
+    ],
+    "exit_code": 0,
+    "seconds": 58.83
+  },
+  {
+    "name": "golden",
+    "args": [
+      "cargo",
+      "test",
+      "-q",
+      "-p",
+      "haider-cli",
+      "--test",
+      "turnhygiene_pin_tests",
+      "provider_request_body_is_budget_independent_and_matches_the_golden_ledger"
+    ],
+    "exit_code": 0,
+    "seconds": 3.38
+  },
+  {
+    "name": "baseline-before-gate",
+    "args": [
+      "cargo",
+      "run",
+      "-q",
+      "-p",
+      "xtask",
+      "--",
+      "test-count",
+      "--update"
+    ],
+    "exit_code": 0,
+    "seconds": 0.85
+  },
+  {
+    "name": "workspace-test",
+    "args": [
+      "cargo",
+      "test",
+      "-q",
+      "--workspace",
+      "--no-fail-fast"
+    ],
+    "exit_code": 0,
+    "seconds": 1620.65
+  },
+  {
+    "name": "clippy",
+    "args": [
+      "cargo",
+      "clippy",
+      "--workspace",
+      "--tests",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "seconds": 173.36
+  },
+  {
+    "name": "test-count-update",
+    "args": [
+      "cargo",
+      "run",
+      "-q",
+      "-p",
+      "xtask",
+      "--",
+      "test-count",
+      "--update"
+    ],
+    "exit_code": 0,
+    "seconds": 1.04
+  },
+  {
+    "name": "test-count",
+    "args": [
+      "cargo",
+      "run",
+      "-q",
+      "-p",
+      "xtask",
+      "--",
+      "test-count"
+    ],
+    "exit_code": 0,
+    "seconds": 0.77
+  },
+  {
+    "name": "fmt",
+    "args": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0,
+    "seconds": 6.84
+  }
+]

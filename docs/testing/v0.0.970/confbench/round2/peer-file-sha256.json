@@ -1,0 +1,34 @@
+{
+  "round1": {
+    "bench/adapters/haider-agent/adapter.toml": "265cc406cd49fcf736ebc6fcbf54120ed719032444c20099552d280b395d6a04",
+    "bench/adapters/normalize.py": "35380a2b505f69e9a1fdfc12b80a758a792cb1637d9052e868497dffdec6ceab",
+    "bench/conformance/runner.py": "4117cbaf603b70463bc3b9b23df490cd5ce81085b2bf4ded47795fa1dea8ffef",
+    "bench/conformance/fake_proxy.py": "b4858e22b975e7786d472485811ef76eb94fb4e9d366aa8dd62b660f03eef415"
+  },
+  "before": {
+    "bench/adapters/haider-agent/adapter.toml": "265cc406cd49fcf736ebc6fcbf54120ed719032444c20099552d280b395d6a04",
+    "bench/adapters/normalize.py": "35380a2b505f69e9a1fdfc12b80a758a792cb1637d9052e868497dffdec6ceab",
+    "bench/conformance/runner.py": "4117cbaf603b70463bc3b9b23df490cd5ce81085b2bf4ded47795fa1dea8ffef",
+    "bench/conformance/fake_proxy.py": "b4858e22b975e7786d472485811ef76eb94fb4e9d366aa8dd62b660f03eef415"
+  },
+  "same_as_round1": true,
+  "after": {
+    "bench/adapters/haider-agent/adapter.toml": "265cc406cd49fcf736ebc6fcbf54120ed719032444c20099552d280b395d6a04",
+    "bench/adapters/normalize.py": "35380a2b505f69e9a1fdfc12b80a758a792cb1637d9052e868497dffdec6ceab",
+    "bench/conformance/runner.py": "4117cbaf603b70463bc3b9b23df490cd5ce81085b2bf4ded47795fa1dea8ffef",
+    "bench/conformance/fake_proxy.py": "b4858e22b975e7786d472485811ef76eb94fb4e9d366aa8dd62b660f03eef415"
+  },
+  "unchanged": true,
+  "after_repeat": {
+    "bench/adapters/haider-agent/adapter.toml": "265cc406cd49fcf736ebc6fcbf54120ed719032444c20099552d280b395d6a04",
+    "bench/adapters/normalize.py": "35380a2b505f69e9a1fdfc12b80a758a792cb1637d9052e868497dffdec6ceab",
+    "bench/conformance/runner.py": "4117cbaf603b70463bc3b9b23df490cd5ce81085b2bf4ded47795fa1dea8ffef",
+    "bench/conformance/fake_proxy.py": "b4858e22b975e7786d472485811ef76eb94fb4e9d366aa8dd62b660f03eef415"
+  },
+  "after_final_repeat": {
+    "bench/adapters/haider-agent/adapter.toml": "265cc406cd49fcf736ebc6fcbf54120ed719032444c20099552d280b395d6a04",
+    "bench/adapters/normalize.py": "35380a2b505f69e9a1fdfc12b80a758a792cb1637d9052e868497dffdec6ceab",
+    "bench/conformance/runner.py": "4117cbaf603b70463bc3b9b23df490cd5ce81085b2bf4ded47795fa1dea8ffef",
+    "bench/conformance/fake_proxy.py": "b4858e22b975e7786d472485811ef76eb94fb4e9d366aa8dd62b660f03eef415"
+  }
+}

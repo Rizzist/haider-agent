@@ -1,0 +1,30 @@
+{
+  "metric": "sum UTF-8 name/native-description/canonical-schema bytes plus system manual; excludes provider dialect framing",
+  "platform": "macOS arm64",
+  "comparator": 13552,
+  "ceiling": 6776,
+  "default_without_spawn": 5670,
+  "round1_full_spawn": {
+    "name": 14,
+    "description": 305,
+    "schema": 2000,
+    "contribution": 2319,
+    "pipe": 7989
+  },
+  "round2_stub_spawn": {
+    "name": 14,
+    "description": 256,
+    "schema": 304,
+    "contribution": 574,
+    "pipe": 6244
+  },
+  "round2_headroom": 532,
+  "round2_reduction_percent": 53.9256,
+  "platform_invariant_pin_before": 7911,
+  "platform_invariant_pin_after": 6166,
+  "platform_description_bytes_measured": 78,
+  "system_manual_bytes": 0,
+  "policy_bytes": 606,
+  "full_authorized_manifest_bytes": 20770,
+  "rust_measurement": "gate/pipe-pin.log"
+}

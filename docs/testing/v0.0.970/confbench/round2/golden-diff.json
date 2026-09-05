@@ -1,0 +1,159 @@
+{
+  "all_other_request_fields_equal": {
+    "max_tokens": true,
+    "messages": true,
+    "model": true,
+    "prompt_cache_key": true,
+    "stream": true,
+    "stream_options": true
+  },
+  "tools_before": [
+    "list_tools",
+    "todo_write",
+    "fs_read",
+    "fs_glob",
+    "fs_search",
+    "fs_write",
+    "fs_edit",
+    "process_exec",
+    "spawn_subagent"
+  ],
+  "tools_after": [
+    "list_tools",
+    "todo_write",
+    "fs_read",
+    "fs_glob",
+    "fs_search",
+    "fs_write",
+    "fs_edit",
+    "process_exec",
+    "spawn_subagent"
+  ],
+  "changed_tool_declarations": [
+    "spawn_subagent"
+  ],
+  "before": {
+    "function": {
+      "description": "delegate one bounded task to a depth-capped child under AgentSpawn policy; waits for child report; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)",
+      "name": "spawn_subagent",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_type": {
+            "description": "Registered Loom agent type for a TYPED child (capability-scoped specialist)",
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "model": {
+            "description": "Optional model for the child; omitted, the child inherits this session's current model. A bare selector matches case-insensitively and ignores '-', '_', '.', and whitespace; literal exact matches win. Call list_models to inspect valid model/provider pairs.",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "parent_slot": {
+            "description": "Declared parent graph evidence slot for the single collapsed child contract",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "prompt": {
+            "description": "Complete task prompt for the child",
+            "maxLength": 32768,
+            "minLength": 1,
+            "type": "string"
+          },
+          "provider": {
+            "description": "Optional disambiguator when `model` is served by several providers; requires `model`",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "request_budget": {
+            "additionalProperties": false,
+            "description": "Optional child per-turn provider request budget; defaults to tranche 32 and hard cap 64. Transport retries are excluded. Must satisfy tranche <= hard_cap.",
+            "properties": {
+              "hard_cap": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "tranche": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "tranche",
+              "hard_cap"
+            ],
+            "type": "object"
+          },
+          "task": {
+            "description": "Short display label for the child",
+            "maxLength": 80,
+            "minLength": 1,
+            "type": "string"
+          },
+          "workflow": {
+            "description": "Optional child workflow proposal; omitted defaults to one bare attempt",
+            "pattern": "^(plain|implement_verify|deeper|workflow_ref\\([A-Za-z0-9_-]{1,64}\\))$",
+            "type": "string"
+          },
+          "workflow_author": {
+            "description": "Request graph-authoring capability; granted only for a deeper trigger",
+            "type": "boolean"
+          },
+          "workflow_trigger": {
+            "description": "Bounded reason the workflow earns its graph",
+            "enum": [
+              "mutation_with_independent_verification",
+              "dependent_phases",
+              "fan_out",
+              "distinct_review",
+              "crash_recovery"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "task",
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "strict": false
+    },
+    "type": "function"
+  },
+  "after": {
+    "function": {
+      "description": "Delegate one bounded task to a depth-capped child under AgentSpawn policy; waits for child report. Inherits the current model/provider. Call list_tools(filter=\"spawn_subagent\") for optional model/provider, workflow, specialist, and request-budget controls.",
+      "name": "spawn_subagent",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "prompt": {
+            "description": "Complete task prompt for the child",
+            "maxLength": 32768,
+            "minLength": 1,
+            "type": "string"
+          },
+          "task": {
+            "description": "Short display label for the child",
+            "maxLength": 80,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "task",
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "strict": false
+    },
+    "type": "function"
+  },
+  "regenerated_by": "UPDATE_FIXTURES=1 cargo test -q -p haider-cli --test turnhygiene_pin_tests provider_request_body_is_budget_independent_and_matches_the_golden_ledger"
+}

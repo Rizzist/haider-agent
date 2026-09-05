@@ -1,0 +1,22 @@
+{
+  "env_law": {
+    "RUST_MIN_STACK": "8388608",
+    "HAIDER_DISCOVERY_DISABLED": "1",
+    "HAIDER_TEST_DEVICE_NAME": "test-mac",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_BUILD_JOBS": "2",
+    "RUST_TEST_THREADS": "4"
+  },
+  "debug_target": "/tmp/confbench-debug",
+  "release_target": "/Users/rizzist/haider-run/lane-970-confbench/target",
+  "daemon_test_env_after_sibling_build": {
+    "HAIDER_TEST_SIBLINGS_PREBUILT": "1"
+  },
+  "read_only_peer_env": {
+    "PYTHONDONTWRITEBYTECODE": "1"
+  },
+  "disk_floor_MiB": 700,
+  "platform": "Darwin arm64",
+  "concurrency_note": "Full gate started in the separate prebuilt debug target while the release build continued; each Cargo invocation used two build jobs. Benchmark durations are operational evidence, not performance claims."
+}

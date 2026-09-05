@@ -1,5 +1,11 @@
 # v0.0.970 conformance release gate
 
+**Round 2 supersedes the round-1 verdict below.** The preserved 50% byte gate
+is unchanged. The old adapter does **not** derive `failed` from `status`:
+its failed-status projection and malformed predicate remain incompatible.
+See the appended round-2 evidence for the compact declaration, fresh release
+benchmark, merged full gate, and corrected 18-pass acceptance.
+
 The old read-only peer benchmark has two incompatibilities with the requested
 release acceptance: its malformed-call evaluator ignores the failed status its
 own adapter emits, and 21 cases with two Darwin skips and the excluded timeout
@@ -316,3 +322,303 @@ under this worktree. The bundle contains the merged upstream history after
 `6c6164c9` plus this lane's commit; its exact ID is in the delivery message.
 Nothing is pushed. The supplied lane notes and turnperf/
 turnperf2/ evidence remain untracked and are excluded from that commit.
+
+## Round 2: compact default delegation and repaired-attempt status
+
+Acceptance is **18 PASS / 1 FAIL (timeout only) / 2 platform SKIP**:
+21 − 2 − 1 = 18, matching the supplied 969 result. This supersedes the
+round-1 discussion of a requested 19-pass count. The 50% economydiet gate
+has not been relaxed or re-derived.
+
+### Product findings and citation audit
+
+The requested malformed-attempt status is already present at the starting
+commit `72364f34`. `close_malformed_tool_failure` builds a failed result
+(`actor.rs:8260`), `commit_tool_result_and_completion` maps the result status
+to the item's status (`actor.rs:10074`), and `ToolResultStatus::item_status`
+maps Failed to Failed (`tool.rs:370-376`). The existing round-1 JSONL completion
+already carries `payload.item.status: "failed"`, plus the durable `failed`,
+`reason`, and `repaired` metadata. No status rewrite is needed or claimed.
+
+The assertion that the old adapter derives `failed: true` from `status: failed`
+is **wrong for the actual peer files**. `adapter.toml:123` and
+`normalize.py:149-165` remain correct citations for a projection that only
+copies declared fields. `runner.py:928` still accepts only `failed is True`
+or a harness error in the malformed case. Its ordinary failed-tool predicate
+at line 915 additionally accepts failed status; the malformed predicate does
+not. The sole adapter harness-error rule (`adapter.toml:151-155`) matches
+`run_failed`; `runner.py:675-682` excludes parser diagnostics. Emitting a
+run-level error would contradict the successfully repaired run's contract.
+The supplied 969 malformed PASS exited **65** after one request; round 1
+exited **0** after two. Its passing score therefore does not establish that
+the old evaluator supports the new successful-repair semantics.
+
+The [executed projection proof](confbench/round2/projection-proof.json),
+[reproduction script](confbench/round2/projection-proof.py), and
+[independent verifier record](confbench/round2/verifier.md) confirm this
+against a real completion from the starting commit. The new CLI regression
+executes a malformed `fs_read` and a valid corrected call with distinct IDs,
+pins failed/completed statuses and repair metadata, requires exit 0 and no
+`run_failed`, and compares the literal live event bytes with durable replay.
+The core runtime pins also assert raw failed status before any repair request
+and for exhausted repair allowance. The event-schema changelog and automation
+contract state these semantics explicitly.
+
+The auxiliary case originally failed because economydiet's eight-tool default
+omitted `spawn_subagent`; neither a spawn stub nor spawn usage reached the
+first request. Round 1 restored the complete definition. The peer's auxiliary
+selector (`fake_proxy.py:296-321`, `:439-447`) selects the exact tool name
+without needing the full schema. Its argument generator (`:507-546`) only
+needs the required task/prompt properties for this call. Child dispatch parses
+`SpawnSubagent::from_tool_args`; omitted selectors inherit the current
+provider/model pair. No routing decision depends on the omitted optional
+schema properties.
+
+The proposed system-prompt-manual design is historical: merged economydiet
+puts each tool's manual semantics once in its native description and has
+**zero system manual bytes** (`worker.rs:2797-2800`, `:14567-14569`,
+`:14694-14715`; the zero-manual test remains intact). Round 2 respects that
+layout. Its default spawn view retains the exact required task/prompt
+property schemas, adds compact usage and inherited-route guidance, and points
+to `list_tools(filter="spawn_subagent")` for optional controls. The full
+authorized catalog is unchanged. A committed discovery result supplies and
+promotes the exact full definition; rejected discovery does not promote.
+Configured/restored promotion, provider refresh and fallback retain the full
+catalog and correct tool-pack digest. Tool/effect grants and lockdown still
+bound execution. Unfamiliar schema shapes stay full rather than silently
+losing constraints.
+
+The supplied turnperf and turnperf2 evidence is contextual inspection evidence,
+not an executed timing experiment here. D7-1/D7-7's call identity, continuation,
+and existing atomic tool settlement remain unchanged; D7-X's fake-proxy proof
+ledger is untouched. No durable boundary, retry budget or deadline changes.
+Historical latency estimates are not reported as round-2 measurements.
+
+### Before/after bytes
+
+[Rust measurement](confbench/round2/gate/pipe-pin.log) and
+[byte ledger](confbench/round2/bytes.json); all executed numbers are macOS arm64.
+The pipe metric is name + native description + canonical schema + system
+manual, excluding provider-dialect JSON framing. It is not a tokenizer result.
+
+| Metric | Economydiet default without spawn | Round 1 full spawn | Round 2 compact spawn |
+|---|---:|---:|---:|
+| Advertised tools | 8 | 9 | 9 |
+| Spawn name | 0 | 14 | 14 |
+| Spawn native usage | 0 | 305 | 256 |
+| Spawn schema | 0 | 2,000 | 304 |
+| Spawn contribution | 0 | 2,319 | 574 |
+| Default instruct pipe | 5,670 | 7,989 | **6,244** |
+| System manual | 0 | 0 | 0 |
+| Reduction vs 13,552 | 58.16% | 41.05% | **53.93%** |
+| Preserved maximum | 6,776 | 6,776 | 6,776 |
+| Headroom | 1,106 | −1,213 | **532** |
+| Preserved 50% gate | PASS | FAIL | **PASS** |
+
+The platform-invariant pin changes **7,911 → 6,166**; measured POSIX command
+prose adds 78 bytes. The full authorized manifest remains **20,770** bytes,
+registered count 30, policy 606 bytes, native description total 1,746 bytes.
+Linux/Windows execution is not claimed: their unchanged platform-description
+accounting plus the platform-independent 574-byte spawn contribution was
+reviewed by inspection. No economydiet threshold is changed, and its prior
+reference-token claims have not been remeasured or extrapolated.
+
+The provider-request golden was regenerated through the repository's
+`UPDATE_FIXTURES=1` test. [Structural comparison](confbench/round2/golden-diff.json)
+shows only the spawn declaration changed from round 1; all other tool
+schemas/descriptions and all other request fields are identical.
+
+### Full gate on the merged round-2 tree
+
+All commands used the [recorded ENV LAW](confbench/round2/execution-environment.json),
+two build jobs, and four test threads. Every build-capable step recorded
+`df -m /` before execution and respected the 700 MiB stop floor. Siblings
+were prebuilt before setting `HAIDER_TEST_SIBLINGS_PREBUILT=1`; the debug
+daemon is **201,747,808 bytes**, above 10 MiB. The release build and full
+gate used separate targets and overlapped; no benchmark time is a performance
+claim. [Exact gate commands and exits](confbench/round2/gate/steps.json) and
+[full test totals](confbench/round2/gate/test-summary.json) are retained.
+
+| Step | Exit | Result |
+|---|---:|---|
+| [siblings](confbench/round2/gate/siblings.log) | 0 | PASS |
+| [protocol](confbench/round2/gate/protocol.log) | 0 | PASS |
+| [malformed](confbench/round2/gate/malformed.log) | 0 | PASS |
+| [core-exposure](confbench/round2/gate/core-exposure.log) | 0 | PASS |
+| [pipe-pin](confbench/round2/gate/pipe-pin.log) | 0 | PASS |
+| [jsonl-replay](confbench/round2/gate/jsonl-replay.log) | 0 | PASS |
+| [golden](confbench/round2/gate/golden.log) | 0 | PASS |
+| [baseline-before-gate](confbench/round2/gate/baseline-before-gate.log) | 0 | PASS |
+| [workspace-test](confbench/round2/gate/workspace-test.log) | 0 | PASS |
+| [clippy](confbench/round2/gate/clippy.log) | 0 | PASS |
+| [test-count-update](confbench/round2/gate/test-count-update.log) | 0 | PASS |
+| [test-count](confbench/round2/gate/test-count.log) | 0 | PASS |
+| [fmt](confbench/round2/gate/fmt.log) | 0 | PASS |
+
+`cargo test -q --workspace --no-fail-fast` exits **0**: **5,469 passed,
+0 failed, 13 existing ignored**, across 340 emitted test-result groups
+(including doc tests). No test was weakened, ignored or platform-gated.
+`cargo clippy --workspace --tests -- -D warnings` exits **0**.
+`xtask test-count --update` and the subsequent check exit **0**: the source
+baseline changes **5,036 → 5,040** (+3 tool-exposure tests and +1 CLI
+JSONL/replay test). Source test counts and emitted test-instance totals are
+different measures. Formatting is green.
+
+Executed named coverage includes `default_spawn_preserves_required_contract_and_full_discovery`,
+`spawn_projection_survives_owned_refresh_and_provider_fallback`,
+`default_spawn_projection_keeps_unfamiliar_schemas_intact`,
+`malformed_attempt_stays_failed_after_successful_repair_in_jsonl_and_replay`,
+`instruct_pipe_shrinks_the_advertised_wire_pack`, the existing malformed
+runtime group, default delegation/grant/lockdown tests, actual child-spawn
+integration, and the provider-request golden pin. Full gate is green on macOS;
+Linux/Windows behavior remains by inspection only.
+
+### Release benchmark: both case tables and raw repeats
+
+The fresh native release pair was built with
+`cargo build --release -p haider-cli -p haider-daemond`; exit **0**.
+[Artifact hashes and sizes](confbench/round2/release/artifacts.json) identify
+`haider` (**35,543,584 bytes**) and `haiderd` (**55,365,968 bytes**).
+Both `--version` commands succeeded under a throwaway HOME/profile. They
+report `0.0.969`, the unchanged package version on this wave-970 candidate;
+the adapter's embedded v0.0.962 artifact identity is not the identity of the
+overridden binaries. The pair's hashes are unchanged across all three runs.
+
+The final [unchanged old-bench report](confbench/round2/haider-970-round2.json)
+is **17 PASS / 2 FAIL / 2 SKIPPED**, exit **1**. Only malformed and timeout
+fail. [Exact command](confbench/round2/benchmark-command.json), run from the
+read-only peer `/Users/rizzist/Documents/CODING/haidercode-web`:
+
+```sh
+python3 -m bench.conformance --adapter haider-agent \
+  --executable /Users/rizzist/haider-run/lane-970-confbench/target/release/haider \
+  --model deepseek-v4-flash --context-window 131072 \
+  --max-output-tokens 8192 --max-turns 20 \
+  --process-timeout 15 --proxy-timeout 20 \
+  --json-report /Users/rizzist/haider-run/lane-970-confbench/docs/testing/v0.0.970/confbench/round2/haider-970-round2.json
+```
+
+Table 1 retains the supplied baseline and pre-fix 970 results, with round 1
+for comparison. These are prior evidence, not newly executed baselines.
+
+| Case | 969 baseline | 970 before | Round 1 |
+|---|---|---|---|
+| exact_model_and_endpoint | PASS | PASS | PASS |
+| allowed_request_paths | PASS | PASS | PASS |
+| streamed_text | PASS | PASS | PASS |
+| one_tool_call | PASS | PASS | PASS |
+| multiple_tool_calls | PASS | PASS | PASS |
+| parallel_tool_calls | PASS | PASS | PASS |
+| fragmented_tool_call | PASS | PASS | PASS |
+| failed_tool_call | PASS | PASS | PASS |
+| malformed_tool_call | PASS | FAIL | FAIL |
+| structured_terminal_success | PASS | PASS | PASS |
+| structured_terminal_failure | PASS | PASS | PASS |
+| retry_429 | PASS | PASS | PASS |
+| retry_500 | PASS | PASS | PASS |
+| stream_disconnect | PASS | PASS | PASS |
+| timeout | FAIL | FAIL | FAIL |
+| no_interactive_prompt | PASS | PASS | PASS |
+| no_request_outside_allowlist | SKIPPED | SKIPPED | SKIPPED |
+| no_persistent_state | SKIPPED | SKIPPED | SKIPPED |
+| no_second_model_or_auxiliary_provider | PASS | FAIL | PASS |
+| tool_call_id_dedup | PASS | PASS | PASS |
+| patch_when_stdout_truncated | PASS | PASS | PASS |
+
+Table 2 records **every** round-2 full run. The first run's extra failure was
+`retry_429`: outside-state audit, exit 0, two requests. On the first unchanged
+repeat the extra outside-state failure moved to `streamed_text`; `retry_429`
+passed. The final unchanged repeat has no extra failure. This supports
+transient outside-state interference, not a new retry or streaming defect.
+All raw statuses remain intact: [first report](confbench/round2/haider-970-round2-audit.json),
+[first repeat](confbench/round2/haider-970-round2-repeat-audit.json),
+[final repeat](confbench/round2/haider-970-round2.json). No per-case results
+are combined into an invented passing run.
+
+| Case | First run | First repeat | Final repeat | Final requests |
+|---|---|---|---|---:|
+| exact_model_and_endpoint | PASS | PASS | PASS | 1 |
+| allowed_request_paths | PASS | PASS | PASS | 1 |
+| streamed_text | PASS | FAIL | PASS | 1 |
+| one_tool_call | PASS | PASS | PASS | 2 |
+| multiple_tool_calls | PASS | PASS | PASS | 3 |
+| parallel_tool_calls | PASS | PASS | PASS | 2 |
+| fragmented_tool_call | PASS | PASS | PASS | 2 |
+| failed_tool_call | PASS | PASS | PASS | 2 |
+| malformed_tool_call | FAIL | FAIL | FAIL | 2 |
+| structured_terminal_success | PASS | PASS | PASS | 1 |
+| structured_terminal_failure | PASS | PASS | PASS | 1 |
+| retry_429 | FAIL | PASS | PASS | 2 |
+| retry_500 | PASS | PASS | PASS | 2 |
+| stream_disconnect | PASS | PASS | PASS | 1 |
+| timeout | FAIL | FAIL | FAIL | 1 |
+| no_interactive_prompt | PASS | PASS | PASS | 1 |
+| no_request_outside_allowlist | SKIPPED | SKIPPED | SKIPPED | 1 |
+| no_persistent_state | SKIPPED | SKIPPED | SKIPPED | 1 |
+| no_second_model_or_auxiliary_provider | PASS | PASS | PASS | 3 |
+| tool_call_id_dedup | PASS | PASS | PASS | 2 |
+| patch_when_stdout_truncated | PASS | PASS | PASS | 2 |
+
+The timeout remains the owner-identified host audit artefact; two procfs
+network/state cases remain Darwin SKIPs. The owner's live daemon was neither
+stopped nor modified. The old peer files are unchanged before/after all runs,
+and match round 1's hashes ([peer ledger](confbench/round2/peer-file-sha256.json));
+Python bytecode writes were disabled. The reports' durations and resource
+fields are not credited as accepted performance measurements.
+
+The release diagnostic captures exercise both regressions separately and retain
+raw JSONL, normalized events, exits and request identities. They are additional
+evidence, not replacements for the full benchmark:
+
+| Regression | Executed release facts | Old bench result |
+|---|---|---|
+| malformed_tool_call | Failed result seq 26; exactly one completed call-1 at seq 27 with status failed, failed=true, reason and repaired=true; second request marker seq 39; one successful terminal seq 51; exit 0; two requests; no run_failed | FAIL: normalization retains failed status but omits the failed boolean |
+| no_second_model_or_auxiliary_provider | spawn_subagent selected; actual agent_spawned seq 31; child_result seq 49; call-1 completed seq 51; successful terminal seq 71; exit 0; three requests, all deepseek-v4-flash at /v1/chat/completions | PASS |
+
+See [asserted regression summary](confbench/round2/regression-summary.json),
+[malformed selected records](confbench/round2/diagnostic/malformed_tool-selected.json),
+and [auxiliary selected records](confbench/round2/diagnostic/auxiliary_probe-selected.json).
+The CLI test additionally executes a genuinely corrected tool call and pins its
+separate successful completion plus literal replay parity. Raw replay, runtime,
+bench, native macOS build and gates were executed; alternate-platform behavior,
+the absence of schema-based routing, and constraint/grant preservation were
+also inspected. No Linux/Windows runtime or real-model-quality claim is made.
+
+### Round-2 verdict, merge and delivery
+
+**NO_SHIP** under the corrected acceptance. The full gate and unchanged 50%
+size ceiling are green; default auxiliary capability is restored with a
+574-byte declaration. The old bench still lacks its 969 passing case
+`malformed_tool_call` ([passing-set comparison](confbench/round2/benchmark-summary.json)).
+The product already emits the requested failed attempt status and successful
+run terminal. An old-adapter projection or predicate correction is still
+needed to recognize that truthful result; emitting run_failed would violate
+the requested behavior. This lane does not change the peer or relabel a FAIL.
+
+Ordinary Git fetch/merge/staging cannot write this worktree's external,
+read-only metadata. The authorized writable mirror `/tmp/confbench-lane.git`
+retains branch `lane-970-confbench`. It fetched and merged forward before the
+full gate, then fetched/merged again after execution: upstream remains
+`620fc1ce2faf0344c2d27c172fabe2c2f99bd253`, already contained in starting commit
+`72364f34`. Both mirror merges returned `Already up to date`;
+[merge evidence](confbench/round2/merge.json) is retained. Thus the final gate
+and release artifacts include the current merged upstream. The provider
+request golden was regenerated through tooling, the byte pin measured, and
+the test baseline recounted. No golden was hand-merged.
+
+The final lane commit is retained in the writable mirror, with its exact ID
+reported at delivery and a portable bundle at
+`tmp/confbench/lane-970-confbench-round2.bundle`. No push or trailer is added.
+The supplied `LANE-COMMON.md`, `LANE-BRIEF-confbench.md`, `turnperf/`, and
+`turnperf2/` inputs remain untracked and excluded. Only closed text logs have
+trailing whitespace and redundant final blank lines removed for whitespace checking; raw benchmark
+JSON and JSONL are unchanged, with formatting hashes recorded separately.
+
+The independent verifier found **no new findings** in two reviews. It confirmed
+the known malformed predicate blocker and independently verified the compact
+spawn route, full discovery retention, and byte arithmetic. These confirmations
+are not counted as novel findings; benchmark audit interference is separately
+reported above. See the [verifier record](confbench/round2/verifier.md).
+
+VERIFIER: findings=0 real=0 noise=0 — no new findings; existing malformed adapter blocker confirmed
+NO_SHIP

@@ -1,0 +1,16 @@
+[
+  {
+    "name": "build",
+    "args": [
+      "cargo",
+      "build",
+      "--release",
+      "-p",
+      "haider-cli",
+      "-p",
+      "haider-daemond"
+    ],
+    "exit_code": 0,
+    "seconds": 2770.19
+  }
+]

@@ -1,0 +1,54 @@
+{
+  "source": "docs/testing/v0.0.970/confbench/diagnostic/malformed_tool.jsonl",
+  "raw_completion": {
+    "schema_version": 1,
+    "event_id": "worker-event-session-32a82753e5aa49bab3e1b70898fa0ccc-1-66b2acbfdbe6e820da5626a06adcca35-20",
+    "seq": 27,
+    "session_id": "session-32a82753e5aa49bab3e1b70898fa0ccc",
+    "run_id": "run-6d7039818b3a5ee0f4eff9fdd2158140",
+    "device_id": "worker-session-32a82753e5aa49bab3e1b70898fa0ccc-1-66b2acbfdbe6e820da5626a06adcca35",
+    "authority_epoch": 0,
+    "worker_generation": 1,
+    "committed_at_ms": 1788645330230,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "verbatim"
+    },
+    "payload": {
+      "event": "completed",
+      "failed": true,
+      "item": {
+        "args": "{\"command\":",
+        "call_id": "call-1",
+        "item": "tool_call",
+        "name": "process_exec",
+        "status": "failed"
+      },
+      "item_id": "item-session-32a82753e5aa49bab3e1b70898fa0ccc-1-1788645330217-6",
+      "provider_request": {
+        "request_kind": "primary",
+        "request_ordinal": 1,
+        "run_id": "run-6d7039818b3a5ee0f4eff9fdd2158140",
+        "session_id": "session-32a82753e5aa49bab3e1b70898fa0ccc",
+        "turn_ordinal": 1
+      },
+      "reason": "malformed_tool_call",
+      "repaired": true,
+      "type": "item"
+    }
+  },
+  "normalized_events": [
+    {
+      "type": "tool_finished",
+      "raw_index": 0,
+      "rule": "tool-finish",
+      "tool_call_id": "call-1",
+      "tool_name": "process_exec",
+      "status": "failed"
+    }
+  ],
+  "old_malformed_failed_predicate": false,
+  "status_failed_is_preserved": true,
+  "failed_boolean_is_derived": false
+}

@@ -1499,6 +1499,65 @@ fn live_jsonl_and_durable_replay_are_byte_identical_for_text_tool_error_and_canc
 }
 
 #[test]
+fn malformed_attempt_stays_failed_after_successful_repair_in_jsonl_and_replay() {
+    let script = serde_json::json!([
+        {"step":"emit_tool_call_start", "call_id":"bad-1", "name":"fs_read"},
+        {"step":"emit_tool_args_delta", "call_id":"bad-1", "fragment":"{broken"},
+        {"step":"emit_tool_call_end", "call_id":"bad-1"},
+        {"step":"finish", "reason":"tool_use"},
+        {"step":"expect_tool_result", "call_id":"bad-1"},
+        {"step":"emit_tool_call", "call_id":"good-2", "name":"fs_read", "args":{"path":"input.txt"}},
+        {"step":"finish", "reason":"tool_use"},
+        {"step":"expect_tool_result", "call_id":"good-2"},
+        {"step":"emit_text", "text":"repair complete"},
+        {"step":"finish", "reason":"end_turn"}
+    ]);
+    let mut source = haider();
+    std::fs::write(
+        source
+            .profile
+            .parent()
+            .expect("profile parent")
+            .join("workspace/input.txt"),
+        "repair input",
+    )
+    .expect("repair input file");
+    source
+        .args(["run", "--provider", "fake", "--jsonl", "repair the read"])
+        .env("HAIDER_TEST_FAKE_PROVIDER", script.to_string())
+        .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0");
+    let live = output_with_boot_retry(&mut source);
+    assert!(
+        live.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&live.stderr)
+    );
+    let events = parse_jsonl(&live.stdout);
+    let completions = events
+        .iter()
+        .filter(|event| {
+            event.payload["event"] == "completed" && event.payload["item"]["item"] == "tool_call"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(completions.len(), 2, "one completion per distinct attempt");
+    assert_eq!(completions[0].payload["item"]["call_id"], "bad-1");
+    assert_eq!(completions[0].payload["item"]["status"], "failed");
+    assert_eq!(completions[0].payload["failed"], true);
+    assert_eq!(completions[0].payload["reason"], "malformed_tool_call");
+    assert_eq!(completions[0].payload["repaired"], true);
+    assert_eq!(completions[1].payload["item"]["call_id"], "good-2");
+    assert_eq!(completions[1].payload["item"]["status"], "completed");
+    assert!(completions[0].seq < completions[1].seq);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.payload["type"] == "run_failed")
+    );
+    assert_eq!(events.last().expect("terminal").payload["state"], "done");
+    assert_jsonl_replay_raw_parity(&source, &live);
+}
+
+#[test]
 fn replay_is_sealed_at_terminal_before_late_same_run_task_facts() {
     let script = serde_json::json!([
         {

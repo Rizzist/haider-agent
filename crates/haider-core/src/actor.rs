@@ -10217,7 +10217,9 @@ impl HarnessActor {
         {
             // Stamp the durable completion, never a JSONL-only projection:
             // replay and live consumers see the rejected attempt before any
-            // repair request. Keep the existing status and call identity.
+            // repair request. The result's Failed status already supplies
+            // item.status=failed: this attempt failed even if a later one
+            // succeeds. The additive metadata never replaces that status.
             completed
                 .payload
                 .insert_metadata("failed", serde_json::json!(true));

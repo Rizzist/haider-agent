@@ -1,0 +1,37 @@
+{
+  "initial_head": "72364f342fb36bf20f3674e758a7fa8a0e463f85",
+  "ordinary_fetch": "failed: FETCH_HEAD Operation not permitted",
+  "ordinary_merge": "failed: ORIG_HEAD.lock Operation not permitted",
+  "writable_git_dir": "/tmp/confbench-lane.git",
+  "fetch_result": "From https://github.com/Rizzist/haider-agent; branch wave-970 -> FETCH_HEAD",
+  "merge_command": [
+    "git",
+    "--git-dir=/tmp/confbench-lane.git",
+    "--work-tree=/Users/rizzist/haider-run/lane-970-confbench",
+    "merge",
+    "--no-commit",
+    "origin/wave-970"
+  ],
+  "merge_result": "Already up to date.",
+  "merged_upstream": "620fc1ce2faf0344c2d27c172fabe2c2f99bd253",
+  "excluded_supplied_inputs": [
+    "docs/testing/v0.0.970/LANE-COMMON.md",
+    "docs/testing/v0.0.970/LANE-BRIEF-confbench.md",
+    "docs/testing/v0.0.970/turnperf/",
+    "docs/testing/v0.0.970/turnperf2/"
+  ],
+  "pre_full_gate_refresh": {
+    "checked_at_utc": "2026-09-05T22:38:28.178865+00:00",
+    "upstream": "620fc1ce2faf0344c2d27c172fabe2c2f99bd253",
+    "fetch_exit": 0,
+    "merge_exit": 0,
+    "merge_result": "Already up to date."
+  },
+  "post_gate_fetch_and_merge": {
+    "upstream": "620fc1ce2faf0344c2d27c172fabe2c2f99bd253",
+    "fetch_exit": 0,
+    "merge_exit": 0,
+    "merge_result": "Already up to date."
+  },
+  "ordinary_staging": "failed: external worktree index.lock Operation not permitted"
+}

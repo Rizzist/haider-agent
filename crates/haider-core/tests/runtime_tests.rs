@@ -2971,6 +2971,7 @@ async fn malformed_tool_json_is_durable_invalid_result_with_one_repair_continuat
     );
     let (completion_index, completion) = completions[0];
     assert!(result_index < completion_index && completion_index < next_request_index);
+    assert_eq!(completion.payload["item"]["status"], "failed");
     assert_eq!(completion.payload["failed"], true);
     assert_eq!(completion.payload["reason"], "malformed_tool_call");
     assert_eq!(completion.payload["repaired"], true);
@@ -3006,6 +3007,7 @@ async fn second_consecutive_malformed_tool_json_terminates_after_one_repair() {
                 == Some("malformed_tool_call")
         })
         .map(|event| {
+            assert_eq!(event.payload["item"]["status"], "failed");
             assert_eq!(event.payload["failed"], true);
             event.payload["repaired"]
                 .as_bool()

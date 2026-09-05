@@ -40,6 +40,15 @@ JSONL and raw replay preserve identical facts; no serializer invents an error
 or a terminal event. The protocol round-trip and malformed repair runtime
 tests pin compatibility, ordering, single completion and exhausted allowance.
 
+Round-2 conformance pin: the malformed attempt's completed item MUST retain
+`item.status: "failed"`, including when `repaired: true`. A subsequent valid
+call has its own call ID and completion with `item.status: "completed"`.
+Successful repair ends the run with one successful terminal and exit 0, with
+no `run_failed`. `malformed_attempt_stays_failed_after_successful_repair_in_jsonl_and_replay`
+executes both attempts and compares literal live JSONL and durable replay
+bytes. This clarifies and pins existing status semantics; it adds no event kind
+or run-level failure.
+
 ### v0.0.970 — durable tool discovery and slim provider results
 
 `tool_result.result.data` adds `kind: "tools_discovered"` with `promoted`,

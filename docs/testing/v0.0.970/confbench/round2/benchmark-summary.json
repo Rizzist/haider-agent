@@ -1,0 +1,75 @@
+{
+  "baseline-969": {
+    "counts": {
+      "PASS": 18,
+      "FAIL": 1,
+      "SKIPPED": 2
+    },
+    "failures": {
+      "timeout": "state write outside the per-run roots observed"
+    }
+  },
+  "before-970": {
+    "counts": {
+      "PASS": 16,
+      "FAIL": 3,
+      "SKIPPED": 2
+    },
+    "failures": {
+      "malformed_tool_call": "malformed tool call lacked structured failure",
+      "timeout": "state write outside the per-run roots observed",
+      "no_second_model_or_auxiliary_provider": "auxiliary/task probe did not complete through the fixed route"
+    }
+  },
+  "round1": {
+    "counts": {
+      "PASS": 17,
+      "FAIL": 2,
+      "SKIPPED": 2
+    },
+    "failures": {
+      "malformed_tool_call": "malformed tool call lacked structured failure",
+      "timeout": "state write outside the per-run roots observed"
+    }
+  },
+  "round2-first": {
+    "counts": {
+      "PASS": 16,
+      "FAIL": 3,
+      "SKIPPED": 2
+    },
+    "failures": {
+      "malformed_tool_call": "malformed tool call lacked structured failure",
+      "retry_429": "state write outside the per-run roots observed",
+      "timeout": "state write outside the per-run roots observed"
+    }
+  },
+  "round2-repeat": {
+    "counts": {
+      "PASS": 16,
+      "FAIL": 3,
+      "SKIPPED": 2
+    },
+    "failures": {
+      "streamed_text": "state write outside the per-run roots observed",
+      "malformed_tool_call": "malformed tool call lacked structured failure",
+      "timeout": "state write outside the per-run roots observed"
+    }
+  },
+  "round2-final": {
+    "counts": {
+      "PASS": 17,
+      "FAIL": 2,
+      "SKIPPED": 2
+    },
+    "failures": {
+      "malformed_tool_call": "malformed tool call lacked structured failure",
+      "timeout": "state write outside the per-run roots observed"
+    }
+  },
+  "baseline_passing_set_included": false,
+  "baseline_passes_missing": [
+    "malformed_tool_call"
+  ],
+  "acceptance_met": false
+}

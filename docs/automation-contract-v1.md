@@ -558,9 +558,14 @@ There is no `agent.spawn` RPC. A model delegates through the
 `spawn_subagent` tool. Its required arguments are `task` (1–80 bytes) and
 `prompt` (1–32 KiB); optional selectors are `model`, `provider` (only with a
 model), `workflow`, `workflow_trigger`, `parent_slot`, `workflow_author`, and
-`agent_type`. Its advertised JSON schema sets `additionalProperties: false`;
+`agent_type`; `request_budget` sets the child's per-turn request allowance.
+The default provider declaration contains only the required `task` and
+`prompt` fields and inherits the parent's current model/provider pair.
+`list_tools(filter="spawn_subagent")` describes and durably promotes the full
+authorized declaration, including all optional controls. Both declarations
+set `additionalProperties: false`;
 controllers must not send unknown properties
-(`crates/haider-tools/src/spawn_subagent.rs:8-46`, `:115-179`).
+(`crates/haider-tools/src/spawn_subagent.rs:8-47`, `:52-104`, `:123-201`).
 
 Creation is observed as `EventPayload::AgentSpawned(AgentManifest)`; the
 manifest carries the opaque agent ID and its grant/fencing coordinates
@@ -783,7 +788,9 @@ These commands are noninteractive. `spawn` and `run` create a coordinator
 session and delegate one actual child through the daemon's tool engine:
 
 The default coding catalog exposes `spawn_subagent`; no tool-exposure
-environment setting is required. Delegation still obeys the daemon's tool
+environment setting is required. Its compact provider declaration supports
+ordinary task/prompt delegation immediately; tool discovery exposes optional
+controls for model callers. Delegation still obeys the daemon's tool
 and effect grants and lockdown policy. A grant-ceiling refusal returns exit
 70 and typed `spawn_failed` with parent coordinates, without creating a child
 or making a provider request. `HAIDER_TOOL_EXPOSURE` can expose additional

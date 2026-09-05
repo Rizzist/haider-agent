@@ -18,6 +18,51 @@ const CORE_TOOLS: &[&str] = &[
 ];
 const DISCOVERY_ROW_CAP: usize = 8;
 
+/// First-request delegation needs only the ordinary task/prompt contract.
+/// Keep the authorized full definition in the exposure snapshot so discovery
+/// can describe and promote every optional control without losing its schema.
+/// Unfamiliar schemas keep their full definition rather than inventing fields
+/// or dropping constraints that might refer to an optional property.
+fn default_delegation_definition(tool: &ToolDefinition) -> Option<ToolDefinition> {
+    if tool.name != "spawn_subagent" {
+        return None;
+    }
+    let schema = tool.input_schema.as_object()?;
+    if schema.get("type")?.as_str() != Some("object")
+        || schema.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "type" | "properties" | "required" | "additionalProperties"
+            )
+        })
+    {
+        return None;
+    }
+    let required = schema.get("required")?.as_array()?;
+    if required.len() != 2
+        || !["task", "prompt"]
+            .iter()
+            .all(|name| required.iter().any(|value| value.as_str() == Some(*name)))
+    {
+        return None;
+    }
+    let properties = schema.get("properties")?.as_object()?;
+    let task = properties.get("task")?;
+    let prompt = properties.get("prompt")?;
+    if task.get("type")?.as_str() != Some("string")
+        || prompt.get("type")?.as_str() != Some("string")
+    {
+        return None;
+    }
+    let mut definition = tool.clone();
+    definition.description = "Delegate one bounded task to a depth-capped child under AgentSpawn policy; waits for child report. Inherits the current model/provider. Call list_tools(filter=\"spawn_subagent\") for optional model/provider, workflow, specialist, and request-budget controls.".into();
+    definition.input_schema["properties"] = serde_json::json!({
+        "task": task,
+        "prompt": prompt,
+    });
+    Some(definition)
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ToolExposure {
     promoted: BTreeSet<String>,
@@ -88,7 +133,15 @@ impl HarnessConfig {
                     CORE_TOOLS.contains(&tool.name.as_str())
                         || exposure.promoted.contains(&tool.name)
                 })
-                .cloned()
+                .map(|tool| {
+                    if !exposure.promoted.contains(&tool.name)
+                        && let Some(default) = default_delegation_definition(tool)
+                    {
+                        default
+                    } else {
+                        tool.clone()
+                    }
+                })
                 .collect::<Vec<_>>()
                 .into()
         };
