@@ -960,13 +960,24 @@ pub(super) async fn run_session_actor(
                         head = last.seq;
                         authority_epoch = last.authority_epoch;
                     }
-                    if crate::worker::turn_trace_enabled() {
-                        let trace = TurnTraceContext::new(turn_trace_ordinal(
-                            &accepted.session_id,
-                            accepted.accepted_seq,
-                        ));
+                    if crate::worker::turn_trace_enabled()
+                        && matches!(
+                            accepted.disposition,
+                            haider_core::TurnAdmissionDisposition::Started
+                                | haider_core::TurnAdmissionDisposition::Queued
+                        )
+                    {
+                        let trace = TurnTraceContext::new(
+                            accepted.session_id.clone(),
+                            accepted.run_id.clone(),
+                            accepted.turn_ordinal,
+                        );
                         trace.emit("accept", 0, 0, 0, 0);
-                        register_turn_trace(accepted.run_id.clone(), trace);
+                        register_turn_trace(
+                            accepted.session_id.clone(),
+                            accepted.run_id.clone(),
+                            trace,
+                        );
                     }
                     observer.observe(HubObservation::Persisted {
                         session_id: session_id.clone(),

@@ -1363,6 +1363,165 @@ async fn custom_no_auth_get_and_post_have_no_credential_headers() {
         .expect("chat POST request");
     assert!(!post.headers().contains_key(AUTHORIZATION));
     assert!(!post.headers().contains_key("api-key"));
+
+    let attempt = haider_protocol::cache::ProviderRequestAttemptV1 {
+        session_id: haider_protocol::ids::SessionId::new("session-compatible"),
+        run_id: haider_protocol::ids::RunId::new("run-compatible"),
+        turn_ordinal: 8,
+        request_ordinal: 2,
+        request_kind: haider_protocol::cache::ProviderRequestKind::Primary,
+    };
+    let correlated = crate::scope_provider_request(
+        attempt,
+        crate::RequestMetadataBodySupport::Unsupported,
+        provider.http.post_json_body_request(
+            &provider.chat_url,
+            serialized_json_body(serde_json::json!({"model":"llama3.1:8b"})),
+        ),
+    )
+    .await
+    .expect("correlated chat POST request");
+    assert_eq!(
+        correlated.headers()[crate::HAIDER_TURN_HEADER],
+        "session-compatible/run-compatible/8/2"
+    );
+    assert_eq!(
+        correlated.headers()[crate::HAIDER_REQUEST_KIND_HEADER],
+        "primary"
+    );
+    let baseline_body = post
+        .body()
+        .expect("baseline request body")
+        .as_bytes()
+        .expect("baseline request byte body");
+    let correlated_body = correlated
+        .body()
+        .expect("correlated request body")
+        .as_bytes()
+        .expect("correlated request byte body");
+    assert_eq!(baseline_body, correlated_body);
+    let expected_body = correlated_body.to_vec();
+    let ledger = crate::capture_in_fake_proxy_ledger(correlated).await;
+    assert_eq!(
+        ledger.headers.get("x-haider-turn").map(String::as_str),
+        Some("session-compatible/run-compatible/8/2")
+    );
+    assert_eq!(
+        ledger
+            .headers
+            .get("x-haider-request-kind")
+            .map(String::as_str),
+        Some("primary")
+    );
+    assert_eq!(ledger.body, expected_body);
+}
+
+#[test]
+fn native_openai_declares_opt_in_metadata_support_but_compatibles_do_not() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("metadata-support");
+    vault.put(&alias, b"audit-key").expect("stores audit key");
+    let native = OpenAiProvider::new(
+        vault.resolve(&alias).expect("resolves native key"),
+        "gpt-audit",
+    )
+    .expect("native provider");
+    assert_eq!(
+        Provider::request_metadata_body_support(&native),
+        crate::RequestMetadataBodySupport::Supported
+    );
+    let compatible = OpenAiCompatibleProvider::new_custom_no_auth(
+        vault
+            .resolve(&alias)
+            .expect("resolves compatible placeholder"),
+        "model",
+        "http://127.0.0.1:11434",
+    )
+    .expect("compatible provider");
+    assert_eq!(
+        Provider::request_metadata_body_support(&compatible),
+        crate::RequestMetadataBodySupport::Unsupported
+    );
+}
+
+#[tokio::test]
+async fn native_openai_request_has_locked_correlation_headers_without_body_mutation() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("native-correlation");
+    vault
+        .put(&alias, b"native-correlation-key")
+        .expect("stores native key");
+    let provider = OpenAiProvider::new(
+        vault.resolve(&alias).expect("resolves native key"),
+        "gpt-audit",
+    )
+    .expect("native provider");
+    let body = serialized_json_body(serde_json::json!({
+        "model": "gpt-audit",
+        "input": []
+    }));
+    let baseline = provider
+        .http
+        .json_request_builder(&provider.api_url)
+        .expect("baseline builder")
+        .body(body.clone())
+        .build()
+        .expect("baseline request");
+    let attempt = haider_protocol::cache::ProviderRequestAttemptV1 {
+        session_id: haider_protocol::ids::SessionId::new("session-native"),
+        run_id: haider_protocol::ids::RunId::new("run-native"),
+        turn_ordinal: 9,
+        request_ordinal: 3,
+        request_kind: haider_protocol::cache::ProviderRequestKind::Side,
+    };
+    let correlated = crate::scope_provider_request(
+        attempt,
+        crate::RequestMetadataBodySupport::Supported,
+        async {
+            provider
+                .http
+                .json_request_builder(&provider.api_url)
+                .expect("correlated builder")
+                .body(body)
+                .build()
+                .expect("correlated request")
+        },
+    )
+    .await;
+
+    assert_eq!(
+        correlated.headers()[crate::HAIDER_TURN_HEADER],
+        "session-native/run-native/9/3"
+    );
+    assert_eq!(
+        correlated.headers()[crate::HAIDER_REQUEST_KIND_HEADER],
+        "side"
+    );
+    let baseline_body = baseline
+        .body()
+        .expect("baseline request body")
+        .as_bytes()
+        .expect("baseline request byte body");
+    let correlated_body = correlated
+        .body()
+        .expect("correlated request body")
+        .as_bytes()
+        .expect("correlated request byte body");
+    assert_eq!(baseline_body, correlated_body);
+    let expected_body = correlated_body.to_vec();
+    let ledger = crate::capture_in_fake_proxy_ledger(correlated).await;
+    assert_eq!(
+        ledger.headers.get("x-haider-turn").map(String::as_str),
+        Some("session-native/run-native/9/3")
+    );
+    assert_eq!(
+        ledger
+            .headers
+            .get("x-haider-request-kind")
+            .map(String::as_str),
+        Some("side")
+    );
+    assert_eq!(ledger.body, expected_body);
 }
 
 fn custom_provider_with_resolver(

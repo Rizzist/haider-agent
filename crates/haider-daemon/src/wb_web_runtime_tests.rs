@@ -122,6 +122,7 @@ impl ProviderFactory for FixedProviderFactory {
 #[derive(Default)]
 struct StubWebSearch {
     calls: Mutex<Vec<(String, String, String)>>,
+    attempts: Mutex<Vec<haider_protocol::cache::ProviderRequestAttemptV1>>,
     answers: Mutex<VecDeque<Result<String, WebSearchFailure>>>,
 }
 
@@ -129,12 +130,20 @@ impl StubWebSearch {
     fn with_answers(answers: Vec<Result<String, WebSearchFailure>>) -> Arc<Self> {
         Arc::new(Self {
             calls: Mutex::new(Vec::new()),
+            attempts: Mutex::new(Vec::new()),
             answers: Mutex::new(answers.into()),
         })
     }
 
     fn calls(&self) -> Vec<(String, String, String)> {
         self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn attempts(&self) -> Vec<haider_protocol::cache::ProviderRequestAttemptV1> {
+        self.attempts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -148,11 +157,16 @@ impl WebSearchExecutor for StubWebSearch {
         model: &str,
         session_id: &str,
         query: &str,
+        attempt: &haider_protocol::cache::ProviderRequestAttemptV1,
     ) -> Result<String, WebSearchFailure> {
         self.calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push((model.to_owned(), session_id.to_owned(), query.to_owned()));
+        self.attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(attempt.clone());
         self.answers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -686,10 +700,46 @@ async fn live_web_search_executes_on_lite_with_the_turn_identity_and_bounds_its_
             "rust sse decoding".to_owned(),
         )]
     );
+    let attempts = executor.attempts();
+    let [attempt] = attempts.as_slice() else {
+        panic!("one web-search side attempt expected");
+    };
+    assert_eq!(attempt.session_id.as_str(), "wb-search-session");
+    assert_eq!(attempt.turn_ordinal, 1);
+    assert_eq!(attempt.request_ordinal, 2);
+    assert_eq!(
+        attempt.request_kind,
+        haider_protocol::cache::ProviderRequestKind::Side
+    );
 
-    let result = world
-        .typed_payloads()
-        .await
+    let payloads = world.typed_payloads().await;
+    assert!(payloads.iter().any(|payload| {
+        let EventPayload::Item(haider_protocol::item::ItemEvent::Completed { item, .. }) = payload
+        else {
+            return false;
+        };
+        haider_protocol::cache::ProviderRequestAttemptV1::try_from_extension_item(item)
+            .is_ok_and(|recorded| recorded.as_ref() == Some(attempt))
+    }));
+    let primary_ordinals = payloads
+        .iter()
+        .filter_map(|payload| {
+            let EventPayload::Item(haider_protocol::item::ItemEvent::Completed { item, .. }) =
+                payload
+            else {
+                return None;
+            };
+            haider_protocol::cache::CacheRequestAttemptV1::from_extension_item(item)
+                .and_then(|marker| marker.correlation)
+                .filter(|attempt| {
+                    attempt.request_kind == haider_protocol::cache::ProviderRequestKind::Primary
+                })
+                .map(|attempt| attempt.request_ordinal)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(primary_ordinals, vec![1, 3]);
+
+    let result = payloads
         .into_iter()
         .find_map(|payload| match payload {
             EventPayload::ToolResult { call_id, result } if call_id == "search-one" => Some(result),

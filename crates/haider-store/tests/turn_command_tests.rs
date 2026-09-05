@@ -147,6 +147,7 @@ fn r2_09_admission_decisions_match_durable_receipt_replay() {
     assert!(metadata.fast);
 
     let spec = HeadlessRunSpecV1 {
+        continuation_of: None,
         cwd: metadata.cwd.clone(),
         provider: metadata.provider.clone(),
         model: metadata.model.clone(),
@@ -157,6 +158,7 @@ fn r2_09_admission_decisions_match_durable_receipt_replay() {
         permission_overrides: permissions,
         trust_hooks: false,
         budget: RunBudgetV1 {
+            request_budget: None,
             max_tokens: Some(123),
             max_cost_microusd: Some(456),
             max_time_ms: Some(789),
@@ -855,4 +857,98 @@ fn aggregate_idle_is_skipped_when_a_new_run_is_durably_active() {
             SessionState::ActiveRun
         ))
     ));
+}
+
+/// A resumed allowance consumes the terminal checkpoint inside the receipt
+/// transaction. Concurrent/stale requests cannot silently queue another run.
+#[test]
+fn budget_continuation_survives_reopen_and_is_consumed_once_at_admission() {
+    use haider_protocol::ids::ItemId;
+    use haider_protocol::item::ItemEvent;
+    use haider_protocol::request_budget::{
+        RequestBudgetContinuationV1, RequestBudgetPhaseV1, RequestBudgetStatusV1, RequestBudgetV1,
+    };
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    let session = SessionId::new("budget-continuation");
+    create(&store, &session);
+    let first = store
+        .accept_turn(&submit(&store, "source", &session, "source-run"))
+        .expect("source accepted");
+    let TurnAcceptOutcome::Committed { envelopes, .. } = first else {
+        panic!("fresh receipt")
+    };
+    let template = envelopes[0].clone();
+    let mut continuation = submit(&store, "continuation", &session, "continued-run");
+    let spec = serde_json::json!({
+        "cwd":"/tmp", "provider":"fake", "model":"fake-v1", "max_output_tokens":4096,
+        "budget":{}, "continuation_of":"source-run"
+    });
+    continuation.request_json = serde_json::json!({"headless":spec}).to_string();
+    assert_eq!(
+        store
+            .accept_turn(&continuation)
+            .expect_err("live checkpoint is not consumable")
+            .code,
+        haider_protocol::error::ErrorCode::InvalidArgument
+    );
+    let mut terminal = template.clone();
+    terminal.seq = 0;
+    terminal.event_id = EventId::new("source-terminal");
+    terminal.payload = serde_json::to_value(EventPayload::RunState(RunState::Done))
+        .expect("terminal")
+        .into();
+    let status = RequestBudgetStatusV1 {
+        used: 32,
+        budget: RequestBudgetV1::default(),
+        phase: RequestBudgetPhaseV1::SoftBound,
+        continuation: RequestBudgetContinuationV1 {
+            session_id: session.clone(),
+            run_id: RunId::new("source-run"),
+            branch_id: None,
+            agent_id: None,
+        },
+    };
+    // Seed the durable marker before the source terminal.
+    let item = status.to_extension_item().expect("status item");
+    let mut marker = template;
+    marker.seq = 0;
+    marker.event_id = EventId::new("budget-checkpoint-fixture");
+    marker.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+        item_id: ItemId::new("budget-checkpoint"),
+        item,
+    }))
+    .expect("marker")
+    .into();
+    let mut started = marker.clone();
+    started.event_id = EventId::new("budget-checkpoint-started");
+    started.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Started {
+        item_id: ItemId::new("budget-checkpoint"),
+        item: status.to_extension_item().expect("started status"),
+    }))
+    .expect("started")
+    .into();
+    store
+        .append(&mut [started, marker, terminal])
+        .expect("checkpoint append");
+    drop(store);
+    let store = Store::open(root.path()).expect("reopen durable store");
+    continuation.worker_generation = store.worker_generation();
+    assert!(matches!(
+        store.accept_turn(&continuation).expect("resume accepted"),
+        TurnAcceptOutcome::Committed { .. }
+    ));
+    assert!(matches!(
+        store
+            .accept_turn(&continuation)
+            .expect("lost response receipt replays"),
+        TurnAcceptOutcome::IdempotentReplay { .. }
+    ));
+    let mut duplicate = continuation.clone();
+    duplicate.command_id = "second-continuation".into();
+    duplicate.run_id = RunId::new("duplicate-run");
+    assert!(
+        store.accept_turn(&duplicate).is_err(),
+        "second allowance cannot queue behind the resumed run"
+    );
 }

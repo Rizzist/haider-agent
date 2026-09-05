@@ -1,6 +1,6 @@
 //! Cache-epoch policy and visible transition facts (CM3).
 
-use crate::ids::SessionId;
+use crate::ids::{RunId, SessionId};
 use crate::item::TurnItem;
 use crate::provider::CacheRequestDiagnosticV1;
 use crate::reply::ReplyText;
@@ -19,6 +19,28 @@ pub const CACHE_EPOCH_TRANSITION_EXTENSION_KIND: &str = "cache_epoch_transition_
 /// provider request. It preserves hashes even when opening or streaming the
 /// request fails before the provider can report usage.
 pub const CACHE_REQUEST_ATTEMPT_EXTENSION_KIND: &str = "cache_request_attempt_v1";
+
+/// Stable hidden marker for a turn-owned provider-side request that has no
+/// model prompt/cache diagnostic (currently subscription web search).
+pub const PROVIDER_REQUEST_ATTEMPT_EXTENSION_KIND: &str = "provider_request_attempt_v1";
+
+/// Additive raw-payload family that reserves a durable session turn identity
+/// for provider inference which is not a conversation run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderOperationEventPayload {
+    ProviderOperationReserved { request_kind: ProviderRequestKind },
+}
+
+impl ProviderOperationEventPayload {
+    pub fn to_payload_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(self)
+    }
+
+    pub fn from_payload_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(value)
+    }
+}
 
 /// Stable hidden extension kind for the exact, provider-rendered cacheable
 /// view written immediately before a physical provider request.
@@ -439,7 +461,91 @@ impl ProviderViewAttemptV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheRequestAttemptV1 {
     pub ordinal: u64,
+    /// Additive v0.0.970 transport identity. Legacy rows omit it; every new
+    /// turn-owned provider attempt must populate it and match `ordinal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<ProviderRequestAttemptV1>,
     pub diagnostic: CacheRequestDiagnosticV1,
+}
+
+/// Benchmark-visible classification of one physical provider request.
+///
+/// `Warmup` is reserved for an explicitly unmeasured warm-up request. Normal
+/// turn traffic must use `Primary` or `Side`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRequestKind {
+    Primary,
+    Side,
+    Warmup,
+}
+
+impl ProviderRequestKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Side => "side",
+            Self::Warmup => "warmup",
+        }
+    }
+}
+
+/// Exact, content-free identity shared by the provider HTTP headers, journal,
+/// and opt-in daemon trace for one physical request attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRequestAttemptV1 {
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub turn_ordinal: u64,
+    pub request_ordinal: u64,
+    pub request_kind: ProviderRequestKind,
+}
+
+impl ProviderRequestAttemptV1 {
+    /// Locked AHRB value for `X-Haider-Turn`.
+    #[must_use]
+    pub fn turn_id(&self) -> String {
+        format!(
+            "{}/{}/{}/{}",
+            self.session_id, self.run_id, self.turn_ordinal, self.request_ordinal
+        )
+    }
+
+    /// The slash-delimited header is ambiguous if either opaque ID contains
+    /// its delimiter; zero ordinals are outside the public contract.
+    #[must_use]
+    pub fn coordinates_valid(&self) -> bool {
+        fn component_is_header_safe(value: &str) -> bool {
+            !value.is_empty()
+                && value.len() <= 256
+                && value
+                    .bytes()
+                    .all(|byte| matches!(byte, b'!'..=b'~') && byte != b'/')
+        }
+
+        self.turn_ordinal != 0
+            && self.request_ordinal != 0
+            && component_is_header_safe(self.session_id.as_str())
+            && component_is_header_safe(self.run_id.as_str())
+    }
+
+    pub fn extension_item(&self) -> Result<TurnItem, serde_json::Error> {
+        Ok(TurnItem::Extension {
+            kind: PROVIDER_REQUEST_ATTEMPT_EXTENSION_KIND.to_owned(),
+            data: serde_json::to_value(self)?,
+        })
+    }
+
+    pub fn try_from_extension_item(item: &TurnItem) -> Result<Option<Self>, serde_json::Error> {
+        let TurnItem::Extension { kind, data } = item else {
+            return Ok(None);
+        };
+        if kind != PROVIDER_REQUEST_ATTEMPT_EXTENSION_KIND {
+            return Ok(None);
+        }
+        serde_json::from_value(data.clone()).map(Some)
+    }
 }
 
 impl CacheRequestAttemptV1 {
@@ -452,12 +558,17 @@ impl CacheRequestAttemptV1 {
 
     #[must_use]
     pub fn from_extension_item(item: &TurnItem) -> Option<Self> {
+        Self::try_from_extension_item(item).ok().flatten()
+    }
+
+    pub fn try_from_extension_item(item: &TurnItem) -> Result<Option<Self>, serde_json::Error> {
         let TurnItem::Extension { kind, data } = item else {
-            return None;
+            return Ok(None);
         };
-        (kind == CACHE_REQUEST_ATTEMPT_EXTENSION_KIND)
-            .then(|| serde_json::from_value(data.clone()).ok())
-            .flatten()
+        if kind != CACHE_REQUEST_ATTEMPT_EXTENSION_KIND {
+            return Ok(None);
+        }
+        serde_json::from_value(data.clone()).map(Some)
     }
 }
 
@@ -595,7 +706,12 @@ impl CacheEpochTransitionV1 {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod incremental_provider_view_tests {
-    use super::{ProviderViewBlobSegmentV1, ProviderViewBlobV1, ProviderViewBlockRefV1};
+    use super::{
+        CacheRequestAttemptV1, ProviderRequestAttemptV1, ProviderRequestKind,
+        ProviderViewBlobSegmentV1, ProviderViewBlobV1, ProviderViewBlockRefV1,
+    };
+    use crate::ids::{RunId, SessionId};
+    use crate::item::TurnItem;
     use crate::reply::ReplyArenaWriter;
 
     #[test]
@@ -642,5 +758,48 @@ mod incremental_provider_view_tests {
         .expect_err("an unseeded streamed shape must fail closed");
 
         assert!(error.to_string().contains("incremental digest candidate"));
+    }
+
+    #[test]
+    fn request_attempt_extensions_are_strict_while_legacy_cache_markers_still_decode() {
+        let attempt = ProviderRequestAttemptV1 {
+            session_id: SessionId::new("session-marker"),
+            run_id: RunId::new("run-marker"),
+            turn_ordinal: 9,
+            request_ordinal: 2,
+            request_kind: ProviderRequestKind::Side,
+        };
+        assert_eq!(
+            ProviderRequestAttemptV1::try_from_extension_item(
+                &attempt.extension_item().expect("standalone marker")
+            )
+            .expect("strict marker decodes"),
+            Some(attempt)
+        );
+
+        let legacy = TurnItem::Extension {
+            kind: super::CACHE_REQUEST_ATTEMPT_EXTENSION_KIND.to_owned(),
+            data: serde_json::json!({
+                "ordinal": 1,
+                "diagnostic": {
+                    "history_message_count":0,
+                    "stable_prefix_tokens":0,
+                    "breakpoint_hashes": {"system":"s","tools":"t","history":"h"},
+                    "prefix_match":{"state":"unavailable"},
+                    "control":{"state":"unavailable"}
+                }
+            }),
+        };
+        let decoded = CacheRequestAttemptV1::try_from_extension_item(&legacy)
+            .expect("legacy marker remains decodable")
+            .expect("cache marker");
+        assert_eq!(decoded.ordinal, 1);
+        assert!(decoded.correlation.is_none());
+
+        let malformed = TurnItem::Extension {
+            kind: super::PROVIDER_REQUEST_ATTEMPT_EXTENSION_KIND.to_owned(),
+            data: serde_json::json!({"session_id":"session-marker"}),
+        };
+        assert!(ProviderRequestAttemptV1::try_from_extension_item(&malformed).is_err());
     }
 }

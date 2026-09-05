@@ -46,6 +46,23 @@ pub struct AgentManifest {
 }
 
 impl AgentManifest {
+    /// Request policy frozen at child creation. Legacy manifests use the
+    /// normal default; malformed persisted policy is an error, never an
+    /// invitation to silently raise the child's limits.
+    pub fn request_budget(&self) -> Result<Option<crate::request_budget::RequestBudgetV1>, String> {
+        let Some(value) = self
+            .coordinates
+            .as_ref()
+            .and_then(|coordinates| coordinates.get("request_budget"))
+        else {
+            return Ok(None);
+        };
+        let budget: crate::request_budget::RequestBudgetV1 =
+            serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+        budget.validate()?;
+        Ok(Some(budget))
+    }
+
     /// Spawn-time provider display coordinate carried by new delegation
     /// manifests. The child session's typed metadata remains execution
     /// authority; this accessor centralizes the additive legacy-coordinate

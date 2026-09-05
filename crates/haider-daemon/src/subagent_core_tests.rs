@@ -584,6 +584,10 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         auto_hermetic: false,
     };
     let request = SpawnSubagent {
+        request_budget: Some(haider_protocol::request_budget::RequestBudgetV1 {
+            tranche: 40,
+            hard_cap: 96,
+        }),
         task: "test branch pin".into(),
         prompt: "report after branch switch".into(),
         model: None,
@@ -611,6 +615,16 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         .expect("parent delegations");
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].parent_branch_id, Some(parent_branch));
+    assert_eq!(
+        records[0]
+            .manifest
+            .request_budget()
+            .expect("valid persisted policy"),
+        Some(haider_protocol::request_budget::RequestBudgetV1 {
+            tranche: 40,
+            hard_cap: 96
+        })
+    );
     let child_events = store
         .read(&records[0].child_session_id, 0, 128)
         .await
@@ -982,6 +996,7 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
                 },
             },
             SpawnSubagent {
+                request_budget: None,
                 task: "parser audit".into(),
                 prompt: "inspect the parser state machine".into(),
                 model: None,
@@ -1232,6 +1247,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                 },
             },
             SpawnSubagent {
+                request_budget: None,
                 task: "first pass".into(),
                 prompt: "finish once".into(),
                 model: None,
@@ -1281,6 +1297,9 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             },
             store: parent_lease,
             run_id: parent_run.clone(),
+            turn_ordinal: 1,
+            provider_request_ordinals: haider_provider::ProviderRequestOrdinal::new(0),
+            turn_trace: None,
             run_deadline: None,
             branch_id: None,
             device_id: DeviceId::new("message-idle-tool-device"),
@@ -1376,6 +1395,229 @@ async fn message_subagent_starts_an_idle_child_immediately() {
     store.close().await.expect("store close");
 }
 
+/// A hard-bound child retains its session, prompt history and frozen policy.
+/// MUTATION CHECK: restart the child session or drop terminal tool history and
+/// the scripted provider cannot find its prior tool result on the follow-up.
+#[tokio::test]
+async fn message_subagent_resumes_hard_bound_child_with_retained_tool_history() {
+    use haider_protocol::ids::ItemId;
+
+    let root = tempfile::tempdir().expect("temp profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = std::fs::canonicalize(workspace.path())
+        .expect("canonical workspace")
+        .to_string_lossy()
+        .into_owned();
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    std::fs::write(
+        std::path::Path::new(&workspace).join("checkpoint.txt"),
+        "retained tool evidence",
+    )
+    .expect("write fixture");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "checkpointed partial work".into(),
+        },
+        FakeStep::EmitToolCall {
+            call_id: "budget-child-read".into(),
+            name: "fs_read".into(),
+            args: serde_json::json!({"path":"checkpoint.txt"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "budget-child-read".into(),
+        },
+        FakeStep::EmitText {
+            text: "continued without rereading".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: provider.clone(),
+            }),
+            tool_factory: Arc::new(BrokerToolFactory),
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let parent_session = SessionId::new("message-budget-parent");
+    let parent_run = RunId::new("message-budget-parent-run");
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-message-budget-parent".into(),
+        request_digest: "create-message-budget-parent-digest".into(),
+        request_json: r#"{"session":"message-budget-parent"}"#.into(),
+        session_id: parent_session.clone(),
+        cwd: workspace.clone(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("created-message-budget-parent"),
+        device_id: DeviceId::new("message-budget-device"),
+    })
+    .await
+    .expect("create parent");
+    terminalize_test_parent(&hub, &parent_session, &parent_run, "message-budget").await;
+    let delegation = DelegationHandle::new(hub.clone());
+    let established = delegation
+        .establish(
+            SpawnCoordinates {
+                parent_session_id: parent_session.clone(),
+                parent_run_id: parent_run.clone(),
+                parent_branch_id: None,
+                parent_agent_id: None,
+                tool_item_id: ItemId::new("message-budget-spawn-item"),
+                call_id: "message-budget-spawn-call".into(),
+                agent_type: None,
+                lockdown: false,
+                auto_hermetic: false,
+                metadata: SessionMetadataV1 {
+                    cwd: workspace.clone(),
+                    provider: "fake".into(),
+                    account_alias: None,
+                    model: "fake-model".into(),
+                    max_tokens: 4096,
+                    system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
+                    permission_overrides: None,
+                    interaction_mode: Default::default(),
+                    title: None,
+                    effort: None,
+                    fast: false,
+                    cache_policy: Default::default(),
+                    context_economy: Default::default(),
+                    created_at_ms: 1,
+                    agent_type: None,
+                },
+            },
+            SpawnSubagent {
+                request_budget: Some(haider_protocol::request_budget::RequestBudgetV1 {
+                    tranche: 1,
+                    hard_cap: 1,
+                }),
+                task: "first pass".into(),
+                prompt: "finish once".into(),
+                model: None,
+                provider: None,
+                workflow: None,
+                workflow_trigger: None,
+                parent_slot: None,
+                workflow_author: false,
+                agent_type: None,
+            },
+        )
+        .await
+        .expect("establish child");
+    let child_record = hub
+        .delegation(established.ticket.manifest.agent.clone())
+        .await
+        .expect("delegation lookup")
+        .expect("delegation row");
+    let child_session = child_record.child_session_id.clone();
+    delegation
+        .launch(&established)
+        .await
+        .expect("launch bounded child");
+    wait_for_state(&store, &child_session, |state| *state == RunState::Errored).await;
+    let first_events = store
+        .read(&child_session, 0, 1024)
+        .await
+        .expect("child journal");
+    assert!(first_events.iter().any(|event| matches!(
+        event.payload.decode_event(),
+        Ok(EventPayload::RunFailed {
+            code: ErrorCode::RequestBudgetExceeded,
+            ..
+        })
+    )));
+    assert_eq!(provider.requests().len(), 1);
+
+    let receipt = delegation
+        .message(
+            MessageCoordinates {
+                parent_session_id: parent_session,
+                parent_agent_id: None,
+                command_id: "message-budget-resume".into(),
+            },
+            MessageSubagent {
+                agent: established.ticket.manifest.agent.clone(),
+                message: "Continue from the preserved checkpoint and tool result.".into(),
+            },
+        )
+        .await
+        .expect("message bounded child");
+    assert_eq!(receipt.delivery, AgentMessageDelivery::DeliveredQueued);
+    assert_ne!(receipt.child_run_id, child_record.child_run_id);
+    wait_for_state(&store, &child_session, |state| *state == RunState::Done).await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|message| message.blocks.iter().any(
+                |block| matches!(block, Block::Text { text } if text == "checkpointed partial work")
+            ))
+    );
+    assert!(requests[1].messages.iter().any(|message| message.blocks.iter().any(|block|
+        matches!(block, Block::ToolResult { call_id, preview, .. } if call_id == "budget-child-read" && preview.contains("retained tool evidence"))
+    )));
+    let events = store
+        .read(&child_session, 0, 1024)
+        .await
+        .expect("continued journal");
+    let resumed_budget = events
+        .iter()
+        .find_map(|event| {
+            if event.run_id.as_ref() != Some(&receipt.child_run_id) {
+                return None;
+            }
+            let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
+                event.payload.decode_event()
+            else {
+                return None;
+            };
+            haider_protocol::request_budget::RequestBudgetStatusV1::from_extension_item(&item)
+        })
+        .expect("continued turn has its own typed budget");
+    assert_eq!(
+        resumed_budget.phase,
+        haider_protocol::request_budget::RequestBudgetPhaseV1::Progress
+    );
+    assert_eq!(resumed_budget.used, 1);
+    assert_eq!(
+        resumed_budget.budget.hard_cap, 1,
+        "child policy survives continuation"
+    );
+    assert_eq!(resumed_budget.continuation.session_id, child_session);
+    assert_eq!(
+        resumed_budget.continuation.agent_id,
+        Some(established.ticket.manifest.agent)
+    );
+    assert_eq!(events.iter().filter(|event| matches!(
+        event.payload.decode_event(),
+        Ok(EventPayload::Item(ItemEvent::Completed { item: TurnItem::ToolCall { call_id, .. }, .. })) if call_id == "budget-child-read"
+    )).count(), 1, "completed tool is not repeated");
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 /// MUTATION CHECK: authorize by target id alone or by ancestry instead of
 /// exact direct ownership. Expected RUNTIME failure: the foreign parent call
 /// succeeds or loses the typed `not_owned_child` detail.
@@ -1443,6 +1685,7 @@ async fn only_own_children_are_messageable_with_typed_error() {
                 },
             },
             SpawnSubagent {
+                request_budget: None,
                 task: "owned child".into(),
                 prompt: "do not cross parents".into(),
                 model: None,
@@ -1823,6 +2066,27 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
     assert!(child_events.iter().all(|event| {
         event.run_id.as_ref() != Some(&delegation.child_run_id)
             || event.agent_id.as_ref() == Some(&spawned.agent)
+    }));
+    let child_attempts = child_events
+        .iter()
+        .filter(|event| event.run_id.as_ref() == Some(&delegation.child_run_id))
+        .filter_map(|event| match event.payload.decode_event().ok()? {
+            EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                haider_protocol::cache::CacheRequestAttemptV1::from_extension_item(&item)
+                    .and_then(|attempt| attempt.correlation)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !child_attempts.is_empty(),
+        "delegated provider attempt is journaled"
+    );
+    assert!(child_attempts.iter().all(|attempt| {
+        attempt.session_id == delegation.child_session_id
+            && attempt.run_id == delegation.child_run_id
+            && attempt.turn_ordinal == 1
+            && attempt.request_kind == haider_protocol::cache::ProviderRequestKind::Side
     }));
 
     // OWNER DIRECTIVE (W6d): delegation is AUTOMATIC — the child is
@@ -3022,8 +3286,13 @@ async fn durable_parent_answer_replays_into_child_after_coordinator_restart() {
         match work {
             RecoveredWork::ChildWait(recovered) => {
                 recovered_parent = true;
+                assert_eq!(recovered.provider_request_ordinal, 1);
                 manager_handle
-                    .recover_child_wait(recovered.accepted, recovered.checkpoint)
+                    .recover_child_wait(
+                        recovered.accepted,
+                        recovered.checkpoint,
+                        recovered.provider_request_ordinal,
+                    )
                     .await
                     .expect("recover parent child wait");
             }
@@ -3036,16 +3305,17 @@ async fn durable_parent_answer_replays_into_child_after_coordinator_restart() {
                         recovered.accepted,
                         recovered.checkpoint,
                         recovered.committed_answer,
+                        recovered.provider_request_ordinal,
                     )
                     .await
                     .expect("recover child input checkpoint");
             }
-            RecoveredWork::Queued(accepted) => manager_handle
-                .recover_queued(accepted)
+            RecoveredWork::Queued(recovered) => manager_handle
+                .recover_queued(recovered.accepted, recovered.provider_request_ordinal)
                 .await
                 .expect("recover queued work"),
-            RecoveredWork::Retry(accepted) => manager_handle
-                .recover_retry(accepted)
+            RecoveredWork::Retry(recovered) => manager_handle
+                .recover_retry(recovered.accepted, recovered.provider_request_ordinal)
                 .await
                 .expect("recover retry work"),
             RecoveredWork::PartialStream(recovered) => manager_handle
@@ -3053,6 +3323,7 @@ async fn durable_parent_answer_replays_into_child_after_coordinator_restart() {
                     recovered.accepted,
                     recovered.checkpoint,
                     recovered.committed_answer,
+                    recovered.provider_request_ordinal,
                 )
                 .await
                 .expect("recover partial stream"),
@@ -4584,17 +4855,22 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
         match work {
             RecoveredWork::ChildWait(recovered) => {
                 resumed_parent = true;
+                assert_eq!(recovered.provider_request_ordinal, 1);
                 manager_handle
-                    .recover_child_wait(recovered.accepted, recovered.checkpoint)
+                    .recover_child_wait(
+                        recovered.accepted,
+                        recovered.checkpoint,
+                        recovered.provider_request_ordinal,
+                    )
                     .await
                     .expect("resume parent child wait");
             }
-            RecoveredWork::Queued(accepted) => manager_handle
-                .recover_queued(accepted)
+            RecoveredWork::Queued(recovered) => manager_handle
+                .recover_queued(recovered.accepted, recovered.provider_request_ordinal)
                 .await
                 .expect("recover queued work"),
-            RecoveredWork::Retry(accepted) => manager_handle
-                .recover_retry(accepted)
+            RecoveredWork::Retry(recovered) => manager_handle
+                .recover_retry(recovered.accepted, recovered.provider_request_ordinal)
                 .await
                 .expect("recover retry work"),
             RecoveredWork::Checkpoint(recovered) => manager_handle
@@ -4602,6 +4878,7 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
                     recovered.accepted,
                     recovered.checkpoint,
                     recovered.committed_answer,
+                    recovered.provider_request_ordinal,
                 )
                 .await
                 .expect("recover checkpoint"),
@@ -4610,6 +4887,7 @@ async fn coordinator_restart_mid_wait_rearms_supervision_from_durable_progress()
                     recovered.accepted,
                     recovered.checkpoint,
                     recovered.committed_answer,
+                    recovered.provider_request_ordinal,
                 )
                 .await
                 .expect("recover partial stream"),

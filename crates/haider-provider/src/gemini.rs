@@ -403,12 +403,13 @@ impl GeminiProvider {
             .validate_endpoint(&self.api_url)
             .await?;
         let request_url = format!("{}?alt=sse", self.api_url);
-        Ok(self
-            .client
-            .post(request_url)
-            .header(CONTENT_TYPE, "application/json")
-            .header(ACCEPT, "text/event-stream")
-            .header("x-goog-api-key", self.api_key_header()?))
+        crate::apply_provider_request_headers(
+            self.client
+                .post(request_url)
+                .header(CONTENT_TYPE, "application/json")
+                .header(ACCEPT, "text/event-stream")
+                .header("x-goog-api-key", self.api_key_header()?),
+        )
     }
 
     async fn send_request(
@@ -653,6 +654,10 @@ impl Provider for GeminiProvider {
         prepared
     }
 
+    fn claim_prewarm(&self) -> bool {
+        crate::claim_optional_http_prewarm(&self.api_url)
+    }
+
     async fn prewarm(&self) {
         crate::optional_http_prewarm(&self.client, &self.api_url).await;
     }
@@ -708,14 +713,22 @@ impl GeminiCacheBackend for GeminiHttpCacheBackend {
                 )
             })?;
         api_key.set_sensitive(true);
+        let auxiliary_attempt = crate::record_auxiliary_provider_request(
+            haider_protocol::cache::ProviderRequestKind::Side,
+        )
+        .await?;
         let request = self
             .client
             .post(GEMINI_CACHED_CONTENTS_URL)
             .header(CONTENT_TYPE, "application/json")
-            .header("x-goog-api-key", api_key)
-            .json(payload)
-            .build()
-            .map_err(transport_error)?;
+            .header("x-goog-api-key", api_key);
+        let request = match auxiliary_attempt.as_ref() {
+            Some(attempt) => crate::apply_provider_request_headers_for(request, attempt)?,
+            None => request,
+        }
+        .json(payload)
+        .build()
+        .map_err(transport_error)?;
         let response = crate::route_gated_timeout(
             GeminiProvider::transport_config().response_open_timeout,
             self.client.execute(request),
@@ -772,12 +785,20 @@ impl GeminiCacheBackend for GeminiHttpCacheBackend {
                 )
             })?;
         api_key.set_sensitive(true);
+        let auxiliary_attempt = crate::record_auxiliary_provider_request(
+            haider_protocol::cache::ProviderRequestKind::Side,
+        )
+        .await?;
         let request = self
             .client
             .delete(endpoint)
-            .header("x-goog-api-key", api_key)
-            .build()
-            .map_err(transport_error)?;
+            .header("x-goog-api-key", api_key);
+        let request = match auxiliary_attempt.as_ref() {
+            Some(attempt) => crate::apply_provider_request_headers_for(request, attempt)?,
+            None => request,
+        }
+        .build()
+        .map_err(transport_error)?;
         let response = crate::route_gated_timeout(
             GeminiProvider::transport_config().response_open_timeout,
             self.client.execute(request),

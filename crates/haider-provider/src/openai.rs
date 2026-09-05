@@ -598,7 +598,7 @@ impl OpenAiHttp {
         if self.grok_subscription_headers {
             request = apply_grok_subscription_headers(request, Some(&self.model));
         }
-        Ok(request)
+        crate::apply_provider_request_headers(request)
     }
 
     async fn get(
@@ -852,6 +852,7 @@ impl OpenAiProvider {
             &mut prepared.payload,
             None,
         );
+        crate::mirror_provider_request_metadata(&mut prepared.payload);
         let body = crate::serialize_prepared_json_body(prepared)?;
         let route_gating = crate::RouteGating::for_endpoint(&self.api_url);
         self.http
@@ -880,6 +881,10 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
+    fn request_metadata_body_support(&self) -> crate::RequestMetadataBodySupport {
+        crate::RequestMetadataBodySupport::Supported
+    }
+
     fn trusts_default_route_absence(&self) -> bool {
         crate::RouteGating::for_endpoint(&self.api_url).enabled()
     }
@@ -1019,6 +1024,10 @@ impl Provider for OpenAiProvider {
             }),
             turn_trace: None,
         })
+    }
+
+    fn claim_prewarm(&self) -> bool {
+        crate::claim_optional_http_prewarm(&self.api_url)
     }
 
     async fn prewarm(&self) {
@@ -2011,6 +2020,10 @@ impl Provider for OpenAiCompatibleProvider {
             }),
             turn_trace: None,
         })
+    }
+
+    fn claim_prewarm(&self) -> bool {
+        crate::claim_optional_http_prewarm(&self.chat_url)
     }
 
     async fn prewarm(&self) {

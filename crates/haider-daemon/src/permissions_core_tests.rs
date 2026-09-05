@@ -1368,11 +1368,11 @@ fn stub_schema_keeps_structure_drops_prose_and_bounds() {
     }
 }
 
-/// MUTATION CHECK: add a tool without a manual line, or leave a description on
-/// the wire. Expected RUNTIME failure: an advertised tool has no signature the
-/// model can read, or a wire ToolDefinition still carries a description.
+/// MUTATION CHECK: add a tool without a manual line, or add native prose outside
+/// the pinned action-critical set. Expected RUNTIME failure: an advertised tool
+/// has no signature the model can read, or the compact wire surface drifts.
 #[test]
-fn every_advertised_tool_is_manual_described_and_wire_is_description_free() {
+fn every_advertised_tool_is_manual_described_and_native_prose_is_scoped() {
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let root = advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
     assert!(
@@ -1385,9 +1385,14 @@ fn every_advertised_tool_is_manual_described_and_wire_is_description_free() {
             "advertised tool `{}` has no manual line — instruct-pipe drift",
             tool.name
         );
-        assert!(
-            tool.description.is_empty(),
-            "wire tool `{}` still carries a description — semantics belong in the manual",
+        let should_have_native_prose = matches!(
+            tool.name.as_str(),
+            "fs_glob" | "fs_search" | "fs_write" | "fs_edit" | "fs_path"
+        );
+        assert_eq!(
+            !tool.description.is_empty(),
+            should_have_native_prose,
+            "wire tool `{}` native-description scope drifted",
             tool.name
         );
     }
@@ -1425,7 +1430,48 @@ fn every_advertised_tool_is_manual_described_and_wire_is_description_free() {
     }
 }
 
-/// MUTATION CHECK: stop stubbing, stop emptying wire descriptions, move
+/// ACTBIAS MUTATION CHECK: blank, generalize, or swap any action-critical
+/// native description. Expected RUNTIME failure: the provider schema no longer
+/// tells a weak model what the search/mutation tool does and when to use it.
+#[test]
+fn search_and_mutation_tool_schema_descriptions_are_pinned() {
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
+    let root = advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
+    let expected = [
+        (
+            "fs_glob",
+            "List workspace paths matching a repository-aware glob; use it to find files by name or extension before reading them",
+        ),
+        (
+            "fs_search",
+            "Search workspace file contents; use it to locate symbols or text before reading or editing a file",
+        ),
+        (
+            "fs_write",
+            "Create or replace one UTF-8 file; use it for a new file or a complete rewrite",
+        ),
+        (
+            "fs_edit",
+            "Apply anchored replacements to one UTF-8 file; use it for focused changes after reading the current contents",
+        ),
+        (
+            "fs_path",
+            "Move, copy, or delete a workspace path; use it when the requested change affects filesystem structure",
+        ),
+    ];
+    for (name, description) in expected {
+        let tool = root
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("missing advertised tool `{name}`"));
+        assert_eq!(
+            tool.description, description,
+            "native prose drifted for `{name}`"
+        );
+    }
+}
+
+/// MUTATION CHECK: stop stubbing, alter the selective native descriptions, move
 /// nothing into the manual, or change the advertised inventory without
 /// recounting it. Expected RUNTIME failure: an inventory/byte pin moves or the
 /// instruct pipe stops being a material (at least 30%) net reduction.
@@ -1436,15 +1482,22 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // The full-prefix comparison deliberately includes the platform-specific
     // computer manifest description. Linux documents X11/Wayland (+49 bytes
     // over macOS), while Windows is one byte shorter than macOS.
+    // v0.0.970 adds spawn_subagent.request_budget: +367 full-schema bytes and
+    // +143 stub-schema bytes. Tool inventory and the 30% savings law stay fixed.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_105;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_621;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_056;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_572;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_055;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_571;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_050;
-    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 12_122;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_566;
+    // v0.0.969 pinned 11_246 bytes. Before actbias, merged monitor/list_models
+    // inventory additions had already moved this wave-970 baseline to 12_122.
+    // Turnbudget adds 143 stub-schema bytes: 12_122 + 143 = 12_265.
+    // Actbias restores five native descriptions: 12_265 + 499 = 12_764.
+    const PRE_ACTBIAS_INSTRUCT_PIPE_BYTES: usize = 12_265;
+    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 12_764;
 
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let stubbed =
@@ -1467,8 +1520,8 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
                     .len()
         })
         .sum();
-    // Instruct-pipe prefix: name + (empty) wire description + stub schema, plus
-    // the one shared manual carried once in the system prompt.
+    // Instruct-pipe prefix: name + selective native description + stub schema,
+    // plus the one shared manual carried once in the system prompt.
     let stub_wire: usize = stubbed
         .iter()
         .map(|tool| {
@@ -1480,8 +1533,17 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         })
         .sum();
     let new_total = stub_wire + tool_manual(&stubbed).len();
+    let native_description_bytes = stubbed
+        .iter()
+        .map(|tool| tool.description.len())
+        .sum::<usize>();
     assert_eq!(full_prefix, EXPECTED_FULL_PREFIX_BYTES);
     assert_eq!(new_total, EXPECTED_INSTRUCT_PIPE_BYTES);
+    assert_eq!(
+        new_total - native_description_bytes,
+        PRE_ACTBIAS_INSTRUCT_PIPE_BYTES,
+        "only the five native descriptions may explain the actbias pipe delta"
+    );
     assert!(full_prefix > 0 && new_total < full_prefix);
     assert!(
         (full_prefix - new_total) * 10 >= full_prefix * 3,

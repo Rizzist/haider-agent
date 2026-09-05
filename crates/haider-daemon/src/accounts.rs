@@ -9578,6 +9578,10 @@ impl std::fmt::Debug for IdentityAnnotatedProvider {
 
 #[async_trait::async_trait]
 impl Provider for IdentityAnnotatedProvider {
+    fn request_metadata_body_support(&self) -> haider_provider::RequestMetadataBodySupport {
+        self.inner.request_metadata_body_support()
+    }
+
     fn trusts_default_route_absence(&self) -> bool {
         self.inner.trusts_default_route_absence()
     }
@@ -9607,6 +9611,10 @@ impl Provider for IdentityAnnotatedProvider {
         tools: &[ToolDefinition],
     ) -> Option<PreparedTurn> {
         self.inner.prepare_turn_with_tools(request, tools)
+    }
+
+    fn claim_prewarm(&self) -> bool {
+        self.inner.claim_prewarm()
     }
 
     async fn prewarm(&self) {

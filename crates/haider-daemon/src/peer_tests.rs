@@ -75,6 +75,7 @@ fn accepted_turn() -> haider_core::AcceptedTurn {
     haider_core::AcceptedTurn {
         session_id: haider_protocol::ids::SessionId::new("session-target"),
         run_id: haider_protocol::ids::RunId::new("peer-run-test"),
+        turn_ordinal: 1,
         accepted_seq: 3,
         worker_generation: 1,
         branch_id: None,

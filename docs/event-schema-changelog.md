@@ -226,6 +226,38 @@ surfaces.
   serialize that retained value. Other derived values belong outside the
   `RawEnvelope` on both paths.
 
+### v0.0.970 — provider request-attempt correlation
+
+- New prompt-omitted payload kind `payload:provider_operation_reserved`
+  records `request_kind` for session-owned provider inference that needs a
+  durable turn identity but is not a conversation run. It contributes to the
+  session-monotonic turn ordinal and is deliberately excluded from run-state
+  observation, user hooks, and agent-usage timing. v0.0.970 uses it for
+  `loom.author.draft` with `request_kind: side`. Session forks omit the entire
+  reserved operation run because its correlation facts remain parent-owned.
+- Additive optional field `cache_request_attempt_v1.correlation` records the
+  exact turn-owned HTTP attempt identity: `session_id`, `run_id`, nonzero
+  `turn_ordinal`, nonzero `request_ordinal`, and `request_kind` (`primary`,
+  `side`, or reserved explicit `warmup`). The enclosing legacy `ordinal` and
+  `correlation.request_ordinal` must agree. Older markers omit `correlation`
+  and continue to decode; new writers always include it.
+- New prompt-omitted `item:extension` subkind
+  `provider_request_attempt_v1` carries the same five fields for turn-owned
+  provider HTTP calls that have no prompt-cache diagnostic, including
+  subscription `web_search`, session-owned `loom.author.draft`, Gemini
+  cache-resource operations, and explicit connection prewarm. It commits
+  before network I/O and shares the operation's physical request-ordinal
+  allocator. Prewarm uses `warmup`; Loom, cache, and tool support use `side`.
+- These markers are durable correlation metadata, not provider request-body
+  content. `RawEnvelope.schema_version` remains 1. Readers must preserve an
+  unknown extension subkind and may ignore it; recovery-aware readers that
+  interpret it must reject zero, ambiguous, mismatched, or reused correlated
+  coordinates as store corruption. Recovery tracks the first logical model
+  boundary separately from the maximum physical ordinal so a preceding
+  warmup/cache request cannot make an interrupted first model call reuse an
+  identity; queued retries and manual compaction likewise resume at the
+  validated maximum plus one.
+
 The following payload kinds were present in the AHRB v0.0.969 capture but had
 not all been called out together in this ledger. Their schema status is:
 
@@ -302,3 +334,23 @@ not all been called out together in this ledger. Their schema status is:
 - Replay must emit the retained tool-result preview byte-for-byte. Suggestions
   are never recomputed or decorated during replay. `SCHEMA_VERSION` remains 1
   because this is an additive nested field on an existing payload kind.
+
+
+### v0.0.970 — logical request budgets and continuation
+
+Additive extension kind `provider_request_budget_v1` uses the existing
+`item:extension` carrier. Its typed data records used logical requests, the
+soft tranche and hard cap, a progress/soft-bound/hard-bound phase, and durable
+session/run/branch/agent continuation coordinates. Only bound notes contribute
+to model history; progress is UI/journal telemetry. Transport retries retain
+the same logical count. Hard checkpoint items and the adjacent
+`run_failed { code: request_budget_exceeded }` / `run_state: errored` pair are
+one transaction, preserving the single-terminal law and replay parity.
+
+Optional `RunBudgetV1.request_budget` and
+`HeadlessRunSpecV1.continuation_of` fields are omitted for legacy values.
+`spawn_subagent` can pin request policy in manifest coordinates. Capability
+`request_budget_v1` is required for explicit policies and the dedicated resume
+client so older daemons cannot silently ignore the settings. Default policy
+is 32 soft / 64 hard. The schema version remains 1; unknown extension data and
+new error codes retain the established forward-compatibility behavior.

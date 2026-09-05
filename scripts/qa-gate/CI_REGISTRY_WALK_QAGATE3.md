@@ -178,6 +178,40 @@ Read against the final uncommitted tree before verification. “checked: none”
 - #95 checked — monitor runners wait outside negotiated connections, and control requests are one-shot; no retained RPC link gains an unserviced wait
 - #96 checked — no warm-retention or turn-performance policy changed
 
+## v0.0.970 turnid delta walk
+
+- #1-#18 checked: none — no dependency, packaging, migration, or platform surface changed
+- #19 fixed — all changed Rust files are rustfmt-clean, the workspace all-targets check passes, the Python QA self-tests pass, and `git diff --check` is clean
+- #20 fixed — sixteen correlation regressions raise the reviewed Rust baseline from 4,748 to 4,764
+- #21 checked: none — no ignored-test policy changed
+- #22 fixed — exact session/run/turn/request trace strings pass a narrow visible-ASCII, delimiter, enum, and unsigned-decimal allow-list; arbitrary tracing fields remain excluded
+- #23 checked — correlation contains opaque IDs and ordinals only; prompt, body, credential, path, and error text never enter the new journal or trace fields
+- #24-#28 checked: none — no affected surface
+- #29 fixed — request identity is committed before model, prewarm, cache-resource, or tool-support network I/O and every resumable recovery shape, including queued retries and manual compaction, seeds the next physical ordinal from the validated durable maximum
+- #30 fixed — named adapter, body-golden, steering, delegation, Loom drafting, tool-support, restart, journal, trace, and prompt-sniff mutation tests assert concrete coordinates
+- #31-#32 checked: none — no affected surface
+- #33 fixed — `cache_request_attempt_v1.correlation` is optional/defaulted for legacy rows and `provider_request_attempt_v1` is an additive prompt-omitted extension
+- #34-#37 checked: none — no affected surface
+- #38 fixed — the trace registry keys by `(session_id, run_id)`, request ordinals share one atomic per turn, first-byte deduplication is an exact set rather than a 64-request bit window, and journal parsing rejects reuse
+- #39-#40 checked: none — no affected surface
+- #41 fixed — provider loopbacks, store tests, and warm-harness profiles retain short hermetic temporary roots
+- #42 fixed — current `haider` and `haiderd` siblings are prebuilt before daemon subprocess tests and the performance harness
+- #43 checked: none — no affected surface
+- #44 fixed — the fake proxy exercises the real UDS daemon path, and every built-in adapter has a real loopback proxy-ledger pass recording locked headers independently of unchanged raw request bodies
+- #45-#63 checked: none — no affected surface
+- #64 checked — final measured release `haiderd` is 54,125,408 bytes, above the mandatory 10 MiB floor
+- #65-#70 checked: none — no affected surface
+- #71 fixed — built-in HTTP adapters, Gemini cache-resource operations, explicit prewarm, Loom drafting, and subscription web-search support use their production request builders; delegation and restart pins exercise production daemon ownership
+- #72 checked — native discovery is intentionally disabled only in the required hermetic tests and measurement environment
+- #73 checked — default strict-provider request bodies remain byte-identical; no fixed-byte source window was weakened
+- #74 fixed — subprocess and benchmark coverage uses throwaway profiles and never reads host credentials
+- #75-#76 checked: none — no affected surface
+- #77 checked — no unsafe code was added; the standalone guard's existing four-test mismatch remains confined to untouched `haider-tui`
+- #78-#93 checked: none — no affected surface
+- #94 checked — no product deadline or retry wait changed; all existing harness bounds remain named and arithmetic-owned
+- #95 checked — no retained negotiated connection gained a new wait
+- #96 fixed — the warm harness now refuses prompt-derived attribution and validates exact header identity/kind/ordinal while retaining 5+25 ABBA, same-PID/generation, durable Idle, raw samples, median/MAD, and load-below-3 acceptance
+
 ## v0.0.970 chocofix delta walk
 
 - #1-#18 checked: none — release packaging metadata/workflow only; no product protocol, migration, or dependency surface changed
@@ -194,4 +228,26 @@ Read against the final uncommitted tree before verification. “checked: none”
 - #75-#76 checked: none — no affected product surface
 - #77 checked — no unsafe code was added and workspace/tests Clippy passes with warnings denied; the standalone guard's existing four-test mismatch is confined to untouched `haider-tui` (`git diff --quiet -- crates/haider-tui` passes), so this lane does not rewrite that unrelated baseline
 - #78-#93 checked: none — no affected product surface
+- #94-#96 checked — no deadline, negotiated-connection wait, or turn-performance policy changed
+
+## v0.0.970 actbias delta walk
+
+- #1-#18 checked: none — no dependency, packaging, migration, or wire-version surface changed
+- #19 fixed — changed Rust is rustfmt-clean, `git diff --check` is clean, focused prompt/schema/golden tests pass, and the workspace suite is green
+- #20 fixed — two reviewed regression tests raise the Rust baseline from 4,748 to 4,750; `xtask test-count` confirms 4,750/4,750
+- #21-#40 checked: none — no affected lifecycle, storage, or compatibility surface
+- #41 checked — focused and golden tests use hermetic temporary roots and the fake provider
+- #42 checked — sibling `haider`/`haiderd` binaries were prebuilt before daemon-driven goldens
+- #43 checked: none — no affected installed-warmup surface
+- #44 checked — provider-request and run goldens exercise the real CLI/daemon UDS path with a fake loopback provider
+- #45-#63 checked: none — no affected surface
+- #64 checked — prebuilt `haiderd` is 197,290,544 bytes, above 10 MiB
+- #65-#70 checked: none — no affected surface
+- #71 fixed — exact provider request, text/tool turn ledgers, and one-shot ledger were regenerated deliberately and then passed without update flags
+- #72 checked — native discovery stayed disabled throughout the hermetic gate
+- #73 fixed — prompt/tool byte changes are explicit: policy 359 -> 725, instruct pipe 12,122 -> 12,621, and combined stable prefix 12,481 -> 13,346
+- #74 checked — tests use throwaway profiles and do not read host credentials
+- #75-#76 checked: none — no affected surface
+- #77 checked — no unsafe code was added; `cargo clippy --workspace -- -D warnings` passes
+- #78-#93 checked: none — no affected surface
 - #94-#96 checked — no deadline, negotiated-connection wait, or turn-performance policy changed

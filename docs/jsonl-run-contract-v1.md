@@ -203,3 +203,21 @@ same stable provider tool-call ids and verifies exactly one typed terminal.
 and `haider sessions wait-ready ... --json` also emit one versioned document
 and one process exit. They do not add, reorder, or reinterpret records in an
 accepted `haider run --output jsonl` stream.
+
+
+## Logical request budgets (v0.0.970)
+
+Every logical provider dispatch carries a durable `provider_request_budget_v1`
+extension status with used requests, soft tranche, and hard cap. The default
+is 32 / 64. The soft-bound note is both model-readable and visible; the hard
+checkpoint commits with `run_failed { code: request_budget_exceeded }` and the
+single `errored` terminal. CLI exit is 77, with continuation instructions.
+These facts replay unchanged and do not discard prior text or tool results.
+
+`haider run --request-tranche 32 --max-requests 96 -p 'task'` pins per-run
+request policy. `haider run --resume RUN_ID --output jsonl` accepts a fresh
+turn in the original headless root session, restoring tool history and the
+source policy unless explicitly overridden. Its stream correlates the new
+run and retains the ordinary contiguous cursor contract. The source run and
+its terminal remain immutable. Interactive timelines and delegated children
+continue through their existing new-turn and `message_subagent` surfaces.

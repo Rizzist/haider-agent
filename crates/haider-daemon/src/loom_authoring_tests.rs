@@ -1,10 +1,11 @@
 #![allow(clippy::expect_used)]
 
 use crate::accounts::ConnectionTransport;
-use crate::loom_author::{draft_from_prose, validate};
+use crate::loom_author::{LoomProviderRequestContext, draft_from_prose, validate};
 use crate::session_hub::{FrameSendError, FrameSink, SessionHub, SessionHubConfig};
 use crate::worker::{ProviderFactory, ResolvedTurnProvider};
-use haider_core::{SessionCreateCommand, SqliteStoreHandle};
+use haider_core::{SessionCreateCommand, SqliteStoreHandle, StoreHandle};
+use haider_protocol::EventPayload;
 use haider_protocol::graph::graph_template_digest;
 use haider_protocol::ids::{DeviceId, EventId, SessionId};
 use haider_protocol::loom::{
@@ -230,6 +231,36 @@ async fn authoring_rpc_registers_and_executes_each_confirmed_hash() {
     };
     assert_eq!(draft.revision, 1);
     assert!(draft.errors.is_empty());
+    let events = StoreHandle::read(&store, &session_id, 0, 256)
+        .await
+        .expect("read Loom provider correlation");
+    let correlation = events
+        .iter()
+        .find_map(|event| {
+            let EventPayload::Item(haider_protocol::item::ItemEvent::Completed { item, .. }) =
+                event.payload.decode_event().ok()?
+            else {
+                return None;
+            };
+            haider_protocol::cache::ProviderRequestAttemptV1::try_from_extension_item(&item)
+                .ok()
+                .flatten()
+        })
+        .expect("Loom provider request has a durable attempt marker");
+    assert_eq!(correlation.session_id, session_id);
+    assert_eq!(correlation.run_id.as_str(), draft.authoring_id);
+    assert_eq!(correlation.request_ordinal, 1);
+    assert_eq!(
+        correlation.request_kind,
+        haider_protocol::cache::ProviderRequestKind::Side
+    );
+    assert_eq!(
+        store
+            .turn_ordinal(session_id.clone(), correlation.run_id.clone())
+            .await
+            .expect("read Loom operation turn ordinal"),
+        Some(correlation.turn_ordinal)
+    );
 
     let mut invalid_spec: LoomAuthorSpec =
         serde_json::from_str(&draft.text).expect("draft JSON for invalid edit");
@@ -517,6 +548,7 @@ async fn prose_draft_edit_confirm_and_reedit_keep_both_executable_hashes() {
         &[],
         &metadata(),
         &factory,
+        std::future::ready(Ok(LoomProviderRequestContext::for_test())),
     )
     .await
     .expect("AI draft");
@@ -752,6 +784,7 @@ async fn ai_draft_requires_a_terminal_finish_event() {
         &[],
         &metadata(),
         &FixedProviderFactory { provider },
+        std::future::ready(Ok(LoomProviderRequestContext::for_test())),
     )
     .await
     .expect_err("premature EOF must reject");

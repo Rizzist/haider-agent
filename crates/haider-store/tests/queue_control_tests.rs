@@ -105,6 +105,65 @@ fn seeded_queue() -> (tempfile::TempDir, Arc<Store>, SessionId) {
 }
 
 #[test]
+fn turn_ordinals_are_session_monotonic_and_same_run_steers_keep_identity() {
+    let (_root, store, session_id) = seeded_queue();
+    let active_run = RunId::new("run-active");
+    assert_eq!(
+        store
+            .turn_ordinal(&session_id, &active_run)
+            .expect("active ordinal"),
+        Some(1)
+    );
+    let queued = submit(
+        &store,
+        &session_id,
+        "ordinal-two",
+        "second",
+        DeliveryMode::Queue,
+    );
+    assert_eq!(queued.turn_ordinal, 2);
+
+    let command = TurnAcceptCommand {
+        command_id: "submit-active-steer".into(),
+        request_digest: "submit-active-steer-digest".into(),
+        request_json: r#"{"mode":"steer","text":"follow up"}"#.into(),
+        session_id: session_id.clone(),
+        worker_generation: store.worker_generation(),
+        run_id: active_run.clone(),
+        agent_id: None,
+        branch_id: None,
+        text: "follow up".into(),
+        attachments: Vec::new(),
+        mode: DeliveryMode::Steer,
+        queued_event_id: EventId::new("active-steer-queued"),
+        user_event_id: EventId::new("active-steer-user"),
+        active_event_id: EventId::new("active-steer-active"),
+        device_id: DeviceId::new("test-daemon"),
+    };
+    let steered = match store.accept_turn(&command).expect("accept same-run steer") {
+        TurnAcceptOutcome::Committed { accepted, .. } => accepted,
+        TurnAcceptOutcome::IdempotentReplay { .. } => panic!("fresh steer replayed"),
+    };
+    assert_eq!(steered.turn_ordinal, 1);
+    assert_eq!(
+        steered.disposition,
+        haider_store::TurnAdmissionDisposition::SteerPending
+    );
+    assert_eq!(
+        store
+            .turn_ordinal(&session_id, &active_run)
+            .expect("stable ordinal"),
+        Some(1)
+    );
+    assert_eq!(
+        store
+            .turn_ordinal(&session_id, &queued.run_id)
+            .expect("queued ordinal"),
+        Some(2)
+    );
+}
+
+#[test]
 fn queue_rows_keep_stable_ids_and_render_complete_text_across_lists() {
     let (_root, store, session_id) = seeded_queue();
     submit(

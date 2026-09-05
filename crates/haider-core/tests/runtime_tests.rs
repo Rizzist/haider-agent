@@ -472,6 +472,10 @@ async fn full_turn_commits_exact_projected_sequence() {
         .iter()
         .map(|event| normalize(event.payload.clone().into()))
         .collect();
+    let correlation_run_id = events
+        .iter()
+        .find_map(|event| event.run_id.as_ref())
+        .expect("turn event run id");
     let expected = vec![
         serde_json::json!({"type":"run_state","state":"queued"}),
         serde_json::json!({
@@ -499,6 +503,13 @@ async fn full_turn_commits_exact_projected_sequence() {
                 "kind":"cache_request_attempt_v1",
                 "data":{
                     "ordinal":1,
+                    "correlation":{
+                        "request_kind":"primary",
+                        "request_ordinal":1,
+                        "run_id":correlation_run_id.as_str(),
+                        "session_id":SESSION,
+                        "turn_ordinal":1
+                    },
                     "diagnostic":{
                         "stable_prefix_tokens":3,
                         "history_message_count":0,
@@ -523,6 +534,13 @@ async fn full_turn_commits_exact_projected_sequence() {
                 "kind":"cache_request_attempt_v1",
                 "data":{
                     "ordinal":1,
+                    "correlation":{
+                        "request_kind":"primary",
+                        "request_ordinal":1,
+                        "run_id":correlation_run_id.as_str(),
+                        "session_id":SESSION,
+                        "turn_ordinal":1
+                    },
                     "diagnostic":{
                         "stable_prefix_tokens":3,
                         "history_message_count":0,
@@ -535,6 +553,31 @@ async fn full_turn_commits_exact_projected_sequence() {
                         "prefix_match":{"state":"unavailable"},
                         "control":{"state":"unavailable"}
                     }
+                }
+            }
+        }),
+        // One visible budget item shares the request-attempt append. Keep
+        // both lifecycle halves in the exact projection rather than filtering
+        // the new telemetry out of this journal contract pin.
+        serde_json::json!({
+            "type":"item", "event":"started", "item_id":"<item>",
+            "item":{
+                "item":"extension", "kind":"provider_request_budget_v1",
+                "data":{
+                    "used":1, "budget":{"tranche":32,"hard_cap":64},
+                    "phase":"progress",
+                    "continuation":{"session_id":SESSION,"run_id":correlation_run_id.as_str()}
+                }
+            }
+        }),
+        serde_json::json!({
+            "type":"item", "event":"completed", "item_id":"<item>",
+            "item":{
+                "item":"extension", "kind":"provider_request_budget_v1",
+                "data":{
+                    "used":1, "budget":{"tranche":32,"hard_cap":64},
+                    "phase":"progress",
+                    "continuation":{"session_id":SESSION,"run_id":correlation_run_id.as_str()}
                 }
             }
         }),
@@ -5083,10 +5126,9 @@ async fn actor_restarts_do_not_reuse_run_or_item_ids() {
             .iter()
             .any(|id| id.starts_with("run-session-test-24-"))
     );
-    // Each request now has both a diagnostic extension item and the visible
-    // assistant item. The four unique IDs still prove neither actor reused an
-    // item ID across the restart boundary.
-    assert_eq!(item_ids.len(), 4);
+    // Each request has a cache diagnostic, visible request-budget status and
+    // assistant item. Six unique IDs prove none are reused across restart.
+    assert_eq!(item_ids.len(), 6);
     assert!(
         item_ids
             .iter()
@@ -5116,14 +5158,15 @@ async fn memory_store_allocates_and_reads_committed_sequences() {
         StoreHandle::latest_seq(store.as_ref(), &SessionId::new(SESSION))
             .await
             .expect("latest"),
-        8
+        // The budget status adds Started + Completed to the former 8 events.
+        10
     );
     let tail = StoreHandle::read(store.as_ref(), &SessionId::new(SESSION), 3, 10)
         .await
         .expect("read");
     assert_eq!(
         tail.iter().map(|event| event.seq).collect::<Vec<_>>(),
-        vec![4, 5, 6, 7, 8]
+        vec![4, 5, 6, 7, 8, 9, 10]
     );
 }
 
@@ -5312,7 +5355,8 @@ impl ToolDispatcher for DurableRunningToolDispatcher {
 }
 
 /// MUTATION CHECK: restore the separate `Thinking` and cache-attempt appends.
-/// Expected failure: no batch contains the exact three-event request boundary.
+/// Expected failure: no batch contains the exact five-event request boundary
+/// (Thinking + two cache events + two visible budget-progress events).
 #[tokio::test]
 async fn request_start_batches_thinking_with_cache_attempt_in_event_order() {
     let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
@@ -5356,9 +5400,19 @@ async fn request_start_batches_thinking_with_cache_attempt_in_event_order() {
             EventPayload::Item(ItemEvent::Completed {
                 item: TurnItem::Extension { kind: completed, .. },
                 ..
-            })
+            }),
+            EventPayload::Item(ItemEvent::Started {
+                item: TurnItem::Extension { kind: budget_started, .. },
+                ..
+            }),
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::Extension { kind: budget_completed, .. },
+                ..
+            }),
         ] if started == CACHE_REQUEST_ATTEMPT_EXTENSION_KIND
             && completed == CACHE_REQUEST_ATTEMPT_EXTENSION_KIND
+            && budget_started == haider_protocol::request_budget::PROVIDER_REQUEST_BUDGET_EXTENSION_KIND
+            && budget_completed == haider_protocol::request_budget::PROVIDER_REQUEST_BUDGET_EXTENSION_KIND
     ));
 }
 
@@ -6314,3 +6368,6 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
         "sources dedup by URL and keep arrival order"
     );
 }
+
+#[path = "support/request_budget_laws.rs"]
+mod request_budget_laws;

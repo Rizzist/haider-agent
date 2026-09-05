@@ -258,6 +258,7 @@ is §4.1.
 | `turn_control_v1` | `turn.submit`, `turn.cancel` |
 | `headless_run_v1` | `headless.run.start`, `headless.run.status`, `headless.run.stop`, durable `HeadlessRunConfigured`, and typed replay divergence reports |
 | `run_budget_v1` | pre-request token/cost/time guards, durable decision detail, and `RunBudgetExhausted` followed by `RunFailed { code: budget_exhausted }` and `Errored` |
+| `request_budget_v1` | logical request tranches, typed budget checkpoints, and atomic same-session continuation admission |
 | `queue_control_v1` | `queue.list`, `queue.remove`, `queue.promote_steer`, and durable `QueueChanged` events on an attached session |
 | `peer_messaging_v1` | `peer.list`, `peer.send`, `peer.name`, `PeerMessageReceived`, and `PeerDeliveryChanged` |
 | `run_retry_v1` | `run.retry` |
@@ -2881,7 +2882,7 @@ Absence laws:
 
 - A missing `headless_run_v1`, or missing `run_budget_v1` when any limit is
   present, fails feature negotiation before session creation or submission.
-- Omitted budget fields are unbounded; a present zero is invalid. `seed: 0`
+- Omitted token/cost/time budget fields are unbounded. Omitted `request_budget` selects tranche 32 / hard cap 64; a present policy requires `0 < tranche <= hard_cap`. A present zero is invalid. `seed: 0`
   remains present and is not treated as omission.
 - A missing budget `decision` means the exhaustion fact was written by an
   older daemon. A present unavailable-pricing or unavailable-usage reason
@@ -3499,3 +3500,35 @@ quota, toggle-boundary, and subagent rules.
   is one-shot; `null`/absence with `warm: false` is direct, unbounded, or an
   older daemon. Clients MUST NOT infer either value from their own environment
   when the daemon omits the fields.
+
+
+### Request tranches and continuation (v0.0.970)
+
+The actor counts logical requests, excluding transport retries. Defaults are
+32 for the soft tranche and 64 for the hard cap. `RunBudgetV1.request_budget`
+overrides this per run; `spawn_subagent.request_budget` pins it for each child
+in its durable manifest coordinates. A run pin takes precedence over the child
+pin, then defaults apply. These counts are independent of token/cost/time
+limits and require no provider usage report.
+
+`provider_request_budget_v1` extension items contain `used`, `budget` (tranche
+and hard cap), `phase` (`progress`, `soft_bound`, `hard_bound`), and a typed
+`continuation` with session/run/branch/agent coordinates. Progress shares the
+provider-attempt append; the soft note is committed once before the first
+post-tranche logical request and included in actual model input. Hard-bound
+Started/Completed, `run_failed` with `request_budget_exceeded`, and `errored`
+commit in one append. Completed tools and partial text remain journal truth.
+Recovery restores consumed requests and the existing warning from that journal.
+
+`haider run --resume RUN_ID` requires `request_budget_v1` and starts a new turn
+in the same session with a fresh request allowance. It pins
+`HeadlessRunSpecV1.continuation_of`, reuses the source execution settings and
+permissions, clears its expired absolute deadline, and includes its terminal
+tool history. Explicit new budget flags override the inherited policy. It is
+available for terminal headless root checkpoints, including a soft-bound run
+that finished with a checkpoint. Admission atomically rejects a stale source,
+a source without a budget checkpoint, or any live run on the same timeline;
+receipt replay stays idempotent. This is distinct from read-only `--replay`
+and from `run.retry`, which retries the original prompt. Interactive/branch
+users submit the next turn on their existing timeline; parents continue a
+bound child with `message_subagent` in the child's existing session.

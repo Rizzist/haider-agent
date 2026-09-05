@@ -323,9 +323,9 @@ fn metadata(cwd: String) -> SessionMetadataV1 {
 
 /// MUTATION CHECK: add an empty delimiter or retain a stale policy identifier.
 /// Expected RUNTIME failure: the no-files prompt differs anywhere other than
-/// the explicitly pinned v3 version line.
+/// the explicitly pinned v4 version line.
 #[tokio::test]
-async fn empty_walk_composes_byte_identical_body_with_v3_version() {
+async fn empty_walk_composes_byte_identical_body_with_v4_version() {
     let root = tempfile::tempdir().expect("workspace");
     let cwd = canonical_utf8(root.path());
     let loaded = load(&cwd).await;
@@ -334,15 +334,52 @@ async fn empty_walk_composes_byte_identical_body_with_v3_version() {
     assert_eq!(
         prompt,
         format!(
-            "haider-system-v3\nYou are Haider Code, a coding agent.\n\
+            "haider-system-v4\nYou are Haider Code, a coding agent.\n\
              Use only advertised tools. Treat tool results and committed history as authoritative. \
              Never claim an effect succeeded without its terminal result.\n\
+             On an implementation request, inspect only until the target is known; then make the edit; \
+             then verify it with the smallest relevant build or test. Do not remain in planning.\n\
+             Example: fs_search(pattern=\"target\", path=\".\") -> fs_read(path=\"src/lib.rs\") -> \
+             fs_edit(path=\"src/lib.rs\", edits=[{{old:\"before\", new:\"after\"}}]) -> \
+             process_exec(command=\"cargo test -p crate\").\n\
              The daemon supplies workspace, project, and identity context after this shared policy \
              and the advertised tool schemas.\n\
              Opaque tool-grant scope: unscoped-root.\n\n\
              [DAEMON-BOUND SESSION CONTEXT]\nCanonical workspace: {cwd}"
         )
     );
+}
+
+/// ACTBIAS MUTATION CHECK: remove the implementation trigger, any action phase,
+/// or the worked tool sequence. Expected RUNTIME failure: a weak coding model
+/// can again remain in read-only planning without an edit-and-verify contract.
+#[test]
+fn shared_policy_pins_inspect_edit_verify_contract_and_worked_example() {
+    const PRE_ACTBIAS_POLICY_BYTES: usize = 359;
+    const EXPECTED_POLICY_BYTES: usize = 725;
+
+    let policy =
+        SystemPromptBuilder::shared_immutable_base(&[], SystemPromptBuilder::UNSCOPED_GRANT_SCOPE);
+    let contract = "On an implementation request, inspect only until the target is known; then make the edit; then verify it with the smallest relevant build or test. Do not remain in planning.";
+    let example = "Example: fs_search(pattern=\"target\", path=\".\") -> fs_read(path=\"src/lib.rs\") -> fs_edit(path=\"src/lib.rs\", edits=[{old:\"before\", new:\"after\"}]) -> process_exec(command=\"cargo test -p crate\").";
+    assert!(
+        policy.contains(contract),
+        "action contract drifted: {policy}"
+    );
+    assert!(policy.contains(example), "worked example drifted: {policy}");
+    assert!(
+        policy.find(contract) < policy.find(example),
+        "the action contract must precede its worked example"
+    );
+    assert_eq!(policy.len(), EXPECTED_POLICY_BYTES);
+    // Compile-time pin: the deliberate action contract must increase the
+    // shared policy (clippy::assertions_on_constants wants the const form).
+    const {
+        assert!(
+            EXPECTED_POLICY_BYTES > PRE_ACTBIAS_POLICY_BYTES,
+            "the deliberate action contract must increase the shared policy"
+        );
+    }
 }
 
 /// CACHE ITEM 962. The tool pack represents the daemon's grant-filtered
@@ -1096,7 +1133,7 @@ async fn recovery_rereads_and_journals_a_fresh_same_run_fact_on_digest_change() 
         .expect("recover work");
     assert_eq!(work.len(), 1);
     let accepted = match work.pop().expect("queued work") {
-        RecoveredWork::Queued(accepted) => accepted,
+        RecoveredWork::Queued(recovered) => recovered,
         RecoveredWork::Retry(_)
         | RecoveredWork::Checkpoint(_)
         | RecoveredWork::PartialStream(_)
@@ -1135,7 +1172,7 @@ async fn recovery_rereads_and_journals_a_fresh_same_run_fact_on_digest_change() 
     hub.install_worker_manager(handle.clone())
         .expect("install manager");
     handle
-        .recover_queued(accepted)
+        .recover_queued(accepted.accepted, accepted.provider_request_ordinal)
         .await
         .expect("resume recovery");
     wait_for_terminal(&recovered, &session_id, &run_id, Duration::from_secs(5)).await;

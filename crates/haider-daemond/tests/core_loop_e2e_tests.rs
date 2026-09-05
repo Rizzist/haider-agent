@@ -771,6 +771,7 @@ async fn start_headless_run_with_budget(
             text: "execute the pinned workflow".into(),
             attachments: Vec::new(),
             spec: HeadlessRunSpecV1 {
+                continuation_of: None,
                 cwd: workspace.to_string_lossy().into_owned(),
                 provider: provider.into(),
                 model: model.into(),
@@ -1660,7 +1661,7 @@ async fn headless_five_stage_workflow_has_no_two_hop_ceiling() {
 }
 
 #[tokio::test]
-async fn headless_workflow_provider_request_cap_returns_typed_loop_limit() {
+async fn headless_workflow_provider_request_cap_returns_resumable_budget_cause() {
     let test_id = "headless-workflow-loop-limit";
     let nodes = ["PLAN", "IMPLEMENT", "VERIFY"];
     let root = test_root("headless-workflow-loop-limit-");
@@ -1715,7 +1716,10 @@ async fn headless_workflow_provider_request_cap_returns_typed_loop_limit() {
     .await;
     let (state, failure, events) = events_until_any_terminal(&mut client, &run_id).await;
     assert_eq!(state, RunState::Errored);
-    assert!(matches!(failure, Some((ErrorCode::LoopLimit, _))));
+    assert!(matches!(
+        failure,
+        Some((ErrorCode::RequestBudgetExceeded, _))
+    ));
     assert!(!events.iter().any(|payload| {
         matches!(
             payload,
@@ -1827,7 +1831,7 @@ async fn workflow_hop_cost_cap_terminalizes_budget_before_request_two() {
     assert!(!events.iter().any(|payload| matches!(
         payload,
         EventPayload::RunFailed {
-            code: ErrorCode::WorkflowUnfinished | ErrorCode::LoopLimit,
+            code: ErrorCode::WorkflowUnfinished | ErrorCode::RequestBudgetExceeded,
             ..
         }
     )));
@@ -2190,8 +2194,8 @@ async fn workflow_recovery_after_budget_admission_preserves_spend_and_ordinal() 
             .iter()
             .map(|attempt| attempt.ordinal)
             .collect::<Vec<_>>(),
-        vec![1, 1, 2],
-        "the retried first hop retains its logical ordinal before hop two"
+        vec![1, 2, 3],
+        "restart retry and later hop each receive a fresh physical ordinal"
     );
     let usage = journal
         .iter()

@@ -931,6 +931,32 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
     StoreHandle::append(&first, &mut accepted)
         .await
         .expect("append old-generation runs");
+    let run_a_turn_ordinal = first
+        .turn_ordinal(session_id.clone(), run_a.clone())
+        .await
+        .expect("read queued turn ordinal")
+        .expect("queued run has a turn ordinal");
+    let auxiliary = haider_protocol::cache::ProviderRequestAttemptV1 {
+        session_id: session_id.clone(),
+        run_id: run_a.clone(),
+        turn_ordinal: run_a_turn_ordinal,
+        request_ordinal: 1,
+        request_kind: haider_protocol::cache::ProviderRequestKind::Warmup,
+    }
+    .extension_item()
+    .expect("standalone warmup marker");
+    let mut auxiliary = [event(
+        "a-warmup-attempt",
+        &run_a,
+        &branch_a,
+        EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+            item_id: haider_protocol::ids::ItemId::new("a-warmup-attempt-item"),
+            item: auxiliary,
+        }),
+    )];
+    StoreHandle::append(&first, &mut auxiliary)
+        .await
+        .expect("append pre-crash auxiliary request marker");
     first.close().await.expect("close first");
 
     let recovered = SqliteStoreHandle::open(root.path()).await.expect("reopen");
@@ -940,7 +966,7 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
     let queued = work
         .into_iter()
         .filter_map(|work| match work {
-            RecoveredWork::Queued(accepted) => Some(accepted),
+            RecoveredWork::Queued(recovered) => Some(recovered),
             RecoveredWork::Retry(_)
             | RecoveredWork::Checkpoint(_)
             | RecoveredWork::PartialStream(_)
@@ -954,9 +980,18 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
     assert_eq!(
         queued
             .iter()
-            .filter_map(|accepted| accepted.branch_id.clone())
+            .filter_map(|recovered| recovered.accepted.branch_id.clone())
             .collect::<Vec<_>>(),
         vec![branch_a.clone(), branch_b.clone()]
+    );
+    assert_eq!(
+        queued
+            .iter()
+            .find(|recovered| recovered.accepted.run_id == run_a)
+            .expect("queued run with pre-crash auxiliary attempt")
+            .provider_request_ordinal,
+        1,
+        "queued recovery preserves the physical request maximum"
     );
 
     let events = StoreHandle::read(&recovered, &session_id, 0, 256)
@@ -1008,9 +1043,9 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
     let handle = manager.handle();
     hub.install_worker_manager(handle.clone())
         .expect("install manager");
-    for accepted in queued {
+    for recovered in queued {
         handle
-            .recover_queued(accepted)
+            .recover_queued(recovered.accepted, recovered.provider_request_ordinal)
             .await
             .expect("start recovered turn");
     }
@@ -1070,6 +1105,18 @@ async fn restart_recovery_keeps_interleaved_runs_on_their_accepted_branches() {
                 )
         }));
     }
+    assert!(started_events.iter().any(|event| {
+        if event.run_id.as_ref() != Some(&run_a) {
+            return false;
+        }
+        let Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Completed { item, .. })) =
+            event.payload.decode_event()
+        else {
+            return false;
+        };
+        haider_protocol::cache::CacheRequestAttemptV1::try_from_extension_item(&item)
+            .is_ok_and(|attempt| attempt.is_some_and(|attempt| attempt.ordinal == 2))
+    }));
     manager.shutdown().await.expect("manager shutdown");
     hub.shutdown().await.expect("hub shutdown");
     recovered.close().await.expect("close recovered");
@@ -1275,7 +1322,7 @@ async fn failed_recovery_start_terminalizes_on_the_accepted_branch() {
     let queued = work
         .into_iter()
         .filter_map(|work| match work {
-            RecoveredWork::Queued(accepted) => Some(accepted),
+            RecoveredWork::Queued(recovered) => Some(recovered),
             RecoveredWork::Retry(_)
             | RecoveredWork::Checkpoint(_)
             | RecoveredWork::PartialStream(_)
@@ -1289,7 +1336,7 @@ async fn failed_recovery_start_terminalizes_on_the_accepted_branch() {
     assert_eq!(
         queued
             .iter()
-            .map(|accepted| accepted.branch_id.clone())
+            .map(|recovered| recovered.accepted.branch_id.clone())
             .collect::<Vec<_>>(),
         vec![Some(branch_id.clone())]
     );
@@ -1309,9 +1356,9 @@ async fn failed_recovery_start_terminalizes_on_the_accepted_branch() {
     let handle = manager.handle();
     hub.install_worker_manager(handle.clone())
         .expect("install manager");
-    for accepted in queued {
+    for recovered in queued {
         handle
-            .recover_queued(accepted)
+            .recover_queued(recovered.accepted, recovered.provider_request_ordinal)
             .await
             .expect("queue recovered turn");
     }

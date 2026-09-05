@@ -475,6 +475,7 @@ async fn dispatch(args: &[String]) -> ExitCode {
                  (supports: --version, self-test, run (-p <prompt>|-|<prompt>) \
                  [--json|--output print|json|jsonl] [--timeout <dur>] \
                  [--max-tokens <n>] [--max-cost <usd>] [--max-time <dur>] [--seed <n>] \
+                 [--request-tranche <n>] [--max-requests <n>] [--resume <run-id>] \
                  [--start] | run --status <run-id> | run --stop <run-id> | run --replay <run-id> \
                  [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>] \
                  [--read-only] [--allow-writes] [--allow-exec] [--auto-allow] [--trust-hooks] [--attach <path>]..., \

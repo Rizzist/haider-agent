@@ -555,7 +555,14 @@ fn render_item(out: &mut String, block: &ItemBlock) {
         },
         TurnItem::Refusal { reason } => out.push_str(&format!("✗ model refused — {reason}\n")),
         TurnItem::Extension { kind, data } => {
-            if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {
+            if let Some(budget) =
+                haider_protocol::request_budget::RequestBudgetStatusV1::from_extension_item(
+                    &block.item,
+                )
+            {
+                out.push_str(&budget.summary());
+                out.push('\n');
+            } else if let Some((_, label)) = crate::projection::image_created_fact(kind, data) {
                 out.push_str(&label);
                 out.push('\n');
             } else if let Some(transition) =

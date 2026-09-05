@@ -111,6 +111,7 @@ fn cache_attempt_envelopes(session_id: &SessionId) -> Vec<RawEnvelope> {
     let item_id = ItemId::new("cache-request-attempt-item");
     let item = CacheRequestAttemptV1 {
         ordinal: 1,
+        correlation: None,
         diagnostic: CacheRequestDiagnosticV1 {
             history_message_count: 1,
             stable_prefix_tokens: 8,

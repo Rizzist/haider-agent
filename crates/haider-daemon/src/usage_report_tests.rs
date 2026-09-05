@@ -1824,6 +1824,31 @@ fn mv6_terminal_snapshot_drops_live_and_retains_error_cancel_partials() {
     }
 }
 
+#[test]
+fn provider_operation_reservation_does_not_create_agent_metrics() {
+    let mut folder = SessionFolder::new("gpt-5.2");
+    folder.push(&envelope(
+        1,
+        Some("loom-authoring"),
+        None,
+        100,
+        haider_protocol::cache::ProviderOperationEventPayload::ProviderOperationReserved {
+            request_kind: haider_protocol::cache::ProviderRequestKind::Side,
+        }
+        .to_payload_value()
+        .expect("provider operation reservation"),
+    ));
+
+    assert!(
+        folder
+            .primary_agent_snapshot(&SessionId::new("s-usage"), 1)
+            .is_none(),
+        "a Loom/provider-support ordinal reservation is not root-agent work"
+    );
+    assert!(folder.run_agents.is_empty());
+    assert!(folder.timings.is_empty());
+}
+
 /// LAW (meter_routing_is_flavor_and_provider_strict): only the three OAuth
 /// subscriptions with supported server meters route to one; Grok's quota
 /// lane, the SAME provider names under an API key, and unknown providers are

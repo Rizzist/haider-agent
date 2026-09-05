@@ -1115,14 +1115,23 @@ async fn run_inner(
         .map_err(DaemonError::from)?;
     for work in recovered_work {
         let result = match work {
-            RecoveredWork::Queued(accepted) => worker_handle.recover_queued(accepted).await,
-            RecoveredWork::Retry(accepted) => worker_handle.recover_retry(accepted).await,
+            RecoveredWork::Queued(recovered) => {
+                worker_handle
+                    .recover_queued(recovered.accepted, recovered.provider_request_ordinal)
+                    .await
+            }
+            RecoveredWork::Retry(recovered) => {
+                worker_handle
+                    .recover_retry(recovered.accepted, recovered.provider_request_ordinal)
+                    .await
+            }
             RecoveredWork::Checkpoint(recovered) => {
                 worker_handle
                     .recover_checkpoint(
                         recovered.accepted,
                         recovered.checkpoint,
                         recovered.committed_answer,
+                        recovered.provider_request_ordinal,
                     )
                     .await
             }
@@ -1132,6 +1141,7 @@ async fn run_inner(
                         recovered.accepted,
                         recovered.checkpoint,
                         recovered.committed_answer,
+                        recovered.provider_request_ordinal,
                     )
                     .await
             }
@@ -1147,7 +1157,11 @@ async fn run_inner(
             }
             RecoveredWork::ChildWait(recovered) => {
                 worker_handle
-                    .recover_child_wait(recovered.accepted, recovered.checkpoint)
+                    .recover_child_wait(
+                        recovered.accepted,
+                        recovered.checkpoint,
+                        recovered.provider_request_ordinal,
+                    )
                     .await
             }
             RecoveredWork::AdmissionRetry(recovered) => {

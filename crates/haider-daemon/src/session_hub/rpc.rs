@@ -25,10 +25,15 @@ use base64::Engine as _;
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::agent::ChipState;
+use haider_protocol::cache::{
+    ProviderOperationEventPayload, ProviderRequestAttemptV1, ProviderRequestKind,
+};
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::effect::{EffectClass, EffectIntent, EffectPhase};
-use haider_protocol::envelope::write_payload_json;
-use haider_protocol::ids::AgentId;
+use haider_protocol::envelope::{
+    EventEnvelope, PromptRender, RawPayload, RenderTargets, SCHEMA_VERSION, write_payload_json,
+};
+use haider_protocol::ids::{AgentId, ItemId, RunId};
 use haider_protocol::item::ItemEvent;
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::permission::{PermissionEventPayload, SystemPermission};
@@ -46,6 +51,240 @@ const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES_PER_TURN: usize = 16 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES_PER_PDF_TURN: usize = 64 * 1024 * 1024;
 const MAX_SURFACE_WATCHES_PER_CONNECTION: usize = 16;
+
+#[derive(Clone)]
+struct LoomProviderRequestAttemptRecorder {
+    hub: SessionHub,
+    session_id: SessionId,
+    run_id: RunId,
+    turn_ordinal: u64,
+    ordinals: haider_provider::ProviderRequestOrdinal,
+    trace: Option<haider_provider::TurnTraceContext>,
+}
+
+impl std::fmt::Debug for LoomProviderRequestAttemptRecorder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LoomProviderRequestAttemptRecorder")
+            .field("session_id", &self.session_id)
+            .field("run_id", &self.run_id)
+            .field("turn_ordinal", &self.turn_ordinal)
+            .finish_non_exhaustive()
+    }
+}
+
+fn loom_provider_envelope(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    run_id: &RunId,
+    event_id: EventId,
+    payload: EventPayload,
+) -> Result<RawEnvelope, HaiderError> {
+    let payload = RawPayload::from_event(payload).map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("Loom provider correlation could not serialize: {error}"),
+            false,
+        )
+    })?;
+    Ok(loom_provider_raw_envelope(
+        hub, session_id, run_id, event_id, payload,
+    ))
+}
+
+fn loom_provider_raw_envelope(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    run_id: &RunId,
+    event_id: EventId,
+    payload: RawPayload,
+) -> RawEnvelope {
+    EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id,
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: Some(run_id.clone()),
+        agent_id: None,
+        device_id: hub.device_id(),
+        authority_epoch: 0,
+        worker_generation: hub.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: false,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload,
+    }
+}
+
+#[async_trait::async_trait]
+impl haider_provider::ProviderRequestAttemptRecorder for LoomProviderRequestAttemptRecorder {
+    async fn record_auxiliary_attempt(
+        &self,
+        request_kind: ProviderRequestKind,
+    ) -> Result<ProviderRequestAttemptV1, haider_provider::ProviderError> {
+        if request_kind == ProviderRequestKind::Primary {
+            return Err(haider_provider::ProviderError::new(
+                haider_provider::ProviderErrorKind::Internal,
+                "Loom provider support cannot allocate a primary request",
+            ));
+        }
+        let request_ordinal = self.ordinals.next()?;
+        let attempt = ProviderRequestAttemptV1 {
+            session_id: self.session_id.clone(),
+            run_id: self.run_id.clone(),
+            turn_ordinal: self.turn_ordinal,
+            request_ordinal,
+            request_kind,
+        };
+        if !attempt.coordinates_valid() {
+            return Err(haider_provider::ProviderError::new(
+                haider_provider::ProviderErrorKind::Internal,
+                "Loom provider correlation coordinates are invalid or ambiguous",
+            ));
+        }
+        let item = attempt.extension_item().map_err(|error| {
+            haider_provider::ProviderError::new(
+                haider_provider::ProviderErrorKind::Internal,
+                format!("Loom provider request marker could not serialize: {error}"),
+            )
+        })?;
+        let item_id = ItemId::new(format!(
+            "loom-provider-request-{}-{request_ordinal}",
+            self.run_id
+        ));
+        let mut envelopes = [
+            loom_provider_envelope(
+                &self.hub,
+                &self.session_id,
+                &self.run_id,
+                EventId::new(format!("{item_id}-started")),
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: item_id.clone(),
+                    item: item.clone(),
+                }),
+            ),
+            loom_provider_envelope(
+                &self.hub,
+                &self.session_id,
+                &self.run_id,
+                EventId::new(format!("{item_id}-completed")),
+                EventPayload::Item(ItemEvent::Completed { item_id, item }),
+            ),
+        ]
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            haider_provider::ProviderError::new(
+                haider_provider::ProviderErrorKind::Internal,
+                format!("Loom provider request marker could not be built: {error}"),
+            )
+        })?;
+        let started = self
+            .trace
+            .as_ref()
+            .map(haider_provider::TurnTraceContext::now_us_from_accept);
+        self.hub.append(&mut envelopes).await.map_err(|error| {
+            haider_provider::ProviderError::new(
+                haider_provider::ProviderErrorKind::Internal,
+                format!("Loom provider request marker could not be journaled: {error}"),
+            )
+        })?;
+        if let Some(trace) = self.trace.as_ref() {
+            trace.register_request(&attempt);
+            if let Some(started) = started {
+                trace.emit(
+                    "request_attempt_commit",
+                    request_ordinal,
+                    0,
+                    started,
+                    trace.now_us_from_accept(),
+                );
+            }
+        }
+        Ok(attempt)
+    }
+}
+
+async fn begin_loom_provider_request(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    authoring_id: &str,
+) -> Result<crate::loom_author::LoomProviderRequestContext, HaiderError> {
+    // A projection-invisible provider operation reserves a durable,
+    // session-monotonic turn ordinal without fabricating a conversation run,
+    // hook terminal, usage timing, or nonterminal-run gate. The request marker
+    // below still commits before provider I/O.
+    let run_id = RunId::new(authoring_id);
+    let mut reservation = [loom_provider_raw_envelope(
+        hub,
+        session_id,
+        &run_id,
+        EventId::new(format!("{authoring_id}-turn-reserved")),
+        ProviderOperationEventPayload::ProviderOperationReserved {
+            request_kind: ProviderRequestKind::Side,
+        }
+        .to_payload_value()
+        .map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("Loom provider operation reservation could not serialize: {error}"),
+                false,
+            )
+        })?
+        .into(),
+    )];
+    hub.append(&mut reservation).await?;
+    let turn_ordinal = hub
+        .turn_ordinal(session_id, &run_id)
+        .await?
+        .ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "Loom provider operation has no durable turn ordinal",
+                false,
+            )
+        })?;
+    let trace = haider_provider::turn_trace_enabled().then(|| {
+        let trace = haider_provider::TurnTraceContext::new(
+            session_id.clone(),
+            run_id.clone(),
+            turn_ordinal,
+        );
+        trace.emit("accept", 0, 0, 0, 0);
+        trace
+    });
+    let recorder = Arc::new(LoomProviderRequestAttemptRecorder {
+        hub: hub.clone(),
+        session_id: session_id.clone(),
+        run_id,
+        turn_ordinal,
+        ordinals: haider_provider::ProviderRequestOrdinal::new(0),
+        trace: trace.clone(),
+    });
+    let attempt = haider_provider::ProviderRequestAttemptRecorder::record_auxiliary_attempt(
+        recorder.as_ref(),
+        ProviderRequestKind::Side,
+    )
+    .await
+    .map_err(|error| {
+        HaiderError::new(
+            ErrorCode::ProviderError,
+            format!("Loom provider request identity could not be committed: {error}"),
+            false,
+        )
+    })?;
+    Ok(crate::loom_author::LoomProviderRequestContext {
+        attempt,
+        auxiliary_recorder: recorder,
+        turn_trace: trace,
+    })
+}
 
 struct TurnSubmitInput {
     command_id: CommandId,
@@ -12350,6 +12589,8 @@ impl HubConnection {
         }
         let sink = Arc::clone(&self.sink);
         let sessions = Arc::clone(&self.loom_author_sessions);
+        let hub = self.hub.clone();
+        let correlation_session_id = session_id.clone();
         let mut cancel = self.identity_lease.loom_author_cancel.subscribe();
         let task = tokio::spawn(async move {
             let result = tokio::select! {
@@ -12370,6 +12611,11 @@ impl HubConnection {
                         &agent_types,
                         &metadata,
                         provider.as_ref(),
+                        begin_loom_provider_request(
+                            &hub,
+                            &correlation_session_id,
+                            &authoring_id,
+                        ),
                     ),
                 ) => match result {
                     Ok(result) => result,
@@ -14208,6 +14454,17 @@ impl HubConnection {
             request.insert("trust_hooks".into(), serde_json::Value::Bool(true));
         }
         if let Some(spec) = headless_spec.as_ref() {
+            if let Some(budget) = spec.budget.request_budget
+                && let Err(message) = budget.validate()
+            {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    &message,
+                    false,
+                    None,
+                );
+            }
             if spec.cwd.trim().is_empty()
                 || spec.provider.trim().is_empty()
                 || spec.model.trim().is_empty()
@@ -19342,6 +19599,31 @@ mod run_identity_tests {
             projection
                 .runs
                 .contains_key(&RunId::new(format!("terminal-{}", total - 1)))
+        );
+    }
+
+    #[test]
+    fn provider_operation_reservation_does_not_replace_the_observed_conversation_run() {
+        let visible_failure = state_envelope("visible-failure", 1, RunState::Errored);
+        let mut reservation = state_envelope("loom-authoring", 2, RunState::Done);
+        reservation.render.ui = false;
+        reservation.payload = ProviderOperationEventPayload::ProviderOperationReserved {
+            request_kind: ProviderRequestKind::Side,
+        }
+        .to_payload_value()
+        .expect("provider operation reservation")
+        .into();
+
+        let digest = digest_of(vec![visible_failure, reservation]);
+        assert_eq!(
+            digest.run_state,
+            haider_rpc::ObserveRunStateWire::Errored,
+            "a provider-support ordinal reservation must not mask the visible failure"
+        );
+        assert_eq!(
+            digest.run_id.as_ref().map(RunId::as_str),
+            Some("visible-failure"),
+            "the hidden operation id must not escape through session observation"
         );
     }
 
