@@ -87,6 +87,8 @@ fn digest(
         head_seq: 12,
         worker_generation: 7,
         metadata: Some(SessionMetadataV1 {
+            provider_base_url: None,
+            provider_rebind_id: None,
             cwd: format!("/tmp/{id}"),
             provider: "openai".into(),
             account_alias: None,
@@ -287,7 +289,7 @@ fn observe_json_schemas_are_goldened_and_secret_free() {
     const VAULT_SENTINEL: &str = "sk-schema-vault-sentinel";
     const OAUTH_SENTINEL: &str = "oauth-schema-refresh-sentinel";
 
-    let status = StatusDocument {
+    let mut status = StatusDocument {
         schema: "haider.observe.v1",
         kind: "status",
         daemon: DaemonView {
@@ -301,6 +303,23 @@ fn observe_json_schemas_are_goldened_and_secret_free() {
             providers_loaded: true,
             idle_ttl_ms: Some(30_000),
             warm: true,
+            caching: Some(haider_rpc::DaemonCachingWire {
+                prompt_cache: true,
+                provider_view_cas: true,
+                session_reuse: haider_rpc::SessionReuseWire::Resident,
+                idle_ttl_ms: Some(30_000),
+                cache_regime: Some(haider_rpc::ProviderCacheRegimeWire::AutomaticPrefix),
+                cache_regimes_by_provider: std::collections::BTreeMap::from([
+                    (
+                        "openai".into(),
+                        Some(haider_rpc::ProviderCacheRegimeWire::AutomaticPrefix),
+                    ),
+                    (
+                        "anthropic".into(),
+                        Some(haider_rpc::ProviderCacheRegimeWire::ExplicitBreakpoints),
+                    ),
+                ]),
+            }),
         },
         update: UpdateView {
             status: "available",
@@ -366,7 +385,21 @@ fn observe_json_schemas_are_goldened_and_secret_free() {
         session: depth_view(permission),
     };
 
-    let status = serde_json::to_string(&status.json()).expect("status serializes") + "\n";
+    // Exercise the actual CLI serializer as well as its test/human projection.
+    assert_eq!(
+        serde_json::to_value(cli_main::observe::status_document_wire(&status))
+            .expect("status wire"),
+        status.json()
+    );
+    let status_json = serde_json::to_string(&status.json()).expect("status serializes") + "\n";
+    status.daemon.caching = None;
+    assert!(
+        serde_json::to_value(cli_main::observe::status_document_wire(&status))
+            .expect("legacy status wire")["daemon"]["caching"]
+            .is_null()
+    );
+    assert!(status.json()["daemon"]["caching"].is_null());
+    let status = status_json;
     let sessions = serde_json::to_string(&sessions.json()).expect("sessions serialize") + "\n";
     let session = serde_json::to_string(&session.json()).expect("session serializes") + "\n";
     status_golden(&status, "/tmp/haider-profile");

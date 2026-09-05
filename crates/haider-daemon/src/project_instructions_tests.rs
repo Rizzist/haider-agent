@@ -303,6 +303,8 @@ fn project_facts(
 
 fn metadata(cwd: String) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        provider_base_url: None,
+        provider_rebind_id: None,
         cwd,
         provider: "fake".into(),
         account_alias: None,

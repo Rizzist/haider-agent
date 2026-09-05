@@ -692,6 +692,10 @@ fn repeated_run_invocations_default_to_one_warm_daemon_until_operator_stop() {
         serde_json::from_slice(&status_output.stdout).expect("status stdout is JSON");
     assert_eq!(status["daemon"]["pid"], daemon_pid);
     assert_eq!(status["daemon"]["idle_ttl_ms"], 30_000);
+    assert_eq!(status["daemon"]["caching"]["idle_ttl_ms"], 30_000);
+    assert_eq!(status["daemon"]["caching"]["session_reuse"], "resident");
+    assert_eq!(status["daemon"]["caching"]["prompt_cache"], true);
+    assert_eq!(status["daemon"]["caching"]["provider_view_cas"], true);
     assert_eq!(status["daemon"]["warm"], true);
     assert_eq!(status["daemon"]["ready"], true);
     assert!(status["daemon"]["ready_since"].as_u64().is_some());

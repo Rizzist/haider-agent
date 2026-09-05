@@ -1,0 +1,3 @@
+    Finished `dev` profile [unoptimized] target(s) in 0.22s
+     Running `target/debug/xtask test-count --update`
+test-count: baseline updated to 4860

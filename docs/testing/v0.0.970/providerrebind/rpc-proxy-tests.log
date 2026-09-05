@@ -1,0 +1,61 @@
+   Compiling haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-core)
+   Compiling haider-daemon v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-daemon)
+   Compiling haider-daemond v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-daemond)
+    Finished `test` profile [unoptimized] target(s) in 1m 38s
+     Running tests/provider_rebind_rpc_tests.rs (target/debug/deps/provider_rebind_rpc_tests-95e9a8fec343ae42)
+
+running 3 tests
+haiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1
+haiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1
+haiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1
+haiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/rebind-current-registry-eLPUfO/runtime/h.sock
+haiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/rebind-current-registry-eLPUfO/runtime/h.sock
+haiderd: ephemeral-lifecycle event=connection_retired reason=error attached_clients=0 error_class=io raw_os_error=Some(57)
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=completed barrier_breached=false
+haiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/rebind-current-registry-eLPUfO/runtime/h.sock
+haiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/rebind-current-registry-eLPUfO/runtime/.haiderd-pid-54bec1c98cd14fda3d5438e5
+haiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/rebind-current-registry-eLPUfO/runtime/tmp
+haiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/rebind-current-registry-eLPUfO/runtime
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=completed barrier_breached=false
+haiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/rebind-account-A4E3Dc/runtime/h.sock
+haiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/rebind-account-A4E3Dc/runtime/h.sock
+haiderd: ephemeral-lifecycle event=connection_retired reason=error attached_clients=0 error_class=io raw_os_error=Some(57)
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started
+test provider_rebind_without_overrides_refreshes_changed_registry_endpoint ... ok
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=completed barrier_breached=false
+haiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/rebind-account-A4E3Dc/runtime/h.sock
+haiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/rebind-account-A4E3Dc/runtime/.haiderd-pid-105c0869c20c360b617b6c2b
+haiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/rebind-account-A4E3Dc/runtime/tmp
+haiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/rebind-account-A4E3Dc/runtime
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=completed barrier_breached=false
+test provider_rebind_selects_named_account_and_rejects_provider_mismatch ... ok
+haiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/provider-rebind-OTzKbW/runtime/h.sock
+haiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/provider-rebind-OTzKbW/runtime/h.sock
+haiderd: ephemeral-lifecycle event=connection_retired reason=error attached_clients=0 error_class=io raw_os_error=Some(57)
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=completed barrier_breached=false
+haiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/provider-rebind-OTzKbW/runtime/h.sock
+haiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/provider-rebind-OTzKbW/runtime/.haiderd-pid-4231fc744a946329b0b0f2f5
+haiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/provider-rebind-OTzKbW/runtime/tmp
+haiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/provider-rebind-OTzKbW/runtime
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=completed barrier_breached=false
+haiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1
+haiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/provider-rebind-OTzKbW/runtime/h.sock
+haiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/provider-rebind-OTzKbW/runtime/h.sock
+haiderd: ephemeral-lifecycle event=connection_retired reason=error attached_clients=0 error_class=io raw_os_error=Some(57)
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=completed barrier_breached=false
+haiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/provider-rebind-OTzKbW/runtime/h.sock
+haiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/provider-rebind-OTzKbW/runtime/.haiderd-pid-a6e58670facfedd85005eb4e
+haiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/provider-rebind-OTzKbW/runtime/tmp
+haiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/provider-rebind-OTzKbW/runtime
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started
+haiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=completed barrier_breached=false
+test provider_rebind_routes_next_request_preserves_inflight_and_replays ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+

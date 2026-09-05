@@ -9209,7 +9209,18 @@ impl AccountsProviderFactory {
         metadata: &haider_protocol::session::SessionMetadataV1,
         tuning: &ProviderTuning,
     ) -> Result<Arc<dyn Provider>, HaiderError> {
-        let profile = self.provider_profile(&descriptor.provider);
+        let mut profile = self.provider_profile(&descriptor.provider);
+        let mut routed_descriptor;
+        let descriptor = if let Some(base_url) = metadata.provider_base_url.as_ref() {
+            routed_descriptor = descriptor.clone();
+            routed_descriptor.base_url = Some(base_url.clone());
+            if let Some(profile) = profile.as_mut() {
+                profile.endpoint = Some(base_url.clone());
+            }
+            &routed_descriptor
+        } else {
+            descriptor
+        };
         let catalog_model = self
             .model_source
             .as_ref()
@@ -9856,7 +9867,7 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
                 return Ok(haider_core::ProviderAttemptDecision::Wait);
             }
         };
-        if self.metadata.account_alias.is_some() {
+        if self.metadata.account_alias.is_some() || self.metadata.provider_base_url.is_some() {
             return Ok(haider_core::ProviderAttemptDecision::Wait);
         }
         let resolved = match self
@@ -9908,7 +9919,7 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
         _current_account: &CredentialAlias,
         error: &haider_provider::ProviderError,
     ) -> Result<haider_core::ProviderAttemptDecision, HaiderError> {
-        if self.metadata.account_alias.is_some() {
+        if self.metadata.account_alias.is_some() || self.metadata.provider_base_url.is_some() {
             return Ok(haider_core::ProviderAttemptDecision::Stop);
         }
         if !matches!(
@@ -10043,12 +10054,13 @@ impl AccountsProviderFactory {
             self.resolve_provider(metadata, &tuning).await?;
         let rotation_budget_consumed = resolved.rotation.is_some();
         let context_window = self.model_context_window(&metadata.provider, &metadata.model);
-        let compaction_promotion = if metadata.account_alias.is_some() {
-            None
-        } else {
-            self.resolve_compaction_promotion_with_web(metadata, web_degrade)
-                .await
-        };
+        let compaction_promotion =
+            if metadata.account_alias.is_some() || metadata.provider_base_url.is_some() {
+                None
+            } else {
+                self.resolve_compaction_promotion_with_web(metadata, web_degrade)
+                    .await
+            };
         Ok(crate::worker::ResolvedTurnProvider {
             provider,
             provider_name: metadata.provider.clone(),
@@ -11877,3 +11889,7 @@ impl AccountsRuntime {
 #[cfg(test)]
 #[path = "accounts_tests.rs"]
 mod accounts_tests;
+
+#[cfg(test)]
+#[path = "accounts_provider_rebind_tests.rs"]
+mod provider_rebind_tests;

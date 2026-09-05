@@ -236,6 +236,8 @@ async fn respond_create_and_attach_with_account(
             created_seq: 0,
             worker_generation: 7,
             metadata: SessionMetadataV1 {
+                provider_base_url: None,
+                provider_rebind_id: None,
                 cwd: "/tmp".into(),
                 provider: provider.into(),
                 account_alias: account_alias.map(Into::into),
@@ -420,6 +422,8 @@ async fn r2_05_attach_then_start_are_ordered_separate_requests_with_receipts() {
                 created_seq: 0,
                 worker_generation: 7,
                 metadata: SessionMetadataV1 {
+                    provider_base_url: None,
+                    provider_rebind_id: None,
                     cwd: "/tmp".into(),
                     provider: "fake".into(),
                     account_alias: None,

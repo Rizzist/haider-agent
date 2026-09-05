@@ -36,6 +36,85 @@ fn rounds(count: usize) -> Vec<FakeStep> {
         .collect()
 }
 
+#[derive(Debug)]
+struct RebindUnavailableAfterBudget {
+    refreshes: AtomicUsize,
+    hard_cap: usize,
+}
+
+#[async_trait]
+impl ProviderRebindResolver for RebindUnavailableAfterBudget {
+    async fn refresh(
+        &self,
+        _model: &str,
+        _reasoning: &str,
+    ) -> Result<Option<ProviderRebindTarget>, HaiderError> {
+        if self.refreshes.fetch_add(1, Ordering::SeqCst) >= self.hard_cap {
+            return Err(HaiderError::new(
+                ErrorCode::ProviderError,
+                "rebound provider is no longer available",
+                false,
+            ));
+        }
+        Ok(None)
+    }
+}
+
+/// MUTATION CHECK: refresh the provider before checking the exhausted logical
+/// budget. A newly unavailable route would replace the durable cap and receipts
+/// even though no further provider request is allowed.
+#[tokio::test]
+async fn hard_request_bound_preserves_typed_terminal_before_provider_rebind_refresh() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("existing.txt"), "original").expect("baseline file");
+    let resolver = Arc::new(RebindUnavailableAfterBudget {
+        refreshes: AtomicUsize::new(0),
+        hard_cap: 2,
+    });
+    let mut bounded = config();
+    bounded.provider_request_tranche = 1;
+    bounded.max_provider_requests_per_turn = 2;
+    bounded.ceiling_workspace = Some(workspace.path().into());
+    bounded.provider_rebind_resolver = Some(resolver.clone());
+    let provider = Arc::new(FakeProvider::new(rounds(3)));
+    let store = Arc::new(MemoryStore::new());
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        bounded,
+        provider.clone(),
+        store.clone(),
+        Some(Arc::new(CompletingDispatcher)),
+    );
+    let task = tokio::spawn(actor.run());
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("inspect until the cap"))
+        .await
+        .expect("accept")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    let error = outcome.error.expect("typed cap cause");
+    assert_eq!(error.code, ErrorCode::RequestBudgetExceeded);
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(resolver.refreshes.load(Ordering::SeqCst), 2);
+    let events = store.events(&SessionId::new(SESSION)).await;
+    let terminals = events
+        .iter()
+        .filter(|event| InternalCeilingTerminalV1::from_payload(&event.payload).is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1);
+    let terminal = &terminals[0].payload["terminal"];
+    assert_eq!(terminal["exit_code"], INTERNAL_CEILING_EXIT_CODE);
+    assert_eq!(terminal["workspace_state"], "untouched");
+    assert_eq!(terminal["workspace_before"], terminal["workspace_after"]);
+    assert_eq!(terminal["partial_progress"]["tool_calls"], 2);
+    assert_eq!(terminal["partial_progress"]["last_request_ordinal"], 2);
+    assert_eq!(error.details.expect("cap details")["terminal"], *terminal);
+    assert_eq!(statuses(&events).last().expect("hard checkpoint").used, 2);
+    drop(handle);
+    task.await.expect("actor joins");
+}
+
 #[tokio::test]
 async fn soft_request_bound_is_once_typed_and_in_the_actual_model_request() {
     let mut bounded = config();

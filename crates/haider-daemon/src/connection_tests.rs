@@ -358,8 +358,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        114,
-        "binary artifact uploads extend the prior 113-feature set"
+        115,
+        "provider rebind extends the merged 114-feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -433,6 +433,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_REQUEST_BUDGET_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_PROVIDER_REBIND_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned(),
             FEATURE_SESSION_MUTATION_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_RENAME_V1.to_owned(),

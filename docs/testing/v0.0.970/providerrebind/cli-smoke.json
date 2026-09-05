@@ -1,0 +1,37 @@
+{
+  "passed": true,
+  "same_daemon_identity": true,
+  "receipt": {
+    "account": null,
+    "base_url": "http://127.0.0.1:64257/v1",
+    "provider": "turnperf-proxy",
+    "schema": "haider.session_provider_rebind.v1",
+    "selected_seq": 24,
+    "session_id": "session-0b541db95d7c902e9d5b8ba31ea030b9",
+    "worker_generation": 1
+  },
+  "caching": {
+    "prompt_cache": true,
+    "provider_view_cas": true,
+    "session_reuse": "resident",
+    "idle_ttl_ms": 30000,
+    "cache_regime": null,
+    "cache_regimes_by_provider": {
+      "anthropic": "explicit-breakpoints",
+      "anthropic-oauth": "explicit-breakpoints",
+      "bedrock": "explicit-breakpoints",
+      "deepseek": "automatic-prefix",
+      "gemini": null,
+      "google-antigravity": null,
+      "grok-oauth": "automatic-prefix",
+      "haider-code": "automatic-prefix",
+      "kimi-oauth": "automatic-prefix",
+      "openai": "automatic-prefix",
+      "openai-compatible": "automatic-prefix",
+      "openai-oauth": "automatic-prefix",
+      "turnperf-proxy": "automatic-prefix",
+      "vertex": "explicit-breakpoints",
+      "xai": "automatic-prefix"
+    }
+  }
+}

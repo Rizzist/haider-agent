@@ -126,6 +126,8 @@ pub struct ObserveStatusSnapshot {
     pub idle_ttl_ms: Option<u64>,
     /// Whether pre-ready boot work remains resident for the first client.
     pub warm: bool,
+    /// Daemon-declared support; `None` means an older daemon did not declare it.
+    pub caching: Option<haider_rpc::DaemonCachingWire>,
 }
 
 /// Finite result from the event-driven durable-roster barrier.
@@ -280,6 +282,7 @@ impl ObserveClient {
                 providers_loaded,
                 idle_ttl_ms,
                 warm,
+                caching,
             } => Ok(ObserveStatusSnapshot {
                 active_account,
                 session_count,
@@ -292,6 +295,7 @@ impl ObserveClient {
                 providers_loaded,
                 idle_ttl_ms,
                 warm,
+                caching,
                 ready: if self
                     .welcome
                     .features

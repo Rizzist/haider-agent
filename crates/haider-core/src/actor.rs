@@ -683,6 +683,11 @@ pub struct HarnessConfig {
     pub rotation_budget_consumed: bool,
     /// Daemon-owned resolver consulted only at a pre-first-event boundary.
     pub provider_attempt_resolver: Option<Arc<dyn ProviderAttemptResolver>>,
+    /// Checks committed session routing before preparing each request. The
+    /// returned adapter is immutable for the lifetime of that request.
+    pub provider_rebind_resolver: Option<Arc<dyn ProviderRebindResolver>>,
+    /// Persisted route identity separates cache domains across explicit rebinds.
+    pub provider_route_epoch: Option<String>,
     /// Daemon-owned durable pair-selection seam. Automatic fallback and
     /// promotion refuse to switch unless this is installed.
     pub provider_pair_switch_committer: Option<Arc<dyn ProviderPairSwitchCommitter>>,
@@ -828,6 +833,8 @@ impl HarnessConfig {
             initial_rotation: None,
             rotation_budget_consumed: false,
             provider_attempt_resolver: None,
+            provider_rebind_resolver: None,
+            provider_route_epoch: None,
             provider_pair_switch_committer: None,
             compaction_promotion: None,
             retry_sleeper: Arc::new(RealRetrySleeper),
@@ -1533,6 +1540,32 @@ pub trait ProviderAttemptResolver: Send + Sync + std::fmt::Debug {
     ) -> Result<ProviderAttemptDecision, HaiderError> {
         Ok(ProviderAttemptDecision::Stop)
     }
+}
+
+/// A route already durably committed by `session.provider.rebind`.
+/// The model is unchanged; all other provider-derived request state travels
+/// with the adapter so preparation and transport observe one snapshot.
+pub struct ProviderRebindTarget {
+    pub provider: Arc<dyn Provider>,
+    pub provider_name: String,
+    pub account: Option<CredentialAlias>,
+    pub context_window: Option<u64>,
+    pub cached_input_is_subset: bool,
+    pub provider_request_state: ProviderDerivedRequestState,
+    pub auth_scope: String,
+    pub attempt_resolver: Option<Arc<dyn ProviderAttemptResolver>>,
+    pub route_epoch: String,
+    pub initial_rotation: Option<RotationEvent>,
+    pub rotation_budget_consumed: bool,
+}
+
+#[async_trait]
+pub trait ProviderRebindResolver: Send + Sync + std::fmt::Debug {
+    async fn refresh(
+        &self,
+        current_model: &str,
+        reasoning_settings: &str,
+    ) -> Result<Option<ProviderRebindTarget>, HaiderError>;
 }
 
 /// Injectable backoff wait for the provider-retry seam (W-C M4). Production
@@ -3513,6 +3546,77 @@ impl HarnessActor {
                             error,
                         )
                         .await;
+                }
+            }
+            // The exhausted logical cap takes precedence over route refresh:
+            // no unavailable provider may replace its typed terminal/receipts.
+            // Snapshot BEFORE provider-specific history projection, cache/CAS
+            // preparation and transport. A rebind never mutates an Arc used
+            // by an earlier in-flight request.
+            if let Some(resolver) = self.config.provider_rebind_resolver.clone() {
+                match resolver
+                    .refresh(&self.config.model, &self.config.reasoning_settings)
+                    .await
+                {
+                    Ok(Some(target)) => {
+                        // Factory-time alternate selection has the same
+                        // durable-before-provider law as initial turn setup.
+                        // An explicit rebind never refunds the logical turn's
+                        // previously consumed automatic-rotation allowance.
+                        rotation_budget_consumed |= target.rotation_budget_consumed;
+                        if let Some(rotation) = target.initial_rotation {
+                            if let Err(error) = self
+                                .commit_pending_thinking(&run_id, &mut thinking_pending)
+                                .await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            if let Err(error) = self
+                                .commit_payload(
+                                    &run_id,
+                                    EventPayload::Rotation(rotation),
+                                    prompt_omit_render(),
+                                )
+                                .await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            rotation_budget_consumed = true;
+                        }
+                        remap_after_provider_opaque_strip(
+                            &mut messages,
+                            &target.provider_name,
+                            &mut stable_history_end,
+                            &mut current_turn_start,
+                            &mut latest_compaction_summary_end,
+                        );
+                        self.config.context_window = target.context_window;
+                        self.config.cached_input_is_subset = target.cached_input_is_subset;
+                        self.config
+                            .install_provider_derived_request_state(&target.provider_request_state);
+                        self.config.usage_account = target.account.clone();
+                        self.config.usage_scope.provider = target.provider_name;
+                        self.config.usage_scope.account_scope = target.account.clone();
+                        self.config.usage_scope.auth_scope = target.auth_scope;
+                        let dimensions = target.provider.usage_lane_dimensions();
+                        self.config.usage_scope.api_family = dimensions.api_family;
+                        self.config.usage_scope.effort = dimensions.effort;
+                        self.config.usage_scope.speed = dimensions.speed;
+                        self.config.provider_route_epoch = Some(target.route_epoch);
+                        self.config.cache_reuse_gap_ms = None;
+                        self.config.context_compactor = None;
+                        self.config.compaction_promotion = None;
+                        self.config.provider_attempt_resolver = target.attempt_resolver;
+                        provider = target.provider;
+                        usage_account = target.account;
+                        previous_cache_request = None;
+                        previous_provider_view = None;
+                        pending_previous_cache_request = None;
+                        previous_cache_request_sent_at = None;
+                        cache_rewarm_pending = Some(CacheRewarmReasonV1::ConfigurationChange);
+                    }
+                    Ok(None) => {}
+                    Err(error) => return self.errored_state_outcome(&run_id, error).await,
                 }
             }
             if provider_attempt == 0 {
@@ -12666,6 +12770,12 @@ fn prompt_cache_metadata(
         "compaction_epoch": compaction_epoch,
         "volatile_context_epoch": volatile_context_epoch,
     }));
+    let cache_epoch = config.provider_route_epoch.as_ref().map_or_else(
+        || cache_epoch.clone(),
+        |route| {
+            digest_json(&serde_json::json!({"request_epoch": cache_epoch, "provider_route": route}))
+        },
+    );
     let stable_prefix_tokens =
         estimated_request_input_tokens(config, &messages[..cacheable_history_end]);
     PromptCacheMetadata {
@@ -14415,5 +14525,41 @@ mod cu1_actor_tests {
         };
         assert_eq!(retained, &images[1..]);
         assert!(preview.contains(images[0].artifact.as_str()));
+    }
+    #[test]
+    fn provider_rebind_epoch_reaches_real_cache_metadata_and_is_stable_between_turns() {
+        let mut config =
+            HarnessConfig::for_session(SessionId::new("route-cache"), DeviceId::new("test"), 0, 0);
+        let messages = vec![Message::user_text("stable prompt")];
+        let epoch = |config: &HarnessConfig| {
+            prompt_cache_metadata(
+                config,
+                &messages,
+                PromptCacheBoundaries {
+                    stable_history_end: 0,
+                    cacheable_history_end: 0,
+                    current_user_start: 0,
+                    previous_stable_history_end: None,
+                    latest_compaction_summary_end: None,
+                },
+                usage_prefix_digests(config, &[]),
+                None,
+                None,
+            )
+            .cache_epoch
+        };
+        let unbound = epoch(&config);
+        config.provider_route_epoch = Some("rebind-a".into());
+        let first = epoch(&config);
+        assert_ne!(unbound, first);
+        assert_eq!(first, epoch(&config.clone()));
+        config.provider_route_epoch = Some("rebind-b".into());
+        assert_ne!(first, epoch(&config));
+        config.provider_route_epoch = None;
+        assert_eq!(
+            unbound,
+            epoch(&config),
+            "ordinary request cache bytes stay unchanged"
+        );
     }
 }

@@ -7793,11 +7793,13 @@ async fn start_turn(
         refresh_context_economy(lease, &pinned_metadata.context_economy).await?;
     if let Some(context) = headless.as_ref() {
         let spec = &context.spec;
-        pinned_metadata.provider.clone_from(&spec.provider);
-        pinned_metadata.model.clone_from(&spec.model);
-        pinned_metadata.max_tokens = spec.max_output_tokens;
-        pinned_metadata.effort.clone_from(&spec.effort);
-        pinned_metadata.fast = spec.fast;
+        provider_rebind::pin_headless_turn_metadata(
+            &mut pinned_metadata,
+            spec,
+            lease,
+            &accepted.run_id,
+        )
+        .await?;
         let exhaustion = match context.exhausted.clone() {
             Some(exhausted) => Some(exhausted),
             None => check_run_budget(lease, &accepted.run_id, spec, context.accepted_at_ms).await?,
@@ -8138,10 +8140,11 @@ async fn start_turn(
         .hub()
         .provider_lockdown_policy_for_active(&resolved.provider_name, resolved.active_no_auth)
         .map_err(hub_error)?;
-    let lockdown = lockdown_turn_snapshot(
+    let lockdown = provider_rebind::rebound_turn_lockdown_snapshot(
         lease.hub(),
         lease.session_id(),
         &accepted.run_id,
+        metadata.provider_rebind_id.is_some(),
         &resolved.provider_name,
         provider_policy,
     )?;
@@ -8572,6 +8575,7 @@ async fn start_turn(
     )
     .with_event_ids(Arc::clone(&event_ids));
     config.turn_trace = turn_trace.clone();
+    config.provider_route_epoch = metadata.provider_rebind_id.clone();
     config.provider_deadline = provider_deadline;
     let provider_request_state = provider_derived_request_state(
         &resolved.provider_name,
@@ -8802,6 +8806,14 @@ async fn start_turn(
     }
     config.rotation_budget_consumed = resolved.rotation_budget_consumed;
     config.initial_rotation = resolved.initial_rotation;
+    config.provider_rebind_resolver = Some(Arc::new(
+        provider_rebind::DaemonProviderRebindResolver::new(
+            lease.clone(),
+            Arc::clone(&dependencies.provider_factory),
+            metadata.clone(),
+            web_degrade,
+        ),
+    ));
     config.provider_attempt_resolver = resolved.attempt_resolver;
     config.compaction_promotion = resolved.compaction_promotion;
     config.provider_pair_switch_committer = Some(Arc::new(DaemonProviderPairSwitchCommitter {
@@ -22335,3 +22347,6 @@ fn tool_error(error: haider_tools::ToolError) -> HaiderError {
 fn computer_error(error: ComputerError) -> HaiderError {
     HaiderError::new(ErrorCode::ProviderError, error.to_string(), false)
 }
+
+#[path = "provider_rebind.rs"]
+mod provider_rebind;

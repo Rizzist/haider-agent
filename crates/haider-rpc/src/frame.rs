@@ -415,6 +415,8 @@ pub const FEATURE_AGENT_CANCEL_V1: &str = "agent_cancel_v1";
 /// (`session.select_model`), including cross-provider rows: the request's
 /// optional `provider` names the selected model row's provider attribute,
 /// and the next logical turn resolves through the committed pair.
+pub const FEATURE_SESSION_PROVIDER_REBIND_V1: &str = "session_provider_rebind_v1";
+
 pub const FEATURE_SESSION_MODEL_SELECT_V1: &str = "session_model_select_v1";
 /// Daemon implements receipted live-session renaming (`session.rename`,
 /// G2): the committed title lands in `sessions.meta_json`, a
@@ -1132,6 +1134,44 @@ pub enum ProviderApiFamilyWire {
     AcpAgent,
     #[serde(other)]
     Unknown,
+}
+
+/// Request-cache convention emitted by the selected provider adapter. This
+/// describes a protocol, not whether an upstream cache hit occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ProviderCacheRegimeWire {
+    AutomaticPrefix,
+    ExplicitBreakpoints,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Process retention policy, independent of durable session persistence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SessionReuseWire {
+    Resident,
+    OneShot,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Daemon-declared caching/reuse support for economy-row annotation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonCachingWire {
+    pub prompt_cache: bool,
+    pub provider_view_cas: bool,
+    pub session_reuse: SessionReuseWire,
+    /// Zero is one-shot; `None` is an unbounded resident daemon.
+    pub idle_ttl_ms: Option<u64>,
+    /// Regime for `status.snapshot.active_account.provider`; no known active
+    /// adapter is `None`. Session overrides use the provider-indexed map.
+    pub cache_regime: Option<ProviderCacheRegimeWire>,
+    pub cache_regimes_by_provider:
+        std::collections::BTreeMap<String, Option<ProviderCacheRegimeWire>>,
 }
 
 /// Immutable authentication requirement of a provider profile.
@@ -3755,6 +3795,18 @@ pub enum RequestBody {
     /// the daemon validates creatability and, when a discovered inventory
     /// exists, membership. The next logical turn resolves through the
     /// committed pair (R6 re-resolution).
+    /// Durable per-session routing change, applied at the next request boundary.
+    #[serde(rename = "session.provider.rebind")]
+    SessionProviderRebind {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+    },
     #[serde(rename = "session.select_model")]
     SessionSelectModel {
         command_id: CommandId,
@@ -4548,6 +4600,9 @@ pub enum ResponseBody {
         /// True only after the daemon's pre-ready warm-up boundary completed.
         #[serde(default, skip_serializing_if = "is_false")]
         warm: bool,
+        /// Absent on older daemons; clients must preserve that uncertainty.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caching: Option<DaemonCachingWire>,
     },
     /// Acknowledges a connection-scoped session roster watch.
     #[serde(rename = "session.list_watch")]
@@ -4872,6 +4927,15 @@ pub enum ResponseBody {
     /// pair — never an echo of the request — plus the committed journal
     /// sequence of the `model_selected` fact. A same-command retry receives
     /// this exact body from its receipt.
+    #[serde(rename = "session.provider.rebind")]
+    SessionProviderRebind {
+        session_id: SessionId,
+        provider: String,
+        base_url: Option<String>,
+        account: Option<String>,
+        selected_seq: u64,
+        worker_generation: u64,
+    },
     #[serde(rename = "session.select_model")]
     SessionSelectModel {
         session_id: SessionId,
