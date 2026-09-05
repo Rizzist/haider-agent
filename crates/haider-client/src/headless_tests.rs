@@ -510,3 +510,22 @@ fn resume_inherits_budgets_and_applies_only_explicit_new_caps() {
     assert_eq!(original.max_cost_microusd, Some(90_000));
     assert_eq!(original.request_budget, overrides.request_budget);
 }
+
+#[tokio::test]
+async fn journalview_private_summary_does_not_replace_the_live_response() {
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    let output = HeadlessEventOutput::new(sender, HeadlessEventMode::Summary);
+    let mut reducer = HeadlessReducer::new(SessionId::new("spool-session"), output);
+    reducer.run_id = Some(RunId::new("spool-run"));
+    reducer
+        .apply(spool_test_envelope(
+            1,
+            serde_json::json!({
+                "type":"item", "event":"completed", "item_id":"summary",
+                "item":{"item":"agent_message", "text":"private compaction summary"},
+                "provider_purpose":"compaction",
+            }),
+        ))
+        .await;
+    assert!(reducer.response.is_none());
+}

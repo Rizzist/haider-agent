@@ -1546,6 +1546,11 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         .iter()
         .map(|tool| tool.description.len())
         .sum::<usize>();
+    eprintln!(
+        "instruct-pipe pin: registered={}, advertised={}, full_prefix_bytes={full_prefix}, instruct_pipe_bytes={new_total}, native_description_bytes={native_description_bytes}",
+        registry.len(),
+        stubbed.len()
+    );
     assert_eq!(full_prefix, EXPECTED_FULL_PREFIX_BYTES);
     assert_eq!(new_total, EXPECTED_INSTRUCT_PIPE_BYTES);
     assert_eq!(

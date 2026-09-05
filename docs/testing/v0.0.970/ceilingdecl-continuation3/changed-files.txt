@@ -1,0 +1,8 @@
+test-baseline.txt
+crates/haider-core/src/actor.rs
+crates/haider-daemon/src/connection_tests.rs
+crates/haider-daemon/src/permissions_core_tests.rs
+crates/haider-cli/tests/fixtures/oneshot_run_golden.jsonl
+crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_text_turn.jsonl
+crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_tool_turn.jsonl
+scripts/qa-gate/CI_REGISTRY_WALK_QAGATE3.md

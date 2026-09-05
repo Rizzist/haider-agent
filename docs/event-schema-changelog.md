@@ -21,6 +21,69 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.970 — durable narrative correlation and compaction announcement
+
+A primary emitted Finish with separate post-stream commits adds a prompt-omitted
+`provider_round_terminal_v1` Started/Completed pair in one atomic append after
+usage, before continuation.
+It preserves the actual reason even if tools already settled before Finish.
+The existing atomic final-text suffix instead retains the reason on its
+completed item and terminal, preserving that batch. Accounting/delta
+metadata never changes according to whether the budget guard flushes usage
+before or after Finish. No existing request barrier is moved.
+
+Existing `item` lifecycle events for assistant text (including incomplete text)
+and reasoning summaries are the declared durable narrative capture points.
+Their `payload.provider_request` adds the existing `ProviderRequestAttemptV1`
+coordinates: session_id, run_id, turn_ordinal, request_ordinal, request_kind.
+Actor-generated tool/result/state events carry the same optional object. After
+an emitted provider Finish, `payload.provider_finish_reason` preserves that
+provider reason. Private summarizer items add `provider_purpose: "compaction"`
+and capture emitted deltas even on unsuccessful attempts. Without a provider
+Finish their closing snapshots retain `provider_terminal_cause` (stream_error,
+stream_eof, cancelled or guard/unsupported-response cause). Private summaries
+remain in events/provider_rounds but never become the user-facing final response.
+These fields are stamped before journal append, retain schema
+version 1, and never expose provider-private reasoning that was not emitted.
+The envelope already supplies committed_at_ms, schema_version, and seq.
+
+The prompt/UI-omitted `provider_round_terminal_v1` extension records
+known private-summarizer terminal outcomes when no narrative item exists to
+carry them, including failed replay-open attempts before text-only fallback.
+Its Started/Completed pair commits atomically and preserves the frozen item lifecycle.
+It carries the same `provider_request` plus actual `provider_finish_reason` or
+`provider_terminal_cause` (including `open_error`) metadata. Replayparity policy:
+this extension is a durable journal fact replayed unchanged; it does not create
+an empty assistant message or alter prompt compilation.
+
+`journalview:context_compaction` is a new supplemental payload kind, serialized
+as `type: "context_compaction"`. It commits atomically with the compaction item
+and history node. It carries the run's turn_ordinal, successful summarizer
+request_ordinal, operation_id, inclusive covers_from/covers_to node range,
+summary_artifact, resume_cause, dropped_item_count, and retained_suffix_size.
+Both counts explicitly use `provider_message` units. The dropped count measures
+the active prefix actually replaced (including a previous summary once), not
+re-expanded historical source messages or the number of journal events. The
+retained suffix excludes the new summary and request-only scaffolding. The
+journal is never deleted by prompt compaction.
+
+`haider.run.v1` JSON and `haider.run.replay.v1` add the derived `provider_rounds`
+array. Entries preserve request coordinates, emitted_text and reasoning_summary
+item arrays, tool_calls, results, and terminal_cause. Narrative entries carry
+item_id, text, completed, first_seq, last_seq, committed_at_ms, schema_version.
+Deltas are assembled once per item/request; completion snapshots do not duplicate
+their bytes. Incomplete items remain incomplete. Missing emitted reasoning is
+an empty array; a missing terminal cause is null. Old uncorrelated journals
+remain intact in events and do not acquire invented round coordinates.
+Unknown future request metadata is omitted only from this derived projection;
+it never prevents raw event serialization or replay.
+
+Replayparity policy: **zero normalized fields inside RawEnvelope**. Correlation,
+finish reason, and compaction scope are durable facts, identical in journal,
+live JSONL, and replay. `provider_rounds` is derived container metadata computed
+by the same reducer for live JSON and replay. Optional metadata is never added
+by a stream serializer. Prompt replay ignores these metadata keys and the
+prompt-omitted announcement; provider input semantics stay unchanged.
 ### v0.0.970 — per-session provider rebind
 
 New supplemental kind: `session_config:session_provider_rebound`. The

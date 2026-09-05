@@ -1148,6 +1148,7 @@ struct DurableReplayDocument<'a> {
     model: &'a str,
     response: Option<haider_protocol::reply::ReplyText>,
     events: &'a HeadlessRunEvents,
+    provider_rounds: Vec<haider_client::provider_rounds::ProviderRound>,
     integrity: DurableReplayIntegrity,
     equivalence: DurableReplayEquivalence,
 }
@@ -1256,6 +1257,7 @@ fn write_durable_replay(
         model: &status.spec.model,
         response,
         events,
+        provider_rounds: haider_client::provider_rounds::provider_rounds(events)?,
         integrity: DurableReplayIntegrity {
             event_count: events.len(),
             first_seq,
@@ -1522,6 +1524,14 @@ fn replay_final_text(
 ) -> io::Result<Option<haider_protocol::reply::ReplyText>> {
     let mut final_text = None;
     events.try_for_each(|envelope| {
+        if envelope
+            .payload
+            .get("provider_purpose")
+            .and_then(serde_json::Value::as_str)
+            == Some("compaction")
+        {
+            return Ok(());
+        }
         let payload = envelope.payload;
         if let Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
             item:
@@ -1675,7 +1685,7 @@ fn write_error_json(
     let outcome = failure.outcome;
     let retryable = failure.retryable;
     let line = format!(
-        "{{\"schema\":\"haider.run.v1\",\"session_id\":null,\"run_id\":null,\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome}\",\"response\":null,\"events\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{retryable}}}}}"
+        "{{\"schema\":\"haider.run.v1\",\"session_id\":null,\"run_id\":null,\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome}\",\"response\":null,\"events\":[],\"provider_rounds\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{retryable}}}}}"
     );
     output.write_all(line.as_bytes())?;
     output.write_all(b"\n")?;
@@ -2032,6 +2042,7 @@ struct RunJson<'a> {
     outcome: HeadlessOutcome,
     response: &'a Option<haider_protocol::reply::ReplyText>,
     events: &'a HeadlessRunEvents,
+    provider_rounds: Vec<haider_client::provider_rounds::ProviderRound>,
     usage: &'a Option<haider_protocol::provider::Usage>,
     budget_exhausted: &'a Option<haider_protocol::headless::RunBudgetExhaustedV1>,
     replay: &'a Option<haider_protocol::headless::ReplayDivergenceV1>,
@@ -2076,6 +2087,7 @@ fn write_run_json(mut output: impl Write, result: &HeadlessRunResult) -> io::Res
             outcome: result.outcome,
             response: &result.response,
             events: &result.events,
+            provider_rounds: haider_client::provider_rounds::provider_rounds(&result.events)?,
             usage: &result.usage,
             budget_exhausted: &result.budget_exhausted,
             replay: &result.replay,
@@ -2520,6 +2532,29 @@ mod tests {
             "payload": payload,
         }))
         .expect("legacy raw envelope")
+    }
+
+    #[test]
+    fn journalview_replay_private_summary_never_becomes_final_response() {
+        let events = HeadlessRunEvents::from_envelopes(
+            RunId::new("run-legacy"),
+            [
+                legacy_replay_envelope(
+                    1,
+                    serde_json::json!({
+                        "type":"item", "event":"completed", "item_id":"summary",
+                        "item":{"item":"agent_message", "text":"private compaction summary"},
+                        "provider_purpose":"compaction",
+                    }),
+                ),
+                legacy_replay_envelope(
+                    2,
+                    serde_json::json!({"type":"run_state", "state":"cancelled"}),
+                ),
+            ],
+        )
+        .expect("ledger");
+        assert_eq!(replay_final_text(&events).expect("response"), None);
     }
 
     /// Pre-v0.0.970 journals lack the additive terminal projection. Replay

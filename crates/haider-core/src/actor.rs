@@ -379,6 +379,10 @@ mod actor_context_economy_tests;
 #[path = "actor_ceiling.rs"]
 mod actor_ceiling;
 
+#[cfg(test)]
+#[path = "actor_journalview_tests.rs"]
+mod actor_journalview_tests;
+
 // Two soft tranches cover the reported 53-round solved benchmark with 11
 // requests of headroom, while preserving a finite guard against runaway work.
 const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 64;
@@ -2437,6 +2441,10 @@ impl ProviderRetryWake {
 
 /// Single-session, single-writer run loop.
 pub struct HarnessActor {
+    /// Coordinates of the physical provider request that produced these facts.
+    /// Stamped before append, so live and replay preserve the identical payload.
+    narrative_request: Option<ProviderRequestAttemptV1>,
+    provider_finish_reason: Option<FinishReason>,
     config: HarnessConfig,
     provider: Arc<dyn Provider>,
     dispatcher: Option<Arc<dyn ToolDispatcher>>,
@@ -2537,6 +2545,8 @@ impl HarnessActor {
         };
         (
             Self {
+                narrative_request: None,
+                provider_finish_reason: None,
                 config,
                 provider,
                 dispatcher,
@@ -2840,6 +2850,8 @@ impl HarnessActor {
         // failure may end that turn before a boundary; never leak its input
         // into a later queued turn.
         self.pending_subturns.clear();
+        self.narrative_request = None;
+        self.provider_finish_reason = None;
         self.provider_deadline_state.begin_provider_request();
         // Tool definitions are a provider cache ABI. Freeze their order and
         // recursively canonicalize schemas once at the conversation-store
@@ -2999,6 +3011,44 @@ impl HarnessActor {
                 // durable run recoverable rather than seal it with open items.
                 Err(error) => return errored_outcome(error),
             };
+        }
+        let recovery_items = checkpoint
+            .iter()
+            .map(|checkpoint| checkpoint.tool_item_id.as_str())
+            .chain(
+                partial_stream
+                    .iter()
+                    .map(|checkpoint| checkpoint.item_id.as_str()),
+            )
+            .chain(route_wait.iter().flat_map(|checkpoint| {
+                checkpoint
+                    .message
+                    .iter()
+                    .chain(checkpoint.reasoning.iter())
+                    .map(|item| item.item_id.as_str())
+                    .chain(checkpoint.tools.iter().map(|tool| tool.item_id.as_str()))
+            }))
+            .chain(child_wait.iter().flat_map(|checkpoint| {
+                checkpoint
+                    .tools
+                    .iter()
+                    .map(|tool| tool.tool_item_id.as_str())
+            }))
+            .collect::<HashSet<_>>();
+        if !recovery_items.is_empty() {
+            match self
+                .recover_narrative_request(&run_id, &recovery_items)
+                .await
+            {
+                Ok(Some((request, finish_reason))) => {
+                    self.narrative_request = Some(request);
+                    self.provider_finish_reason = finish_reason;
+                }
+                // Legacy checkpoints predate request metadata. Keep absence
+                // explicit instead of guessing from an unrelated side request.
+                Ok(None) => {}
+                Err(error) => return errored_outcome(error),
+            }
         }
         let mut replay = ReplayPrefix::default();
         let mut route_message_ranges = VecDeque::<ReplyText>::new();
@@ -3569,7 +3619,15 @@ impl HarnessActor {
                                 .commit_pending_thinking(&run_id, &mut thinking_pending)
                                 .await
                             {
-                                return self.errored_state_outcome(&run_id, error).await;
+                                return self
+                                    .errored_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
                             }
                             if let Err(error) = self
                                 .commit_payload(
@@ -3579,7 +3637,15 @@ impl HarnessActor {
                                 )
                                 .await
                             {
-                                return self.errored_state_outcome(&run_id, error).await;
+                                return self
+                                    .errored_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
                             }
                             rotation_budget_consumed = true;
                         }
@@ -3616,7 +3682,20 @@ impl HarnessActor {
                         cache_rewarm_pending = Some(CacheRewarmReasonV1::ConfigurationChange);
                     }
                     Ok(None) => {}
-                    Err(error) => return self.errored_state_outcome(&run_id, error).await,
+                    Err(error) => {
+                        // A recovered or reconnected response can still own
+                        // open items here. Close them under their original
+                        // request before recording this pre-dispatch failure.
+                        return self
+                            .errored_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                                error,
+                            )
+                            .await;
+                    }
                 }
             }
             if provider_attempt == 0 {
@@ -4171,6 +4250,15 @@ impl HarnessActor {
             } else {
                 None
             };
+            // A reserved ordinal is not a durable request until admission
+            // succeeds. Keep the previous item's owner through refusal and
+            // pending-delta cleanup, then stamp the atomic attempt batch.
+            if let Err(error) = self.flush_pending_item_delta().await {
+                return self.errored_state_outcome(&run_id, error).await;
+            }
+            let prior_narrative_request =
+                self.narrative_request.replace(request_correlation.clone());
+            let prior_finish_reason = self.provider_finish_reason.take();
             let request_attempt_commit_started = self
                 .config
                 .turn_trace
@@ -4199,7 +4287,11 @@ impl HarnessActor {
                 .await
             {
                 Ok(stored) => stored,
-                Err(error) => return self.errored_state_outcome(&run_id, error).await,
+                Err(error) => {
+                    self.narrative_request = prior_narrative_request;
+                    self.provider_finish_reason = prior_finish_reason;
+                    return self.errored_state_outcome(&run_id, error).await;
+                }
             };
             if let (Some(trace), Some(started)) =
                 (&self.config.turn_trace, request_attempt_commit_started)
@@ -5798,6 +5890,7 @@ impl HarnessActor {
                         }
                     }
                     StreamEvent::Finish { reason } => {
+                        self.provider_finish_reason = Some(reason);
                         if let (Some(trace), Some(started)) =
                             (&self.config.turn_trace, provider_stream_started)
                         {
@@ -5869,6 +5962,29 @@ impl HarnessActor {
                         if !post_stream_batch {
                             if let Err(error) = self
                                 .commit_pending_usage(&run_id, &mut pending_usage_commit)
+                                .await
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        DriveError::from(error),
+                                    )
+                                    .await;
+                            }
+                            // With no guaranteed final text batch, all narrative
+                            // may already have closed before Finish. Record its
+                            // exact cause after usage in either budget path. The
+                            // final text batch carries the same reason on its
+                            // completed item and terminal without another append.
+                            if let Err(error) = self
+                                .commit_hidden_extension_marker(
+                                    &run_id,
+                                    "provider_round_terminal_v1",
+                                    serde_json::json!({"reason": reason}),
+                                )
                                 .await
                             {
                                 return self
@@ -7703,6 +7819,91 @@ impl HarnessActor {
         .map_err(DriveError::Store)?;
         *accumulator = None;
         Ok((item_id, text))
+    }
+
+    /// Restore the request owning the checkpoint's actual content before an
+    /// approval or deferred-child settlement can emit new facts. The latest
+    /// physical request in the run may instead be an auxiliary side request.
+    /// Follow only the checkpoint item IDs, and retain a finish reason only
+    /// when a durable event for that exact request already recorded it.
+    async fn recover_narrative_request(
+        &self,
+        run_id: &RunId,
+        items: &HashSet<&str>,
+    ) -> Result<Option<(ProviderRequestAttemptV1, Option<FinishReason>)>, HaiderError> {
+        let mut recovered = None::<(ProviderRequestAttemptV1, Option<FinishReason>)>;
+        let mut cursor = 0;
+        loop {
+            let page = self
+                .store
+                .read_reducer_page(
+                    &self.config.session_id,
+                    cursor,
+                    256,
+                    1024 * 1024,
+                    // The store indexes ToolCall Started/Completed under
+                    // item_tool_call rather than the outer wire kind item.
+                    &[
+                        "item",
+                        "item_tool_call",
+                        "run_state",
+                        "usage",
+                        "tool_result",
+                    ],
+                )
+                .await?;
+            if page.is_empty() {
+                return Ok(recovered);
+            }
+            for event in page {
+                cursor = event.seq;
+                if event.run_id.as_ref() != Some(run_id) {
+                    continue;
+                }
+                let Some(value) = event.payload.get("provider_request") else {
+                    continue;
+                };
+                let request: ProviderRequestAttemptV1 = serde_json::from_value(value.clone())
+                    .map_err(|error| {
+                        HaiderError::new(ErrorCode::StoreCorrupt, error.to_string(), false)
+                    })?;
+                if !request.coordinates_valid()
+                    || request.session_id != self.config.session_id
+                    || request.run_id != *run_id
+                {
+                    return Err(HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        "checkpoint narrative request has inconsistent coordinates",
+                        false,
+                    ));
+                }
+                let owns_item = event
+                    .payload
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("item")
+                    && event
+                        .payload
+                        .get("item_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|item| items.contains(item));
+                if owns_item
+                    && recovered
+                        .as_ref()
+                        .is_none_or(|(known, _)| known != &request)
+                {
+                    recovered = Some((request.clone(), None));
+                }
+                if let Some((known, finish)) = recovered.as_mut()
+                    && known == &request
+                    && let Some(value) = event.payload.get("provider_finish_reason")
+                {
+                    *finish = Some(serde_json::from_value(value.clone()).map_err(|error| {
+                        HaiderError::new(ErrorCode::StoreCorrupt, error.to_string(), false)
+                    })?);
+                }
+            }
+        }
     }
 
     async fn recover_tool_repair_state(
@@ -10976,7 +11177,25 @@ impl HarnessActor {
         if let EventPayload::ToolResult { result, .. } = &mut payload {
             ensure_tool_result_presentation(result);
         }
-        let payload =
+        // Accounting events can be prepared before or after Finish depending
+        // on the budget guard's usage flush. Their metadata must not depend on
+        // that batching choice. The explicit terminal marker is authoritative.
+        let finish_metadata = matches!(
+            &payload,
+            EventPayload::RunState(_)
+                | EventPayload::ToolResult { .. }
+                | EventPayload::NodeCommitted(_)
+                | EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::AgentMessage { .. }
+                        | TurnItem::IncompleteAgentMessage { .. }
+                        | TurnItem::Reasoning { .. }
+                        | TurnItem::ToolCall { .. },
+                    ..
+                })
+        ) || matches!(&payload, EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::Extension { kind, .. }, ..
+        }) if kind == "provider_round_terminal_v1");
+        let mut payload =
             haider_protocol::envelope::RawPayload::from_event(payload).map_err(|error| {
                 HaiderError::new(
                     ErrorCode::Internal,
@@ -10984,6 +11203,24 @@ impl HarnessActor {
                     false,
                 )
             })?;
+        if let Some(request) = &self.narrative_request
+            && request.run_id == *run_id
+        {
+            payload.insert_metadata(
+                "provider_request",
+                serde_json::to_value(request).map_err(|error| {
+                    HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                })?,
+            );
+            if finish_metadata && let Some(reason) = self.provider_finish_reason {
+                payload.insert_metadata(
+                    "provider_finish_reason",
+                    serde_json::to_value(reason).map_err(|error| {
+                        HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                    })?,
+                );
+            }
+        }
         Ok(EventEnvelope {
             schema_version: SCHEMA_VERSION,
             event_id: self.next_event_id(),

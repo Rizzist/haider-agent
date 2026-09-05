@@ -1,0 +1,10 @@
+workspace=101
+clippy=0
+xtask=0
+fmt=0
+diff=0
+unsafe=0
+qa-selftests=0
+Only failure: oauth::tests::device_flow_runner_continues_and_honors_slow_down_interval, device start response.
+Unchanged test passed in isolation and full daemon binary with four test threads (1057 passed, 0 failed, 3 existing ignores).
+No OAuth source or test edits. Next full cargo gate uses RUST_TEST_THREADS=4.
