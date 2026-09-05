@@ -9,6 +9,7 @@
 //! and [`ToolError::Ledger`] makes a post-apply evidence failure explicit.
 
 use haider_protocol::ids::MenuId;
+use haider_protocol::tool::ToolFileEffect;
 use std::path::PathBuf;
 
 pub type ToolResult<T> = Result<T, ToolError>;
@@ -26,6 +27,13 @@ pub struct FsEditAnchorMismatch {
 /// Typed failures at the tool boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolError {
+    /// The filesystem mutation landed before a later evidence/publication
+    /// failure. Preserve the original error classification and text while
+    /// retaining truthful file effects for a failed tool result.
+    Applied {
+        source: Box<ToolError>,
+        effects: Vec<ToolFileEffect>,
+    },
     RefusedByLockdown {
         tool: String,
         reason: String,
@@ -90,6 +98,31 @@ pub enum ToolError {
 }
 
 impl ToolError {
+    pub fn source_error(&self) -> &Self {
+        match self {
+            Self::Applied { source, .. } => source.source_error(),
+            other => other,
+        }
+    }
+
+    pub fn applied_effects(&self) -> &[ToolFileEffect] {
+        match self {
+            Self::Applied { effects, .. } => effects,
+            _ => &[],
+        }
+    }
+
+    pub fn with_applied_effects(self, effects: Vec<ToolFileEffect>) -> Self {
+        if effects.is_empty() {
+            return self;
+        }
+        let source = match self {
+            Self::Applied { source, .. } => source,
+            other => Box::new(other),
+        };
+        Self::Applied { source, effects }
+    }
+
     pub fn invalid_argument(message: impl Into<String>) -> Self {
         Self::InvalidArgument {
             message: message.into(),
@@ -130,6 +163,7 @@ impl ToolError {
 impl std::fmt::Display for ToolError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Applied { source, .. } => std::fmt::Display::fmt(source, formatter),
             Self::RefusedByLockdown { tool, reason } => write!(
                 formatter,
                 "RefusedByLockdown {{ tool: {tool}, reason: {reason} }}"
@@ -228,7 +262,14 @@ impl std::fmt::Display for ToolError {
     }
 }
 
-impl std::error::Error for ToolError {}
+impl std::error::Error for ToolError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Applied { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 impl From<crate::ComputerError> for ToolError {
     fn from(error: crate::ComputerError) -> Self {

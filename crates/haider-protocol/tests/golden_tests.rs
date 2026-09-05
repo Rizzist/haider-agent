@@ -547,6 +547,8 @@ fn golden_error_presentation_contract() {
             result: BoundedResult {
                 preview: "tool failed".into(),
                 truncated: false,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: Vec::new(),
@@ -626,6 +628,8 @@ fn golden_image_bearing_tool_result_is_additive_and_legacy_decodes_empty() {
             result: BoundedResult {
                 preview: "captured dashboard".into(),
                 truncated: false,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: vec![ImageBlockRef {
@@ -665,6 +669,8 @@ fn structured_search_result_wire_is_additive_and_legacy_decodes() {
     let result = BoundedResult {
         preview: "src/lib.rs:7:needle\n".into(),
         truncated: true,
+        truncation: None,
+        effects: Vec::new(),
         data: Some(ToolResultData::FsSearch {
             matches: vec![FsSearchMatch {
                 path: "src/lib.rs".into(),
@@ -784,6 +790,7 @@ fn golden_additive_task_facts_and_unknown_kind_tolerance() {
         state: TaskTerminalState::Completed { exit_code: Some(0) },
         elapsed_ms: 61_000,
         output_bytes: 700_000,
+        output_sha256: None,
         tail: "test result: ok\n".into(),
         artifact: Some(ArtifactRef::new(
             "blake3:9c1185a5c5e9fc54612808977ee8f548b2258d31",

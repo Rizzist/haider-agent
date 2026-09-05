@@ -757,7 +757,13 @@ async fn live_web_search_executes_on_lite_with_the_turn_identity_and_bounds_its_
             .preview
             .contains("\"scope\":\"web_search_output_cap\"")
     );
-    assert!(result.preview.len() <= 32 * 1024);
+    assert!(result.payload_text().len() <= 32 * 1024);
+    let marker = result
+        .truncation
+        .as_ref()
+        .expect("original search provenance");
+    assert_eq!(marker.payload_bytes, result.payload_text().len() as u64);
+    assert!(result.preview.ends_with(&marker.marker()));
 }
 
 /// LAW (LW4 client half, degrade): a 404/410 from the unofficial

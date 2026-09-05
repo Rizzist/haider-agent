@@ -28,6 +28,7 @@ use haider_protocol::item::{ItemDelta, OutputStream, ToolStatus, TurnItem};
 use rustix::fs::{Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::future::Future;
@@ -330,6 +331,9 @@ pub struct ProcessResult {
     /// BLAKE3 of the exact bounded stdout/stderr bytes accepted by the
     /// supervisor, in capture order.
     pub transcript_digest: String,
+    /// SHA-256 of every observed stdout/stderr byte, in capture order, before
+    /// any adapter reduction (including observed bytes after a hard limit).
+    pub output_sha256: String,
     pub inline_output: Vec<ProcessOutputChunk>,
     pub artifact: Option<ArtifactRef>,
     pub escalation_note: Option<String>,
@@ -1179,6 +1183,7 @@ async fn supervise_process_with_exit_observation(
     let mut output_bytes = 0usize;
     let mut source_elided_bytes_at_least = 0usize;
     let mut transcript_hasher = blake3::Hasher::new();
+    let mut output_sha256 = Sha256::new();
     let mut fatal = None;
     let mut cancelled = *cancel.borrow();
     let mut cancel_open = true;
@@ -1269,6 +1274,7 @@ async fn supervise_process_with_exit_observation(
             maybe_chunk = captured.recv(), if output_open => {
                 match maybe_chunk {
                     Some(Captured::Chunk(stream, bytes)) => {
+                        output_sha256.update(&bytes);
                         #[cfg(windows)]
                         if process_trace && !first_output_traced {
                             first_output_traced = true;
@@ -1673,6 +1679,7 @@ async fn supervise_process_with_exit_observation(
         output_elided_bytes_at_least,
         source_output_elided_bytes_at_least: source_elided_bytes_at_least,
         transcript_digest: format!("blake3:{}", transcript_hasher.finalize().to_hex()),
+        output_sha256: format!("{:x}", output_sha256.finalize()),
         inline_output,
         artifact,
         escalation_note: escalation_note.clone(),

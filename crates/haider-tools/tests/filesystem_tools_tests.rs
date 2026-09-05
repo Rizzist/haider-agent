@@ -601,7 +601,7 @@ async fn flat_edit_and_write_round_trip_matches_transactional_tools_and_receipts
             .await
             .expect("replace all");
         let delete = FsEdit::from_edit_args(&serde_json::json!({"file_path":"nested/test.txt", "old_string":"new new", "new_string":""})).expect("empty replacement");
-        broker
+        let deleted = broker
             .fs_edit(&delete, &policy, &attribution, &ledger)
             .await
             .expect("delete text");
@@ -609,7 +609,7 @@ async fn flat_edit_and_write_round_trip_matches_transactional_tools_and_receipts
             &serde_json::json!({"file_path":"nested/test.txt", "content":""}),
         )
         .expect("empty content");
-        broker
+        let emptied = broker
             .fs_write(&empty, &policy, &attribution, &ledger)
             .await
             .expect("overwrite fresh file");
@@ -622,7 +622,40 @@ async fn flat_edit_and_write_round_trip_matches_transactional_tools_and_receipts
             .changes_for(&attribution.session, &attribution.turn)
             .expect("ledger");
         assert_eq!(changes.writes.len(), 4);
-        let result = (created, edited, changes);
+        for (result, kind, bytes) in [
+            (
+                &created,
+                haider_protocol::tool::ToolFileEffectKind::Create,
+                8,
+            ),
+            (&edited, haider_protocol::tool::ToolFileEffectKind::Edit, 8),
+            (&deleted, haider_protocol::tool::ToolFileEffectKind::Edit, 1),
+            (
+                &emptied,
+                haider_protocol::tool::ToolFileEffectKind::Write,
+                0,
+            ),
+        ] {
+            assert_eq!(
+                result.effects.len(),
+                1,
+                "flat aliases retain exact file effects"
+            );
+            let effect = &result.effects[0];
+            assert_eq!(effect.kind, kind);
+            assert_eq!(effect.name, "test.txt");
+            assert_eq!(Path::new(&effect.path), Path::new("nested/test.txt"));
+            assert_eq!(
+                Path::new(&effect.absolute_path),
+                fs::canonicalize(directory.path())
+                    .expect("canonical workspace")
+                    .join("nested/test.txt")
+            );
+            assert_eq!(effect.bytes, bytes);
+            assert!(!result.truncated);
+            assert!(result.truncation.is_none());
+        }
+        let result = (created, edited, deleted, emptied, changes);
         if let Some(previous) = previous {
             assert_eq!(
                 result, previous,
@@ -744,6 +777,13 @@ async fn anchor_miss_reports_nearest_whitespace_candidate_without_applying_it() 
         )
         .await
         .expect_err("exact anchor missing");
+    assert!(
+        error.applied_effects().is_empty(),
+        "anchor refusal has no applied file effect"
+    );
+    assert!(
+        matches!(error.source_error(), ToolError::EditAnchor(conflict) if conflict.matches == 0 && conflict.nearest_candidate.is_some())
+    );
     let message = error.to_string();
     assert!(
         message.contains("no exact byte-for-byte match"),
@@ -1120,7 +1160,17 @@ async fn applied_write_is_ledgered_before_a_failed_outcome_append() {
         .await
         .expect_err("outcome append fails after apply");
 
-    assert!(matches!(error, ToolError::Journal { .. }));
+    assert!(matches!(error.source_error(), ToolError::Journal { .. }));
+    assert_eq!(error.applied_effects().len(), 1);
+    assert_eq!(
+        error.applied_effects()[0].kind,
+        haider_protocol::tool::ToolFileEffectKind::Edit
+    );
+    assert_eq!(error.applied_effects()[0].bytes, 5);
+    assert_eq!(
+        Path::new(&error.applied_effects()[0].absolute_path),
+        fs::canonicalize(&path).expect("canonical applied path")
+    );
     let written = fs::read(&path).expect("read applied bytes");
     assert_eq!(written, b"after");
     let changes = ledger
@@ -1717,7 +1767,7 @@ async fn ledger_append_failure_becomes_a_failed_effect_outcome() {
         .await
         .expect_err("ledger failure is returned");
 
-    assert!(matches!(error, ToolError::Ledger { .. }));
+    assert!(matches!(error.source_error(), ToolError::Ledger { .. }));
     assert_eq!(
         fs::read_to_string(&path).expect("read applied file"),
         "after"
@@ -1993,7 +2043,19 @@ async fn oversized_result_keeps_preview_and_freezes_full_payload_in_cas() {
         .expect("bounded read");
 
     assert!(result.truncated);
-    assert!(result.preview.len() <= 9);
+    assert!(result.payload_text().len() <= 9);
+    assert_eq!(result.payload_text(), "αβγ de");
+    let marker = result
+        .truncation
+        .as_ref()
+        .expect("typed truncation metadata");
+    assert_eq!(marker.original_bytes, full.len() as u64);
+    assert_eq!(marker.payload_bytes, result.payload_text().len() as u64);
+    assert_eq!(
+        marker.sha256,
+        "859c9fd11efbc93ee3d6b5458111b031d4a6477f405146d65d543732901bdfc4"
+    );
+    assert!(result.preview.ends_with(&marker.marker()));
     assert!(result.preview.is_char_boundary(result.preview.len()));
     assert!(result.artifact.is_some());
     assert_eq!(cas.writes, vec![full.into_bytes()]);
@@ -2059,4 +2121,460 @@ async fn file_read_limit_without_offset_starts_at_the_first_numbered_line() {
 
     assert_eq!(result.preview, "1: one\n2: two\n");
     assert!(cas.writes.is_empty());
+}
+
+/// The result declares precisely the paths already retained by the mutation
+/// receipt and ledger, including both ordered sides of a move. No filesystem
+/// read after settlement is used to reconstruct these facts.
+#[tokio::test]
+async fn toolshape_file_effects_match_receipts_and_ledger_in_effect_order() {
+    use haider_protocol::tool::ToolFileEffectKind::{Create, Delete, Edit, Write};
+    use haider_tools::{FsPath, FsPathOperation};
+
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let root = fs::canonicalize(directory.path()).expect("canonical workspace");
+    let journal = SharedRecordingJournal::default();
+    let observer = journal.observer();
+    let mut broker = broker_at(journal, &root);
+    let ledger = ChangeLedger::new();
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
+    let policy = allow(EffectClass::FsWrite);
+    let mut results = Vec::new();
+    results.push(
+        broker
+            .fs_write(
+                &FsWrite::new("nested/fixture.txt", "before\n"),
+                &policy,
+                &attribution,
+                &ledger,
+            )
+            .await
+            .expect("create fixture"),
+    );
+    results.push(
+        broker
+            .fs_write(
+                &FsWrite::new(root.join("nested/fixture.txt"), "replacement\n"),
+                &policy,
+                &attribution,
+                &ledger,
+            )
+            .await
+            .expect("overwrite fixture"),
+    );
+    results.push(
+        broker
+            .fs_edit(
+                &FsEdit::new("nested/fixture.txt", "replacement", "edited"),
+                &policy,
+                &attribution,
+                &ledger,
+            )
+            .await
+            .expect("edit fixture"),
+    );
+    results.push(
+        broker
+            .fs_path(
+                &FsPath::new(FsPathOperation::Copy, "nested/fixture.txt")
+                    .with_destination("nested/copied.txt"),
+                &policy,
+                &attribution,
+                &ledger,
+            )
+            .await
+            .expect("copy fixture"),
+    );
+    results.push(
+        broker
+            .fs_path(
+                &FsPath::new(FsPathOperation::Copy, "nested/fixture.txt")
+                    .with_destination("nested/copied.txt")
+                    .overwrite(true),
+                &policy,
+                &attribution,
+                &ledger,
+            )
+            .await
+            .expect("overwrite copy"),
+    );
+    results.push(
+        broker
+            .fs_path(
+                &FsPath::new(FsPathOperation::Move, "nested/copied.txt")
+                    .with_destination("nested/moved.txt"),
+                &policy,
+                &attribution,
+                &ledger,
+            )
+            .await
+            .expect("move copied fixture"),
+    );
+    results.push(
+        broker
+            .fs_path(
+                &FsPath::new(FsPathOperation::Move, "nested/fixture.txt")
+                    .with_destination("nested/moved.txt")
+                    .overwrite(true),
+                &policy,
+                &attribution,
+                &ledger,
+            )
+            .await
+            .expect("overwrite moved fixture"),
+    );
+    results.push(
+        broker
+            .fs_path(
+                &FsPath::new(FsPathOperation::Delete, "nested/moved.txt"),
+                &policy,
+                &attribution,
+                &ledger,
+            )
+            .await
+            .expect("delete moved fixture"),
+    );
+
+    let expected = [
+        vec![(Create, "nested/fixture.txt", 7)],
+        vec![(Write, "nested/fixture.txt", 12)],
+        vec![(Edit, "nested/fixture.txt", 7)],
+        vec![(Create, "nested/copied.txt", 7)],
+        vec![(Write, "nested/copied.txt", 7)],
+        vec![
+            (Delete, "nested/copied.txt", 7),
+            (Create, "nested/moved.txt", 7),
+        ],
+        vec![
+            (Delete, "nested/fixture.txt", 7),
+            (Write, "nested/moved.txt", 7),
+        ],
+        vec![(Delete, "nested/moved.txt", 7)],
+    ];
+    let changes = ledger
+        .changes_for(&attribution.session, &attribution.turn)
+        .expect("ledger records");
+    let payloads = observer.storage.payloads.lock().expect("recorded receipts");
+    let receipts: Vec<_> = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            EventPayload::CheckpointRecorded(receipt) => Some(receipt),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), receipts.len());
+    assert_eq!(results.len(), changes.writes.len());
+    for (((result, receipt), record), expected) in results
+        .iter()
+        .zip(receipts)
+        .zip(changes.writes)
+        .zip(expected)
+    {
+        assert_eq!(receipt.effect_id, record.effect);
+        assert_eq!(result.effects.len(), expected.len());
+        assert_eq!(result.effects.len(), receipt.paths.len());
+        assert_eq!(result.effects.len(), record.paths.len());
+        assert!(result.truncation.is_none());
+        for (((effect, captured), absolute), (kind, relative, bytes)) in result
+            .effects
+            .iter()
+            .zip(&receipt.paths)
+            .zip(record.paths)
+            .zip(expected)
+        {
+            assert_eq!(effect.kind, kind);
+            assert_eq!(Path::new(&effect.path), Path::new(relative));
+            assert_eq!(effect.path, captured.path);
+            assert_eq!(Path::new(&effect.absolute_path), absolute);
+            assert_eq!(Path::new(&effect.absolute_path), root.join(relative));
+            assert_eq!(
+                effect.name,
+                Path::new(relative)
+                    .file_name()
+                    .expect("basename")
+                    .to_string_lossy()
+            );
+            assert_eq!(effect.bytes, bytes);
+            if effect.kind == Delete {
+                assert!(captured.post_digest.is_none());
+            } else {
+                let installed = match bytes {
+                    12 => b"replacement\n".as_slice(),
+                    _ if effect.kind == Create && relative == "nested/fixture.txt" => {
+                        b"before\n".as_slice()
+                    }
+                    _ => b"edited\n".as_slice(),
+                };
+                assert_eq!(
+                    captured.post_digest.as_deref(),
+                    Some(format!("blake3:{}", blake3::hash(installed).to_hex()).as_str())
+                );
+            }
+        }
+    }
+    assert!(
+        fs::read_dir(root.join("nested"))
+            .expect("final directory")
+            .next()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn toolshape_search_and_glob_hash_original_spool_before_preview_reduction() {
+    use haider_tools::FsGlob;
+    use sha2::{Digest as _, Sha256};
+
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    fs::write(directory.path().join("alpha.txt"), "needle one\n").expect("seed alpha");
+    fs::write(directory.path().join("beta.txt"), "needle two\n").expect("seed beta");
+    let mut broker = broker_at(RecordingJournal::default(), directory.path());
+    let policy = allow(EffectClass::FsRead);
+    let mut cas = RecordingCas::default();
+    let bounds = ResultBounds {
+        max_preview_bytes: 9,
+    };
+    let searched = broker
+        .fs_search(
+            &FsSearch::new(directory.path(), "needle"),
+            &policy,
+            &mut cas,
+            bounds,
+        )
+        .await
+        .expect("bounded search");
+    let globbed = broker
+        .fs_glob(
+            &FsGlob::new(directory.path(), "*.txt"),
+            &policy,
+            &mut cas,
+            bounds,
+        )
+        .await
+        .expect("bounded glob");
+    for (result, original) in [
+        (searched, "alpha.txt:1:needle one\nbeta.txt:1:needle two\n"),
+        (globbed, "alpha.txt\nbeta.txt\n"),
+    ] {
+        let marker = result.truncation.as_ref().expect("declared truncation");
+        assert_eq!(marker.original_bytes, original.len() as u64);
+        assert_eq!(
+            marker.sha256,
+            format!("{:x}", Sha256::digest(original.as_bytes()))
+        );
+        assert_eq!(result.payload_text(), &original[..9]);
+        assert_eq!(marker.payload_bytes, 9);
+        assert!(result.preview.ends_with(&marker.marker()));
+        assert!(
+            cas.writes
+                .iter()
+                .any(|stored| stored == original.as_bytes())
+        );
+    }
+}
+
+#[tokio::test]
+async fn toolshape_fixture_write_result_golden_is_additive_and_replays() {
+    use haider_protocol::envelope::RawPayload;
+
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let root = fs::canonicalize(directory.path()).expect("canonical workspace");
+    let mut broker = broker_at(RecordingJournal::default(), &root);
+    let ledger = ChangeLedger::new();
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
+    let result = broker
+        .fs_write(
+            &FsWrite::new("fixture.txt", "fixture write\n"),
+            &allow(EffectClass::FsWrite),
+            &attribution,
+            &ledger,
+        )
+        .await
+        .expect("fixture write");
+    assert_eq!(
+        fs::read(root.join("fixture.txt")).expect("fixture bytes"),
+        b"fixture write\n"
+    );
+    let mut legacy = serde_json::to_value(&result).expect("serialize result");
+    legacy
+        .as_object_mut()
+        .expect("result object")
+        .remove("effects");
+    assert_eq!(
+        legacy,
+        serde_json::json!({
+            "preview": format!("wrote 14 bytes to {}", root.join("fixture.txt").display()),
+            "truncated": false,
+        })
+    );
+    let event = EventPayload::ToolResult {
+        call_id: "fixture-write".into(),
+        result,
+    };
+    let raw = RawPayload::from_event(event.clone()).expect("durable result");
+    assert_eq!(raw.decode_event().expect("replay decode"), event);
+    let mut normalized = serde_json::to_value(&raw).expect("event JSON");
+    fn normalize(value: &mut serde_json::Value, root: &str) {
+        match value {
+            serde_json::Value::String(text) => *text = text.replace(root, "<WORKSPACE>"),
+            serde_json::Value::Array(values) => {
+                values.iter_mut().for_each(|value| normalize(value, root))
+            }
+            serde_json::Value::Object(values) => {
+                values.values_mut().for_each(|value| normalize(value, root))
+            }
+            _ => {}
+        }
+    }
+    normalize(&mut normalized, &root.to_string_lossy());
+    let actual = serde_json::to_string_pretty(&normalized).expect("golden JSON") + "\n";
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/toolshape/fs_write_result.json");
+    if std::env::var_os("UPDATE_FIXTURES").is_some() {
+        fs::create_dir_all(fixture.parent().expect("fixture parent")).expect("create fixtures");
+        fs::write(&fixture, &actual).expect("bless fixture write result");
+    }
+    // The absolute path uses the native separator. Only the temporary root is
+    // normalized in the actual result; expand the portable golden on Windows.
+    let expected = fs::read_to_string(fixture).expect("fixture write golden");
+    let expected = if cfg!(windows) {
+        expected.replace("<WORKSPACE>/", "<WORKSPACE>\\\\")
+    } else {
+        expected
+    };
+    assert_eq!(actual, expected);
+}
+
+#[derive(Clone, Default)]
+struct ToolshapePostApplyFailure {
+    records: Arc<Mutex<Vec<haider_tools::FsWriteRecord>>>,
+}
+
+impl haider_tools::ChangeLedgerSink for ToolshapePostApplyFailure {
+    fn record_fs_write(
+        &self,
+        _session: SessionId,
+        _turn: RunId,
+        record: haider_tools::FsWriteRecord,
+    ) -> ToolResult<()> {
+        self.records
+            .lock()
+            .expect("captured attempted ledger record")
+            .push(record);
+        Err(ToolError::ledger("injected post-apply evidence failure"))
+    }
+}
+
+#[tokio::test]
+async fn toolshape_post_apply_failure_preserves_effects_and_original_failure_receipt() {
+    use haider_protocol::tool::ToolFileEffectKind::{Create, Delete, Edit};
+    use haider_tools::{FsPath, FsPathOperation};
+
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let root = fs::canonicalize(directory.path()).expect("canonical workspace");
+    let journal = SharedRecordingJournal::default();
+    let observer = journal.observer();
+    let mut broker = broker_at(journal, &root);
+    let attribution = TurnAttribution::new(SessionId::new("session"), RunId::new("turn"));
+    let policy = allow(EffectClass::FsWrite);
+    broker
+        .fs_write(
+            &FsWrite::from_write_args(
+                &serde_json::json!({"file_path":"fixture.txt", "content":"before\n"}),
+            )
+            .expect("flat write"),
+            &policy,
+            &attribution,
+            &ChangeLedger::new(),
+        )
+        .await
+        .expect("create fixture");
+    let failing_ledger = ToolshapePostApplyFailure::default();
+    let edit = broker
+        .fs_edit(
+            &FsEdit::from_edit_args(&serde_json::json!({"file_path":"fixture.txt", "old_string":"before", "new_string":"after"})).expect("flat edit"),
+            &policy,
+            &attribution,
+            &failing_ledger,
+        )
+        .await
+        .expect_err("injected edit evidence failure");
+    assert_eq!(
+        fs::read(root.join("fixture.txt")).expect("applied edit"),
+        b"after\n"
+    );
+    let moved = broker
+        .fs_path(
+            &FsPath::new(FsPathOperation::Move, "fixture.txt").with_destination("moved.txt"),
+            &policy,
+            &attribution,
+            &failing_ledger,
+        )
+        .await
+        .expect_err("injected move evidence failure");
+    assert!(!root.join("fixture.txt").exists());
+    assert_eq!(
+        fs::read(root.join("moved.txt")).expect("applied move"),
+        b"after\n"
+    );
+    let failures = [edit, moved];
+    let records = failing_ledger
+        .records
+        .lock()
+        .expect("attempted ledger records");
+    let payloads = observer.storage.payloads.lock().expect("durable receipts");
+    let receipts: Vec<_> = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            EventPayload::CheckpointRecorded(receipt) => Some(receipt),
+            _ => None,
+        })
+        .skip(1)
+        .collect();
+    let outcomes: Vec<_> = payloads
+        .iter()
+        .filter_map(|payload| match payload {
+            EventPayload::Effect(EffectPhase::Outcome {
+                outcome: EffectOutcome::Failed { error },
+                ..
+            }) => Some(error),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(outcomes.len(), 2);
+    for ((((error, record), receipt), outcome), expected_kinds) in failures
+        .iter()
+        .zip(records.iter())
+        .zip(receipts)
+        .zip(outcomes)
+        .zip([vec![Edit], vec![Delete, Create]])
+    {
+        assert!(matches!(error.source_error(), ToolError::Ledger { .. }));
+        assert_eq!(
+            error.to_string(),
+            "change ledger failed: injected post-apply evidence failure"
+        );
+        assert_eq!(
+            outcome,
+            &error.to_string(),
+            "original failed effect text remains byte-identical"
+        );
+        assert_eq!(receipt.effect_id, record.effect);
+        assert_eq!(error.applied_effects().len(), expected_kinds.len());
+        assert_eq!(error.applied_effects().len(), receipt.paths.len());
+        assert_eq!(error.applied_effects().len(), record.paths.len());
+        for (((effect, captured), absolute), kind) in error
+            .applied_effects()
+            .iter()
+            .zip(&receipt.paths)
+            .zip(&record.paths)
+            .zip(expected_kinds)
+        {
+            assert_eq!(effect.kind, kind);
+            assert_eq!(effect.path, captured.path);
+            assert_eq!(Path::new(&effect.absolute_path), absolute);
+            assert_eq!(effect.bytes, 6);
+        }
+    }
 }

@@ -111,6 +111,7 @@ pub enum EventPayload {
     Effect(effect::EffectPhase),
     ToolResult {
         call_id: String,
+        #[serde(flatten, with = "tool::tool_result_payload")]
         result: tool::BoundedResult,
     },
     // history

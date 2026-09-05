@@ -14762,6 +14762,8 @@ impl ToolDispatcher for WorkspaceUnavailableToolDispatcher {
             })
             .to_string(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -15333,6 +15335,8 @@ fn ssh_tool_refusal(
             })
             .to_string(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -16883,42 +16887,45 @@ impl BrokerToolDispatcher {
                     .await
                     .map_err(tool_error)?;
                 let failed = result.timed_out || output_limited || unsuccessful_exit.is_some();
-                Ok((
-                    ToolDispatchResult::Completed(BoundedResult {
-                        preview: serde_json::json!({
-                            "remote": true,
-                            "untrusted": true,
-                            "profile": result.profile,
-                            "stdout": result.stdout,
-                            "stderr": result.stderr,
-                            "stdout_truncated": result.stdout_truncated,
-                            "stderr_truncated": result.stderr_truncated,
-                            "exit_code": result.exit_code,
-                            "timed_out": result.timed_out,
-                        })
-                        .to_string(),
-                        truncated: result.stdout_truncated || result.stderr_truncated,
-                        data: None,
-                        artifact: None,
-                        images: Vec::new(),
-                        cursor: None,
-                        status: if failed {
-                            ToolResultStatus::Failed
-                        } else {
-                            ToolResultStatus::Completed
-                        },
-                        reason: if result.timed_out {
-                            Some("remote command reached its deadline".into())
-                        } else if output_limited {
-                            Some("remote command reached the shell output cap".into())
-                        } else {
-                            unsuccessful_exit
-                                .map(|code| format!("remote command exited with status {code}"))
-                        },
-                        presentation: None,
-                    }),
-                    false,
-                ))
+                let mut bounded = BoundedResult {
+                    preview: serde_json::json!({
+                        "remote": true,
+                        "untrusted": true,
+                        "profile": result.profile,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "stdout_truncated": result.stdout_truncated,
+                        "stderr_truncated": result.stderr_truncated,
+                        "exit_code": result.exit_code,
+                        "timed_out": result.timed_out,
+                    })
+                    .to_string(),
+                    truncated: result.stdout_truncated || result.stderr_truncated,
+                    truncation: None,
+                    effects: Vec::new(),
+                    data: None,
+                    artifact: None,
+                    images: Vec::new(),
+                    cursor: None,
+                    status: if failed {
+                        ToolResultStatus::Failed
+                    } else {
+                        ToolResultStatus::Completed
+                    },
+                    reason: if result.timed_out {
+                        Some("remote command reached its deadline".into())
+                    } else if output_limited {
+                        Some("remote command reached the shell output cap".into())
+                    } else {
+                        unsuccessful_exit
+                            .map(|code| format!("remote command exited with status {code}"))
+                    },
+                    presentation: None,
+                };
+                if let Some(truncation) = result.truncation {
+                    bounded.declare_truncation(truncation);
+                }
+                Ok((ToolDispatchResult::Completed(bounded), false))
             }
             Err(error) => {
                 shell.exited(None).map_err(|registry_error| {
@@ -16947,6 +16954,8 @@ impl BrokerToolDispatcher {
                         })
                         .to_string(),
                         truncated: false,
+                        truncation: None,
+                        effects: Vec::new(),
                         data: None,
                         artifact: None,
                         images: Vec::new(),
@@ -17366,6 +17375,19 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     )));
                 }
                 Err(error) => {
+                    let effects =
+                        if matches!(&error, crate::lockdown::LockdownError::AppliedWrite(_)) {
+                            lockdown_write_result(
+                                &lockdown.sandbox,
+                                &written_path,
+                                operation.content.len(),
+                                0,
+                                0,
+                            )
+                            .effects
+                        } else {
+                            Vec::new()
+                        };
                     let reason = error.to_string();
                     broker
                         .journal_outcome(
@@ -17375,7 +17397,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             },
                         )
                         .await
-                        .map_err(tool_error)?;
+                        .map_err(|error| tool_error(error.with_applied_effects(effects.clone())))?;
                     append_payloads(
                         &self.output.store,
                         &self.output.device_id,
@@ -17391,16 +17413,26 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             },
                         )],
                     )
-                    .await?;
-                    return Ok(ToolDispatchResult::Completed(lockdown_refusal_result(
-                        lockdown, name, &reason,
-                    )));
+                    .await
+                    .map_err(|error| attach_file_effects(error, &effects))?;
+                    let mut rejected = lockdown_refusal_result(lockdown, name, &reason);
+                    rejected.effects = effects;
+                    return Ok(ToolDispatchResult::Completed(rejected));
                 }
             };
+            let completed = lockdown_write_result(
+                &lockdown.sandbox,
+                &written_path,
+                operation.content.len(),
+                status.quota_used,
+                status.quota_limit,
+            );
             broker
                 .journal_outcome(&intent, EffectOutcome::Ok)
                 .await
-                .map_err(tool_error)?;
+                .map_err(|error| {
+                    tool_error(error.with_applied_effects(completed.effects.clone()))
+                })?;
             append_payloads(
                 &self.output.store,
                 &self.output.device_id,
@@ -17415,13 +17447,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     },
                 )],
             )
-            .await?;
-            return Ok(ToolDispatchResult::Completed(lockdown_write_result(
-                &written_path,
-                operation.content.len(),
-                status.quota_used,
-                status.quota_limit,
-            )));
+            .await
+            .map_err(|error| attach_file_effects(error, &completed.effects))?;
+            return Ok(ToolDispatchResult::Completed(completed));
         }
         if let Some(lockdown) = self.lockdown.as_ref()
             && route == RegisteredToolRoute::FsRead
@@ -17505,6 +17533,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             })
                             .to_string(),
                             truncated: false,
+                            truncation: None,
+                            effects: Vec::new(),
                             data: None,
                             artifact: None,
                             images: Vec::new(),
@@ -17744,6 +17774,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
             return Ok(ToolDispatchResult::Completed(BoundedResult {
                 preview,
                 truncated: false,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: Vec::new(),
@@ -17779,6 +17811,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     })
                     .to_string(),
                     truncated: false,
+                    truncation: None,
+                    effects: Vec::new(),
                     data: None,
                     artifact: None,
                     images: Vec::new(),
@@ -17845,6 +17879,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 })
                 .to_string(),
                 truncated: false,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: Vec::new(),
@@ -17904,6 +17940,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         })
                         .to_string(),
                         truncated: false,
+                        truncation: None,
+                        effects: Vec::new(),
                         data: None,
                         artifact: None,
                         images: Vec::new(),
@@ -17940,6 +17978,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             })
                             .to_string(),
                             truncated: false,
+                            truncation: None,
+                            effects: Vec::new(),
                             data: None,
                             artifact: None,
                             images: Vec::new(),
@@ -18137,6 +18177,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         })
                         .to_string(),
                         truncated: false,
+                        truncation: None,
+                        effects: Vec::new(),
                         data: None,
                         artifact: None,
                         images: Vec::new(),
@@ -18158,6 +18200,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
             return Ok(ToolDispatchResult::Completed(BoundedResult {
                 preview,
                 truncated: false,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: Vec::new(),
@@ -18218,6 +18262,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 })
                 .to_string(),
                 truncated: false,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: Vec::new(),
@@ -18261,9 +18307,21 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 .and_then(|facade| facade.management.read())
                 .map(|view| view.providers)
                 .unwrap_or_default();
-            let page = crate::model_select::ModelSelectionAuthority::new(None, summaries)
-                .model_catalog(filter.as_deref(), haider_tools::LIST_MODELS_ROW_CAP);
-            let truncated = page.truncated;
+            let mut page = crate::model_select::ModelSelectionAuthority::new(None, summaries)
+                .model_catalog(filter.as_deref(), usize::MAX);
+            let cap = haider_tools::LIST_MODELS_ROW_CAP;
+            let truncated = page.models.len() > cap;
+            let original = truncated
+                .then(|| serde_json::to_vec(&page))
+                .transpose()
+                .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+            if truncated {
+                page.models.truncate(cap);
+                page.truncated = true;
+                page.hint = Some(format!(
+                    "catalog truncated at {cap} rows; call list_models again with a model, provider, or alias filter"
+                ));
+            }
             let preview = serde_json::to_string(&page).map_err(|error| {
                 HaiderError::new(
                     ErrorCode::Internal,
@@ -18271,9 +18329,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     false,
                 )
             })?;
-            return Ok(ToolDispatchResult::Completed(BoundedResult {
+            let mut result = BoundedResult {
                 preview,
                 truncated,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: Vec::new(),
@@ -18281,7 +18341,13 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 status: ToolResultStatus::Completed,
                 reason: None,
                 presentation: None,
-            }));
+            };
+            if let Some(original) = original {
+                result.declare_truncation(haider_protocol::tool::ToolTruncation::from_bytes(
+                    &original, 0,
+                ));
+            }
+            return Ok(ToolDispatchResult::Completed(result));
         }
         if route == RegisteredToolRoute::PeerList {
             let operation = parsed_operation
@@ -18326,6 +18392,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 // compact their model-facing copy without rewriting it.
                 preview,
                 truncated: false,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: Vec::new(),
@@ -18401,6 +18469,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     return Ok(ToolDispatchResult::Completed(BoundedResult {
                         preview,
                         truncated: false,
+                        truncation: None,
+                        effects: Vec::new(),
                         data: None,
                         artifact: None,
                         images: Vec::new(),
@@ -18428,6 +18498,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         })
                         .to_string(),
                         truncated: false,
+                        truncation: None,
+                        effects: Vec::new(),
                         data: None,
                         artifact: None,
                         images: Vec::new(),
@@ -18528,6 +18600,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             })
                             .to_string(),
                             truncated: false,
+                            truncation: None,
+                            effects: Vec::new(),
                             data: None,
                             artifact: None,
                             images: Vec::new(),
@@ -18572,6 +18646,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     return Ok(ToolDispatchResult::Completed(BoundedResult {
                         preview: serde_json::json!({ "ok": false, "error": reason }).to_string(),
                         truncated: false,
+                        truncation: None,
+                        effects: Vec::new(),
                         data: None,
                         artifact: None,
                         images: Vec::new(),
@@ -18750,6 +18826,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 let completed = |value: serde_json::Value| BoundedResult {
                     preview: value.to_string(),
                     truncated: false,
+                    truncation: None,
+                    effects: Vec::new(),
                     data: None,
                     artifact: None,
                     images: Vec::new(),
@@ -18942,6 +19020,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         })
                         .to_string(),
                         truncated: false,
+                        truncation: None,
+                        effects: Vec::new(),
                         data: None,
                         artifact: None,
                         images: Vec::new(),
@@ -18996,12 +19076,14 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     .journal_outcome(&intent, EffectOutcome::Ok)
                                     .await
                                     .map_err(tool_error)?;
-                                Ok(BoundedResult {
+                                let mut result = BoundedResult {
                                     preview: format!(
                                         "[{} · {}]\n{}",
                                         outcome.final_url, outcome.content_type, outcome.text
                                     ),
                                     truncated: outcome.truncated,
+                                    truncation: None,
+                                    effects: Vec::new(),
                                     data: None,
                                     artifact: None,
                                     images: Vec::new(),
@@ -19011,7 +19093,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                         "transient web_fetch failure — retry 2/2 succeeded".into()
                                     }),
                                     presentation: None,
-                                })
+                                };
+                                if let Some(truncation) = outcome.truncation { result.declare_truncation(truncation); }
+                                Ok(result)
                             }
                             Err(error) => {
                                 let message = error.to_string();
@@ -19027,6 +19111,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 Ok(BoundedResult {
                                     preview: format!("web_fetch failed: {message}"),
                                     truncated: false,
+                                    truncation: None,
+                                    effects: Vec::new(),
                                     data: None,
                                     artifact: None,
                                     images: Vec::new(),
@@ -19097,7 +19183,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         .await
                 {
                     self.clear_cached_operation(&operation_key);
-                    return Err(tool_error(error));
+                    return Err(tool_error(error.with_applied_effects(result.as_ref().map_or_else(|_| Vec::new(), |result| result.effects.clone()))));
                 }
                 result
             }
@@ -19157,6 +19243,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             "web_search is unavailable: no subscription search executor is configured"
                                 .into(),
                         truncated: false,
+                        truncation: None,
+                        effects: Vec::new(),
                         data: None,
                         artifact: None,
                         images: Vec::new(),
@@ -19177,10 +19265,13 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             .await
                         {
                             Ok(text) => {
+                                let original = haider_protocol::tool::ToolTruncation::from_bytes(text.as_bytes(), 0);
                                 let (preview, truncated) = bounded_search_preview(text);
-                                Ok(BoundedResult {
+                                let mut result = BoundedResult {
                                     preview,
                                     truncated,
+                                    truncation: None,
+                                    effects: Vec::new(),
                                     data: None,
                                     artifact: None,
                                     images: Vec::new(),
@@ -19188,7 +19279,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     status: ToolResultStatus::Completed,
                                     reason: None,
                                     presentation: None,
-                                })
+                                };
+                                if truncated { result.declare_truncation(original); }
+                                Ok(result)
                             }
                             Err(failure) => {
                                 if failure.degraded {
@@ -19200,6 +19293,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 Ok(BoundedResult {
                                     preview: format!("web_search failed: {}", failure.message),
                                     truncated: false,
+                                    truncation: None,
+                                    effects: Vec::new(),
                                     data: None,
                                     artifact: None,
                                     images: Vec::new(),
@@ -19345,6 +19440,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                                 image.width, image.height
                                             ),
                                             truncated: false,
+                                            truncation: None,
+                                            effects: Vec::new(),
                                             data: None,
                                             artifact: None,
                                             images: vec![image],
@@ -19375,6 +19472,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             Ok(BoundedResult {
                                 preview: serde_json::json!({"x": x, "y": y}).to_string(),
                                 truncated: false,
+                                truncation: None,
+                                effects: Vec::new(),
                                 data: None,
                                 artifact: None,
                                 images: Vec::new(),
@@ -19447,6 +19546,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                         Ok(BoundedResult {
                                             preview,
                                             truncated: false,
+                                            truncation: None,
+                                            effects: Vec::new(),
                                             data: None,
                                             artifact: None,
                                             images: vec![image],
@@ -19477,6 +19578,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             Ok(BoundedResult {
                                 preview: format!("{action} completed"),
                                 truncated: false,
+                                truncation: None,
+                                effects: Vec::new(),
                                 data: None,
                                 artifact: None,
                                 images: Vec::new(),
@@ -19544,6 +19647,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                             image.width, image.height
                                         ),
                                         truncated: false,
+                                        truncation: None,
+                                        effects: Vec::new(),
                                         data: None,
                                         artifact: None,
                                         images: vec![image],
@@ -19601,6 +19706,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             Ok(BoundedResult {
                                 preview,
                                 truncated: false,
+                                truncation: None,
+                                effects: Vec::new(),
                                 data: None,
                                 artifact: None,
                                 images: Vec::new(),
@@ -19661,26 +19768,26 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 Ok(mut result) => {
                     let Some(changes) = self.ledger.changes_for(&self.session_id, run_id) else {
                         self.clear_cached_operation(&operation_key);
-                        return Err(HaiderError::new(
+                        return Err(file_effect_error(
                             ErrorCode::Internal,
                             "filesystem mutation committed without ledger provenance",
-                            false,
+                            &result.effects,
                         ));
                     };
                     let Some(record) = changes.writes.get(fs_write_count) else {
                         self.clear_cached_operation(&operation_key);
-                        return Err(HaiderError::new(
+                        return Err(file_effect_error(
                             ErrorCode::Internal,
                             "filesystem mutation committed without one new ledger record",
-                            false,
+                            &result.effects,
                         ));
                     };
                     if changes.writes.len() != fs_write_count.saturating_add(1) {
                         self.clear_cached_operation(&operation_key);
-                        return Err(HaiderError::new(
+                        return Err(file_effect_error(
                             ErrorCode::Internal,
                             "filesystem mutation produced ambiguous ledger provenance",
-                            false,
+                            &result.effects,
                         ));
                     }
                     let mutation = match durable_workspace_mutation(
@@ -19693,7 +19800,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         Ok(mutation) => mutation,
                         Err(error) => {
                             self.clear_cached_operation(&operation_key);
-                            return Err(tool_error(error));
+                            return Err(tool_error(
+                                error.with_applied_effects(result.effects.clone()),
+                            ));
                         }
                     };
                     let subject_digest = mutation.subject_digest.clone();
@@ -20213,6 +20322,12 @@ fn selected_menu_option<'a>(
 }
 
 pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<BoundedResult> {
+    if let haider_tools::ToolError::Applied { source, effects } = error {
+        return typed_tool_result(source).map(|mut result| {
+            result.effects = effects.clone();
+            result
+        });
+    }
     if let haider_tools::ToolError::Computer(error) = error {
         return Some(computer_failure_result(error));
     }
@@ -20275,6 +20390,7 @@ pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<Bound
         haider_tools::ToolError::Computer(_) => unreachable!("handled above"),
         haider_tools::ToolError::Mobile(_) => unreachable!("handled above"),
         haider_tools::ToolError::StaleRead { .. } => ("conflict", "stale_read"),
+        haider_tools::ToolError::Applied { .. } => unreachable!("handled above"),
         haider_tools::ToolError::AuthorizationRequired { .. }
         | haider_tools::ToolError::Journal { .. }
         | haider_tools::ToolError::Ledger { .. }
@@ -20335,6 +20451,8 @@ fn computer_failure_result(error: &ComputerError) -> BoundedResult {
         })
         .to_string(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),
@@ -20393,6 +20511,8 @@ fn mobile_failure_result(error: &MobileError) -> BoundedResult {
         })
         .to_string(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),
@@ -20428,6 +20548,8 @@ fn typed_error_result(
     BoundedResult {
         preview: body.to_string(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),
@@ -20457,6 +20579,8 @@ fn selection_rejection_result(refusal: &crate::model_select::SelectionRefusal) -
         })
         .to_string(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),
@@ -20479,6 +20603,8 @@ fn recursion_limit_result() -> BoundedResult {
         })
         .to_string(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),
@@ -20506,6 +20632,8 @@ fn subagent_limit_result(error: &HaiderError) -> BoundedResult {
         })
         .to_string(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),
@@ -20529,6 +20657,8 @@ fn typed_workflow_boundary_result(message: &str) -> BoundedResult {
         })
         .to_string(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),
@@ -20554,6 +20684,8 @@ fn grant_ceiling_result(name: &str) -> BoundedResult {
         })
         .to_string(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),
@@ -20593,6 +20725,8 @@ fn lockdown_refusal_result(
         })
         .to_string(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),
@@ -20604,6 +20738,7 @@ fn lockdown_refusal_result(
 }
 
 fn lockdown_write_result(
+    workspace: &Path,
     path: &Path,
     bytes: usize,
     quota_used: u64,
@@ -20619,6 +20754,22 @@ fn lockdown_write_result(
         })
         .to_string(),
         truncated: false,
+        truncation: None,
+        effects: vec![haider_protocol::tool::ToolFileEffect {
+            kind: haider_protocol::tool::ToolFileEffectKind::Write,
+            name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            path: path
+                .strip_prefix(workspace)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/"),
+            absolute_path: path.to_string_lossy().into_owned(),
+            bytes: bytes as u64,
+        }],
         data: None,
         artifact: None,
         images: Vec::new(),
@@ -20657,6 +20808,8 @@ fn lockdown_quota_result(
         })
         .to_string(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),
@@ -20700,9 +20853,11 @@ fn lockdown_read_result(text: &str, offset: Option<usize>, limit: Option<usize>)
     } else {
         selected
     };
-    BoundedResult {
+    let mut result = BoundedResult {
         preview: selected,
         truncated,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),
@@ -20710,7 +20865,14 @@ fn lockdown_read_result(text: &str, offset: Option<usize>, limit: Option<usize>)
         status: ToolResultStatus::Completed,
         reason: Some("lockdown secret redaction forced on".to_owned()),
         presentation: None,
+    };
+    if truncated {
+        result.declare_truncation(haider_protocol::tool::ToolTruncation::from_bytes(
+            text.as_bytes(),
+            0,
+        ));
     }
+    result
 }
 
 fn mobile_capability_denied_result() -> BoundedResult {
@@ -20728,6 +20890,8 @@ fn mobile_capability_denied_result() -> BoundedResult {
         })
         .to_string(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),
@@ -20760,6 +20924,8 @@ fn graph_evidence_rejection(
         })
         .to_string(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),
@@ -21398,9 +21564,11 @@ fn process_result_with_signal(
             savings = next;
         }
     }
-    BoundedResult {
+    let mut bounded = BoundedResult {
         preview,
         truncated,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact,
         images: Vec::new(),
@@ -21417,7 +21585,19 @@ fn process_result_with_signal(
         },
         reason,
         presentation: None,
+    };
+    if truncated {
+        bounded.declare_truncation(haider_protocol::tool::ToolTruncation {
+            truncated: true,
+            original_bytes: result
+                .output_bytes
+                .saturating_add(result.source_output_elided_bytes_at_least)
+                as u64,
+            payload_bytes: 0, // declare_truncation measures the unchanged payload.
+            sha256: result.output_sha256,
+        });
     }
+    bounded
 }
 
 fn process_result_minimal_preview_json(
@@ -22115,9 +22295,30 @@ impl JournalSink for HubJournalSink {
     }
 }
 
+fn attach_file_effects(
+    mut failure: HaiderError,
+    effects: &[haider_protocol::tool::ToolFileEffect],
+) -> HaiderError {
+    if !effects.is_empty() {
+        let details = failure.details.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(details) = details.as_object_mut() {
+            details.insert("applied_effects".into(), serde_json::json!(effects));
+        }
+    }
+    failure
+}
+
+fn file_effect_error(
+    code: ErrorCode,
+    message: impl Into<String>,
+    effects: &[haider_protocol::tool::ToolFileEffect],
+) -> HaiderError {
+    attach_file_effects(HaiderError::new(code, message, false), effects)
+}
+
 fn tool_error(error: haider_tools::ToolError) -> HaiderError {
     let code = if matches!(
-        &error,
+        error.source_error(),
         haider_tools::ToolError::PermissionDenied { .. }
             | haider_tools::ToolError::RefusedByLockdown { .. }
     ) {
@@ -22125,7 +22326,7 @@ fn tool_error(error: haider_tools::ToolError) -> HaiderError {
     } else {
         ErrorCode::ProviderError
     };
-    HaiderError::new(code, error.to_string(), false)
+    file_effect_error(code, error.to_string(), error.applied_effects())
 }
 
 fn computer_error(error: ComputerError) -> HaiderError {

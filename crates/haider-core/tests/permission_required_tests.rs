@@ -70,6 +70,8 @@ impl ToolDispatcher for RecoveredImageApprovalDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "recovered capture".into(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: vec![self.image.clone()],
@@ -108,6 +110,8 @@ impl ToolDispatcher for ApprovalDispatcher {
             Ok(ToolDispatchResult::Completed(BoundedResult {
                 preview: "approved".into(),
                 truncated: false,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: Vec::new(),

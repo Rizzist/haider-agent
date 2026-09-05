@@ -75,6 +75,11 @@ pub struct TaskCompleted {
     pub elapsed_ms: u64,
     /// Total bytes the task produced (may exceed what was retained).
     pub output_bytes: u64,
+    /// SHA-256 of every original output byte in capture order, including
+    /// bytes omitted by the retention cap. Absent on legacy/recovered tasks
+    /// whose original stream was not observed by this daemon generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_sha256: Option<String>,
     /// Bounded output tail preview (last [`TASK_TAIL_BYTES`], lossy UTF-8).
     pub tail: String,
     /// Full bounded output (cap [`TASK_OUTPUT_RETAIN_BYTES`]) in the CAS.

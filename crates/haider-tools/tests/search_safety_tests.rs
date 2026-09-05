@@ -250,12 +250,13 @@ async fn overlong_lines_are_reported_instead_of_silently_omitted() {
         .expect("bounded search");
     let Some(ToolResultData::FsSearch {
         truncated_reason, ..
-    }) = result.data
+    }) = &result.data
     else {
         panic!("typed search data");
     };
-    assert_eq!(truncated_reason, Some(ToolTruncationReason::LineTooLong));
-    assert!(result.preview.is_empty());
+    assert_eq!(*truncated_reason, Some(ToolTruncationReason::LineTooLong));
+    assert!(result.payload_text().is_empty());
+    assert!(result.truncation.is_some());
 }
 
 /// MUTATION CHECK: expose a denied path or raw token in either the legacy
@@ -334,7 +335,8 @@ async fn search_and_read_redact_without_spilling_inline_results() {
         )
         .await
         .expect("sensitive read");
-    assert_eq!(env.preview, "[REDACTED:sensitive_file]\n");
+    assert_eq!(env.payload_text(), "[REDACTED:sensitive_file]\n");
+    assert!(env.truncation.is_some());
     assert!(env.artifact.is_none());
     assert!(cas.0.is_empty());
 
@@ -359,7 +361,8 @@ async fn search_and_read_redact_without_spilling_inline_results() {
         )
         .await
         .expect("ranged key-body read");
-    assert_eq!(ranged.preview, "2: [REDACTED:private_key]\n");
+    assert_eq!(ranged.payload_text(), "2: [REDACTED:private_key]\n");
+    assert!(ranged.truncation.is_some());
     assert!(ranged.artifact.is_none());
     assert!(cas.0.is_empty());
 

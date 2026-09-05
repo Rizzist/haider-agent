@@ -375,3 +375,33 @@ Optional `RunBudgetV1.request_budget` and
 client so older daemons cannot silently ignore the settings. Default policy
 is 32 soft / 64 hard. The schema version remains 1; unknown extension data and
 new error codes retain the established forward-compatibility behavior.
+
+### v0.0.970 — tool-result truncation provenance and applied file effects
+
+- Optional `payload.truncation` and `payload.effects` on `tool_result`, mirrored
+  on `payload.result` / standalone `BoundedResult`. They are absent when unused;
+  legacy results decode with no metadata. `SCHEMA_VERSION` remains 1.
+- Truncation has exactly `truncated: true`, unsigned `original_bytes` and
+  `payload_bytes`, and `sha256` (64 lowercase hexadecimal digits of the ORIGINAL
+  captured bytes). The text preview appends one standalone final line:
+  `[haider:truncated truncated=true original_bytes=<uint> payload_bytes=<uint> sha256=<hex64>]`.
+  The former preview and its prefix/suffix policy are retained; the new marker
+  and its added separator are excluded from `payload_bytes`.
+- Applied file effects are ordered `{kind,name,path,absolute_path,bytes}` records,
+  with `kind` in `write|create|edit|delete`; relative and absolute paths agree with
+  the workspace receipt. Moves declare source delete then destination create/write.
+  Counts describe installed bytes (removed bytes for delete; zero for directory
+  structure). Failures before application add no invented effect; post-apply
+  failures retain effects while preserving the original failure disposition.
+- SHA-256 is accumulated on original process bytes before lossless capture is
+  bounded or bytes are converted to text; existing BLAKE3 receipt digests retain
+  their meanings. Raw replay preserves the metadata. Fatal post-apply failures
+  record one failed tool result with landed effects before existing cleanup;
+  event kinds, terminal semantics, sequence allocation rules, and persistence
+  boundaries stay the same. Details and byte-count scope are
+  in [the run JSONL contract](jsonl-run-contract-v1.md#tool-result-byte-provenance-and-file-effects-v00970).
+
+- Optional `output_sha256` on `task_completed` persists original background
+  output provenance for eviction/recovery; legacy facts omit it. Optional
+  `truncation` on `SshShellResultWire` carries the same typed captured-byte
+  provenance. Both are additive and are omitted when unavailable/unused.

@@ -71,6 +71,7 @@ impl DeferredDispatcher {
                         },
                         chip: ChipState::Done,
                         truncated: false,
+                        truncation: None,
                     },
                 ),
                 (
@@ -84,6 +85,7 @@ impl DeferredDispatcher {
                         },
                         chip: ChipState::Done,
                         truncated: false,
+                        truncation: None,
                     },
                 ),
             ]),
@@ -307,6 +309,7 @@ async fn errored_child_is_a_red_report_and_parent_tool_result() {
             },
             chip: ChipState::Error,
             truncated: false,
+            truncation: None,
         },
     );
     let dispatcher = Arc::new(dispatcher);
@@ -339,6 +342,107 @@ async fn errored_child_is_a_red_report_and_parent_tool_result() {
             )
         })
     }));
+    drop(handle);
+    actor_task.await.expect("actor exits");
+}
+
+#[tokio::test]
+async fn toolshape_deferred_report_carries_original_digest_to_durable_result_and_model() {
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "call-a".into(),
+            name: "spawn_subagent".into(),
+            args: serde_json::json!({"task":"a","prompt":"fail"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(MemoryStore::new());
+    let mut dispatcher = DeferredDispatcher::two();
+    let original = "public child failure plus discarded original report bytes";
+    let marker = haider_protocol::tool::ToolTruncation::from_bytes(original.as_bytes(), 0);
+    dispatcher.completions.insert(
+        "call-a".into(),
+        DeferredToolResult {
+            report: ChildReport {
+                agent: AgentId::new("agent-a"),
+                summary: "public child failure".into(),
+                verified: ReportVerification::Red,
+                workspace_revision: None,
+            },
+            chip: ChipState::Error,
+            truncated: true,
+            truncation: Some(marker.clone()),
+        },
+    );
+    let dispatcher = Arc::new(dispatcher);
+    let config = HarnessConfig::for_session(
+        SessionId::new("error-parent"),
+        DeviceId::new("test-device"),
+        1,
+        1,
+    );
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        config,
+        provider.clone(),
+        store.clone(),
+        Some(dispatcher.clone()),
+    );
+    let actor_task = tokio::spawn(actor.run());
+    let turn = handle
+        .submit_turn(SubmitTurn::new("delegate failure"))
+        .await
+        .expect("turn accepted");
+    tokio::task::yield_now().await;
+    dispatcher.release("call-a");
+    let outcome = turn.wait().await.expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    let events = store.events(&SessionId::new("error-parent")).await;
+    let result = events
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::ToolResult { result, .. } => Some(result),
+            _ => None,
+        })
+        .expect("durable child tool result");
+    assert_eq!(
+        result.payload_text(),
+        "agent: agent-a\n\npublic child failure"
+    );
+    assert_eq!(
+        result.truncation.as_ref().expect("marker").sha256,
+        marker.sha256
+    );
+    assert_eq!(
+        result.truncation.as_ref().expect("marker").original_bytes,
+        original.len() as u64
+    );
+    assert_eq!(
+        result.preview.lines().last(),
+        Some(
+            result
+                .truncation
+                .as_ref()
+                .expect("marker")
+                .marker()
+                .as_str()
+        )
+    );
+    let model = provider.requests()[1]
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .find_map(|block| match block {
+            Block::ToolResult { preview, .. } => Some(preview.clone()),
+            _ => None,
+        })
+        .expect("model child tool result");
+    assert!(model.ends_with(&format!("sha256={}]", marker.sha256)));
+    assert_eq!(model.matches("[haider:truncated ").count(), 1);
     drop(handle);
     actor_task.await.expect("actor exits");
 }

@@ -7332,6 +7332,8 @@ fn tool_result(
     BoundedResult {
         preview: preview.to_string(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),

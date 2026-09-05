@@ -197,6 +197,7 @@ fn e1a_worker_maps_denial_anchor_miss_and_nonzero_process_to_failure_status() {
         output_elided_bytes_at_least: 0,
         source_output_elided_bytes_at_least: 0,
         transcript_digest: format!("blake3:{}", blake3::hash(&[]).to_hex()),
+        output_sha256: haider_protocol::tool::ToolTruncation::from_bytes(&[], 0).sha256,
         inline_output: Vec::new(),
         artifact: None,
         escalation_note: None,
@@ -233,6 +234,8 @@ fn process_accounting_fixture(
         output_elided_bytes_at_least: 0,
         source_output_elided_bytes_at_least: 0,
         transcript_digest: format!("blake3:{}", blake3::hash(output.as_bytes()).to_hex()),
+        output_sha256: haider_protocol::tool::ToolTruncation::from_bytes(output.as_bytes(), 0)
+            .sha256,
         inline_output: vec![haider_tools::ProcessOutputChunk {
             stream: haider_protocol::item::OutputStream::Stdout,
             chunk_b64: base64::engine::general_purpose::STANDARD.encode(output),
@@ -278,7 +281,7 @@ fn process_model_boundary_accounting_is_signed_deterministic_and_full_projection
         let replay = crate::worker::process_result(input);
         assert_eq!(result, replay, "same input must reproduce exactly: {name}");
         let value: serde_json::Value =
-            serde_json::from_str(&result.preview).expect("process preview JSON");
+            serde_json::from_str(result.payload_text()).expect("process preview JSON");
         let (before, after, net) = if let Some(savings_value) = value.get("context_savings_detail")
         {
             let savings: haider_protocol::context::OutputSavings =
@@ -287,7 +290,7 @@ fn process_model_boundary_accounting_is_signed_deterministic_and_full_projection
             assert_eq!(
                 savings.output_bytes,
                 u64::try_from(haider_tools::provider_request_text_projection_bytes(
-                    &result.preview,
+                    result.payload_text(),
                 ))
                 .expect("fixture length fits u64")
             );
@@ -363,7 +366,7 @@ fn process_model_boundary_accounting_is_signed_deterministic_and_full_projection
         "elision must be deterministic"
     );
     let value: serde_json::Value =
-        serde_json::from_str(&first.preview).expect("process preview JSON");
+        serde_json::from_str(first.payload_text()).expect("process preview JSON");
     let output = value["output"].as_str().expect("bounded output text");
     assert!(output.contains("COMMAND cargo test --locked"));
     assert!(output.contains("FAILURE: final linker diagnostic"));
@@ -372,6 +375,49 @@ fn process_model_boundary_accounting_is_signed_deterministic_and_full_projection
         raw_chunk,
         process_accounting_fixture("head-tail", &diagnostic, true).inline_output[0].chunk_b64,
         "model projection must not mutate the captured output"
+    );
+}
+
+#[test]
+fn toolshape_one_mib_process_result_golden_preserves_payload_and_replays() {
+    use haider_protocol::{EventPayload, envelope::RawPayload};
+    let mut output = "x".repeat(1024 * 1024);
+    output.replace_range(..17, "ORIGINAL-STDOUT!\n");
+    output.replace_range(output.len() - 16.., "\nORIGINAL-TAIL!!");
+    let input = process_accounting_fixture("one-mib", &output, false);
+    let result = crate::worker::process_result(input);
+    let marker = result.truncation.as_ref().expect("typed truncation");
+    assert_eq!(marker.original_bytes, 1024 * 1024);
+    assert_eq!(
+        marker.sha256,
+        haider_protocol::tool::ToolTruncation::from_bytes(output.as_bytes(), 0).sha256
+    );
+    assert_eq!(marker.payload_bytes, result.payload_text().len() as u64);
+    assert_eq!(
+        result.preview.lines().last(),
+        Some(marker.marker().as_str())
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(result.payload_text()).expect("original JSON payload");
+    let selected = payload["output"].as_str().expect("stdout");
+    assert!(selected.contains("ORIGINAL-STDOUT!"));
+    assert!(selected.contains("ORIGINAL-TAIL!!"));
+    let event = EventPayload::ToolResult {
+        call_id: "fixture-one-mib".into(),
+        result,
+    };
+    let raw = RawPayload::from_event(event.clone()).expect("durable payload");
+    assert_eq!(raw.decode_event().expect("replay"), event);
+    let actual = serde_json::to_string_pretty(&raw).expect("golden JSON") + "\n";
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/toolshape/process_one_mib.json");
+    if std::env::var_os("UPDATE_FIXTURES").is_some() {
+        std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("mkdir");
+        std::fs::write(&path, &actual).expect("bless");
+    }
+    assert_eq!(
+        actual,
+        std::fs::read_to_string(path).expect("process golden")
     );
 }
 
@@ -5167,6 +5213,249 @@ async fn agent_type_selection_is_registry_validated_receipted_and_reversible() {
         .expect("metadata read")
         .expect("metadata present");
     assert_eq!(metadata.agent_type, None, "None reverts to plain");
+
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+/// The child journal retains the unbounded original after the bounded report
+/// has been persisted in the delegation record. First collection and a fresh
+/// coordinator's recollection must recover the same original-byte metadata.
+#[tokio::test]
+async fn toolshape_collect_and_recollect_long_utf8_report_hash_original_child_journal() {
+    use haider_protocol::ids::{BranchId, ItemId};
+
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let parent_session = SessionId::new("toolshape-report-parent");
+    let parent_run = RunId::new("toolshape-report-parent-run");
+    let parent_branch = BranchId::new("toolshape-report-a");
+    let cwd = std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+        .expect("canonical cwd")
+        .to_string_lossy()
+        .into_owned();
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-toolshape-report-parent".into(),
+        request_digest: "create-toolshape-report-parent-digest".into(),
+        request_json: r#"{"session":"toolshape-report-parent"}"#.into(),
+        session_id: parent_session.clone(),
+        cwd: cwd.clone(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("created-toolshape-report-parent"),
+        device_id: DeviceId::new("toolshape-report-device"),
+    })
+    .await
+    .expect("create parent");
+    let metadata = SessionMetadataV1 {
+        cwd,
+        provider: "fake".into(),
+        account_alias: None,
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
+        permission_overrides: None,
+        interaction_mode: Default::default(),
+        title: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        context_economy: Default::default(),
+        created_at_ms: 1,
+        agent_type: None,
+    };
+    // The production collector derives its one fallback deadline from the
+    // accepted parent's first durable run fact. Keep this direct coordinator
+    // fixture honest by establishing that anchor before the child is spawned.
+    let mut parent_started = [EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new("toolshape-report-parent-started"),
+        seq: 0,
+        session_id: parent_session.clone(),
+        branch_id: Some(parent_branch.clone()),
+        run_id: Some(parent_run.clone()),
+        agent_id: None,
+        device_id: DeviceId::new("toolshape-report-device"),
+        authority_epoch: 0,
+        worker_generation: store.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(EventPayload::RunState(RunState::Thinking))
+            .expect("parent run start payload")
+            .into(),
+    }];
+    hub.append(&mut parent_started)
+        .await
+        .expect("append parent run start");
+    let coordinates = || SpawnCoordinates {
+        parent_session_id: parent_session.clone(),
+        parent_run_id: parent_run.clone(),
+        parent_branch_id: Some(parent_branch.clone()),
+        parent_agent_id: None,
+        tool_item_id: ItemId::new("toolshape-report-item"),
+        call_id: "toolshape-report-call".into(),
+        metadata: metadata.clone(),
+        agent_type: None,
+        lockdown: false,
+        auto_hermetic: false,
+    };
+    let request = SpawnSubagent {
+        request_budget: Some(haider_protocol::request_budget::RequestBudgetV1 {
+            tranche: 40,
+            hard_cap: 96,
+        }),
+        task: "test branch pin".into(),
+        prompt: "report after branch switch".into(),
+        model: None,
+        provider: None,
+        workflow: None,
+        workflow_trigger: None,
+        parent_slot: None,
+        workflow_author: false,
+        agent_type: None,
+    };
+    let delegation = DelegationHandle::new(hub.clone());
+    let first = delegation
+        .establish(coordinates(), request.clone())
+        .await
+        .expect("establish child");
+    let records = hub
+        .delegations_for_parent_run(parent_session, parent_run)
+        .await
+        .expect("parent delegations");
+    assert_eq!(records.len(), 1);
+    assert!(records[0].report.is_none());
+    let child_session = records[0].child_session_id.clone();
+    let child_run = records[0].child_run_id.clone();
+    // A three-byte scalar crosses the 16 KiB boundary, leaving a 16,383-byte
+    // stored prefix; the original-only tail must still influence both hashes.
+    let original = format!("{}ORIGINAL-REPORT-TAIL", "€".repeat(6_000));
+    let expected_hash =
+        haider_protocol::tool::ToolTruncation::from_bytes(original.as_bytes(), 0).sha256;
+    let terminal = [EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new("toolshape-report-child-done"),
+        seq: 0,
+        session_id: child_session,
+        branch_id: None,
+        run_id: Some(child_run),
+        agent_id: Some(first.ticket.manifest.agent.clone()),
+        device_id: DeviceId::new("toolshape-report-device"),
+        authority_epoch: 0,
+        worker_generation: store.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
+            .expect("child terminal payload")
+            .into(),
+    }];
+    let item_id = ItemId::new("toolshape-report-text");
+    let mut report_events = [
+        EventEnvelope {
+            event_id: EventId::new("toolshape-report-text-started"),
+            payload: haider_protocol::envelope::RawPayload::from_event(EventPayload::Item(
+                ItemEvent::Started {
+                    item_id: item_id.clone(),
+                    item: TurnItem::AgentMessage { text: "".into() },
+                },
+            ))
+            .expect("started report payload"),
+            ..terminal[0].clone()
+        },
+        EventEnvelope {
+            event_id: EventId::new("toolshape-report-text-completed"),
+            payload: haider_protocol::envelope::RawPayload::from_event(EventPayload::Item(
+                ItemEvent::Completed {
+                    item_id,
+                    item: TurnItem::AgentMessage {
+                        text: original.clone().into(),
+                    },
+                },
+            ))
+            .expect("complete original report payload"),
+            ..terminal[0].clone()
+        },
+        terminal[0].clone(),
+    ];
+    hub.append(&mut report_events)
+        .await
+        .expect("journal original report and terminal without idle settlement");
+    let bounded =
+        DelegationHandle::with_settlement_tail_timeout(hub.clone(), Duration::from_millis(50));
+    let collected = timeout(
+        Duration::from_secs(1),
+        bounded.collect(
+            &first.ticket,
+            &CancelToken::new(),
+            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+        ),
+    )
+    .await
+    .expect("durable child terminal releases the parent without idle settlement")
+    .expect("collect terminal child");
+    assert!(collected.truncated);
+    assert_eq!(collected.report.summary, original[..16_383]);
+    let first_marker = collected
+        .truncation
+        .as_ref()
+        .expect("first collection original provenance");
+    assert_eq!(first_marker.original_bytes, original.len() as u64);
+    assert_eq!(first_marker.sha256, expected_hash);
+    assert_ne!(
+        first_marker.sha256,
+        haider_protocol::tool::ToolTruncation::from_bytes(collected.report.summary.as_bytes(), 0)
+            .sha256
+    );
+    let stored = hub
+        .delegation(first.ticket.manifest.agent.clone())
+        .await
+        .expect("stored delegation")
+        .expect("delegation exists");
+    assert_eq!(
+        stored.report.as_ref(),
+        Some(&collected.report),
+        "recollection must exercise the already-stored report branch"
+    );
+    let restarted =
+        DelegationHandle::with_settlement_tail_timeout(hub.clone(), Duration::from_millis(50));
+    let recollected = timeout(
+        Duration::from_secs(1),
+        restarted.collect(
+            &first.ticket,
+            &CancelToken::new(),
+            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+        ),
+    )
+    .await
+    .expect("bounded recollection")
+    .expect("recollect stored bounded report");
+    assert!(recollected.truncated);
+    assert_eq!(recollected.report, collected.report);
+    assert_eq!(recollected.truncation, collected.truncation);
+    let child_replay = store
+        .read(&records[0].child_session_id, 0, 128)
+        .await
+        .expect("child report replay");
+    assert!(child_replay.iter().any(|event| matches!(event.payload.decode_event(), Ok(EventPayload::Item(ItemEvent::Completed { item: TurnItem::AgentMessage { text }, .. })) if text.to_owned_string() == original)));
 
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");

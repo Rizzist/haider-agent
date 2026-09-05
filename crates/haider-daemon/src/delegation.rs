@@ -1025,12 +1025,25 @@ impl DelegationHandle {
                         } else {
                             ChipState::Done
                         };
+                        // The child journal retains the unbounded report. On
+                        // re-collection, recover byte provenance from that
+                        // authority instead of hashing the stored prefix.
+                        let truncation =
+                            if report.summary.len() >= MAX_REPORT_BYTES.saturating_sub(3) {
+                                self.derive_terminal_report(&record)
+                                    .await?
+                                    .filter(|completion| completion.report == report)
+                                    .and_then(|completion| completion.truncation)
+                            } else {
+                                None
+                            };
                         return Ok(ChildWaitWake::Ready {
                             record,
                             completion: DeferredToolResult {
                                 report,
                                 chip,
-                                truncated: false,
+                                truncated: truncation.is_some(),
+                                truncation,
                             },
                         });
                     }
@@ -1055,6 +1068,7 @@ impl DelegationHandle {
                                 report,
                                 chip: completion.chip,
                                 truncated: completion.truncated,
+                                truncation: completion.truncation,
                             },
                         });
                     }
@@ -2204,7 +2218,7 @@ impl DelegationHandle {
         } else {
             String::new()
         };
-        let (summary, truncated) = bounded_report_summary(summary, &lockdown_prefix);
+        let (summary, truncated, truncation) = bounded_report_summary(summary, &lockdown_prefix);
         Ok(Some(DeferredToolResult {
             report: ChildReport {
                 agent: record.agent_id.clone(),
@@ -2214,6 +2228,7 @@ impl DelegationHandle {
             },
             chip,
             truncated,
+            truncation,
         }))
     }
 
@@ -3979,7 +3994,31 @@ enum ReportSummaryText {
     Owned(String),
 }
 
-fn bounded_report_summary(summary: ReportSummaryText, prefix: &str) -> (String, bool) {
+fn bounded_report_summary(
+    summary: ReportSummaryText,
+    prefix: &str,
+) -> (String, bool, Option<haider_protocol::tool::ToolTruncation>) {
+    use sha2::{Digest as _, Sha256};
+    let original_bytes = prefix.len().saturating_add(match &summary {
+        ReportSummaryText::Reply(text) => text.len(),
+        ReportSummaryText::Owned(text) => text.len(),
+    });
+    let truncation = (original_bytes > MAX_REPORT_BYTES).then(|| {
+        let mut digest = Sha256::new();
+        digest.update(prefix.as_bytes());
+        match &summary {
+            ReportSummaryText::Reply(text) => {
+                text.visit_strs(|part| digest.update(part.as_bytes()))
+            }
+            ReportSummaryText::Owned(text) => digest.update(text.as_bytes()),
+        }
+        haider_protocol::tool::ToolTruncation {
+            truncated: true,
+            original_bytes: original_bytes as u64,
+            payload_bytes: 0,
+            sha256: format!("{:x}", digest.finalize()),
+        }
+    });
     let remaining = MAX_REPORT_BYTES.saturating_sub(prefix.len());
     match summary {
         ReportSummaryText::Reply(text) => {
@@ -3998,8 +4037,47 @@ fn bounded_report_summary(summary: ReportSummaryText, prefix: &str) -> (String, 
             let mut output = String::with_capacity(prefix.len().saturating_add(body.len()));
             output.push_str(prefix);
             output.push_str(&body);
-            (output, truncated)
+            (output, truncated, truncation)
         }
-        ReportSummaryText::Owned(summary) => bounded_summary(format!("{prefix}{summary}")),
+        ReportSummaryText::Owned(summary) => {
+            let (output, truncated) = bounded_summary(format!("{prefix}{summary}"));
+            (output, truncated, truncation)
+        }
+    }
+}
+
+#[cfg(test)]
+mod toolshape_tests {
+    use super::*;
+
+    #[test]
+    fn toolshape_report_hashes_full_owned_and_arena_summary_before_prefix_bound() {
+        let prefix = "[lockdown provider fixture] ";
+        let original = format!("{}TAIL-A", "é".repeat(MAX_REPORT_BYTES));
+        let full = format!("{prefix}{original}");
+        let expected = haider_protocol::tool::ToolTruncation::from_bytes(full.as_bytes(), 0);
+        let (owned, truncated, marker) =
+            bounded_report_summary(ReportSummaryText::Owned(original.clone()), prefix);
+        assert!(truncated);
+        assert_eq!(marker.as_ref(), Some(&expected));
+        assert_eq!((owned.clone(), true), bounded_summary(full));
+        let mut arena = haider_protocol::reply::ReplyArenaWriter::new();
+        let _ = arena.append(original[..original.len() - 6].to_owned());
+        let _ = arena.append("TAIL-A".into());
+        let arena_result = bounded_report_summary(ReportSummaryText::Reply(arena.seal()), prefix);
+        assert_eq!(arena_result, (owned.clone(), true, marker.clone()));
+        let changed = format!("{}TAIL-B", "é".repeat(MAX_REPORT_BYTES));
+        let (changed_payload, _, changed_marker) =
+            bounded_report_summary(ReportSummaryText::Owned(changed), prefix);
+        assert_eq!(changed_payload, owned);
+        assert_ne!(
+            changed_marker, marker,
+            "discarded suffix still changes original digest"
+        );
+        let (small, truncated, marker) =
+            bounded_report_summary(ReportSummaryText::Owned("small".into()), "");
+        assert_eq!(small, "small");
+        assert!(!truncated);
+        assert!(marker.is_none());
     }
 }

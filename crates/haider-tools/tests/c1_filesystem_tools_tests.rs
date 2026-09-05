@@ -281,10 +281,11 @@ async fn search_and_glob_are_root_confined_sorted_and_bounded() {
         .await
         .expect("glob");
     assert!(glob.truncated);
-    assert_eq!(glob.preview.lines().count(), 4);
-    assert_eq!(glob.preview.lines().next(), Some("entry-000.rs"));
+    assert_eq!(glob.payload_text().lines().count(), 4);
+    assert!(glob.truncation.is_some());
+    assert_eq!(glob.payload_text().lines().next(), Some("entry-000.rs"));
     assert_eq!(
-        glob.preview.lines().next_back(),
+        glob.payload_text().lines().next_back(),
         Some("[… 497 more .rs files]")
     );
     let raw_glob = String::from_utf8(cas.writes.last().expect("raw glob CAS").clone())
@@ -332,7 +333,8 @@ async fn search_caps_preview_at_200_and_cas_preserves_every_match() {
         .await
         .expect("bounded search");
     assert!(result.truncated);
-    assert_eq!(result.preview.lines().count(), 200);
+    assert_eq!(result.payload_text().lines().count(), 200);
+    assert!(result.truncation.is_some());
     assert!(result.artifact.is_some());
     let full = String::from_utf8(cas.writes.pop().expect("full CAS payload")).expect("UTF-8 CAS");
     assert_eq!(full.lines().count(), 201);
@@ -360,7 +362,8 @@ async fn search_preview_is_eight_kib_utf8_safe_with_full_cas_overflow() {
         .await
         .expect("long search");
     assert!(result.truncated);
-    assert!(result.preview.len() <= 8 * 1024);
+    assert!(result.payload_text().len() <= 8 * 1024);
+    assert!(result.truncation.is_some());
     assert!(std::str::from_utf8(result.preview.as_bytes()).is_ok());
     assert!(result.artifact.is_some());
     let full = String::from_utf8(cas.writes.pop().expect("full CAS payload")).expect("UTF-8 CAS");
@@ -1056,7 +1059,7 @@ async fn landed_write_with_ledger_failure_still_updates_freshness() {
         )
         .await
         .expect_err("ledger failure is surfaced");
-    assert!(matches!(error, ToolError::Ledger { .. }));
+    assert!(matches!(error.source_error(), ToolError::Ledger { .. }));
     assert_eq!(
         fs::read_to_string(directory.path().join("ledger.txt")).expect("read"),
         "two"

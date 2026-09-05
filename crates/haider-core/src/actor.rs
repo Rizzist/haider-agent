@@ -145,6 +145,42 @@ fn model_tool_result_projection(
     result: &BoundedResult,
 ) -> ModelToolResultProjection {
     const INVENTORY_MODEL_PREVIEW_MAX_BYTES: usize = 8 * 1024;
+    if result.truncation.is_some() && result.payload_text() != result.preview {
+        // A producer already bounded this output and declared the exact raw
+        // byte provenance. Keep the final marker intact on first send/replay.
+        // The legacy nested process detail measures the unchanged payload;
+        // account for the additive footer at the provider boundary as well.
+        let mut legacy = result.clone();
+        legacy.preview = result.payload_text().to_owned();
+        legacy.truncation = None;
+        let legacy_projection = model_tool_result_projection(tool_name, &legacy);
+        let mut projected = legacy;
+        projected.preview = legacy_projection.preview;
+        if let Some(marker) = result.truncation.clone() {
+            projected.declare_truncation(marker);
+        }
+        let savings = legacy_projection.savings.map(|savings| {
+            let cost = OutputSavings::from_provider_request_bytes(
+                &savings.scope,
+                savings.input_bytes as usize,
+                haider_tools::provider_request_text_projection_bytes(&projected.preview),
+                savings.omitted_bytes as usize,
+                savings.omitted_bytes_exact,
+            );
+            OutputSavings {
+                output_bytes: cost.output_bytes,
+                estimated_tokens_after: cost.estimated_tokens_after,
+                estimated_net_tokens_saved: cost.estimated_net_tokens_saved,
+                estimated_tokens_saved: cost.estimated_tokens_saved,
+                ..savings
+            }
+        });
+        return ModelToolResultProjection {
+            preview: projected.preview,
+            truncated: true,
+            savings,
+        };
+    }
     let disclosed_omission = inline_text_elision_disclosure(&result.preview);
     if tool_name == "process_exec"
         && result.truncated
@@ -1207,6 +1243,7 @@ pub struct DeferredToolResult {
     pub report: ChildReport,
     pub chip: ChipState,
     pub truncated: bool,
+    pub truncation: Option<haider_protocol::tool::ToolTruncation>,
 }
 
 /// Port for general tool execution. `request_input` remains actor-owned
@@ -5459,6 +5496,8 @@ impl HarnessActor {
                             let result = BoundedResult {
                                 preview,
                                 truncated: false,
+                                truncation: None,
+                                effects: Vec::new(),
                                 data: None,
                                 artifact: None,
                                 images: Vec::new(),
@@ -7677,6 +7716,8 @@ impl HarnessActor {
         let result = BoundedResult {
             preview: diagnostic.to_string(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: Some(haider_protocol::tool::ToolResultData::InvalidToolCall {
                 tool: tool.name.clone(),
                 message: error.message.clone(),
@@ -7749,6 +7790,8 @@ impl HarnessActor {
                 })
                 .to_string(),
                 truncated: false,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: Vec::new(),
@@ -7886,7 +7929,50 @@ impl HarnessActor {
                 let _ = dispatcher.cancel().await;
                 return Err(DriveError::Cancelled);
             };
-            let result = result.map_err(DriveError::Store)?;
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Some(effects) = error
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("applied_effects"))
+                        .and_then(|effects| {
+                            serde_json::from_value::<Vec<haider_protocol::tool::ToolFileEffect>>(
+                                effects.clone(),
+                            )
+                            .ok()
+                        })
+                        .filter(|effects| !effects.is_empty())
+                    {
+                        // The mutation already landed. Record its captured
+                        // effects while retaining the original fatal outcome;
+                        // normal error cleanup still closes the tool item.
+                        self.commit_payload(
+                            run_id,
+                            EventPayload::ToolResult {
+                                call_id: tool.call_id.clone(),
+                                result: BoundedResult {
+                                    preview: sanitized_failure_message(&error.message),
+                                    truncated: false,
+                                    truncation: None,
+                                    effects,
+                                    data: None,
+                                    artifact: None,
+                                    images: Vec::new(),
+                                    cursor: None,
+                                    status: ToolResultStatus::Failed,
+                                    reason: Some(sanitized_failure_message(&error.message)),
+                                    presentation: None,
+                                },
+                            },
+                            prompt_verbatim_render(),
+                        )
+                        .await
+                        .map_err(DriveError::Store)?;
+                    }
+                    return Err(DriveError::Store(error));
+                }
+            };
             match result {
                 ToolDispatchResult::Completed(result) => {
                     return Ok(GeneralToolOutcome::Completed(result));
@@ -8193,6 +8279,8 @@ impl HarnessActor {
                 BoundedResult {
                     preview: request.result_echo().to_string(),
                     truncated: false,
+                    truncation: None,
+                    effects: Vec::new(),
                     data: None,
                     artifact: None,
                     images: Vec::new(),
@@ -8212,6 +8300,8 @@ impl HarnessActor {
                 })
                 .to_string(),
                 truncated: false,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: Vec::new(),
@@ -8387,6 +8477,8 @@ impl HarnessActor {
         let bounded = BoundedResult {
             preview: result.clone(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -8527,6 +8619,8 @@ impl HarnessActor {
         let bounded = BoundedResult {
             preview: result.clone(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -8560,6 +8654,8 @@ impl HarnessActor {
         let bounded = tools[index].correct_result(BoundedResult {
             preview: result.clone(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -9048,6 +9144,8 @@ impl HarnessActor {
             let bounded = BoundedResult {
                 preview: result.clone(),
                 truncated: false,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: Vec::new(),
@@ -9136,11 +9234,12 @@ impl HarnessActor {
                             },
                             chip: ChipState::Error,
                             truncated: false,
+                            truncation: None,
                         },
                     };
                 }
             };
-            let result = BoundedResult {
+            let mut result = BoundedResult {
                 // The opaque id is operational routing, not display identity:
                 // a later `message_subagent` call must be able to name the
                 // direct child without guessing from task/callsign text.
@@ -9149,6 +9248,8 @@ impl HarnessActor {
                     completion.report.agent, completion.report.summary
                 ),
                 truncated: completion.truncated,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: Vec::new(),
@@ -9168,6 +9269,9 @@ impl HarnessActor {
                     )
                 }),
             };
+            if let Some(truncation) = completion.truncation {
+                result.declare_truncation(truncation);
+            }
             if !pending.report_emitted {
                 self.commit_payload(
                     run_id,
@@ -11421,8 +11525,9 @@ struct ToolAccumulator {
 impl ToolAccumulator {
     fn correct_result(&self, mut result: BoundedResult) -> BoundedResult {
         if let Some(requested) = &self.requested_name {
-            let mut preview = serde_json::from_str::<serde_json::Value>(&result.preview)
-                .unwrap_or_else(|_| serde_json::Value::String(result.preview.clone()));
+            let payload = result.payload_text();
+            let mut preview = serde_json::from_str::<serde_json::Value>(payload)
+                .unwrap_or_else(|_| serde_json::Value::String(payload.to_owned()));
             if !preview.is_object() {
                 preview = serde_json::json!({ "result": preview });
             }
@@ -11430,7 +11535,11 @@ impl ToolAccumulator {
                 "requested": requested,
                 "resolved": self.name,
             });
+            let truncation = result.truncation.take();
             result.preview = preview.to_string();
+            if let Some(truncation) = truncation {
+                result.declare_truncation(truncation);
+            }
         }
         result
     }
