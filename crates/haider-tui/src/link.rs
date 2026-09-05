@@ -706,6 +706,7 @@ pub struct CommandContext {
     /// the status-bar flash (owner bug: boot-time auto-refresh of a dead
     /// probe provider flashed `provider_error` at the launcher).
     models_provider: Option<String>,
+    custom_probe: Option<u64>,
     /// The `artifact.put` flight's client-side identity (B4b): the upload
     /// id and the ISSUING draft's surface key. The wire is receipt-free,
     /// so this context is the ONLY thing that can route the reply —
@@ -789,6 +790,10 @@ impl CommandContext {
                 _ => None,
             },
             oauth_attempt,
+            custom_probe: match command {
+                LiveCommand::ProbeCustomModels { attempt, .. } => Some(*attempt),
+                _ => None,
+            },
             models_provider: match command {
                 LiveCommand::RefreshProviderModels { provider } => Some(provider.clone()),
                 _ => None,
@@ -1675,6 +1680,20 @@ pub fn request_body_for_features(
         // command (report §4.4).
         // G4a: keyless presets carry `auth_requirement: none` — the only
         // identity difference from a keyed custom.
+        LiveCommand::ProbeCustomModels {
+            provider,
+            origin,
+            keyless,
+            family,
+            probe_vault_reference,
+            ..
+        } => RequestBody::ProviderModelsProbe {
+            provider,
+            origin,
+            keyless,
+            api_family: family,
+            probe_vault_reference,
+        },
         LiveCommand::ConfigureProvider {
             command_id,
             provider,
@@ -2458,6 +2477,21 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 }],
             }
         }
+        ResponseBody::ProviderModelsProbe {
+            provider,
+            models,
+            default_model,
+        } => context
+            .custom_probe
+            .map(|attempt| {
+                vec![LiveReply::CustomModelsProbed {
+                    attempt,
+                    provider,
+                    models,
+                    default_model,
+                }]
+            })
+            .unwrap_or_default(),
         ResponseBody::Error {
             code,
             message,
@@ -2465,6 +2499,19 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             data,
         } => context.attach.clone().map_or_else(
             || {
+                if let Some(attempt) = context.custom_probe {
+                    let failure = match data.as_ref() {
+                        Some(haider_rpc::ErrorData::ProviderProbeFailed { failure, .. }) => {
+                            *failure
+                        }
+                        _ => haider_rpc::ProviderProbeFailureWire::Unknown,
+                    };
+                    return vec![LiveReply::CustomModelsProbeFailed {
+                        attempt,
+                        failure,
+                        message: message.clone(),
+                    }];
+                }
                 if let Some(haider_rpc::ErrorData::ProviderProbeFailed { provider, failure }) =
                     data.as_ref()
                     && let Some(command_id) = context.command_id.clone()

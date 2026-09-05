@@ -1214,8 +1214,8 @@ pub use cache::{
 };
 pub use catalog::{
     CatalogError, CatalogSource, DiscoveredCatalog, DiscoveredModel, DiscoveredModelExtensions,
-    catalog_request_url, discover_models, discover_models_with_resolver,
-    openai_compatible_catalog_endpoint, parse_catalog, pickable,
+    catalog_request_url, compatible_model_id_is_display_safe, discover_models,
+    discover_models_with_resolver, openai_compatible_catalog_endpoint, parse_catalog, pickable,
 };
 pub use effort::{
     anthropic_default_effort, anthropic_effort_clamp, anthropic_fast_mode_supported,
@@ -1248,6 +1248,7 @@ pub use openai::{
     replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
     replay_openai_native_computer_sse, replay_openai_responses_sse, replay_xai_chat_sse,
     replay_xai_models_response, validate_openai_compatible_endpoint,
+    validate_openai_compatible_origin,
 };
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 pub use pricing::{

@@ -402,6 +402,12 @@
       "response_method": "status.snapshot",
       "request": {"method":"status.snapshot"},
       "response": {"method":"status.snapshot","session_count":365,"adoption_available":[{"source":"codex","email":"person@example.invalid"}],"daemon_pid":4242,"socket_path":"/tmp/haider-golden/h.sock","pid_file_path":"/tmp/haider-golden/haiderd.pid","ready":true,"ready_since":1753500000000,"providers_loaded":true}
+    },
+    {
+      "request_method": "provider.models_probe",
+      "response_method": "provider.models_probe",
+      "request": {"method":"provider.models_probe","provider":"local-models","origin":"http://127.0.0.1:8000/v1","api_family":"openai_chat_completions","keyless":false,"probe_vault_reference":"opaque-stage-reference"},
+      "response": {"method":"provider.models_probe","provider":"local-models","models":["server-default","other-model"],"default_model":"server-default"}
     }
   ]
 }

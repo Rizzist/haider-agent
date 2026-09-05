@@ -1887,6 +1887,7 @@ fn render_launcher(
 fn push_custom_card_lines<'a>(
     model: &'a AppModel,
     theme: &Theme,
+    width: u16,
     lines_out: &mut Vec<Line<'a>>,
     rects_out: &mut Vec<(usize, u16, u16, Hit)>,
 ) {
@@ -1894,6 +1895,9 @@ fn push_custom_card_lines<'a>(
         // G4b: the enterprise kinds retitle the SAME card and relabel its
         // fields; Generic stays byte-for-byte.
         let title = match card.kind {
+            crate::app::CustomCardKind::Generic if card.discover_models && card.edit => {
+                "edit custom server"
+            }
             crate::app::CustomCardKind::Generic if card.discover_models => {
                 "add custom server — local or web"
             }
@@ -1908,6 +1912,83 @@ fn push_custom_card_lines<'a>(
             Span::styled("◉ ", theme.gold_style()),
             Span::styled(title, theme.warn_style()),
         ]));
+        if let crate::app::CustomPhase::Choosing {
+            models,
+            selection,
+            error,
+        } = &card.phase
+        {
+            lines_out.push(Line::styled(
+                format!("  {} · {}", card.name, card.origin),
+                theme.dim_style(),
+            ));
+            if let Some(error) = error {
+                let available = usize::from(width.saturating_sub(2)).max(1);
+                if unicode_width::UnicodeWidthStr::width(error.as_str()) <= available {
+                    lines_out.push(Line::styled(format!("  {error}"), theme.warn_style()));
+                } else {
+                    // Keep the action intact when a typed transport/body
+                    // reason spans rows at the owner's narrow width.
+                    let reason = error.strip_suffix(" — type the model id").unwrap_or(error);
+                    for row in wrap_plain(reason, available) {
+                        lines_out.push(Line::styled(format!("  {row}"), theme.warn_style()));
+                    }
+                    lines_out.push(Line::styled("  type the model id", theme.warn_style()));
+                }
+            }
+            if models.is_empty() {
+                let prefix = "  model    ❯ ";
+                let byte = card
+                    .model
+                    .char_indices()
+                    .nth(card.cursor)
+                    .map_or(card.model.len(), |(byte, _)| byte);
+                rects_out.push((
+                    lines_out.len(),
+                    prefix.chars().count() as u16,
+                    u16::MAX,
+                    Hit::CustomProviderField {
+                        attempt: card.attempt,
+                        field: crate::app::CustomField::Model,
+                    },
+                ));
+                lines_out.push(Line::styled(
+                    format!("{prefix}{}▏{}", &card.model[..byte], &card.model[byte..]),
+                    theme.text_style(),
+                ));
+            } else {
+                lines_out.push(Line::styled(
+                    format!("  models · {} discovered", models.len()),
+                    theme.dim_style(),
+                ));
+                // Keep the selection visible even on the 80-column card.
+                let start = selection
+                    .saturating_sub(2)
+                    .min(models.len().saturating_sub(5));
+                for (index, id) in models.iter().enumerate().skip(start).take(5) {
+                    let selected = index == *selection;
+                    lines_out.push(Line::styled(
+                        format!("  {} {id}", if selected { "❯" } else { " " }),
+                        if selected {
+                            theme.gold_style()
+                        } else {
+                            theme.text_style()
+                        },
+                    ));
+                }
+            }
+            lines_out.push(Line::styled(
+                match (card.edit, models.is_empty()) {
+                    (true, true) => "  ⏎ save · tab connection · esc cancel",
+                    (false, true) => "  ⏎ create · tab connection · esc cancel",
+                    (true, false) => "  ⏎ save · ↑/↓ model · tab connection · esc cancel",
+                    (false, false) => "  ⏎ create · ↑/↓ model · tab connection · esc cancel",
+                },
+                theme.gold_style(),
+            ));
+            lines_out.push(Line::raw(""));
+            return;
+        }
         if model.mode.fabricates_locally() {
             for line in [
                 "  base URL + key — works with any OpenAI-compatible server",
@@ -1992,46 +2073,6 @@ fn push_custom_card_lines<'a>(
                 ));
             }
             if card.kind == CustomCardKind::Generic && card.discover_models {
-                let auth = if card.keyless { "no auth" } else { "API key" };
-                let family = if matches!(
-                    card.family,
-                    haider_rpc::ProviderApiFamilyWire::AnthropicMessages
-                ) {
-                    "anthropic"
-                } else {
-                    "openai"
-                };
-                for (label, value, field) in [
-                    ("auth    ", auth, crate::app::CustomField::Auth),
-                    ("API     ", family, crate::app::CustomField::ApiFamily),
-                ] {
-                    let prefix = format!("  {label} ❯ ");
-                    if editing {
-                        rects_out.push((
-                            lines_out.len(),
-                            u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX),
-                            u16::MAX,
-                            Hit::CustomProviderField {
-                                attempt: card.attempt,
-                                field,
-                            },
-                        ));
-                    }
-                    let marker = if editing && card.focus == field {
-                        "‹ "
-                    } else {
-                        ""
-                    };
-                    let end_marker = if editing && card.focus == field {
-                        " ›"
-                    } else {
-                        ""
-                    };
-                    lines_out.push(Line::styled(
-                        format!("{prefix}{marker}{value}{end_marker}"),
-                        theme.text_style(),
-                    ));
-                }
                 if !card.keyless {
                     const MASK_CAP: usize = 32;
                     let prefix = "  key      ❯ ";
@@ -2062,11 +2103,55 @@ fn push_custom_card_lines<'a>(
                         theme.text_style(),
                     ));
                 }
+                let auth = if card.keyless { "no auth" } else { "API key" };
+                let family = if matches!(
+                    card.family,
+                    haider_rpc::ProviderApiFamilyWire::AnthropicMessages
+                ) {
+                    "anthropic"
+                } else {
+                    "openai"
+                };
+                for (label, value, field) in [
+                    ("auth    ", auth, crate::app::CustomField::Auth),
+                    ("API     ", family, crate::app::CustomField::ApiFamily),
+                ] {
+                    let prefix = format!("  {label} ❯ ");
+                    if card.can_edit_field(field) {
+                        rects_out.push((
+                            lines_out.len(),
+                            u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX),
+                            u16::MAX,
+                            Hit::CustomProviderField {
+                                attempt: card.attempt,
+                                field,
+                            },
+                        ));
+                    }
+                    let marker = if card.can_edit_field(field) && card.focus == field {
+                        "‹ "
+                    } else {
+                        ""
+                    };
+                    let end_marker = if card.can_edit_field(field) && card.focus == field {
+                        " ›"
+                    } else {
+                        ""
+                    };
+                    lines_out.push(Line::styled(
+                        format!("{prefix}{marker}{value}{end_marker}"),
+                        theme.text_style(),
+                    ));
+                }
             }
             if editing {
                 let hint = match card.kind {
                     CustomCardKind::Generic if card.discover_models => {
-                        "  probes /v1/models now · key is masked and never printed"
+                        if card.edit {
+                            "  blank key reuses the saved key · ⏎ discovers models"
+                        } else {
+                            "  name → origin → API key → discover → model"
+                        }
                     }
                     CustomCardKind::Generic => {
                         if card.edit {
@@ -2088,7 +2173,7 @@ fn push_custom_card_lines<'a>(
                 lines_out.push(Line::styled(hint, theme.dim_style()));
                 lines_out.push(Line::styled(
                     if card.discover_models {
-                        "  ⏎ add and discover · tab field · ←/→ changes choices · esc cancel"
+                        "  ⏎ continue · tab field · ←/→ changes choices · esc cancel"
                     } else if card.edit {
                         "  ⏎ save · tab origin/model · esc cancel"
                     } else {
@@ -2098,7 +2183,11 @@ fn push_custom_card_lines<'a>(
                 ));
             } else {
                 lines_out.push(Line::styled(
-                    "  committing the provider…",
+                    if matches!(card.phase, crate::app::CustomPhase::Probing) {
+                        "  discovering models…"
+                    } else {
+                        "  committing the provider…"
+                    },
                     theme.pulse_ink(theme.gold, model.anim_phase),
                 ));
             }
@@ -2787,7 +2876,13 @@ fn render_accounts(
     // tui.js:3629-3682). Demo = the sim's verbatim fabrication card; live
     // = the editable name/origin fields (the provider.configure front
     // door).
-    push_custom_card_lines(model, theme, &mut footer_lines, &mut add_button_rects);
+    push_custom_card_lines(
+        model,
+        theme,
+        area.width,
+        &mut footer_lines,
+        &mut add_button_rects,
+    );
     // 970: the first-login disclosure is the safeguard that REPLACES a policy
     // gate, so it has to stay readable at 80 columns. Its total modality
     // already makes the add row dead while it is open, so the row yields to
@@ -2879,7 +2974,7 @@ fn render_providers(
             theme.dim_style(),
         ),
     ]));
-    push_custom_card_lines(model, theme, &mut lines, &mut chip_hits);
+    push_custom_card_lines(model, theme, area.width, &mut lines, &mut chip_hits);
     if let Some(message) = &model.providers.message {
         lines.push(Line::styled(message.clone(), theme.gold_style()));
     }

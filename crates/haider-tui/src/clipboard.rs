@@ -32,13 +32,15 @@ const CONFIRM_BOUND: Duration = Duration::from_millis(300);
 pub enum LocalClipboardWriter {
     Pbcopy,
     WindowsArboard,
+    Unavailable,
 }
 
-/// Keep the existing Unix behavior while selecting a real Windows writer.
+/// Keep the desktop writers while explicitly declining a local Android copy.
 #[must_use]
 pub fn local_writer_for_os(os: &str) -> LocalClipboardWriter {
     match os {
         "windows" => LocalClipboardWriter::WindowsArboard,
+        "android" => LocalClipboardWriter::Unavailable,
         _ => LocalClipboardWriter::Pbcopy,
     }
 }
@@ -49,10 +51,21 @@ pub fn local_writer_for_os(os: &str) -> LocalClipboardWriter {
 pub fn copy_local(text: &str) -> bool {
     match local_writer_for_os(std::env::consts::OS) {
         LocalClipboardWriter::Pbcopy => copy_pbcopy(text),
-        LocalClipboardWriter::WindowsArboard => arboard::Clipboard::new()
-            .and_then(|mut board| board.set_text(text))
-            .is_ok(),
+        LocalClipboardWriter::WindowsArboard => copy_arboard(text),
+        LocalClipboardWriter::Unavailable => false,
     }
+}
+
+#[cfg(all(feature = "desktop-clipboard", not(target_os = "android")))]
+fn copy_arboard(text: &str) -> bool {
+    arboard::Clipboard::new()
+        .and_then(|mut board| board.set_text(text))
+        .is_ok()
+}
+
+#[cfg(any(not(feature = "desktop-clipboard"), target_os = "android"))]
+const fn copy_arboard(_text: &str) -> bool {
+    false
 }
 
 /// Wording shared by the live copy effect and its tests. An OSC 52 mirror
@@ -183,11 +196,19 @@ pub enum ClipboardContent {
 /// A clipboard read that could not happen (no clipboard server, a locked
 /// Windows clipboard, an unreadable image). Always a NOTICE, never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClipboardError(pub String);
+pub enum ClipboardError {
+    /// The target or build has no native clipboard backend.
+    Unavailable,
+    /// A supported clipboard backend failed, or returned unusable data.
+    Unreadable(String),
+}
 
 impl std::fmt::Display for ClipboardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            Self::Unavailable => f.write_str("clipboard unavailable on this platform"),
+            Self::Unreadable(note) => f.write_str(note),
+        }
     }
 }
 
@@ -203,6 +224,7 @@ pub trait ClipboardSource {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OsClipboard;
 
+#[cfg(all(feature = "desktop-clipboard", not(target_os = "android")))]
 impl ClipboardSource for OsClipboard {
     fn read(&self) -> Result<ClipboardContent, ClipboardError> {
         match arboard::Clipboard::new() {
@@ -218,12 +240,12 @@ impl ClipboardSource for OsClipboard {
                     }
                     Err(error) => match wayland_fallback() {
                         Some(content) => content,
-                        None => return Err(ClipboardError(clipboard_note(&error))),
+                        None => return Err(ClipboardError::Unreadable(clipboard_note(&error))),
                     },
                 }),
                 Err(error) => match wayland_fallback() {
                     Some(content) => Ok(content),
-                    None => Err(ClipboardError(clipboard_note(&error))),
+                    None => Err(ClipboardError::Unreadable(clipboard_note(&error))),
                 },
             },
             // No clipboard connection at all — on Wayland this is the
@@ -231,13 +253,21 @@ impl ClipboardSource for OsClipboard {
             // to. Try the `wl-paste` route before calling it a failure.
             Err(error) => match wayland_fallback() {
                 Some(content) => Ok(content),
-                None => Err(ClipboardError(clipboard_note(&error))),
+                None => Err(ClipboardError::Unreadable(clipboard_note(&error))),
             },
         }
     }
 }
 
+#[cfg(any(not(feature = "desktop-clipboard"), target_os = "android"))]
+impl ClipboardSource for OsClipboard {
+    fn read(&self) -> Result<ClipboardContent, ClipboardError> {
+        Err(ClipboardError::Unavailable)
+    }
+}
+
 /// Short, honest wording for an arboard failure — never the raw Debug.
+#[cfg(all(feature = "desktop-clipboard", not(target_os = "android")))]
 fn clipboard_note(error: &arboard::Error) -> String {
     match error {
         arboard::Error::ContentNotAvailable => "the clipboard is empty".to_owned(),
@@ -259,16 +289,20 @@ fn encode_rgba_png(
     rgba: &[u8],
 ) -> Result<ClipboardImage, ClipboardError> {
     let (Ok(w), Ok(h)) = (u32::try_from(width), u32::try_from(height)) else {
-        return Err(ClipboardError("clipboard image is too large".to_owned()));
+        return Err(ClipboardError::Unreadable(
+            "clipboard image is too large".to_owned(),
+        ));
     };
     if w == 0 || h == 0 {
-        return Err(ClipboardError("clipboard image is empty".to_owned()));
+        return Err(ClipboardError::Unreadable(
+            "clipboard image is empty".to_owned(),
+        ));
     }
     let expected = (width)
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(4));
     if expected != Some(rgba.len()) {
-        return Err(ClipboardError(
+        return Err(ClipboardError::Unreadable(
             "clipboard image pixels are malformed".to_owned(),
         ));
     }
@@ -276,10 +310,10 @@ fn encode_rgba_png(
     let encoder = image::codecs::png::PngEncoder::new(&mut png);
     image::ImageEncoder::write_image(encoder, rgba, w, h, image::ExtendedColorType::Rgba8)
         .map_err(|error| {
-            ClipboardError(format!("clipboard image could not be encoded: {error}"))
+            ClipboardError::Unreadable(format!("clipboard image could not be encoded: {error}"))
         })?;
     if png.len() > MAX_CLIPBOARD_IMAGE_BYTES {
-        return Err(ClipboardError(format!(
+        return Err(ClipboardError::Unreadable(format!(
             "clipboard image is {} MB — the limit is {} MB",
             png.len() / (1024 * 1024),
             MAX_CLIPBOARD_IMAGE_BYTES / (1024 * 1024)
@@ -296,22 +330,23 @@ fn encode_rgba_png(
 /// nothing (see the module note). `None` on every other OS, and on Linux
 /// whenever the tool is missing or holds no image — the caller then reports
 /// the original clipboard failure rather than inventing one.
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "desktop-clipboard", target_os = "linux"))]
 fn wayland_fallback() -> Option<ClipboardContent> {
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        return None;
-    }
+    std::env::var_os("WAYLAND_DISPLAY")?;
     let png = wl_paste_png()?;
     encode_check_png(&png)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(
+    feature = "desktop-clipboard",
+    not(any(target_os = "linux", target_os = "android"))
+))]
 const fn wayland_fallback() -> Option<ClipboardContent> {
     None
 }
 
 /// `wl-paste --type image/png`, bounded. Returns the raw PNG bytes.
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "desktop-clipboard", target_os = "linux"))]
 fn wl_paste_png() -> Option<Vec<u8>> {
     use std::process::{Command, Stdio};
     let output = Command::new("wl-paste")
@@ -325,7 +360,7 @@ fn wl_paste_png() -> Option<Vec<u8>> {
 
 /// Accept already-PNG bytes from the shell route, verifying the header and
 /// the size bound rather than trusting the tool.
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "desktop-clipboard", target_os = "linux"))]
 fn encode_check_png(png: &[u8]) -> Option<ClipboardContent> {
     const MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
     if !png.starts_with(&MAGIC) || png.len() > MAX_CLIPBOARD_IMAGE_BYTES {
@@ -341,7 +376,7 @@ fn encode_check_png(png: &[u8]) -> Option<ClipboardContent> {
 
 /// A PNG's IHDR dimensions (bytes 16..24), so the chip can label the paste
 /// without decoding the whole image.
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "desktop-clipboard", target_os = "linux"))]
 fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
     let width = u32::from_be_bytes(png.get(16..20)?.try_into().ok()?);
     let height = u32::from_be_bytes(png.get(20..24)?.try_into().ok()?);
@@ -378,7 +413,7 @@ impl FakeClipboard {
 
     #[must_use]
     pub fn broken(note: &str) -> Self {
-        Self(Err(ClipboardError(note.to_owned())))
+        Self(Err(ClipboardError::Unreadable(note.to_owned())))
     }
 }
 

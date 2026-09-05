@@ -6,6 +6,14 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["desktop-clipboard"]
+desktop-clipboard = ["dep:arboard"]
+
+[[test]]
+name = "w970_winclip_windows_tests"
+required-features = ["desktop-clipboard"]
+
 [dependencies]
 haider-platform = { path = "../haider-platform" }
 haider-protocol = { path = "../haider-protocol" }
@@ -13,7 +21,6 @@ haider-rpc = { path = "../haider-rpc" }
 haider-client = { path = "../haider-client" }
 haider-stt = { path = "../haider-stt" }
 zeroize.workspace = true
-arboard.workspace = true
 base64.workspace = true
 ratatui.workspace = true
 serde.workspace = true
@@ -24,6 +31,11 @@ unicode-segmentation.workspace = true
 unicode-width.workspace = true
 ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Android Phase 1 builds the CLI/TUI too, but arboard has no Android backend.
+# Keep the desktop feature enabled by default without resolving arboard there.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = { workspace = true, optional = true }
 
 [dev-dependencies]
 haider-provider = { path = "../haider-provider" }

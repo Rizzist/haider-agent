@@ -62,8 +62,8 @@ pub use process::{
 };
 #[cfg(windows)]
 pub use process::{
-    WindowsProcessState, windows_command_interpreter, windows_powershell, windows_process_in_group,
-    windows_process_state,
+    WindowsProcessState, process_exists, windows_command_interpreter, windows_powershell,
+    windows_process_in_group, windows_process_state,
 };
 pub use reachability::{ROUTE_STATUS_CACHE_TTL, RouteStatus, route_status};
 pub use shutdown::{ShutdownInstallError, ShutdownSignal, ShutdownSignals, shutdown_signal};

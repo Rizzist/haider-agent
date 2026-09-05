@@ -1,5 +1,53 @@
 #![allow(clippy::expect_used)]
 
+#[cfg(windows)]
+#[test]
+fn process_exists_reports_current_process_and_rejects_zero() {
+    assert!(super::process_exists(std::process::id()));
+    assert!(!super::process_exists(0));
+}
+
+#[cfg(windows)]
+#[test]
+fn process_exists_rejects_exited_child_with_retained_handle() {
+    let mut child = std::process::Command::new(super::windows_command_interpreter())
+        .args(["/d", "/c", "exit /b 0"])
+        .spawn()
+        .expect("spawn immediate-exit child");
+    let pid = child.id();
+    assert!(child.wait().expect("reap child").success());
+    // `Child` still owns its Windows process handle: existence of the kernel
+    // object must not be confused with a process that remains running.
+    assert!(!super::process_exists(pid));
+    drop(child);
+}
+
+#[cfg(windows)]
+#[test]
+fn process_exists_mapping_rejects_missing_and_retains_query_errors() {
+    assert!(!super::windows_process_result_may_be_alive(Ok(None)));
+    assert!(!super::windows_process_result_may_be_alive(Ok(Some(
+        super::WindowsProcessState {
+            alive: false,
+            exit_code: Some(0),
+            in_any_job: false,
+        },
+    ))));
+    assert!(super::windows_process_result_may_be_alive(Ok(Some(
+        super::WindowsProcessState {
+            alive: true,
+            exit_code: None,
+            in_any_job: false,
+        },
+    ))));
+    assert!(!super::windows_process_result_may_be_alive(Err(
+        std::io::Error::from_raw_os_error(1168),
+    )));
+    assert!(super::windows_process_result_may_be_alive(Err(
+        std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+    )));
+}
+
 #[cfg(all(unix, not(target_os = "espidf")))]
 #[allow(unsafe_code)]
 fn assert_spawn_closes_inherited_descriptors(test_name: &str, descriptor_count: usize) {

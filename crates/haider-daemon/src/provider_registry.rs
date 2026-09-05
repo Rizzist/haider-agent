@@ -33,6 +33,12 @@ pub(crate) const COMPACTION_PROMOTION_ENV: &str = "HAIDER_COMPACTION_PROMOTION";
 #[async_trait::async_trait]
 pub trait ProviderEndpointValidator: Send + Sync {
     async fn validate(&self, origin: &str) -> Result<String, HaiderError>;
+
+    /// An explicitly chosen model inventory needs origin safety, not a
+    /// second availability probe. Injected validators retain their policy.
+    async fn validate_configured_origin(&self, origin: &str) -> Result<String, HaiderError> {
+        self.validate(origin).await
+    }
 }
 
 #[derive(Debug, Default)]
@@ -40,6 +46,24 @@ pub struct ProductionProviderEndpointValidator;
 
 #[async_trait::async_trait]
 impl ProviderEndpointValidator for ProductionProviderEndpointValidator {
+    async fn validate_configured_origin(&self, origin: &str) -> Result<String, HaiderError> {
+        haider_provider::validate_openai_compatible_origin(
+            origin,
+            haider_provider::CompatibleOriginPolicy::TrustedLan,
+        )
+        .await
+        .map_err(|error| {
+            let code = match error.kind {
+                ProviderErrorKind::InvalidRequest => ErrorCode::InvalidArgument,
+                ProviderErrorKind::NetworkUnavailable | ProviderErrorKind::Transport => {
+                    ErrorCode::ProviderError
+                }
+                _ => ErrorCode::Internal,
+            };
+            HaiderError::new(code, error.message, error.retryable)
+        })
+    }
+
     async fn validate(&self, origin: &str) -> Result<String, HaiderError> {
         // This validator runs for brand-new and repointed custom
         // `provider.configure` profiles, so both paths share the scoped

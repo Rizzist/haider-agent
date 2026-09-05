@@ -82,21 +82,46 @@ fn staged_configure(driver: &mut LiveDriver, model: &mut AppModel, secret: &str)
             _ => None,
         })
         .expect("credential stage issued");
-    live_pass(
+    let probing = live_pass(
         driver,
         model,
         Some(LiveReply::Staged {
             vault_reference: "vault-ref-custom-test".to_owned(),
-            provider,
+            provider: provider.clone(),
             alias,
             attempt,
         }),
         now,
-    )
-    .commands
-    .into_iter()
-    .find(|command| matches!(command, LiveCommand::ConfigureProvider { .. }))
-    .expect("configure issued after stage")
+    );
+    assert!(
+        probing
+            .commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::ProbeCustomModels { .. }))
+    );
+    assert!(
+        !probing
+            .commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::ConfigureProvider { .. }))
+    );
+    live_pass(
+        driver,
+        model,
+        Some(LiveReply::CustomModelsProbed {
+            attempt,
+            provider,
+            models: vec!["llama3.1:8b".to_owned()],
+            default_model: None,
+        }),
+        now,
+    );
+    key(model, KeyCode::Enter);
+    live_pass(driver, model, None, now)
+        .commands
+        .into_iter()
+        .find(|command| matches!(command, LiveCommand::ConfigureProvider { .. }))
+        .expect("configure issued after accepting the discovered model")
 }
 
 /// MUTATION CHECK (W5g-4): make the demo `[1]` land a row under the BARE
@@ -175,7 +200,7 @@ fn the_live_card_edits_and_submits_under_the_snapshot_revision() {
             LiveCommand::ConfigureProvider { provider, origin, model, expected_revision, .. }
                 if provider == "custom-llama"
                     && origin == "http://127.0.0.1:11434/v1"
-                    && model.is_empty()
+                    && model == "llama3.1:8b"
                     && expected_revision == 7
         ),
         "the configure rides the edited fields under the snapshot revision"
