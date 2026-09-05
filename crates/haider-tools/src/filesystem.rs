@@ -4841,6 +4841,15 @@ fn apply_windows_edit(
                 path: operation.path.clone(),
                 matches,
                 replace_all: edit.replace_all,
+                nearest_candidate: (matches == 0)
+                    .then(|| {
+                        crate::filesystem_edit_diagnostic::nearest_anchor_candidate(
+                            &operation.path,
+                            &edited,
+                            &edit.old,
+                        )
+                    })
+                    .flatten(),
             }));
         }
         edited = if edit.replace_all {
@@ -6551,6 +6560,15 @@ fn apply_edit_at_with_commit_hooks(
                 path: operation.path.clone(),
                 matches,
                 replace_all: edit.replace_all,
+                nearest_candidate: (matches == 0)
+                    .then(|| {
+                        crate::filesystem_edit_diagnostic::nearest_anchor_candidate(
+                            &operation.path,
+                            &edited,
+                            &edit.old,
+                        )
+                    })
+                    .flatten(),
             }));
         }
         edited = if edit.replace_all {

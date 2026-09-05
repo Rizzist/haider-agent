@@ -163,25 +163,10 @@ async fn always_allow_is_bound_to_class_and_exact_argument_digest() {
 }
 
 #[tokio::test]
-async fn unresolved_ask_denial_is_lower_priority_than_grants_but_not_true_denies() {
+async fn explicit_deny_is_higher_priority_than_session_grants() {
     let mut broker = broker_at(RecordingJournal::default(), source_root(), 1);
     let mut policy = PermissionPolicy::default();
     policy.ask(EffectClass::FsRead);
-    policy.deny_unresolved_asks("no_human_available");
-
-    let unresolved = broker
-        .normalize(&FsRead::new("src/lib.rs"))
-        .await
-        .expect("normalize unresolved read");
-    assert_eq!(
-        broker
-            .authorize(&unresolved, &policy)
-            .await
-            .expect("authorize unresolved read"),
-        AuthorizationVerdict::Deny {
-            reason: "no_human_available".into(),
-        }
-    );
 
     policy
         .allow_for_session(EffectClass::FsRead)
@@ -212,6 +197,91 @@ async fn unresolved_ask_denial_is_lower_priority_than_grants_but_not_true_denies
             reason: "explicit deny wins".into(),
         }
     );
+}
+
+#[tokio::test]
+async fn autonomous_ask_promotion_allows_residual_classes_but_never_explicit_deny() {
+    let mut broker = broker_at(RecordingJournal::default(), source_root(), 1);
+    let mut policy = PermissionPolicy::default();
+    policy.auto_allow_asks();
+
+    let allowed = broker
+        .normalize(&FsRead::new("src/lib.rs"))
+        .await
+        .expect("normalize residual Ask");
+    assert_eq!(
+        broker
+            .authorize(&allowed, &policy)
+            .await
+            .expect("autonomous residual authorization"),
+        AuthorizationVerdict::Allow
+    );
+
+    policy.deny(EffectClass::FsRead, "explicit read deny");
+    let denied = broker
+        .normalize(&FsRead::new("src/broker.rs"))
+        .await
+        .expect("normalize explicit deny");
+    assert_eq!(
+        broker
+            .authorize(&denied, &policy)
+            .await
+            .expect("explicit denial remains a verdict"),
+        AuthorizationVerdict::Deny {
+            reason: "explicit read deny".into(),
+        }
+    );
+}
+
+/// A first-committed one-shot rejection is explicit user policy for the exact
+/// effect shape. Autonomous fallback must not turn that durable `RejectOnce`
+/// into Allow during live retry or recovery.
+#[tokio::test]
+async fn autonomous_fallback_honors_exact_one_shot_user_rejection() {
+    let mut broker = broker_at(RecordingJournal::default(), source_root(), 1);
+    let mut policy = PermissionPolicy::default();
+    let operation = FsRead::new("src/lib.rs");
+    let asked = broker
+        .normalize(&operation)
+        .await
+        .expect("normalize initial operation");
+    let AuthorizationVerdict::Ask { menu } = broker
+        .authorize(&asked, &policy)
+        .await
+        .expect("initial operation asks")
+    else {
+        panic!("default policy must ask");
+    };
+    broker
+        .resolve_permission(
+            &MenuAnswer {
+                menu,
+                option_key: Some("deny".into()),
+                option_index: 2,
+                value: None,
+                via: AnswerVia::Rpc,
+            },
+            &mut policy,
+        )
+        .expect("commit exact one-shot rejection");
+    policy.auto_allow_asks();
+
+    let retried = broker
+        .normalize(&operation)
+        .await
+        .expect("normalize exact retry");
+    assert_eq!(
+        broker
+            .authorize(&retried, &policy)
+            .await
+            .expect("authorize exact retry"),
+        AuthorizationVerdict::Deny {
+            reason: "rejected once by user".into(),
+        }
+    );
+    assert!(!effect_phases(&broker).iter().any(|phase| {
+        matches!(phase, EffectPhase::Dispatched { effect } if effect == &retried.effect)
+    }));
 }
 
 #[tokio::test]

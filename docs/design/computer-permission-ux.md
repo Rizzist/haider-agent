@@ -1,7 +1,10 @@
 # Computer permission UX seam
 
 This backend surface keeps Haider authorization and operating-system
-authorization separate. It does not change the global default-deny policy.
+authorization separate. Interactive sessions retain the per-effect Ask path;
+Autonomous sessions resolve Haider's Ask to ordinary Allow. Neither mode can
+fabricate an operating-system permission, and explicit deny, `--read-only`,
+and lockdown rules still win.
 
 ## Explicit computer-use consent
 

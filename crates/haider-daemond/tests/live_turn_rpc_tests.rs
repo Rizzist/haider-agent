@@ -5531,6 +5531,8 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
             "fs_search",
             "fs_write",
             "fs_edit",
+            "write",
+            "edit",
             "fs_path",
             "process_exec",
             "spawn_subagent",
@@ -7133,6 +7135,7 @@ async fn session_create_permission_overrides_are_digest_bound_and_persisted() {
     )
     .await;
     let expected = SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: true,
         allow_exec: false,
         allow_mobile: false,

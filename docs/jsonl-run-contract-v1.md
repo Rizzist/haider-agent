@@ -95,6 +95,30 @@ and optional `previous_path` (present on current producers, absent on legacy
 facts). Both payload kinds are additive and must be preserved by raw-envelope
 readers.
 
+## Autonomous permissions and explicit denials
+
+`haider run` creates an autonomous session. All Haider permission-policy Ask
+defaults resolve to ordinary journaled `Allow`, including workspace writes and
+process execution; no allow flag is required. Explicit user deny rules and
+provider-lockdown hard denies retain precedence, and workspace containment is
+unchanged.
+
+An explicit brokered-effect deny produces an `effect` / `authorized` envelope with
+`verdict == "deny"` and its stable reason, followed by a typed rejected
+`tool_result` that the model can read. The aggregate JSON result also includes
+that reason in `permission_denials`; it is never synthesized from a menu label.
+For a direct filesystem write under `--read-only`, the exact reason is `write
+denied: run is --read-only`. The option also denies local/remote process, Git,
+desktop-control, and peer-message effects that could write indirectly, using
+route-specific reasons. The client first requires the additive
+`session_read_only_v1` feature so an older daemon cannot silently ignore this
+explicit deny. After the model observes such a typed refusal, the terminal is
+`failure` with `error_code == "permission_denied"` and the same reason.
+The plan-gated `loom_register` route has no effect class; read-only therefore
+rejects it directly with a typed `tool_result` and the exact terminal reason
+`registry mutation denied: run is --read-only`, before any registry CAS or
+installer job exists.
+
 ## Exactly one typed terminal
 
 An attached run ends with exactly one terminal envelope. It is still the

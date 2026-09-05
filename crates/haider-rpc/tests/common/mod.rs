@@ -1028,6 +1028,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 model: "claude-test".into(),
                 max_tokens: 4096,
                 permission_overrides: Some(SessionPermissionOverridesV1 {
+                    read_only: false,
                     allow_writes: true,
                     allow_exec: true,
                     allow_mobile: false,

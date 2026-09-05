@@ -19,6 +19,8 @@ pub struct FsEditAnchorMismatch {
     pub path: PathBuf,
     pub matches: usize,
     pub replace_all: bool,
+    /// Bounded, informational suggestion; never used to apply a replacement.
+    pub nearest_candidate: Option<String>,
 }
 
 /// Typed failures at the tool boundary.
@@ -180,17 +182,36 @@ impl std::fmt::Display for ToolError {
                 "refusing to mutate stale file {}; re-read before editing",
                 path.display()
             ),
-            Self::EditAnchor(conflict) if conflict.replace_all && conflict.matches == 0 => write!(
-                formatter,
-                "edit anchor for {} matched 0 locations; replace_all requires at least one match",
-                conflict.path.display()
-            ),
-            Self::EditAnchor(conflict) => write!(
-                formatter,
-                "edit anchor for {} matched {} locations; expected exactly 1",
-                conflict.path.display(),
-                conflict.matches
-            ),
+            Self::EditAnchor(conflict) => {
+                write!(
+                    formatter,
+                    "edit anchor for {} matched {} locations; ",
+                    conflict.path.display(),
+                    conflict.matches
+                )?;
+                if conflict.replace_all {
+                    write!(formatter, "replace_all requires at least one match")?;
+                } else {
+                    write!(formatter, "expected exactly 1")?;
+                }
+                if conflict.matches == 0 {
+                    write!(
+                        formatter,
+                        "; no exact byte-for-byte match (including whitespace)"
+                    )?;
+                    if let Some(candidate) = &conflict.nearest_candidate {
+                        write!(formatter, "; {candidate}")?;
+                    } else {
+                        write!(formatter, "; file is empty, so no nearest candidate exists")?;
+                    }
+                } else {
+                    write!(
+                        formatter,
+                        "; include more surrounding text or explicitly use replace_all"
+                    )?;
+                }
+                Ok(())
+            }
             Self::Io {
                 operation,
                 path,
