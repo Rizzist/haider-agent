@@ -1287,11 +1287,12 @@ async fn observe_process_leader_exit_with_pidfd(pid: ProcessId) -> std::io::Resu
 }
 
 #[cfg(target_os = "macos")]
+const NOTIFICATION_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(target_os = "macos")]
 async fn observe_process_leader_exit_with_kqueue(pid: ProcessId) -> std::io::Result<bool> {
     use nix::libc::timespec;
     use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
-
-    const NOTIFICATION_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
     // A leader can become waitable between the caller's probe and kqueue
     // registration. Probe immediately before arming so an already-reaped
