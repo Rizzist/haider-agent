@@ -3536,7 +3536,6 @@ impl HarnessActor {
                                 .commit_pending_thinking(&run_id, &mut thinking_pending)
                                 .await
                             {
-<<<<<<< HEAD
                                 return self
                                     .errored_outcome_with_items(
                                         &run_id,
@@ -3546,9 +3545,6 @@ impl HarnessActor {
                                         error,
                                     )
                                     .await;
-=======
-                                return self.errored_state_outcome(&run_id, error).await;
->>>>>>> origin/wave-970
                             }
                             if let Err(error) = self
                                 .commit_payload(
@@ -3558,7 +3554,6 @@ impl HarnessActor {
                                 )
                                 .await
                             {
-<<<<<<< HEAD
                                 return self
                                     .errored_outcome_with_items(
                                         &run_id,
@@ -3568,9 +3563,6 @@ impl HarnessActor {
                                         error,
                                     )
                                     .await;
-=======
-                                return self.errored_state_outcome(&run_id, error).await;
->>>>>>> origin/wave-970
                             }
                             rotation_budget_consumed = true;
                         }
@@ -3607,7 +3599,6 @@ impl HarnessActor {
                         cache_rewarm_pending = Some(CacheRewarmReasonV1::ConfigurationChange);
                     }
                     Ok(None) => {}
-<<<<<<< HEAD
                     Err(error) => {
                         // A recovered or reconnected response can still own
                         // open items here. Close them under their original
@@ -3622,9 +3613,6 @@ impl HarnessActor {
                             )
                             .await;
                     }
-=======
-                    Err(error) => return self.errored_state_outcome(&run_id, error).await,
->>>>>>> origin/wave-970
                 }
             }
             if provider_attempt == 0 {

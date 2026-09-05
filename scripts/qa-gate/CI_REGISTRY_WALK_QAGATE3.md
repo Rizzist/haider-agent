@@ -304,7 +304,6 @@ Scope: the uncommitted `session_provider.rs` initializer correction and two
 - #92 checked — build-capable commands record disk headroom; the gate retains failures and missing-executable diagnostics in its raw log.
 - #93 checked: none — no class #93 is defined in the supplied registry.
 - #94-#96 checked: none — no deadline, negotiated-connection wait, provider durability boundary, or performance policy changed. Windows/Linux behavior is by inspection; gates here run on macOS arm64.
-<<<<<<< HEAD
 
 ## journalview continuation, merged through 38359fd3
 
@@ -327,5 +326,3 @@ Scope: the uncommitted `session_provider.rs` initializer correction and two
 - #93: no class #93 is defined in the supplied registry.
 - #94/#95 checked: no new product deadline or negotiated-connection wait; the regression adds no timeout.
 - #96 checked: no latency or benchmark-score claim. macOS execution only; Linux/Windows behavior is by inspection. AHRB scoped credit remains undeclared until its owner maps the checker units; the supplied TOML declares announced-only support.
-=======
->>>>>>> origin/wave-970

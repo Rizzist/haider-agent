@@ -21,7 +21,6 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
-<<<<<<< HEAD
 ### v0.0.970 — durable narrative correlation and compaction announcement
 
 A primary emitted Finish with separate post-stream commits adds a prompt-omitted
@@ -85,9 +84,6 @@ live JSONL, and replay. `provider_rounds` is derived container metadata computed
 by the same reducer for live JSON and replay. Optional metadata is never added
 by a stream serializer. Prompt replay ignores these metadata keys and the
 prompt-omitted announcement; provider input semantics stay unchanged.
-
-=======
->>>>>>> origin/wave-970
 ### v0.0.970 — per-session provider rebind
 
 New supplemental kind: `session_config:session_provider_rebound`. The
