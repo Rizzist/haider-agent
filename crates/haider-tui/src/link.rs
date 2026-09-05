@@ -972,6 +972,7 @@ pub fn request_body_for_features(
             // "controlling your screen" banner still shows.
             permission_overrides: Some(
                 haider_rpc::haider_protocol::session::SessionPermissionOverridesV1 {
+                    read_only: false,
                     allow_writes: true,
                     allow_exec: true,
                     allow_mobile: false,

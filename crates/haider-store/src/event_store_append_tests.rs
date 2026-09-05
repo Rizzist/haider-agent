@@ -167,13 +167,19 @@ fn permission_blocker_codes_mirror_the_headless_reducer() {
     record_headless_menu(&mut unavailable, &permission);
     assert_eq!(
         unavailable.blocking_error_code,
-        Some("permission_reject_unavailable")
+        Some("permission_allow_unavailable")
     );
 
     let mut conflict = DurableHeadlessRunFacts {
         configured: true,
         ..DurableHeadlessRunFacts::default()
     };
+    permission.options.push(haider_protocol::menu::MenuOption {
+        key: "allow_once".into(),
+        label: "Allow".into(),
+        detail: None,
+        decision: Some(DecisionKind::AllowOnce),
+    });
     permission.options.push(haider_protocol::menu::MenuOption {
         key: "reject_once".into(),
         label: "Reject".into(),

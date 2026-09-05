@@ -248,6 +248,7 @@ impl WebWorld {
             model: model.into(),
             max_tokens: 4096,
             permission_overrides: Some(SessionPermissionOverridesV1 {
+                read_only: false,
                 allow_writes: false,
                 allow_exec: true,
                 allow_mobile: false,

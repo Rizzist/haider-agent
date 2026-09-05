@@ -567,19 +567,24 @@ impl DelegationHandle {
         };
         manifest.placement.ensure_local()?;
         // Delegated request_input is answered through the projected parent
-        // menu, so the child must retain the ordinary Interactive wait until
-        // that durable answer is forwarded. Writes and exec remain
-        // pre-allowed through the W9b override seam (journaled as ordinary
-        // policy `Allow`); spawning a child is itself the standing permission.
+        // menu, so the child retains the ordinary Interactive wait until that
+        // durable answer is forwarded. A headless parent's Autonomous rule is
+        // projected separately into the child's permission-only override;
+        // explicit grant ceilings still bound reachable tool authority.
         let child_overrides = Some(haider_protocol::session::SessionPermissionOverridesV1 {
+            read_only: coordinates
+                .metadata
+                .permission_overrides
+                .is_some_and(|overrides| overrides.read_only),
             allow_writes: crate::worker::effect_within_grant(&grant, &EffectClass::FsWrite),
             allow_exec: crate::worker::effect_within_grant(&grant, &EffectClass::ProcessExec),
             allow_mobile: false,
-            // A child's pre-allow is bounded per-class by its grant ceiling, so
-            // it never gets the blanket auto-allow flip: computer/screen access
-            // for a subagent must flow deliberately through the grant, not ride
-            // in on the parent's auto-allow mode.
-            auto_allow: false,
+            auto_allow: coordinates.metadata.interaction_mode
+                == haider_protocol::session::SessionInteractionModeV1::Autonomous
+                || coordinates
+                    .metadata
+                    .permission_overrides
+                    .is_some_and(|overrides| overrides.auto_allow),
         });
         let child_interaction_mode =
             haider_protocol::session::SessionInteractionModeV1::Interactive;

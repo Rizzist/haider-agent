@@ -13,11 +13,11 @@ the provider tail and the transcript.
 kind, and workspace. It returns the live peer descriptors.
 
 `peer_send` accepts `to`, `message`, and an optional `summary`. It sends data
-outside the current session, so its permission default is **Ask** under the
-dedicated peer-message effect class. An explicit session-wide auto-allow
-policy may lift Ask in the same way as other brokered effects; the effect is
-still journaled. The permission preview names the peer and includes bounded
-message/summary text.
+outside the current session, so its interactive permission default is **Ask**
+under the dedicated peer-message effect class. Autonomous sessions resolve
+that Ask to ordinary journaled Allow. `--read-only` explicitly denies the
+route so work cannot be delegated to an independently writable peer. The
+permission preview names the peer and includes bounded message/summary text.
 
 Tool-result storage follows the raw-record law: the durable journal retains
 the complete tool result. Provider adapters may compact only the copy sent to

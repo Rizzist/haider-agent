@@ -1,0 +1,13 @@
+{
+  "command": "cargo test -q --workspace --no-fail-fast",
+  "exit": 0,
+  "result_summaries": 329,
+  "aggregate_reported_harness_results": {
+    "passed": 5206,
+    "failed": 0,
+    "ignored": 13,
+    "measured": 0,
+    "filtered_out": 1376
+  },
+  "note": "Includes nested subprocess harness result lines and doctests; distinct source test count is 4799."
+}

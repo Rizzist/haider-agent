@@ -7135,6 +7135,7 @@ async fn session_create_permission_overrides_are_digest_bound_and_persisted() {
     )
     .await;
     let expected = SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: true,
         allow_exec: false,
         allow_mobile: false,

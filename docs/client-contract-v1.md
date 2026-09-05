@@ -243,8 +243,8 @@ An operation not listed here is part of the v1 base surface. “Field” means t
 client may use that field only when it is present; the named token permits an
 affordance before the response exists.
 
-The ordinary v0.0.969 `welcome_features()` set contains all 101 tokens below.
-The re-verification anchors are the `welcome_features()` function in
+The current `welcome_features()` set contains the tokens below. The
+re-verification anchors are the `welcome_features()` function in
 `crates/haider-daemon/src/connection.rs` and the `FEATURE_*` constant block in
 `crates/haider-rpc/src/frame.rs`. The one peer-specific withholding exception
 is §4.1.
@@ -253,6 +253,7 @@ is §4.1.
 |---|---|
 | `session_mutation_v1` | `session.create` and typed create metadata |
 | `session_permission_overrides_v1` | `session.create.permission_overrides` and metadata permission overrides |
+| `session_read_only_v1` | the additive `SessionPermissionOverridesV1.read_only` deny and its complete daemon enforcement |
 | `autonomous_interaction_v1` | `session.create.interaction_mode` and `SessionMetadataV1.interaction_mode` |
 | `turn_control_v1` | `turn.submit`, `turn.cancel` |
 | `headless_run_v1` | `headless.run.start`, `headless.run.status`, `headless.run.stop`, durable `HeadlessRunConfigured`, and typed replay divergence reports |
@@ -1639,6 +1640,13 @@ Those owning surfaces retain their own base/feature gates;
 `autonomous_interaction_v1` gates this metadata member wherever typed metadata
 is present.
 
+`session_read_only_v1` separately gates a true
+`SessionPermissionOverridesV1.read_only`. A headless client requesting
+read-only MUST require both this token and `session_permission_overrides_v1`
+before `session.create`; otherwise an older daemon could ignore the additive
+deny while accepting legacy allow fields. Missing negotiation fails before
+session mutation rather than degrading to a writable run.
+
 The create dispatcher passes the decoded value to the producer, which stores
 it in durable `SessionMetadataV1` and returns that metadata in the success
 response (`crates/haider-daemon/src/session_hub/rpc.rs:1975-2005,8925-8977,9077-9110`
@@ -1656,8 +1664,11 @@ feature is advertised, an omitted request field creates an interactive
 session and an omitted `interaction_mode` inside present `SessionMetadataV1`
 means interactive. If the outer metadata is absent, the mode is unknown.
 
-The mode is a human-availability contract, not a permission grant. The exact
-autonomous resolutions in
+The mode is the durable human-availability contract. For Haider's permission
+broker it is also decisive: an `Ask` has meaning only when a human is available,
+so autonomous mode resolves an Ask to ordinary policy `Allow`. This is not
+`PreAuthorized(UserTyped)`, does not erase an explicit deny, and does not lift
+provider lockdown or workspace containment. The exact autonomous resolutions in
 `crates/haider-protocol/src/interaction.rs:5-94` are:
 
 | Gate | Autonomous resolution |
@@ -1667,7 +1678,8 @@ autonomous resolutions in
 | `InteractionGate::PartialProviderStream` | `InteractionResolution::ContinuePartial` |
 | `InteractionGate::WorkflowUnfinishedFirst` | `InteractionResolution::ContinueWorkflow` |
 | `InteractionGate::WorkflowUnfinishedRecurrence` | `InteractionResolution::ReturnWorkflowUnfinished` for recurrence of the same durable `(run_id, workflow-state digest)` |
-| `InteractionGate::EffectBrokerAsk`, `InteractionGate::OsOrDesktopPermission`, `InteractionGate::CredentialOrLogin`, `InteractionGate::MobileOrDeviceGrant`, `InteractionGate::GraphHumanConfirm`, `InteractionGate::UnknownEffectAfterCrash`, `InteractionGate::DestructiveOrClobber`, or `InteractionGate::CacheEpochOrConfiguration` | `InteractionResolution::FailClosed` |
+| `InteractionGate::EffectBrokerAsk`, `InteractionGate::MobileOrDeviceGrant` | `InteractionResolution::AutoApprove` |
+| `InteractionGate::OsOrDesktopPermission`, `InteractionGate::CredentialOrLogin`, `InteractionGate::GraphHumanConfirm`, `InteractionGate::UnknownEffectAfterCrash`, `InteractionGate::DestructiveOrClobber`, or `InteractionGate::CacheEpochOrConfiguration` | `InteractionResolution::FailClosed`; these are external prerequisites, ambiguous recovery/finalization states, or reserved gates—not Haider Ask-policy permission decisions |
 
 `ReturnNoHumanAvailable` commits the typed tool code
 `"no_human_available"` in `HarnessActor::run_turn`, and
@@ -1682,8 +1694,38 @@ rebinds the active typed node and exact CAS inputs at each logical provider
 request. Repeating the same digest remains fail-closed because the journal
 cannot distinguish no progress from an ambiguous crash/replay at that point.
 
-In particular, autonomous mode MUST NOT be rendered as auto-approval. Durable
-permission overrides remain a separate field and authority. Without
+Every registered tool effect whose interactive default is `Ask` is promoted to
+ordinary `Allow` before dispatch in an autonomous session. The broker still
+journals `Intent` then `Authorized(Allow)` before `Dispatched`. Specialized
+routes—including filesystem mutation, local and remote process execution,
+web/network access, computer/mobile actions, monitor commands, subagent spawn,
+and peer send—use that same policy. A compatibility safety net in the reusable
+headless client answers `AllowOnce` if an older daemon nevertheless publishes a
+Haider permission menu; it never converts that menu into `RejectOnce`.
+
+An explicit `AuthorizationVerdict::Deny` remains a typed, model-readable tool
+result whose denial notice preserves the rule's reason. `haider run
+--read-only` durably denies filesystem mutation plus local/remote process,
+Git, desktop-control, and peer-message effects that could write the workspace
+indirectly; matching automatic hooks are suppressed with a typed `HookNotice`, and Loom
+registry mutation cannot enqueue an installer. The exact
+direct-write reason is `write denied: run is --read-only`. The model sees a
+requested effect's specific result, and a later attempted successful finish
+becomes a `permission_denied` terminal naming the same rule. Provider
+lockdown remains a daemon hard deny with higher priority than allows. An OS
+TCC grant is outside Haider's permission broker: autonomous mode does not
+pretend the operating system granted it and does not open an unanswerable
+settings menu. Similarly, missing credentials, unresolved crash outcomes, and
+workflow-confirmation recurrence retain their existing typed non-permission
+failure behavior.
+
+Delegated children retain interactive mode so an explicit `request_input` can
+be projected to and answered by the parent. Delegation separately projects an
+Autonomous parent's permission-only auto-allow rule into the child and inherits
+the explicit read-only restriction. The child's declared capability grant
+remains a separate hard ceiling, so this projection cannot widen its tool pack.
+
+Without
 `autonomous_interaction_v1`, a client MUST omit `interaction_mode`, MUST NOT
 offer autonomous creation, and may use only the base interactive create
 behavior. Sending `"autonomous"` to a daemon that did not advertise the bit is
@@ -2713,6 +2755,16 @@ turn/tool/usage schema: tool calls, bounded typed tool results, normalized
 usage, cache reads, cache writes, terminal causes, and unknown future event
 payloads retain their protocol shapes. Stable field order plus journal order
 makes repeated serialization of the same session byte-stable.
+
+An unflagged autonomous run resolves all Haider permission-policy Ask defaults
+to ordinary `Allow`, including workspace write/edit and process execution.
+`--allow-writes`, `--allow-exec`, and `--auto-allow` remain accepted for
+backward CLI compatibility but are not the source of the autonomous default.
+`--read-only` is the explicit no-workspace-write policy: it denies direct
+filesystem mutation and write-capable process, Git, desktop-control,
+peer-message, and automatic-hook routes, and takes precedence over those
+compatibility flags. Loom registry/installer mutation is denied by the same
+explicit policy.
 
 `headless.run.start` commits `Queued`, the exact `UserMessage`, and
 `HeadlessRunConfigured` in the same receipt transaction. The configuration

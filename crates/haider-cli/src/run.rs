@@ -72,6 +72,7 @@ pub(crate) struct RunOptions {
     pub action: RunAction,
     pub output: RunOutput,
     pub timeout: Option<Duration>,
+    pub read_only: bool,
     pub allow_writes: bool,
     pub allow_exec: bool,
     pub auto_allow: bool,
@@ -108,9 +109,18 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
     let mut legacy_jsonl = false;
     let mut json = false;
     let mut timeout = None;
-    let mut allow_writes = false;
-    let mut allow_exec = false;
-    let mut auto_allow = false;
+    // Autonomous runs never wait on an Ask permission. These legacy flags
+    // remain accepted no-op compatibility inputs. Their true projection
+    // mirrors the public run default, but durable interaction mode is the
+    // daemon-side authority that promotes every Ask class, including future
+    // classes these legacy booleans do not name.
+    let allow_writes = true;
+    let allow_exec = true;
+    let auto_allow = true;
+    let mut read_only = false;
+    let mut allow_writes_seen = false;
+    let mut allow_exec_seen = false;
+    let mut auto_allow_seen = false;
     let mut trust_hooks = false;
     let mut provider = None;
     let mut model = None;
@@ -252,13 +262,19 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
                 timeout = Some(parse_timeout(value)?);
             }
             "--timeout" => return Err("duplicate --timeout flag".into()),
-            "--allow-writes" if !allow_writes => allow_writes = true,
+            "--read-only" if !read_only => read_only = true,
+            "--read-only" => return Err("duplicate --read-only flag".into()),
+            "--allow-writes" if !allow_writes_seen => {
+                allow_writes_seen = true;
+            }
             "--allow-writes" => return Err("duplicate --allow-writes flag".into()),
-            "--allow-exec" if !allow_exec => allow_exec = true,
+            "--allow-exec" if !allow_exec_seen => {
+                allow_exec_seen = true;
+            }
             "--allow-exec" => return Err("duplicate --allow-exec flag".into()),
-            // Full auto-allow (Codex --full-auto analogue): every effect class
-            // resolves to Allow, including computer control and web fetch.
-            "--auto-allow" if !auto_allow => auto_allow = true,
+            "--auto-allow" if !auto_allow_seen => {
+                auto_allow_seen = true;
+            }
             "--auto-allow" => return Err("duplicate --auto-allow flag".into()),
             "--trust-hooks" if !trust_hooks => trust_hooks = true,
             "--trust-hooks" => return Err("duplicate --trust-hooks flag".into()),
@@ -358,15 +374,19 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
         return Err("--resume cannot be combined with another lifecycle action".into());
     }
     if resume_run_id.is_some() {
+        // New-run defaults are not caller overrides: a continuation inherits
+        // its source session's permissions. Reject explicit permission flags,
+        // including --read-only, which the continuation cannot reconfigure.
         if provider.is_some()
             || model.is_some()
             || effort.is_some()
             || fast.is_some()
             || account.is_some()
             || ssh_scope.is_some()
-            || allow_writes
-            || allow_exec
-            || auto_allow
+            || read_only
+            || allow_writes_seen
+            || allow_exec_seen
+            || auto_allow_seen
             || trust_hooks
         {
             return Err("--resume inherits the source session's model and permissions".into());
@@ -409,9 +429,10 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
             || !attachments.is_empty()
             || !budget.is_empty()
             || seed.is_some()
-            || allow_writes
-            || allow_exec
-            || auto_allow
+            || read_only
+            || allow_writes_seen
+            || allow_exec_seen
+            || auto_allow_seen
             || trust_hooks)
     {
         return Err("status, stop, and replay use the run's pinned configuration".into());
@@ -436,6 +457,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
             action,
             output,
             timeout,
+            read_only,
             allow_writes,
             allow_exec,
             auto_allow,
@@ -553,6 +575,10 @@ pub(crate) fn parse_timeout(value: &str) -> Result<Duration, String> {
 }
 
 pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
+    if matches!(rest, [flag] if flag == "--help" || flag == "-h") {
+        println!("{RUN_HELP}");
+        return ExitCode::SUCCESS;
+    }
     let machine_output = requested_machine_output(rest);
     let parsed = match parse_run_options_with_config(rest) {
         Ok(parsed) => parsed,
@@ -792,6 +818,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         detached: options.action == RunAction::Start,
         permission_overrides: execution_permission_overrides(
             None,
+            options.read_only,
             options.allow_writes,
             options.allow_exec,
             options.auto_allow,
@@ -981,17 +1008,35 @@ fn read_stdin_prompt() -> io::Result<String> {
 
 fn execution_permission_overrides(
     replay: Option<SessionPermissionOverridesV1>,
+    read_only: bool,
     allow_writes: bool,
     allow_exec: bool,
     auto_allow: bool,
 ) -> SessionPermissionOverridesV1 {
     replay.unwrap_or(SessionPermissionOverridesV1 {
+        read_only,
         allow_writes,
         allow_exec,
         allow_mobile: false,
         auto_allow,
     })
 }
+
+const RUN_HELP: &str = "Usage: haider run (-p <prompt>|-|<prompt>) [options]\n\
+\n\
+Runs autonomously: Haider permission prompts are allowed automatically, including\n\
+workspace writes and process execution. Explicit user deny rules, --read-only,\n\
+workspace containment, and provider lockdown remain enforced.\n\
+\n\
+Permission options:\n\
+  --read-only       Deny workspace mutation and write-capable process routes\n\
+  --allow-writes    Compatibility alias; autonomous runs already allow writes\n\
+  --allow-exec      Compatibility alias; autonomous runs already allow execution\n\
+  --auto-allow      Compatibility alias; autonomous runs already resolve Ask to Allow\n\
+  --trust-hooks     Trust configured hooks for this run\n\
+\n\
+Output and lifecycle options include --output print|json|jsonl, --json, --jsonl,\n\
+--timeout <duration>, --start, --status, --stop, and --replay.";
 
 pub(crate) fn read_stdin_prompt_from(mut input: impl Read) -> io::Result<String> {
     let mut bytes = Vec::new();
@@ -1235,7 +1280,7 @@ fn replay_legacy_terminal_projection(
     let mut cancellation_intent_at_ms = None;
     let mut adjacent_failure = None::<(u64, ErrorCode)>;
     let mut blocking_error_code = None;
-    let mut pending_permission_rejects = HashMap::<String, (String, u32)>::new();
+    let mut pending_permission_allows = HashMap::<String, (String, u32)>::new();
     let mut missing_projection = None::<(u64, &'static str, Option<&'static str>)>;
 
     events.try_for_each(|envelope| {
@@ -1275,21 +1320,21 @@ fn replay_legacy_terminal_projection(
                     && let Ok(EventPayload::MenuOpened(menu)) = envelope.payload.decode_event()
                 {
                     if let MenuKind::Permission { .. } = menu.kind {
-                        let reject_once = menu
+                        let allow_once = menu
                             .options
                             .iter()
                             .enumerate()
-                            .find(|(_, option)| option.decision == Some(DecisionKind::RejectOnce))
+                            .find(|(_, option)| option.decision == Some(DecisionKind::AllowOnce))
                             .and_then(|(index, option)| {
                                 u32::try_from(index)
                                     .ok()
                                     .map(|index| (option.key.clone(), index))
                             });
-                        if let Some(reject_once) = reject_once {
-                            pending_permission_rejects
-                                .insert(menu.id.as_str().to_owned(), reject_once);
+                        if let Some(allow_once) = allow_once {
+                            pending_permission_allows
+                                .insert(menu.id.as_str().to_owned(), allow_once);
                         } else {
-                            blocking_error_code.get_or_insert("permission_reject_unavailable");
+                            blocking_error_code.get_or_insert("permission_allow_unavailable");
                         }
                     } else if menu.blocking {
                         blocking_error_code.get_or_insert("input_required");
@@ -1300,7 +1345,7 @@ fn replay_legacy_terminal_projection(
             Some("menu_answered") => {
                 if let Ok(EventPayload::MenuAnswered(answer)) = envelope.payload.decode_event()
                     && let Some((option_key, option_index)) =
-                        pending_permission_rejects.remove(answer.menu.as_str())
+                        pending_permission_allows.remove(answer.menu.as_str())
                     && !deadline_exceeded
                     && cancellation_intent_at_ms.is_none()
                     && blocking_error_code.is_none()
@@ -1313,7 +1358,7 @@ fn replay_legacy_terminal_projection(
             }
             Some("menu_closed") => {
                 if let Ok(EventPayload::MenuClosed { menu, .. }) = envelope.payload.decode_event()
-                    && pending_permission_rejects.remove(menu.as_str()).is_some()
+                    && pending_permission_allows.remove(menu.as_str()).is_some()
                     && !deadline_exceeded
                     && cancellation_intent_at_ms.is_none()
                     && blocking_error_code.is_none()
@@ -2195,6 +2240,58 @@ mod tests {
     }
 
     #[test]
+    fn resume_parser_accepts_defaults_and_each_budget_without_prompt() {
+        for flags in [
+            vec![],
+            vec!["--request-tranche", "40"],
+            vec!["--max-requests", "80"],
+            vec!["--max-tokens", "1000"],
+            vec!["--max-cost", "0.50"],
+            vec!["--max-time", "10s"],
+        ] {
+            let mut args = vec!["--resume".to_owned(), "bound-run".to_owned()];
+            args.extend(flags.iter().map(|flag| (*flag).to_owned()));
+            let parsed = parse_run_options_with_config(&args).expect("continuation options");
+            assert_eq!(parsed.options.resume_run_id, Some(RunId::new("bound-run")));
+            assert_eq!(parsed.options.action, RunAction::Execute);
+            assert_eq!(
+                parsed.options.prompt,
+                "Continue the checkpointed task using the retained messages and tool history."
+            );
+            assert!(!parsed.options.prompt_stdin);
+            assert!(!parsed.options.read_only);
+            assert!(parsed.options.allow_writes);
+            assert!(parsed.options.allow_exec);
+            assert!(parsed.options.auto_allow);
+        }
+    }
+
+    #[test]
+    fn resume_parser_rejects_explicit_permission_overrides_in_either_order() {
+        for flag in [
+            "--read-only",
+            "--allow-writes",
+            "--allow-exec",
+            "--auto-allow",
+            "--trust-hooks",
+        ] {
+            for args in [
+                vec!["--resume", "bound-run", flag],
+                vec![flag, "--resume", "bound-run"],
+            ] {
+                let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+                let error = parse_run_options_with_config(&args)
+                    .err()
+                    .expect("explicit permission override must be rejected");
+                assert_eq!(
+                    error, "--resume inherits the source session's model and permissions",
+                    "{args:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn request_budget_exit_is_blocked_and_json_preserves_resume_instruction() {
         let message = "request hard cap reached; continue with haider run --resume bound-run";
         let result = HeadlessRunResult {
@@ -2350,13 +2447,14 @@ mod tests {
     #[test]
     fn replay_preserves_the_complete_permission_pin() {
         let pinned = SessionPermissionOverridesV1 {
+            read_only: false,
             allow_writes: false,
             allow_exec: false,
             allow_mobile: true,
             auto_allow: false,
         };
         assert_eq!(
-            execution_permission_overrides(Some(pinned), true, true, true),
+            execution_permission_overrides(Some(pinned), false, true, true, true),
             pinned
         );
     }

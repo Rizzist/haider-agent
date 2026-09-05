@@ -55,6 +55,21 @@ $ haider --version
 $ haider
 ```
 
+For headless automation, `haider run` is autonomous by definition: Haider
+permission prompts are resolved to allow, so an unflagged coding run can edit
+the selected workspace and execute its tests.
+
+```console
+$ haider run -p "Fix the failing test and verify it" --output json
+```
+
+Use `--read-only` for a no-workspace-write run. It denies filesystem mutation
+and the process, Git, desktop-control, peer-message, Loom registry/installer,
+and automatic-hook routes that could write indirectly. Workspace containment
+and provider lockdown remain hard boundaries. The older
+`--allow-writes`, `--allow-exec`, and `--auto-allow` flags are accepted as
+compatibility aliases; autonomous runs already allow Ask-policy effects.
+
 ---
 
 ## ⚔️ What is Haider?

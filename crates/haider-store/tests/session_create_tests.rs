@@ -292,6 +292,7 @@ fn same_session_create_command_with_different_body_is_rejected() {
 fn session_create_persists_permission_overrides_and_binds_them_to_the_receipt() {
     let root = tempfile::tempdir().expect("tempdir");
     let expected = SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: true,
         allow_exec: false,
         allow_mobile: false,

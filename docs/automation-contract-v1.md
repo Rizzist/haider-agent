@@ -195,6 +195,22 @@ Sources: `wire_transcript.json:95`, `:99`; types
 no-auth custom provider has no credential alias and is selected with
 `--provider` plus `--model`.
 
+For the packaged headless front door, `haider run -p TEXT` creates the session
+with `interaction_mode: "autonomous"`. Every Haider permission-policy `Ask`
+then resolves to ordinary `Allow`; unflagged runs may mutate the selected
+workspace and execute processes. This rule comes from interaction mode, not
+from implied `--allow-writes` or `--allow-exec` flags. Explicit deny policy,
+`--read-only`, workspace containment, and provider lockdown remain enforced.
+An explicit denial is returned as a typed tool result with its rule reason.
+`--read-only` blocks filesystem mutation and local/remote process, Git,
+desktop-control, and peer-message effects that could mutate the workspace
+indirectly; matching automatic hooks and Loom registry/installer mutation are
+also suppressed. The exact direct-write
+reason is `write denied: run is --read-only`; any attempted read-only effect's
+specific reason also names the run's `permission_denied` terminal.
+Clients require the additive `session_read_only_v1` feature before creating a
+read-only session, so daemon reuse cannot silently drop this explicit deny.
+
 #### `session.list`
 
 ```json wire.request
