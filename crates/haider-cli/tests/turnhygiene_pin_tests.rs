@@ -624,6 +624,65 @@ fn normalize_body(body: &[u8], workspace: &Path) -> String {
     normalize_identities(&text.replace(escaped.trim_matches('"'), "<CWD>"))
 }
 
+const POSIX_PROCESS_COMMAND_DESCRIPTION: &str =
+    "Exact shell program passed to /bin/zsh -c when available, otherwise /bin/sh -c";
+const WINDOWS_PROCESS_COMMAND_DESCRIPTION: &str =
+    "Exact PowerShell program passed to the absolute System32 Windows PowerShell";
+
+/// The request golden is shared across platforms. Only this schema field is
+/// platform-specific: 78 POSIX bytes versus 75 Windows bytes. Validate the
+/// native manual before replacing its exact JSON string; preserve every other
+/// request byte, including field order and formatting, for the golden check.
+fn normalize_process_command_description(body: &str, native_description: &str) -> String {
+    let parsed: serde_json::Value = serde_json::from_str(body).expect("chat body JSON");
+    let tools = parsed["tools"].as_array().expect("native tool array");
+    let process = tools
+        .iter()
+        .find(|tool| tool["function"]["name"] == "process_exec")
+        .expect("process_exec tool");
+    assert_eq!(
+        process["function"]["parameters"]["properties"]["command"]["description"],
+        native_description,
+        "process_exec must advertise the native command interpreter"
+    );
+    let encoded = serde_json::to_string(native_description).expect("description JSON");
+    assert_eq!(
+        body.matches(&encoded).count(),
+        1,
+        "normalize only the single process_exec command description"
+    );
+    body.replacen(&encoded, "\"<PLATFORM_PROCESS_COMMAND_DESCRIPTION>\"", 1)
+}
+
+#[test]
+fn request_golden_normalizes_only_the_platform_command_manual() {
+    let body = |description: &str, max_length: u64| {
+        serde_json::json!({"tools": [{"function": {
+            "name": "process_exec",
+            "parameters": {"properties": {"command": {
+                "description": description, "maxLength": max_length
+            }}}
+        }}]})
+        .to_string()
+    };
+    let posix = body(POSIX_PROCESS_COMMAND_DESCRIPTION, 8192);
+    let windows = body(WINDOWS_PROCESS_COMMAND_DESCRIPTION, 8192);
+    let normalized =
+        normalize_process_command_description(&posix, POSIX_PROCESS_COMMAND_DESCRIPTION);
+    assert_eq!(
+        normalized,
+        normalize_process_command_description(&windows, WINDOWS_PROCESS_COMMAND_DESCRIPTION)
+    );
+    assert_ne!(
+        normalized,
+        normalize_process_command_description(
+            &body(WINDOWS_PROCESS_COMMAND_DESCRIPTION, 8191),
+            WINDOWS_PROCESS_COMMAND_DESCRIPTION
+        ),
+        "platform normalization must retain schema constraint drift"
+    );
+}
+
 fn proxy_run(profile: &TestProfile, cwd: &Path, extra: &[&str], prompt: &str) -> Output {
     let mut command = profile.proxy_command();
     command.current_dir(cwd).args([
@@ -1005,9 +1064,17 @@ fn provider_request_body_is_budget_independent_and_matches_the_golden_ledger() {
         ],
         "cold, warm and budgeted coding turns retain the exact core tier"
     );
+    let native_command_description = if cfg!(windows) {
+        WINDOWS_PROCESS_COMMAND_DESCRIPTION
+    } else {
+        POSIX_PROCESS_COMMAND_DESCRIPTION
+    };
     assert_golden(
         "provider_request_no_budget.json",
-        &format!("{}\n", normalized[0]),
+        &format!(
+            "{}\n",
+            normalize_process_command_description(&normalized[0], native_command_description)
+        ),
     );
 
     // The journals differ only by the declared budget; the footprint, cache
@@ -1135,9 +1202,23 @@ fn capture_hook_command(capture: &Path) -> String {
 
 #[cfg(windows)]
 fn capture_hook_command(capture: &Path) -> String {
+    use base64::Engine as _;
+
     let capture = capture.display().to_string().replace('\'', "''");
-    format!(
+    let script = format!(
         "$i=[Console]::OpenStandardInput();$f=[IO.File]::Open('{capture}',[IO.FileMode]::Append,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite);$i.CopyTo($f);$f.WriteByte(10);$f.Dispose()"
+    );
+    let utf16 = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    // Hooks execute cmd.exe /D /S /C on Windows, unlike process_exec's native
+    // PowerShell program. Invoke the absolute interpreter explicitly and encode
+    // its script so cmd cannot interpret PowerShell syntax or capture-path bytes.
+    format!(
+        "\"{}\" -NoProfile -NonInteractive -EncodedCommand {}",
+        haider_platform::windows_powershell().display(),
+        base64::engine::general_purpose::STANDARD.encode(utf16)
     )
 }
 

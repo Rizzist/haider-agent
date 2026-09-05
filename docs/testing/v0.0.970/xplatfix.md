@@ -256,3 +256,201 @@ aggregate: findings=5, real=4, noise=1.
 Release acceptance is proven only when `ci` and `xplat-check` are green on the
 landed `wave-970` commit. Local Mac checks or a green run on the base cannot
 establish that acceptance.
+
+## Round 2 — Windows test job
+
+Base and merge-forward target: `471b9d680610b62c4cdd4a8be7b6ee7faf3959d3`.
+Read the supplied lane instructions and turnperf/turnperf2 evidence before
+implementation. Those historical performance estimates are not Windows timing
+measurements and those supplied documents are excluded from the commit.
+
+### Claim audit
+
+Read the complete log with `gh run view --job 101322816225 --log`, from
+[xplat-check 33972289990](https://github.com/Rizzist/haider-agent/actions/runs/33972289990/job/101322816225).
+It contains six failing tests in **three crates / four test binaries** (daemon
+lib and daemon integration tests are separate binaries), not four crates.
+All six panic citations match the base. The CLI citations at 446 and 657 are
+shared assertion/wait helpers rather than the named tests' definitions. The
+sidecar test lives under daemon `tests/`, not `src/`. Symbols were located before
+editing; source lines shift with these repairs.
+
+1. **Instruct-pipe byte pin — confirmed, exact difference identified.**
+   `worker.rs` advertises `process_exec.command.description` as
+   `Exact shell program passed to /bin/zsh -c when available, otherwise /bin/sh -c`
+   (78 bytes) or
+   `Exact PowerShell program passed to the absolute System32 Windows PowerShell`
+   (75 bytes). The expected Windows total was incorrectly 5,670; actual is
+   5,667. The test now pins the platform-invariant 5,670 − 78 = 5,592 bytes and
+   adds the JSON-escaped byte contribution of this actual schema field (excluding
+   its two framing quotes). Thus a manual edit cannot silently leave a stale
+   three-byte offset. POSIX remains 5,670; Windows becomes 5,667. The 50% reduction
+   requirement, tool counts, semantics and validation constraints remain pinned.
+
+2. **Verified provenance guard — underbudget proven; exact Windows stall not
+   measured.** The original ten-second observation encloses `process_exec`
+   with its default sixty-second wall budget. Its command is `echo verified`,
+   valid for Windows PowerShell; execution is explicitly authorized and the
+   graph guard is cfg-neutral. Graph-only sibling confirmations passed on this
+   Windows run. The log records only `Elapsed(())` and test-completion timestamps,
+   not this process's spawn/exit timestamps, so it cannot distinguish cold
+   PowerShell latency from another stall. The helper now derives its one-process
+   observer BudgetSum as 10s graph/journal + 30s existing cold-PowerShell fixture
+   allowance (`haider-daemond/tests/support/mod.rs`) + 60s `ProcessBounds` wall +
+   2s termination + 2s pipe drain + two 500ms workspace receipts = **105s**.
+   The 30s component is inherited fixture policy, not a measurement from this
+   runner. Graph-only fixtures retain ten seconds. No sleep or product deadline
+   is added. Incremental journal observations record elapsed time and sequence,
+   fail immediately on typed tool/run failure or an unexpected blocking menu,
+   and print the reason and progress on exhaustion. All original process-signal
+   provenance, slim result, replay and explicit abandonment assertions remain.
+   Failure queues a best-effort drain wake; it does not claim completed cleanup.
+
+3. **Native pipe I/O failure — the claimed retained old tail is contradicted by
+   the log.** Actual bytes contain the correct durable user row and coverage 2,
+   both in generation **1**; the injected stale file was generation **9** with
+   seq 999. The actor's append only enqueues asynchronous sidecar maintenance.
+   The original fixture removed the obstruction and wrote generation 9 without
+   joining that writer. A first-touch generation-1 rebuild can therefore overwrite
+   the fixture's stale file. The repair moves the named test into
+   `pipe_native_tests.rs`, where the existing private constructor can retain the
+   **same `Arc<PipeNativeWriter>`** across two hub lifetimes. It joins the first
+   actor while the obstruction still exists and asserts actual dirty state before
+   removing it. The second hub uses that same writer and must rebuild generation
+   9 → 10, match the complete durable bytes, clear dirty state, and confirm exact
+   coverage. Independent review strengthened the stale file to plausible coverage
+   1 with incorrect text: bypassing dirty repair must now fail, whereas seq 999
+   independently caused a rebuild even without dirty handling. The expected
+   generation-10 result was not weakened. The product also now refuses to
+   classify an observed non-directory `pipe` parent as a missing sidecar:
+   Windows `ERROR_PATH_NOT_FOUND` maps to Rust `NotFound`, whereas an executed
+   macOS open beneath a file returned ENOTDIR. Root-open error classification
+   checks the parent on the error path and preserves other I/O failures. A
+   portable regression supplies Windows' ambiguous NotFound for absent-parent,
+   absent-leaf and obstructed-parent cases, plus a non-NotFound failure. Rust
+   1.95's installed Windows error-mapping source was inspected; no Windows API
+   was executed. This fixes the classification, but cannot eliminate arbitrary
+   external file-creation races or uniquely reconstruct the failed run's timing.
+   No file-handle, rename or CRLF failure is established by the old log.
+
+4. **Provider request golden — confirmed, only one differing JSON value.**
+   Parsed both complete CI bodies and recursively diffed them: the sole pointer
+   is `/tools/7/function/parameters/properties/command/description`, exactly the
+   platform manual from claim 1. The comparison validates the native description
+   against explicit platform prose, then replaces its single serialized string
+   with `<PLATFORM_PROCESS_COMMAND_DESCRIPTION>`. All other request bytes,
+   ordering and formatting remain sensitive. The existing native cold/warm/budget
+   byte comparisons run before this normalization. A new regression checks both
+   platform descriptions normalize identically while a changed `maxLength`
+   remains different. There is one golden, regenerated through `UPDATE_FIXTURES=1`.
+
+5. **Resident hook — real fixture interpreter mismatch.** Windows hooks execute
+   `cmd.exe /D /S /C`, while the fixture supplied raw PowerShell syntax. This is
+   distinct from the `process_exec` interpreter. The fixture now explicitly
+   invokes absolute System32 PowerShell with `-NoProfile -NonInteractive
+   -EncodedCommand`, encoding its script as UTF-16LE/base64 so cmd cannot
+   reinterpret script or capture-path bytes. This follows the existing daemon
+   hook-test pattern and adds only the workspace base64 dev dependency. Discovery
+   between resident runs, two captured lines, session/run identity and cwd-scoping
+   assertions remain intact.
+
+6. **Monitor cwd — ancestor protection already passed; child cwd needed a
+   compatible path and identity-based verification.** The original failure
+   occurs after the ancestor-rename denial succeeds. Its log omitted actual cwd,
+   so it does not uniquely prove a PowerShell reset versus Windows short/long
+   pathname spelling. Canonical Windows `\\?\` paths have documented child-tool
+   compatibility limitations ([Rust canonicalize documentation](https://doc.rust-lang.org/stable/std/fs/fn.canonicalize.html),
+   [Rust PowerShell cwd report](https://github.com/rust-lang/rust/issues/133553)).
+   `WorkspaceDirectory::process_path` now constructs a DOS/UNC spelling, opens
+   its full chain, and checks its file identity against the retained original
+   handle before returning it. A changed identity or unsupported namespace fails
+   closed. Original root-to-cwd handles still deny delete-sharing and remain alive
+   through CreateProcess. The shared setter propagates errors through the normal
+   effect finalizer for foreground and background processes; monitor preparation
+   also propagates them. Two Windows platform tests cover drive/UNC conversion
+   and rejection of trailing-dot normalization that names a different directory.
+   The monitor test retains ancestor-swap denial, compares reported/expected
+   directory identities (the runner uses 8.3 temp spellings), and requires a
+   relative sentinel read from the prepared directory, with actual cwd/stderr
+   diagnostics. This is a product-path repair plus stronger security evidence;
+   native Windows execution remains required.
+
+### Round 2 verification
+
+All Cargo commands use the ENV LAW, rustup Rust 1.95.0, two build jobs, four test
+threads, and `df -m /` checked before each build-capable command with a 700 MiB
+minimum. CLI/daemon siblings are prebuilt before daemon/workspace tests and
+`HAIDER_TEST_SIBLINGS_PREBUILT=1` is set only afterward. Logs are under
+`/tmp/xplatfix-round2-evidence/`; raw Windows job log is
+`/tmp/xplatfix-windows-job.log`.
+
+Executed focused checks on macOS:
+
+| Repair | Executed host evidence | Windows evidence |
+| --- | --- | --- |
+| Instruct-pipe pin | Named daemon lib test PASS, actual 5,670 bytes. | Pin/schema arithmetic inspected; affected-crate cross check/Clippy blocked in native dependencies. |
+| Provenance guard | All nine `worker::g1_todo_runtime_tests` PASS (1.67s); named provenance confirmation observed at about 606ms on this Mac. | Interpreter/guard path inspected; exact runner latency unknown; cross check/Clippy blocked before daemon test compilation. |
+| Native pipe | All four `pipe_native::pipe_native_tests` PASS. Dirty-branch mutant FAILS with stale generation 9 versus expected durable generation 10, exit 101, 0.18s; exact source restoration then PASS (0.15s). | Ambiguous NotFound classification executed through the portable seam on Mac; actual Windows API inspected only. |
+| Request golden | `UPDATE_FIXTURES=1 cargo test -p haider-cli --test turnhygiene_pin_tests provider_request_body_is_budget_independent_and_matches_the_golden_ledger -- --nocapture` PASS. Regenerated JSON diff has exactly one field. Entire 12-test binary also PASS. | Parsed actual/golden CI bodies; sole platform-manual difference proved. Windows CLI test cfg inspected; cross check/Clippy blocked in dependencies. |
+| Resident hook | Named test PASS in all 12 `turnhygiene_pin_tests` (7.16s). This executes the POSIX fixture on Mac. | cmd/PowerShell encoded fixture, stdin EOF and cwd assertions inspected; no Windows hook executed. |
+| Monitor cwd | Host compilation and final workspace gate cover shared callers/Unix implementations. | Platform-only Windows check AND Clippy with `--all-targets --features blake3/pure` PASS, compiling the new helper and two Windows tests. Tools monitor/foreground/background Windows cfg inspected, not compiled past native dependency blockers or run locally. |
+
+Exact affected-crate Windows attempts were both executed under ENV LAW:
+`cargo check -p haider-platform -p haider-tools -p haider-daemon -p haider-cli
+--target x86_64-pc-windows-msvc --all-targets --keep-going`, and the same
+`cargo clippy ... -- -D warnings`. Both exit **101**: missing `ml64.exe` and
+Windows SDK C headers (`stdlib.h`, `windows.h`, also native crypto/SQLite
+requirements). These are not passing Windows checks. Supplemental
+`cargo check -p haider-platform --target x86_64-pc-windows-msvc --all-targets
+--features blake3/pure` and the same Clippy command with `-- -D warnings` both
+exit **0**; they use BLAKE3's supported pure-Rust backend, not a fake SDK or
+forced host cfg. They do not execute Windows binaries or compile the dependent
+CLI/daemon/tools Windows paths.
+
+The first focused G1 run found a new diagnostic-helper defect: blanket
+`decode_event` rejected daemon-owned `project_instructions_loaded` facts outside
+`EventPayload`. Restricting strict decoding to the six observed wire kinds while
+advancing the cursor over every fact corrected it; the entire nine-test suite
+then passed. This was found by execution, separately from the independent
+verifier tally. No failed run is counted as a pass.
+
+The first full workspace invocation stopped during test linking with
+`errno=28 (No space left on device)`: the filesystem dropped to 139 MiB,
+below the 700 MiB ENV LAW floor. No later build was started until space was
+recovered. The failed log and status are preserved as
+`workspace-test-unstripped-environment-blocked.log` and
+`host-gate-status-unstripped-environment-blocked.tsv`. Only this lane's generated
+`target/` tree was removed, recovering 8,592 MiB; no other lane's artifacts or
+source files were deleted. The restarted gate retains every ENV LAW setting and
+adds `CARGO_PROFILE_DEV_STRIP=symbols CARGO_PROFILE_TEST_STRIP=symbols` to bound
+Mach-O artifact size. This strips binary symbols, changes no test assertions or
+product source, and applies consistently to freshly rebuilt siblings and tests.
+
+Completed-tree gate results follow below. The baseline before this round is
+4,997 source test markers; `xtask test-count --update` produces **5,001**. Moving
+the sidecar test preserves its count, while one normalizer, one missing-parent
+and two Windows directory tests add four. This is distinct from the number of
+tests executed on Mac.
+
+### Round 2 merge, commit and acceptance
+
+The user explicitly requests a commit, overriding the older uncommitted-lane
+instruction. The worktree's `.git` points outside the writable sandbox. Actual
+fetch and merge attempts failed at `FETCH_HEAD` and `ORIG_HEAD.lock`. A writable
+shared clone at `/tmp/xplatfix-round2-integration`, on `lane-970-xplatfix`, fetched
+`origin/wave-970` and ran `git merge --no-commit origin/wave-970` before the gate.
+The remote still points at `471b9d68`; Git reports already up to date. No upstream
+conflicts or new manual/golden drift are present. The clone is the commit
+location; source changes remain present in the original worktree. No push.
+
+Independent reviewers found two issues that changed tests: the dirty-tail
+fixture could pass without dirty handling, and the monitor assertion compared
+path spellings rather than directory identities. Both were repaired. A concern
+that the guard would hide the failure reason behind Errored was rejected because
+`RunFailed` precedes Errored atomically. A best-effort-cleanup comment was clarified;
+that editorial correction is not counted as an additional behavioral finding.
+Round 2 aggregate: **findings=3, real=2, noise=1**.
+
+**Release acceptance is proven only when xplat-check is green on the landed
+`wave-970` commit.** A local Mac pass or Windows source inspection does not prove
+that acceptance; this lane does not run Windows binaries locally or push CI.

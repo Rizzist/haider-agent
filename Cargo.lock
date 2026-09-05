@@ -1734,6 +1734,7 @@ name = "haider-cli"
 version = "0.0.969"
 dependencies = [
  "async-trait",
+ "base64",
  "haider-accounts",
  "haider-client",
  "haider-core",

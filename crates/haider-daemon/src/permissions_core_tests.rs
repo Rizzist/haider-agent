@@ -1513,8 +1513,13 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     const PRE_DIET_INSTRUCT_PIPE_BYTES: usize = 13_552;
     // Measured v5 core pack: seven coding tools + list_tools, native prose
     // once and no system manual, preserving parameter constraints and semantics.
-    // 13_552 -> 5_670 (-58.2%); do not trim validation bounds to save tokens.
-    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 5_670;
+    // POSIX 13_552 -> 5_670 (-58.2%); do not trim validation bounds to save tokens.
+    // The only platform-specific bytes are process_exec.command.description:
+    // POSIX names /bin/zsh and /bin/sh (78 bytes), Windows names the absolute
+    // System32 PowerShell (75 bytes). Pin the other 5_670 - 78 = 5_592 bytes
+    // and derive this field's contribution from its actual schema string, so
+    // future manual edits cannot leave a stale hard-coded Windows offset.
+    const EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES: usize = 5_592;
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let authorized =
         advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
@@ -1527,6 +1532,21 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();
+    let process_command_description = tools
+        .iter()
+        .find(|tool| tool.name == "process_exec")
+        .expect("advertised process_exec")
+        .input_schema["properties"]["command"]["description"]
+        .as_str()
+        .expect("platform-specific process command description");
+    // Count JSON-escaped bytes because tool_bytes measures serialized schemas.
+    // Remove the two framing quotes, which remain in the invariant byte pin.
+    let process_command_description_bytes = serde_json::to_vec(process_command_description)
+        .expect("process command description JSON")
+        .len()
+        - 2;
+    let expected_pipe_bytes =
+        EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES + process_command_description_bytes;
     assert_eq!(registered_tools().len(), 30);
     assert_eq!(
         tools.len(),
@@ -1567,12 +1587,9 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         tools.len(),
         policy.len()
     );
-    assert_eq!(pipe_bytes, EXPECTED_INSTRUCT_PIPE_BYTES);
+    assert_eq!(pipe_bytes, expected_pipe_bytes);
     assert!(pipe_bytes * 2 <= PRE_DIET_INSTRUCT_PIPE_BYTES);
-    assert_eq!(
-        system.len() + tool_bytes,
-        606 + EXPECTED_INSTRUCT_PIPE_BYTES
-    );
+    assert_eq!(system.len() + tool_bytes, 606 + expected_pipe_bytes);
 }
 
 /// C1 MUTATION CHECK: drop the node walk or the agent-type/task rendering.
