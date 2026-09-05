@@ -1,0 +1,10 @@
+   Compiling haider-cli v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-cli)
+    Finished `test` profile [unoptimized] target(s) in 0.96s
+     Running tests/turnhygiene_pin_tests.rs (/private/tmp/haider-economydiet-target/debug/deps/turnhygiene_pin_tests-da1c494e2686883d)
+
+running 2 tests
+test run_jsonl_text_turn_matches_the_normalized_golden ... ok
+test run_jsonl_tool_turn_matches_the_normalized_golden ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 2.88s
+

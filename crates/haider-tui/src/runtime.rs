@@ -2001,7 +2001,7 @@ impl DemoDriver {
             // Unreachable in demo BY DESIGN: the demo card's `[1]`
             // fabricates locally (sim confirmAuth) and never pushes this
             // request — only the live card's ⏎ does.
-            AppRequest::ProviderConfigure { .. } | AppRequest::CustomProviderRetired { .. } => {}
+            AppRequest::ProviderConfigure { .. } | AppRequest::CustomModelsProbe { .. } | AppRequest::CustomProviderRetired { .. } => {}
             // Live-only read (G4a): demo fabricates no discovery.
             AppRequest::ProviderModelsRefresh { .. } => {}
             AppRequest::SetDefaultModel {

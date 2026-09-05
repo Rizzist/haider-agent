@@ -747,6 +747,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "peer.send",
         "provider.configure",
         "provider.list",
+        "provider.models_probe",
         "provider.models_refresh",
         "provider.remove",
         "provider.set_trust",
@@ -817,8 +818,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        132,
-        "126 pre-v0.0.970 methods plus four account source registry methods, monitor.mutate and provider rebind"
+        133,
+        "126 pre-v0.0.970 methods plus four account source registry methods, monitor.mutate, provider rebind and custom model probes"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -868,8 +869,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     assert_eq!(fixture.contract, "haider-client-wire/v1");
     assert_eq!(
         fixture.methods.len(),
-        67,
-        "the supplemental fixture must contain the 67 methods absent from the union transcript"
+        68,
+        "the supplemental fixture must contain the 68 methods absent from the union transcript"
     );
     for pair in fixture.methods {
         assert_eq!(wire_method(&pair.request), pair.request_method);
@@ -6048,4 +6049,30 @@ fn provider_rebind_request_and_receipt_are_golden() {
     assert_eq!(actual, golden);
     let decoded: Vec<WireFrame> = serde_json::from_str(&golden).expect("decode rebind fixture");
     assert_eq!(decoded, frames);
+}
+
+#[test]
+fn customprov_models_probe_is_feature_gated_and_has_no_durable_or_secret_fields() {
+    let request: RequestBody = serde_json::from_value(serde_json::json!({
+        "method": "provider.models_probe", "provider": "local-models",
+        "origin": "http://127.0.0.1:8000/v1", "api_family": "openai_chat_completions",
+        "keyless": false, "probe_vault_reference": "opaque-stage-reference"
+    }))
+    .expect("probe request decodes");
+    assert_eq!(
+        request.additive_shape_feature(),
+        Some(haider_rpc::FEATURE_PROVIDER_MODELS_PROBE_V1)
+    );
+    let encoded = serde_json::to_value(request).expect("probe request encodes");
+    assert!(encoded.get("command_id").is_none());
+    assert!(encoded.get("secret").is_none());
+    let reply = ResponseBody::ProviderModelsProbe {
+        provider: "local-models".into(),
+        models: vec!["served-model".into()],
+        default_model: Some("served-model".into()),
+    };
+    let encoded = serde_json::to_value(reply).expect("probe reply encodes");
+    assert_eq!(encoded["method"], "provider.models_probe");
+    assert!(encoded.get("revision").is_none());
+    assert!(encoded.get("secret").is_none());
 }

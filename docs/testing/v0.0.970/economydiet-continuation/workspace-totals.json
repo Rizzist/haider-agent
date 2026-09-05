@@ -1,0 +1,11 @@
+{
+  "top_level_result_blocks": 325,
+  "top_level_passed": 5397,
+  "failed": 0,
+  "ignored": 13,
+  "nested_result_blocks": 12,
+  "nested_passed": 12,
+  "all_result_blocks": 337,
+  "all_passed_including_nested": 5409,
+  "cargo_exit": 0
+}

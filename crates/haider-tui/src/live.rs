@@ -74,6 +74,8 @@ fn provider_probe_failure_text(
     };
     if detail.is_empty() {
         class.to_owned()
+    } else if matches!(failure, haider_rpc::ProviderProbeFailureWire::Unavailable) {
+        detail.to_owned()
     } else {
         format!("{class} — {detail}")
     }
@@ -838,6 +840,15 @@ pub enum LiveCommand {
         worker_generation: u64,
         agent_type: Option<String>,
     },
+    /// A read-only custom catalog probe, correlated to the live card.
+    ProbeCustomModels {
+        attempt: u64,
+        provider: String,
+        origin: String,
+        keyless: bool,
+        family: haider_rpc::ProviderApiFamilyWire,
+        probe_vault_reference: Option<String>,
+    },
     /// `provider.configure` for a custom OpenAI-compatible provider
     /// (W5g-4) or a G4b enterprise builtin. The provider name stays fixed on
     /// edit while a custom origin may be repointed under the revision CAS;
@@ -1148,6 +1159,7 @@ impl LiveCommand {
             | Self::DeviceCandidates
             | Self::ProviderList
             | Self::RefreshProviderModels { .. }
+            | Self::ProbeCustomModels { .. }
             | Self::OAuthStart { .. }
             | Self::OAuthStatus { .. }
             | Self::OAuthCancel { .. }
@@ -1357,6 +1369,17 @@ pub enum LiveReply {
     StageFailed {
         attempt: u64,
         code: String,
+        message: String,
+    },
+    CustomModelsProbed {
+        attempt: u64,
+        provider: String,
+        models: Vec<String>,
+        default_model: Option<String>,
+    },
+    CustomModelsProbeFailed {
+        attempt: u64,
+        failure: haider_rpc::ProviderProbeFailureWire,
         message: String,
     },
     /// `provider.configure` discovery failed with a stable machine-readable
@@ -1955,6 +1978,8 @@ struct OAuthFlight {
 /// so a late stage reply cannot mint a durable configure command.
 #[derive(Debug, Clone, PartialEq)]
 struct CustomConfigureFlight {
+    probe: bool,
+    account_alias: String,
     attempt: u64,
     name: String,
     origin: String,
@@ -1964,6 +1989,14 @@ struct CustomConfigureFlight {
     models: Vec<String>,
     default_model: Option<String>,
     expected_revision: u64,
+}
+
+#[derive(Debug)]
+struct CustomProbe {
+    attempt: u64,
+    provider: String,
+    account_alias: String,
+    vault_reference: Option<String>,
 }
 
 /// Correlation for a durable `provider.configure`. A present vault reference
@@ -2153,6 +2186,8 @@ pub struct LiveDriver {
     pending_provider_remove: Option<(CommandId, String)>,
     /// Custom card waiting for its non-durable key stage.
     custom_stage: Option<CustomConfigureFlight>,
+    /// Staged reference retained through model choice; never outboxed.
+    custom_probe: Option<CustomProbe>,
     /// The in-flight durable `provider.configure` and optional staged key.
     pending_custom: Option<PendingCustom>,
     /// Stage start for the same bounded recovery used by ordinary API-key
@@ -2365,6 +2400,7 @@ impl LiveDriver {
             pending_account_remove: None,
             pending_provider_remove: None,
             custom_stage: None,
+            custom_probe: None,
             pending_custom: None,
             custom_stage_started: None,
             pending_hook_trust: None,
@@ -3970,7 +4006,7 @@ impl LiveDriver {
                 let custom_live = self.custom_stage.as_ref().is_some_and(|flight| {
                     flight.attempt == attempt
                         && flight.name == provider
-                        && alias.as_deref() == Some(flight.name.as_str())
+                        && alias.as_deref() == Some(flight.account_alias.as_str())
                 }) && model.custom_add.as_ref().map(|card| card.attempt)
                     == Some(attempt);
                 if custom_live {
@@ -3978,6 +4014,22 @@ impl LiveDriver {
                         return Vec::new();
                     };
                     self.custom_stage_started = None;
+                    if flight.probe {
+                        self.custom_probe = Some(CustomProbe {
+                            attempt,
+                            provider: flight.name.clone(),
+                            account_alias: flight.account_alias,
+                            vault_reference: Some(vault_reference.clone()),
+                        });
+                        return vec![LiveCommand::ProbeCustomModels {
+                            attempt,
+                            provider: flight.name,
+                            origin: flight.origin,
+                            keyless: flight.keyless,
+                            family: flight.family,
+                            probe_vault_reference: Some(vault_reference),
+                        }];
+                    }
                     let command_id = self.mint();
                     self.pending_custom = Some(PendingCustom {
                         command_id: command_id.clone(),
@@ -4640,6 +4692,40 @@ impl LiveDriver {
                     self.login_attempt = None;
                     model.login_result(Err((code, message)));
                     model.dirty = true;
+                }
+                Vec::new()
+            }
+            LiveReply::CustomModelsProbed {
+                attempt,
+                provider,
+                models,
+                default_model,
+            } => {
+                if self
+                    .custom_probe
+                    .as_ref()
+                    .is_some_and(|probe| probe.attempt == attempt && probe.provider == provider)
+                {
+                    model.custom_models_probed(attempt, models, default_model, None);
+                }
+                Vec::new()
+            }
+            LiveReply::CustomModelsProbeFailed {
+                attempt,
+                failure,
+                message,
+            } => {
+                if self
+                    .custom_probe
+                    .as_ref()
+                    .is_some_and(|probe| probe.attempt == attempt)
+                {
+                    model.custom_models_probed(
+                        attempt,
+                        Vec::new(),
+                        None,
+                        Some(provider_probe_failure_text(failure, &message)),
+                    );
                 }
                 Vec::new()
             }
@@ -5410,7 +5496,9 @@ impl LiveDriver {
     /// configure that still carries its borrowed reference). The raw key was
     /// taken from the card at submit, so recovery is always a visible retype.
     fn abandon_custom_stage(&mut self, model: &mut AppModel, why: &str) {
-        let attempt = if let Some(flight) = self.custom_stage.take() {
+        let attempt = if let Some(probe) = self.custom_probe.take() {
+            Some(probe.attempt)
+        } else if let Some(flight) = self.custom_stage.take() {
             Some(flight.attempt)
         } else if let Some(pending) = self
             .pending_custom
@@ -6332,6 +6420,60 @@ impl LiveDriver {
                     agent_type,
                 })]
             }
+            AppRequest::CustomModelsProbe {
+                attempt,
+                name,
+                origin,
+                keyless,
+                family,
+                secret,
+            } => {
+                let account_alias = model
+                    .accounts
+                    .rows
+                    .iter()
+                    .filter(|row| row.provider == name)
+                    .max_by_key(|row| row.selected)
+                    .map_or_else(|| name.clone(), |row| row.alias.clone());
+                if let Some(secret) = secret {
+                    self.next_command += 1;
+                    self.custom_stage_started = Some(self.now);
+                    self.custom_stage = Some(CustomConfigureFlight {
+                        probe: true,
+                        account_alias: account_alias.clone(),
+                        attempt,
+                        name: name.clone(),
+                        origin,
+                        model: String::new(),
+                        keyless,
+                        family,
+                        models: Vec::new(),
+                        default_model: None,
+                        expected_revision: 0,
+                    });
+                    return vec![LiveCommand::Stage {
+                        stage_id: format!("{}-custom-stage-{}", self.instance, self.next_command),
+                        secret,
+                        provider: name.clone(),
+                        alias: Some(account_alias),
+                        attempt,
+                    }];
+                }
+                self.custom_probe = Some(CustomProbe {
+                    attempt,
+                    provider: name.clone(),
+                    account_alias,
+                    vault_reference: None,
+                });
+                vec![LiveCommand::ProbeCustomModels {
+                    attempt,
+                    provider: name,
+                    origin,
+                    keyless,
+                    family,
+                    probe_vault_reference: None,
+                }]
+            }
             AppRequest::ProviderConfigure {
                 attempt,
                 name,
@@ -6345,6 +6487,8 @@ impl LiveDriver {
                 expected_revision,
             } => {
                 let flight = CustomConfigureFlight {
+                    probe: false,
+                    account_alias: name.clone(),
                     attempt,
                     name,
                     origin,
@@ -6368,12 +6512,19 @@ impl LiveDriver {
                     }];
                 }
                 let command_id = self.mint();
+                let probe = self
+                    .custom_probe
+                    .take_if(|probe| probe.attempt == attempt && probe.provider == flight.name);
+                let (account_alias, vault_reference) = probe.map_or_else(
+                    || (flight.name.clone(), None),
+                    |probe| (probe.account_alias, probe.vault_reference),
+                );
                 self.pending_custom = Some(PendingCustom {
                     command_id: command_id.clone(),
                     attempt,
                     provider: flight.name.clone(),
-                    account_alias: flight.name.clone(),
-                    vault_reference: None,
+                    account_alias,
+                    vault_reference,
                 });
                 vec![self.enqueue(LiveCommand::ConfigureProvider {
                     command_id,
@@ -6389,6 +6540,7 @@ impl LiveDriver {
                 })]
             }
             AppRequest::CustomProviderRetired { attempt } => {
+                self.custom_probe.take_if(|probe| probe.attempt == attempt);
                 self.custom_stage
                     .take_if(|flight| flight.attempt == attempt);
                 self.custom_stage_started = None;

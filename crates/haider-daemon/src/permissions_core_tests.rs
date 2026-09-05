@@ -1557,6 +1557,16 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         "native descriptions are the sole tool manual"
     );
     let pipe_bytes = tool_bytes + manual_bytes;
+    let native_description_bytes = tools
+        .iter()
+        .map(|tool| tool.description.len())
+        .sum::<usize>();
+    eprintln!(
+        "instruct-pipe pin: registered={}, advertised={}, policy_bytes={}, instruct_pipe_bytes={pipe_bytes}, native_description_bytes={native_description_bytes}",
+        registered_tools().len(),
+        tools.len(),
+        policy.len()
+    );
     assert_eq!(pipe_bytes, EXPECTED_INSTRUCT_PIPE_BYTES);
     assert!(pipe_bytes * 2 <= PRE_DIET_INSTRUCT_PIPE_BYTES);
     assert_eq!(

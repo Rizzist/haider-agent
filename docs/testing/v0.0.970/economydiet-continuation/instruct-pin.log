@@ -1,0 +1,18 @@
+   Compiling haider-protocol v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-protocol)
+   Compiling haider-accounts v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-accounts)
+   Compiling haider-provider v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-provider)
+   Compiling haider-store v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-store)
+   Compiling haider-rpc v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-rpc)
+   Compiling haider-tools v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-tools)
+   Compiling haider-client v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-client)
+   Compiling haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-core)
+   Compiling haider-daemon v0.0.969 (/Users/rizzist/haider-run/lane-970-economydiet/crates/haider-daemon)
+    Finished `test` profile [unoptimized] target(s) in 2m 57s
+     Running unittests src/lib.rs (/private/tmp/haider-economydiet-target/debug/deps/haider_daemon-a026225e55aa3ca6)
+
+running 1 test
+instruct-pipe pin: registered=30, advertised=8, policy_bytes=606, instruct_pipe_bytes=5670, native_description_bytes=1490
+test permissions_core_tests::instruct_pipe_shrinks_the_advertised_wire_pack ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1087 filtered out; finished in 0.01s
+

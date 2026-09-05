@@ -7243,3 +7243,89 @@ fn effect_outcome_unknown_maps_to_typed_state_and_outranks() {
         ObserveRunStateWire::WaitingForRoute
     ));
 }
+
+/// Custom discovery is read-only but credential-bearing, so it requires
+/// Control and keyed requests require the same-UID local secret surface.
+#[tokio::test]
+async fn customprov_models_probe_requires_control_and_keeps_keyed_probes_local() {
+    let root = tempfile::tempdir().expect("probe store");
+    let store = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("probe store opens");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("probe hub opens");
+    let (commands, mut mailbox) = mpsc::channel(2);
+    hub.install_accounts(crate::accounts::AccountsFacade {
+        login: Some(commands),
+        oauth: None,
+        snapshot: Arc::new(Mutex::new(Vec::new())),
+        management: crate::accounts::ManagementSnapshot::new(0, Vec::new(), Vec::new()),
+        vault_supported: true,
+        discovery_disabled: false,
+        device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+        sources: Arc::new(std::sync::Mutex::new(Vec::new())),
+        vault: Some(Arc::new(haider_accounts::MemoryVault::default())),
+    })
+    .expect("install probe accounts");
+    for (control, local, keyless) in [
+        (false, true, true),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        let sink = Arc::new(CapturingFrameSink::default());
+        let mut capabilities = std::collections::BTreeSet::from([haider_rpc::Capability::View]);
+        if control {
+            capabilities.insert(haider_rpc::Capability::Control);
+        }
+        let connection = hub
+            .open_connection(
+                capabilities,
+                sink.clone(),
+                if local {
+                    crate::accounts::ConnectionTransport::LocalSameUid
+                } else {
+                    crate::accounts::ConnectionTransport::Remote
+                },
+            )
+            .expect("probe connection");
+        sink.0.lock().expect("probe frames").clear();
+        connection
+            .request(
+                haider_rpc::RequestId::new("customprov-probe-correlated"),
+                haider_rpc::RequestBody::ProviderModelsProbe {
+                    provider: "custom-fixture".into(),
+                    origin: "http://127.0.0.1:18080/v1".into(),
+                    api_family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
+                    keyless,
+                    probe_vault_reference: None,
+                },
+            )
+            .await
+            .expect("probe request handled");
+        if control && local {
+            let crate::accounts::AccountCommand::ProbeProviderModels(job) =
+                mailbox.try_recv().expect("probe actor job")
+            else {
+                panic!("probe dispatch must use the non-durable actor job");
+            };
+            assert_eq!(job.provider, "custom-fixture");
+            assert!(job.probe_secret.is_none());
+            assert_eq!(job.route.request_id.as_str(), "customprov-probe-correlated");
+            assert!(
+                sink.0.lock().expect("probe frames").is_empty(),
+                "connection hands off without waiting for network"
+            );
+        } else {
+            assert!(mailbox.try_recv().is_err());
+            assert!(matches!(sink.0.lock().expect("probe denial").as_slice(),
+                [WireFrame::Response { body: haider_rpc::ResponseBody::Error { code, .. }, .. }]
+                    if code == haider_rpc::ERROR_CODE_CAPABILITY_DENIED));
+        }
+        drop(connection);
+    }
+    assert_eq!(
+        store.management_revision().await.expect("probe revision"),
+        0
+    );
+    hub.shutdown().await.expect("probe hub stops");
+    store.close().await.expect("probe store closes");
+}

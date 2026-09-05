@@ -325,6 +325,7 @@ is §4.1.
 | `provider_configure_v1` | `provider.configure` |
 | `provider_remove_v1` | `provider.remove` |
 | `provider_models_v1` | `provider.models_refresh`, provider model inventories/details |
+| `provider_models_probe_v1` | `provider.models_probe`, ephemeral custom-provider discovery before create/edit |
 | `models_list_v1` | headless model enumeration composed from `provider.list` and `account.list`; it is not another RPC method |
 | `session_provider_rebind_v1` | `session.provider.rebind` |
 | `session_model_select_v1` | `session.select_model` |
@@ -543,6 +544,7 @@ force selector.
 | `account.oauth_start`, `account.oauth_status`, `account.oauth_cancel`, `account.oauth_import_sources`, `account.device_candidates` | same-named response | connection-bound flow/catalog reads/actions |
 | `account.set_label` | `AccountSetLabel` | control mutation; alias remains identity |
 | `provider.models_refresh` | `ProviderModelsRefresh` | provider snapshot refresh |
+| `provider.models_probe` | `ProviderModelsProbe` | Control-only asynchronous read; keyed probes require same-UID UDS, borrow a staged API key or the existing custom provider key, and write no profile, credential, receipt, or model cache |
 | `provider.configure`, `provider.remove` | same-named response | durable provider mutation |
 | `transcription.secret_get`, `transcription.secret_set` | same-named response | same-UID UDS-only secret read/write, not a command receipt |
 | `account.refresh` | `AccountRefresh` | re-derives informational identity from the vault-held credential; no secret field exists |
@@ -558,7 +560,7 @@ The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, account-source transcript and
 `provider_rebind_wire.json`, pins a request and successful response for every
-one of the 132 v1 request methods. `menu.answer` and resident
+one of the 133 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
 ### 5.3 Account identity and local-login adoption
@@ -2719,8 +2721,8 @@ The machine-checkable contract lives in these fixtures/tests:
   prompt-fork tail. Later fleet/agent/family additions bring the current
   transcript count to 183.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
-  67 supplemental methods, completing the historical transcript's 60 pairs,
-  four account-source pairs and one provider-rebind pair for all 132 request
+  68 supplemental methods, completing the historical transcript's 60 pairs,
+  four account-source pairs and one provider-rebind pair for all 133 request
   methods and all five command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/provider_rebind_wire.json`: the additive
   per-session routing request and durable receipt, generated from typed frames.

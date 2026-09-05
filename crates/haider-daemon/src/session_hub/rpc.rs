@@ -5747,6 +5747,80 @@ impl HubConnection {
                 }
                 self.provider_models_refresh(request_id, provider)
             }
+            RequestBody::ProviderModelsProbe {
+                provider,
+                origin,
+                api_family,
+                keyless,
+                probe_vault_reference,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if provider.trim().is_empty() || origin.trim().is_empty() {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        "model-probe provider and origin must not be empty",
+                        false,
+                        None,
+                    );
+                }
+                // Probing may borrow an already-vaulted credential as well
+                // as a staged one; both require the local secret surface.
+                if !keyless && self.secret_surface_facade(&request_id)?.is_none() {
+                    return Ok(());
+                }
+                let probe_secret = if let Some(reference) = probe_vault_reference {
+                    let borrowed = {
+                        let mut stages = lock(&self.stages)?;
+                        stages.probe(&reference)
+                    };
+                    match borrowed {
+                        Some((haider_rpc::StagePurpose::ApiKey, secret)) => Some(secret),
+                        Some(_) => {
+                            return self.respond_error(
+                                request_id,
+                                ERROR_CODE_INVALID_ARGUMENT,
+                                "staged secret was not staged for api_key use",
+                                false,
+                                None,
+                            );
+                        }
+                        None => return self.respond_error(
+                            request_id,
+                            ERROR_CODE_RESTAGE_REQUIRED,
+                            "staged secret is no longer available; stage the key again and retry",
+                            true,
+                            None,
+                        ),
+                    }
+                } else {
+                    None
+                };
+                self.send_management_command(
+                    request_id.clone(),
+                    crate::accounts::AccountCommand::ProbeProviderModels(Box::new(
+                        crate::accounts::ProviderModelsProbeJob {
+                            provider,
+                            origin,
+                            api_family,
+                            keyless,
+                            probe_secret,
+                            route: crate::accounts::LoginRoute {
+                                request_id,
+                                sink: Arc::clone(&self.sink),
+                            },
+                        },
+                    )),
+                )
+            }
             RequestBody::ProviderConfigure {
                 command_id,
                 provider,

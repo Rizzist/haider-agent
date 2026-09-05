@@ -1,0 +1,99 @@
+HEAD crates/haider-cli/tests/fixtures/oneshot_run_golden.jsonl: 0/28 changed records
+HEAD crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_text_turn.jsonl: 0/28 changed records
+HEAD crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_tool_turn.jsonl: 0/59 changed records
+HEAD crates/haider-cli/tests/fixtures/turnhygiene/provider_request_no_budget.json: 0/1 changed records
+MERGE_HEAD crates/haider-cli/tests/fixtures/oneshot_run_golden.jsonl: 1/28 changed records
+  line 23: /payload/scope/cache_boundaries/system_version
+MERGE_HEAD crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_text_turn.jsonl: 1/28 changed records
+  line 23: /payload/scope/cache_boundaries/system_version
+MERGE_HEAD crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_tool_turn.jsonl: 1/59 changed records
+  line 54: /payload/scope/cache_boundaries/system_version
+MERGE_HEAD crates/haider-cli/tests/fixtures/turnhygiene/provider_request_no_budget.json: 1/1 changed records
+  line 1: /messages, /tools
+368f093c6aab crates/haider-cli/tests/fixtures/oneshot_run_golden.jsonl: 17/28 changed records
+  line 12: /
+  line 13: /
+  line 14: /seq
+  line 15: /seq
+  line 16: /seq
+  line 17: /seq
+  line 18: /seq
+  line 19: /seq
+  line 20: /seq
+  line 21: /seq
+  line 22: /seq
+  line 23: /payload/scope/cache_boundaries/system_version, /seq
+  line 24: /seq
+  line 25: /seq
+  line 26: /seq
+  line 27: /seq
+  line 28: /seq
+368f093c6aab crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_text_turn.jsonl: 17/28 changed records
+  line 12: /
+  line 13: /
+  line 14: /event_id, /payload/item_id, /seq
+  line 15: /event_id, /payload/item_id, /seq
+  line 16: /event_id, /payload/item_id, /seq
+  line 17: /event_id, /payload/item_id, /seq
+  line 18: /event_id, /seq
+  line 19: /event_id, /payload/item_id, /seq
+  line 20: /event_id, /payload/item_id, /seq
+  line 21: /event_id, /payload/item_id, /seq
+  line 22: /event_id, /payload/item_id, /seq
+  line 23: /event_id, /payload/scope/cache_boundaries/system_version, /seq
+  line 24: /event_id, /payload/item_id, /seq
+  line 25: /event_id, /payload/item_id, /seq
+  line 26: /event_id, /payload/item_id, /seq
+  line 27: /event_id, /seq
+  line 28: /event_id, /seq
+368f093c6aab crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_tool_turn.jsonl: 48/59 changed records
+  line 12: /
+  line 13: /
+  line 14: /event_id, /payload/item_id, /seq
+  line 15: /event_id, /payload/item_id, /seq
+  line 16: /event_id, /payload/item_id, /seq
+  line 17: /event_id, /payload/item_id, /seq
+  line 18: /event_id, /seq
+  line 19: /event_id, /payload/item_id, /seq
+  line 20: /event_id, /payload/item_id, /seq
+  line 21: /event_id, /payload/item_id, /seq
+  line 22: /event_id, /payload/item_id, /seq
+  line 23: /event_id, /payload/item_id, /seq
+  line 24: /event_id, /payload/item_id, /seq
+  line 25: /event_id, /seq
+  line 26: /event_id, /seq
+  line 27: /event_id, /seq
+  line 28: /event_id, /seq
+  line 29: /event_id, /payload/item_id, /seq
+  line 30: /event_id, /payload/workspace_mutation/workspace_revision, /seq
+  line 31: /payload/workspace_revision, /seq
+  line 32: /event_id, /payload/result/preview, /seq
+  line 33: /event_id, /payload/item_id, /seq
+  line 34: /event_id, /seq
+  line 35: /event_id, /seq
+  line 36: /event_id, /payload/item_id, /seq
+  line 37: /event_id, /payload/item_id, /seq
+  line 38: /event_id, /payload/item_id, /seq
+  line 39: /event_id, /payload/item_id, /seq
+  line 40: /event_id, /seq
+  line 41: /event_id, /payload/item_id, /seq
+  line 42: /event_id, /payload/item_id, /seq
+  line 43: /event_id, /payload/item_id, /seq
+  line 44: /event_id, /payload/item_id, /seq
+  line 45: /event_id, /payload/item_id, /seq
+  line 46: /event_id, /payload/item_id, /seq
+  line 47: /event_id, /payload/item_id, /seq
+  line 48: /event_id, /payload/item_id, /seq
+  line 49: /event_id, /seq
+  line 50: /event_id, /payload/item_id, /seq
+  line 51: /event_id, /payload/item_id, /seq
+  line 52: /event_id, /payload/item_id, /seq
+  line 53: /event_id, /payload/item_id, /seq
+  line 54: /event_id, /payload/scope/cache_boundaries/system_version, /seq
+  line 55: /event_id, /payload/item_id, /seq
+  line 56: /event_id, /payload/item_id, /seq
+  line 57: /event_id, /payload/item_id, /seq
+  line 58: /event_id, /seq
+  line 59: /event_id, /seq
+368f093c6aab crates/haider-cli/tests/fixtures/turnhygiene/provider_request_no_budget.json: 1/1 changed records
+  line 1: /messages, /tools

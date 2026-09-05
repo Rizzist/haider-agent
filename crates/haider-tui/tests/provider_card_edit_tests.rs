@@ -191,8 +191,11 @@ fn existing_provider_origin_is_editable_but_name_is_not() {
         .apply_snapshot(vec![provider_summary("stable-provider")], 7);
     model.handle(key(KeyCode::Char('e')));
 
-    // The endpoint is a normal edit field.
-    model.handle(key(KeyCode::Tab));
+    // Discovery-backed edits begin on the editable endpoint.
+    assert_eq!(
+        model.custom_add.as_ref().expect("card").focus,
+        CustomField::Origin
+    );
     model.handle(key(KeyCode::End));
     model.handle(key(KeyCode::Char('x')));
     assert!(

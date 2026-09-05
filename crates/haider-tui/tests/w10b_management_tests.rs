@@ -55,8 +55,8 @@ fn provider_summary(name: &str) -> haider_rpc::ProviderSummaryWire {
         models: vec!["m-1".into()],
         model_details: Vec::new(),
         inventory_fetched_at_ms: None,
-        inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
-        auth_methods: Vec::new(),
+        inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Advisory,
+        auth_methods: vec![haider_protocol::credential::AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,
         default_model: Some("m-1".into()),
@@ -174,7 +174,7 @@ fn provider_remove_issues_and_surfaces_the_typed_refusal() {
     );
 }
 
-/// MUTATION CHECK: relock the origin in edit mode (Tab pins back to Model),
+/// MUTATION CHECK: relock the origin in edit mode,
 /// let Tab/BackTab land on the identity line, or drop the prefill. Expected
 /// RUNTIME failure: the assertions below — the endpoint becomes unreachable
 /// for repointing, or the fixed name takes focus.
@@ -195,24 +195,25 @@ fn edit_card_prefills_and_repoints_endpoint_with_locked_name() {
     assert_eq!(card.name, "probefix");
     assert_eq!(card.origin, "http://127.0.0.1:9999/v1");
     assert_eq!(card.model, "m-1");
-    assert_eq!(card.focus, CustomField::Model);
-    // The endpoint is repointable in place: Tab reaches the origin line…
-    model.handle(key(KeyCode::Tab));
-    assert_eq!(
-        model.custom_add.as_ref().expect("card").focus,
-        CustomField::Origin
-    );
-    // …and cycles back to the model, never onto the locked identity line.
-    model.handle(key(KeyCode::Tab));
-    assert_eq!(
-        model.custom_add.as_ref().expect("card").focus,
-        CustomField::Model
-    );
-    // BackTab mirrors the two-field cycle and also stays off the name line.
+    assert_eq!(card.focus, CustomField::Origin);
+    // Required endpoint/key fields precede auth; name and API family remain
+    // locked identities throughout the complete cycle.
+    for expected in [CustomField::Key, CustomField::Auth, CustomField::Origin] {
+        model.handle(key(KeyCode::Tab));
+        assert_eq!(model.custom_add.as_ref().expect("card").focus, expected);
+    }
     model.handle(key(KeyCode::BackTab));
     assert_eq!(
         model.custom_add.as_ref().expect("card").focus,
-        CustomField::Origin
+        CustomField::Auth
+    );
+    let family = model.custom_add.as_ref().expect("card").family;
+    model.custom_add.as_mut().expect("card").focus = CustomField::ApiFamily;
+    model.handle(key(KeyCode::Right));
+    assert_eq!(
+        model.custom_add.as_ref().expect("card").family,
+        family,
+        "an edit cannot switch an existing provider's API family"
     );
 }
 
@@ -234,8 +235,7 @@ fn edit_card_submits_repointed_origin_under_the_same_name() {
     model.handle(key(KeyCode::Char('e')));
     model.requests.clear();
 
-    // Focus the origin line and repoint the endpoint to a new address.
-    model.handle(key(KeyCode::Tab));
+    // Edit starts at origin; repoint it before discovery.
     assert_eq!(
         model.custom_add.as_ref().expect("card").focus,
         CustomField::Origin
@@ -252,6 +252,31 @@ fn edit_card_submits_repointed_origin_under_the_same_name() {
         "the origin line accepts edits in edit mode"
     );
 
+    model.handle(key(KeyCode::Enter)); // origin -> API key
+    model.handle(AppEvent::Paste("repoint-fixture-key".to_owned().into()));
+    model.handle(key(KeyCode::Enter));
+    let attempt = model
+        .requests
+        .iter()
+        .find_map(|request| match request {
+            AppRequest::CustomModelsProbe {
+                attempt,
+                name,
+                origin,
+                secret: Some(_),
+                ..
+            } if name == "probefix" && origin == "http://10.0.0.5:1234/v1" => Some(*attempt),
+            _ => None,
+        })
+        .expect("repointed endpoint is probed before any provider mutation");
+    assert!(
+        !model
+            .requests
+            .iter()
+            .any(|request| matches!(request, AppRequest::ProviderConfigure { .. }))
+    );
+    model.requests.clear();
+    model.custom_models_probed(attempt, vec!["m-1".into(), "m-2".into()], None, None);
     model.handle(key(KeyCode::Enter));
     let (name, origin, expected_revision) = model
         .requests
