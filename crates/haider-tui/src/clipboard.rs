@@ -1,18 +1,19 @@
 //! Auto-copy for the in-app selection (owner item 9).
 //!
-//! ORDER, documented: (1) `pbcopy` — the authoritative LOCAL macOS
-//! clipboard; (2) OSC 52 — best-effort, ALWAYS emitted after, so a remote
+//! ORDER, documented: (1) the platform writer — `pbcopy` on macOS, arboard's
+//! CF_UNICODETEXT writer on Windows, and the existing `pbcopy` attempt on
+//! other hosts; (2) OSC 52 — best-effort, ALWAYS emitted after, so a remote
 //! or embedded terminal viewing this TUI (ssh, a web terminal) can mirror
-//! the copy into its own host clipboard. Neither step may stall the event
-//! loop: `pbcopy` is spawned with a piped stdin (a screen's worth of text
-//! is far below the pipe buffer, so the write cannot block) and reaped on a
-//! detached thread; OSC 52 is a single buffered write the caller flushes
-//! with the frame.
+//! the copy into its own host clipboard. `pbcopy` success is confirmed by
+//! its exit status; Windows success is confirmed by `set_text`, which owns
+//! the clipboard while calling SetClipboardData. arboard 3.6.1 retries an
+//! occupied Windows clipboard five times at 5 ms (25 ms of retry sleeps).
+//! OSC 52 is a single buffered write the caller flushes with the frame.
 //!
 //! Failure is a FLASH, never a crash: an unconfirmed local copy reports
 //! `false` and the caller words the flash honestly (OSC 52 already went
-//! out, so the copy may still land via the terminal). A missing `pbcopy`
-//! (non-macOS host) degrades the same way.
+//! out, so the copy may still land via the terminal). A missing platform
+//! writer or busy clipboard degrades the same way.
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};
@@ -26,6 +27,47 @@ use base64::Engine as _;
 /// event loop.
 const CONFIRM_BOUND: Duration = Duration::from_millis(300);
 
+/// The authoritative local writer; OSC 52 remains a separate mirror.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalClipboardWriter {
+    Pbcopy,
+    WindowsArboard,
+}
+
+/// Keep the existing Unix behavior while selecting a real Windows writer.
+#[must_use]
+pub fn local_writer_for_os(os: &str) -> LocalClipboardWriter {
+    match os {
+        "windows" => LocalClipboardWriter::WindowsArboard,
+        _ => LocalClipboardWriter::Pbcopy,
+    }
+}
+
+/// Hand `text` to the host clipboard. Success means the platform writer
+/// confirmed ownership, never merely that the OSC 52 bytes were emitted.
+#[must_use]
+pub fn copy_local(text: &str) -> bool {
+    match local_writer_for_os(std::env::consts::OS) {
+        LocalClipboardWriter::Pbcopy => copy_pbcopy(text),
+        LocalClipboardWriter::WindowsArboard => arboard::Clipboard::new()
+            .and_then(|mut board| board.set_text(text))
+            .is_ok(),
+    }
+}
+
+/// Wording shared by the live copy effect and its tests. An OSC 52 mirror
+/// cannot establish whether the receiving terminal accepted the copy.
+#[must_use]
+pub const fn copy_confirmation(local_confirmed: bool, osc52_sent: bool) -> &'static str {
+    if local_confirmed {
+        "· copied"
+    } else if osc52_sent {
+        "· copy unconfirmed — sent via OSC 52 only"
+    } else {
+        "· copy failed — local clipboard and OSC 52 unavailable"
+    }
+}
+
 /// Hand `text` to the local clipboard via `pbcopy`. Returns `true` ONLY
 /// once the child's EXIT STATUS confirms success (review TUI4.1 P3-5 —
 /// success used to be claimed after spawn + stdin write, so a failing
@@ -34,7 +76,7 @@ const CONFIRM_BOUND: Duration = Duration::from_millis(300);
 /// and the copy reports UNCONFIRMED (`false`) — a bounded process-exit
 /// poll, not a synchronization sleep.
 #[must_use]
-pub fn copy_local(text: &str) -> bool {
+fn copy_pbcopy(text: &str) -> bool {
     let mut child = match Command::new("pbcopy")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -130,10 +172,10 @@ impl std::fmt::Debug for ClipboardImage {
 pub enum ClipboardContent {
     /// A raster image, already re-encoded as PNG.
     Image(ClipboardImage),
-    /// Text. The paste path leaves this ALONE — the terminal's own bracketed
-    /// paste already owns text, and duplicating it here would insert the
-    /// draft twice on terminals that pass the chord through as well.
-    Text,
+    /// Text from a forwarded paste chord, protected at the same ingress
+    /// boundary as terminal paste. A terminal-handled chord delivers paste
+    /// content instead of requesting this read.
+    Text(crate::app::Pasted),
     /// Nothing on the clipboard, or nothing in a shape we can use.
     Empty,
 }
@@ -167,11 +209,17 @@ impl ClipboardSource for OsClipboard {
             Ok(mut board) => match board.get_image() {
                 Ok(image) => encode_rgba_png(image.width, image.height, &image.bytes)
                     .map(ClipboardContent::Image),
-                // Not an image: text is the terminal's job, so only report
-                // WHICH of the two it was.
+                // A forwarded chord has not delivered text. Keep the bytes
+                // so the runtime can feed the ordinary atomic paste path.
                 Err(arboard::Error::ContentNotAvailable) => Ok(match board.get_text() {
-                    Ok(text) if !text.is_empty() => ClipboardContent::Text,
-                    _ => wayland_fallback().unwrap_or(ClipboardContent::Empty),
+                    Ok(text) if !text.is_empty() => ClipboardContent::Text(text.into()),
+                    Ok(_) | Err(arboard::Error::ContentNotAvailable) => {
+                        wayland_fallback().unwrap_or(ClipboardContent::Empty)
+                    }
+                    Err(error) => match wayland_fallback() {
+                        Some(content) => content,
+                        None => return Err(ClipboardError(clipboard_note(&error))),
+                    },
                 }),
                 Err(error) => match wayland_fallback() {
                     Some(content) => Ok(content),
@@ -314,8 +362,13 @@ impl FakeClipboard {
     }
 
     #[must_use]
-    pub const fn text() -> Self {
-        Self(Ok(ClipboardContent::Text))
+    pub fn text() -> Self {
+        Self::text_with("clipboard text")
+    }
+
+    #[must_use]
+    pub fn text_with(text: &str) -> Self {
+        Self(Ok(ClipboardContent::Text(text.to_owned().into())))
     }
 
     #[must_use]
