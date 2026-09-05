@@ -148,6 +148,8 @@ async fn daemon_restart_preserves_route_wait_with_partial_and_completed_tool_eff
     let completed_result = haider_protocol::tool::BoundedResult {
         preview: "completed once".into(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),

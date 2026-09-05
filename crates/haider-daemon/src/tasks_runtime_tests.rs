@@ -567,7 +567,7 @@ async fn dispatch(
     let ToolDispatchResult::Completed(result) = result else {
         panic!("tool `{name}` must complete, got a non-completed dispatch");
     };
-    serde_json::from_str(&result.preview).expect("tool preview is JSON")
+    serde_json::from_str(result.payload_text()).expect("tool preview is JSON")
 }
 
 async fn read_all(store: &SqliteStoreHandle, session_id: &SessionId) -> Vec<RawEnvelope> {

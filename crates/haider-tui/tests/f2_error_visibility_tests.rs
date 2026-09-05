@@ -431,6 +431,8 @@ fn failed_result(reason: &str) -> haider_protocol::tool::BoundedResult {
     haider_protocol::tool::BoundedResult {
         preview: String::new(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),

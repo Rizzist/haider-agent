@@ -28,7 +28,7 @@ use haider_protocol::task::{
     TASK_CONCURRENCY_CAP, TASK_OUTPUT_RETAIN_BYTES, TASK_TAIL_BYTES, TaskCompleted,
     TaskCompletionDelivery, TaskEventPayload, TaskStarted, TaskTerminalState,
 };
-use haider_protocol::tool::{BoundedResult, ToolResultStatus};
+use haider_protocol::tool::{BoundedResult, ToolResultStatus, ToolTruncation};
 use haider_tools::{
     BACKGROUND_KILL_GRACE, BackgroundExec, BackgroundExitStatus, EffectBroker, EffectOperation,
     PermissionPolicy, PidLiveness, ProcessExec, SharedTaskOutput, TaskKillHandle, ToolError,
@@ -357,6 +357,7 @@ impl TaskFacade {
                 state: state.clone(),
                 elapsed_ms: now_ms().saturating_sub(started.fact.started_at_ms),
                 output_bytes: 0,
+                output_sha256: None,
                 tail: String::new(),
                 artifact: None,
                 truncated: false,
@@ -425,6 +426,8 @@ impl TaskFacade {
                 })
                 .to_string(),
                 truncated: false,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: Vec::new(),
@@ -570,6 +573,8 @@ impl TaskFacade {
             })
             .to_string(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -626,10 +631,11 @@ impl TaskFacade {
             tracing::warn!(%session_id, task = %task, "running task lost its live output buffer");
             return;
         };
-        let (output_bytes, truncated, tail, retained) = {
+        let (output_bytes, output_sha256, truncated, tail, retained) = {
             let buffer = lock_task_output(output);
             (
                 buffer.total_bytes(),
+                buffer.output_sha256(),
                 buffer.truncated(),
                 buffer.tail_lossy(),
                 buffer.retained().to_vec(),
@@ -652,6 +658,7 @@ impl TaskFacade {
             state: state.clone(),
             elapsed_ms: now_ms().saturating_sub(entry.started_at_ms),
             output_bytes,
+            output_sha256: Some(output_sha256),
             tail,
             artifact,
             truncated,
@@ -743,21 +750,28 @@ impl TaskFacade {
                 .and_then(|fact| fact.artifact.clone()),
         };
         let state = task_state_value(&entry.state);
-        let (preview, result_cursor, truncated) = match cursor {
+        let (preview, result_cursor, truncated, provenance) = match cursor {
             None => {
-                let (output_bytes, truncated, tail) = if let Some(fact) = terminal_fact.as_ref() {
-                    (fact.output_bytes, fact.truncated, fact.tail.clone())
-                } else {
-                    let Some(output) = entry.output.as_ref() else {
-                        return Err(missing_task_output_backing(&task));
+                let (output_bytes, truncated, tail, output_sha256) =
+                    if let Some(fact) = terminal_fact.as_ref() {
+                        (
+                            fact.output_bytes,
+                            fact.truncated,
+                            fact.tail.clone(),
+                            fact.output_sha256.clone(),
+                        )
+                    } else {
+                        let Some(output) = entry.output.as_ref() else {
+                            return Err(missing_task_output_backing(&task));
+                        };
+                        let buffer = lock_task_output(output);
+                        (
+                            buffer.total_bytes(),
+                            buffer.truncated(),
+                            buffer.tail_lossy(),
+                            Some(buffer.output_sha256()),
+                        )
                     };
-                    let buffer = lock_task_output(output);
-                    (
-                        buffer.total_bytes(),
-                        buffer.truncated(),
-                        buffer.tail_lossy(),
-                    )
-                };
                 (
                     json!({
                         "task_id": task,
@@ -769,15 +783,21 @@ impl TaskFacade {
                     }),
                     None,
                     truncated,
+                    output_sha256.map(|sha256| (output_bytes, sha256)),
                 )
             }
             Some(cursor) => {
-                let (bytes, next_cursor, exhausted, output_bytes, truncated) =
-                    if let Some((artifact, output_bytes, truncated)) =
+                let (bytes, next_cursor, exhausted, output_bytes, truncated, output_sha256) =
+                    if let Some((artifact, output_bytes, truncated, output_sha256)) =
                         terminal_fact.as_ref().and_then(|fact| {
-                            fact.artifact
-                                .as_ref()
-                                .map(|artifact| (artifact, fact.output_bytes, fact.truncated))
+                            fact.artifact.as_ref().map(|artifact| {
+                                (
+                                    artifact,
+                                    fact.output_bytes,
+                                    fact.truncated,
+                                    fact.output_sha256.clone(),
+                                )
+                            })
                         })
                     {
                         let retained = self
@@ -787,7 +807,14 @@ impl TaskFacade {
                             .map_err(|error| ToolError::cas(error.message))?;
                         let (bytes, next_cursor, exhausted) =
                             read_task_output_page(&retained, cursor, TASK_OUTPUT_READ_BYTES);
-                        (bytes, next_cursor, exhausted, output_bytes, truncated)
+                        (
+                            bytes,
+                            next_cursor,
+                            exhausted,
+                            output_bytes,
+                            truncated,
+                            output_sha256,
+                        )
                     } else {
                         let Some(output) = entry.output.as_ref() else {
                             return Err(missing_task_output_backing(&task));
@@ -804,6 +831,10 @@ impl TaskFacade {
                             exhausted,
                             buffer.total_bytes(),
                             buffer.truncated(),
+                            terminal_fact.as_ref().map_or_else(
+                                || Some(buffer.output_sha256()),
+                                |fact| fact.output_sha256.clone(),
+                            ),
                         )
                     };
                 (
@@ -819,12 +850,15 @@ impl TaskFacade {
                     }),
                     Some(next_cursor.to_string()),
                     truncated,
+                    output_sha256.map(|sha256| (output_bytes, sha256)),
                 )
             }
         };
-        Ok(BoundedResult {
+        let mut result = BoundedResult {
             preview: preview.to_string(),
             truncated,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact,
             images: Vec::new(),
@@ -832,7 +866,16 @@ impl TaskFacade {
             status: ToolResultStatus::Completed,
             reason: None,
             presentation: None,
-        })
+        };
+        if truncated && let Some((original_bytes, sha256)) = provenance {
+            result.declare_truncation(ToolTruncation {
+                truncated: true,
+                original_bytes,
+                payload_bytes: result.preview.len() as u64,
+                sha256,
+            });
+        }
+        Ok(result)
     }
 
     /// Brokered pgid kill (LT5): journals intent/outcome around the
@@ -861,6 +904,8 @@ impl TaskFacade {
                 })
                 .to_string(),
                 truncated: false,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: Vec::new(),
@@ -886,6 +931,8 @@ impl TaskFacade {
             })
             .to_string(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -1257,6 +1304,8 @@ fn unknown_task_result(task_id: &str) -> BoundedResult {
         })
         .to_string(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),

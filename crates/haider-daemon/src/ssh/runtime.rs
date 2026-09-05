@@ -18,6 +18,7 @@ use haider_tools::CommandOutputSink;
 use russh::client;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, Disconnect};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use zeroize::Zeroizing;
 
@@ -279,6 +280,7 @@ impl SshRuntime {
                 stderr: String::new(),
                 stdout_truncated: false,
                 stderr_truncated: false,
+                truncation: None,
                 exit_code: None,
                 timed_out: true,
             }),
@@ -624,6 +626,8 @@ impl SshRuntime {
         let mut stderr = Vec::new();
         let mut stdout_truncated = false;
         let mut stderr_truncated = false;
+        let mut original_bytes = 0u64;
+        let mut original_sha256 = Sha256::new();
         let mut exit_code = None;
         let mut closed_by_operator = false;
         let mut close = request.close.clone();
@@ -648,6 +652,8 @@ impl SshRuntime {
             };
             let output_limit_reached = match message {
                 ChannelMsg::Data { data } => {
+                    original_bytes = original_bytes.saturating_add(data.len() as u64);
+                    original_sha256.update(data.as_ref());
                     let (limit_reached, retained) = append_bounded(
                         &mut stdout,
                         stderr.len(),
@@ -658,6 +664,8 @@ impl SshRuntime {
                     limit_reached
                 }
                 ChannelMsg::ExtendedData { data, .. } => {
+                    original_bytes = original_bytes.saturating_add(data.len() as u64);
+                    original_sha256.update(data.as_ref());
                     let (limit_reached, retained) = append_bounded(
                         &mut stderr,
                         stdout.len(),
@@ -693,6 +701,14 @@ impl SshRuntime {
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
             stdout_truncated,
             stderr_truncated,
+            truncation: (stdout_truncated || stderr_truncated).then(|| {
+                haider_protocol::tool::ToolTruncation {
+                    truncated: true,
+                    original_bytes,
+                    payload_bytes: 0,
+                    sha256: format!("{:x}", original_sha256.finalize()),
+                }
+            }),
             exit_code,
             timed_out: false,
         })

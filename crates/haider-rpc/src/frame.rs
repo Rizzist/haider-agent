@@ -1657,6 +1657,8 @@ pub struct SshShellResultWire {
     #[serde(default, skip_serializing_if = "is_false")]
     pub stderr_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<haider_protocol::tool::ToolTruncation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     pub timed_out: bool,
 }
@@ -4477,6 +4479,9 @@ pub enum ResponseBody {
     /// Verified content address and decoded byte count for `artifact.put`.
     #[serde(rename = "artifact.put")]
     ArtifactPut { artifact: ArtifactRef, bytes: u64 },
+    /// Acknowledges one complete binary upload frame; never publishes a partial artifact.
+    #[serde(rename = "artifact.put.progress")]
+    ArtifactPutProgress { bytes: u64 },
     /// Durable acceptance coordinates of an atomic `session.create` (R2):
     /// a same-command retry receives this exact body from its receipt.
     #[serde(rename = "session.create")]

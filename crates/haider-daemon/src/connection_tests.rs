@@ -358,8 +358,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        113,
-        "read-only negotiation, request-budget policy and continuation negotiation extend the prior 111-feature set"
+        114,
+        "binary artifact uploads extend the prior 113-feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -376,6 +376,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_ACCOUNT_SOURCES_V1.to_owned(),
             FEATURE_ACCOUNT_ROTATION_V1.to_owned(),
             haider_rpc::FEATURE_ARTIFACT_PUT_V1.to_owned(),
+            haider_rpc::binary_artifact::FEATURE.to_owned(),
             haider_rpc::FEATURE_EXPORT_SEQ_V1.to_owned(),
             haider_rpc::FEATURE_BRANCH_CREATE_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_FORK_V1.to_owned(),

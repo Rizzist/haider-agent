@@ -1513,6 +1513,8 @@ fn process_start_observer_surfaces_second_permission_and_terminal_exec_text() {
                     result: haider_protocol::tool::BoundedResult {
                         preview: "fixture tool result".into(),
                         truncated: false,
+                        truncation: None,
+                        effects: Vec::new(),
                         artifact: None,
                         images: Vec::new(),
                         cursor: None,

@@ -1,0 +1,12 @@
+test measure_cold_fold_after_several_compactions ... ignored, manual multi-compaction cold-cache timing probe
+test accounts::accounts_tests::live_smoke_packaged_default_model_validates_a_real_key ... ignored, live Anthropic API smoke; requires HAIDER_ANTHROPIC_API_KEY
+test accounts::accounts_tests::validator_ping_uses_real_adapter_and_stores_no_secret_in_errors ... ignored, live Gemini validator ping; requires HAIDER_LIVE_PROVIDER_TESTS=1
+test mobile_transport::mobile_transport_tests::host_loopback_gate_authenticates_and_advertises_capabilities ... ignored, requires a host that permits numeric loopback socket binds
+test live_anthropic_second_turn_reads_cached_prompt_prefix ... ignored, live Anthropic cache assertion; requires HAIDER_LIVE_PROVIDER_TESTS=1
+test live_anthropic_text_smoke_is_explicitly_gated ... ignored, live Anthropic smoke; requires HAIDER_LIVE_PROVIDER_TESTS=1
+test promote_sanitized_real_anthropic_captures ... ignored, promotes fixtures; requires both live and explicit promotion gates
+test live_gemini_text_smoke_is_explicitly_gated ... ignored, live Gemini smoke; requires HAIDER_LIVE_PROVIDER_TESTS=1
+test promote_sanitized_real_gemini_captures ... ignored, captures Gemini fixtures; requires live, promotion, and output-dir gates
+test live_openai_responses_text_smoke_is_explicitly_gated ... ignored, live OpenAI smoke; requires HAIDER_LIVE_PROVIDER_TESTS=1
+test live_anthropic_oauth_meter_parses_and_normalizes ... ignored, live anthropic-oauth usage poll; requires HAIDER_LIVE_USAGE_TESTS=1 + HAIDER_ANTHROPIC_OAUTH_TOKEN
+test computer::macos::tests::manual_real_hardware_screenshot ... ignored, requires an interactive macOS display and Screen Recording permission

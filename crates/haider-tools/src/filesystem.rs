@@ -75,7 +75,9 @@ use haider_platform::WorkspaceDirectory as OwnedFd;
 use haider_protocol::checkpoint::{CheckpointKind, CheckpointOrigin};
 use haider_protocol::effect::{EffectClass, FileFreshness, WorkspaceMutation};
 use haider_protocol::ids::{ArtifactRef, BranchId, RunId, SessionId};
-use haider_protocol::tool::{BoundedResult, DispatchMode, ToolManifest};
+use haider_protocol::tool::{
+    BoundedResult, DispatchMode, ToolFileEffect, ToolFileEffectKind, ToolManifest, ToolTruncation,
+};
 use haider_protocol::tool::{FsSearchMatch, ToolResultData, ToolTruncationReason};
 use regex::{Regex, RegexBuilder};
 use regex_syntax::ParserBuilder as RegexParserBuilder;
@@ -83,6 +85,7 @@ use regex_syntax::hir::{Capture, Hir, HirKind, Look};
 #[cfg(unix)]
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use std::borrow::Cow;
 #[cfg(test)]
 use std::collections::HashSet;
@@ -1459,6 +1462,10 @@ impl EffectBroker {
                     None,
                 ),
             };
+            let applied_effects = match &result {
+                Ok(result) => result.effects.clone(),
+                Err(error) => error.applied_effects().to_vec(),
+            };
             let checkpoint = match capture {
                 Some(capture) => {
                     let input = checkpoint_freeze_input(&checkpoint_attribution, &intent.effect);
@@ -1494,6 +1501,7 @@ impl EffectBroker {
             let result = finish
                 .finish_with_checkpoint(result, freshness, workspace_mutation, checkpoint)
                 .await;
+            let result = result.map_err(|error| error.with_applied_effects(applied_effects));
             let error = result.as_ref().err().cloned();
             let _ = result_sender.send(result);
             error
@@ -1622,6 +1630,10 @@ impl EffectBroker {
                     None,
                 ),
             };
+            let applied_effects = match &result {
+                Ok(result) => result.effects.clone(),
+                Err(error) => error.applied_effects().to_vec(),
+            };
             let checkpoint = match capture {
                 Some(capture) => {
                     let input = checkpoint_freeze_input(&checkpoint_attribution, &intent.effect);
@@ -1657,6 +1669,7 @@ impl EffectBroker {
             let result = finish
                 .finish_with_checkpoint(result, freshness, workspace_mutation, checkpoint)
                 .await;
+            let result = result.map_err(|error| error.with_applied_effects(applied_effects));
             let error = result.as_ref().err().cloned();
             let _ = result_sender.send(result);
             error
@@ -1804,6 +1817,10 @@ impl EffectBroker {
                     None,
                 ),
             };
+            let applied_effects = match &result {
+                Ok(result) => result.effects.clone(),
+                Err(error) => error.applied_effects().to_vec(),
+            };
             let checkpoint = match capture {
                 Some(capture) => {
                     let input = checkpoint_freeze_input(&checkpoint_attribution, &intent.effect);
@@ -1839,6 +1856,7 @@ impl EffectBroker {
             let result = finish
                 .finish_with_checkpoint(result, None, workspace_mutation, checkpoint)
                 .await;
+            let result = result.map_err(|error| error.with_applied_effects(applied_effects));
             let error = result.as_ref().err().cloned();
             let _ = result_sender.send(result);
             error
@@ -2602,6 +2620,7 @@ struct SearchOutput {
     match_count: usize,
     max_matches: usize,
     total_bytes: usize,
+    original_sha256: String,
     complete: tempfile::NamedTempFile,
     footprint: Option<ReadFootprint>,
     structured: Vec<FsSearchMatch>,
@@ -2616,6 +2635,7 @@ struct SearchCollector {
     preview: String,
     match_count: usize,
     total_bytes: usize,
+    original_hasher: Sha256,
     max_preview_bytes: usize,
     max_matches: usize,
     preview_saturated: bool,
@@ -2663,6 +2683,7 @@ impl SearchCollector {
             preview: String::new(),
             match_count: 0,
             total_bytes: 0,
+            original_hasher: Sha256::new(),
             max_preview_bytes,
             max_matches,
             preview_saturated: false,
@@ -2699,6 +2720,8 @@ impl SearchCollector {
             .write_all(raw_line.as_bytes())
             .and_then(|()| self.complete.write_all(b"\n"))
             .map_err(|error| ToolError::io("write search result spool", "<search>", error))?;
+        self.original_hasher.update(raw_line.as_bytes());
+        self.original_hasher.update(b"\n");
         self.total_bytes = projected_bytes;
         let first_match_index = self.match_count;
         self.match_count = self.match_count.saturating_add(structured.len());
@@ -2806,6 +2829,7 @@ impl SearchCollector {
             match_count: self.match_count,
             max_matches: self.max_matches,
             total_bytes: self.total_bytes,
+            original_sha256: format!("{:x}", self.original_hasher.finalize()),
             complete: self.complete,
             footprint,
             structured: self.structured,
@@ -3946,6 +3970,8 @@ mod read_memo_tests {
             result: BoundedResult {
                 preview: byte.to_string().repeat(900),
                 truncated: true,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: Some(ArtifactRef::new(format!("blake3:{byte}"))),
                 images: Vec::new(),
@@ -4130,6 +4156,44 @@ struct AppliedMutation {
     paths: Vec<PathBuf>,
     post_digest: String,
     checkpoint: CheckpointCapture,
+}
+
+impl AppliedMutation {
+    /// The receipt and change ledger already own the ordered relative and
+    /// absolute paths. Attach metadata before either is moved into its durable
+    /// finalizer; never reread a mutable path to infer the completed effect.
+    fn with_file_effects(mut self, bytes: u64, move_destination_existed: bool) -> Self {
+        debug_assert_eq!(self.paths.len(), self.checkpoint.paths.len());
+        self.result.effects = self
+            .paths
+            .iter()
+            .zip(&self.checkpoint.paths)
+            .enumerate()
+            .map(|(index, (absolute, captured))| {
+                let kind = match self.checkpoint.kind {
+                    CheckpointKind::Write => ToolFileEffectKind::Write,
+                    CheckpointKind::Create => ToolFileEffectKind::Create,
+                    CheckpointKind::Edit => ToolFileEffectKind::Edit,
+                    CheckpointKind::Delete => ToolFileEffectKind::Delete,
+                    CheckpointKind::Move if index == 0 => ToolFileEffectKind::Delete,
+                    CheckpointKind::Move if move_destination_existed => ToolFileEffectKind::Write,
+                    CheckpointKind::Move => ToolFileEffectKind::Create,
+                };
+                ToolFileEffect {
+                    kind,
+                    name: absolute
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    path: captured.path.clone(),
+                    absolute_path: absolute.to_string_lossy().into_owned(),
+                    bytes,
+                }
+            })
+            .collect();
+        self
+    }
 }
 
 enum MutationWorkerOutcome {
@@ -4635,7 +4699,7 @@ where
     let effect = context.effect.clone();
     if let Err(error) = sync_mutation_parents(&paths) {
         return MutationWorkerOutcome::PostApplyFailed {
-            error,
+            error: error.with_applied_effects(result.effects),
             effect,
             post_digest,
             checkpoint,
@@ -4658,7 +4722,7 @@ where
             checkpoint,
         },
         Err(error) => MutationWorkerOutcome::PostApplyFailed {
-            error,
+            error: error.with_applied_effects(result.effects),
             effect,
             post_digest,
             checkpoint,
@@ -4769,6 +4833,8 @@ fn apply_windows_write(
                 operation.path.display()
             ),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -4790,7 +4856,8 @@ fn apply_windows_write(
             }],
             post_digest,
         },
-    })
+    }
+    .with_file_effects(bytes.len() as u64, false))
 }
 
 #[cfg(windows)]
@@ -4905,6 +4972,8 @@ fn apply_windows_edit(
                 if replacements == 1 { "" } else { "s" }
             ),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -4926,7 +4995,8 @@ fn apply_windows_edit(
             }],
             post_digest,
         },
-    })
+    }
+    .with_file_effects(bytes.len() as u64, false))
 }
 
 #[cfg(windows)]
@@ -5535,6 +5605,12 @@ fn apply_windows_path(
     let source_identity = source_entry.identity;
     let source_preimage =
         capture_windows_entry_preimage(&mut source_entry, source_relative, &operation.source)?;
+    let effect_bytes = if source_identity.directory {
+        0
+    } else {
+        source_identity.size
+    };
+    let mut move_destination_existed = false;
     let source_post_digest = source_preimage.pre_digest.clone();
     let mut checkpoint_kind = CheckpointKind::Delete;
     let mut checkpoint_paths = vec![CheckpointCapturePath {
@@ -5639,6 +5715,7 @@ fn apply_windows_path(
                     });
             }
             destination_preimage.post_digest = source_post_digest.clone();
+            move_destination_existed = destination_entry.is_some();
             match operation.operation {
                 FsPathOperation::Move => {
                     checkpoint_kind = CheckpointKind::Move;
@@ -5744,7 +5821,8 @@ fn apply_windows_path(
             paths: checkpoint_paths,
             post_digest,
         },
-    })
+    }
+    .with_file_effects(effect_bytes, move_destination_existed))
 }
 
 #[cfg(windows)]
@@ -6253,7 +6331,7 @@ where
     let effect = context.effect.clone();
     if let Err(error) = sync_mutation_parents(&paths) {
         return MutationWorkerOutcome::PostApplyFailed {
-            error,
+            error: error.with_applied_effects(result.effects),
             effect,
             post_digest,
             checkpoint,
@@ -6276,7 +6354,7 @@ where
             checkpoint,
         },
         Err(error) => MutationWorkerOutcome::PostApplyFailed {
-            error,
+            error: error.with_applied_effects(result.effects),
             effect,
             post_digest,
             checkpoint,
@@ -6396,6 +6474,8 @@ fn apply_write_at(
                 operation.path.display()
             ),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -6417,7 +6497,8 @@ fn apply_write_at(
             }],
             post_digest,
         },
-    })
+    }
+    .with_file_effects(bytes.len() as u64, false))
 }
 
 #[cfg(unix)]
@@ -6443,7 +6524,7 @@ where
     let effect = context.effect.clone();
     if let Err(error) = sync_mutation_parents(&paths) {
         return MutationWorkerOutcome::PostApplyFailed {
-            error,
+            error: error.with_applied_effects(result.effects),
             effect,
             post_digest,
             checkpoint,
@@ -6466,7 +6547,7 @@ where
             checkpoint,
         },
         Err(error) => MutationWorkerOutcome::PostApplyFailed {
-            error,
+            error: error.with_applied_effects(result.effects),
             effect,
             post_digest,
             checkpoint,
@@ -6641,6 +6722,8 @@ fn apply_edit_at_with_commit_hooks(
                 if replacements == 1 { "" } else { "s" }
             ),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -6662,7 +6745,8 @@ fn apply_edit_at_with_commit_hooks(
             }],
             post_digest,
         },
-    })
+    }
+    .with_file_effects(bytes.len() as u64, false))
 }
 
 #[cfg(unix)]
@@ -6694,7 +6778,7 @@ where
     let effect = context.effect.clone();
     if let Err(error) = sync_mutation_parents(&paths) {
         return MutationWorkerOutcome::PostApplyFailed {
-            error,
+            error: error.with_applied_effects(result.effects),
             effect,
             post_digest,
             checkpoint,
@@ -6717,7 +6801,7 @@ where
             checkpoint,
         },
         Err(error) => MutationWorkerOutcome::PostApplyFailed {
-            error,
+            error: error.with_applied_effects(result.effects),
             effect,
             post_digest,
             checkpoint,
@@ -6787,6 +6871,15 @@ fn apply_path_at_with_commit_hook(
         source_relative,
         &operation.source,
     )?;
+    let effect_bytes = if FileType::from_raw_mode(source_metadata.st_mode) == FileType::Directory {
+        0
+    } else {
+        u64::try_from(source_metadata.st_size).map_err(|_| ToolError::PathChanged {
+            path: operation.source.clone(),
+            message: "fs_path source reported a negative size".into(),
+        })?
+    };
+    let mut move_destination_existed = false;
     let source_post_digest = source_preimage.pre_digest.clone();
     let mut checkpoint_kind = CheckpointKind::Delete;
     let mut checkpoint_paths = vec![CheckpointCapturePath {
@@ -6891,6 +6984,7 @@ fn apply_path_at_with_commit_hook(
                     });
             }
             destination_preimage.post_digest = source_post_digest.clone();
+            move_destination_existed = destination_metadata.is_some();
             match operation.operation {
                 FsPathOperation::Move => {
                     checkpoint_kind = CheckpointKind::Move;
@@ -7110,7 +7204,8 @@ fn apply_path_at_with_commit_hook(
             paths: checkpoint_paths,
             post_digest,
         },
-    })
+    }
+    .with_file_effects(effect_bytes, move_destination_existed))
 }
 
 #[cfg(unix)]
@@ -7124,6 +7219,8 @@ fn mutation_result(preview: String) -> BoundedResult {
     BoundedResult {
         preview,
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),
@@ -8099,15 +8196,19 @@ where
     let artifact_required = semantic_truncated
         || contents_len > bounds.max_preview_bytes
         || redacted.full_len > bounds.max_preview_bytes;
+    let truncation =
+        truncated.then(|| ToolTruncation::from_bytes(contents.as_bytes(), redacted.text.len()));
     drop(presented);
     let artifact = if artifact_required {
         Some(cas.put_owned(contents.into_bytes()).await?)
     } else {
         None
     };
-    Ok(BoundedResult {
+    let mut result = BoundedResult {
         preview: redacted.text,
         truncated,
+        truncation: None,
+        effects: Vec::new(),
         data,
         artifact,
         images: Vec::new(),
@@ -8115,7 +8216,11 @@ where
         status: haider_protocol::tool::ToolResultStatus::Completed,
         reason: None,
         presentation: None,
-    })
+    };
+    if let Some(truncation) = truncation {
+        result.declare_truncation(truncation);
+    }
+    Ok(result)
 }
 
 async fn bounded_search<C>(
@@ -8140,6 +8245,12 @@ where
         } else {
             None
         });
+    let truncation = ToolTruncation {
+        truncated: true,
+        original_bytes: output.total_bytes as u64,
+        payload_bytes: output.preview.len() as u64,
+        sha256: output.original_sha256,
+    };
     let artifact = if truncated {
         Some(cas.put_file(output.complete.path()).await?)
     } else {
@@ -8148,6 +8259,8 @@ where
     let mut result = BoundedResult {
         preview: output.preview,
         truncated,
+        truncation: None,
+        effects: Vec::new(),
         data: Some(ToolResultData::FsSearch {
             matches: output.structured,
             truncated_reason,
@@ -8163,7 +8276,14 @@ where
         reason: None,
         presentation: None,
     };
+    if result.truncated {
+        result.declare_truncation(truncation.clone());
+    }
     enforce_search_wire_cap(&mut result)?;
+    if result.truncated && result.truncation.is_none() {
+        result.declare_truncation(truncation);
+        enforce_search_wire_cap(&mut result)?;
+    }
     Ok(result)
 }
 
@@ -8189,12 +8309,15 @@ fn enforce_search_wire_cap(result: &mut BoundedResult) -> ToolResult<()> {
         };
         *truncated_reason = Some(ToolTruncationReason::ResultBytes);
         if matches.pop().is_none() {
-            if result.preview.is_empty() {
+            if result.payload_text().is_empty() {
                 return Err(ToolError::Runtime {
                     message: "fs_search metadata exceeded its hard result-byte cap".into(),
                 });
             }
             result.preview.clear();
+            if let Some(truncation) = result.truncation.clone() {
+                result.declare_truncation(truncation);
+            }
         }
     }
     Ok(())
@@ -8214,14 +8337,18 @@ where
     let truncated_reason = output
         .truncated_reason
         .or(byte_truncated.then_some(ToolTruncationReason::ResultBytes));
+    let truncation = truncated
+        .then(|| ToolTruncation::from_bytes(output.contents.as_bytes(), output.preview.len()));
     let artifact = if truncated {
         Some(cas.put_owned(output.contents.into_bytes()).await?)
     } else {
         None
     };
-    Ok(BoundedResult {
+    let mut result = BoundedResult {
         preview: utf8_prefix(&output.preview, bounds.max_preview_bytes).to_owned(),
         truncated,
+        truncation: None,
+        effects: Vec::new(),
         data: Some(ToolResultData::FsGlob {
             truncated_reason,
             skipped_sensitive: output.skipped_sensitive,
@@ -8234,7 +8361,11 @@ where
         status: haider_protocol::tool::ToolResultStatus::Completed,
         reason: None,
         presentation: None,
-    })
+    };
+    if let Some(truncation) = truncation {
+        result.declare_truncation(truncation);
+    }
+    Ok(result)
 }
 
 fn utf8_prefix(text: &str, max_bytes: usize) -> &str {

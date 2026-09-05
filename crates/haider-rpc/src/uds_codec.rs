@@ -724,6 +724,7 @@ pub struct DecodeBatch {
     /// Valid `artifact.put` requests decoded in-place by the daemon-only
     /// decoder mode.
     pub artifact_puts: Vec<InPlaceArtifactPut>,
+    pub binary_artifacts: Vec<crate::binary_artifact::Frame>,
     /// The terminal error, if this chunk poisoned the decoder.
     pub error: Option<CodecError>,
 }
@@ -737,6 +738,7 @@ pub struct DecodeStep {
     /// One daemon-bound `artifact.put` whose base64 bytes were decoded by
     /// reusing the completed decoder allocation.
     pub artifact_put: Option<InPlaceArtifactPut>,
+    pub binary_artifact: Option<crate::binary_artifact::Frame>,
     /// Exact bytes consumed from the supplied chunk.
     pub consumed: usize,
     /// The terminal error, if this step poisoned the decoder.
@@ -744,18 +746,11 @@ pub struct DecodeStep {
 }
 
 impl DecodeBatch {
-    fn complete(frames: Vec<WireFrame>) -> Self {
-        Self {
-            frames,
-            artifact_puts: Vec::new(),
-            error: None,
-        }
-    }
-
     fn failed(frames: Vec<WireFrame>, error: CodecError) -> Self {
         Self {
             frames,
             artifact_puts: Vec::new(),
+            binary_artifacts: Vec::new(),
             error: Some(error),
         }
     }
@@ -938,6 +933,8 @@ pub struct Decoder {
     zeroize_bodies: bool,
     encoding: WireEncoding,
     decode_artifact_put_in_place: bool,
+    binary_enabled: bool,
+    binary_body: bool,
 }
 
 impl Decoder {
@@ -952,6 +949,8 @@ impl Decoder {
             zeroize_bodies: false,
             encoding: WireEncoding::Json,
             decode_artifact_put_in_place: false,
+            binary_enabled: false,
+            binary_body: false,
         }
     }
 
@@ -998,6 +997,15 @@ impl Decoder {
         }
     }
 
+    /// Enable binary artifact bodies only at a negotiated frame boundary.
+    pub fn set_binary_artifacts(&mut self, enabled: bool) {
+        if matches!(&self.state, DecodeState::Prefix { filled: 0, .. }) {
+            self.binary_enabled = enabled;
+        } else {
+            self.poison();
+        }
+    }
+
     /// Returns whether a prior protocol violation permanently poisoned this
     /// decoder.
     pub fn is_poisoned(&self) -> bool {
@@ -1013,21 +1021,31 @@ impl Decoder {
     /// connection.
     pub fn push(&mut self, mut chunk: &[u8]) -> DecodeBatch {
         let mut frames = Vec::new();
+        let mut binary_artifacts = Vec::new();
         while !chunk.is_empty() {
             let step = self.push_one(chunk);
             chunk = &chunk[step.consumed..];
             if let Some(frame) = step.frame {
                 frames.push(frame);
             }
+            if let Some(frame) = step.binary_artifact {
+                binary_artifacts.push(frame);
+            }
             if let Some(artifact_put) = step.artifact_put {
                 return DecodeBatch {
                     frames,
                     artifact_puts: vec![artifact_put],
+                    binary_artifacts,
                     error: step.error,
                 };
             }
             if let Some(error) = step.error {
-                return DecodeBatch::failed(frames, error);
+                return DecodeBatch {
+                    frames,
+                    artifact_puts: Vec::new(),
+                    binary_artifacts,
+                    error: Some(error),
+                };
             }
             if step.consumed == 0 {
                 break;
@@ -1036,7 +1054,12 @@ impl Decoder {
         if self.is_poisoned() {
             DecodeBatch::failed(frames, CodecError::DecoderPoisoned)
         } else {
-            DecodeBatch::complete(frames)
+            DecodeBatch {
+                frames,
+                artifact_puts: Vec::new(),
+                binary_artifacts,
+                error: None,
+            }
         }
     }
 
@@ -1049,6 +1072,7 @@ impl Decoder {
             return DecodeStep {
                 frame: None,
                 artifact_put: None,
+                binary_artifact: None,
                 consumed: 0,
                 error: Some(CodecError::DecoderPoisoned),
             };
@@ -1071,6 +1095,7 @@ impl Decoder {
                             return DecodeStep {
                                 frame: None,
                                 artifact_put: None,
+                                binary_artifact: None,
                                 consumed,
                                 error: Some(error),
                             };
@@ -1100,11 +1125,30 @@ impl Decoder {
                                 return DecodeStep {
                                     frame: None,
                                     artifact_put: None,
+                                    binary_artifact: None,
                                     consumed,
                                     error: Some(CodecError::DecoderPoisoned),
                                 };
                             }
                         };
+                        if self.binary_body {
+                            let decoded = crate::binary_artifact::decode(&body);
+                            body.zeroize();
+                            let (binary_artifact, error) = match decoded {
+                                Ok(frame) => (Some(frame), None),
+                                Err(error) => {
+                                    self.poison();
+                                    (None, Some(error))
+                                }
+                            };
+                            return DecodeStep {
+                                frame: None,
+                                artifact_put: None,
+                                binary_artifact,
+                                consumed,
+                                error,
+                            };
+                        }
                         let in_place = self
                             .decode_artifact_put_in_place
                             .then(|| decode_artifact_put_in_place(&mut body, self.encoding))
@@ -1113,6 +1157,7 @@ impl Decoder {
                             return DecodeStep {
                                 frame: None,
                                 artifact_put: Some(artifact_put),
+                                binary_artifact: None,
                                 consumed,
                                 error: None,
                             };
@@ -1132,6 +1177,7 @@ impl Decoder {
                                 return DecodeStep {
                                     frame: Some(frame),
                                     artifact_put: None,
+                                    binary_artifact: None,
                                     consumed,
                                     error: None,
                                 };
@@ -1141,6 +1187,7 @@ impl Decoder {
                                 return DecodeStep {
                                     frame: None,
                                     artifact_put: None,
+                                    binary_artifact: None,
                                     consumed,
                                     error: Some(error),
                                 };
@@ -1152,6 +1199,7 @@ impl Decoder {
                     return DecodeStep {
                         frame: None,
                         artifact_put: None,
+                        binary_artifact: None,
                         consumed,
                         error: Some(CodecError::DecoderPoisoned),
                     };
@@ -1161,12 +1209,27 @@ impl Decoder {
         DecodeStep {
             frame: None,
             artifact_put: None,
+            binary_artifact: None,
             consumed,
             error: None,
         }
     }
 
     fn start_body(&mut self, announced_len: usize) -> Result<(), CodecError> {
+        self.binary_body = announced_len & crate::binary_artifact::PREFIX_FLAG as usize != 0;
+        if self.binary_body && !self.binary_enabled {
+            self.poison();
+            return Err(CodecError::InvalidBinaryFrame);
+        }
+        let announced_len = announced_len & !(crate::binary_artifact::PREFIX_FLAG as usize);
+        if self.binary_body && announced_len > crate::binary_artifact::MAX_FRAME_BYTES {
+            self.poison();
+            return Err(CodecError::FrameLimitExceeded {
+                frame_limit: crate::binary_artifact::MAX_FRAME_BYTES,
+                announced_len: Some(announced_len),
+            });
+        }
+
         if announced_len == 0 {
             self.state = DecodeState::Poisoned;
             return Err(CodecError::EmptyFrame);

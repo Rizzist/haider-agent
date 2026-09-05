@@ -373,6 +373,7 @@ impl EffectBroker {
 /// memory stays bounded while the task keeps running.
 #[derive(Debug)]
 pub struct TaskOutputBuffer {
+    original_hasher: sha2::Sha256,
     retained: Vec<u8>,
     retain_cap: usize,
     tail: VecDeque<u8>,
@@ -384,6 +385,7 @@ impl TaskOutputBuffer {
     #[must_use]
     pub fn new(retain_cap: usize, tail_cap: usize) -> Self {
         Self {
+            original_hasher: sha2::Sha256::default(),
             retained: Vec::new(),
             retain_cap,
             tail: VecDeque::new(),
@@ -393,6 +395,8 @@ impl TaskOutputBuffer {
     }
 
     pub fn append(&mut self, bytes: &[u8]) {
+        use sha2::Digest as _;
+        self.original_hasher.update(bytes);
         self.total = self.total.saturating_add(bytes.len() as u64);
         let room = self.retain_cap.saturating_sub(self.retained.len());
         self.retained
@@ -406,6 +410,13 @@ impl TaskOutputBuffer {
     #[must_use]
     pub fn total_bytes(&self) -> u64 {
         self.total
+    }
+
+    /// Hash every captured byte, independent of retained head/tail limits.
+    #[must_use]
+    pub fn output_sha256(&self) -> String {
+        use sha2::Digest as _;
+        format!("{:x}", self.original_hasher.clone().finalize())
     }
 
     /// True when output beyond the retained cap was dropped.
@@ -1079,5 +1090,35 @@ pub fn task_kill_manifest() -> haider_protocol::tool::ToolManifest {
             "required": ["task_id"],
             "additionalProperties": false,
         }),
+    }
+}
+
+#[cfg(test)]
+mod toolshape_tests {
+    use super::TaskOutputBuffer;
+
+    #[test]
+    fn toolshape_task_buffer_hashes_original_bytes_after_retention_cap() {
+        let original = b"head\0\xffbodytail";
+        let mut buffer = TaskOutputBuffer::new(4, 4);
+        for chunk in original.chunks(3) {
+            buffer.append(chunk);
+        }
+        assert_eq!(buffer.retained(), b"head");
+        assert_eq!(buffer.tail_lossy(), "tail");
+        assert_eq!(buffer.total_bytes(), original.len() as u64);
+        assert!(buffer.truncated());
+        assert_eq!(
+            buffer.output_sha256(),
+            "61a81f962a05782adddcf8c6b1f933791f78b95e577576cee9bf7f05e7e78d73"
+        );
+        let mut dropped = TaskOutputBuffer::new(0, 0);
+        dropped.append(original);
+        assert!(dropped.retained().is_empty());
+        assert_eq!(dropped.output_sha256(), buffer.output_sha256());
+        assert_eq!(
+            TaskOutputBuffer::new(0, 0).output_sha256(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 }

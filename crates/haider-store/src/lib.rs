@@ -22,7 +22,7 @@ mod profile_lock;
 mod provider_view_store;
 mod usage_ledger;
 
-pub use cas::{FileCas, validate_image_block};
+pub use cas::{CasUpload, FileCas, validate_image_block};
 pub use event_store::{
     ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_ACTIVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD,
     AbandonedGraph, AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, AccountAddClaim,

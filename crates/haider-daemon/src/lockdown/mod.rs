@@ -41,6 +41,7 @@ pub(crate) const ALLOWED_TOOLS: &[&str] = &[
 
 #[derive(Debug)]
 pub(crate) enum LockdownError {
+    AppliedWrite(Box<LockdownError>),
     Io {
         operation: &'static str,
         path: PathBuf,
@@ -80,6 +81,7 @@ pub(crate) enum LockdownError {
 impl fmt::Display for LockdownError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AppliedWrite(source) => fmt::Display::fmt(source, formatter),
             Self::Io {
                 operation,
                 path,
@@ -503,11 +505,22 @@ impl LockdownManager {
         relative_path: &Path,
         contents: &[u8],
     ) -> Result<LockdownStatus, LockdownError> {
+        self.write_with_post_apply(provider, relative_path, contents, || Ok(()))
+    }
+
+    fn write_with_post_apply(
+        &self,
+        provider: &str,
+        relative_path: &Path,
+        contents: &[u8],
+        after_apply: impl FnOnce() -> Result<(), LockdownError>,
+    ) -> Result<LockdownStatus, LockdownError> {
         let provider_root = self.provider_root(provider)?;
         let target = sandbox_path(&provider_root, relative_path)?;
         let temporary_name = data_temporary_name(&target)?;
         check_path_budget(&self.root.join(&temporary_name))?;
-        self.with_locked_ledger(|ledger| {
+        let mut applied = false;
+        let result = self.with_locked_ledger(|ledger| {
             let parent = target
                 .parent()
                 .ok_or_else(|| LockdownError::InvalidRelativePath {
@@ -543,7 +556,14 @@ impl LockdownManager {
             ensure_private_directory(&provider_root)?;
             ensure_private_descendants(&provider_root, parent)?;
             refuse_symlink(&target)?;
-            atomic_write_staged(&self.root, &temporary_name, &target, contents)?;
+            atomic_write_staged(
+                &self.root,
+                &temporary_name,
+                &target,
+                contents,
+                &mut applied,
+                after_apply,
+            )?;
             ledger.used = directory_size(&self.root)?;
             Ok(LockdownStatus {
                 provider: Some(provider.to_owned()),
@@ -552,6 +572,13 @@ impl LockdownManager {
                 quota_used: ledger.used,
                 quota_limit: ledger.limit,
             })
+        });
+        result.map_err(|error| {
+            if applied {
+                LockdownError::AppliedWrite(Box::new(error))
+            } else {
+                error
+            }
         })
     }
 
@@ -1081,6 +1108,8 @@ fn atomic_write_staged(
     temporary_name: &str,
     target: &Path,
     contents: &[u8],
+    applied: &mut bool,
+    after_apply: impl FnOnce() -> Result<(), LockdownError>,
 ) -> Result<(), LockdownError> {
     let parent = target
         .parent()
@@ -1091,6 +1120,8 @@ fn atomic_write_staged(
     check_path_budget(&temporary)?;
     check_path_budget(target)?;
     write_and_replace(&temporary, target, contents)?;
+    *applied = true;
+    after_apply()?;
     haider_platform::fs::sync_directory(parent, SyncPolicy::Full)
         .map_err(|source| io_error("sync directory", parent, source))?;
     if parent != staging_root {
@@ -1236,5 +1267,48 @@ fn io_error(operation: &'static str, path: &Path, source: std::io::Error) -> Loc
         operation,
         path: path.to_path_buf(),
         source,
+    }
+}
+
+#[cfg(test)]
+mod toolshape_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn toolshape_lockdown_quota_publication_failure_marks_the_already_applied_write() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let manager = LockdownManager::initialize(temp.path().join("ld")).expect("manager");
+        let error = manager
+            .write_with_post_apply("fixture", Path::new("written.txt"), b"landed bytes", || {
+                fs::create_dir(manager.root.join(QUOTA_TEMP_FILE)).map_err(|source| {
+                    io_error("inject quota publication failure", &manager.root, source)
+                })
+            })
+            .expect_err("quota temporary directory prevents publication");
+        let LockdownError::AppliedWrite(source) = &error else {
+            panic!("write already landed: {error}");
+        };
+        assert_eq!(
+            error.to_string(),
+            source.to_string(),
+            "original failure text stays unchanged"
+        );
+        assert_eq!(
+            fs::read(
+                manager
+                    .provider_root("fixture")
+                    .expect("provider root")
+                    .join("written.txt")
+            )
+            .expect("landed file"),
+            b"landed bytes"
+        );
+        assert!(matches!(source.as_ref(), LockdownError::Io { .. }));
+        let refused = manager
+            .write("fixture", Path::new("../outside"), b"denied")
+            .expect_err("outside path refused");
+        assert!(!matches!(refused, LockdownError::AppliedWrite(_)));
     }
 }

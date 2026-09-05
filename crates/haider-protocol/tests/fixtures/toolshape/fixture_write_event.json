@@ -1,0 +1,26 @@
+{
+  "type": "tool_result",
+  "call_id": "call-fixture-write",
+  "result": {
+    "preview": "wrote 17 bytes to fixtures/toolshape.txt",
+    "truncated": false,
+    "effects": [
+      {
+        "kind": "write",
+        "name": "toolshape.txt",
+        "path": "fixtures/toolshape.txt",
+        "absolute_path": "/workspace/fixtures/toolshape.txt",
+        "bytes": 17
+      }
+    ]
+  },
+  "effects": [
+    {
+      "kind": "write",
+      "name": "toolshape.txt",
+      "path": "fixtures/toolshape.txt",
+      "absolute_path": "/workspace/fixtures/toolshape.txt",
+      "bytes": 17
+    }
+  ]
+}

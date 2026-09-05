@@ -3603,6 +3603,26 @@ impl HubConnection {
         self.artifact_put_bytes(request_id, bytes).await
     }
 
+    pub(crate) fn binary_artifact_store(&self) -> Result<SqliteStoreHandle, ResponseBody> {
+        if self.closed.load(Ordering::Acquire) || self.hub.inner.draining.load(Ordering::Acquire) {
+            return Err(ResponseBody::Error {
+                code: ERROR_CODE_DRAINING.into(),
+                message: "connection closed or daemon draining".into(),
+                retryable: true,
+                data: None,
+            });
+        }
+        if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+            return Err(ResponseBody::Error {
+                code: ERROR_CODE_CAPABILITY_DENIED.into(),
+                message: message.into(),
+                retryable: false,
+                data: None,
+            });
+        }
+        Ok(self.hub.inner.store.clone())
+    }
+
     /// Handles one request and enqueues its correlated response.
     pub async fn request(
         &self,
@@ -19221,7 +19241,7 @@ async fn validate_turn_attachments(
                 });
             }
         };
-        let bytes = store.get(artifact).await.map_err(|_| AttachmentValidationFailure {
+        let missing = || AttachmentValidationFailure {
             code: ERROR_CODE_ATTACHMENT_NOT_FOUND,
             message: format!(
                 "attachment {index} references unavailable or unverified artifact {artifact}; upload it with artifact.put and retry"
@@ -19230,34 +19250,66 @@ async fn validate_turn_attachments(
                 index: index_u32,
                 artifact: artifact.clone(),
             }),
-        })?;
+        };
+        let reader = store
+            .open_cas_reader(artifact)
+            .await
+            .map_err(|_| missing())?;
+        let actual_bytes = reader.metadata().map_err(|_| missing())?.len();
+        let is_pdf = matches!(
+            attachment,
+            haider_protocol::tool::AttachmentBlock::Pdf { .. }
+        );
+        let cap = if is_pdf {
+            haider_pdf::MAX_PDF_BYTES
+        } else {
+            MAX_ATTACHMENT_BYTES
+        };
+        if is_pdf && actual_bytes > haider_pdf::MAX_PDF_BYTES as u64 {
+            let message = format!(
+                "PDF attachment {index} is {actual_bytes} bytes; the PDF limit is {}",
+                haider_pdf::MAX_PDF_BYTES
+            );
+            let presentation = haider_protocol::error::ErrorPresentation::new(
+                "pdf-too-large",
+                "PDF is too large",
+                &message,
+                haider_protocol::error::ErrorScope::Turn,
+                [haider_protocol::error::ErrorAction::None],
+            );
+            return Err(AttachmentValidationFailure {
+                code: ERROR_CODE_PDF_TOO_LARGE,
+                message,
+                data: Some(ErrorData::PdfTooLarge {
+                    index: index_u32,
+                    artifact: artifact.clone(),
+                    actual_bytes,
+                    max_bytes: haider_pdf::MAX_PDF_BYTES as u64,
+                    presentation,
+                }),
+            });
+        }
+        if !is_pdf && actual_bytes > cap as u64 {
+            return Err(oversized_attachment(
+                index_u32,
+                artifact,
+                usize::try_from(actual_bytes).unwrap_or(usize::MAX),
+            ));
+        }
+        // The verified file handle is read in bounded chunks. PDF inspection
+        // still requires contiguous bytes, but only after enforcing its cap.
+        use tokio::io::AsyncReadExt as _;
+        let mut reader = tokio::fs::File::from_std(reader).take(cap as u64 + 1);
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| missing())?;
+        if bytes.len() as u64 != actual_bytes {
+            return Err(missing());
+        }
         let canonical_attachment = match attachment {
             haider_protocol::tool::AttachmentBlock::Pdf { name, .. } => {
-                if bytes.len() > haider_pdf::MAX_PDF_BYTES {
-                    let actual_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                    let message = format!(
-                        "PDF attachment {index} is {actual_bytes} bytes; the PDF limit is {}",
-                        haider_pdf::MAX_PDF_BYTES
-                    );
-                    let presentation = haider_protocol::error::ErrorPresentation::new(
-                        "pdf-too-large",
-                        "PDF is too large",
-                        &message,
-                        haider_protocol::error::ErrorScope::Turn,
-                        [haider_protocol::error::ErrorAction::None],
-                    );
-                    return Err(AttachmentValidationFailure {
-                        code: ERROR_CODE_PDF_TOO_LARGE,
-                        message,
-                        data: Some(ErrorData::PdfTooLarge {
-                            index: index_u32,
-                            artifact: artifact.clone(),
-                            actual_bytes,
-                            max_bytes: haider_pdf::MAX_PDF_BYTES as u64,
-                            presentation,
-                        }),
-                    });
-                }
                 let metadata = haider_pdf::inspect_pdf(&bytes).map_err(|error| {
                     let message = format!("PDF attachment {index} could not be parsed: {error}");
                     AttachmentValidationFailure {
