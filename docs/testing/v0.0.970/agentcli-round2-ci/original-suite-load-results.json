@@ -1,0 +1,486 @@
+{
+  "hogs": 32,
+  "concurrent_suites": 4,
+  "results": [
+    {
+      "iteration": 1,
+      "exit": 0,
+      "elapsed_ms": 2056.58,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 2,
+      "exit": 0,
+      "elapsed_ms": 2100.54,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 3,
+      "exit": 0,
+      "elapsed_ms": 2088.35,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 4,
+      "exit": 0,
+      "elapsed_ms": 2099.01,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 5,
+      "exit": 0,
+      "elapsed_ms": 2041.28,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 6,
+      "exit": 0,
+      "elapsed_ms": 2046.32,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 7,
+      "exit": 0,
+      "elapsed_ms": 2050.1,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 8,
+      "exit": 0,
+      "elapsed_ms": 2047.74,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 9,
+      "exit": 0,
+      "elapsed_ms": 2055.04,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 10,
+      "exit": 0,
+      "elapsed_ms": 2057.77,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 11,
+      "exit": 0,
+      "elapsed_ms": 2066.99,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 12,
+      "exit": 0,
+      "elapsed_ms": 2061.15,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 13,
+      "exit": 0,
+      "elapsed_ms": 2062.97,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 14,
+      "exit": 0,
+      "elapsed_ms": 2081.77,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 15,
+      "exit": 0,
+      "elapsed_ms": 2073.72,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 16,
+      "exit": 0,
+      "elapsed_ms": 2087.38,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 17,
+      "exit": 0,
+      "elapsed_ms": 2039.1,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 18,
+      "exit": 0,
+      "elapsed_ms": 2037.21,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 19,
+      "exit": 0,
+      "elapsed_ms": 2071.08,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 20,
+      "exit": 0,
+      "elapsed_ms": 2075.5,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 21,
+      "exit": 0,
+      "elapsed_ms": 2043.67,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 22,
+      "exit": 0,
+      "elapsed_ms": 2047.61,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 23,
+      "exit": 0,
+      "elapsed_ms": 2039.5,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 24,
+      "exit": 0,
+      "elapsed_ms": 2059.47,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 25,
+      "exit": 0,
+      "elapsed_ms": 2028.07,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 26,
+      "exit": 0,
+      "elapsed_ms": 2039.39,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 27,
+      "exit": 0,
+      "elapsed_ms": 2051.58,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 28,
+      "exit": 0,
+      "elapsed_ms": 2036.76,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 29,
+      "exit": 0,
+      "elapsed_ms": 2056.0,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 30,
+      "exit": 0,
+      "elapsed_ms": 2057.23,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 31,
+      "exit": 0,
+      "elapsed_ms": 2047.12,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 32,
+      "exit": 0,
+      "elapsed_ms": 2047.42,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 33,
+      "exit": 0,
+      "elapsed_ms": 2066.06,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 34,
+      "exit": 0,
+      "elapsed_ms": 2040.4,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 35,
+      "exit": 0,
+      "elapsed_ms": 2051.8,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 36,
+      "exit": 0,
+      "elapsed_ms": 2051.77,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 37,
+      "exit": 0,
+      "elapsed_ms": 2040.9,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 38,
+      "exit": 0,
+      "elapsed_ms": 2038.67,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 39,
+      "exit": 0,
+      "elapsed_ms": 2037.61,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 40,
+      "exit": 0,
+      "elapsed_ms": 2049.21,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 41,
+      "exit": 0,
+      "elapsed_ms": 2051.15,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 42,
+      "exit": 0,
+      "elapsed_ms": 2060.86,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 43,
+      "exit": 0,
+      "elapsed_ms": 2075.48,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 44,
+      "exit": 0,
+      "elapsed_ms": 2073.1,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 45,
+      "exit": 0,
+      "elapsed_ms": 2071.92,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 46,
+      "exit": 0,
+      "elapsed_ms": 2094.71,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 47,
+      "exit": 0,
+      "elapsed_ms": 2068.41,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 48,
+      "exit": 0,
+      "elapsed_ms": 2077.66,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 49,
+      "exit": 0,
+      "elapsed_ms": 2066.67,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 50,
+      "exit": 0,
+      "elapsed_ms": 2084.29,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 51,
+      "exit": 0,
+      "elapsed_ms": 2061.44,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 52,
+      "exit": 0,
+      "elapsed_ms": 2065.4,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 53,
+      "exit": 0,
+      "elapsed_ms": 2057.95,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 54,
+      "exit": 0,
+      "elapsed_ms": 2059.51,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 55,
+      "exit": 0,
+      "elapsed_ms": 2059.86,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 56,
+      "exit": 0,
+      "elapsed_ms": 2065.26,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 57,
+      "exit": 0,
+      "elapsed_ms": 2069.89,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 58,
+      "exit": 0,
+      "elapsed_ms": 2071.95,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 59,
+      "exit": 0,
+      "elapsed_ms": 2078.18,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 60,
+      "exit": 0,
+      "elapsed_ms": 2065.12,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 61,
+      "exit": 0,
+      "elapsed_ms": 2061.11,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 62,
+      "exit": 0,
+      "elapsed_ms": 2049.72,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 63,
+      "exit": 0,
+      "elapsed_ms": 2053.92,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 64,
+      "exit": 0,
+      "elapsed_ms": 2069.32,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 65,
+      "exit": 0,
+      "elapsed_ms": 2069.36,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 66,
+      "exit": 0,
+      "elapsed_ms": 2072.38,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 67,
+      "exit": 0,
+      "elapsed_ms": 2057.09,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 68,
+      "exit": 0,
+      "elapsed_ms": 2073.48,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 69,
+      "exit": 0,
+      "elapsed_ms": 2049.48,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 70,
+      "exit": 0,
+      "elapsed_ms": 2044.19,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 71,
+      "exit": 0,
+      "elapsed_ms": 2041.09,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 72,
+      "exit": 0,
+      "elapsed_ms": 2050.65,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 73,
+      "exit": 0,
+      "elapsed_ms": 2046.84,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 74,
+      "exit": 0,
+      "elapsed_ms": 2040.46,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 75,
+      "exit": 0,
+      "elapsed_ms": 2038.21,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 76,
+      "exit": 0,
+      "elapsed_ms": 2044.05,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 77,
+      "exit": 0,
+      "elapsed_ms": 2050.43,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 78,
+      "exit": 0,
+      "elapsed_ms": 2049.01,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 79,
+      "exit": 0,
+      "elapsed_ms": 2044.9,
+      "kqueue_failed": false
+    },
+    {
+      "iteration": 80,
+      "exit": 0,
+      "elapsed_ms": 2050.68,
+      "kqueue_failed": false
+    }
+  ]
+}

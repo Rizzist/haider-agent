@@ -383,3 +383,195 @@ for the orchestrator. Independent final review returns **SHIP**; the
 [completion audit](agentcli-merge-wave-970/completion-audit.json) confirms
 1,147 matching source hashes, matching final binaries, unchanged HEAD and
 MERGE_HEAD, empty marker scan, and both status-owned daemon cleanup proofs.
+
+## Round 2 — CI
+
+### Claim audit and merge
+
+Read the supplied lane common/brief and the turnperf/turnperf2 facts, lens
+summaries, and relevant client/process rows before changing code. Historical
+lens timings remain estimates, not measurements of this fix. Audited the actual
+logs for [CI run `33980468430`, macOS job `101344667558`](https://github.com/Rizzist/haider-agent/actions/runs/33980468430/job/101344667558),
+and xplat-check run `33980468392`: [Windows Clippy job `101344667770`](https://github.com/Rizzist/haider-agent/actions/runs/33980468392/job/101344667770)
+and [test job `101344667648`](https://github.com/Rizzist/haider-agent/actions/runs/33980468392/job/101344667648).
+The brief's two source citations are correct on landed head `f211be0e`: the
+unused method is `with_request_observer_for_test` at discovery.rs:125, and the
+panic is the first timeout's `.expect` at process_tests.rs:246. The historical
+line numbers drift after this test rewrite.
+
+Windows Clippy reports exactly that one dead-code error. Both method callers
+are in `update/tui_tests.rs:82,192`, whose module has `#![cfg(unix)]`. Its
+definition now uses `#[cfg(all(test, unix))]`, matching its callers exactly.
+No dead-code allowance was added and no test was platform-gated to hide a
+failure.
+
+The Windows test log has **five** failing tests, all explicitly owned by
+`970-xplatfix-cont-brief.md`:
+
+| Failed test | Ownership-brief item |
+| --- | --- |
+| `permissions_core_tests::instruct_pipe_shrinks_the_advertised_wire_pack` | 1: platform prose byte pin |
+| `worker::g1_todo_runtime_tests::verified_slot_resolves_journal_provenance_with_slim_live_and_replayed_results` | 2: provenance guard fixture |
+| `provider_request_body_is_budget_independent_and_matches_the_golden_ledger` | 4: platform prose in golden |
+| `resident_daemon_discovers_a_hook_installed_between_runs_and_scopes_it_by_cwd` | 5: Windows hook fixture |
+| `process::windows_monitor_command_tests::monitor_cwd_ancestor_cannot_be_replaced_between_prepare_and_spawn` | 6: prepared cwd guard |
+
+The sixth pre-existing failure, `native_pipe_io_failure_never_fails_the_journal_append`,
+**passed** in this newer run. All **12/12** public agent CLI integration tests
+passed on Windows. The four failing source files are absent from agentcli's
+first-parent landed diff. No extra agentcli-caused Windows runtime failure was
+found; this lane does not duplicate xplatfix's changes.
+
+The original worktree's external Git metadata rejects `FETCH_HEAD` writes with
+`Operation not permitted`. A temporary Git directory retains the lane branch
+and uses this same working tree. Fetch succeeded there, and
+`git merge --no-commit origin/wave-970` fast-forwarded `f211be0e` to `620fc1ce`
+before the final gates. This includes xplatfix, docsync, and relgate. The
+previously untracked `wallperf-analysis.md` exactly matched the incoming tracked
+file, so it was preserved without content edits. No conflicts or golden merges
+occurred. Upstream's regenerated golden and derived instruct-pipe pin are
+preserved; this lane does not edit the prompt/tool surface. The merged named pin test
+executes with `--nocapture` and confirms **5,670 → 5,670 bytes** on macOS; no
+repin is needed. The source baseline is **5,027 → upstream 5,033 → lane 5,033**,
+with both authoritative update and verification passing. The supplied
+`LANE-COMMON.md`, `LANE-BRIEF-agentcli.md`, and both turnperf directories remain
+excluded from the commit.
+
+### Kqueue root cause and mechanism proof
+
+The old test launched `/bin/sleep 0.005`, then required each exit observer to
+finish inside a literal 50 ms wall timeout. That deadline also charges child
+scheduling, thread creation, and runtime scheduling. It did not prove kqueue
+notification: an already-exited child could satisfy a pre-arm `waitid` probe,
+and the retained monitor was not awaited until the first observer finished.
+
+Source inspection finds no missing arming window in the public macOS observer:
+it probes waitable state before registration, registers `EVFILT_PROC/NOTE_EXIT`
+synchronously, probes again after registration, and probes if registration
+fails. An exit during registration is therefore either waitable or retained by
+kqueue. The retained identity registers synchronously at capture time. This
+round changes no production arming, polling interval, or exit ownership policy;
+it only moves the unchanged 30-second repair constant to module scope so the
+test can derive its watchdog from the actual implementation.
+
+Load reproduction was deliberately recorded rather than inferred from one
+local pass. The unchanged test passed 100 sequential probes with 32 CPU hogs,
+160 probes at 16 concurrent tests with 64 hogs, and 80 complete platform suites
+at four concurrent suites with 32 hogs. Thus **340 loaded runs did not reproduce
+the spontaneous CI failure**. A controlled OS scheduling fault did reproduce
+the exact CI panic **10/10**: the harness discovers only its test process's
+child, SIGSTOPs that child for `2 × 50ms = 100ms`, then SIGCONTs that exact PID.
+The unchanged observer times out before the child is allowed to exit. This is
+fault injection, not a sleep added to the test or product. It establishes that
+the literal deadline can fail with correct notification behavior; GitHub's
+precise scheduling interleaving remains an inference because its log has no
+per-step trace. There is no evidence here that kqueue lost the short-lived child.
+
+The replacement keeps the same named test and requires the mechanism directly:
+
+- A single `/bin/cat` child blocks on an owned stdin pipe. Both the public
+  observer and retained monitor are polled and required to be Pending while
+  the gate is held, proving neither already-exited shortcut can satisfy the test.
+- Dropping stdin releases the child. A self-waking polling future keeps the
+  paused Tokio runtime runnable, preventing automatic clock advancement while
+  actual kernel events wake both oneshot receivers.
+- Both exits must be delivered at **zero virtual elapsed time**. Any 50 ms
+  Tokio polling replacement remains asleep before its first poll.
+- The real-time watchdog is **30s repair interval / 2 = 15s**. It bounds host
+  scheduling while excluding the first native repair poll. It is checked both
+  before polling and after recording completion, so descheduling inside the
+  poll cannot admit repair as notification evidence. Failure names both
+  observers' states, child status, wall/virtual elapsed time, and the bound.
+  The owned child is killed on stalled delivery and reaped before the final
+  assertions; successful EOF must have a successful exit status.
+
+The replacement passed all 30 scheduling-fault/load probes with 32 CPU hogs:
+**29 successfully injected child holds and one load-only run**. Separate
+mutations in an isolated source copy insert a 50 ms Tokio sleep into the public
+observer and the retained observer. Both fail at the derived watchdog with
+virtual time still `0ns`; respectively `leader=None, retained=Some(Ok(()))` and
+`leader=Some(Ok(())), retained=None`. These failures distinguish the two actual
+notification paths and are not stopwatch latency measurements. A final paired
+replay using the retained original binary and the final workspace binary, with
+32 hogs running alongside the workspace gate, reproduces the old panic on
+10/10 injected holds. The final binary passes 10/10 runs, comprising nine
+successfully injected holds and one load-only run. See the retained
+[replay script and evidence](agentcli-round2-ci/).
+
+### Executed gates and registry walk
+
+Final command results are recorded below. All build-capable
+commands check `df -m /` first and enforce the 700 MiB floor. macOS gates use
+`RUST_MIN_STACK=8388608 HAIDER_DISCOVERY_DISABLED=1
+HAIDER_TEST_DEVICE_NAME=test-mac CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
+CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=4 TMPDIR=/tmp`. Fresh CLI/daemon siblings
+precede `HAIDER_TEST_SIBLINGS_PREBUILT=1`; `haiderd` is **201,719,408 bytes**,
+above 10 MiB. Full logs and command ledgers are retained in
+`/tmp/agentcli-round2/`.
+
+Windows cross-compilation first exposed Homebrew Rust's separate sysroot,
+then missing native SDK tools/headers. Selecting rustup's 1.95.0 toolchain and
+installing a temporary SDK through [cargo-xwin](https://github.com/rust-cross/cargo-xwin)
+resolves those environment
+prerequisites. BLAKE3's clang-cl build writes intermediate assembly beside its
+sources, so that unchanged dependency receives a writable temporary source
+copy. No dependency features, source bytes, Cargo manifest, or lockfile are
+changed for these checks. Cross-compilation is executed Windows cfg evidence;
+native Windows runtime tests remain inspected CI evidence until the landed
+head runs there.
+
+Registry walk: #5/#10 fixed by matching the method's actual cfg callers;
+#19/#20 require formatting and authoritative recount; #21/#41/#42/#44/#54/#64/
+#67/#71/#72/#74/#81/#92 checked with the ENV LAW, disk floor, fresh siblings,
+short temporary paths, and explicit executed-vs-inspected scope. #29 is
+checked: no handshake EOF or spawn authority changed. #30/#83/#90 fixed at the
+test oracle: actual exit events, explicit state diagnostics, preserved failed
+and passing load evidence, and no retry presented as proof of a fix. #34/#39/
+#45 checked: existing Tokio test-util is already enabled, test code remains in
+the existing sibling module, and no unsafe code is added. #85/#86/#87/#88/#89/
+#91 checked through merge-forward and the exact full workspace test/Clippy
+commands; incoming fixtures and files are preserved. #94 fixed through the
+repair-derived watchdog and frozen-clock polling mutation checks; the registry
+also has a later disk entry numbered #94, separately covered by disk checks.
+#95 checked: this process-only fixture owns no negotiated IPC connection.
+Other #1–#96 classes are checked: none on this narrow cfg/test change; no
+protocol, persistence, provider, credential, process-tree, or release policy
+is changed by this lane's diff.
+
+Independent code verifier: **findings=1, real=1, noise=0**. It found the
+post-poll descheduling window in the test watchdog; the final elapsed check
+closes it. Reviewed code scope: **SHIP**. The final evidence review and delivery status are recorded below.
+
+
+| Final executed command/check | Result |
+| --- | --- |
+| `cargo test -q --workspace --no-fail-fast` | Exit 0; 5,463 summed passes, 0 failures, 13 unchanged ignores. |
+| `cargo clippy --workspace --tests -- -D warnings` | Exit 0. |
+| `rustup target add x86_64-pc-windows-msvc` | Exit 0; target already installed in rustup’s sysroot. |
+| `cargo clippy -p haider-cli --all-targets --target x86_64-pc-windows-msvc -- -D warnings` | Exit 0 with the documented SDK environment; actual Windows cfg and test targets compiled. |
+| `cargo check --workspace --all-targets --target x86_64-pc-windows-msvc` | Exit 0 with the same SDK environment. |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings` | Exit 0 with the same SDK environment. |
+| `cargo run -q -p xtask -- test-count --update` and `test-count` | Both exit 0; 5,033 / 5,033. |
+| `cargo fmt --all -- --check`, changed-source rustfmt, `git diff --check` | Exit 0. |
+| `python3 scripts/check-unsafe-counts.py` | PASS: production 189 / test 20, unchanged. |
+| Final source audit | All 767 Rust/manifest/lockfile hashes match the recorded gate source. |
+
+The workspace sum includes nested subprocess summaries and multiply included
+test modules; it is not the source-test baseline. The long existing TUI shape
+benchmark completed successfully; no test was skipped or changed to finish the
+gate. Repository log copies trim only trailing whitespace at EOF; raw logs
+remain in `/tmp/agentcli-round2/`. This is a development-profile correctness gate, not release performance
+evidence. Logs, exact command/environment ledgers, mutation failures, load
+results, and the replay harness are retained in
+[agentcli-round2-ci](agentcli-round2-ci/), including the
+[gate summary](agentcli-round2-ci/gate-summary.json).
+
+All requested local gates pass on the merged tree. Native Windows runtime
+execution and a green GitHub run on the new commit are not claimed; no push or
+CI rerun was requested. The original worktree branch cannot be updated here:
+`git add` also fails to create its external `index.lock`. The reviewed commit
+is therefore recorded on `lane-970-agentcli` in the temporary Git directory and
+exported as a bundle, with no trailer and no push. The original checkout keeps
+the complete merged working tree and excluded instruction/lens files intact.
+Local code/gate verdict: **SHIP**. Original-worktree branch delivery remains
+**NO_SHIP** until that bundle is imported outside the metadata restriction.

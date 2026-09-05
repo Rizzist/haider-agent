@@ -1,0 +1,14 @@
+
+running 1 test
+
+thread 'process::tests::armed_kqueue_observes_a_short_command_without_coarse_backoff' (39230674) panicked at crates/haider-platform/src/process_tests.rs:246:6:
+armed kqueue must beat a 50 ms replacement backoff: Elapsed(())
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test process::tests::armed_kqueue_observes_a_short_command_without_coarse_backoff ... FAILED
+
+failures:
+
+failures:
+    process::tests::armed_kqueue_observes_a_short_command_without_coarse_backoff
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.05s

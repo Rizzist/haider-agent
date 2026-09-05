@@ -1,0 +1,22 @@
+{
+  "command": [
+    "target/debug/deps/haider_daemon-1ae2dc3c343c19a1",
+    "--exact",
+    "permissions_core_tests::instruct_pipe_shrinks_the_advertised_wire_pack",
+    "--nocapture"
+  ],
+  "env": {
+    "RUST_MIN_STACK": "8388608",
+    "HAIDER_DISCOVERY_DISABLED": "1",
+    "HAIDER_TEST_DEVICE_NAME": "test-mac",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_BUILD_JOBS": "2",
+    "TMPDIR": "/tmp",
+    "RUST_TEST_THREADS": "4",
+    "HAIDER_TEST_SIBLINGS_PREBUILT": "1"
+  },
+  "exit": 0,
+  "elapsed_s": 0.10946512222290039,
+  "disk_mib_before": 12689
+}

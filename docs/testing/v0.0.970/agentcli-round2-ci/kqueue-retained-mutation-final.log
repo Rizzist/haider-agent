@@ -1,0 +1,19 @@
+   Compiling haider-platform v0.0.969 (/tmp/agentcli-round2/mutation/crates/haider-platform)
+    Finished `test` profile [unoptimized] target(s) in 1.89s
+     Running unittests src/lib.rs (/tmp/agentcli-round2/platform-target/debug/deps/haider_platform-04ab3c7fcdc6f107)
+
+running 1 test
+
+thread 'process::tests::armed_kqueue_observes_a_short_command_without_coarse_backoff' (39005999) panicked at crates/haider-platform/src/process_tests.rs:304:5:
+kqueue delivery before repair: leader=Some(Ok(())), retained=None, child=exit status: 0, wall=15.000086875s, virtual=0ns, watchdog=15s
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test process::tests::armed_kqueue_observes_a_short_command_without_coarse_backoff ... FAILED
+
+failures:
+
+failures:
+    process::tests::armed_kqueue_observes_a_short_command_without_coarse_backoff
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 32 filtered out; finished in 15.00s
+
+error: test failed, to rerun pass `-p haider-platform --lib`

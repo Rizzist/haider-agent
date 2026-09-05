@@ -1,0 +1,24 @@
+{
+  "command": [
+    "cargo",
+    "check",
+    "--workspace",
+    "--all-targets",
+    "--target",
+    "x86_64-pc-windows-msvc"
+  ],
+  "env": {
+    "RUST_MIN_STACK": "8388608",
+    "HAIDER_DISCOVERY_DISABLED": "1",
+    "HAIDER_TEST_DEVICE_NAME": "test-mac",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_BUILD_JOBS": "2",
+    "TMPDIR": "/tmp",
+    "RUST_TEST_THREADS": "4",
+    "HAIDER_TEST_SIBLINGS_PREBUILT": "1"
+  },
+  "exit": 0,
+  "elapsed_s": 484.00609827041626,
+  "disk_mib_before": 11856
+}
