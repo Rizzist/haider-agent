@@ -65,6 +65,32 @@ fn spawn_arguments_are_trimmed_and_bounded() {
 }
 
 #[test]
+fn child_request_budget_is_validated_and_preserved_in_spawn_arguments() {
+    let request = SpawnSubagent::from_tool_args(serde_json::json!({
+        "task": "long task", "prompt": "continue to completion",
+        "request_budget": {"tranche": 40, "hard_cap": 96}
+    }))
+    .expect("valid child budget");
+    assert_eq!(
+        request.arguments().expect("arguments")["request_budget"],
+        serde_json::json!({"tranche": 40, "hard_cap": 96})
+    );
+    for (tranche, hard_cap) in [(0, 64), (32, 0), (65, 64)] {
+        assert!(
+            SpawnSubagent::from_tool_args(serde_json::json!({
+                "task": "task", "prompt": "prompt",
+                "request_budget": {"tranche": tranche, "hard_cap": hard_cap}
+            }))
+            .is_err()
+        );
+    }
+    assert_eq!(
+        spawn_subagent_manifest().input_schema["properties"]["request_budget"]["required"],
+        serde_json::json!(["tranche", "hard_cap"])
+    );
+}
+
+#[test]
 fn m2e_legacy_spawn_arguments_remain_byte_for_byte_plain() {
     // MUTATION CHECK: serialize any default workflow field. Expected failure:
     // the frozen legacy argument value gains a key below.

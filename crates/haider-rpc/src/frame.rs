@@ -290,6 +290,9 @@ pub const FEATURE_TURN_CONTROL_V1: &str = "turn_control_v1";
 pub const FEATURE_HEADLESS_RUN_V1: &str = "headless_run_v1";
 /// Daemon enforces typed run-local token, cost, and wall-clock budgets.
 pub const FEATURE_RUN_BUDGET_V1: &str = "run_budget_v1";
+/// Daemon honors logical request tranches, hard caps, and durable same-session
+/// request-budget continuation pins on newly accepted headless turns.
+pub const FEATURE_REQUEST_BUDGET_V1: &str = "request_budget_v1";
 /// Daemon implements receipt-backed terminal-failure and backoff-wake retry
 /// (`run.retry`).
 pub const FEATURE_RUN_RETRY_V1: &str = "run_retry_v1";

@@ -259,3 +259,112 @@ supplied lane briefs and turnperf evidence. Exporting the patch does not stage o
 commit any file.
 
 NO_SHIP
+
+## Merge-forward continuation — 2026-09-05
+
+This continuation supersedes the original commit-delivery blocker above: the
+current instruction explicitly requires an **uncommitted** resolved tree. The
+actual lane HEAD is `8c339bf5721c64b7ff802268a46dbe21d80399e1`, an evidence-tracking
+cleanup after `b91f0b21`; its only changes remove the supplied lane/turnperf files
+from tracking. Those files remain untouched and unstaged in this continuation.
+
+The requested fetch failed writing the external worktree `FETCH_HEAD`; the
+fallback merge failed writing its external `ORIG_HEAD.lock`. The existing
+`origin/wave-970` ref is the requested `b9c2a0475214102d1fb4c8d9c3ae3f480fd05fe4`.
+A real `git merge --no-commit origin/wave-970` was therefore performed against the
+same writable working tree using isolated Git metadata at
+`/tmp/toolrepair-970-merge-93u6wqpm`, with read-only object alternates to the
+original repository. This reproduced exactly the three reported conflicts.
+The temporary index has no unresolved entries; the original repository's HEAD,
+index and refs are unchanged. No commit or push was attempted or created.
+The orchestrator owns recording the merge from the resolved tree/temporary index.
+
+| File | Resolution and evidence |
+| --- | --- |
+| `crates/haider-daemon/src/permissions_core_tests.rs` | Kept 29 registered / 26 advertised tools, seven native descriptions, all platform-specific full-prefix pins, and the unchanged 30% reduction assertion. The runtime test measured the merged instruct pipe at **13,552 bytes**: wave **12,764 → 13,552 (+788)** = +597 schema/manual bytes +191 alias-description bytes; lane **13,409 → 13,552 (+143)** = turnbudget's stub schema. Description-free pin **12,862**, native descriptions **690**, macOS full prefix **19,736** (31.33% reduction). Turnbudget adds 367 full-schema bytes: Linux 19,785, Windows 19,735, other 19,730 are preserved offsets, by inspection. |
+| `crates/haider-cli/tests/fixtures/turnhygiene/provider_request_no_budget.json` | Overwrote the conflicted file only through `UPDATE_FIXTURES=1 cargo test -p haider-cli --test turnhygiene_pin_tests provider_request_body_is_budget_independent_and_matches_the_golden_ledger -- --exact`. Passed 1/1. Reviewed the complete changed JSON line through exhaustive whole-object equality: removing only `spawn_subagent.request_budget` reproduces the lane parent; removing only `write`/`edit` definitions and their two manual lines reproduces wave. All other fields, ordering, existing native descriptions and actbias policy bytes remain identical. Canonical UTF-8 serialization is unchanged. Final 17,006 bytes; SHA-256 `5b511b74a5b01470ad7ccc7839b1253e1c77d4886ecd8ee667d2c09f1f8ef5e1`. |
+| `test-baseline.txt` | Regenerated using `cargo run -p xtask --locked -- test-count --update`: lane 4,786 / wave 4,788 → merged **4,808**. Independent non-updating `target/debug/xtask test-count` confirms 4,808/4,808. This is the repository's source-marker count, separate from executed test totals. |
+
+The HTTP request-body golden does not contain a `correlation` root field in either
+parent. Turnid's additive correlation belongs to the journal/request-attempt
+records. The merged `oneshot_run_golden.jsonl`, `run_jsonl_text_turn.jsonl`, and
+`run_jsonl_tool_turn.jsonl` remain **byte-identical to wave-970**, retaining both
+correlation and request-budget records. The two turnhygiene JSONL files use the
+existing `<TS>`/`<N>` template normalization; they are intentionally not raw JSON.
+No hand-edited HTTP correlation field or weakened golden assertion was introduced.
+
+Automatically merged actor, prompt-history, worker, runtime tests, subagent tests,
+and event-schema changelog preserve both sides. Independent reading confirms
+repair-state recovery plus budget-state recovery, invalid-tool safe-object replay
+plus budget-note replay, the pre-request budget check, and durable attempt commit
+before transport. This continuation adds no production behavior or deadline.
+The round-2 evidence's warning against unproven durable-boundary fusion is retained;
+no latency, CPU, release-binary, or non-macOS execution claim is made.
+
+Relevant citation audit: RawEnvelope cursor contract at
+`docs/jsonl-run-contract-v1.md:15` remains correct. Older actor, schema and durable
+boundary citations have drifted. The merged actor commits the provider attempt at
+`crates/haider-core/src/actor.rs:3973` before opening transport at 4038. The old
+unconditional-budget-projection behavior claim is stale (the actor's 3703 path is
+gated); the old first-malformed-terminal claim is intentionally replaced by the
+first-repair/second-terminal path at 5357–5389 and 7597–7650.
+
+All Cargo invocations used `RUST_MIN_STACK=8388608 HAIDER_DISCOVERY_DISABLED=1
+HAIDER_TEST_DEVICE_NAME=test-mac CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`.
+Sibling build `cargo build -p haider-daemond -p haider-cli --locked` passed before
+subprocess tests, which used `HAIDER_TEST_SIBLINGS_PREBUILT=1`. The rebuilt
+`haiderd` is an arm64 Mach-O of 198,287,680 bytes, above 10 MiB. Free space was checked
+before every build and throughout the full gate; the 700 MiB floor was retained.
+
+| Gate | Final result |
+| --- | --- |
+| `cargo test -q --workspace --no-fail-fast` | **PASS, exit 0**; 317 top-level result summaries: **5,191 passed, 0 failed, 13 pre-existing ignored, 0 measured, 0 filtered**. Six successful nested self-reexec summaries are excluded from these totals; eight nested child starts intentionally produced no separate summary. The independent verifier confirmed the accounting. Full command elapsed 1,900 seconds including compilation; the existing debug TUI 200k-row test passed in 772.85 seconds. |
+| `cargo clippy --workspace --tests -- -D warnings` | **PASS, exit 0**, 2m30s; `--tests` and `-D warnings` included exactly. |
+| Exact `permissions_core_tests::instruct_pipe_shrinks_the_advertised_wire_pack` | **PASS, 1/1**; runtime total 13,552 and full prefix 19,736 with the unchanged invariants. |
+| `cargo fmt --all --check` | **PASS, exit 0**. |
+| `bash scripts/check-unsafe-counts.sh` | **PASS, exit 0**; production 189/test 20. |
+| Golden revalidation | Full non-blessing workspace run passed; final SHA-256 unchanged from regeneration. |
+| Baseline check | **PASS**, source count 4,808 against baseline 4,808. |
+
+The final workspace build also leaves an arm64 Mach-O `haiderd` of 198,262,736
+bytes, independently rechecked after both gates. Windows/Linux execution and
+release-only timing bounds remain by inspection/not executed as described above.
+
+Evidence: `/tmp/toolrepair-970-workspace.log`, `/tmp/toolrepair-970-clippy.log`,
+`/tmp/toolrepair-970-gate-summary.json`, `/tmp/toolrepair-970-bless.log`,
+`/tmp/toolrepair-970-golden-review.log`, `/tmp/toolrepair-970-pipe-final.log`,
+`/tmp/toolrepair-970-count-update.log`, `/tmp/toolrepair-970-count-check.log`,
+`/tmp/toolrepair-970-fmt.log`, `/tmp/toolrepair-970-unsafe.log`.
+The handoff diff from the original lane HEAD is
+`/tmp/toolrepair-970-merge.patch`; it excludes the supplied lane/turnperf evidence.
+
+### CI registry continuation walk
+
+The source registry was reread in full. The original class 1–87 and 94–95 review
+above remains applicable; the continuation rechecks those classes on the combined
+tree, with the concrete updates below. The newer registry now defines **#88**;
+only 89–93 remain undefined. No new CI-error class was encountered in the merge
+resolution. No source/test ignore or platform-gating workaround was added.
+
+| Class | Continuation review |
+| --- | --- |
+|1,2,3,4,5,6,39,62|checked — automatically merged API/constructor, ownership, cfg and test seams retain both parents; full workspace gates cover all consumers.|
+|7,34,40|checked: none — no manifest, lockfile or feature changes from this resolution; sibling/xtask builds used `--locked`.|
+|8,19|checked — surgical resolution reread; `cargo fmt --all --check` and both temporary-index diff whitespace checks pass.|
+|9–18,35–38,55|checked — required workspace Clippy includes tests and denies warnings.|
+|20|fixed — authoritative recount and non-updating check both 4,808.|
+|21,54,64,67,81|checked — all ENV LAW values retained; rebuilt both siblings; binary format/size and disk floor checked.|
+|22–33,41–49,51–53,56,58–61,63,65–66,68–75,78–84,94–95|checked: none — continuation introduces no production, platform, timeout, transport, lifecycle or release-policy changes; inherited behavior retained.|
+|50,57|fixed — real merged pipe 13,552; native description accounting 690; platform offsets and 30% floor intact.|
+|76|checked — wave's correlation and request-budget records preserved in JSONL and auto-merged consumers.|
+|77|checked — unsafe-count guard passes with production 189/test 20; no unsafe-source or guard metadata change in this continuation.|
+|85,86|checked — exact full workspace test run on the resolved combined tree; no check-only substitute.|
+|87|checked — exact `cargo clippy --workspace --tests -- -D warnings` used.|
+|88|fixed — wave merged using writable temporary metadata; provider golden generated by tooling, real pipe pin verified, baseline recounted, full merged-tree gates executed.|
+
+Independent verifier returned **SHIP** after reviewing the merge seams, complete
+golden comparison, measured pins, environment and exact gate logs. No finding
+changed code, tests or verdict, and none was rejected as noise.
+
+VERIFIER: findings=0 real=0 noise=0 — no findings
+SHIP

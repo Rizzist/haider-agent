@@ -355,3 +355,23 @@ not all been called out together in this ledger. Their schema status is:
 - Replay must emit the retained tool-result preview byte-for-byte. Suggestions
   are never recomputed or decorated during replay. `SCHEMA_VERSION` remains 1
   because this is an additive nested field on an existing payload kind.
+
+
+### v0.0.970 — logical request budgets and continuation
+
+Additive extension kind `provider_request_budget_v1` uses the existing
+`item:extension` carrier. Its typed data records used logical requests, the
+soft tranche and hard cap, a progress/soft-bound/hard-bound phase, and durable
+session/run/branch/agent continuation coordinates. Only bound notes contribute
+to model history; progress is UI/journal telemetry. Transport retries retain
+the same logical count. Hard checkpoint items and the adjacent
+`run_failed { code: request_budget_exceeded }` / `run_state: errored` pair are
+one transaction, preserving the single-terminal law and replay parity.
+
+Optional `RunBudgetV1.request_budget` and
+`HeadlessRunSpecV1.continuation_of` fields are omitted for legacy values.
+`spawn_subagent` can pin request policy in manifest coordinates. Capability
+`request_budget_v1` is required for explicit policies and the dedicated resume
+client so older daemons cannot silently ignore the settings. Default policy
+is 32 soft / 64 hard. The schema version remains 1; unknown extension data and
+new error codes retain the established forward-compatibility behavior.

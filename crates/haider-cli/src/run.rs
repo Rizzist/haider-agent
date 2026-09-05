@@ -14,7 +14,8 @@ use haider_client::{
     HeadlessOutcome, HeadlessRunError, HeadlessRunEvents, HeadlessRunRequest, HeadlessRunResult,
     HeadlessRunStatus, HeadlessSessionConfig, HeadlessTerminalKind, ProfileEnv,
     autospawn_daemon_lifetime, headless_run_events, headless_run_status, load_attachment,
-    resolve_profile, run_headless_with_session_config_event_mode_and_interrupts, stop_headless_run,
+    resolve_profile, resume_headless_with_event_mode_and_interrupts,
+    run_headless_with_session_config_event_mode_and_interrupts, stop_headless_run,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
@@ -79,6 +80,7 @@ pub(crate) struct RunOptions {
     pub model: Option<String>,
     pub attachments: Vec<PathBuf>,
     pub budget: RunBudgetV1,
+    pub resume_run_id: Option<RunId>,
     pub seed: Option<u64>,
 }
 
@@ -121,6 +123,9 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
     let mut prompt_stdin = false;
     let mut action = RunAction::Execute;
     let mut budget = RunBudgetV1::default();
+    let mut request_tranche = None;
+    let mut max_requests = None;
+    let mut resume_run_id = None;
     let mut seed = None;
     let mut index = 0;
 
@@ -167,6 +172,30 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
                 action = RunAction::Replay(parse_run_id(value, "--replay")?);
             }
             "--replay" => return Err("only one lifecycle action may be requested".into()),
+            "--resume" if resume_run_id.is_none() => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .ok_or_else(|| "--resume requires a run id".to_owned())?;
+                resume_run_id = Some(parse_run_id(value, "--resume")?);
+            }
+            "--resume" => return Err("duplicate --resume flag".into()),
+            "--request-tranche" if request_tranche.is_none() => {
+                index += 1;
+                request_tranche = Some(parse_positive_u64(
+                    rest.get(index).map(String::as_str),
+                    "--request-tranche",
+                )?);
+            }
+            "--request-tranche" => return Err("duplicate --request-tranche flag".into()),
+            "--max-requests" if max_requests.is_none() => {
+                index += 1;
+                max_requests = Some(parse_positive_u64(
+                    rest.get(index).map(String::as_str),
+                    "--max-requests",
+                )?);
+            }
+            "--max-requests" => return Err("duplicate --max-requests flag".into()),
             "--max-tokens" if budget.max_tokens.is_none() => {
                 index += 1;
                 budget.max_tokens = Some(parse_positive_u64(
@@ -314,6 +343,41 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
         index += 1;
     }
 
+    if request_tranche.is_some() || max_requests.is_some() {
+        let defaults = haider_protocol::request_budget::RequestBudgetV1::default();
+        let request_budget = haider_protocol::request_budget::RequestBudgetV1 {
+            tranche: usize::try_from(request_tranche.unwrap_or(defaults.tranche as u64))
+                .map_err(|_| "--request-tranche exceeds this platform's range")?,
+            hard_cap: usize::try_from(max_requests.unwrap_or(defaults.hard_cap as u64))
+                .map_err(|_| "--max-requests exceeds this platform's range")?,
+        };
+        request_budget.validate()?;
+        budget.request_budget = Some(request_budget);
+    }
+    if resume_run_id.is_some() && action != RunAction::Execute {
+        return Err("--resume cannot be combined with another lifecycle action".into());
+    }
+    if resume_run_id.is_some() {
+        if provider.is_some()
+            || model.is_some()
+            || effort.is_some()
+            || fast.is_some()
+            || account.is_some()
+            || ssh_scope.is_some()
+            || allow_writes
+            || allow_exec
+            || auto_allow
+            || trust_hooks
+        {
+            return Err("--resume inherits the source session's model and permissions".into());
+        }
+        if prompt.is_none() {
+            prompt = Some(
+                "Continue the checkpointed task using the retained messages and tool history."
+                    .into(),
+            );
+        }
+    }
     let output = match (legacy_jsonl, json, output) {
         (true, false, Some(RunOutput::Jsonl) | None) => RunOutput::Jsonl,
         (false, true, Some(RunOutput::Json) | None) => RunOutput::Json,
@@ -368,6 +432,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
         options: RunOptions {
             prompt,
             prompt_stdin,
+            resume_run_id,
             action,
             output,
             timeout,
@@ -750,16 +815,29 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     };
     let (interrupt_sender, interrupt_receiver) = mpsc::unbounded_channel();
     let signal_forwarder = tokio::spawn(forward_sigints(interrupt_sender));
-    let result = run_headless_with_session_config_event_mode_and_interrupts(
-        &profile,
-        ensure,
-        request,
-        session_config,
-        events,
-        event_mode,
-        Some(interrupt_receiver),
-    )
-    .await;
+    let result = if let Some(source_run_id) = options.resume_run_id.clone() {
+        resume_headless_with_event_mode_and_interrupts(
+            &profile,
+            ensure,
+            request,
+            source_run_id,
+            events,
+            event_mode,
+            Some(interrupt_receiver),
+        )
+        .await
+    } else {
+        run_headless_with_session_config_event_mode_and_interrupts(
+            &profile,
+            ensure,
+            request,
+            session_config,
+            events,
+            event_mode,
+            Some(interrupt_receiver),
+        )
+        .await
+    };
     signal_forwarder.abort();
     let adapter_result = match adapter.await {
         Ok(result) => result,
@@ -1959,6 +2037,7 @@ pub(crate) fn exit_code_for_result(result: &HeadlessRunResult) -> u8 {
                 ErrorCode::PermissionDenied
                 | ErrorCode::EffectUnknownOutcome
                 | ErrorCode::BudgetExhausted
+                | ErrorCode::RequestBudgetExceeded
                 | ErrorCode::WorkflowUnfinished,
             ))
             | Some(HeadlessFailureCode::Blocked(_)) => EX_BLOCKED,
@@ -2026,6 +2105,17 @@ pub(crate) fn exit_code_for_error(error: &HeadlessRunError) -> u8 {
         {
             EX_PROTOCOL
         }
+        HeadlessRunError::Rpc { code, .. }
+            if matches!(
+                code.as_str(),
+                "request_budget_exceeded"
+                    | "continuation_active"
+                    | "continuation_unavailable"
+                    | "continuation_scope_unsupported"
+            ) =>
+        {
+            EX_BLOCKED
+        }
         HeadlessRunError::Rpc { .. } => EX_SOFTWARE,
     }
 }
@@ -2034,6 +2124,108 @@ pub(crate) fn exit_code_for_error(error: &HeadlessRunError) -> u8 {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_budget_flags_preserve_defaults_and_reject_invalid_or_duplicate_limits() {
+        let parsed = parse_run_options_with_config(&[
+            "-p".into(),
+            "long task".into(),
+            "--max-requests".into(),
+            "96".into(),
+        ])
+        .expect("hard override");
+        assert_eq!(
+            parsed.options.budget.request_budget,
+            Some(haider_protocol::request_budget::RequestBudgetV1 {
+                tranche: 32,
+                hard_cap: 96
+            })
+        );
+        for flags in [
+            vec!["--request-tranche", "0"],
+            vec!["--max-requests", "0"],
+            vec!["--request-tranche", "65"],
+            vec!["--request-tranche", "40", "--max-requests", "39"],
+            vec!["--request-tranche", "32", "--request-tranche", "32"],
+            vec!["--max-requests", "64", "--max-requests", "64"],
+        ] {
+            let mut args = vec!["-p".to_owned(), "task".to_owned()];
+            args.extend(flags.iter().map(|flag| (*flag).to_owned()));
+            assert!(parse_run_options_with_config(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn resume_parser_accepts_handle_and_budget_without_prompt() {
+        let parsed = parse_run_options_with_config(&[
+            "--resume".into(),
+            "bound-run".into(),
+            "--request-tranche".into(),
+            "40".into(),
+            "--max-requests".into(),
+            "80".into(),
+        ])
+        .expect("continuation options");
+        assert_eq!(parsed.options.resume_run_id, Some(RunId::new("bound-run")));
+        assert!(!parsed.options.prompt.is_empty());
+        assert_eq!(
+            parsed.options.budget.request_budget,
+            Some(haider_protocol::request_budget::RequestBudgetV1 {
+                tranche: 40,
+                hard_cap: 80
+            })
+        );
+        for incompatible in [
+            "--start",
+            "--allow-writes",
+            "--allow-exec",
+            "--auto-allow",
+            "--trust-hooks",
+        ] {
+            assert!(
+                parse_run_options_with_config(&[
+                    "--resume".into(),
+                    "bound-run".into(),
+                    incompatible.into()
+                ])
+                .is_err(),
+                "{incompatible}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_budget_exit_is_blocked_and_json_preserves_resume_instruction() {
+        let message = "request hard cap reached; continue with haider run --resume bound-run";
+        let result = HeadlessRunResult {
+            session_id: haider_protocol::ids::SessionId::new("budget-session"),
+            run_id: RunId::new("bound-run"),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            attachments: Vec::new(),
+            outcome: HeadlessOutcome::Errored,
+            response: None,
+            usage: None,
+            events: HeadlessRunEvents::empty(RunId::new("bound-run")),
+            budget_exhausted: None,
+            replay: None,
+            permission_denials: Vec::new(),
+            terminal_seq: Some(7),
+            background_tasks_running: Vec::new(),
+            failure: Some(haider_client::HeadlessRunFailure {
+                code: HeadlessFailureCode::Run(ErrorCode::RequestBudgetExceeded),
+                message: message.into(),
+                retryable: false,
+                presentation: None,
+            }),
+        };
+        assert_eq!(exit_code_for_result(&result), EX_BLOCKED);
+        let mut json = Vec::new();
+        write_final(&mut json, RunOutput::Json, &result).expect("budget JSON");
+        let value: serde_json::Value = serde_json::from_slice(&json).expect("JSON");
+        assert_eq!(value["error"]["code"], "request_budget_exceeded");
+        assert_eq!(value["error"]["message"], message);
+    }
 
     #[derive(Default)]
     struct FlushCountingWriter {

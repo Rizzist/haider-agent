@@ -1057,7 +1057,7 @@ fn budgeted_workflow_admission_is_recoverable(
     reduction: &RunReduction,
     graph_phase: Option<GraphPhase>,
 ) -> bool {
-    !reduction.headless_budget.is_empty() && graph_phase == Some(GraphPhase::Active)
+    reduction.headless_budget.has_shared_limits() && graph_phase == Some(GraphPhase::Active)
 }
 
 async fn pending_workflow_continuation(
@@ -2262,6 +2262,19 @@ mod composite_recovery_tests {
             Some(GraphPhase::Active)
         ));
 
+        // Request tranches must not widen the existing ambiguous-dispatch
+        // recovery policy. Only the shared token/cost/time coordinator owns it.
+        let request_only = RunReduction {
+            headless_budget: RunBudgetV1 {
+                request_budget: Some(Default::default()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!budgeted_workflow_admission_is_recoverable(
+            &request_only,
+            Some(GraphPhase::Active),
+        ));
         let budgeted = RunReduction {
             headless_budget: RunBudgetV1 {
                 max_cost_microusd: Some(10_000_000),

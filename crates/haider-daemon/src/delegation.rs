@@ -533,6 +533,13 @@ impl DelegationHandle {
             manifest_coordinates["workflow_decision"] =
                 serde_json::to_value(&decision).map_err(internal_serialization)?;
         }
+        if let Some(budget) = request.request_budget {
+            budget
+                .validate()
+                .map_err(|message| HaiderError::new(ErrorCode::InvalidArgument, message, false))?;
+            manifest_coordinates["request_budget"] =
+                serde_json::to_value(budget).map_err(internal_serialization)?;
+        }
         let manifest = AgentManifest {
             agent: agent_id.clone(),
             role: AgentRole::Subagent,

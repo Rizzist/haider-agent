@@ -1301,20 +1301,22 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // The full-prefix comparison deliberately includes the platform-specific
     // computer manifest description. Linux documents X11/Wayland (+49 bytes
     // over macOS), while Windows is one byte shorter than macOS.
+    // Turnbudget adds 367 full-schema bytes and 143 stub-schema bytes for
+    // spawn_subagent.request_budget. Toolrepair adds the two flat aliases.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_418;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_785;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_369;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_736;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_368;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_735;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_363;
-    // v0.0.969 pinned 11_246 bytes. Before actbias, merged monitor/list_models
-    // inventory additions had already moved this wave-970 baseline to 12_122.
-    // The toolrepair delta adds two flat schemas/manual entries and preserves
-    // the original selective-description accounting and 30% reduction floor.
-    const PRE_ACTBIAS_INSTRUCT_PIPE_BYTES: usize = 12_719;
-    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 13_409;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_730;
+    // Wave-970's pipe is 12_764 bytes: 12_265 schema/manual + 499 native
+    // descriptions. Toolrepair adds 597 schema/manual bytes and 191 native
+    // description bytes: 12_764 + 788 = 13_552 (lane's 13_409 + 143 budget
+    // schema bytes). Keep the seven-description accounting and 30% floor.
+    const PRE_ACTBIAS_INSTRUCT_PIPE_BYTES: usize = 12_862;
+    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 13_552;
 
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let stubbed =
