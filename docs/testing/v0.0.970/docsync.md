@@ -1,0 +1,436 @@
+# v0.0.970 docsync claim audit
+
+## Scope and source audit
+
+Audited on `lane-970-docsync`, starting at
+`9270f40286d3181fd22c20600b4ae4f9586b8c1d` (also the cached and live
+`origin/wave-970` SHA at the merge attempt). Read the supplied lane common/brief
+and turnperf/turnperf2 evidence. Those supplied files remain untracked and are
+excluded from the change. No runtime behavior, protocol schema, permission
+rule, dependency, or release artifact is changed.
+
+The source is section 3 MODIFY P0 of the local 2026-09-05 harness analysis.
+Its four capability citations were audited before editing:
+
+| Citation in analysis | Result at starting tree | Runtime truth / disposition |
+| --- | --- | --- |
+| `worker.rs:14420` | Correct construct; wording drifted from “activates SMS monitors first” to “non-SMS fails closed” at :14421 | **Fixed**: all six sources are active. |
+| `monitor.rs:1250` | Correct source-class activation loop (:1251–1256) | **True**: sms, process, file, poll, timer, cli each start a classifier. |
+| `client-contract-v1.md:3178` | Correct stale structural-absence entry | **Fixed**: explicit creation pins and receipt-backed rebind exist. |
+| `haider-client/src/headless.rs:2997` | Correct create request; account field at :3008 | **True**: `--account` sends the exact session pin and validates returned metadata. |
+
+Coordinates in the inventory below are audit-input coordinates, not promises
+that lines stay fixed after prose edits. Runtime paths abbreviated below are
+under `crates/`; document paths are repository-relative.
+
+## Corrected capability statements
+
+| Statement checked | Result and authority |
+| --- | --- |
+| Model manual says non-SMS monitors fail closed | **Fixed** in `haider-daemon/src/worker.rs::tool_manual_line`: all six live source kinds; monitor schema retains `register/list/update/pause/resume/trigger/remove`. `monitor.rs::activate`, `monitor_source_availability`, and typed `MonitorRequest` are authoritative. |
+| Register/update arguments and ID requirements | **Fixed**: both require source/action; update/pause/resume/trigger/remove require monitor_id; timeout lifetime requires timeout_ms. Strict parser in `haider-tools/src/monitor.rs` verifies each shape. |
+| Monitor wake and coalescing semantics | **True, made explicit** in manual and manifest: idle subturn, busy queue at next turn boundary, coalescing per monitor. `monitor.rs::wake_monitor_report` uses durable `DeliveryMode::Subturn`; register/update receipts publish the same wake rule. |
+| Monitor authorization | **True, made explicit**: command registration/update is authorized under ProcessExec using exact argv/cwd/env-name coordinates; external files use FsRead. `MonitorApproval::new`, `EffectOperation`, and `worker.rs` monitor dispatch retain allow/preauthorized/ask/deny behavior; this is policy authorization, not an unconditional new user prompt. Workspace files, timers and SMS require no extra monitor-source effect approval. |
+| Spawn semantics | **True, made explicit** in manual/manifest: bounded depth-capped local child under AgentSpawn policy; parent waits for report before receiving tool result. `worker.rs` SpawnSubagent dispatch calls `begin_agent_spawn`; `delegation.rs` sequential contract parks in Waiting(LocalChild). `request_budget?` now appears in the signature for its existing schema field. |
+| Session account is always absent / binding and `--account` cannot exist | **Fixed** in client contract opening, absence table, §16 and conclusion; RPC/protocol Rustdoc corrected. §9.2.2 names `session.create.account_alias` / `session_account_select_v1` and `session.provider.rebind` / `session_provider_rebind_v1`. |
+| Exact pin ownership and absence | **True, made explicit**: summary promotes metadata.account_alias; this is a configured pin, not an inferred per-request identity. None remains unknown for request-account identity. Explicit pins bypass active-account selection and cannot rotate/fallback to another credential (`accounts.rs::resolve_selected_account` / `resolve_provider`, pinned-route guards; session summary projection). |
+| Rebind receipt / application / approval scope | **True, made explicit**: Control plus control attachment; atomic event+metadata+receipt; exact replay; next request boundary including retries/tool continuations; in-flight adapter unchanged; frozen active trust policy must remain compatible or busy. Omitted account/URL clear session overrides. `session_hub/provider_rebind.rs`, store rebind transaction, and existing automation rebind contract agree. |
+| Runtime-directory provenance is not yet published | **Fixed** in automation contract: CLI status publishes `runtime_dir_resolution.source` and optional `rejections` with source/reason. `haider-cli/src/observe.rs` and `haider-client/src/profile.rs::RuntimeDirResolution`; it is still not an RPC StatusSnapshot field. |
+| Regex is deferred / direct regex dependency absent | **Fixed**, original C1 deferral marked superseded in OPTIMIZATIONS: literal/simple/regex modes and bounded linear-time Rust regex already ship. `haider-tools/src/filesystem.rs::CompiledSearch::new`, Cargo.toml, and search safety tests. |
+| Adjacent C1 whole-file search deferral | **Fixed**, marked landed: `collect_streamed_file_matches` / `read_bounded_search_line` stream bounded lines and report explicit truncation. The older optimization ledger must not advertise this as outstanding work. |
+
+## Prompt bytes and regression coverage
+
+Only the monitor and spawn manual lines changed. The monitor line adds 239
+UTF-8 bytes and the spawn line adds 65, total **+304 bytes**:
+**instruct pipe 13,552 → 13,856**. The schema/manual subtotal is
+**12,862 → 13,166**; seven native descriptions remain **690 bytes**. No
+schema, tool inventory (29 registered / 26 advertised), or native-description
+scope changed. The full manifest comparison adds 226 bytes (monitor +147,
+spawn +79): macOS **19,736 → 19,962**, Linux **19,785 → 20,011**, Windows
+**19,735 → 19,961**, other **19,730 → 19,956**. The existing 30% reduction
+guard is unchanged; host ratio is approximately 30.59%. Non-host pin offsets
+are checked by inspection, not claimed as executed cross-platform results.
+
+- `monitor_and_spawn_descriptions_match_runtime_capabilities` ties manual,
+  manifest, operation schema, wake, and authorization vocabulary together.
+- `instruct_pipe_shrinks_the_advertised_wire_pack` and existing inventory/manual
+  coverage retain exact byte counts and the 30% guard.
+- `list_models_surface_is_manifest_route_and_text_pinned` retains its exact
+  spawn-line pin, updated with the request-budget/authorization/wait rationale.
+- `client_contract_account_pins_and_rebind_match_typed_requests` ties the
+  documented methods, features, and account fields to typed serde requests
+  and rejects the superseded impossibility claims.
+- Existing monitor tests cover source availability, durable register/list/remove,
+  update/pause/resume/trigger, unapproved command rejection, external-file
+  FsRead approval, SMS durable subturn wake, burst coalescing, once/every,
+  timeouts, timer restart, file events, poll conditions and process events.
+- Existing account/rebind tests cover exact-account selection, wrong-provider
+  rejection, frozen in-flight routing, next-request routing, replay, conflicts,
+  stale generations and clearing session-only overrides.
+
+## Verification and integration
+
+The initial sibling prebuild passed; the fresh daemon was 201,235,968 bytes
+(above the 10 MiB gate). All builds use the mandated stack/discovery/device,
+incremental and debug environment; daemon tests use prebuilt siblings. Disk
+space was checked with `df -m /` before each build.
+
+The first manual test run measured the exact intended bytes (19,962 full /
+13,856 pipe / 690 native) and passed 32 of 33 tests. The new operation-prose
+assertion rejected sentence-initial “Register” because it was case-sensitive;
+normalize human prose case while still testing exact schema enum strings.
+This corrects the test, without changing the descriptions or byte guard.
+The corrected manual suite passes **33/33**; contract doc tests pass **2/2**.
+`UPDATE_FIXTURES=1 cargo test -q -p haider-cli --test turnhygiene_pin_tests
+provider_request_body_is_budget_independent_and_matches_the_golden_ledger`
+passes **1/1** and regenerates `provider_request_no_budget.json`. A structural
+JSON comparison found exactly one changed value, `messages[0].content`, and
+exactly the two intended manual lines; fixture bytes **17,006 → 17,310**.
+`cargo run -q -p xtask -- test-count --update` recounts source markers
+**4,966 → 4,968** for the two new regression tests.
+
+The complete #1–96 delta walk is appended in
+`scripts/qa-gate/CI_REGISTRY_WALK_QAGATE3.md` under the docsync heading.
+The first no-fail-fast workspace run exposed the remaining old exact spawn
+manual pin in `worker_tool_catalog_tests.rs`; that pin is now updated with a
+rationale, preserving the exact equality assertion. The corrected full `cargo test -q --workspace --no-fail-fast` rerun exits **0**
+(`/tmp/docsync-workspace-tests-final.log`); all 337 libtest summaries are green,
+including nested probes. `cargo clippy --workspace --tests -- -D warnings`
+exits **0**; `cargo fmt --all -- --check` exits **0**; the final
+`cargo run -q -p xtask -- test-count` confirms **4,968 / 4,968**, exit **0**.
+`git diff --check` is clean. No test was newly ignored or platform-gated.
+
+Logs: `/tmp/docsync-manual-tests-final.log`,
+`/tmp/docsync-contract-tests.log`, `/tmp/docsync-fixture-refresh.log`,
+`/tmp/docsync-workspace-tests-final.log`, `/tmp/docsync-clippy.log`,
+`/tmp/docsync-fmt.log`, and `/tmp/docsync-test-count.log`. The first failed
+workspace run remains separately recorded in `/tmp/docsync-workspace-tests.log`;
+it had only the old exact spawn-line pin failure, fixed before the green rerun.
+
+Git fetch failed writing the external gitdir's `FETCH_HEAD`; the required
+`git merge --no-commit origin/wave-970` then failed creating `ORIG_HEAD.lock`.
+A read-only `git ls-remote origin refs/heads/wave-970` confirmed live upstream
+still matched HEAD at that point. No merge was recorded. The sandbox has no
+approval path for writing that gitdir; do not call this an executed merged-tree
+gate or completed commit.
+
+Final staging used an explicit list of 15 changed deliverable files, excluding
+all supplied lane/turnperf evidence. `git add` exited **128** because the
+sandbox denied creating the external gitdir's `index.lock`; commit could not
+proceed. No push was attempted. The exact error is retained in
+`/tmp/docsync-git-final.log`; a complete review/apply patch is saved at
+`/tmp/docsync.patch`. Changes remain in the worktree, uncommitted.
+
+## Independent verifier
+
+Finding 1 (real): the first draft said “other mutations need monitor_id”, which
+failed to explicitly include update. Changed the manual and regression to name
+update/pause/resume/trigger/remove; the corrected ID statement adds 19 of the
+304 final prompt bytes. No substantive finding was rejected as noise. The verifier also independently
+reconciled all 175 inventory coordinates; an editorial account-function citation
+was corrected during the final report audit.
+
+`VERIFIER: findings=1 real=1 noise=0 — corrected monitor update ID requirement and regression`
+
+The independent verifier's final closeout checked the green full-test log,
+Clippy completion, 4,968/4,968 source count, retained exact spawn pin, and
+fixture-only manual delta, with no new substantive findings.
+
+Delivery verdict: **NO_SHIP** until the required Git merge/commit can be recorded;
+the working-tree functional and lint gates are green.
+
+## Negative-capability claim sweep (audit input coordinates)
+
+Command: `rg -n -i 'not yet|not active|does not exist|unsupported' docs/ crates/haider-daemon/src/worker.rs`.
+
+Coordinates below identify the starting-tree statements (edits can move their final line numbers). Every matched statement is represented; duplicate test-log names are grouped with all coordinates. Current capability claims are checked against runtime. Dated briefs/reviews/research remain historical evidence: superseded product assumptions are marked here rather than rewriting prior reports; external policy/API observations and missing old CI/live-probe evidence are not current Haider promises and this audit does not claim to revalidate them. Windows/Linux behavior is by inspection. User-supplied LANE/turnperf inputs are read-only and must not be committed.
+
+This pass accounted for 175 matching lines: 139 individual statements and 36 log-name occurrences in 11 groups.
+
+| Statement coordinate | Matched statement | Classification | Runtime/provenance check |
+|---|---|---|---|
+| `crates/haider-daemon/src/worker.rs:2224` | "unsupported_tool_call", | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:8629` | haider_provider::RequestMetadataBodySupport::Unsupported, | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:8670` | }) && provider_capabilities.vision == FeatureResolve::Unsupported | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:8673` | ErrorCode::VisionUnsupported, | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:10141` | haider_pdf::PdfErrorKind::Unsupported => ( | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:10142` | "pdf-extraction-unsupported", | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:10143` | "PDF text encoding is unsupported", | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:10199` | if vision == FeatureResolve::Unsupported { | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:10294` | "pdf-native-document-unsupported", | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:10326` | format!("skill attachment `{name}` is reserved but not yet supported"), | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:10334` | if vision == FeatureResolve::Unsupported { | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:10500` | format!("skill attachment `{name}` is reserved but not yet supported"), | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:15050` | tool_result_images_supported: capabilities.vision != FeatureResolve::Unsupported, | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:16819` | "unsupported fs_search case mode `{value}`" | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:16829` | "unsupported fs_search pattern mode `{value}`" | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:16971` | "unsupported fs_path operation `{value}`" | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:17516` | "unsupported tool `{name}`" | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `crates/haider-daemon/src/worker.rs:20762` | \| ComputerError::InspectUnsupported { message, .. } | Non-capability match; retained | This match is outside the model-manual string: conditional runtime enum/error handling, not an advertised missing capability. Skill attachments remain explicitly rejected in both admission paths (:10326/:10500); vision/PDF capability guards remain typed and source-specific. |
+| `docs/briefs/W5e-1-review-1-SHIP.md:53` | ## Not yet proven | Historical record retained | The dated review explicitly records lack of a live browser/consent probe; a Rust capability implementation cannot retroactively supply that external test evidence. |
+| `docs/briefs/B4a-attachments-core-brief.md:27` | `capabilities().vision` is Unsupported → typed local refusal | Still true | `worker.rs:8670`, attachment admission rejects declared unsupported vision; `haider-daemond/tests/live_turn_rpc_tests.rs:2397` pins local typed refusal. |
+| `docs/briefs/B4a-attachments-core-brief.md:53` | - vision_unsupported_provider_refuses_locally_with_typed_error. | Still true | `worker.rs:8670`, attachment admission rejects declared unsupported vision; `haider-daemond/tests/live_turn_rpc_tests.rs:2397` pins local typed refusal. |
+| `docs/briefs/W5c.1-review-1-SHIP.md:120` | ⟺ `VaultProvision::Unsupported`, and the vault guard returns first. Latent | Still true | `VaultProvision::Unsupported` remains a conditional vault guard; `account_rpc_tests.rs:774` tests explicit unsupported provisioning. This does not say all non-macOS production vaults are unavailable. |
+| `docs/briefs/B4a-attachments-core-mutation-notes.md:12` | \| Accept caller-declared image types outside jpeg/png/gif/webp. \| `haider-daemon/tests/session_hub_tests.rs::mime_allowlist_enforced_at_acceptance` \| SVG reaches durable acceptance instead of returning `attachment_mime_unsuppor… | Historical record retained | Mutation evidence names rejection codes and observers; current local vision refusal remains in `worker.rs:8670` and `live_turn_rpc_tests.rs:2397`. The test path typo is historical, not an advertised capability. |
+| `docs/briefs/B4a-attachments-core-mutation-notes.md:13` | \| Move the unsupported-vision check after `stream_turn`, silently discard the image, or return a generic provider error. \| `haider-daemond/tests/live_turn_rpc_tests.rs::vision_unsupported_provider_refuses_locally_with_typed_err… | Historical record retained | Mutation evidence names rejection codes and observers; current local vision refusal remains in `worker.rs:8670` and `live_turn_rpc_tests.rs:2397`. The test path typo is historical, not an advertised capability. |
+| `docs/briefs/W5f-1-import-brief.md:34` | provider `anthropic-oauth`. On macOS this file usually does not exist (the | Historical record retained | Dated external Claude credential-location observation, not Haider session/account capability. Current discovery has source-specific capability checks in `accounts.rs:2488`; do not promote an old external layout observation to a current guarantee. |
+| `docs/briefs/W3-C3-tui-live-swap.md:17` | PLUS the two carried pins (W3c2 review): the pending-command secret TTL paused-time pin (retryable login, advance past SECRET_TTL, assert restage_required + wipe) and the five stable-code literal pins (unauthorized/permission_d… | Historical record retained | Names historical required stable error-code/TTL tests; `vault_unsupported` is a conditional refusal retained in `haider-daemond/tests/account_rpc_tests.rs:774`, not a claim all current platforms lack vaults. |
+| `docs/briefs/D1-device-oauth-discovery-mutation-notes.md:61` | ## K5 — unsupported-guessed (EXECUTED, reverted) | Historical record retained | Executed-and-reverted mutation/test-name record. Current candidate acceptance still checks `import_supported` and source allowlist in `accounts.rs:2488`. |
+| `docs/briefs/D1-device-oauth-discovery-mutation-notes.md:64` | importable: `import_supported = true`, `unsupported_reason = None`. | Historical record retained | Executed-and-reverted mutation/test-name record. Current candidate acceptance still checks `import_supported` and source allowlist in `accounts.rs:2488`. |
+| `docs/briefs/D1-device-oauth-discovery-mutation-notes.md:65` | - Observer: `accounts::accounts_tests::unsupported_candidate_is_honest_not_guessed` | Historical record retained | Executed-and-reverted mutation/test-name record. Current candidate acceptance still checks `import_supported` and source allowlist in `accounts.rs:2488`. |
+| `docs/briefs/D1-device-oauth-discovery-mutation-notes.md:105` | `unsupported_candidate_is_honest_not_guessed` observer), and K3's byte-bound | Historical record retained | Executed-and-reverted mutation/test-name record. Current candidate acceptance still checks `import_supported` and source allowlist in `accounts.rs:2488`. |
+| `docs/briefs/G3-effort-fast-notes.md:33` | codes `effort_unsupported` (typed data carries the exact ladder — empty | Still true | Pair-declared unsupported effort/fast remains a typed refusal; `haider-tui/tests/g3_effort_fast_tests.rs:271` pins unsupported-pair client refusal. |
+| `docs/briefs/G3-effort-fast-notes.md:34` | means "pair declares none") / `fast_unsupported`. Receipt replay precedes | Still true | Pair-declared unsupported effort/fast remains a typed refusal; `haider-tui/tests/g3_effort_fast_tests.rs:271` pins unsupported-pair client refusal. |
+| `docs/briefs/G3-effort-fast-notes.md:181` | (construction gate), `fast_gate_refuses_client_side_on_unsupported_pairs` | Still true | Pair-declared unsupported effort/fast remains a typed refusal; `haider-tui/tests/g3_effort_fast_tests.rs:271` pins unsupported-pair client refusal. |
+| `docs/briefs/W8a-permissions-core-brief.md:30` | side-effect lane). `!cd`: REJECT as unsupported in this slice with a | Still true | `session_hub/rpc.rs:14955` still rejects persistent `!cd`; invocation-scoped `shell.exec.cwd` exists separately. |
+| `docs/automation-contract-v1.md:670` | candidates were rejected; the field is landing in 968 and is not yet in this | Fixed current capability claim | Corrected the stale landing claim: current CLI publishes top-level `runtime_dir_resolution` (`observe.rs:78,289,631`), with `{source,rejections?}` and `{source,reason}` entries (`haider-client/src/profile.rs:187-201`); empty rejections omitted. It remains CLI status data rather than `StatusSnapshot`. Removed speculative branch/landing language. |
+| `docs/briefs/W5g-6-review-1-SHIP.md:51` | a locked-scope pillar not yet built; the model now gets to SAY that in | Superseded historical claim; preserved | Subagents are implemented (`worker.rs` canonical SpawnSubagent route and `delegation.rs` coordinator); the W5g-6 no-subagent statement is dated superseded evidence. |
+| `docs/briefs/G2-attach-rename-notes.md:16` | `unsupported_attachment_encoding` refusal (message names PDFs/binary as | Still true | Historical text-loader typed rejection, not a blanket attachment claim; current PDF route is separate (`worker.rs:10141-10303`). |
+| `docs/briefs/G2-attach-rename-notes.md:17` | unsupported), returns bytes + line count + sanitized basename. | Superseded historical claim; preserved | PDFs are no longer generally unsupported: `worker.rs:10141-10303` has extraction/native document branches. Preserve the dated text-lane notes. |
+| `docs/briefs/G2-attach-rename-notes.md:21` | `unsupported_attachment_type` the text lane loads the file → | Still true | Type-refusal fallback routing remains conceptually valid; this match is an error identifier, not an assertion that all attachments are unsupported. |
+| `docs/perf/v0.0.967-group-commit-barrier.md:25` | `SyncPolicy::Barrier` on Apple. Unsupported Apple barriers fail closed rather | Still true | `haider-store/src/cas.rs:588-592` uses `SyncPolicy::Barrier` and documents fail-closed behavior; provider-view barrier failure tests remain in `provider_view_store_tests.rs`. |
+| `docs/briefs/G3-effort-fast-brief.md:58` | the oauth beta when both). /fast on unsupported pair → client refuses | Still true | Unsupported provider/model pairs remain client/daemon refusals, pinned by `g3_effort_fast_tests.rs:271`. |
+| `docs/briefs/G3-effort-fast-brief.md:102` | - LE4 fast: body+header golden; unsupported-pair refusal (client+daemon); | Still true | Unsupported provider/model pairs remain client/daemon refusals, pinned by `g3_effort_fast_tests.rs:271`. |
+| `docs/briefs/G2-attach-rename-brief.md:13` | distinct error (`unsupported_attachment_encoding`). PDFs remain | Still true | Text-loader binary encoding refusal is still a real typed branch; it must not be conflated with separate PDF attachment support. |
+| `docs/briefs/G2-attach-rename-brief.md:14` | unsupported — out of scope, error message may say so. | Superseded historical claim; preserved | PDF support now routes through `worker.rs:10141-10303` and `haider-pdf`; the old G2 slice explicitly excluded PDFs and remains a dated brief. |
+| `docs/briefs/G2-attach-rename-brief.md:20` | `unsupported_attachment_type`, fall back to text load → | Still true | Image-loader fallback refusal identifier remains a routing condition; separate PDF extraction does not invalidate text/image type checks. |
+| `docs/briefs/W3b2-review-2-NO_SHIP.md:10` | grant≡consume, lost-wakeup closed by subscribe-before-offer + credit signaling). NOT yet | Historical record retained | Frozen-SHA failed-review diagnosis of then-current fairness/backpressure, not a current unavailable-feature promise. Preserve its historical verdict rather than rewriting the old interleaving analysis. |
+| `docs/perf/speed-optimization-analysis.md:97` | Any future batching design must group only callers that have not yet received | Still true | A batching design prerequisite (only unacknowledged callers may join a commit), not an unavailable capability; store commit receipts continue to delimit accepted durability. |
+| `docs/OPTIMIZATIONS.md:330` | \| `crates/haider-daemon/src/session_hub/rpc.rs` (`shell_exec`), `crates/haider-tools/src/shell.rs` (`prepare_user_process`) \| `shell.exec.cwd` is deliberately invocation-scoped. Persistent `!cd` is unsupported until daemon-owne… | Still true | `session_hub/rpc.rs:14955` still explicitly rejects persistent `!cd`; `haider-tools/src/shell.rs:846` scopes cwd to one invocation. |
+| `docs/OPTIMIZATIONS.md:346` | \| `crates/haider-tools/src/filesystem.rs` (`FsSearchMode::Simple`, `wildcard_matches`) \| Full regex syntax is deferred; C1 supports literal search and the explicitly advertised `*`/`?` simple pattern grammar. \| Trigger: a shipp… | Fixed current capability claim | `filesystem.rs:731-740` includes `FsSearchMode::Regex`; `CompiledSearch::new` at :2859 compiles bounded linear-time Rust regex; direct dependencies include regex/regex-syntax/globset. Also corrected the adjacent no-regex/no-glob-dependency paragraph (:338-340), which contradicts the same implementation. `search_safety_tests.rs:64,182,194` pin success and refusal bounds. |
+| `docs/briefs/D2-accounts-discovery-mutation-notes.md:40` | - Observer: `unsupported_rows_are_dim_honest_and_inert` | Historical record retained | Mutation output/test identifiers for unsupported candidate rows. `accounts.rs:2488` still declines unsupported source candidates; no global import-absence claim. |
+| `docs/briefs/D2-accounts-discovery-mutation-notes.md:42` | `a forged unsupported coordinate is inert: [DeviceImport { candidate: | Historical record retained | Mutation output/test identifiers for unsupported candidate rows. `accounts.rs:2488` still declines unsupported source candidates; no global import-absence claim. |
+| `docs/briefs/W5a-review-1-NO_SHIP.md:31` | However, the native implementation does not yet preserve Responses reasoning-continuation items, so the material capability R2 was protecting is still lost. The report must be amended to document two explicit families—native Re… | Superseded historical claim; preserved | Current native OpenAI adapter preserves opaque reasoning-item continuation (`haider-provider/src/openai.rs:2784,2843,3272`); the dated failed review remains historical evidence. |
+| `docs/briefs/W5a-review-1-NO_SHIP.md:45` | 1. Hostile `/v1/models` and HTTP error bodies are read without size bounds ([openai.rs:286](/Users/rizzist/haider-run/haider-w5a/crates/haider-provider/src/openai.rs:286), [openai.rs:363](/Users/rizzist/haider-run/haider-w5a/cr… | Superseded historical claim; preserved | The old unbounded-read finding is superseded by bounded model/error reads (`openai.rs:1732,2093,2191`). Conservative unsupported-capability inference remains correct. |
+| `docs/jsonl-run-contract-v1.md:36` | raw envelopes. Unsupported future request metadata stays in the raw events; | Still true | `haider-client/src/provider_rounds.rs:59,386` preserves unknown-future raw request metadata while declining to invent a typed round. |
+| `docs/jsonl-run-contract-v1.md:347` | not an atomic filesystem snapshot; detected concurrent changes, unsupported | Still true | `haider-core/src/turn_workspace.rs:190-222` hashes bounded observed bytes, checks metadata stability, and rejects unsupported special files; sequential receipt failures remain typed unavailability rather than an invented snapshot. |
+| `docs/briefs/D1-device-oauth-discovery-brief.md:46` | - unsupported_candidate_is_honest_not_guessed. | Still true | Test-name match for honest candidate capability; `accounts.rs:2488` enforces source/import support. |
+| `docs/briefs/W5b-review-1-NO_SHIP.md:95` | \| Refresh issuer/resource/audience mismatch \| Missing and unsupported \| | Historical record retained | Frozen failed-review test coverage matrix; whether that old probe covered issuer/audience mismatch is historical evidence, not a current OAuth guarantee. OAuth files are explicitly excluded from this lane edits. |
+| `docs/briefs/TUI0-review-2-SHIP_WITH_FIXES.md:6` | - **P2 — Plan `Started` events bypass lifecycle idempotency.** The duplicate check searches `finished_items` and streaming transcript blocks at [projection.rs:211](/Users/rizzist/Documents/CODING/haider-agent-tui0/crates/haider… | Historical record retained | Duplicate paragraphs report a frozen review gap in a particular observer ("not active-plan starts"), not an unavailable plan feature. Retained as original verification evidence; current projection is implemented in `haider-tui/src/projection.rs`. |
+| `docs/briefs/TUI0-review-2-SHIP_WITH_FIXES.md:36` | - **P2 — Plan `Started` events bypass lifecycle idempotency.** The duplicate check searches `finished_items` and streaming transcript blocks at [projection.rs:211](/Users/rizzist/Documents/CODING/haider-agent-tui0/crates/haider… | Historical record retained | Duplicate paragraphs report a frozen review gap in a particular observer ("not active-plan starts"), not an unavailable plan feature. Retained as original verification evidence; current projection is implemented in `haider-tui/src/projection.rs`. |
+| `docs/briefs/TUI5-cursor-brief.md:16` | 6. **History interplay.** ↑ on the FIRST visual row (no selection) = previous submitted input; ↓ on the LAST row = next/back to draft — Claude Code behavior. Recall places the cursor at end. If input history does not exist yet … | Superseded historical claim; preserved | Conditional build instruction is satisfied: composer history exists (`haider-tui/src/composer.rs:311`) and session prompt history exists (`session.rs:93`); preserve original brief. |
+| `docs/briefs/W5e-1b-review-1-SHIP.md:67` | `provider.models_refresh` and `provider.configure` affordances are not yet | Superseded historical claim; preserved | Provider configure/models refresh are shipped feature-gated RPC surfaces in current client contract feature table and runtime registry; the old no-UI-yet statement belongs to the historical W5e-1b slice. |
+| `docs/briefs/C4a-review-5-NO_SHIP.md:3` | "Terminal writes are centralized, but ownership and exactly-once behavior are not yet | Historical record retained | The file explicitly freezes SHA 34abe11. Its terminalization critique is a historical failed-review result, not a current capability contract; preserving it does not endorse the diagnosis against current broker code. |
+| `docs/CU-2-COMPUTER.md:43` | On Linux, `WAYLAND_DISPLAY` or `XDG_SESSION_TYPE=wayland` positively selects Wayland and never falls through to X11. The shipped `haider-wayland-portal` companion owns one xdg-desktop-portal ScreenCast + RemoteDesktop session, … | Still true | Wayland backend explicitly rejects Inspect and CursorPosition (`haider-tools/src/computer/wayland.rs:447-458`), while screenshot/input use the portal. Linux runtime behavior audited by inspection here. |
+| `docs/event-schema-changelog.md:44` | stream_eof, cancelled or guard/unsupported-response cause). Private summaries | Still true | "unsupported-response cause" names an additive terminal-cause kind, not an absent feature; raw event/round projections tolerate future metadata. |
+| `docs/event-schema-changelog.md:174` | The five automation terminal kinds did not yet exist at this baseline. | Historical record retained | Explicit historical baseline statement about automation terminal kinds, not the current enum; current automation receipt types exist in `haider-rpc` and contract. |
+| `docs/client-contract-v1.md:450` | \| Command execution \| `command.invoke` \| `CommandInvoke` \| correlated result: receipt, parked, client-owned, or unsupported \| listed ownership and canonical nested receipt \| | Still true | `haider-rpc/src/command.rs:603` models conditional Unsupported outcomes; absence of reason is not invented public detail. |
+| `docs/client-contract-v1.md:756` | mutations; changing `session_id` does not create a new namespace. Unsupported | Still true | Unsupported future monitor sources retain durable typed registration rejection; current six-source availability is separately stated and does not remove the forward-compatible rejection enum (`monitor.rs`, `session_hub/rpc.rs:5995-6250`). |
+| `docs/client-contract-v1.md:1267` | daemon enforces at turn time as `vision_unsupported`. Absence means the daemon | Still true | `worker.rs:8670` rejects explicitly unsupported vision before provider spend; absent capability remains distinct from supported. |
+| `docs/client-contract-v1.md:1479` | \| `CommandInvokeOutcomeWire` with `kind: "unsupported"`, `reason` omitted \| unsupported with no public detail; do not parse another field for a reason \| | Still true | `haider-rpc/src/command.rs:603` models conditional Unsupported outcomes; absence of reason is not invented public detail. |
+| `docs/client-contract-v1.md:1495` | \| device candidate `account_label`, `expires_at_ms` \| the external store supplied no label or expiry. `unsupported_reason=None` means no public reason, not that import is supported; use `import_supported` \| | Still true | Discovery eligibility uses `import_supported`, independently of optional `unsupported_reason` (`accounts.rs:2488,6635`). |
+| `docs/client-contract-v1.md:1607` | `"client_owned"`, `"unsupported"`, or `"unknown"`. | Still true | `haider-rpc/src/command.rs:603` models conditional Unsupported outcomes; absence of reason is not invented public detail. |
+| `docs/client-contract-v1.md:1618` | `"client_owned"` redirects to client view behavior. For `kind: "unsupported"`, | Still true | `haider-rpc/src/command.rs:603` models conditional Unsupported outcomes; absence of reason is not invented public detail. |
+| `docs/client-contract-v1.md:2540` | does not exist in this advertised snapshot. A client MUST NOT replace `None` | Still true | `session_hub/rpc.rs:12084-12130` returns None for a missing workflow id/digest; absence is a conditional lookup result, not absence of the workflow feature. |
+| `docs/client-contract-v1.md:2559` | does not exist; copying `template_digest` into `digest` would fabricate a | Still true | `session_hub/rpc.rs:12094-12101` gives built-ins a template_digest with digest/pipe_version/node_metadata None; user instances at :12116-12124 carry their registry facts. |
+| `docs/client-contract-v1.md:2945` | unsupported directory image has no artifact and MUST carry | Still true | `haider-tools/src/checkpoint.rs:56-103` records bounded pre-images or `truncated_reason`; unsupported directory images must not masquerade as absent files. |
+| `docs/client-contract-v1.md:2984` | stop locally with an unsupported-feature error and must not send a checkpoint | Still true | Welcome feature absence continues to fence checkpoint RPC use; it is conditional compatibility behavior, not a claim current daemons lack checkpoint support. |
+| `docs/client-contract-v1.md:3154` | - **[STRUCTURAL]** — the value does not exist in the daemon. "Unknown" is | Still true | Defines the STRUCTURAL absence label; apply only to verified actual absences. The falsely labeled account entry is corrected separately. |
+| `docs/client-contract-v1.md:3182` | field is empty because the fact does not exist, not because a publisher | Fixed current capability claim | Actual exact session account pins and receipt-backed provider/account/endpoint rebind exist; corrected `session.create.account_alias` and `session.provider.rebind` contract references and account summary absence semantics. |
+| `docs/client-contract-v1.md:3380` | had not yet synced. | Still true | Crash between notification handoff and durable publication marker can repeat notifications; dedup by msg_id remains appropriate, not an unavailable feature. |
+| `docs/testing/v0.0.967/tool-calling.md:20` | \| The armed process-exit path still polls at 1 kHz \| wrong \| Linux uses pidfd and macOS uses kqueue; only unsupported targets retain the bounded one-millisecond fallback. \| | Still true | Report describes platform-specific process-exit implementation and bounded fallback; unsupported-target qualifier is conditional, not a claim process monitoring is unavailable on supported targets. |
+| `docs/testing/v0.0.967/tool-calling.md:188` | Not yet proven locally: Windows/Linux process-tree behavior. The commands have | Historical record retained | Lack of executed Windows/Linux process-tree evidence remains an honest historical local-validation limit; this audit also assesses those platforms by inspection only. |
+| `docs/client-contract-v1-enum-audit.md:267` | `"invalid_argument"` \| `"unknown_method"` \| `"protocol_mismatch"` \| `"unauthorized"` \| `"credential_missing"` \| `"credential_limited"` \| `"session_not_found"` \| `"run_not_active"` \| `"menu_not_found"` \| `"menu_already_answered"… | Still true | Wire enum token inventory: `haider-protocol/src/error.rs:331` includes typed VisionUnsupported/RunNotActive variants and unknown tolerance; token names are not capability denials. |
+| `docs/client-contract-v1-enum-audit.md:418` | `"invalid_boundaries"` \| `"missing_account_scope"` \| `"provider_mismatch"` \| `"unsupported_model"` \| `"unverified"` \| `"adapter_unavailable"` \| `"unknown"`; any other string → Rust `Unknown`. | Still true | Wire enum inventory: `haider-protocol/src/provider.rs:447-449` retains MissingAccountScope and UnsupportedModel reasons. |
+| `docs/client-contract-v1-enum-audit.md:433` | `"native"` \| `"explicitly_emulated"` \| `"unsupported"`. | Still true | `haider-protocol/src/provider.rs:720` FeatureResolve explicitly contains native/emulated/unsupported states. |
+| `docs/client-contract-v1-enum-audit.md:518` | `"receipt"` \| `"parked"` \| `"client_owned"` \| `"unsupported"` \| `"unknown"`; any other string → Rust `Unknown`. | Still true | `haider-rpc/src/command.rs:603` retains explicit CommandInvokeOutcomeWire Unsupported alongside receipt/parked/client-owned outcomes. |
+| `docs/research/w6-subagent-research.md:419` | A real nudge transport does not exist yet: | Superseded historical claim; preserved | A real safe-boundary nudge now exists: `delegation.rs:2281-2325` durably records and calls `submit_internal_nudge`; preserve historical research, mark superseded here. |
+| `docs/testing/v0.0.969/cfbgate.md:21` | The post-change CI result is not yet available, so the original runner failure | Historical record retained | Dated runner-observation availability; product source cannot supply absent external CI measurement. No stale capability denial. |
+| `docs/design/cu1-image-tool-results.md:82` | For an unsupported provider/model, the core explicitly replaces refs in the | Still true | Unsupported-image providers get explicit placeholders (`haider-core/src/actor.rs:2589-2664,13479-13480`), including compaction projection, without changing durable refs. |
+| `docs/design/cu1-image-tool-results.md:100` | then apply the same oldest-first budget, then use the explicit unsupported | Still true | Unsupported-image providers get explicit placeholders (`haider-core/src/actor.rs:2589-2664,13479-13480`), including compaction projection, without changing durable refs. |
+| `docs/research/w5-provider-research-report.md:46` | `TurnRequest` is already provider-neutral: messages, requested model, maximum output, optional system prompt, tool definitions, and resolved attachments (`crates/haider-provider/src/lib.rs:117-129`). `ProviderError` normalizes … | Still true | `haider-provider/src/lib.rs:2562` ProviderErrorKind has no dedicated Unsupported variant; unsupported request shapes use existing typed error paths. |
+| `docs/research/w5-provider-research-report.md:305` | Current Keychain is the only production vault. On unsupported platforms OAuth is unavailable for the same reason API-key durable login is unavailable (`crates/haider-accounts/src/keychain.rs:177-202`). W5 does not add plaintext… | Superseded historical claim; preserved | Old Keychain-only implementation is superseded by `haider-accounts/src/file_vault.rs`; retain dated W5 design constraints rather than rewrite history. |
+| `docs/research/w5-provider-research-report.md:548` | Generic transport/5xx overload is provider-wide or network-wide and retries the same account according to core policy; rotating credentials would hide the real failure. Permission 403, malformed responses, unsupported models, a… | Still true | Unsupported model/permission/malformed local request failures are not a reason to silently select unrelated credentials; exact account resolution and bounded rebind preserve caller identity. |
+| `docs/research/w5-provider-research-report.md:711` | \| W5-RK13 \| token-at-rest law \| add a `0600` JSON fallback \| cleartext refresh token survives \| Keychain-capable vault only; unsupported platform unavailable \| | Superseded historical claim; preserved | Historical Keychain-only risk entry predates shipped FileVault (`haider-accounts/src/lib.rs:31`); not a current platform support statement. |
+| `docs/research/w5-provider-research-report.md:722` | \| W5-RK24 \| capability truth is bounded \| infer model capability only from name or stale probe \| send unsupported tools/images/reasoning \| registry config + adapter doc + existing typed `InvalidRequest` capability message \| | Still true | Capability-truth risk/mitigation still applies; runtime `FeatureResolve` includes explicit Unsupported and rejects unsupported vision (`worker.rs:8670`). |
+| `docs/research/w3c-research-report.md:451` | W3c session configuration makes provider/model/max-tokens configurable. Keep the production Anthropic URL and version adapter-owned; keep the endpoint override test-only. Expose timeout/retry bounds through `DaemonConfig` only … | Superseded historical claim; preserved | The explicit W3c-only OpenAI absence is superseded by current native/compatible OpenAI adapters (`haider-provider/src/openai.rs`); keep historical scope record. |
+| `docs/research/w3c-research-report.md:527` | `turn.submit` and `turn.cancel` require a control attachment to match existing menu policy; `session.create` cannot require an attachment because the session does not exist yet. `vault.stage` and account login are harness/profi… | Still true | A new session has no existing attachment before `session.create`; connection capability versus session attachment remains the correct creation/auth distinction in `session_hub/rpc.rs`. |
+| `docs/research/w3c-research-report.md:659` | **Platform decision.** W3c's `/login anthropic api` release gate is macOS, the only platform with a working vault today. On non-macOS, the daemon rejects the command before staging/validation with stable `vault_unsupported`, ne… | Superseded historical claim; preserved | Keychain-only platform limit is historical: `accounts.rs:11972-11978` selects the subsequently landed FileVault for PlatformDefault, including non-macOS. Explicit unsupported provisioning still has typed refusal tests. |
+| `docs/research/w3c-research-report.md:802` | Store replay guarantees all committed envelopes in contiguous sequence order. It does not restore an HTTP response body not yet committed, provider TCP/SSE state, process memory, an uncommitted tool result, or knowledge of an e… | Still true | Committed journal replay cannot restore an uncommitted remote body/process state or unknowable external outcome; current recovery continues to use durable facts, not invented history. |
+| `docs/research/w3c-research-report.md:841` | \| Platform credential support \| claim login support where `KeychainVault` always errors \| macOS release gate; named `vault_unsupported`; ledger a real Linux backend \| | Superseded historical claim; preserved | Historical Keychain-only release gate is superseded by FileVault (`haider-accounts/src/file_vault.rs`); preserve the old risk table and record supersession here. |
+| `docs/research/b4-attachments-research.md:60` | openai-compatible + Fake Unsupported) but NEVER consulted by any | Superseded historical claim; preserved | Old "vision never consulted" finding is superseded by `worker.rs:8670` and `live_turn_rpc_tests.rs:2397` local typed refusal. |
+| `docs/research/subagent-metrics-proposal-gpt56.md:86` | The current UI has useful recursive scaffolding—`ChipModel.children`, depth-first flattening and recursive live counting ([app.rs:808](/Users/rizzist/haider-run/b2b-tui/crates/haider-tui/src/app.rs:808), [app.rs:1149](/Users/ri… | Superseded historical claim; preserved | Current fleet has its own `haider-tui/src/fleet.rs:1-3` projection and daemon recursive snapshot (`session_hub/rpc.rs:961-1061,17220`); original dated incomplete-fleet proposal is not a current contract. Do not rewrite the proposal. |
+| `docs/testing/v0.0.970/oauthcapture-analysis.md:15` | - Keep direct subscription-token imports behind an unsupported, explicit policy gate—or omit them. | Historical record retained | Historical external-policy interpretations and proposed acceptance requirements, explicitly tagged A/V-DOC. They are not current daemon capability assertions; this runtime audit neither revalidates external policy nor rewrites research. Current account pin/rebind surface is corrected separately in the contract. |
+| `docs/testing/v0.0.970/oauthcapture-analysis.md:58` | \| Run Haider-native OAuth login N times and keep credentials in Haider’s file vault \| **V-CODE:** Avoids Claude Keychain. Browser/device authorization still requires user action. Haider already has OpenAI and Anthropic OAuth re… | Historical record retained | Historical external-policy interpretations and proposed acceptance requirements, explicitly tagged A/V-DOC. They are not current daemon capability assertions; this runtime audit neither revalidates external policy nor rewrites research. Current account pin/rebind surface is corrected separately in the contract. |
+| `docs/testing/v0.0.970/oauthcapture-analysis.md:179` | - **[A — legal interpretation]** Direct Codex subscription-token reuse by Haider remains unsupported and carries enforcement risk even when the account owner and machine are the same. Delegating to the official Codex app server… | Historical record retained | Historical external-policy interpretations and proposed acceptance requirements, explicitly tagged A/V-DOC. They are not current daemon capability assertions; this runtime audit neither revalidates external policy nor rewrites research. Current account pin/rebind surface is corrected separately in the contract. |
+| `docs/testing/v0.0.970/oauthcapture-analysis.md:180` | - **[A — release gate]** Direct subscription-token compatibility modes require legal review, explicit informed opt-in, prominent unsupported-status disclosure, and a remote kill switch. | Historical record retained | Historical external-policy interpretations and proposed acceptance requirements, explicitly tagged A/V-DOC. They are not current daemon capability assertions; this runtime audit neither revalidates external policy nor rewrites research. Current account pin/rebind surface is corrected separately in the contract. |
+| `docs/testing/v0.0.970/oauthcapture-analysis.md:218` | - **[A — acceptance]** Metering errors differentiate broker failure, missing identity, source restriction, provider response, and unsupported delegated metering. | Historical record retained | Historical external-policy interpretations and proposed acceptance requirements, explicitly tagged A/V-DOC. They are not current daemon capability assertions; this runtime audit neither revalidates external policy nor rewrites research. Current account pin/rebind surface is corrected separately in the contract. |
+| `docs/testing/v0.0.970/oauthcapture-analysis.md:230` | - **[A — acceptance]** Unsupported direct-token modes are compile-time or policy-gated, default off, auditable, and accompanied by legal approval. | Historical record retained | Historical external-policy interpretations and proposed acceptance requirements, explicitly tagged A/V-DOC. They are not current daemon capability assertions; this runtime audit neither revalidates external policy nor rewrites research. Current account pin/rebind surface is corrected separately in the contract. |
+| `docs/testing/v0.0.970/_antigravity-pins.md:25` | "unsupported platform" error and must never fall back to another archive. | Still true | Platform pin table deliberately omits Intel macOS; installer test `intel_macos_is_unsupported_and_never_falls_back` documents the exact refusal, not all macOS absence. |
+| `docs/testing/v0.0.970/cfbcal.md:25` | The repository does not yet have the requested all-surface N=5 runner artifact: | Historical record retained | Records missing all-surface N=5 runner artifact at that lane date; no current runtime capability claim, and no runner artifact is fabricated by this docs audit. |
+| `docs/testing/v0.0.970/turnbudget.md:134` | The CLI rejects unsupported branch/agent scope instead of starting a different | Still true | `haider-cli/src/run.rs:2216` handles `continuation_scope_unsupported`; refusal prevents silently changing continuation scope. |
+| `docs/testing/v0.0.970/turnperf2/X3.md:6` | \| X3.4 \| both \| Conservative per-target `-C target-cpu` experiment; never ship `native` blindly \| Release builds generic target triples for five architectures (`.github/workflows/release.yml:26-37`) with plain release commands … | Historical record retained | Supplied performance proposal; unsupported-instruction risk is a conditional deployment constraint, not missing Haider capability. Preserve user-supplied evidence. |
+| `docs/research/wb-web-tools-research.md:46` | url_not_accessible, unsupported_content_type, max_uses_exceeded. | Historical record retained | Historical third-party API error kinds/model mixing support and unconfirmed assumptions; not Haider runtime capability statements. Preserve provenance; runtime registry and adapters govern actual exposure. |
+| `docs/research/wb-web-tools-research.md:83` | function_declarations; 2.5 does NOT (mixing unsupported — omission- | Historical record retained | Historical third-party API error kinds/model mixing support and unconfirmed assumptions; not Haider runtime capability statements. Preserve provenance; runtime registry and adapters govern actual exposure. |
+| `docs/research/wb-web-tools-research.md:109` | models (all gpt-5.x). Lite: UNCONFIRMED — assume unsupported, use | Historical record retained | Historical third-party API error kinds/model mixing support and unconfirmed assumptions; not Haider runtime capability statements. Preserve provenance; runtime registry and adapters govern actual exposure. |
+| `docs/research/error-handling-analysis-gpt56.md:36` | - **Today:** Immediate nonretryable `InvalidRequest`; only recognized context-overflow codes are carved out. Model-not-found, unsupported parameter/tool, bad replay signature, and malformed request otherwise collapse together. … | Historical record retained | Dated error taxonomy/recommendation, not a current feature denial. `ProviderErrorKind::InvalidRequest` remains (`provider/lib.rs:2570`); import source validation remains (`accounts.rs:2488`). Recommendations are not promises of implementation. |
+| `docs/research/error-handling-analysis-gpt56.md:38` | - **Recommended:** Usually **FATAL-WITH-GUIDANCE**, using safe subcodes. Invalid model should **PARK-FOR-USER** with `m Choose model`; optional unsupported capability should **RECOVER/DEGRADE**. | Historical record retained | Dated error taxonomy/recommendation, not a current feature denial. `ProviderErrorKind::InvalidRequest` remains (`provider/lib.rs:2570`); import source validation remains (`accounts.rs:2488`). Recommendations are not promises of implementation. |
+| `docs/research/error-handling-analysis-gpt56.md:110` | - **Today:** Disabled discovery, unavailable candidate, unsupported source, file-read and import failures are returned precisely. The TUI shows `✗ import failed — message` inline and releases the pending gate. [accounts.rs:4036… | Historical record retained | Dated error taxonomy/recommendation, not a current feature denial. `ProviderErrorKind::InvalidRequest` remains (`provider/lib.rs:2570`); import source validation remains (`accounts.rs:2488`). Recommendations are not promises of implementation. |
+| `docs/research/g-wave-external-api-research.md:30` | Claude Code uses: unsupported level → highest supported level at or below. | Historical record retained | External Claude Code fallback observation, not a current Haider unavailability claim; preserve research provenance, no external-currentness claim. |
+| `docs/research/w7-context-research.md:32` | It is not yet `tree → render plan → prompt`. | Superseded historical claim; preserved | `haider-core/src/prompt_history.rs:1-2,16,64-71` now reconstructs from a durable history tree and compaction artifact projections; do not use the dated "not yet" sentence as a present capability restriction. |
+| `docs/research/w7-context-research.md:404` | - `/tree` is also a stub, so live mode cannot yet navigate the originals promised by the compaction card. | Superseded historical claim; preserved | `/tree` is implemented in `haider-tui/src/app.rs:14328` and enters `Screen::Tree`; old stub statement is superseded historical research. |
+| `docs/testing/v0.0.970/turnperf2/X2.md:6` | \| X2-3 \| daemon \| Speculative provider transport connect during admission, never speculative inference \| Start advisory provider resolution and pooled DNS/TCP/TLS/ALPN preconnect when a validated `headless.run.start` enters adm… | Historical record retained | Supplied performance proposal names possible unsupported HEAD prewarm as a conditional transport risk; no claim actual inference is unavailable. |
+| `docs/research/w8-permissions-research.md:198` | 2. W8 documents every `!cmd` as starting at the session workspace root and rejects `!cd` as unsupported. | Still true | Persistent `!cd` remains rejected at `session_hub/rpc.rs:14955`; one-invocation cwd is distinct. |
+| `docs/research/C1-anthropic-notes.md:152` | \| unknown \| 100,000 (conservative) \| unsupported \| | Historical record retained | Historical external provider model support table; not a current Haider capability source. Runtime provider capability registry remains the authority; no external status/pricing revalidation is claimed. |
+| `docs/research/cachemaxxing-plan-gpt56.md:246` | - Never blend unsupported-provider input invisibly into the denominator. | Still true | Unsupported-provider usage must stay unknown/separate; current `pricing.rs:618` checks normalized availability before pricing, so absence is not zero. |
+| `docs/research/cachemaxxing-plan-gpt56.md:312` | Current Haider pricing cannot yet produce these numbers reliably: | Superseded historical claim; preserved | Pricing now normalizes cache reads/writes and prices write TTLs (`haider-provider/src/pricing.rs:576-648`); the old double-count/write-premium analysis is superseded historical evidence. |
+| `docs/research/cachemaxxing-plan-gpt56.md:344` | - Honest unsupported state for Ollama/arbitrary compatible endpoints. | Still true | Unsupported/arbitrary endpoint cache telemetry still requires an honest unavailable state; current normalized pricing guards do not invent absent counters. |
+| `docs/research/cachemaxxing-plan-gpt56.md:373` | Exit criterion: the sample counters produce exactly `99.59% hit`, unsupported providers show `n/a`, and mixed-provider sessions cannot display a misleading complete percentage. | Historical record retained | A proposed acceptance criterion, not an unavailable capability statement or current percentage claim. Retain the historical goal without asserting it was executed. |
+| `docs/research/cachemaxxing-plan-gpt56.md:444` | \| Private OAuth/responses-lite behavior differs \| Capability-probe, feature-gate, retain stateless/full-history fallback, and label unsupported behavior unverified. \| | Historical record retained | Historical external/private-API risk recommendation; no current runtime absence is asserted. Preserve evidence rather than revalidate private provider claims in a docsync lane. |
+| `docs/research/b2-branches-research.md:162` | 6. Gate live behavior on the advertised branch feature. Without it, keep an honest unsupported notice; never fabricate a live branch locally. Demo/persistence can mirror the simulator, but durable live truth remains daemon-owned. | Still true | Feature-absence rule remains correct: a client must refuse absent advertised branch support instead of fabricating branch state. This is conditional, not a blanket denial. |
+| `docs/testing/v0.0.970/turnperf2/PROPOSAL2.md:109` | - **X3-4 — universal `target-cpu=native`:** unsupported-instruction risk exceeds an estimated below-MAD gain. | Historical record retained | Supplied performance proposal rejects blindly shipping native CPU instructions. A conditional ISA risk, not a runtime surface claim. |
+| `docs/testing/v0.0.970/codepagediet.md:8` | source is unchanged.  The requested root `run.sh` does not exist: the current | Historical record retained | Dated evidence that requested root run.sh was absent, not a product capability denial; preserve lane evidence without manufacturing a script. |
+| `docs/testing/v0.0.970/googleoauth.md:169` | - There is no Intel-macOS build; that host gets a typed unsupported-platform error, never a fallback. | Still true | Antigravity installer intentionally has no Intel-macOS artifact; logged `intel_macos_is_unsupported_and_never_falls_back` test pins honest refusal. Platform execution remains by inspection except recorded arm64 probe. |
+| `docs/testing/v0.0.970/googleoauth.md:204` | \| Root override \| **`GROK_HOME`** (whole directory; used verbatim, empty falls back to default). `GROK_AUTH_PATH` moves only the file; `GROK_AUTH` supplies inline JSON read-only. `XDG_CONFIG_HOME` is **not** honoured and `GROK_… | Historical record retained | Measured external Grok credential-root environment names, not a Haider feature absence. Preserve original probe provenance and do not treat external names as a current runtime promise. |
+| `docs/testing/v0.0.970/googleoauth.md:446` | - Vision is declared `Unsupported` even though the live agent advertises | Still true | Current adapter still declares `vision: FeatureResolve::Unsupported` (`haider-provider/src/acp/antigravity.rs:319`); upstream capability alone does not activate unimplemented image shaping. |
+| `docs/research/d1-daemon-research-report.md:164` | The README labels WebSocket support experimental/unsupported. The WS server exposes `/readyz` and `/healthz`. The transport rejects any request containing an `Origin` header, a defensible cross-site safeguard for native clients… | Historical record retained | The paragraph concerns an external tool README/WebSocket transport, not Haider runtime. Preserve external research, no present external support guarantee asserted. |
+| `docs/research/g2-attach-rename-seam-map.md:20` | (jpeg/png/gif/webp); error "unsupported_attachment_type" :88-94. Shared | Still true | `unsupported_attachment_type` is a concrete image-type refusal, not a claim all attachments or PDFs remain unsupported; PDF route now exists separately. |
+| `docs/testing/v0.0.970/winclip.md:87` | input disabled, discards those unsupported generic-key delimiters. Payload is | Still true | Unsupported generic-key bracketed-paste delimiters are deliberately discarded on that input-disabled path; preserves typed paste semantics, not absence of Windows paste. |
+| `docs/testing/v0.0.970/LANE-BRIEF-docsync.md:8` | 2. The CLIENT CONTRACT (docs/client-contract-v1.md) still says per-session account binding does not exist, while exact session account | Non-capability match; retained | User-supplied task description/search pattern, not a product contract. Read-only input; do not commit. |
+| `docs/testing/v0.0.970/LANE-BRIEF-docsync.md:11` | Then sweep for the same class: grep docs/ and the manual for "not yet", "not active", "does not exist", "unsupported" and verify each | Non-capability match; retained | User-supplied task description/search pattern, not a product contract. Read-only input; do not commit. |
+
+### Duplicate test-log identifiers
+
+These are successful test identifiers in historical captured logs, not capability promises. The log evidence itself remains unchanged; the current definitions continue to distinguish unsupported contexts from globally missing features.
+
+| Test identifier | All matched log coordinates | Check |
+|---|---|---|
+| `accounts::accounts_tests::unsupported_candidate_is_honest_not_guessed` | `docs/testing/v0.0.970/providerrebind/workspace-tests.log:1587`; `docs/testing/v0.0.970/casstream-evidence/daemon-core-feature-pin-fixed.log:494`; `docs/testing/v0.0.970/casstream-evidence/merged-tests.log:1541`; `docs/testing/v0.0.970/casstream-evidence/premerge/daemon-core-tests.log:499` | Historical passing test-name evidence; current source definitions were found with `rg -n "fn <name>" crates/`; the unsupported condition is deliberate and scoped. |
+| `actor::cu1_actor_tests::unsupported_actor_without_reader_degrades_refs_before_provider_projection` | `docs/testing/v0.0.970/providerrebind/workspace-tests.log:1125`; `docs/testing/v0.0.970/casstream-evidence/daemon-core-feature-pin-fixed.log:41`; `docs/testing/v0.0.970/casstream-evidence/merged-tests.log:1092`; `docs/testing/v0.0.970/casstream-evidence/premerge/daemon-core-tests.log:37` | Historical passing test-name evidence; current source definitions were found with `rg -n "fn <name>" crates/`; the unsupported condition is deliberate and scoped. |
+| `antigravity_install_tests::intel_macos_is_unsupported_and_never_falls_back` | `docs/testing/v0.0.970/providerrebind/workspace-tests.log:1576`; `docs/testing/v0.0.970/casstream-evidence/daemon-core-feature-pin-fixed.log:480`; `docs/testing/v0.0.970/casstream-evidence/merged-tests.log:1543`; `docs/testing/v0.0.970/casstream-evidence/premerge/daemon-core-tests.log:482` | Historical passing test-name evidence; current source definitions were found with `rg -n "fn <name>" crates/`; the unsupported condition is deliberate and scoped. |
+| `auto_hermetic_tests::trigger_boundaries_exclude_keyed_disabled_builtin_and_unsupported_profiles` | `docs/testing/v0.0.970/providerrebind/workspace-tests.log:1614`; `docs/testing/v0.0.970/casstream-evidence/daemon-core-feature-pin-fixed.log:519`; `docs/testing/v0.0.970/casstream-evidence/merged-tests.log:1581`; `docs/testing/v0.0.970/casstream-evidence/premerge/daemon-core-tests.log:521` | Historical passing test-name evidence; current source definitions were found with `rg -n "fn <name>" crates/`; the unsupported condition is deliberate and scoped. |
+| `checkpoint_tests::unsupported_checkpoint_sink_fails_before_filesystem_mutation` | `docs/testing/v0.0.970/providerrebind/workspace-tests.log:4601`; `docs/testing/v0.0.970/casstream-evidence/merged-tests.log:4312` | Historical passing test-name evidence; current source definitions were found with `rg -n "fn <name>" crates/`; the unsupported condition is deliberate and scoped. |
+| `fast_gate_refuses_client_side_on_unsupported_pairs` | `docs/testing/v0.0.970/providerrebind/workspace-tests.log:5361`; `docs/testing/v0.0.970/casstream-evidence/merged-tests.log:5087` | Historical passing test-name evidence; current source definitions were found with `rg -n "fn <name>" crates/`; the unsupported condition is deliberate and scoped. |
+| `typed_agent_installer::typed_agent_installer_tests::unsupported_program_is_rejected_without_process_execution` | `docs/testing/v0.0.970/providerrebind/workspace-tests.log:2348`; `docs/testing/v0.0.970/casstream-evidence/daemon-core-feature-pin-fixed.log:1252`; `docs/testing/v0.0.970/casstream-evidence/merged-tests.log:2321`; `docs/testing/v0.0.970/casstream-evidence/premerge/daemon-core-tests.log:1254` | Historical passing test-name evidence; current source definitions were found with `rg -n "fn <name>" crates/`; the unsupported condition is deliberate and scoped. |
+| `unsupported_wire_version_is_deliberately_strict` | `docs/testing/v0.0.970/providerrebind/workspace-tests.log:3985`; `docs/testing/v0.0.970/casstream-evidence/merged-tests.log:3840`; `docs/testing/v0.0.970/providerrebind/wire-goldens.log:102`; `docs/testing/v0.0.970/casstream-evidence/premerge/rpc-client-tests.log:479` | Historical passing test-name evidence; current source definitions were found with `rg -n "fn <name>" crates/`; the unsupported condition is deliberate and scoped. |
+| `vaultless_platforms_answer_the_stable_vault_unsupported_code` | `docs/testing/v0.0.970/providerrebind/workspace-tests.log:2679`; `docs/testing/v0.0.970/casstream-evidence/merged-tests.log:2643` | Historical passing test-name evidence; current source definitions were found with `rg -n "fn <name>" crates/`; the unsupported condition is deliberate and scoped. |
+| `vision_unsupported_provider_refuses_locally_with_typed_error` | `docs/testing/v0.0.970/providerrebind/workspace-tests.log:2813`; `docs/testing/v0.0.970/casstream-evidence/merged-tests.log:2776` | Historical passing test-name evidence; current source definitions were found with `rg -n "fn <name>" crates/`; the unsupported condition is deliberate and scoped. |
+| `worker::cu1_image_runtime_tests::replay_rejects_conflicting_metadata_and_unsupported_vision_gets_a_placeholder` | `docs/testing/v0.0.970/providerrebind/workspace-tests.log:2399`; `docs/testing/v0.0.970/casstream-evidence/daemon-core-feature-pin-fixed.log:1303`; `docs/testing/v0.0.970/casstream-evidence/merged-tests.log:2372`; `docs/testing/v0.0.970/casstream-evidence/premerge/daemon-core-tests.log:1305` | Historical passing test-name evidence; current source definitions were found with `rg -n "fn <name>" crates/`; the unsupported condition is deliberate and scoped. |
+
+## Merge with local wave-970
+
+This continuation starts from committed docsync `0510d4b8` with the
+orchestrator's local integration merge already in progress:
+`MERGE_HEAD=471b9d68` (local `wave-970`, including economydiet, xplatfix,
+and gitignore). Only working-tree files are edited here. The orchestrator owns
+staging and recording the merge; no Git mutation was attempted in this
+continuation. The earlier report's Git-related NO_SHIP is historical and does
+not impose a commit requirement on this file-only handoff. Supplied LANE and
+turnperf/turnperf2 evidence is retained without edits.
+
+Read `cb1b209a` and the earlier `b6e8aaf6` design. The former removed the shared
+`tool_manual` and moved its semantic suffixes into native tool descriptions;
+`stub_schema` now retains argument prose and constraints, and the default
+provider pack is seven coding tools plus `list_tools`. The initial conflict
+resolution had retained docsync's entire older permission-test block, losing
+wave's schema/native-description/discovery regressions. Restored those wave
+regressions, including `native_action_parameters_preserve_the_former_manual_unique_constraints`
+and the `list_tools` inventory entry, while retaining the docsync regression.
+The monitor/spawn regression now reads the provider definitions after explicit
+promotion through `HarnessConfig::enable_tool_discovery`; it checks all six
+source classes, both source and operation enums, argument requirements,
+wake/coalescing, ProcessExec/FsRead authorization, and AgentSpawn/report semantics.
+There is no replacement implementation of the retired helper.
+
+Manual TEXT survival was checked with exact grep for each of ten corrected
+clauses, and both obsolete monitor claims were absent
+(`/tmp/docsync-merge-manual-text.log`). The complete corrected monitor and spawn
+lines remain at `worker.rs:14579` and `:14617`; native projection is at `:14691`,
+policy composition at `:2800`, and the exact spawn source-line pin remains at
+`worker_tool_catalog_tests.rs:879`. These coordinates were re-grepped, rather
+than copied from the older brief. Account pin/rebind statements are still in
+`client-contract-v1.md:1152` and remain covered by
+`client_contract_account_pins_and_rebind_match_typed_requests` at
+`automation_contract_doc_tests.rs:290`. The affected monitor/spawn manifests,
+protocol/RPC Rustdoc, account regression, client/automation contracts and
+OPTIMIZATIONS ledger are byte-identical to `0510d4b8`. Historical turnperf
+manual-allocation proposals describe the superseded composition; their presence
+does not justify recreating the removed helper or changing durable envelopes.
+
+The test's own failed assertion in `/tmp/docsync-merge-pins-before.log` produced
+`left: (20770, 5670)` against `right: (19962, 13856)` for
+`(full_manifest, default_instruct_pipe)`. Pins were changed only after this
+measurement, with rationale beside the assertions:
+
+| Byte accounting | Old → new | Rationale / evidence |
+| --- | --- | --- |
+| macOS full authorized manifest | 19,962 → 20,770 | Executed: +808 = +337 `list_tools`, +153 parameter descriptions, +318 net `graph_evidence` schema/description change. |
+| Linux full authorized manifest | 20,011 → 20,819 | By inspection: same +808; computer prose remains +49 versus macOS. |
+| Windows full authorized manifest | 19,961 → 20,769 | By inspection: same +808; computer prose +2 and process command parameter prose −3 give net −1 versus macOS. |
+| Other Unix full authorized manifest | 19,956 → 20,764 | By inspection: same +808; computer prose remains −6 versus macOS. |
+| Default instruct pipe, macOS | 13,856 → 5,670 | Executed: eight default tools, native semantics once, no system manual. Monitor/spawn remain available through promotion. Other Unix uses the same value by inspection. |
+| Default instruct pipe, Windows | 13,856 → 5,667 | By inspection: retained process command parameter prose is 75 bytes versus Unix's 78; this pack excludes computer. Corrects wave's platform-independent 5,670 → 5,667 Windows pin. |
+| Native-description accounting | 690 → 1,490 | Executed: the old seven selective descriptions across the full pack are superseded by native descriptions for all eight default tools. |
+| Bytes excluding native descriptions | 13,166 → 4,180 | Executed subtraction: the smaller catalog and removal of the duplicated system manual replace the old schema/manual subtotal. |
+
+The no-duplicate-manual assertion remains exact. Wave's stricter 50% reduction
+comparison against its pre-docsync 13,552-byte baseline and docsync's original
+30% full-manifest floor both remain. No assertion is ignored or platform-disabled;
+Windows gets a derived expected value. The full-manifest comparator and the
+actual default provider pack are explicitly distinct; provider-dialect JSON
+framing is outside these sums. No cross-platform execution or new latency,
+RSS, live-model, or crash-matrix measurement is claimed.
+
+Executed before the full gate: sibling prebuild
+`cargo build -q -p haider-cli -p haider-daemond --bin haider --bin haiderd`
+passed, and the resulting `haiderd` is 201,508,944 bytes (>10 MiB).
+The intermediate permission suite passed 34/34 after repinning; the final
+six-source strengthening was made while that build was running, so the full
+workspace gate below is the authoritative final-source run. The targeted
+account-contract regression passed 1/1. `cargo run -q -p xtask -- test-count
+--update` updated the wave baseline **4,997 → 4,999**, incorporating the two
+retained docsync regressions with wave's argument-constraint regression restored.
+The requested `grep -rl '^<<<<<<<' crates docs scripts test-baseline.txt`
+printed nothing (exit 1 means no matches).
+
+Every Cargo build/test/recount/lint step uses:
+`RUST_MIN_STACK=8388608 HAIDER_DISCOVERY_DISABLED=1
+HAIDER_TEST_DEVICE_NAME=test-mac CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
+HAIDER_TEST_SIBLINGS_PREBUILT=1 CARGO_BUILD_JOBS=4`.
+`df -m /` is recorded before each such step, with a stop below 700 MiB.
+The orchestrator-regenerated goldens and unioned CI registry walk are retained;
+fixture regeneration provenance belongs to the orchestrator, while the full
+workspace execution below checks those merged fixtures.
+
+Independent verifier findings in this continuation:
+
+1. **Real:** wave's single Unix instruct-pipe pin would fail on Windows after
+   argument descriptions became model-visible. Added the derived Windows
+   **5,670 → 5,667** pin and documented the −3-byte command description.
+2. **Real:** substring checks could still claim the `file` source after it was
+   removed from the source list, because “external files” satisfied the check.
+   Required the explicit six-class clause and exact source-kind enums in both
+   the promoted native description/schema and full manifest/schema. The
+   verifier demonstrated the old false positive with a read-only string
+   mutation and confirmed the strengthened assertion closes it.
+
+No substantive finding was rejected as noise. This continuation's count is
+separate from the original docsync verifier's one historical finding.
+
+Final merged-tree verification, executed on macOS against the final Rust source:
+
+- `cargo test -q --workspace --no-fail-fast`: **exit 0**; all **337** libtest
+  summaries report zero failures, including nested subprocess probes. This is
+  the authoritative run for the strengthened six-source regression and retained
+  merged goldens, not the intermediate permission-only run.
+- `cargo clippy --workspace --tests -- -D warnings`: **exit 0**.
+- `cargo fmt --all -- --check` and `git diff --check`: **exit 0**.
+- Final `cargo run -q -p xtask -- test-count`: **4,999 / 4,999**, exit 0.
+- Final conflict-marker grep: empty output, exit 1 (no matches). No unresolved
+  index entries were reported by the read-only diff check. HEAD and MERGE_HEAD
+  remain `0510d4b8` and `471b9d68`; the orchestrator records the merge.
+
+Logs are `/tmp/docsync-merge-workspace-tests.log`,
+`/tmp/docsync-merge-clippy.log`, `/tmp/docsync-merge-count-final.log`,
+`/tmp/docsync-merge-recount.log`, `/tmp/docsync-merge-contract.log`,
+`/tmp/docsync-merge-prebuild.log`, `/tmp/docsync-merge-fmt.log`,
+`/tmp/docsync-merge-diff-check.log`, and
+`/tmp/docsync-merge-conflict-markers.log`, with adjacent `.exit` files and
+`.disk` files for Cargo build/test/recount/lint steps. The intentional stale-pin
+failure remains in `/tmp/docsync-merge-pins-before.log`; it is superseded by the
+passing full gate. No new ignores, weakened deadlines, runtime behavior changes,
+or cross-platform execution claims were introduced by this continuation.
+
+VERIFIER: findings=2 real=2 noise=0 — corrected the Windows native-pipe pin for retained parameter prose; strengthened the six-source regression so external-file authorization cannot mask a missing file source
+SHIP

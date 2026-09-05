@@ -1316,10 +1316,10 @@ async fn recovery_dual_reads_historical_and_canonical_permission_states() {
     recovered.close().await.expect("close store");
 }
 
-/// MUTATION CHECK: keep a description/bound in the stub, forget to recurse into
-/// items/properties, or leave a top-level combinator. Expected RUNTIME failure:
+/// MUTATION CHECK: remove a description/bound, forget to recurse into
+/// items/properties, or drop a top-level combinator. Expected RUNTIME failure:
 /// removing nested structure, bounds, or parameter semantics would leave the
-/// caller without its action constraints now that the manual is gone.
+/// caller without its action constraints now that the system manual is gone.
 #[test]
 fn native_schema_keeps_structure_parameter_semantics_and_bounds() {
     let full = serde_json::json!({
@@ -1462,6 +1462,103 @@ fn every_advertised_tool_has_native_semantics_without_a_duplicate_manual() {
     }
 }
 
+/// DOCSYNC: keep the promoted native descriptions and full manifests honest
+/// about landed monitor runners, boundary wake delivery, and authorization.
+/// Mutating the semantic-suffix projection must fail even if the source manual
+/// line still contains the right words.
+#[test]
+fn monitor_and_spawn_descriptions_match_runtime_capabilities() {
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
+    let mut config = haider_core::HarnessConfig::for_session(
+        SessionId::new("docsync-capabilities"),
+        DeviceId::new("test-device"),
+        0,
+        0,
+    );
+    config.tools =
+        advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
+    config.enable_tool_discovery(vec!["monitor".into(), "spawn_subagent".into()]);
+    let tools = config.tool_definitions();
+    let monitor = tools
+        .iter()
+        .find(|tool| tool.name == "monitor")
+        .expect("promoted monitor");
+    let manifest = haider_tools::monitor_manifest();
+    let manual = monitor.description.as_str();
+    // A bare contains("file") also matches the separate "external files"
+    // authorization clause. Removing /file from the supported-source list
+    // must fail, even while that authorization guidance remains present.
+    for text in [manual, manifest.description.as_str()] {
+        assert!(
+            text.contains("durable sms/process/file/poll/timer/cli watches"),
+            "monitor description must advertise all six supported source classes: {text}"
+        );
+    }
+    for schema in [&manifest.input_schema, &monitor.input_schema] {
+        assert_eq!(
+            schema["properties"]["source"]["properties"]["kind"]["enum"],
+            serde_json::json!(["sms", "process", "file", "poll", "timer", "cli"]),
+            "monitor source schema must expose all six supported classes"
+        );
+    }
+    for operation in [
+        "register", "list", "update", "pause", "resume", "trigger", "remove",
+    ] {
+        assert!(
+            manifest
+                .description
+                .to_ascii_lowercase()
+                .contains(operation),
+            "monitor description missing operation {operation}"
+        );
+        for schema in [&manifest.input_schema, &monitor.input_schema] {
+            assert!(
+                schema["properties"]["operation"]["enum"]
+                    .as_array()
+                    .expect("monitor operations")
+                    .iter()
+                    .any(|value| value == operation)
+            );
+        }
+    }
+    for text in [manual, manifest.description.as_str()] {
+        for required in [
+            "subturn",
+            "busy",
+            "next turn boundary",
+            "per monitor",
+            "ProcessExec",
+            "argv/cwd/env names",
+            "external files",
+            "FsRead",
+        ] {
+            assert!(
+                text.contains(required),
+                "monitor description missing {required}"
+            );
+        }
+        assert!(!text.contains("non-SMS fails closed"));
+        assert!(!text.contains("activates SMS monitors first"));
+    }
+    assert!(manual.contains("register/update need source+action"));
+    assert!(manual.contains("update/pause/resume/trigger/remove need monitor_id"));
+    assert!(manual.contains("timeout needs timeout_ms"));
+    let spawn = haider_tools::spawn_subagent_manifest();
+    for text in [
+        tools
+            .iter()
+            .find(|tool| tool.name == "spawn_subagent")
+            .expect("promoted spawn_subagent")
+            .description
+            .as_str(),
+        spawn.description.as_str(),
+    ] {
+        assert!(text.contains("AgentSpawn policy"));
+        assert!(text.contains("waits for"));
+        assert!(text.contains("child report"));
+    }
+}
+
 /// ACTBIAS MUTATION CHECK: blank, generalize, or swap any action-critical
 /// native description. Expected RUNTIME failure: the provider schema no longer
 /// tells a weak model what the search/mutation tool does and when to use it.
@@ -1507,14 +1604,19 @@ fn search_and_mutation_tool_schema_descriptions_are_pinned() {
 /// in the policy, or change schema bytes without deliberate release accounting.
 #[test]
 fn instruct_pipe_shrinks_the_advertised_wire_pack() {
-    // Before economydiet on merged wave-970: 29 registered / 26 advertised,
-    // 725 policy + 5_162 manual + 8_390 name/native/schema = 14_277 bytes.
-    // The provider-dialect JSON framing is measured separately by AHRB.
+    // Keep wave's stricter pre-diet comparator (before docsync's +304 bytes).
+    // Provider-dialect JSON framing is measured separately by AHRB.
     const PRE_DIET_INSTRUCT_PIPE_BYTES: usize = 13_552;
-    // Measured v5 core pack: seven coding tools + list_tools, native prose
-    // once and no system manual, preserving parameter constraints and semantics.
-    // 13_552 -> 5_670 (-58.2%); do not trim validation bounds to save tokens.
+    // Merge measurement: docsync's 13_856 -> 5_670 on macOS. The default pack
+    // now has seven coding tools + list_tools, native semantics once and no
+    // system manual. Monitor/spawn semantics survive in promoted descriptions.
+    // Windows is 5_670 -> 5_667 by inspection: process_exec.command's retained
+    // parameter description is 75 bytes there versus 78 on Unix. Computer is
+    // absent from this coding pack, so its platform prose cannot offset -3.
+    #[cfg(not(target_os = "windows"))]
     const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 5_670;
+    #[cfg(target_os = "windows")]
+    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 5_667;
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let authorized =
         advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
@@ -1524,6 +1626,38 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         0,
         0,
     );
+    let registry = registered_tools();
+    assert_eq!(authorized.len(), 27, "26 former tools plus list_tools");
+    let full_prefix: usize = authorized
+        .iter()
+        .map(|tool| {
+            let entry = registry
+                .iter()
+                .find(|entry| entry.manifest.name == tool.name)
+                .expect("authorized tool has a manifest");
+            tool.name.len()
+                + entry.manifest.description.len()
+                + serde_json::to_vec(&entry.manifest.input_schema)
+                    .expect("full schema")
+                    .len()
+        })
+        .sum();
+    // Full authorized manifest comparison: macOS 19_962 -> 20_770, measured
+    // by this test. +808 = +337 list_tools +153 parameter prose +318 net
+    // graph_evidence evidence_from/schema prose. This is the full catalog,
+    // distinct from the default eight-tool provider pack measured below.
+    // Other hosts are derived from unchanged platform deltas: Linux +49;
+    // Windows computer +2 and process command -3 = -1; other Unix -6.
+    // Thus Linux 20_011 -> 20_819, Windows 19_961 -> 20_769, other
+    // Unix 19_956 -> 20_764. Only macOS was executed for this merge.
+    #[cfg(target_os = "linux")]
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 20_819;
+    #[cfg(target_os = "macos")]
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 20_770;
+    #[cfg(target_os = "windows")]
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 20_769;
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 20_764;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();
@@ -1562,13 +1696,22 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         .map(|tool| tool.description.len())
         .sum::<usize>();
     eprintln!(
-        "instruct-pipe pin: registered={}, advertised={}, policy_bytes={}, instruct_pipe_bytes={pipe_bytes}, native_description_bytes={native_description_bytes}",
+        "instruct-pipe pin: registered={}, advertised={}, full_prefix_bytes={full_prefix}, policy_bytes={}, instruct_pipe_bytes={pipe_bytes}, native_description_bytes={native_description_bytes}",
         registered_tools().len(),
         tools.len(),
         policy.len()
     );
-    assert_eq!(pipe_bytes, EXPECTED_INSTRUCT_PIPE_BYTES);
+    assert_eq!(
+        (full_prefix, pipe_bytes),
+        (EXPECTED_FULL_PREFIX_BYTES, EXPECTED_INSTRUCT_PIPE_BYTES),
+        "full-manifest and default instruct-pipe byte pins"
+    );
     assert!(pipe_bytes * 2 <= PRE_DIET_INSTRUCT_PIPE_BYTES);
+    assert!(full_prefix > 0 && pipe_bytes < full_prefix);
+    assert!(
+        (full_prefix - pipe_bytes) * 10 >= full_prefix * 3,
+        "instruct pipe must retain the full-manifest reduction floor of 30%"
+    );
     assert_eq!(
         system.len() + tool_bytes,
         606 + EXPECTED_INSTRUCT_PIPE_BYTES

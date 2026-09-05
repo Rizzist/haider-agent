@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 const AUTOMATION_CONTRACT: &str = include_str!("../../../docs/automation-contract-v1.md");
+const CLIENT_CONTRACT: &str = include_str!("../../../docs/client-contract-v1.md");
 const WIRE_TRANSCRIPT: &str = include_str!("fixtures/wire_transcript.json");
 const METHOD_MATRIX: &str = include_str!("fixtures/client_contract_methods_v1.json");
 const CLI_STATUS: &str = include_str!("../../haider-cli/tests/fixtures/observe_status.json");
@@ -321,4 +322,89 @@ fn every_automation_contract_json_example_decodes_and_matches_a_golden() {
 
     assert_catalog_coverage(&tags, &request_methods, &response_methods);
     assert_correlated_wire_examples(&wire_request_ids, &wire_response_ids);
+}
+
+#[test]
+fn client_contract_account_pins_and_rebind_match_typed_requests() {
+    let account_section = CLIENT_CONTRACT
+        .split_once("#### 9.2.2 Exact account pins and provider rebind")
+        .expect("account surface has a dedicated contract section")
+        .1
+        .split_once("### 9.3 ")
+        .expect("account section ends before observe optionals")
+        .0;
+    let create: RequestBody = serde_json::from_value(serde_json::json!({
+        "method": "session.create",
+        "command_id": "account-create",
+        "cwd": "/workspace",
+        "provider": "",
+        "model": "",
+        "max_tokens": 4096,
+        "account_alias": "work",
+        "resolve_provider": true,
+        "resolve_model": true
+    }))
+    .expect("documented account pin decodes as a create request");
+    assert!(matches!(
+        &create,
+        RequestBody::SessionCreateWithPermissionOverrides {
+            account_alias: Some(alias),
+            resolve_provider: true,
+            resolve_model: true,
+            ..
+        } if alias.as_str() == "work"
+    ));
+    let rebind: RequestBody = serde_json::from_value(serde_json::json!({
+        "method": "session.provider.rebind",
+        "command_id": "account-rebind",
+        "session_id": "session",
+        "worker_generation": 7,
+        "provider": "openai-compatible",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "account": "work"
+    }))
+    .expect("documented account rebind decodes as a routing request");
+    assert!(matches!(
+        &rebind,
+        RequestBody::SessionProviderRebind { account: Some(alias), .. }
+            if alias == "work"
+    ));
+    for (body, feature, account_field) in [
+        (
+            create,
+            haider_rpc::FEATURE_SESSION_ACCOUNT_SELECT_V1,
+            "account_alias",
+        ),
+        (
+            rebind,
+            haider_rpc::FEATURE_SESSION_PROVIDER_REBIND_V1,
+            "account",
+        ),
+    ] {
+        let encoded = serde_json::to_value(body).expect("serialize typed account request");
+        let method = encoded["method"].as_str().expect("request method");
+        assert_eq!(encoded[account_field], "work");
+        for name in [method, feature, account_field] {
+            assert!(
+                account_section.contains(&format!("`{name}`")),
+                "account contract must name the real {name} surface"
+            );
+        }
+    }
+    let normalized = CLIENT_CONTRACT
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for stale_claim in [
+        "there is no per-session account binding to report",
+        "no per-session account seam exists yet",
+        "SessionSummary.account_alias` is currently always absent",
+        "haider run --account` cannot work",
+        "a feature string with zero daemon-side definitions",
+    ] {
+        assert!(
+            !normalized.contains(stale_claim),
+            "client contract resurrected a false capability claim: {stale_claim}"
+        );
+    }
 }

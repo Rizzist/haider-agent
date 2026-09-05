@@ -664,17 +664,14 @@ through `session.diagnostic` when a session coordinate exists. Never replace
 unknown with empty, zero, or a locally guessed default
 (`docs/client-contract-v1.md:27-49`).
 
-The 968 runtime-directory lane is adding
-[`runtime_dir_resolution`](https://github.com/Rizzist/haider-agent/blob/lane-968-rtdir/crates/haider-cli/src/observe.rs#L67-L78) to
-`haider status --json`. It reports which resolution source won and why prior
-candidates were rejected; the field is landing in 968 and is not yet in this
-branch's wire or CLI types. Until it merges, use the daemon-published
-`.daemon.socket_path` and `.daemon.pid_file_path` from status, and report
-resolution provenance as unavailable rather than reverse-engineering it. It
-remains a CLI status field, not `ResponseBody::StatusSnapshot`. The visible
-`lane-968-rtdir` branch defines and projects it at
-`crates/haider-cli/src/observe.rs:67-78`, `:240-272`, `:562-608`; its typed
-meaning is at `crates/haider-client/src/profile.rs:187-200` on that branch.
+`haider status --json` publishes `runtime_dir_resolution`: `source` identifies
+the selected runtime-directory source; optional `rejections` lists earlier
+candidates as `{source, reason}` and is omitted when empty. Use this provenance
+alongside `.daemon.socket_path` and `.daemon.pid_file_path`, without inferring
+the resolver's choices from paths. This is a CLI status field, not
+`ResponseBody::StatusSnapshot`; its projection is in
+`crates/haider-cli/src/observe.rs` and its types are in
+`crates/haider-client/src/profile.rs`.
 
 ## 11. Daemon caching and reuse declaration
 
