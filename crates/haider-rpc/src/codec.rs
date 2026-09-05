@@ -24,6 +24,8 @@ pub enum WireEncoding {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum CodecError {
+    /// Invalid or unnegotiated binary artifact body.
+    InvalidBinaryFrame,
     /// The encoded or announced body exceeds the configured limit.
     ///
     /// `announced_len` is `Some` when the offending length was known up front
@@ -55,6 +57,9 @@ pub enum CodecError {
 impl std::fmt::Display for CodecError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidBinaryFrame => {
+                formatter.write_str("invalid or unnegotiated binary artifact frame")
+            }
             Self::FrameLimitExceeded {
                 frame_limit,
                 announced_len: Some(announced_len),

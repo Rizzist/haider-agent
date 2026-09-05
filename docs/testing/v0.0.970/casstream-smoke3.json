@@ -1,0 +1,217 @@
+{
+  "schema": "casstream-benchmark-v1",
+  "platform": "darwin",
+  "measurement": "fresh Python IPC client self getrusage + fresh daemon wait4, peak RSS includes startup; wall excludes fixture/startup",
+  "python": "3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 21.0.0 (clang-2100.1.1.101)]",
+  "blake3_version": "1.0.9",
+  "smoke": true,
+  "daemon": "/Users/rizzist/haider-run/lane-970-casstream/target/debug/haiderd",
+  "daemon_sha256": "ee3f4307bce5c137d9dd06922c7158db17771e58bbead7f114d159f802e5bb44",
+  "daemon_bytes": 199155792,
+  "samples": [
+    {
+      "run": 1,
+      "mode": "legacy_eight",
+      "total_bytes": 8388608,
+      "load_1m_start": 6.7197265625,
+      "load_1m_max": 6.7197265625,
+      "load_valid": true,
+      "daemon_peak_rss_bytes": 50987008,
+      "daemon_exit_code": 0,
+      "digest_integrity": "verified",
+      "wall_seconds": 0.773295292048715,
+      "client_peak_rss_bytes": 31227904,
+      "accepted": true,
+      "responses": [
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:cd4138bfa1a08fc9b16d96cf09d8947aa8510a910d0978488eadb4a10930fd89",
+          "bytes": 1048576
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:c83b997378c5e12d227e47166306b8f12d5380ef536d3987fa4461570e806a3b",
+          "bytes": 1048576
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:2e300d96469ed4ccb6238ab35aa7d95aae2d96fd9b7361a262bf431ed03c5a96",
+          "bytes": 1048576
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:6287247974fea5739bd391e2ab893242fb89ab2dde387b8ead883cf6f33341ec",
+          "bytes": 1048576
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:f99ae0dd64e2821aa6f7774957c4860efd68f8415cca6c680b2b3bbc14c8b30e",
+          "bytes": 1048576
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:58447da36c14413e50ce2ce04db998503b34d930f39e2acbdde738611f37c1b9",
+          "bytes": 1048576
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:3629648e2c06fb8426c81c057684fd774331edf955d30404897dd9585c4a5589",
+          "bytes": 1048576
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:78686e89f77d82bf8f8f26d3ffefef176e5907242a2e9ad0f74c27b55bf0c68c",
+          "bytes": 1048576
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    },
+    {
+      "run": 1,
+      "mode": "binary_eight",
+      "total_bytes": 8388608,
+      "load_1m_start": 6.7197265625,
+      "load_1m_max": 6.7197265625,
+      "load_valid": true,
+      "daemon_peak_rss_bytes": 48922624,
+      "daemon_exit_code": 0,
+      "digest_integrity": "verified",
+      "wall_seconds": 0.7200135000166483,
+      "client_peak_rss_bytes": 28049408,
+      "accepted": true,
+      "responses": [
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:cd4138bfa1a08fc9b16d96cf09d8947aa8510a910d0978488eadb4a10930fd89",
+          "bytes": 1048576
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:c83b997378c5e12d227e47166306b8f12d5380ef536d3987fa4461570e806a3b",
+          "bytes": 1048576
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:2e300d96469ed4ccb6238ab35aa7d95aae2d96fd9b7361a262bf431ed03c5a96",
+          "bytes": 1048576
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:6287247974fea5739bd391e2ab893242fb89ab2dde387b8ead883cf6f33341ec",
+          "bytes": 1048576
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:f99ae0dd64e2821aa6f7774957c4860efd68f8415cca6c680b2b3bbc14c8b30e",
+          "bytes": 1048576
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:58447da36c14413e50ce2ce04db998503b34d930f39e2acbdde738611f37c1b9",
+          "bytes": 1048576
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:3629648e2c06fb8426c81c057684fd774331edf955d30404897dd9585c4a5589",
+          "bytes": 1048576
+        },
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:78686e89f77d82bf8f8f26d3ffefef176e5907242a2e9ad0f74c27b55bf0c68c",
+          "bytes": 1048576
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    },
+    {
+      "run": 1,
+      "mode": "binary_single",
+      "total_bytes": 8388608,
+      "load_1m_start": 6.7197265625,
+      "load_1m_max": 6.7197265625,
+      "load_valid": true,
+      "daemon_peak_rss_bytes": 48693248,
+      "daemon_exit_code": 0,
+      "digest_integrity": "verified",
+      "wall_seconds": 0.6436273750150576,
+      "client_peak_rss_bytes": 28196864,
+      "accepted": true,
+      "responses": [
+        {
+          "method": "artifact.put",
+          "artifact": "blake3:a7e56e2bea5ea11da4919936eecc7ffa1e0896eac9020131b717787809f14fc5",
+          "bytes": 8388608
+        }
+      ],
+      "welcome_frame_limit": 50331648
+    }
+  ],
+  "fixture": {
+    "parts": [
+      {
+        "offset": 0,
+        "bytes": 1048576,
+        "digest": "cd4138bfa1a08fc9b16d96cf09d8947aa8510a910d0978488eadb4a10930fd89"
+      },
+      {
+        "offset": 1048576,
+        "bytes": 1048576,
+        "digest": "c83b997378c5e12d227e47166306b8f12d5380ef536d3987fa4461570e806a3b"
+      },
+      {
+        "offset": 2097152,
+        "bytes": 1048576,
+        "digest": "2e300d96469ed4ccb6238ab35aa7d95aae2d96fd9b7361a262bf431ed03c5a96"
+      },
+      {
+        "offset": 3145728,
+        "bytes": 1048576,
+        "digest": "6287247974fea5739bd391e2ab893242fb89ab2dde387b8ead883cf6f33341ec"
+      },
+      {
+        "offset": 4194304,
+        "bytes": 1048576,
+        "digest": "f99ae0dd64e2821aa6f7774957c4860efd68f8415cca6c680b2b3bbc14c8b30e"
+      },
+      {
+        "offset": 5242880,
+        "bytes": 1048576,
+        "digest": "58447da36c14413e50ce2ce04db998503b34d930f39e2acbdde738611f37c1b9"
+      },
+      {
+        "offset": 6291456,
+        "bytes": 1048576,
+        "digest": "3629648e2c06fb8426c81c057684fd774331edf955d30404897dd9585c4a5589"
+      },
+      {
+        "offset": 7340032,
+        "bytes": 1048576,
+        "digest": "78686e89f77d82bf8f8f26d3ffefef176e5907242a2e9ad0f74c27b55bf0c68c"
+      }
+    ],
+    "total_bytes": 8388608,
+    "whole": {
+      "offset": 0,
+      "bytes": 8388608,
+      "digest": "a7e56e2bea5ea11da4919936eecc7ffa1e0896eac9020131b717787809f14fc5"
+    }
+  },
+  "medians": {
+    "binary_eight": {
+      "wall_seconds": 0.7200135000166483,
+      "client_peak_rss_bytes": 28049408,
+      "daemon_peak_rss_bytes": 48922624
+    },
+    "binary_single": {
+      "wall_seconds": 0.6436273750150576,
+      "client_peak_rss_bytes": 28196864,
+      "daemon_peak_rss_bytes": 48693248
+    },
+    "legacy_eight": {
+      "wall_seconds": 0.773295292048715,
+      "client_peak_rss_bytes": 31227904,
+      "daemon_peak_rss_bytes": 50987008
+    }
+  },
+  "valid": false
+}

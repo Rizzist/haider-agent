@@ -5,6 +5,232 @@ use base64::Engine as _;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
+fn staged_upload_count(cas: &FileCas) -> usize {
+    fs::read_dir(&cas.root)
+        .expect("CAS staging directory")
+        .map(|entry| entry.expect("CAS staging entry"))
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".tmp-"))
+        .count()
+}
+
+#[test]
+fn streamed_cas_put_checks_digest_and_declared_length_before_publication() {
+    let root = tempfile::tempdir().expect("CAS root");
+    let cas = FileCas::open(root.path()).expect("open CAS");
+    let bytes = b"three complete transport chunks";
+    let expected = artifact_for(bytes);
+    let mut upload = cas.begin_put(bytes.len() as u64).expect("begin upload");
+    for chunk in bytes.chunks(7) {
+        upload.write_chunk(chunk).expect("upload chunk");
+        assert!(!cas.path_for(&expected).expect("object path").exists());
+    }
+    assert_eq!(upload.received_len(), bytes.len() as u64);
+    assert_eq!(upload.finish(&expected).expect("publish"), expected);
+    assert_eq!(cas.get(&expected).expect("read complete object"), bytes);
+    assert_eq!(staged_upload_count(&cas), 0);
+
+    let wrong_digest = artifact_for(b"wrong digest");
+    let mut upload = cas.begin_put(bytes.len() as u64).expect("begin mismatch");
+    upload.write_chunk(bytes).expect("write mismatch bytes");
+    assert!(upload.finish(&wrong_digest).is_err());
+    assert!(!cas.path_for(&wrong_digest).expect("mismatch path").exists());
+    assert_eq!(staged_upload_count(&cas), 0);
+
+    let incomplete = artifact_for(b"partial");
+    let mut upload = cas.begin_put(8).expect("begin incomplete");
+    upload.write_chunk(b"partial").expect("write prefix");
+    assert!(upload.finish(&incomplete).is_err());
+    assert!(!cas.path_for(&incomplete).expect("partial path").exists());
+    assert_eq!(staged_upload_count(&cas), 0);
+}
+
+#[test]
+fn streamed_cas_partial_drop_aborts_and_reconnect_retry_deduplicates() {
+    let root = tempfile::tempdir().expect("CAS root");
+    let cas = FileCas::open(root.path()).expect("open CAS");
+    let bytes = b"restart an immutable upload after disconnect";
+    let expected = artifact_for(bytes);
+    {
+        let mut upload = cas.begin_put(bytes.len() as u64).expect("begin upload");
+        upload
+            .write_chunk(&bytes[..9])
+            .expect("write partial frame prefix");
+        assert_eq!(staged_upload_count(&cas), 1);
+    }
+    assert_eq!(staged_upload_count(&cas), 0);
+    assert!(!cas.path_for(&expected).expect("object path").exists());
+    for _ in 0..2 {
+        let mut upload = cas.begin_put(bytes.len() as u64).expect("retry upload");
+        upload.write_chunk(bytes).expect("write complete retry");
+        assert_eq!(upload.finish(&expected).expect("publish retry"), expected);
+        assert_eq!(staged_upload_count(&cas), 0);
+    }
+    assert_eq!(cas.get(&expected).expect("retry bytes"), bytes);
+}
+
+#[test]
+fn streamed_cas_overlong_chunk_poisons_complete_prefix() {
+    let root = tempfile::tempdir().expect("CAS root");
+    let cas = FileCas::open(root.path()).expect("open CAS");
+    let expected = artifact_for(b"ok");
+    let mut upload = cas.begin_put(2).expect("begin upload");
+    upload.write_chunk(b"ok").expect("exact prefix");
+    assert!(upload.write_chunk(b"extra").is_err());
+    assert!(upload.finish(&expected).is_err());
+    assert!(!cas.path_for(&expected).expect("object path").exists());
+    assert_eq!(staged_upload_count(&cas), 0);
+}
+
+#[test]
+fn streamed_cas_read_large_blob_is_seekable_and_detects_corruption_before_read() {
+    let root = tempfile::tempdir().expect("CAS root");
+    let cas = FileCas::open(root.path()).expect("open CAS");
+    let chunk = [0x59_u8; 16 * 1024];
+    let mut upload = cas.begin_put(8 * 1024 * 1024).expect("begin large upload");
+    for _ in 0..512 {
+        upload.write_chunk(&chunk).expect("write bounded chunk");
+    }
+    let artifact = upload.finish_computed().expect("publish large blob");
+    let mut reader = cas
+        .open_verified(&artifact)
+        .expect("verified streamed reader");
+    assert_eq!(reader.stream_position().expect("reader offset"), 0);
+    assert_eq!(
+        std::io::copy(&mut reader, &mut std::io::sink()).expect("stream blob"),
+        8 * 1024 * 1024
+    );
+    reader.rewind().expect("seek verified object");
+    let mut prefix = [0_u8; 32];
+    reader.read_exact(&mut prefix).expect("read prefix");
+    assert_eq!(prefix, [0x59_u8; 32]);
+    drop(reader);
+
+    let path = cas.path_for(&artifact).expect("object path");
+    let mut corrupted = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open mutation target");
+    corrupted.write_all(b"X").expect("mutate first byte");
+    drop(corrupted);
+    assert!(
+        cas.open_verified(&artifact).is_err(),
+        "corruption must fail before returning any reader"
+    );
+}
+
+#[test]
+fn streamed_cas_empty_upload_and_invalid_digest_leave_no_staging() {
+    let root = tempfile::tempdir().expect("CAS root");
+    let cas = FileCas::open(root.path()).expect("open CAS");
+    let empty = artifact_for(b"");
+    assert_eq!(
+        cas.begin_put(0)
+            .expect("empty upload")
+            .finish(&empty)
+            .expect("empty object"),
+        empty
+    );
+    assert!(
+        cas.begin_put(0)
+            .expect("invalid upload")
+            .finish(&ArtifactRef::new("blake3:../outside"))
+            .is_err()
+    );
+    assert_eq!(staged_upload_count(&cas), 0);
+}
+
+/// MUTATION CHECK: omit the existing-object success branch's shard sync.
+/// The losing uploader must close its own durability boundary while the
+/// original publisher is paused between hard-link publication and sync.
+#[test]
+fn streamed_cas_dedup_syncs_shard_while_original_publisher_is_paused() {
+    assert_duplicate_syncs_shard(|cas, bytes, expected| {
+        let mut upload = cas.begin_put(bytes.len() as u64)?;
+        upload.write_chunk(bytes)?;
+        upload.finish(expected)
+    });
+}
+
+#[test]
+fn streamed_cas_publication_racing_legacy_put_and_file_put_still_syncs_shard() {
+    assert_duplicate_syncs_shard(|cas, bytes, _expected| cas.put(bytes));
+    assert_duplicate_syncs_shard(|cas, bytes, _expected| {
+        cas.put_reader(Cursor::new(bytes), Path::new("legacy-reader"))
+    });
+}
+
+fn assert_duplicate_syncs_shard(
+    put: impl FnOnce(&FileCas, &[u8], &ArtifactRef) -> StoreResult<ArtifactRef>,
+) {
+    let root = tempfile::tempdir().expect("CAS root");
+    let cas = FileCas::open(root.path()).expect("open CAS");
+    let bytes = b"concurrent publication requires its own durable acknowledgement";
+    let expected = artifact_for(bytes);
+    let shard = cas
+        .path_for(&expected)
+        .expect("object path")
+        .parent()
+        .expect("shard")
+        .to_path_buf();
+    let publisher = cas.clone();
+    let publisher_digest = expected.clone();
+    let publisher_shard = shard.clone();
+    let (linked_sender, linked_receiver) = std::sync::mpsc::sync_channel(1);
+    let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+    let original = std::thread::spawn(move || {
+        with_cas_sync_test_hook(
+            move |path, policy, target| {
+                if path == publisher_shard
+                    && policy == haider_platform::SyncPolicy::Full
+                    && target == CasSyncTarget::Directory
+                {
+                    linked_sender.send(()).expect("signal unsynced publication");
+                    release_receiver.recv().expect("release original publisher");
+                }
+            },
+            || {
+                let mut upload = publisher
+                    .begin_put(bytes.len() as u64)
+                    .expect("original upload");
+                upload.write_chunk(bytes).expect("original bytes");
+                upload.finish(&publisher_digest).expect("original publish")
+            },
+        )
+    });
+    linked_receiver
+        .recv()
+        .expect("original link exists but is not synced");
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let observations = Arc::clone(&observed);
+    let duplicate = with_cas_sync_test_hook(
+        move |path, policy, target| {
+            observations.lock().expect("sync observations").push((
+                path.to_path_buf(),
+                policy,
+                target,
+            ));
+        },
+        || put(&cas, bytes, &expected),
+    );
+    // Release before assertions, including on a failed duplicate, so a
+    // mutation cannot strand a test thread behind the publication barrier.
+    release_sender.send(()).expect("release publisher");
+    assert_eq!(original.join().expect("publisher thread"), expected);
+    assert_eq!(duplicate.expect("duplicate acknowledgement"), expected);
+    assert!(
+        observed
+            .lock()
+            .expect("sync observations")
+            .iter()
+            .any(|(path, policy, target)| {
+                path == &shard
+                    && *policy == haider_platform::SyncPolicy::Full
+                    && *target == CasSyncTarget::Directory
+            }),
+        "deduplicated acknowledgement must sync the target shard independently"
+    );
+}
+
 fn png(width: u32, height: u32) -> Vec<u8> {
     let image = image::RgbaImage::from_pixel(width, height, image::Rgba([17, 42, 91, 255]));
     let mut encoded = Cursor::new(Vec::new());

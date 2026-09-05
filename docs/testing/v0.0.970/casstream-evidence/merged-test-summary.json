@@ -1,0 +1,26 @@
+{
+  "cargo_exit_code": 0,
+  "test_result_lines": 291,
+  "reported_passes": 5119,
+  "reported_failures": 0,
+  "reported_ignores": 12,
+  "build": [
+    "Finished `test` profile [unoptimized] target(s) in 6m 38s"
+  ],
+  "packages": [
+    "haider-rpc",
+    "haider-store",
+    "haider-core",
+    "haider-client",
+    "haider-daemon",
+    "haider-protocol",
+    "haider-provider",
+    "haider-tools",
+    "haider-daemond",
+    "haider-tui",
+    "haider-cli"
+  ],
+  "all_targets": true,
+  "test_threads": 4,
+  "notes": "Reported passes include nested subprocess helper result lines; xtask4886 is source baseline, not this executable total."
+}

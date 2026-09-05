@@ -1,0 +1,28 @@
+{
+  "upstream_source_commit": "372a2639fd5ae971d6ecc29f61f7cbe1ad5a0551",
+  "sha256": {
+    "crates/haider-rpc/src/binary_artifact.rs": "138439f62b3fdc66ac1a063b078529fbd5cd0179788e391d45a3c280ffd20c73",
+    "crates/haider-rpc/src/codec.rs": "3f09ea8756a3c7f59a28dabb7c8cf85824e868637f2f368389809cdcd21720d8",
+    "crates/haider-rpc/src/frame.rs": "4c5b365b939029937a81cc469aff9cc07c977865df4eabf0a7c3ce15bdab5376",
+    "crates/haider-rpc/src/lib.rs": "f945ec019a4372794365fe938f22c357f7715d9311274679874c5c22846ee350",
+    "crates/haider-rpc/src/uds_codec.rs": "1158250a6f8d2d046c1e2407135458926d0bf3887c46f6ebb0e413bfcc70bcb4",
+    "crates/haider-client/src/client.rs": "73ef57cf36ea48a114e1bbdba4c0304c228fce463c4072e9cfd6e67fb1ef2f0f",
+    "crates/haider-client/src/headless.rs": "fe272864d1986e4455aad2dc35a0efd17b77db96509b253e43078992096918f7",
+    "crates/haider-client/tests/headless_run_tests.rs": "a5c892f10ff21a730f83ebd57c1c9d557498cd08cce6a44fee3cc380ba35de65",
+    "crates/haider-daemon/src/binary_upload.rs": "430571677a93ceee811cc5fa89219cbf40ca8e0acce49a56baab2dc6bcbd8147",
+    "crates/haider-daemon/src/connection.rs": "ad75b6d9dd8369ef8fe7890b73f25a1e3f9f680a36f59b16698cc5891d6cebaa",
+    "crates/haider-daemon/src/connection_duplex_tests.rs": "c1edf80d8ccebc8efd8020930651f2977046964b6cc5cfcd751a25722a88dc1a",
+    "crates/haider-daemon/src/connection_tests.rs": "d7bc4999b373ce97cd19cc1abeab222019e3a97e25a87cd9925fd922e6b1c247",
+    "crates/haider-daemon/src/lib.rs": "a9d2b5d501025a86f6f64c7ff3e11b0fd3d394f80ef7a4397eb550915dee9c1c",
+    "crates/haider-daemon/src/session_hub/rpc.rs": "d45e74296db8a2ac72f6f544d5d48d7ea8d6a1deeed48fcb5e3cef9c2b342cef",
+    "crates/haider-core/src/sqlite_store.rs": "ca15febb1cc68d6af895ae67b84590ed439988e7c8b79ced5fdbacdf6c87edf4",
+    "crates/haider-store/src/cas.rs": "8da56df7ca889ad511f2bd85eb495adbbfcb82163c2159b7a3b454ae08755b18",
+    "crates/haider-store/src/cas_tests.rs": "78f74c11a0b90a98eb876c96bc19b0f90c1fa48413bbd852b5028fdf83dcd55c",
+    "crates/haider-store/src/event_store.rs": "484f0a88eacf4afd3b94757889847256c96264a5abb1d3805994dbbe4a5ce459",
+    "crates/haider-store/src/event_text_cas.rs": "e314bd920f30f1741bcd4b33d6249bc41b0ebd4bc36f57e3250cfc1b08dbf42f",
+    "crates/haider-store/src/event_text_cas_tests.rs": "7070e444ad711f2eb52abe0444e18290910b99468cabc04ef62a12bf0bb17431",
+    "crates/haider-store/src/lib.rs": "328c998bc3290ac8b7b37f290ff18635cdfa45a2e13093f7069ce3fae4ade8e6",
+    "scripts/qa-gate/casstream_bench.py": "0e3975ec296785689bd89a753456f76eec1414fe5d718adec5cca159ef584204",
+    "test-baseline.txt": "b91cd9a7949a2907a27b5c97fe24f4e09a26ad7c180e71ce7ea3e9daa6f1a374"
+  }
+}

@@ -1,0 +1,10 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling haider-rpc v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-rpc)
+   Compiling haider-store v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-store)
+   Compiling haider-client v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-client)
+   Compiling haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-core)
+   Compiling haider-daemon v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-daemon)
+   Compiling haider-tui v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-tui)
+   Compiling haider-cli v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-cli)
+   Compiling haider-daemond v0.0.969 (/Users/rizzist/haider-run/lane-970-casstream/crates/haider-daemond)
+    Finished `dev` profile [unoptimized] target(s) in 1m 51s
