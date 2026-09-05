@@ -866,9 +866,11 @@ fn list_models_surface_is_manifest_route_and_text_pinned() {
         "list_models(filter?) — read the daemon's cached model/provider catalog; filter matches model, provider, or alias without a network refresh"
     );
     let spawn = tool_manual_line("spawn_subagent").expect("spawn_subagent manual line");
+    // Docsync retains model lookup guidance while exposing the existing
+    // request-budget argument, spawn authorization, and deferred report wait.
     assert_eq!(
         spawn,
-        "spawn_subagent(task, prompt, model?, provider?, agent_type?, workflow?, workflow_trigger?, parent_slot?, workflow_author?) — delegate one bounded task to a depth-capped child; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)"
+        "spawn_subagent(task, prompt, model?, provider?, agent_type?, workflow?, workflow_trigger?, parent_slot?, workflow_author?, request_budget?) — delegate one bounded task to a depth-capped child under AgentSpawn policy; waits for child report; bare model matching ignores case, `-`, `_`, `.`, and whitespace, with literal exact slugs first; call list_models to inspect valid pairs; agent_type = a registered Loom specialist (its Job frames the child)"
     );
 }
 

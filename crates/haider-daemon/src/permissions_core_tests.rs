@@ -1439,6 +1439,68 @@ fn every_advertised_tool_is_manual_described_and_native_prose_is_scoped() {
     }
 }
 
+/// DOCSYNC: keep the compact manual and full manifests honest about the
+/// landed monitor runners, boundary wake delivery, and broker authorization.
+#[test]
+fn monitor_and_spawn_descriptions_match_runtime_capabilities() {
+    let manifest = haider_tools::monitor_manifest();
+    let manual = tool_manual_line("monitor").expect("monitor manual");
+    for source in ["sms", "process", "file", "poll", "timer", "cli"] {
+        for text in [manual, manifest.description.as_str()] {
+            assert!(text.contains(source), "missing monitor source {source}");
+        }
+    }
+    for operation in [
+        "register", "list", "update", "pause", "resume", "trigger", "remove",
+    ] {
+        assert!(
+            manifest
+                .description
+                .to_ascii_lowercase()
+                .contains(operation),
+            "monitor description missing operation {operation}"
+        );
+        assert!(
+            manifest.input_schema["properties"]["operation"]["enum"]
+                .as_array()
+                .expect("monitor operations")
+                .iter()
+                .any(|value| value == operation)
+        );
+    }
+    for text in [manual, manifest.description.as_str()] {
+        for required in [
+            "subturn",
+            "busy",
+            "next turn boundary",
+            "per monitor",
+            "ProcessExec",
+            "argv/cwd/env names",
+            "external files",
+            "FsRead",
+        ] {
+            assert!(
+                text.contains(required),
+                "monitor description missing {required}"
+            );
+        }
+        assert!(!text.contains("non-SMS fails closed"));
+        assert!(!text.contains("activates SMS monitors first"));
+    }
+    assert!(manual.contains("register/update need source+action"));
+    assert!(manual.contains("update/pause/resume/trigger/remove need monitor_id"));
+    assert!(manual.contains("timeout needs timeout_ms"));
+    let spawn = haider_tools::spawn_subagent_manifest();
+    for text in [
+        tool_manual_line("spawn_subagent").expect("spawn manual"),
+        spawn.description.as_str(),
+    ] {
+        assert!(text.contains("AgentSpawn policy"));
+        assert!(text.contains("waits for"));
+        assert!(text.contains("child report"));
+    }
+}
+
 /// ACTBIAS MUTATION CHECK: blank, generalize, or swap any action-critical
 /// native description. Expected RUNTIME failure: the provider schema no longer
 /// tells a weak model what the search/mutation tool does and when to use it.
@@ -1494,19 +1556,22 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // Turnbudget adds 367 full-schema bytes and 143 stub-schema bytes for
     // spawn_subagent.request_budget. Toolrepair adds the two flat aliases.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_785;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 20_011;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_736;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_962;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_735;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_961;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_730;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_956;
     // Wave-970's pipe is 12_764 bytes: 12_265 schema/manual + 499 native
     // descriptions. Toolrepair adds 597 schema/manual bytes and 191 native
     // description bytes: 12_764 + 788 = 13_552 (lane's 13_409 + 143 budget
     // schema bytes). Keep the seven-description accounting and 30% floor.
-    const PRE_ACTBIAS_INSTRUCT_PIPE_BYTES: usize = 12_862;
-    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 13_552;
+    // Docsync: monitor source/wake/authorization truth and spawn wait/policy
+    // add 304 manual bytes: 13_552 -> 13_856. Full manifests add
+    // 226 bytes (macOS 19_736 -> 19_962); schemas/native prose unchanged.
+    const PRE_ACTBIAS_INSTRUCT_PIPE_BYTES: usize = 13_166;
+    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 13_856;
 
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let stubbed =

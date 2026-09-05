@@ -363,3 +363,23 @@ Scope: the uncommitted `session_provider.rs` initializer correction and two
 - Final customprov gates: workspace exit 0 (5372 top-level passes +12 nested probes, 0 failures, 13 existing ignores); strict Clippy with tests exit 0; test baseline 4966/4966. Gated-source hashes remain unchanged after both commands.
 - Independent customprov verifier: findings=6 real=5 noise=1; all five real findings fixed, stale completion-wording report rejected as noise; code verdict SHIP. Original Git ref is read-only; the writable isolated lane checkout and bundle carry the commit.
 
+
+
+## v0.0.970 docsync delta walk
+
+- #1–18 checked — only capability prose/Rustdoc and regression assertions change; no production type, signature, ownership, async-lock, dependency, lint-suppression, or serde surface changes. Tests use existing public request types and private manual helpers in their existing modules.
+- #19 checked — rustfmt and whitespace checks cover the changed Rust/docs; final gate outcomes are recorded in `docs/testing/v0.0.970/docsync.md`.
+- #20 fixed — `xtask test-count --update` recounts 4,966 → 4,968 for the manual-capability and account-contract regressions. Source markers are distinct from executed libtest totals.
+- #21 checked — every build/test uses `RUST_MIN_STACK=8388608`; no recursion or test-stack behavior changed.
+- #22–49 checked — no process-global state, store schema, provider authority, platform, transport, shutdown, lock, unsafe, filesystem walker, or runtime deadline implementation changed. The provider-request golden was regenerated with the fresh sibling daemon through the real loopback harness. Non-host behavior is by inspection.
+- #50 fixed — exact instruct-pipe 13,552 → 13,856 (+304), full-prefix macOS 19,736 → 19,962 (+226); existing Linux/Windows/other offsets and the 30% guard are retained. Seven native descriptions remain 690 bytes. Fixture JSON 17,006 → 17,310 differs only in the two system-manual lines.
+- #51–53 checked — profile locks, UI layout, and runtime-root security are untouched. Runtime-resolution prose now describes the existing typed CLI provenance.
+- #54 checked — full gates use the required stack environment; no tests are ignored, gated, or weakened to pass.
+- #55–63 checked — no Windows binding, exit-code, rendering, CAS, release, or privilege behavior change; the manual states the existing effect broker policy.
+- #64 checked — prebuilt `haiderd` is 201,235,968 bytes, above 10 MiB; siblings were refreshed after source edits and `HAIDER_TEST_SIBLINGS_PREBUILT=1` is used.
+- #65–71 checked — no registry/account selection/recovery semantics changed; the client contract is tied to actual typed account request serialization and the provider fixture uses the built daemon.
+- #72 checked — `HAIDER_DISCOVERY_DISABLED=1 HAIDER_TEST_DEVICE_NAME=test-mac` is set throughout hermetic gates.
+- #73–93 checked — no live workload, release deployment, unsafe boundary, process ownership, or performance policy is modified. The 175-match source audit distinguishes historical evidence from current capability facts.
+- #94–96 checked — no new wait/deadline, negotiated-link loop, durability boundary, or performance claim; original timing/load/keepalive rules remain unchanged.
+- Integration constraint — `git fetch origin wave-970` and `git merge --no-commit origin/wave-970` were attempted before the gate; the sandbox denied external gitdir writes. Read-only live upstream matched HEAD `9270f402`. No recorded merge or commit is claimed; delivery verdict and exact gate results are in the lane report.
+- Final validation — corrected full `cargo test -q --workspace --no-fail-fast` exits 0; exact `cargo clippy --workspace --tests -- -D warnings` exits 0; formatting/whitespace are clean; final source count is 4,968/4,968. The initial workspace run had one stale exact spawn-line pin, now updated with rationale and retained as an exact assertion. Verifier: one substantive finding, the corrected monitor-update ID requirement.

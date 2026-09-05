@@ -413,12 +413,14 @@ pub const FEATURE_AGENT_MESSAGE_V1: &str = "agent_message_v1";
 /// Daemon implements receipt-backed cancellation of an owned direct child.
 /// The child remains visible and reaches a durable terminal run state.
 pub const FEATURE_AGENT_CANCEL_V1: &str = "agent_cancel_v1";
+/// Daemon implements receipt-backed per-session provider/account/endpoint
+/// routing changes (`session.provider.rebind`) at the next request boundary.
+pub const FEATURE_SESSION_PROVIDER_REBIND_V1: &str = "session_provider_rebind_v1";
+
 /// Daemon implements receipted live-session model selection
 /// (`session.select_model`), including cross-provider rows: the request's
 /// optional `provider` names the selected model row's provider attribute,
 /// and the next logical turn resolves through the committed pair.
-pub const FEATURE_SESSION_PROVIDER_REBIND_V1: &str = "session_provider_rebind_v1";
-
 pub const FEATURE_SESSION_MODEL_SELECT_V1: &str = "session_model_select_v1";
 /// Daemon implements receipted live-session renaming (`session.rename`,
 /// G2): the committed title lands in `sessions.meta_json`, a
@@ -1954,8 +1956,8 @@ pub struct SessionSummary {
     /// is the real normal mode; `None` is reserved for older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast: Option<bool>,
-    /// None until the per-session account seam lands; readers must not infer
-    /// the daemon default.
+    /// Explicit account pin promoted from session metadata. None means no
+    /// explicit pin, a legacy row, or an older daemon; never infer its default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_alias: Option<String>,
     /// Additive prompt-fork provenance. The sequence names the selected source
@@ -3789,14 +3791,6 @@ pub enum RequestBody {
         session_id: SessionId,
         worker_generation: u64,
     },
-    /// Receipted live-session model selection. Sessions are provider-agnostic:
-    /// the user selects a MODEL, and the provider rides along as an attribute
-    /// of the selected row. An absent `provider` keeps today's bytes and
-    /// behavior — the model is selected within the session's current
-    /// provider. A present `provider` selects a row served by that provider;
-    /// the daemon validates creatability and, when a discovered inventory
-    /// exists, membership. The next logical turn resolves through the
-    /// committed pair (R6 re-resolution).
     /// Durable per-session routing change, applied at the next request boundary.
     #[serde(rename = "session.provider.rebind")]
     SessionProviderRebind {
@@ -3809,6 +3803,14 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<String>,
     },
+    /// Receipted live-session model selection. Sessions are provider-agnostic:
+    /// the user selects a MODEL, and the provider rides along as an attribute
+    /// of the selected row. An absent `provider` keeps today's bytes and
+    /// behavior — the model is selected within the session's current
+    /// provider. A present `provider` selects a row served by that provider;
+    /// the daemon validates creatability and, when a discovered inventory
+    /// exists, membership. The next logical turn resolves through the
+    /// committed pair (R6 re-resolution).
     #[serde(rename = "session.select_model")]
     SessionSelectModel {
         command_id: CommandId,
