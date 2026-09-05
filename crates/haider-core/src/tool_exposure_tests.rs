@@ -27,6 +27,7 @@ fn config() -> HarnessConfig {
         "fs_write",
         "fs_edit",
         "process_exec",
+        "spawn_subagent",
         "computer",
         "monitor",
         "plan",
@@ -62,6 +63,7 @@ fn default_coding_surface_and_catalog_read_do_not_promote() {
             "fs_write",
             "fs_edit",
             "process_exec",
+            "spawn_subagent",
         ]
     );
     let before = config.canonical_tool_pack_digest();
@@ -77,6 +79,10 @@ fn default_coding_surface_and_catalog_read_do_not_promote() {
     assert_eq!(before, config.canonical_tool_pack_digest());
     assert!(!tool_call_within_advertised_ceiling(&config, "monitor"));
     assert!(tool_call_within_advertised_ceiling(&config, "exec"));
+    assert!(tool_call_within_advertised_ceiling(
+        &config,
+        "spawn_subagent"
+    ));
 }
 
 #[test]
@@ -197,12 +203,33 @@ fn provider_refresh_and_fallback_preserve_the_discovery_tier() {
     config.install_provider_derived_request_state(&state);
     assert!(names(&config).contains(&"monitor"));
     assert!(!names(&config).contains(&"computer"));
+    assert!(names(&config).contains(&"spawn_subagent"));
     config.activate_provider_tool_fallback();
     let result = config.discovered_tool_result(serde_json::json!({"filter": "web_fetch"}));
     config.promote_committed_tools(&result);
     assert!(names(&config).contains(&"web_fetch"));
     assert!(names(&config).contains(&"monitor"));
     assert!(!names(&config).contains(&"computer"));
+    assert!(names(&config).contains(&"spawn_subagent"));
+}
+
+#[test]
+fn default_delegation_does_not_restore_a_tool_removed_by_provider_refresh() {
+    let mut config = config();
+    assert!(tool_call_within_advertised_ceiling(
+        &config,
+        "spawn_subagent"
+    ));
+    config.tools = vec![definition("list_tools"), definition("fs_read")];
+    config.shared_tools = None;
+    config.refresh_tool_exposure();
+    let result = config.discovered_tool_result(serde_json::json!({"filter": "spawn_subagent"}));
+    config.promote_committed_tools(&result);
+    assert_eq!(names(&config), ["list_tools", "fs_read"]);
+    assert!(!tool_call_within_advertised_ceiling(
+        &config,
+        "spawn_subagent"
+    ));
 }
 
 /// VERIFIER F3: the standalone owned tools vector becomes a shared filtered

@@ -1,0 +1,17 @@
+
+running 1 test
+instruct-pipe pin: registered=30, advertised=9, full_prefix_bytes=20770, policy_bytes=606, instruct_pipe_bytes=7989, native_description_bytes=1795
+
+thread 'permissions_core_tests::instruct_pipe_shrinks_the_advertised_wire_pack' (39010610) panicked at crates/haider-daemon/src/permissions_core_tests.rs:1724:5:
+assertion failed: pipe_bytes * 2 <= PRE_DIET_INSTRUCT_PIPE_BYTES
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+permissions_core_tests::instruct_pipe_shrinks_the_advertised_wire_pack --- FAILED
+
+failures:
+
+failures:
+    permissions_core_tests::instruct_pipe_shrinks_the_advertised_wire_pack
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1096 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p haider-daemon --lib`

@@ -5837,7 +5837,11 @@ impl HarnessActor {
                             {
                                 let (block, result) = match self
                                     .close_malformed_tool_failure(
-                                        &run_id, &mut tools, &call_id, &error,
+                                        &run_id,
+                                        &mut tools,
+                                        &call_id,
+                                        &error,
+                                        !malformed_tool_pending_repair,
                                     )
                                     .await
                                 {
@@ -8223,6 +8227,7 @@ impl HarnessActor {
         tools: &mut Vec<ToolAccumulator>,
         call_id: &str,
         error: &ProviderError,
+        repaired: bool,
     ) -> Result<(Block, Message), DriveError> {
         let Some(index) = tools.iter().position(|tool| tool.call_id == call_id) else {
             return Err(DriveError::Provider(provider_protocol_error(format!(
@@ -8247,6 +8252,7 @@ impl HarnessActor {
             data: Some(haider_protocol::tool::ToolResultData::InvalidToolCall {
                 tool: tool.name.clone(),
                 message: error.message.clone(),
+                repaired: Some(repaired),
             }),
             artifact: None,
             images: Vec::new(),
@@ -10189,8 +10195,8 @@ impl HarnessActor {
         if let Some(result) = result_envelope {
             envelopes.push(result);
         }
-        envelopes.push(
-            self.uncommitted_envelope(
+        let mut completed = self
+            .uncommitted_envelope(
                 run_id,
                 EventPayload::Item(ItemEvent::Completed {
                     item_id: tool.item_id.clone(),
@@ -10203,8 +10209,26 @@ impl HarnessActor {
                 }),
                 prompt_verbatim_render(),
             )
-            .map_err(DriveError::Store)?,
-        );
+            .map_err(DriveError::Store)?;
+        if let Some(haider_protocol::tool::ToolResultData::InvalidToolCall {
+            repaired: Some(repaired),
+            ..
+        }) = result.and_then(|result| result.data.as_ref())
+        {
+            // Stamp the durable completion, never a JSONL-only projection:
+            // replay and live consumers see the rejected attempt before any
+            // repair request. Keep the existing status and call identity.
+            completed
+                .payload
+                .insert_metadata("failed", serde_json::json!(true));
+            completed
+                .payload
+                .insert_metadata("reason", serde_json::json!("malformed_tool_call"));
+            completed
+                .payload
+                .insert_metadata("repaired", serde_json::json!(repaired));
+        }
+        envelopes.push(completed);
         if let Some(savings_envelopes) = savings_envelopes {
             envelopes.extend(savings_envelopes);
         }

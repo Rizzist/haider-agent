@@ -274,12 +274,15 @@ pub(crate) mod tool_result_payload {
 pub enum ToolResultData {
     /// Actor-authored discovery receipt. Only a successful, correlated
     /// `list_tools` result promotes these names into a session's tool view.
-    ToolsDiscovered {
-        promoted: Vec<String>,
-    },
+    ToolsDiscovered { promoted: Vec<String> },
     InvalidToolCall {
         tool: String,
         message: String,
+        /// Whether this failure consumed the run's non-terminal repair
+        /// allowance. This records permission to continue, not a successful
+        /// future model response; legacy results leave it unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repaired: Option<bool>,
     },
     FsSearch {
         matches: Vec<FsSearchMatch>,

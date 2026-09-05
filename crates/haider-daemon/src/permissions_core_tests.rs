@@ -1607,16 +1607,16 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // Keep wave's stricter pre-diet comparator (before docsync's +304 bytes).
     // Provider-dialect JSON framing is measured separately by AHRB.
     const PRE_DIET_INSTRUCT_PIPE_BYTES: usize = 13_552;
-    // Docsync keeps the default v5 core pack: seven coding tools + list_tools,
-    // with monitor/spawn semantics in promoted descriptions. Native prose
-    // once and no system manual, preserving parameter constraints and semantics.
-    // POSIX 13_552 -> 5_670 (-58.2%); do not trim validation bounds to save tokens.
-    // The only platform-specific bytes are process_exec.command.description:
-    // POSIX names /bin/zsh and /bin/sh (78 bytes), Windows names the absolute
-    // System32 PowerShell (75 bytes). Pin the other 5_670 - 78 = 5_592 bytes
-    // and derive this field's contribution from its actual schema string, so
-    // future manual edits cannot leave a stale hard-coded Windows offset.
-    const EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES: usize = 5_592;
+    // Confbench restores default delegation: POSIX 5_670 + 2_319 = 7_989
+    // (spawn name 14 + native description 305 + schema 2_000). Keep native
+    // semantics once, all constraints, and no duplicate system manual.
+    // Preserve wave's platform-derived pin: process_exec.command.description
+    // names /bin/zsh and /bin/sh on POSIX (78 bytes), and absolute System32
+    // PowerShell on Windows (75 bytes). Its actual serialized contribution
+    // is measured below; the invariant pin is 5_592 + 2_319 = 7_911.
+    // Keep the reduction floor independent of this exact-value pin: adding
+    // delegation cannot waive the existing release budget.
+    const EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES: usize = 7_911;
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let authorized =
         advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
@@ -1645,7 +1645,7 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // Full authorized manifest comparison: macOS 19_962 -> 20_770, measured
     // by this test. +808 = +337 list_tools +153 parameter prose +318 net
     // graph_evidence evidence_from/schema prose. This is the full catalog,
-    // distinct from the default eight-tool provider pack measured below.
+    // distinct from the default nine-tool provider pack measured below.
     // Other hosts are derived from unchanged platform deltas: Linux +49;
     // Windows computer +2 and process command -3 = -1; other Unix -6.
     // Thus Linux 20_011 -> 20_819, Windows 19_961 -> 20_769, other
@@ -1679,8 +1679,8 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     assert_eq!(registered_tools().len(), 30);
     assert_eq!(
         tools.len(),
-        8,
-        "seven coding tools and one discovery primitive"
+        9,
+        "seven coding tools, discovery, and delegation"
     );
     let tool_bytes: usize = tools
         .iter()

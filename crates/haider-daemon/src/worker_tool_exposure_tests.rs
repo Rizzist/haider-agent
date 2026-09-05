@@ -100,6 +100,23 @@ fn tier_configuration_preserves_explicit_grants_and_lockdown_allowlists() {
     assert_eq!(actual_names, allowed.iter().map(String::as_str).collect());
     assert!(!actual_names.contains("list_tools"));
     assert!(!actual_names.contains("monitor"));
+    // The standard lockdown policy permits bounded children. A narrower
+    // allowlist must still remove delegation despite its default exposure.
+    assert!(actual_names.contains("spawn_subagent"));
+    let without_spawn = allowed
+        .into_iter()
+        .filter(|name| name != "spawn_subagent")
+        .collect::<Vec<_>>();
+    let narrowed = lockdown_tool_definition_pack(
+        registered_tool_catalog().provider_definition_pack.clone(),
+        Some(&without_spawn),
+    );
+    assert!(
+        narrowed
+            .definitions
+            .iter()
+            .all(|tool| tool.name != "spawn_subagent")
+    );
 }
 
 #[test]
@@ -132,6 +149,7 @@ fn production_coding_surface_and_explicit_names_remain_authorized() {
             "fs_write",
             "fs_edit",
             "process_exec",
+            "spawn_subagent",
             "monitor"
         ]
     );
@@ -142,6 +160,39 @@ fn production_coding_surface_and_explicit_names_remain_authorized() {
     assert!(!names.contains(&"computer"));
     let explicit = DaemonDependencies::default().with_tool_exposure(None);
     assert!(explicit.tool_factory.initial_tool_exposure().is_none());
+}
+
+#[test]
+fn default_delegation_exposure_preserves_tool_and_effect_grant_ceilings() {
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(configured_factory(Some(Vec::new())));
+    for grant in [
+        Grant {
+            tools: vec!["fs_read".into()],
+            effect_ceiling: vec![EffectClass::FsRead, EffectClass::AgentSpawn],
+        },
+        Grant {
+            tools: vec!["fs_read".into(), "spawn_subagent".into()],
+            effect_ceiling: vec![EffectClass::FsRead],
+        },
+    ] {
+        let mut config =
+            HarnessConfig::for_session(SessionId::new("scope"), DeviceId::new("scope"), 0, 1);
+        config.tools = advertised_tool_definitions(
+            &factory,
+            Some(&grant),
+            "fake",
+            WebCapabilityDegrade::default(),
+        );
+        config.enable_tool_discovery(vec!["spawn_subagent".into()]);
+        assert_eq!(
+            config
+                .tool_definitions()
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["fs_read"]
+        );
+    }
 }
 
 #[test]

@@ -21,6 +21,25 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.970 — explicit malformed-attempt completion metadata
+
+The existing completed `tool_call` item adds optional payload-level `failed:
+true`, `reason: "malformed_tool_call"`, and `repaired: true|false` when its
+arguments are malformed. The matching `tool_result.result.data` with
+`kind: "invalid_tool_call"` adds optional `repaired`. Legacy results omit it.
+Existing call IDs, raw arguments, `item.status: "failed"`, result status,
+diagnostics, event kinds and schema version remain unchanged.
+
+`repaired: true` records that this rejected attempt consumed the available
+non-terminal repair allowance. It does not promise a later successful model
+response or a provider request if cancellation, a budget, or another malformed
+call prevents continuation. An exhausted allowance records `false`. Both the
+result and completed item commit in their existing atomic settlement before
+any repair request. The metadata is journaled before publication, so live
+JSONL and raw replay preserve identical facts; no serializer invents an error
+or a terminal event. The protocol round-trip and malformed repair runtime
+tests pin compatibility, ordering, single completion and exhausted allowance.
+
 ### v0.0.970 — durable tool discovery and slim provider results
 
 `tool_result.result.data` adds `kind: "tools_discovered"` with `promoted`,

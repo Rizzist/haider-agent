@@ -10,6 +10,9 @@ const CORE_TOOLS: &[&str] = &[
     "fs_edit",
     "fs_write",
     "process_exec",
+    // Delegation must be callable on the first request, including by
+    // headless clients. This remains an intersection with the granted pack.
+    "spawn_subagent",
     "todo_write",
     "list_tools",
 ];

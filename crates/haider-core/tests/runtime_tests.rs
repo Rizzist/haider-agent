@@ -2916,6 +2916,10 @@ async fn malformed_tool_json_is_durable_invalid_result_with_one_repair_continuat
         "invalid_tool_call"
     );
     assert_eq!(
+        serde_json::to_value(result.data.as_ref().expect("typed data")).expect("serialize")["repaired"],
+        true
+    );
+    assert_eq!(
         result
             .presentation
             .as_ref()
@@ -2948,6 +2952,32 @@ async fn malformed_tool_json_is_durable_invalid_result_with_one_repair_continuat
         result_index < next_request_index,
         "result is durable before repair attempt"
     );
+    let completions = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event
+                .payload
+                .get("event")
+                .and_then(serde_json::Value::as_str)
+                == Some("completed")
+                && event.payload["item"]["call_id"] == "bad-1"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completions.len(),
+        1,
+        "one completion for the rejected attempt"
+    );
+    let (completion_index, completion) = completions[0];
+    assert!(result_index < completion_index && completion_index < next_request_index);
+    assert_eq!(completion.payload["failed"], true);
+    assert_eq!(completion.payload["reason"], "malformed_tool_call");
+    assert_eq!(completion.payload["repaired"], true);
+    assert_eq!(completion.schema_version, 1);
+    let wire = serde_json::to_vec(completion).expect("live JSONL envelope");
+    let replay: RawEnvelope = serde_json::from_slice(&wire).expect("read journal envelope");
+    assert_eq!(serde_json::to_vec(&replay).expect("replay JSONL"), wire);
     assert!(
         !events
             .iter()
@@ -2966,6 +2996,27 @@ async fn second_consecutive_malformed_tool_json_terminates_after_one_repair() {
     assert_eq!(outcome.state, RunState::Errored);
     assert_eq!(requests.len(), 2, "no second repair continuation");
     assert_eq!(calls, 0);
+    let repair_flags = events
+        .iter()
+        .filter(|event| {
+            event
+                .payload
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                == Some("malformed_tool_call")
+        })
+        .map(|event| {
+            assert_eq!(event.payload["failed"], true);
+            event.payload["repaired"]
+                .as_bool()
+                .expect("repair allowance recorded")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        repair_flags,
+        [true, false],
+        "exhaustion is not marked repaired"
+    );
     assert_eq!(events.iter().filter(|event| matches!(typed(event), EventPayload::ToolResult { ref result, .. }
         if result.presentation.as_ref().is_some_and(|value| value.subcode.as_str() == "invalid-tool-call")
     )).count(), 2);
