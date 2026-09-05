@@ -1,0 +1,51 @@
+   Compiling haider-core v0.0.969 ($WORKTREE/crates/haider-core)
+   Compiling haider-cli v0.0.969 ($WORKTREE/crates/haider-cli)
+warning: unused `ClientCloseOutcome` that must be used
+   --> crates/haider-cli/tests/agent_cli_tests.rs:218:17
+    |
+218 |                 connection.client.close();
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: inspect whether the peer was notified or explicitly discard the close outcome
+    = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+    |
+218 |                 let _ = connection.client.close();
+    |                 +++++++
+
+warning: `haider-cli` (test "agent_cli_tests") generated 1 warning
+    Finished `test` profile [unoptimized] target(s) in 6.93s
+     Running tests/agent_cli_tests.rs ($AGENTCLI_TARGET/debug/deps/agent_cli_tests-c5f670a3c4f1e196)
+
+running 10 tests
+test agent_and_workflow_no_spawn_leave_fresh_profile_without_daemon ... ok
+test agent_missing_target_and_malformed_cli_are_typed_errors ... ok
+test agent_spawn_list_wait_publish_durable_child_result_and_exact_identities ... ok
+test agent_headless_input_is_rejected_and_provider_continues_to_child_result ... ok
+test agent_message_to_idle_child_returns_new_run_delivery_receipt ... ok
+test agent_spawn_provider_only_resolves_model_through_daemon_session_authority ... FAILED
+test agent_spawn_prompt_flag_and_cwd_are_public_noninteractive_inputs ... ok
+test agent_wait_failed_child_returns_durable_red_report_and_exit_one ... ok
+test agent_wait_timeout_observes_without_cancelling_then_cancel_is_terminal ... ok
+test workflow_list_run_status_expose_actual_child_graph_activation ... ok
+
+failures:
+
+---- agent_spawn_provider_only_resolves_model_through_daemon_session_authority stdout ----
+
+thread 'agent_spawn_provider_only_resolves_model_through_daemon_session_authority' (35565910) panicked at crates/haider-cli/tests/agent_cli_tests.rs:126:9:
+assertion `left == right` failed: args=["agent", "spawn", "resolve the provider default model", "--provider", "fake", "--json"]
+stdout={"error":{"code":"no_default_model","message":"provider `fake` publishes no default model","retryable":false},"ok":false,"result":null,"schema":"haider.agent.spawn.v1"}
+
+stderr=
+  left: Some(70)
+ right: Some(0)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    agent_spawn_provider_only_resolves_model_through_daemon_session_authority
+
+test result: FAILED. 9 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.73s
+
+error: test failed, to rerun pass `-p haider-cli --test agent_cli_tests`

@@ -1,0 +1,89 @@
+{
+  "error": null,
+  "ok": true,
+  "result": {
+    "agent_id": "agent-investigation",
+    "child_run_id": "run-child",
+    "child_session_id": "session-child",
+    "manifest": {
+      "agent": "agent-investigation",
+      "attempt": 0,
+      "budget_tokens": 4096,
+      "callsign": "gold-fox-000001",
+      "coordinates": {
+        "auto_hermetic": false,
+        "call_id": "agent-cli-run-parent",
+        "child_session_id": "session-child",
+        "handoff_dir": "/workspace/.haider/handoff/parent",
+        "lockdown": false,
+        "parent_run_id": "run-parent",
+        "parent_session_id": "session-parent",
+        "provider": "fake",
+        "public_headless": true,
+        "public_operator_spawn": true,
+        "tool_item_id": "item-parent-spawn"
+      },
+      "fencing_epoch": 1,
+      "grant": {
+        "effect_ceiling": [
+          {
+            "class": "fs_read"
+          },
+          {
+            "class": "fs_write"
+          },
+          {
+            "class": "process_exec"
+          },
+          {
+            "class": "remote_execution"
+          },
+          {
+            "class": "agent_spawn"
+          },
+          {
+            "class": "network",
+            "host": ""
+          },
+          {
+            "class": "peer_message"
+          }
+        ],
+        "tools": [
+          "request_input",
+          "fs_read",
+          "fs_glob",
+          "fs_search",
+          "fs_write",
+          "fs_edit",
+          "write",
+          "edit",
+          "fs_path",
+          "process_exec",
+          "spawn_subagent",
+          "message_subagent",
+          "task_output",
+          "task_kill",
+          "web_fetch",
+          "web_search",
+          "monitor",
+          "list_models",
+          "peer_list",
+          "peer_send",
+          "ssh_list",
+          "ssh_shell"
+        ]
+      },
+      "lease": "lease-child",
+      "model_profile": "fake-model",
+      "placement": {
+        "placement": "local"
+      },
+      "role": "subagent",
+      "task": "investigation"
+    },
+    "run_id": "run-parent",
+    "session_id": "session-parent"
+  },
+  "schema": "haider.agent.spawn.v1"
+}

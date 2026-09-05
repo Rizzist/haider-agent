@@ -1,0 +1,50 @@
+{
+  "crates/haider-daemon/src/subagent_core_tests.rs": {
+    "stage2_entries": 49,
+    "stage3_entries": 45,
+    "merged_entries": 50,
+    "missing": {
+      "2": [],
+      "3": []
+    }
+  },
+  "scripts/qa-gate/CI_REGISTRY_WALK_QAGATE3.md": {
+    "stage2_entries": 318,
+    "stage3_entries": 330,
+    "merged_entries": 349,
+    "missing": {
+      "2": [],
+      "3": []
+    }
+  },
+  "combined_conflict_registry_keys": [
+    1,
+    1,
+    5,
+    9,
+    19,
+    20,
+    21,
+    21,
+    22,
+    22,
+    26,
+    29,
+    31,
+    31,
+    33,
+    43,
+    55,
+    68,
+    73,
+    77,
+    82,
+    85,
+    85,
+    93,
+    94,
+    94,
+    95,
+    96
+  ]
+}

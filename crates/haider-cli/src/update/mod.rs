@@ -200,6 +200,15 @@ pub(crate) fn check_update_availability() -> Result<UpdateAvailability, UpdateEr
     check_update_availability_with(&mut transport, &source, super::VERSION, target)
 }
 
+pub(crate) fn check_update_availability_cancellable(
+    cancellation: discovery::DiscoveryCancellation,
+) -> Result<UpdateAvailability, UpdateError> {
+    let source = ReleaseSource::production()?;
+    let target = compiled_target()?;
+    let mut transport = CurlTransport::from_environment().with_cancellation(cancellation);
+    check_update_availability_with(&mut transport, &source, super::VERSION, target)
+}
+
 pub(crate) fn check_update_availability_with<T: discovery::UpdateTransport>(
     transport: &mut T,
     source: &ReleaseSource,

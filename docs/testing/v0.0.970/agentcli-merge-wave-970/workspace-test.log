@@ -1,0 +1,1910 @@
+
+running 18 tests
+..................
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+
+running 18 tests
+.......i..........
+test result: ok. 17 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 79 tests
+.{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+..{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.....{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+......................................................................
+test result: ok. 79 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+
+running 11 tests
+. 1/11
+agent_spawn_list_wait_publish_durable_child_result_and_exact_identities --- FAILED
+agent_headless_input_is_rejected_and_provider_continues_to_child_result --- FAILED
+agent_message_to_idle_child_returns_new_run_delivery_receipt --- FAILED
+agent_missing_target_and_malformed_cli_are_typed_errors --- FAILED
+agent_spawn_provider_without_published_default_retains_native_rejection --- FAILED
+agent_spawn_provider_only_resolves_model_through_daemon_session_authority --- FAILED
+agent_wait_failed_child_returns_durable_red_report_and_exit_one --- FAILED
+agent_spawn_prompt_flag_and_cwd_are_public_noninteractive_inputs --- FAILED
+agent_wait_timeout_observes_without_cancelling_then_cancel_is_terminal --- FAILED
+workflow_list_run_status_expose_actual_child_graph_activation --- FAILED
+
+failures:
+
+---- agent_spawn_list_wait_publish_durable_child_result_and_exact_identities stdout ----
+
+thread 'agent_spawn_list_wait_publish_durable_child_result_and_exact_identities' (37115358) panicked at crates/haider-cli/tests/agent_cli_tests.rs:126:9:
+assertion `left == right` failed: args=["agent", "spawn", "return the fixture report", "--task", "agentcli-report", "--provider", "fake", "--model", "fake-model", "--json", "--timeout", "10s"]
+stdout={"error":{"code":"spawn_failed","message":"grant ceiling violation: session is not allowed to use `spawn_subagent`; call list_tools with a matching filter to discover and enable authorized tools","retryable":false},"ok":false,"result":{"run_id":"run-826fa988e1ee856f4ab5f0ddeac8ccf5","session_id":"session-57d6ecbf06f8f91b20fd702ddfa0bf1d"},"schema":"haider.agent.spawn.v1"}
+
+stderr=
+  left: Some(70)
+ right: Some(0)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- agent_headless_input_is_rejected_and_provider_continues_to_child_result stdout ----
+
+thread 'agent_headless_input_is_rejected_and_provider_continues_to_child_result' (37115260) panicked at crates/haider-cli/tests/agent_cli_tests.rs:126:9:
+assertion `left == right` failed: args=["agent", "spawn", "return the fixture report", "--task", "agentcli-report", "--provider", "fake", "--model", "fake-model", "--json", "--timeout", "10s"]
+stdout={"error":{"code":"spawn_failed","message":"grant ceiling violation: session is not allowed to use `spawn_subagent`; call list_tools with a matching filter to discover and enable authorized tools","retryable":false},"ok":false,"result":{"run_id":"run-af351a5d7179f87783c81dea8f54c06f","session_id":"session-0f3977a6a6e5c61b46cf065efb75f213"},"schema":"haider.agent.spawn.v1"}
+
+stderr=
+  left: Some(70)
+ right: Some(0)
+
+---- agent_message_to_idle_child_returns_new_run_delivery_receipt stdout ----
+
+thread 'agent_message_to_idle_child_returns_new_run_delivery_receipt' (37115261) panicked at crates/haider-cli/tests/agent_cli_tests.rs:126:9:
+assertion `left == right` failed: args=["agent", "spawn", "return the fixture report", "--task", "agentcli-report", "--provider", "fake", "--model", "fake-model", "--json", "--timeout", "10s"]
+stdout={"error":{"code":"spawn_failed","message":"grant ceiling violation: session is not allowed to use `spawn_subagent`; call list_tools with a matching filter to discover and enable authorized tools","retryable":false},"ok":false,"result":{"run_id":"run-9183d91d340d41b739e2e0d40892c225","session_id":"session-d5ec97d60f4fe5186e59949ab6323a89"},"schema":"haider.agent.spawn.v1"}
+
+stderr=
+  left: Some(70)
+ right: Some(0)
+
+---- agent_missing_target_and_malformed_cli_are_typed_errors stdout ----
+
+thread 'agent_missing_target_and_malformed_cli_are_typed_errors' (37115262) panicked at crates/haider-cli/tests/agent_cli_tests.rs:126:9:
+assertion `left == right` failed: args=["agent", "spawn", "return the fixture report", "--task", "agentcli-report", "--provider", "fake", "--model", "fake-model", "--json", "--timeout", "10s"]
+stdout={"error":{"code":"spawn_failed","message":"grant ceiling violation: session is not allowed to use `spawn_subagent`; call list_tools with a matching filter to discover and enable authorized tools","retryable":false},"ok":false,"result":{"run_id":"run-ade8e13d5b7f6ed53b7930daa0d0505d","session_id":"session-11ca78fafccf5daa5fcde897fe553805"},"schema":"haider.agent.spawn.v1"}
+
+stderr=
+  left: Some(70)
+ right: Some(0)
+
+---- agent_spawn_provider_without_published_default_retains_native_rejection stdout ----
+
+thread 'agent_spawn_provider_without_published_default_retains_native_rejection' (37116814) panicked at crates/haider-cli/tests/agent_cli_tests.rs:296:23:
+cannot prove owned daemon exit: ESRCH: No such process
+
+---- agent_spawn_provider_only_resolves_model_through_daemon_session_authority stdout ----
+
+thread 'agent_spawn_provider_only_resolves_model_through_daemon_session_authority' (37116800) panicked at crates/haider-cli/tests/agent_cli_tests.rs:126:9:
+assertion `left == right` failed: args=["agent", "spawn", "resolve the provider default model", "--provider", "xai", "--json"]
+stdout={"error":{"code":"spawn_failed","message":"grant ceiling violation: session is not allowed to use `spawn_subagent`; call list_tools with a matching filter to discover and enable authorized tools","retryable":false},"ok":false,"result":{"run_id":"run-3dcbe69701b0d7c5504991084fb509ed","session_id":"session-d82e64464eaab9fdf3cbe5ad2684e6fa"},"schema":"haider.agent.spawn.v1"}
+
+stderr=
+  left: Some(70)
+ right: Some(0)
+
+---- agent_wait_failed_child_returns_durable_red_report_and_exit_one stdout ----
+
+thread 'agent_wait_failed_child_returns_durable_red_report_and_exit_one' (37116838) panicked at crates/haider-cli/tests/agent_cli_tests.rs:126:9:
+assertion `left == right` failed: args=["agent", "spawn", "return the fixture report", "--task", "agentcli-report", "--provider", "fake", "--model", "fake-model", "--json", "--timeout", "10s"]
+stdout={"error":{"code":"spawn_failed","message":"grant ceiling violation: session is not allowed to use `spawn_subagent`; call list_tools with a matching filter to discover and enable authorized tools","retryable":false},"ok":false,"result":{"run_id":"run-e81cf8eb5a50842e4e79fa099dfb5fdf","session_id":"session-97deb12d21bda7e13a3fa6bc9fc81127"},"schema":"haider.agent.spawn.v1"}
+
+stderr=
+  left: Some(70)
+ right: Some(0)
+
+---- agent_spawn_prompt_flag_and_cwd_are_public_noninteractive_inputs stdout ----
+
+thread 'agent_spawn_prompt_flag_and_cwd_are_public_noninteractive_inputs' (37116797) panicked at crates/haider-cli/tests/agent_cli_tests.rs:126:9:
+assertion `left == right` failed: args=["agent", "spawn", "-p", "flag prompt", "--task", "flag-task", "--provider", "fake", "--model", "fake-model", "--cwd", "/tmp/h-ac-Wxfegg/w", "--json"]
+stdout={"error":{"code":"spawn_failed","message":"grant ceiling violation: session is not allowed to use `spawn_subagent`; call list_tools with a matching filter to discover and enable authorized tools","retryable":false},"ok":false,"result":{"run_id":"run-71b437f51ade40c009709a6b8d417209","session_id":"session-4e4e7d261588061cc843267c5f11f6f0"},"schema":"haider.agent.spawn.v1"}
+
+stderr=
+  left: Some(70)
+ right: Some(0)
+
+---- agent_wait_timeout_observes_without_cancelling_then_cancel_is_terminal stdout ----
+
+thread 'agent_wait_timeout_observes_without_cancelling_then_cancel_is_terminal' (37116886) panicked at crates/haider-cli/tests/agent_cli_tests.rs:126:9:
+assertion `left == right` failed: args=["agent", "spawn", "return the fixture report", "--task", "agentcli-report", "--provider", "fake", "--model", "fake-model", "--json", "--timeout", "10s"]
+stdout={"error":{"code":"spawn_failed","message":"grant ceiling violation: session is not allowed to use `spawn_subagent`; call list_tools with a matching filter to discover and enable authorized tools","retryable":false},"ok":false,"result":{"run_id":"run-617dc8027b793177eb654818a5665e1c","session_id":"session-c170195a37ad74b231a9f404b5b61e03"},"schema":"haider.agent.spawn.v1"}
+
+stderr=
+  left: Some(70)
+ right: Some(0)
+
+---- workflow_list_run_status_expose_actual_child_graph_activation stdout ----
+
+thread 'workflow_list_run_status_expose_actual_child_graph_activation' (37116903) panicked at crates/haider-cli/tests/agent_cli_tests.rs:126:9:
+assertion `left == right` failed: args=["workflow", "run", "child-implement-verify", "implement and independently verify", "--trigger", "mutation_with_independent_verification", "--provider", "fake", "--model", "fake-model", "--json", "--timeout", "10s"]
+stdout={"error":{"code":"spawn_failed","message":"grant ceiling violation: session is not allowed to use `spawn_subagent`; call list_tools with a matching filter to discover and enable authorized tools","retryable":false},"ok":false,"result":{"run_id":"run-0a3d05a5f8007d18708d720bf50056e7","session_id":"session-6eb489fdb8c83180d44b226556973316"},"schema":"haider.workflow.run.v1"}
+
+stderr=
+  left: Some(70)
+ right: Some(0)
+
+
+failures:
+    agent_headless_input_is_rejected_and_provider_continues_to_child_result
+    agent_message_to_idle_child_returns_new_run_delivery_receipt
+    agent_missing_target_and_malformed_cli_are_typed_errors
+    agent_spawn_list_wait_publish_durable_child_result_and_exact_identities
+    agent_spawn_prompt_flag_and_cwd_are_public_noninteractive_inputs
+    agent_spawn_provider_only_resolves_model_through_daemon_session_authority
+    agent_spawn_provider_without_published_default_retains_native_rejection
+    agent_wait_failed_child_returns_durable_red_report_and_exit_one
+    agent_wait_timeout_observes_without_cancelling_then_cancel_is_terminal
+    workflow_list_run_status_expose_actual_child_graph_activation
+
+test result: FAILED. 1 passed; 10 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.98s
+
+error: test failed, to rerun pass `-p haider-cli --test agent_cli_tests`
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.18s
+
+
+running 143 tests
+........{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+...{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+..{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+........................................................................ 87/143
+........................................................
+test result: ok. 143 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.19s
+
+
+running 91 tests
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+....{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+....{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+............................................................................... 87/91
+....
+test result: ok. 91 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+
+
+running 10 tests
+..........
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 85 tests
+...{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.....{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+............................................................................
+test result: ok. 85 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.55s
+
+
+running 91 tests
+........{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+....{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.......................................................................... 87/91
+....
+test result: ok. 91 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+
+running 86 tests
+...{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+...{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+...............................................................................
+test result: ok. 86 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.09s
+
+
+running 102 tests
+...{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"add","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+...{"schema":"haider.account.custom.v1","operation":"probe","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+..{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"https://router.example.test/v1","api_family":"openai","auth_state":"authenticated","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+.{"schema":"haider.account.custom.v1","operation":"update","alias":"router","base_url":"http://127.0.0.1:8080","api_family":"openai","auth_state":"no_auth","reachable":true,"latency_ms":0,"model_count":2,"models":["router/alpha","router/beta"]}
+............................................................................. 87/102
+...............
+test result: ok. 102 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.66s
+
+
+running 20 tests
+....................
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 63 tests
+...............................................................
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.96s
+
+
+running 18 tests
+............
+running 1 test
+...test spawned_daemon_inherits_no_descriptors_beyond_stdio ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.51s
+
+...
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+
+
+running 34 tests
+..................................
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.21s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 93 tests
+....................................................................................... 87/93
+......
+test result: ok. 93 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 40 tests
+.............i..........................
+test result: ok. 39 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 97 tests
+....................................................................................... 87/97
+..........
+test result: ok. 97 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.33s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 1093 tests
+............................................................i.......................... 87/1093
+....................................i.................................................. 174/1093
+.........................................................................
+running 1 test
+.............. 261/1093
+........................
+running 1 test
+..test hooks::tests::hook_secret_child_probe ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1092 filtered out; finished in 0.07s
+
+............................................................. 348/1093
+................................................i...................................... 435/1093
+....................................................................................... 522/1093
+....................................................................................... 609/1093
+....................................................................................... 696/1093
+....................................................................................... 783/1093
+....................................................................................... 870/1093
+....................................................................................... 957/1093
+....................................................................................... 1044/1093
+.................................................
+test result: ok. 1090 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 29.02s
+
+
+running 105 tests
+....................................................................................... 87/105
+..................
+test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.73s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+
+
+running 20 tests
+....................
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.61s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.85s
+
+
+running 38 tests
+......................................
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.74s
+
+
+running 41 tests
+.........................................
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.77s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.11s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.08s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.71s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 10 tests
+..........
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.08s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 33 tests
+..............................
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+.
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.02s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.02s
+
+.test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.03s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.04s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.04s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.04s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.05s
+
+test spawn::log_tests::concurrent_process_writer_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.05s
+
+.
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 87 tests
+....................................................................................... 87/87
+
+test result: ok. 87 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 58 tests
+..........................................................
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 10 tests
+..........
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 264 tests
+....................................................................................... 87/264
+....................................................................................... 174/264
+....................................................................................... 261/264
+...
+test result: ok. 264 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.60s
+
+
+running 5 tests
+iii..
+test result: ok. 2 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 24 tests
+........................
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.90s
+
+
+running 20 tests
+....................
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+ii
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 18 tests
+..................
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 1 test
+i
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+test: live_openai_responses_text_smoke_is_explicitly_gated, ignore_message: live OpenAI smoke; requires HAIDER_LIVE_PROVIDER_TESTS=1
+
+
+running 35 tests
+...................................
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 17 tests
+.................
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+i
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+test: live_anthropic_oauth_meter_parses_and_normalizes, ignore_message: live anthropic-oauth usage poll; requires HAIDER_LIVE_USAGE_TESTS=1 + HAIDER_ANTHROPIC_OAUTH_TOKEN
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 25 tests
+.........................
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 10 tests
+..........
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 103 tests
+....................................................................................... 87/103
+................
+test result: ok. 103 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+
+running 69 tests
+.............................
+running 1 test
+test event_store::group_commit_tests::crash_mid_group_loses_the_whole_group_atomically ... ........................................
+test result: ok. 69 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.30s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.71s
+
+
+running 65 tests
+.................................................................
+test result: ok. 65 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.71s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.75s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+
+
+running 22 tests
+......................
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 28 tests
+............................
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+
+running 13 tests
+.............
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+
+
+running 86 tests
+............i.........................................................................
+test result: ok. 85 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.78s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 35 tests
+...................................
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 29 tests
+....
+running 1 test
+test env_view_redacts_secret_names_and_preserves_non_secret_values ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 28 filtered out; finished in 0.00s
+
+............
+running 1 test
+test process_exec_repository_without_a_git_binary_still_detects_source_mutation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 28 filtered out; finished in 0.01s
+
+.............
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.32s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 32 tests
+................................
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 28 tests
+............................
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 10 tests
+..........
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 16 tests
+................
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 17 tests
+.................
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 21 tests
+.....................
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 18 tests
+..................
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 31 tests
+...............................
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 22 tests
+......................
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 15 tests
+...............
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 16 tests
+................
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 10 tests
+..........
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+running 17 tests
+.................
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 15 tests
+...............
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 25 tests
+.........................
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 17 tests
+.................
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+
+running 26 tests
+..........................
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 46 tests
+..............................................
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 49 tests
+.................................................
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+
+running 21 tests
+.....................
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.36s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.04s
+
+
+running 2 tests
+.test first_frame_and_cached_p95_are_flat_from_10k_to_200k_rows has been running for over 60 seconds
+.
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 198.99s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 21 tests
+.....................
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 30 tests
+..............................
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 10 tests
+..........
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 21 tests
+.....................
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 13 tests
+.............
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+
+
+running 21 tests
+.....................
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 25 tests
+.........................
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.44s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 7 tests
+......]52;c;aHR0cHM6Ly9hdXRoLm9wZW5haS5jb20veA==.
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 25 tests
+.........................
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+running 21 tests
+.....................
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+
+
+running 28 tests
+............................
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 18 tests
+..................
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 15 tests
+...............
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.05s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: 1 target failed:
+    `-p haider-cli --test agent_cli_tests`

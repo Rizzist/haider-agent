@@ -505,6 +505,7 @@ async fn recoverable_workflow_continuation_blocks_daemon_idle_ttl_retirement() {
         RunState::Queued,
     );
     *configured.payload = HeadlessRunEventPayload::HeadlessRunConfigured(HeadlessRunSpecV1 {
+        agent_spawn: None,
         continuation_of: None,
         cwd: "workflow-idle-ttl-workspace".into(),
         provider: "fake".into(),

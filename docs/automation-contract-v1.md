@@ -780,7 +780,213 @@ support; a rebind does not promise a hit at a different endpoint or account.
 Harnesses should retain each rebind receipt, effective provider ID, caching
 declaration, and observed proxy/provider usage on the corresponding row.
 
+## Public agent and workflow commands (v0.0.970)
+
+These commands are noninteractive. `spawn` and `run` create a coordinator
+session and delegate one actual child through the daemon's tool engine:
+
+The daemon must expose `spawn_subagent`, for example by starting it with
+`HAIDER_TOOL_EXPOSURE=spawn_subagent`. Setting this variable on a later CLI
+invocation does not reconfigure an already-running daemon. The default coding
+catalog leaves delegation unexposed; spawn/run then return exit 70 and typed
+`spawn_failed` with the native grant-ceiling refusal and parent coordinates,
+without creating a child or making a provider request.
+
+```sh
+export HAIDER_TOOL_EXPOSURE=spawn_subagent
+haider agent spawn "inspect the failing tests" --task investigation --json
+haider agent list <parent-session-id> --json
+haider agent message <parent-session-id> <agent-id> "inspect the new failure" --json
+haider agent cancel <parent-session-id> <agent-id> --json
+haider agent wait <parent-session-id> <agent-id> --timeout 30s --json
+haider workflow list --json
+haider workflow run child-implement-verify "implement and verify the fix" \
+  --trigger mutation_with_independent_verification --json
+haider workflow status <child-session-id> --json
+```
+
+All verbs accept `--json`, `--no-spawn`, and `--timeout <duration>`. Timeout
+defaults to 30 seconds of command observation after connection; connection
+startup and transport requests retain their standard finite budgets. Expiring
+an observation does not cancel accepted work. A spawn timeout can contain
+the accepted `session_id` and `run_id` in `result`; retain these coordinates
+and inspect the session instead of blindly retrying. Explicit cancellation
+uses `agent cancel`. Closing a successful spawn command leaves its child owned
+by the daemon. The ordinary durable delegation lifetime budget still applies.
+
+Spawn/run accept `--provider`, `--model`, `--agent-type`, `--task`, and
+`--cwd`; `--prompt`/`-p` can replace the positional prompt. Omitted provider
+and model are resolved by the daemon's session-create authority. `--` ends
+option parsing, allowing literal prompts such as `--help` or `--json`. Agent spawn
+also accepts `--workflow <id> --trigger <reason>`. Workflow execution requires
+an explicit valid trigger and an admitted workflow, never a silent bare-task
+fallback. Inspect `workflow list` for the native built-in/user catalog.
+The catalog also includes workflows with human confirmation gates; those
+cannot run as autonomous children and are rejected. `child-implement-verify`
+uses `mutation_with_independent_verification`; `child-deeper` accepts
+`dependent_phases`, `fan_out`, `distinct_review`, or `crash_recovery`.
+Mutations accept `--command-id <id>` for the existing receipt identity rules;
+an omitted ID is generated per invocation. Reusing an ID with different
+request semantics is an error, not a new operation.
+
+With `--json`, stdout contains exactly one JSON object followed by LF:
+
+```json value.agent_spawn
+{
+  "error": null,
+  "ok": true,
+  "result": {
+    "agent_id": "agent-investigation",
+    "child_run_id": "run-child",
+    "child_session_id": "session-child",
+    "manifest": {
+      "agent": "agent-investigation",
+      "attempt": 0,
+      "budget_tokens": 4096,
+      "callsign": "gold-fox-000001",
+      "coordinates": {
+        "auto_hermetic": false,
+        "call_id": "agent-cli-run-parent",
+        "child_session_id": "session-child",
+        "handoff_dir": "/workspace/.haider/handoff/parent",
+        "lockdown": false,
+        "parent_run_id": "run-parent",
+        "parent_session_id": "session-parent",
+        "provider": "fake",
+        "public_headless": true,
+        "public_operator_spawn": true,
+        "tool_item_id": "item-parent-spawn"
+      },
+      "fencing_epoch": 1,
+      "grant": {
+        "effect_ceiling": [
+          {
+            "class": "fs_read"
+          },
+          {
+            "class": "fs_write"
+          },
+          {
+            "class": "process_exec"
+          },
+          {
+            "class": "remote_execution"
+          },
+          {
+            "class": "agent_spawn"
+          },
+          {
+            "class": "network",
+            "host": ""
+          },
+          {
+            "class": "peer_message"
+          }
+        ],
+        "tools": [
+          "request_input",
+          "fs_read",
+          "fs_glob",
+          "fs_search",
+          "fs_write",
+          "fs_edit",
+          "write",
+          "edit",
+          "fs_path",
+          "process_exec",
+          "spawn_subagent",
+          "message_subagent",
+          "task_output",
+          "task_kill",
+          "web_fetch",
+          "web_search",
+          "monitor",
+          "list_models",
+          "peer_list",
+          "peer_send",
+          "ssh_list",
+          "ssh_shell"
+        ]
+      },
+      "lease": "lease-child",
+      "model_profile": "fake-model",
+      "placement": {
+        "placement": "local"
+      },
+      "role": "subagent",
+      "task": "investigation"
+    },
+    "run_id": "run-parent",
+    "session_id": "session-parent"
+  },
+  "schema": "haider.agent.spawn.v1"
+}
+```
+
+The five agent schemas are `haider.agent.spawn.v1`, `haider.agent.list.v1`,
+`haider.agent.message.v1`, `haider.agent.cancel.v1`, and
+`haider.agent.wait.v1`. Workflow schemas are `haider.workflow.run.v1`,
+`haider.workflow.status.v1`, and `haider.workflow.list.v1`. All share `ok`,
+`result`, and `error`. An error has `code`, `message`, and boolean `retryable`;
+`result` is null or preserves available durable coordinates/evidence. Consumers
+must tolerate additive fields. Human output is not a parsing contract.
+
+| Verb | Successful `result` |
+| --- | --- |
+| agent spawn / workflow run | Parent `session_id`/`run_id`, actual `agent_id`, `child_session_id`/`child_run_id`, and durable `manifest`. |
+| agent list | Native `SessionFleetSnapshot`, including `roots`, bounds, truncation and rollup. |
+| agent message | Native `receipt`, including delivery kind and child run coordinates. Running children receive steer; idle children receive a queued fresh turn. |
+| agent cancel | Native `agent.cancel` fields: `agent`, child session/run, status and optional terminal sequence. Acceptance is not terminal completion. |
+| agent wait | Parent/agent/child coordinates, terminal `state`, child `terminal_seq`, `report`, `report_source`, and nullable parent `child_result_seq`. |
+| workflow status | `session_id`, native `graph` status and nullable typed `activation`. A built-in graph need not have a typed Loom activation. |
+| workflow list | `workflows`: native workflow catalog entries. |
+
+Wait selects the latest child run visible during its initial journal replay
+and keeps that target. For the initial delegation it requires both the child's
+typed terminal and its parent's completed `ChildResult`, with
+`report_source: "child_result"` and the exact `child_result_seq`. After an idle
+child is messaged, its follow-up turn has no new parent collector: wait reads
+the actual completed child message and terminal, reports
+`report_source: "child_journal"`, `verified: "unverified"`, and a null
+`child_result_seq`. It never substitutes the old parent's report. `agent.cancel`
+retains the native RPC's original delegation-run targeting and recursive
+cancellation semantics; its returned child-run coordinate is authoritative.
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | Operation succeeded, or wait observed successful completion. |
+| 1 | Wait observed a failed child / red report (`child_failed`). |
+| 2 | Invalid CLI syntax or locally invalid spawn arguments. |
+| 69 | Profile/daemon connection unavailable. |
+| 70 | Native RPC rejection, missing target, or rejected spawn. |
+| 74 | Output could not be written, including a closed stdout pipe. |
+| 76 | Required feature, profile identity, or response protocol mismatch. |
+| 124 | Observation deadline expired; accepted work continues. |
+| 130 | Wait observed child cancellation (`child_cancelled`). |
+
+Public children are autonomous. A `request_input` without a default produces
+the durable rejected tool result `no_human_available`, closes the menu, and
+continues the provider loop. It is not a failed agent result. Wait observes
+the eventual child terminal/report. The CLI never opens a TUI or waits for
+stdin to answer a child menu.
+
 ## Additive changelog
+
+### 2026-09-05 — v0.0.970 public agent/workflow CLI
+
+- Added the eight documented verbs, singleton JSON envelopes and exit codes
+  above. Existing command output and exit contracts are unchanged.
+- Added negotiated `agent_cli_v1` and optional
+  `HeadlessRunSpecV1.agent_spawn`. The existing headless start receipt pins
+  operator-authored delegation before dispatch; the coordinator invokes no
+  provider request. Child admission, result publication and collection use
+  the native engine, with autonomous input handling for public children.
+- Added the T0 spawn/result gate with sourced `BudgetSum` bounds and explicit
+  status-owned daemon cleanup/no-orphan evidence.
+- Added optional `caller_owner` to `session.surface_watch` responses. TUI
+  clients learn their authoritative mirror identity at watch adoption, before
+  publishing local edits; delayed self-echoes cannot overwrite newer typing.
+  Omission preserves older response bytes and the legacy compatibility path.
 
 ### 2026-09-03 — v0.0.970
 

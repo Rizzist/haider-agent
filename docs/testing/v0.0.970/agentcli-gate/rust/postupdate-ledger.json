@@ -1,0 +1,115 @@
+[
+  {
+    "name": "provider-fixture-regenerated",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "haider-cli",
+      "--test",
+      "turnhygiene_pin_tests",
+      "provider_request_body_is_budget_independent_and_matches_the_golden_ledger",
+      "--locked",
+      "--",
+      "--exact",
+      "--test-threads=1"
+    ],
+    "env_overrides": {
+      "UPDATE_FIXTURES": "1"
+    },
+    "exit": 0,
+    "elapsed_s": 23.672,
+    "disk_available_mib": 16062
+  },
+  {
+    "name": "haider-cli-postupdate",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "haider-cli",
+      "--locked",
+      "--no-fail-fast",
+      "--",
+      "--test-threads=4"
+    ],
+    "env_overrides": {},
+    "exit": 0,
+    "elapsed_s": 94.395,
+    "disk_available_mib": 16060
+  },
+  {
+    "name": "clippy-postupdate",
+    "command": [
+      "cargo",
+      "clippy",
+      "-p",
+      "haider-cli",
+      "-p",
+      "haider-client",
+      "-p",
+      "haider-core",
+      "-p",
+      "haider-daemon",
+      "-p",
+      "haider-daemond",
+      "-p",
+      "haider-protocol",
+      "-p",
+      "haider-rpc",
+      "-p",
+      "haider-store",
+      "--tests",
+      "--locked",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "env_overrides": {},
+    "exit": 0,
+    "elapsed_s": 93.37,
+    "disk_available_mib": 15352
+  },
+  {
+    "name": "test-count-final",
+    "command": [
+      "cargo",
+      "run",
+      "-p",
+      "xtask",
+      "--locked",
+      "--",
+      "test-count",
+      "--update"
+    ],
+    "env_overrides": {},
+    "exit": 0,
+    "elapsed_s": 1.51,
+    "disk_available_mib": 14181
+  },
+  {
+    "name": "fmt-postupdate",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "env_overrides": {},
+    "exit": 0,
+    "elapsed_s": 5.226,
+    "disk_available_mib": 14181
+  },
+  {
+    "name": "unsafe-postupdate",
+    "command": [
+      "python3",
+      "scripts/check-unsafe-counts.py"
+    ],
+    "env_overrides": {},
+    "exit": 0,
+    "elapsed_s": 4.972,
+    "disk_available_mib": 14180
+  }
+]

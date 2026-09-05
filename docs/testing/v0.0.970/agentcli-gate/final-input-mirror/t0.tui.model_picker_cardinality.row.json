@@ -1,0 +1,2038 @@
+{
+  "id": "t0.tui.model_picker_cardinality",
+  "area": "tui",
+  "status": "PASS",
+  "evidence": [
+    {
+      "label": "top_level_cardinality",
+      "status": "PASS",
+      "evidence_line": "top_rows expected=37 actual_118x36=37 actual_80x24=37 unique_api_slugs=29 oauth_pairs=2 placeholders=6 seed=8_api_overlap+2_oauth_pairs actual=true alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "artefacts": []
+    },
+    {
+      "label": "current_and_escape",
+      "status": "PASS",
+      "evidence_line": "current_visible_top=true provider_stage_once=true esc_to_list=true second_esc_closes=true actual_current_rows={'118x36': ['\u25cf shared-alpha              * 8 providers        api         \u2014  current \u00b7 qa-api-1  8/8 available \u00b7 8 default'], '80x24': ['\u25cf shared-alpha              * 8 providers        api         \u2014  current \u00b7 qa-ap']} actual_provider_headers={'118x36': ['PROVIDERS \u2014 shared-alpha \u00b7 choose which API serves it'], '80x24': ['PROVIDERS \u2014 shared-alpha \u00b7 choose which API serves it']} actual_list_headers={'118x36': ['MODELS \u2014 OAuth subscriptions + one API choice per model'], '80x24': ['MODELS \u2014 OAuth subscriptions + one API choice per model']} actual_closed_headers={'118x36': [], '80x24': []}",
+      "artefacts": []
+    },
+    {
+      "label": "search_reachability",
+      "status": "PASS",
+      "evidence_line": "targets=37 activated_each=true search_plus_provider_stages_max=1 unreachable=[] actual=[\"Go:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider has no credential'],needles=['provider has no', 'provider has no credential'],stages=0\", \"Go Max:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider has no credential'],needles=['provider has no', 'provider has no credential'],stages=0\", \"anthropic.claude-fable-5:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider has no credential'],needles=['provider has no', 'provider has no credential'],stages=0\", \"anthropic.claude-haiku-4-5:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider has no credential'],needles=['provider has no', 'provider has no credential'],stages=0\", \"anthropic.claude-opus-4-7:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider has no credential'],needles=['provider has no', 'provider has no credential'],stages=0\", \"anthropic.claude-opus-4-8:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider has no credential'],needles=['provider has no', 'provider has no credential'],stages=0\", \"anthropic.claude-opus-5:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider has no credential'],needles=['provider has no', 'provider has no credential'],stages=0\", \"anthropic.claude-sonnet-5:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider has no credential'],needles=['provider has no', 'provider has no credential'],stages=0\", \"claude-fable-5:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider endpoint is not configured'],needles=['provider endpoint is', 'provider endpoint is not configured'],stages=0\", \"claude-haiku-4-5@20251001:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider endpoint is not configured'],needles=['provider endpoint is', 'provider endpoint is not configured'],stages=0\", \"claude-opus-5:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider endpoint is not configured'],needles=['provider endpoint is', 'provider endpoint is not configured'],stages=0\", \"claude-sonnet-4-5@20250929:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider endpoint is not configured'],needles=['provider endpoint is', 'provider endpoint is not configured'],stages=0\", \"claude-sonnet-5:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider endpoint is not configured'],needles=['provider endpoint is', 'provider endpoint is not configured'],stages=0\", \"deepseek-chat:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider has no credential'],needles=['provider has no', 'provider has no credential'],stages=0\", \"deepseek-reasoner:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider has no credential'],needles=['provider has no', 'provider has no credential'],stages=0\", \"grok-4.3:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider has no credential'],needles=['provider has no', 'provider has no credential'],stages=0\", \"grok-4.5:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider has no credential'],needles=['provider has no', 'provider has no credential'],stages=0\", \"grok-4.6:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider has no credential'],needles=['provider has no', 'provider has no credential'],stages=0\", \"grok-build-0.1:selected=False,refused=True,visible=True,placeholder_index=None,reasons=['provider has no credential'],needles=['provider has no', 'provider has no credential'],stages=0\", 'shared-alpha:selected=True,refused=False,visible=True,placeholder_index=None,reasons=[],needles=[],stages=1', 'shared-beta:selected=True,refused=False,visible=True,placeholder_index=None,reasons=[],needles=[],stages=1', 'unique-1:selected=True,refused=False,visible=True,placeholder_index=None,reasons=[],needles=[],stages=1', 'unique-2:selected=True,refused=False,visible=True,placeholder_index=None,reasons=[],needles=[],stages=1', 'unique-3:selected=True,refused=False,visible=True,placeholder_index=None,reasons=[],needles=[],stages=1', 'unique-4:selected=True,refused=False,visible=True,placeholder_index=None,reasons=[],needles=[],stages=1', 'unique-5:selected=True,refused=False,visible=True,placeholder_index=None,reasons=[],needles=[],stages=1', 'unique-6:selected=True,refused=False,visible=True,placeholder_index=None,reasons=[],needles=[],stages=1', 'unique-7:selected=True,refused=False,visible=True,placeholder_index=None,reasons=[],needles=[],stages=1', 'unique-8:selected=True,refused=False,visible=True,placeholder_index=None,reasons=[],needles=[],stages=1', 'anthropic-oauth/oauth-shared:selected=True,refused=False,visible=True,placeholder_index=None,reasons=[],needles=[],stages=0', 'openai-oauth/oauth-shared:selected=True,refused=False,visible=True,placeholder_index=None,reasons=[],needles=[],stages=0', \"anthropic/\u2014:selected=False,refused=True,visible=True,placeholder_index=1,reasons=['provider model inventory is unavailable'],needles=['provider model inventory', 'provider model inventory is unavailable'],stages=0\", \"gemini/\u2014:selected=False,refused=True,visible=True,placeholder_index=0,reasons=['provider model inventory is unavailable'],needles=['provider model inventory', 'provider model inventory is unavailable'],stages=0\", \"google-antigravity/\u2014:selected=False,refused=True,visible=True,placeholder_index=0,reasons=['provider model inventory is unavailable'],needles=['provider model inventory', 'provider model inventory is unavailable'],stages=0\", \"grok-oauth/\u2014:selected=False,refused=True,visible=True,placeholder_index=0,reasons=['provider model inventory is unavailable'],needles=['provider model inventory', 'provider model inventory is unavailable'],stages=0\", \"kimi-oauth/\u2014:selected=False,refused=True,visible=True,placeholder_index=0,reasons=['provider model inventory is unavailable'],needles=['provider model inventory', 'provider model inventory is unavailable'],stages=0\", \"openai/\u2014:selected=False,refused=True,visible=True,placeholder_index=1,reasons=['provider model inventory is unavailable'],needles=['provider model inventory', 'provider model inventory is unavailable'],stages=0\"] daemon_transport=haiderd: ephemeral-lifecycle event=connection_retired reason=error attached_clients=1 error_class=io raw_os_error=Some(57)",
+      "artefacts": []
+    },
+    {
+      "label": "no_orphan_daemons",
+      "status": "PASS",
+      "evidence_line": "no_orphan_daemons pids=72480 stop=stopped_cleanly alive_after=false",
+      "artefacts": []
+    }
+  ],
+  "wall_ms": 299324,
+  "artefacts": [],
+  "timed": false,
+  "measurement_accepted": null,
+  "budget": {
+    "total_ms": 3149500,
+    "parts": [
+      {
+        "name": "daemon startup deadline",
+        "milliseconds": 30000,
+        "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "daemon stop timeout",
+        "milliseconds": 20000,
+        "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+      },
+      {
+        "name": "post-stop process-exit observation grace",
+        "milliseconds": 2000,
+        "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+      },
+      {
+        "name": "post-stop process-exit observation grace",
+        "milliseconds": 2000,
+        "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+      }
+    ]
+  },
+  "segments": 1,
+  "turns_expected": 0,
+  "expected_fail_until": null
+}

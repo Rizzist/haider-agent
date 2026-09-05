@@ -85,6 +85,8 @@ const HANDOFF_IGNORE: &[u8] = b"*";
 
 #[derive(Clone)]
 pub(crate) struct DelegationHandle {
+    #[cfg(test)]
+    establishment_fault: bool,
     hub: SessionHub,
     stall_deadline: Duration,
     run_wait_timeout: Duration,
@@ -248,8 +250,57 @@ pub(crate) struct EstablishedSpawn {
 }
 
 impl DelegationHandle {
+    #[cfg(test)]
+    pub(crate) fn fail_after_establishment_row(hub: SessionHub) -> Self {
+        Self {
+            establishment_fault: true,
+            ..Self::new(hub)
+        }
+    }
+    async fn public_headless_parent(
+        &self,
+        coordinates: &SpawnCoordinates,
+    ) -> Result<(bool, bool), HaiderError> {
+        let inherited = self
+            .hub
+            .delegation_for_child_session(coordinates.parent_session_id.clone())
+            .await?
+            .and_then(|parent| parent.manifest.coordinates)
+            .as_ref()
+            .and_then(|value| value.get("public_headless"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let mut cursor = 0;
+        loop {
+            let page = self
+                .hub
+                .read_internal_session(&coordinates.parent_session_id, cursor, 256)
+                .await?;
+            if page.is_empty() {
+                return Ok((inherited, false));
+            }
+            for event in page {
+                cursor = event.seq;
+                if event.run_id.as_ref() == Some(&coordinates.parent_run_id)
+                    && let Some(
+                        haider_protocol::headless::HeadlessRunEventPayload::HeadlessRunConfigured(
+                            spec,
+                        ),
+                    ) = haider_protocol::headless::HeadlessRunEventPayload::from_payload_value(
+                        &event.payload,
+                    )
+                    && spec.agent_spawn.is_some()
+                {
+                    return Ok((true, true));
+                }
+            }
+        }
+    }
+
     pub(crate) fn new(hub: SessionHub) -> Self {
         Self {
+            #[cfg(test)]
+            establishment_fault: false,
             hub,
             stall_deadline: CHILD_STALL_DEADLINE,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
@@ -262,6 +313,8 @@ impl DelegationHandle {
     #[cfg(all(test, unix))]
     pub(crate) fn with_stall_deadline(hub: SessionHub, stall_deadline: Duration) -> Self {
         Self {
+            #[cfg(test)]
+            establishment_fault: false,
             hub,
             stall_deadline,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
@@ -277,6 +330,8 @@ impl DelegationHandle {
         stall_deadline_clock: Arc<StallDeadlineTestClock>,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            establishment_fault: false,
             hub,
             stall_deadline,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
@@ -291,6 +346,8 @@ impl DelegationHandle {
         settlement_tail_timeout: Duration,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            establishment_fault: false,
             hub,
             stall_deadline: CHILD_STALL_DEADLINE,
             run_wait_timeout: CHILD_RUN_WAIT_TIMEOUT,
@@ -308,6 +365,8 @@ impl DelegationHandle {
         settlement_tail_timeout: Duration,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            establishment_fault: false,
             hub,
             stall_deadline,
             run_wait_timeout,
@@ -383,6 +442,8 @@ impl DelegationHandle {
         coordinates: SpawnCoordinates,
         request: SpawnSubagent,
     ) -> Result<EstablishedSpawn, HaiderError> {
+        let (public_headless, direct_operator_spawn) =
+            self.public_headless_parent(&coordinates).await?;
         let ancestry = self
             .spawn_ancestry(
                 &coordinates.parent_session_id,
@@ -411,6 +472,11 @@ impl DelegationHandle {
         let child_run_id = RunId::new(format!("run-child-{identity}"));
         let lease = LeaseId::new(format!("lease-child-{identity}"));
         let callsign = callsign_from_identity(&identity);
+        let existing_public_spawn = if direct_operator_spawn {
+            self.hub.delegation(agent_id.clone()).await?
+        } else {
+            None
+        };
         let registered_workflow = match request.workflow.as_ref() {
             Some(haider_protocol::graph::ChildWorkflowSelector::WorkflowRef(name))
                 if graph_template(name).is_none() =>
@@ -419,12 +485,72 @@ impl DelegationHandle {
             }
             _ => None,
         };
-        let decision = decide_child_workflow_with_registry(
+        let public_catalog_ref = direct_operator_spawn
+            && matches!(request.workflow.as_ref(),
+            Some(haider_protocol::graph::ChildWorkflowSelector::WorkflowRef(name)) if graph_template(name).is_some());
+        let mut decision = decide_child_workflow_with_registry(
             request.workflow.as_ref(),
             request.workflow_trigger,
             request.workflow_author,
-            registered_workflow.is_some(),
+            registered_workflow.is_some() || public_catalog_ref,
         );
+        if public_catalog_ref && decision.reason == "registered_loom_workflow_ref" {
+            decision.reason = "public_builtin_workflow_ref".into();
+        }
+        if direct_operator_spawn
+            && request.workflow.as_ref().is_some_and(|workflow| {
+                !matches!(
+                    workflow,
+                    haider_protocol::graph::ChildWorkflowSelector::Plain
+                )
+            })
+            && decision.template.is_none()
+        {
+            return Err(workflow_rejection(
+                "workflow_not_selected",
+                decision.reason.clone(),
+            ));
+        }
+        // A public workflow is itself the requested operation. It has no
+        // parent evidence slot to attest; ordinary delegated workflows keep
+        // the existing parent-contract requirement below.
+        let standalone_workflow = if direct_operator_spawn && request.parent_slot.is_none() {
+            decision
+                .template
+                .as_ref()
+                .map(|name| {
+                    graph_template(name)
+                        .or_else(|| {
+                            registered_workflow
+                                .as_ref()
+                                .map(|workflow| workflow.template.clone())
+                        })
+                        .ok_or_else(|| {
+                            workflow_rejection(
+                                "unknown_child_workflow",
+                                format!("unknown workflow {name}"),
+                            )
+                        })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        if let Some(template) = standalone_workflow.as_ref() {
+            validate_graph_template(template).map_err(|error| {
+                workflow_rejection("malformed_child_workflow", error.to_string())
+            })?;
+            if template
+                .nodes
+                .iter()
+                .any(|node| matches!(node.gate, GraphGateKind::HumanConfirm))
+            {
+                return Err(workflow_rejection(
+                    "child_human_gate_forbidden",
+                    "public workflows cannot contain a human-confirm gate",
+                ));
+            }
+        }
         let mut requested_grant = crate::worker::default_child_grant();
         // B3 — a typed child starts from its TYPE's grant, intersected with
         // the ordinary child ceiling (never wider than an untyped child).
@@ -434,8 +560,10 @@ impl DelegationHandle {
                 &requested_grant,
             );
         }
-        let mut workflow = self
-            .prepare_child_workflow(
+        let mut workflow = if standalone_workflow.is_some() {
+            None
+        } else {
+            self.prepare_child_workflow(
                 &coordinates,
                 &request,
                 &decision,
@@ -445,8 +573,9 @@ impl DelegationHandle {
                 &requested_grant,
                 registered_workflow.as_ref(),
             )
-            .await?;
-        if workflow.is_some() {
+            .await?
+        };
+        if workflow.is_some() || standalone_workflow.is_some() {
             if !requested_grant
                 .tools
                 .iter()
@@ -468,6 +597,13 @@ impl DelegationHandle {
             None => requested_grant,
         };
         crate::worker::validate_grant(&grant)?;
+        if standalone_workflow.is_some() && !grant.tools.iter().any(|tool| tool == "graph_evidence")
+        {
+            return Err(workflow_rejection(
+                "insufficient_child_workflow_grant",
+                "effective child grant withholds graph_evidence required by its workflow",
+            ));
+        }
         if let Some(attached) = workflow.as_mut() {
             if !grant.tools.iter().any(|tool| tool == "graph_evidence") {
                 return Err(workflow_rejection(
@@ -525,6 +661,12 @@ impl DelegationHandle {
             "lockdown": child_lockdown,
             "auto_hermetic": coordinates.auto_hermetic,
         });
+        if public_headless {
+            manifest_coordinates["public_headless"] = serde_json::Value::Bool(true);
+        }
+        if direct_operator_spawn {
+            manifest_coordinates["public_operator_spawn"] = serde_json::Value::Bool(true);
+        }
         if let Some(attached) = &workflow {
             manifest_coordinates["child_graph"] =
                 serde_json::to_value(attached).map_err(internal_serialization)?;
@@ -553,7 +695,11 @@ impl DelegationHandle {
             budget_tokens: Some(coordinates.metadata.max_tokens),
             placement: Placement::Local,
             lease,
-            fencing_epoch: self.hub.worker_generation(),
+            fencing_epoch: existing_public_spawn
+                .as_ref()
+                .map_or(self.hub.worker_generation(), |record| {
+                    record.manifest.fencing_epoch
+                }),
             attempt: 0,
             parent: coordinates.parent_agent_id.clone(),
             coordinates: Some(manifest_coordinates),
@@ -566,11 +712,10 @@ impl DelegationHandle {
                 .map(|record| record.clis.clone()),
         };
         manifest.placement.ensure_local()?;
-        // Delegated request_input is answered through the projected parent
-        // menu, so the child retains the ordinary Interactive wait until that
-        // durable answer is forwarded. A headless parent's Autonomous rule is
-        // projected separately into the child's permission-only override;
-        // explicit grant ceilings still bound reachable tool authority.
+        // Ordinary delegated request_input is answered through the projected
+        // parent menu. Public CLI descendants carry an explicit durable
+        // no-human marker and instead resolve request_input autonomously.
+        // Explicit grant ceilings still bound reachable tool authority.
         let child_overrides = Some(haider_protocol::session::SessionPermissionOverridesV1 {
             read_only: coordinates
                 .metadata
@@ -586,8 +731,11 @@ impl DelegationHandle {
                     .permission_overrides
                     .is_some_and(|overrides| overrides.auto_allow),
         });
-        let child_interaction_mode =
-            haider_protocol::session::SessionInteractionModeV1::Interactive;
+        let child_interaction_mode = if public_headless {
+            haider_protocol::session::SessionInteractionModeV1::Autonomous
+        } else {
+            haider_protocol::session::SessionInteractionModeV1::Interactive
+        };
         let create_json = serde_json::to_string(&serde_json::json!({
             "cwd": coordinates.metadata.cwd,
             "provider": coordinates.metadata.provider,
@@ -628,6 +776,27 @@ impl DelegationHandle {
             )
             .await?;
 
+        if let Some(template) = standalone_workflow.as_ref() {
+            let graph_id = GraphId::new(format!("graph-child-{identity}"));
+            let expected_digest = graph_template_digest(template);
+            let request_json = serde_json::json!({"session_id":child_session_id,"graph_id":graph_id,"template":template.name,"expected_digest":expected_digest}).to_string();
+            self.hub
+                .pin_graph_matching_digest(
+                    GraphPinCommand {
+                        command_id: format!("delegation-graph-pin-{identity}"),
+                        request_digest: digest_bytes(request_json.as_bytes()),
+                        request_json,
+                        session_id: child_session_id.clone(),
+                        worker_generation: self.hub.worker_generation(),
+                        graph_id,
+                        template: template.name.clone(),
+                        device_id: self.hub.device_id(),
+                    },
+                    expected_digest,
+                )
+                .await
+                .map_err(hub_graph_error)?;
+        }
         if let Some(attached) = workflow.as_ref() {
             let pin_request = serde_json::to_string(&serde_json::json!({
                 "session_id": attached.child_session_id,
@@ -688,6 +857,14 @@ impl DelegationHandle {
             DelegationCreateOutcome::Committed(record)
             | DelegationCreateOutcome::IdempotentReplay(record) => record,
         };
+        #[cfg(test)]
+        if self.establishment_fault {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "injected crash after delegation row",
+                false,
+            ));
+        }
         let manifest = record.manifest.clone();
         let persisted_lockdown = manifest
             .coordinates
@@ -743,16 +920,23 @@ impl DelegationHandle {
             "Delegated task: {}\n\n{}\n\nReturn a concise final report for the parent agent.",
             record.task, record.prompt
         );
-        let turn_json = serde_json::to_string(&serde_json::json!({
+        let mut turn_value = serde_json::json!({
             "session_id": record.child_session_id,
             "worker_generation": self.hub.worker_generation(),
             "text": turn_text,
             "attachments": [],
             "mode": DeliveryMode::Steer,
             "delegation_agent": record.agent_id,
-        }))
-        .map_err(internal_serialization)?;
-        let accepted = self
+        });
+        if direct_operator_spawn {
+            // Generation is an admission fence, not operator semantics. A
+            // crash before broker outcome replays this same child acceptance.
+            if let Some(fields) = turn_value.as_object_mut() {
+                fields.remove("worker_generation");
+            }
+        }
+        let turn_json = serde_json::to_string(&turn_value).map_err(internal_serialization)?;
+        let mut accepted = self
             .hub
             .accept_internal_turn(TurnAcceptCommand {
                 command_id: format!("delegation-turn-{identity}"),
@@ -772,6 +956,9 @@ impl DelegationHandle {
                 device_id: self.hub.device_id(),
             })
             .await?;
+        if direct_operator_spawn {
+            accepted.worker_generation = self.hub.worker_generation();
+        }
         Ok(EstablishedSpawn {
             ticket: DeferredTicket {
                 id: agent_id.as_str().to_owned(),

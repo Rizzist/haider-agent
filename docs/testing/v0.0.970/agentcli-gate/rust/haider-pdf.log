@@ -1,0 +1,36 @@
+   Compiling getrandom v0.4.3
+   Compiling aes v0.8.4
+   Compiling rand v0.10.2
+   Compiling lopdf v0.42.0
+   Compiling pdf-extract v0.12.0
+   Compiling haider-pdf v0.0.969 ($WORKTREE/crates/haider-pdf)
+    Finished `test` profile [unoptimized] target(s) in 3.27s
+     Running unittests src/lib.rs ($AGENTCLI_TARGET/debug/deps/haider_pdf-047d54ea2e48c03f)
+
+running 10 tests
+test tests::image_only_and_encrypted_pdfs_fail_actionably ... ok
+test tests::malformed_non_pdf_is_rejected ... ok
+test tests::numeric_comments_between_objects_do_not_hide_later_pages ... ok
+test tests::page_tree_order_and_text_operators_are_extracted ... ok
+test tests::per_page_bound_emits_the_exact_honest_marker ... ok
+test tests::range_backed_object_bodies_equal_the_legacy_copies ... ok
+test tests::aggregate_bound_emits_the_exact_honest_marker ... ok
+test tests::streamed_backend_trimming_matches_reference_for_huge_unicode_whitespace ... ok
+test tests::every_daemon_mapped_error_kind_has_a_corpus_witness ... ok
+test tests::corpus_outcomes_match_the_preconvergence_baseline ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.21s
+
+     Running tests/probe_real_world.rs ($AGENTCLI_TARGET/debug/deps/probe_real_world-92cee75a2a18f05d)
+
+running 1 test
+test probe_real_world_pdf ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests haider_pdf
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -52,8 +52,29 @@ impl RunBudgetV1 {
 }
 
 /// Fully resolved execution settings pinned to an accepted headless run.
+/// One operator-authored delegation, executed without a parent model request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSpawnSpecV1 {
+    pub task: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_trigger: Option<String>,
+}
+
+/// Fully resolved execution settings pinned to an accepted headless run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadlessRunSpecV1 {
+    /// Requires `agent_cli_v1`; omission preserves the ordinary model turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_spawn: Option<AgentSpawnSpecV1>,
     /// Canonical workspace used to create the autonomous session.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cwd: String,

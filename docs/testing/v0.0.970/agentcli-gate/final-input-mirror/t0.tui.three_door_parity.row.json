@@ -1,0 +1,701 @@
+{
+  "id": "t0.tui.three_door_parity",
+  "area": "tui",
+  "status": "PASS",
+  "evidence": [
+    {
+      "label": "model",
+      "status": "PASS",
+      "evidence_line": "model receipt_kind=session.select_model palette=['session.seen', 'session.select_model'] typed=['session.seen', 'session.select_model'] rpc=['session.select_model'] sqlite_truth=palette:true,typed:true,rpc:true authoritative_projection=session.list projection_truth=palette:true,typed:true,rpc:true projection_actual=palette:'claude-opus-4-8',typed:'claude-opus-4-8',rpc:'claude-opus-4-8' receipt_rows=palette:[{'method': 'session.seen', 'state': 'committed', 'response': {'session_id': 'session-a57b18aaa4c152353bde02326fcff012', 'seen_at_ms': 1788619077090, 'seen_seq': 2, 'worker_generation': 1}, 'accepted_seq': 2, 'final_revision': None}, {'method': 'session.select_model', 'state': 'committed', 'response': {'session_id': 'session-a57b18aaa4c152353bde02326fcff012', 'provider': 'anthropic', 'model': 'claude-opus-4-8', 'selected_seq': 3, 'worker_generation': 1}, 'accepted_seq': 3, 'final_revision': None}],typed:[{'method': 'session.seen', 'state': 'committed', 'response': {'session_id': 'session-f9557707b1a9b7273550ebd1532afa8e', 'seen_at_ms': 1788619084600, 'seen_seq': 2, 'worker_generation': 1}, 'accepted_seq': 2, 'final_revision': None}, {'method': 'session.select_model', 'state': 'committed', 'response': {'session_id': 'session-f9557707b1a9b7273550ebd1532afa8e', 'provider': 'anthropic', 'model': 'claude-opus-4-8', 'selected_seq': 3, 'worker_generation': 1}, 'accepted_seq': 3, 'final_revision': None}],rpc:[{'method': 'session.select_model', 'state': 'committed', 'response': {'session_id': 'session-9aaba6ebf14cc25d88da89e0b29b9a96', 'provider': 'anthropic', 'model': 'claude-opus-4-8', 'selected_seq': 2, 'worker_generation': 1}, 'accepted_seq': 2, 'final_revision': None}] rpc_outcome='receipt'",
+      "artefacts": []
+    },
+    {
+      "label": "effort",
+      "status": "PASS",
+      "evidence_line": "effort receipt_kind=session.select_effort palette=['session.seen', 'session.select_effort'] typed=['session.seen', 'session.select_effort'] rpc=['session.select_effort'] sqlite_truth=palette:true,typed:true,rpc:true authoritative_projection=session.list projection_truth=palette:true,typed:true,rpc:true projection_actual=palette:'xhigh',typed:'xhigh',rpc:'xhigh' receipt_rows=palette:[{'method': 'session.seen', 'state': 'committed', 'response': {'session_id': 'session-56d65a4ee5a8c243a569ac16b4e5d7ee', 'seen_at_ms': 1788619092277, 'seen_seq': 2, 'worker_generation': 1}, 'accepted_seq': 2, 'final_revision': None}, {'method': 'session.select_effort', 'state': 'committed', 'response': {'session_id': 'session-56d65a4ee5a8c243a569ac16b4e5d7ee', 'effort': 'xhigh', 'selected_seq': 3, 'worker_generation': 1}, 'accepted_seq': 3, 'final_revision': None}],typed:[{'method': 'session.seen', 'state': 'committed', 'response': {'session_id': 'session-56f1e7d2c67528613e184ecc579671cc', 'seen_at_ms': 1788619098753, 'seen_seq': 2, 'worker_generation': 1}, 'accepted_seq': 2, 'final_revision': None}, {'method': 'session.select_effort', 'state': 'committed', 'response': {'session_id': 'session-56f1e7d2c67528613e184ecc579671cc', 'effort': 'xhigh', 'selected_seq': 3, 'worker_generation': 1}, 'accepted_seq': 3, 'final_revision': None}],rpc:[{'method': 'session.select_effort', 'state': 'committed', 'response': {'session_id': 'session-a31c61979a5f9d25643ada1468e5c483', 'effort': 'xhigh', 'selected_seq': 2, 'worker_generation': 1}, 'accepted_seq': 2, 'final_revision': None}] rpc_outcome='receipt'",
+      "artefacts": []
+    },
+    {
+      "label": "fast",
+      "status": "PASS",
+      "evidence_line": "fast receipt_kind=session.select_fast palette=['session.seen', 'session.select_fast'] typed=['session.seen', 'session.select_fast'] rpc=['session.select_fast'] sqlite_truth=palette:true,typed:true,rpc:true authoritative_projection=session.list projection_truth=palette:true,typed:true,rpc:true projection_actual=palette:True,typed:True,rpc:True receipt_rows=palette:[{'method': 'session.seen', 'state': 'committed', 'response': {'session_id': 'session-1cf3934d3ace15bfb882793076da4600', 'seen_at_ms': 1788619105383, 'seen_seq': 2, 'worker_generation': 1}, 'accepted_seq': 2, 'final_revision': None}, {'method': 'session.select_fast', 'state': 'committed', 'response': {'session_id': 'session-1cf3934d3ace15bfb882793076da4600', 'enabled': True, 'selected_seq': 3, 'worker_generation': 1}, 'accepted_seq': 3, 'final_revision': None}],typed:[{'method': 'session.seen', 'state': 'committed', 'response': {'session_id': 'session-591271d9a31deefc0cb7a935859c74c4', 'seen_at_ms': 1788619111430, 'seen_seq': 2, 'worker_generation': 1}, 'accepted_seq': 2, 'final_revision': None}, {'method': 'session.select_fast', 'state': 'committed', 'response': {'session_id': 'session-591271d9a31deefc0cb7a935859c74c4', 'enabled': True, 'selected_seq': 3, 'worker_generation': 1}, 'accepted_seq': 3, 'final_revision': None}],rpc:[{'method': 'session.select_fast', 'state': 'committed', 'response': {'session_id': 'session-964ea6c8a72346a1d2a8aa293a149d36', 'enabled': True, 'selected_seq': 2, 'worker_generation': 1}, 'accepted_seq': 2, 'final_revision': None}] rpc_outcome='receipt'",
+      "artefacts": []
+    },
+    {
+      "label": "rename",
+      "status": "PASS",
+      "evidence_line": "rename receipt_kind=session.rename palette=['session.seen', 'session.rename'] typed=['session.seen', 'session.rename'] rpc=['session.rename'] sqlite_truth=palette:true,typed:true,rpc:true authoritative_projection=session.list projection_truth=palette:true,typed:true,rpc:true projection_actual=palette:'QA parity title',typed:'QA parity title',rpc:'QA parity title' receipt_rows=palette:[{'method': 'session.seen', 'state': 'committed', 'response': {'session_id': 'session-de788e2642b26a6b5de3ed93f7b0605c', 'seen_at_ms': 1788619117620, 'seen_seq': 2, 'worker_generation': 1}, 'accepted_seq': 2, 'final_revision': None}, {'method': 'session.rename', 'state': 'committed', 'response': {'session_id': 'session-de788e2642b26a6b5de3ed93f7b0605c', 'title': 'QA parity title', 'renamed_seq': 3, 'worker_generation': 1}, 'accepted_seq': 3, 'final_revision': None}],typed:[{'method': 'session.seen', 'state': 'committed', 'response': {'session_id': 'session-c681ae89c0f7b94ada5f2e4f9649e792', 'seen_at_ms': 1788619124778, 'seen_seq': 2, 'worker_generation': 1}, 'accepted_seq': 2, 'final_revision': None}, {'method': 'session.rename', 'state': 'committed', 'response': {'session_id': 'session-c681ae89c0f7b94ada5f2e4f9649e792', 'title': 'QA parity title', 'renamed_seq': 3, 'worker_generation': 1}, 'accepted_seq': 3, 'final_revision': None}],rpc:[{'method': 'session.rename', 'state': 'committed', 'response': {'session_id': 'session-29c87a82a86bfa744cdf201de02a1258', 'title': 'QA parity title', 'renamed_seq': 2, 'worker_generation': 1}, 'accepted_seq': 2, 'final_revision': None}] rpc_outcome='receipt'",
+      "artefacts": []
+    },
+    {
+      "label": "compact",
+      "status": "PASS",
+      "evidence_line": "compact receipt_kind=session.compact palette=['session.seen', 'turn.submit', 'session.compact'] typed=['session.seen', 'turn.submit', 'session.compact'] rpc=['session.seen', 'turn.submit', 'session.compact'] sqlite_truth=palette:true,typed:true,rpc:true authoritative_projection=session_json_event_tail projection_truth=palette:true,typed:true,rpc:true projection_actual=palette:['run_state', 'session_state', 'item', 'item', 'run_state', 'item', 'item', 'item', 'item', 'item', 'item', 'item', 'node_committed', 'item', 'item', 'item', 'item', 'context_compaction', 'run_state', 'session_state'],typed:['run_state', 'session_state', 'item', 'item', 'run_state', 'item', 'item', 'item', 'item', 'item', 'item', 'item', 'node_committed', 'item', 'item', 'item', 'item', 'context_compaction', 'run_state', 'session_state'],rpc:['run_state', 'session_state', 'item', 'item', 'run_state', 'item', 'item', 'item', 'item', 'item', 'item', 'item', 'node_committed', 'item', 'item', 'item', 'item', 'context_compaction', 'run_state', 'session_state'] receipt_rows=palette:[{'method': 'session.seen', 'state': 'committed', 'response': {'session_id': 'session-c58d62cddda8449a37b8fcdc76da55cc', 'seen_at_ms': 1788619132126, 'seen_seq': 2, 'worker_generation': 1}, 'accepted_seq': 2, 'final_revision': None}, {'method': 'turn.submit', 'state': 'committed', 'response': {'session_id': 'session-c58d62cddda8449a37b8fcdc76da55cc', 'run_id': 'run-dd85460712d151b3225312bc84fab0fa', 'turn_ordinal': 1, 'accepted_seq': 4, 'worker_generation': 1, 'disposition': 'started', 'first_user_turn': True}, 'accepted_seq': 4, 'final_revision': None}, {'method': 'session.compact', 'state': 'committed', 'response': {'session_id': 'session-c58d62cddda8449a37b8fcdc76da55cc', 'run_id': 'manual-compact-tui-83948-1788619132025796000-3', 'accepted_seq': 25, 'worker_generation': 1}, 'accepted_seq': 25, 'final_revision': None}],typed:[{'method': 'session.seen', 'state': 'committed', 'response': {'session_id': 'session-a49e37f8befefc79c8abe9b2384ec093', 'seen_at_ms': 1788619139883, 'seen_seq': 2, 'worker_generation': 1}, 'accepted_seq': 2, 'final_revision': None}, {'method': 'turn.submit', 'state': 'committed', 'response': {'session_id': 'session-a49e37f8befefc79c8abe9b2384ec093', 'run_id': 'run-6033cad734a5a26675a47c21b4d21c1b', 'turn_ordinal': 1, 'accepted_seq': 4, 'worker_generation': 1, 'disposition': 'started', 'first_user_turn': True}, 'accepted_seq': 4, 'final_revision': None}, {'method': 'session.compact', 'state': 'committed', 'response': {'session_id': 'session-a49e37f8befefc79c8abe9b2384ec093', 'run_id': 'manual-compact-tui-84741-1788619139815869000-3', 'accepted_seq': 25, 'worker_generation': 1}, 'accepted_seq': 25, 'final_revision': None}],rpc:[{'method': 'session.seen', 'state': 'committed', 'response': {'session_id': 'session-eca5f5f2fca30efd1e44a7cef2f41b40', 'seen_at_ms': 1788619147606, 'seen_seq': 2, 'worker_generation': 1}, 'accepted_seq': 2, 'final_revision': None}, {'method': 'turn.submit', 'state': 'committed', 'response': {'session_id': 'session-eca5f5f2fca30efd1e44a7cef2f41b40', 'run_id': 'run-88982e05311cd79210e242cc9a17a596', 'turn_ordinal': 1, 'accepted_seq': 4, 'worker_generation': 1, 'disposition': 'started', 'first_user_turn': True}, 'accepted_seq': 4, 'final_revision': None}, {'method': 'session.compact', 'state': 'committed', 'response': {'session_id': 'session-eca5f5f2fca30efd1e44a7cef2f41b40', 'run_id': 'manual-compact-qa-parity-compact-15', 'accepted_seq': 25, 'worker_generation': 1}, 'accepted_seq': 25, 'final_revision': None}] rpc_outcome='receipt'",
+      "artefacts": []
+    },
+    {
+      "label": "rpc_client_owned_zero_mutation",
+      "status": "PASS",
+      "evidence_line": "client_owned_count=36 wrong_outcomes=[] daemon_mutation_rows=false",
+      "artefacts": []
+    },
+    {
+      "label": "no_orphan_daemons",
+      "status": "PASS",
+      "evidence_line": "no_orphan_daemons pids=83326 stop=stopped_cleanly alive_after=false",
+      "artefacts": []
+    }
+  ],
+  "wall_ms": 74582,
+  "artefacts": [],
+  "timed": false,
+  "measurement_accepted": null,
+  "budget": {
+    "total_ms": 5332500,
+    "parts": [
+      {
+        "name": "daemon startup deadline",
+        "milliseconds": 30000,
+        "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "daemon stop timeout",
+        "milliseconds": 20000,
+        "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+      },
+      {
+        "name": "post-stop process-exit observation grace",
+        "milliseconds": 2000,
+        "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+      },
+      {
+        "name": "post-stop process-exit observation grace",
+        "milliseconds": 2000,
+        "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+      }
+    ]
+  },
+  "segments": 6,
+  "turns_expected": 6,
+  "expected_fail_until": null
+}

@@ -114,6 +114,13 @@ restricted to an exact trusted PID. The harness never uses `pgrep` or
 
 ## T0 checks
 
+- `t0.agent.spawn_result` runs public `agent spawn` followed by `agent wait`
+  against one finite fake-provider child segment. It requires distinct parent
+  and child session/run identities, a correlated successful child terminal,
+  positive durable terminal and ChildResult sequences, and the exact child
+  report nonce. Its 288-second BudgetSum covers both command bounds and the
+  runner's mandatory status-owned no-orphan cleanup. It reports correctness
+  without publishing a timing measurement.
 - `t0.run.jsonl_contract` runs `haider run -p x --provider fake --model
   fake-model --output jsonl --timeout 30s`. It requires first-line acceptance,
   a non-empty session, `head_seq == first envelope seq`, contiguous later

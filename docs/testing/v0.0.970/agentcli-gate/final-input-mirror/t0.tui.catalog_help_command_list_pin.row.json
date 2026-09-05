@@ -1,0 +1,86 @@
+{
+  "id": "t0.tui.catalog_help_command_list_pin",
+  "area": "tui",
+  "status": "PASS",
+  "evidence": [
+    {
+      "label": "rendered_help_equals_command_list",
+      "status": "PASS",
+      "evidence_line": "authority=command.list built_in_count=42 rendered_help_count=41 self_command_excluded=help missing_from_help=[] extra_in_help=[] rpc_duplicates=[] invalid_rpc_rows=[] help_opened=true panel_captured=true alt_enter=1 alt_leave=1 panic_free=true exit_clean=true",
+      "artefacts": []
+    },
+    {
+      "label": "no_orphan_daemons",
+      "status": "PASS",
+      "evidence_line": "no_orphan_daemons pids=72193 stop=stopped_cleanly alive_after=false",
+      "artefacts": []
+    }
+  ],
+  "wall_ms": 2979,
+  "artefacts": [],
+  "timed": false,
+  "measurement_accepted": null,
+  "budget": {
+    "total_ms": 277500,
+    "parts": [
+      {
+        "name": "daemon startup deadline",
+        "milliseconds": 30000,
+        "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "live TUI alternate-screen boot",
+        "milliseconds": 25000,
+        "source": "scripts/tui-probes/pty-probe-live.py:177-184 boot deadline"
+      },
+      {
+        "name": "palette action observation",
+        "milliseconds": 12000,
+        "source": "scripts/tui-probes/pty-probe-live.py:186-191 bounded visible-state wait"
+      },
+      {
+        "name": "two pinned full repaints",
+        "milliseconds": 4000,
+        "source": "scripts/tui-probes/pty-probe-live.py:221-237 resize repaint (2s each) \u00d7 2 sizes"
+      },
+      {
+        "name": "clean PTY child exit",
+        "milliseconds": 2500,
+        "source": "scripts/tui-probes/probelib.py:154-178 reap deadline"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "daemon stop timeout",
+        "milliseconds": 20000,
+        "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+      },
+      {
+        "name": "post-stop process-exit observation grace",
+        "milliseconds": 2000,
+        "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+      },
+      {
+        "name": "post-stop process-exit observation grace",
+        "milliseconds": 2000,
+        "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+      }
+    ]
+  },
+  "segments": 1,
+  "turns_expected": 0,
+  "expected_fail_until": "0.0.968"
+}

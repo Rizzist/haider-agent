@@ -1,0 +1,264 @@
+   Compiling haider-rpc v0.0.969 ($WORKTREE/crates/haider-rpc)
+    Finished `test` profile [unoptimized] target(s) in 25.36s
+     Running unittests src/lib.rs ($AGENTCLI_TARGET/debug/deps/haider_rpc-d4152208ec995fbe)
+
+running 3 tests
+test binary_artifact::tests::binary_artifact_rejects_unnegotiated_oversized_and_invalid_bodies ... ok
+test binary_artifact::tests::binary_artifact_partial_frame_does_not_deliver_and_debug_redacts ... ok
+test binary_artifact::tests::binary_artifact_roundtrips_at_every_split_in_both_encodings ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/agent_cli_feature_tests.rs ($AGENTCLI_TARGET/debug/deps/agent_cli_feature_tests-3c9b9adf9f8e34b3)
+
+running 1 test
+test operator_spawn_requires_feature_while_legacy_headless_shape_is_unchanged ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/automation_contract_doc_tests.rs ($AGENTCLI_TARGET/debug/deps/automation_contract_doc_tests-5ac214ea851303bc)
+
+running 1 test
+test every_automation_contract_json_example_decodes_and_matches_a_golden ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/command_door_tests.rs ($AGENTCLI_TARGET/debug/deps/command_door_tests-927f3f18b3ae76f1)
+
+running 6 tests
+test future_command_kinds_decode_as_unknown_without_action_semantics ... ok
+test every_advertised_daemon_operation_has_a_command_door_route ... ok
+test help_is_explicitly_client_owned ... ok
+test launcher_argument_queries_hide_session_only_operations ... ok
+test command_catalog_reflects_session_context_and_dynamic_slots ... ok
+test command_door_request_response_shapes_are_additive_and_golden ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/conformance_tests.rs ($AGENTCLI_TARGET/debug/deps/conformance_tests-51419d18f2435ec4)
+
+running 25 tests
+test loom_l4_feature_tokens_are_exact_and_independent ... ok
+test monitor_feature_is_pinned ... ok
+test msgpack_empty_and_oversize_decode_refusals_match_json_shapes ... ok
+test loom_registry_record_kind_is_unknown_tolerant ... ok
+test msgpack_malformed_body_has_a_typed_refusal ... ok
+test msgpack_round_trips_nested_json_value_on_both_transports ... ok
+test oauth_import_bodies_round_trip_and_feature_is_pinned ... ok
+test bounded_encoder_capacity_does_not_exceed_an_exact_frame_limit ... ok
+test msgpack_encoder_enforces_the_same_bounded_writer_limit_as_json ... ok
+test typed_agent_install_cancel_preserves_the_962_state_enum ... ok
+test typed_agent_install_status_round_trips_and_feature_is_pinned ... ok
+test typed_agent_install_control_receipts_and_watch_cursors_round_trip ... ok
+test uds_coalesced_frames_are_all_yielded ... ok
+test uds_accepts_a_frame_exactly_at_the_limit ... ok
+test uds_empty_frame_is_rejected_and_poisoned ... ok
+test uds_invalid_utf8_body_poisons_decoder ... ok
+test both_transports_use_identical_json_body_bytes ... ok
+test uds_delivery_and_terminal_error_are_invariant_at_every_split_point ... ok
+test uds_oversize_prefix_poisons_decoder_before_body_is_accepted ... ok
+test uds_valid_utf8_but_invalid_json_body_poisons_decoder ... ok
+test uds_split_length_prefix_is_buffered_without_body_allocation ... ok
+test ws_empty_message_is_rejected_as_an_empty_frame ... ok
+test ws_limit_is_checked_before_json_decode ... ok
+test uds_one_byte_drip_feed_yields_full_transcript ... ok
+test shared_transcript_is_parameterized_across_both_codecs ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/context_compaction_tests.rs ($AGENTCLI_TARGET/debug/deps/context_compaction_tests-733809f73a8b79ef)
+
+running 1 test
+test session_compact_request_and_response_are_additive_and_golden ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/context_footprint_tests.rs ($AGENTCLI_TARGET/debug/deps/context_footprint_tests-9b5c24770fb08a04)
+
+running 1 test
+test session_read_latest_context_footprint_is_additive_and_optional ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/graph_tests.rs ($AGENTCLI_TARGET/debug/deps/graph_tests-dacfd59231c043bd)
+
+running 5 tests
+test graph_status_terminal_variants_have_stable_typed_shapes ... ok
+test workflow_revision_conflict_is_typed_and_carries_current_authority ... ok
+test graph_request_and_response_family_has_exact_additive_wire_shapes ... ok
+test old_method_decoders_and_new_graph_decoders_remain_tolerant ... ok
+test workflow_catalog_is_additive_verbatim_and_unknown_origin_tolerant ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/model_details_tests.rs ($AGENTCLI_TARGET/debug/deps/model_details_tests-59cdc71799fcaa20)
+
+running 4 tests
+test provider_summary_without_model_details_decodes_an_empty_vector ... ok
+test provider_summary_model_details_round_trip_names_and_windows ... ok
+test provider_summary_transport_timeouts_preserve_typed_absence ... ok
+test provider_summary_inventory_fetch_time_and_authority_are_additive_and_pinned ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/negotiation_tests.rs ($AGENTCLI_TARGET/debug/deps/negotiation_tests-bd4f453b06982960)
+
+running 10 tests
+test negotiation_keeps_json_when_msgpack_is_offered_but_not_served ... ok
+test negotiation_keeps_json_when_msgpack_is_served_but_not_offered ... ok
+test negotiation_never_grants_unrequested_capabilities ... ok
+test negotiation_never_grants_the_unknown_capability_even_when_both_sides_list_it ... ok
+test negotiation_rejects_disjoint_protocol_ranges ... ok
+test negotiation_rejects_invalid_client_range ... ok
+test negotiation_rejects_invalid_server_range ... ok
+test negotiation_rejects_ranges_that_only_overlap_at_unimplemented_versions ... ok
+test negotiation_selects_implemented_overlap_and_capability_intersection ... ok
+test negotiation_selects_msgpack_only_when_offered_and_served ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/queue_control_tests.rs ($AGENTCLI_TARGET/debug/deps/queue_control_tests-b840ada363c7b479)
+
+running 2 tests
+test queue_delta_cannot_decode_without_its_revision ... ok
+test queue_feature_and_revision_bearing_delta_are_golden ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/resilience_feature_tests.rs ($AGENTCLI_TARGET/debug/deps/resilience_feature_tests-6a655f5812c64f57)
+
+running 1 test
+test resilience_feature_literals_are_pinned ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/run_retry_tests.rs ($AGENTCLI_TARGET/debug/deps/run_retry_tests-bc134ad86bdd2c1d)
+
+running 2 tests
+test run_retry_request_is_additive_and_feature_named ... ok
+test run_retry_response_carries_fresh_and_source_coordinates ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/smoke_tests.rs ($AGENTCLI_TARGET/debug/deps/smoke_tests-9282f20ab19be8ee)
+
+running 1 test
+test crate_name_is_stable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/wire_golden_tests.rs ($AGENTCLI_TARGET/debug/deps/wire_golden_tests-7fd9e36170571682)
+
+running 103 tests
+test a_mid_frame_encoding_switch_poisons_the_decoder ... ok
+test account_auth_method_and_credential_status_remain_closed ... ok
+test account_list_watch_is_a_signal_not_a_delta ... ok
+test account_methods_decode_as_unknown_for_older_readers ... ok
+test account_and_vault_stable_codes_pin_their_wire_literals ... ok
+test a_pipelined_handshake_chunk_switches_encodings_at_the_frame_boundary ... ok
+test additive_handshake_identity_fields_have_tolerant_decode_defaults ... ok
+test api_family_wire_addition_tolerated_by_older_clients ... ok
+test attachment_error_codes_and_data_are_typed_additively ... ok
+test attention_fields_and_waiting_why_are_additive ... ok
+test borrowed_event_encode_is_byte_identical_to_owned ... ok
+test checkpoint_error_codes_and_typed_coordinates_are_pinned ... ok
+test checkpoint_list_and_record_optional_fields_are_pinned ... ok
+test agent_cancel_is_the_exact_two_frame_tail ... ok
+test computer_permission_action_wire_is_typed_and_url_free ... ok
+test acp_agent_family_is_the_exact_one_frame_tail_and_older_clients_tolerate_it ... ok
+test cursor_pagination_and_lag_notice_have_no_numeric_resume_authority ... ok
+test correlated_errors_pin_the_named_stable_codes ... ok
+test customprov_models_probe_is_feature_gated_and_has_no_durable_or_secret_fields ... ok
+test custom_provider_probe_wire_fields_are_pinned ... ok
+test effect_recovery_state_and_roster_scalars_are_additive ... ok
+test error_data_decodes_tolerantly_when_absent_or_unknown_kind ... ok
+test device_discovery_goldens_are_additive_and_tolerance_re_proved ... ok
+test account_methods_are_kind_tagged_and_unknown_field_tolerant ... ok
+test event_frame_has_no_parallel_cursor_field ... ok
+test fleet_identity_is_the_exact_three_frame_tail_on_both_paths ... ok
+test haider_code_plan_status_is_typed_tolerant_and_feature_detectable ... ok
+test hooks_list_revision_and_trust_state_are_additive_and_tolerant ... ok
+test hooks_rpc_and_run_scoped_trust_shapes_round_trip_exactly ... ok
+test legacy_session_create_defaults_permission_overrides_to_none ... ok
+test liveness_and_drain_metadata_are_top_level_and_timestamped ... ok
+test loom_registry_cas_fields_preserve_typed_absence ... ok
+test loom_registry_stream_is_tail_appended_and_exactly_addressed ... ok
+test management_reads_preserve_legacy_account_list_and_tolerate_future_providers ... ok
+test menu_answer_request_id_is_optional_correlation_beside_the_durable_command_id ... ok
+test menu_answer_success_is_correlated_by_request_and_resolution_sequence ... ok
+test method_features_are_additive_sorted_and_absent_when_empty ... ok
+test model_detail_tuning_fields_are_additive_and_skip_empty ... ok
+test model_selection_refusals_are_typed_and_golden ... ok
+test monitor_delivery_stream_is_additive_replayable_and_explicitly_bounded ... ok
+test monitor_nested_future_discriminants_decode_without_losing_the_request_frame ... ok
+test monitor_register_additive_defaults_are_stable ... ok
+test needs_input_is_additive_tolerant_and_shape_pinned ... ok
+test new_methods_are_kind_tagged_and_new_statuses_are_unknown_tolerant ... ok
+test oauth_authorization_and_ready_ref_codec_round_trip_but_debug_redacts ... ok
+test oauth_methods_features_and_status_are_additive_unknown_tolerant ... ok
+test oauth_start_carries_the_device_user_code_additively ... ok
+test every_request_method_has_a_golden_request_and_success_response ... ok
+test oauth_status_shapes_cannot_carry_callback_or_token_secrets ... ok
+test peer_ambiguity_error_keeps_typed_candidate_coordinates ... ok
+test peer_messaging_methods_and_events_are_tail_appended ... ok
+test observe_methods_preserve_older_client_unknown_method_tolerance ... ok
+test prompt_fork_error_taxonomy_is_typed_and_retryability_is_explicit ... ok
+test prompt_fork_frames_remain_the_exact_four_frame_block ... ok
+test provider_auth_oauth_wire_wart_is_stable_and_documented ... ok
+test preexisting_session_fork_frames_decode_with_identical_bytes ... ok
+test provider_lockdown_pipe_event_shapes_are_exact ... ok
+test provider_models_unavailable_reason_is_typed_and_golden ... ok
+test provider_rebind_request_and_receipt_are_golden ... ok
+test provider_remove_refusal_reason_and_aliases_are_golden ... ok
+test resident_binding_token_sanity_is_bounded_without_interpretation ... ok
+test resident_session_binding_decodes_without_optional_fields ... ok
+test revision_conflict_code_and_structured_body_are_golden ... ok
+test segmented_reply_event_encode_is_byte_identical_to_owned ... ok
+test session_create_ignores_unknown_additive_fields ... ok
+test session_descendant_stream_is_additive_tagged_and_golden ... ok
+test session_fleet_frames_are_additive_and_unknown_tolerant ... ok
+test session_list_recency_order_is_additive_and_legacy_omission_is_unchanged ... ok
+test session_metafork_review_shape_is_additive_and_exact ... ok
+test session_pipe_path_request_and_response_have_stable_wire_shapes ... ok
+test session_rename_frames_are_additive_and_golden ... ok
+test session_select_agent_type_is_additive_and_old_decoder_tolerant ... ok
+test session_select_model_absent_provider_keeps_legacy_bytes ... ok
+test session_select_model_pair_request_and_response_are_golden ... ok
+test session_summary_cache_absence_levels_remain_distinguishable ... ok
+test session_summary_lineage_is_additive_and_old_decoder_tolerant ... ok
+test session_summary_roster_truth_fields_are_additive_and_tolerated ... ok
+test session_summary_without_top_level_provider_still_decodes ... ok
+test session_summary_workspace_is_additive_and_old_decoder_tolerant ... ok
+test session_tuning_pairs_are_golden_and_revert_omits_the_effort_key ... ok
+test shell_exec_run_id_is_additive_in_both_decode_directions ... ok
+test shell_registry_events_are_additive_and_golden ... ok
+test snapshot_availability_is_compatible_in_both_n_minus_one_directions ... ok
+test ssh_auth_debug_redacts_all_staged_capabilities ... ok
+test ssh_terminal_input_debug_is_redacted_through_request_and_frame ... ok
+test ssh_terminal_output_debug_is_redacted_through_frame ... ok
+test stage_frame_debug_formatting_never_reveals_the_secret ... ok
+test status_runtime_fields_are_additive_in_both_client_directions ... ok
+test surface_attachment_refs_and_structured_status_are_additive ... ok
+test compact_ws_bodies_and_length_prefixed_uds_streams_are_golden ... ok
+test turn_submit_and_cancel_ignore_unknown_additive_fields ... ok
+test transcription_secret_frames_are_additive_and_redacted ... ok
+test turn_submit_round_trips_subturn_mode ... ok
+test typed_agent_install_control_is_additive_under_v1 ... ok
+test unknown_fields_and_future_method_discriminants_are_tolerated ... ok
+test unknown_oauth_import_source_reason_code_preserves_prose ... ok
+test unknown_top_level_frame_kind_is_tolerated ... ok
+test unsupported_wire_version_is_deliberately_strict ... ok
+test usage_history_wire_preserves_absence ... ok
+test usage_report_goldens_are_additive_normalized_and_secret_free ... ok
+test v0_0_942_session_summary_without_promoted_cache_rates_still_decodes ... ok
+test provider_list_and_management_feature_families_are_golden ... ok
+test five_mib_artifact_put_fits_the_default_negotiated_frame ... ok
+
+test result: ok. 103 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+   Doc-tests haider_rpc
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

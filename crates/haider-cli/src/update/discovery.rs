@@ -7,12 +7,29 @@ use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 const RELEASE_PAGE_SIZE: usize = 100;
 const MAX_RELEASE_PAGES: usize = 20;
 const MAX_RELEASE_RESPONSE: usize = 8 * 1024 * 1024;
 const CURL: &str = "/usr/bin/curl";
+
+pub(crate) type DiscoveryCancellation = Arc<dyn Fn() -> bool + Send + Sync>;
+// Registry #94: the existing QA TUI_EXIT budget is 2.5s
+// (scripts/qa-gate/gate/tui_probe.py:42 and scripts/tui-probes/probelib.py reap).
+// Observe closure within one tenth of that budget, reserving the remainder
+// for kill, reap, the joined watcher, and Tokio runtime teardown.
+pub(crate) const UPDATE_CHECK_EXIT_BUDGET: Duration = Duration::from_millis(2_500);
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CurlRequestObservation {
+    Spawned(u32),
+    Reaped { pid: u32, status: ExitStatus },
+    WatcherJoined,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReleaseSelection {
@@ -56,6 +73,9 @@ pub(crate) trait UpdateTransport {
 
 pub(crate) struct CurlTransport {
     token: Option<String>,
+    cancellation: Option<DiscoveryCancellation>,
+    #[cfg(test)]
+    request_observer: Option<Arc<dyn Fn(CurlRequestObservation) + Send + Sync>>,
 }
 
 impl CurlTransport {
@@ -68,13 +88,27 @@ impl CurlTransport {
                     .ok()
                     .filter(|token| !token.is_empty())
             });
-        Self { token }
+        Self {
+            token,
+            cancellation: None,
+            #[cfg(test)]
+            request_observer: None,
+        }
+    }
+
+    pub fn with_cancellation(mut self, cancellation: DiscoveryCancellation) -> Self {
+        self.cancellation = Some(cancellation);
+        self
     }
 
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn without_token() -> Self {
-        Self { token: None }
+        Self {
+            token: None,
+            cancellation: None,
+            request_observer: None,
+        }
     }
 
     #[cfg(test)]
@@ -82,7 +116,18 @@ impl CurlTransport {
     pub fn with_token_for_test(token: &str) -> Self {
         Self {
             token: Some(token.to_owned()),
+            cancellation: None,
+            request_observer: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_request_observer_for_test(
+        mut self,
+        observer: Arc<dyn Fn(CurlRequestObservation) + Send + Sync>,
+    ) -> Self {
+        self.request_observer = Some(observer);
+        self
     }
 
     fn command(
@@ -319,6 +364,9 @@ impl CurlTransport {
         limit: usize,
         authenticated: bool,
     ) -> Result<Vec<u8>, UpdateError> {
+        if let Some(cancellation) = &self.cancellation {
+            return self.request_bytes_cancellable(url, limit, authenticated, cancellation.clone());
+        }
         validate_transport_url(url)?;
         // Authenticated release-list requests never auto-follow redirects.
         let mut command = self.command(url, "application/vnd.github+json", authenticated, false);
@@ -358,6 +406,96 @@ impl CurlTransport {
         Ok(body)
     }
 
+    fn request_bytes_cancellable(
+        &self,
+        url: &str,
+        limit: usize,
+        authenticated: bool,
+        cancellation: DiscoveryCancellation,
+    ) -> Result<Vec<u8>, UpdateError> {
+        // This preflight runs for every release page, so a closed TUI cannot
+        // start another curl after a preceding response completes.
+        if cancellation() {
+            return Err(discovery_cancelled());
+        }
+        validate_transport_url(url)?;
+        if authenticated
+            && self
+                .token
+                .as_ref()
+                .is_some_and(|token| token.bytes().any(|byte| byte.is_ascii_control()))
+        {
+            return Err(UpdateError::Refused(
+                "GitHub token contains control characters".into(),
+            ));
+        }
+        let mut command = self.command(url, "application/vnd.github+json", authenticated, false);
+        command.stdout(Stdio::piped()).stderr(Stdio::null());
+        let mut child = RequestChild {
+            process: command.spawn().map_err(|error| {
+                UpdateError::network(format!("cannot start release request: {error}"))
+            })?,
+            #[cfg(test)]
+            observer: self.request_observer.clone(),
+            #[cfg(test)]
+            reaped_observed: false,
+        };
+        #[cfg(test)]
+        if let Some(observer) = &self.request_observer {
+            observer(CurlRequestObservation::Spawned(child.process.id()));
+        }
+        let mut stdout =
+            child.process.stdout.take().ok_or_else(|| {
+                UpdateError::Internal("curl response pipe was not created".into())
+            })?;
+        let stdin = child.process.stdin.take();
+        let watcher = RequestWatcher::spawn(
+            child,
+            cancellation.clone(),
+            #[cfg(test)]
+            self.request_observer.clone(),
+        )?;
+        let response = (|| {
+            if authenticated && let Some(token) = &self.token {
+                let mut stdin = stdin.ok_or_else(|| {
+                    UpdateError::Internal("curl authentication pipe was not created".into())
+                })?;
+                stdin
+                    .write_all(format!("Authorization: Bearer {token}\n").as_bytes())
+                    .map_err(|error| UpdateError::io("write curl authentication header", error))?;
+            }
+            let take_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+            let mut body = Vec::new();
+            stdout
+                .by_ref()
+                .take(take_limit)
+                .read_to_end(&mut body)
+                .map_err(|error| {
+                    UpdateError::network(format!("release response failed: {error}"))
+                })?;
+            if body.len() > limit {
+                return Err(UpdateError::Network(
+                    "release response exceeded the configured bound".into(),
+                ));
+            }
+            Ok(body)
+        })();
+        // Even authentication/read/bound errors stop and JOIN the owner. The
+        // join completes only after curl has been waited, never detached.
+        let status = watcher.finish(response.is_err());
+        let body = response?;
+        let status = status?;
+        if cancellation() {
+            return Err(discovery_cancelled());
+        }
+        if !status.success() {
+            return Err(UpdateError::Network(
+                "release API or download is unavailable".into(),
+            ));
+        }
+        Ok(body)
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn authenticated_get_for_test(
@@ -377,6 +515,144 @@ impl CurlTransport {
         limit: u64,
     ) -> Result<(), UpdateError> {
         self.download_api_asset(url, path, limit)
+    }
+}
+
+fn discovery_cancelled() -> UpdateError {
+    UpdateError::Refused("update check cancelled because its TUI closed".into())
+}
+
+/// Owns the actual process before and during watcher construction. Every
+/// unwinding/error path kills and waits; a successfully waited child is a no-op.
+struct RequestChild {
+    process: Child,
+    #[cfg(test)]
+    observer: Option<Arc<dyn Fn(CurlRequestObservation) + Send + Sync>>,
+    #[cfg(test)]
+    reaped_observed: bool,
+}
+
+impl RequestChild {
+    fn terminate(&mut self) -> Result<(), UpdateError> {
+        let _ = self.process.kill();
+        let status = self.process.wait().map_err(|error| {
+            UpdateError::network(format!("cannot reap release request: {error}"))
+        })?;
+        self.observe_reaped(status);
+        Ok(())
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        let status = self.process.try_wait()?;
+        if let Some(status) = status {
+            self.observe_reaped(status);
+        }
+        Ok(status)
+    }
+
+    fn observe_reaped(&mut self, _status: ExitStatus) {
+        #[cfg(test)]
+        if !self.reaped_observed {
+            self.reaped_observed = true;
+            if let Some(observer) = &self.observer {
+                // This is the actual owning Child's successful wait receipt,
+                // never a post-reap PID query or inferred permission failure.
+                observer(CurlRequestObservation::Reaped {
+                    pid: self.process.id(),
+                    status: _status,
+                });
+            }
+        }
+    }
+}
+
+impl Drop for RequestChild {
+    fn drop(&mut self) {
+        if !matches!(self.try_wait(), Ok(Some(_))) {
+            let _ = self.terminate();
+        }
+    }
+}
+
+/// The watcher exclusively owns curl; the blocking caller owns stdout. This
+/// avoids holding a child mutex across wait(), which would block cancellation.
+struct RequestWatcher {
+    stop: mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<Result<ExitStatus, UpdateError>>>,
+    #[cfg(test)]
+    observer: Option<Arc<dyn Fn(CurlRequestObservation) + Send + Sync>>,
+}
+
+impl RequestWatcher {
+    fn spawn(
+        mut child: RequestChild,
+        cancellation: DiscoveryCancellation,
+        #[cfg(test)] observer: Option<Arc<dyn Fn(CurlRequestObservation) + Send + Sync>>,
+    ) -> Result<Self, UpdateError> {
+        let (stop, stopped) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("haider-update-curl-owner".into())
+            .spawn(move || {
+                loop {
+                    if cancellation() {
+                        child.terminate()?;
+                        return Err(discovery_cancelled());
+                    }
+                    if let Some(status) = child.try_wait().map_err(|error| {
+                        UpdateError::network(format!("release request failed: {error}"))
+                    })? {
+                        return Ok(status);
+                    }
+                    match stopped.recv_timeout(UPDATE_CHECK_EXIT_BUDGET / 10) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            child.terminate()?;
+                            return Err(UpdateError::Network("release request aborted".into()));
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+            })
+            .map_err(|error| {
+                // On spawn failure the dropped closure retains RequestChild's
+                // kill/wait guard; no ownerless process escapes this return.
+                UpdateError::io("start release request cancellation watcher", error)
+            })?;
+        Ok(Self {
+            stop,
+            worker: Some(worker),
+            #[cfg(test)]
+            observer,
+        })
+    }
+
+    fn finish(mut self, abort: bool) -> Result<ExitStatus, UpdateError> {
+        if abort {
+            let _ = self.stop.send(());
+        }
+        self.join()
+    }
+
+    fn join(&mut self) -> Result<ExitStatus, UpdateError> {
+        let worker = self.worker.take().ok_or_else(|| {
+            UpdateError::Internal("release request watcher was already joined".into())
+        })?;
+        let outcome = worker.join().map_err(|_| {
+            UpdateError::Internal("release request cancellation watcher failed".into())
+        });
+        #[cfg(test)]
+        if let Some(observer) = &self.observer {
+            observer(CurlRequestObservation::WatcherJoined);
+        }
+        outcome?
+    }
+}
+
+impl Drop for RequestWatcher {
+    fn drop(&mut self) {
+        if self.worker.is_some() {
+            let _ = self.stop.send(());
+            let _ = self.join();
+        }
     }
 }
 

@@ -122,6 +122,7 @@ pub fn surface_watch_snapshot(
             session_id,
             input,
             status,
+            ..
         } => Ok(SurfaceWatchSnapshot {
             session_id,
             input,

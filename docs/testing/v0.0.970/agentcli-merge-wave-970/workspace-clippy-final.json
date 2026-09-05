@@ -1,0 +1,26 @@
+{
+  "command": [
+    "cargo",
+    "clippy",
+    "--workspace",
+    "--tests",
+    "--",
+    "-D",
+    "warnings"
+  ],
+  "environment": {
+    "RUST_MIN_STACK": "8388608",
+    "HAIDER_DISCOVERY_DISABLED": "1",
+    "HAIDER_TEST_DEVICE_NAME": "test-mac",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+    "CARGO_BUILD_JOBS": "4",
+    "CARGO_TARGET_DIR": "/private/tmp/haider-agentcli-target",
+    "TMPDIR": "/tmp",
+    "RUST_TEST_THREADS": "4"
+  },
+  "disk_available_mib": 6284,
+  "exit": 0,
+  "elapsed_s": 121.748
+}

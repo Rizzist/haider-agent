@@ -6,6 +6,30 @@ use super::{
 use crate::error::ErrorCode;
 use crate::state::RunState;
 
+#[test]
+fn legacy_headless_spec_omits_direct_spawn_and_new_pin_round_trips() {
+    let legacy = serde_json::json!({"provider":"fake","model":"fake-model","max_output_tokens":64,"fast":false});
+    let mut spec: super::HeadlessRunSpecV1 =
+        serde_json::from_value(legacy.clone()).expect("legacy spec");
+    assert!(spec.agent_spawn.is_none());
+    assert_eq!(serde_json::to_value(&spec).expect("legacy encode"), legacy);
+    spec.agent_spawn = Some(super::AgentSpawnSpecV1 {
+        task: "task".into(),
+        prompt: "prompt".into(),
+        model: None,
+        provider: None,
+        agent_type: None,
+        workflow: Some("deeper".into()),
+        workflow_trigger: Some("dependent_phases".into()),
+    });
+    let encoded = serde_json::to_value(&spec).expect("new encode");
+    assert_eq!(encoded["agent_spawn"]["workflow"], "deeper");
+    assert_eq!(
+        serde_json::from_value::<super::HeadlessRunSpecV1>(encoded).expect("new decode"),
+        spec
+    );
+}
+
 /// MUTATION CHECK: make the additive decision field required. Stored
 /// pre-decision budget events must remain readable after this extension.
 #[test]

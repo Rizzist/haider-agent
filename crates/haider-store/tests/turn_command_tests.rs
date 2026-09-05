@@ -147,6 +147,7 @@ fn r2_09_admission_decisions_match_durable_receipt_replay() {
     assert!(metadata.fast);
 
     let spec = HeadlessRunSpecV1 {
+        agent_spawn: None,
         continuation_of: None,
         cwd: metadata.cwd.clone(),
         provider: metadata.provider.clone(),

@@ -259,7 +259,8 @@ establish that acceptance.
 
 ## Round 2 — Windows test job
 
-Base and merge-forward target: `471b9d680610b62c4cdd4a8be7b6ee7faf3959d3`.
+Base: `471b9d680610b62c4cdd4a8be7b6ee7faf3959d3`. Final forward-merge
+target: `f211be0e9fb6ca960d0fa73e0dbc970f2a04fb37` (agentcli).
 Read the supplied lane instructions and turnperf/turnperf2 evidence before
 implementation. Those historical performance estimates are not Windows timing
 measurements and those supplied documents are excluded from the commit.
@@ -406,6 +407,10 @@ requirements). These are not passing Windows checks. Supplemental
 exit **0**; they use BLAKE3's supported pure-Rust backend, not a fake SDK or
 forced host cfg. They do not execute Windows binaries or compile the dependent
 CLI/daemon/tools Windows paths.
+These exact default and pure-platform commands were repeated on the resolved
+`f211be0e` forward merge in the integration clone: default check/Clippy again
+exit 101 in native dependencies, while both platform-only commands exit 0.
+Their logs have the `merged-windows-` prefix.
 
 The first focused G1 run found a new diagnostic-helper defect: blanket
 `decode_event` rejected daemon-owned `project_instructions_loaded` facts outside
@@ -426,11 +431,31 @@ adds `CARGO_PROFILE_DEV_STRIP=symbols CARGO_PROFILE_TEST_STRIP=symbols` to bound
 Mach-O artifact size. This strips binary symbols, changes no test assertions or
 product source, and applies consistently to freshly rebuilt siblings and tests.
 
-Completed-tree gate results follow below. The baseline before this round is
-4,997 source test markers; `xtask test-count --update` produces **5,001**. Moving
-the sidecar test preserves its count, while one normalizer, one missing-parent
-and two Windows directory tests add four. This is distinct from the number of
-tests executed on Mac.
+On the resolved forward merge, the named instruct-pipe test passed again at
+**5,670 → 5,670 POSIX bytes** (derived Windows expectation 5,667). The provider
+golden was regenerated and its named test passed again; its SHA-256 stayed
+identical to the pre-regeneration merged fixture, so there was no additional
+golden drift after the merge. Final workspace gate results follow below.
+
+The first merged workspace test command returned zero, but its following
+Clippy pass exposed stale pre-merge metadata: it reported missing upstream
+`AgentSpawnSpecV1` / `HarnessConfig.agent_spawn` despite both being present in
+the resolved source. Copying with preserved timestamps had put changed source
+before the pre-merge Clippy fingerprints. That test pass is therefore not used
+as final fresh-build evidence. Its logs/status are preserved under the
+`merged-stale-metadata-` prefix. `cargo clean -p ...` removed only this
+worktree’s workspace-package artifacts (all 17 workspace members), retaining
+third-party dependencies. The complete sibling build, pins, baseline, workspace
+test and strict Clippy gate were restarted; a fresh strict Clippy pass before
+the expensive test run checks that the stale metadata failure is gone. That
+fresh strict Clippy pass returned **0** in 3m 30s, with no source change needed.
+
+The baseline before this round is
+4,997 source test markers; the first `xtask test-count --update` produced
+5,001. The forward merge supplies upstream's 5,027 baseline; recounting the
+resolved tree produces **5,031**. Moving the sidecar test preserves its count,
+while one normalizer, one missing-parent and two Windows directory tests add
+four. This is distinct from the number of tests executed on Mac.
 
 ### Round 2 merge, commit and acceptance
 
@@ -439,9 +464,23 @@ instruction. The worktree's `.git` points outside the writable sandbox. Actual
 fetch and merge attempts failed at `FETCH_HEAD` and `ORIG_HEAD.lock`. A writable
 shared clone at `/tmp/xplatfix-round2-integration`, on `lane-970-xplatfix`, fetched
 `origin/wave-970` and ran `git merge --no-commit origin/wave-970` before the gate.
-The remote still points at `471b9d68`; Git reports already up to date. No upstream
-conflicts or new manual/golden drift are present. The clone is the commit
-location; source changes remain present in the original worktree. No push.
+Initial checks found `471b9d68` up to date. During the long host gate, the
+remote advanced to `f211be0e` (agentcli). The lane changes were committed in the
+clone as `f53c6d70`, then `git merge --no-commit origin/wave-970` performed the
+actual forward merge. The shared session-hub test file merged cleanly, preserving
+both the input-owner acknowledgement assertions and this lane's moved sidecar
+regression. Registry-walk additions were unioned; the baseline conflict was
+resolved by the repository test-count tool, not by choosing either side's number.
+All 557 paths changed from the original base were copied back before the final
+host gate; all 2,691 tracked files matched the resolved clone byte-for-byte. The clone is the
+commit location; source changes remain present in the original worktree. No push.
+
+A stop attempt for the superseded pre-merge TUI benchmark was refused by the
+sandbox (`operation not permitted`); it was not stopped or disabled and completed
+naturally in 630.86s. The pre-merge workspace test, strict Clippy, xtask,
+formatting and unsafe gates all subsequently passed. Their logs are preserved
+with the `premerge-` prefix; acceptance uses the complete gate on the merged
+source tree.
 
 Independent reviewers found two issues that changed tests: the dirty-tail
 fixture could pass without dirty handling, and the monitor assertion compared
@@ -449,6 +488,9 @@ path spellings rather than directory identities. Both were repaired. A concern
 that the guard would hide the failure reason behind Errored was rejected because
 `RunFailed` precedes Errored atomically. A best-effort-cleanup comment was clarified;
 that editorial correction is not counted as an additional behavioral finding.
+A final read-only review against the forward-merged upstream found no new
+material issues: all six repairs remained, and the shared session-hub file
+preserved upstream assertions.
 Round 2 aggregate: **findings=3, real=2, noise=1**.
 
 **Release acceptance is proven only when xplat-check is green on the landed

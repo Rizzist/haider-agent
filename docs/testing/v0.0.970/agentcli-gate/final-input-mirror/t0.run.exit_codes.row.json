@@ -1,0 +1,150 @@
+{
+  "id": "t0.run.exit_codes",
+  "area": "headless",
+  "status": "PASS",
+  "evidence": [
+    {
+      "label": "provider_error",
+      "status": "PASS",
+      "evidence_line": "case=provider_error exit=65 typed_terminals=1 terminal_kind=provider_error error_code=provider_error",
+      "artefacts": []
+    },
+    {
+      "label": "timeout",
+      "status": "PASS",
+      "evidence_line": "case=timeout exit=124 timeout_terminals=1 terminal_kind=timeout",
+      "artefacts": []
+    },
+    {
+      "label": "max_time",
+      "status": "PASS",
+      "evidence_line": "case=max-time exit=77 typed_budget_facts=1 terminal=errored error_code=budget_exhausted dimension=time",
+      "artefacts": []
+    },
+    {
+      "label": "cancellation",
+      "status": "PASS",
+      "evidence_line": "case=cancellation signal=SIGINT-to-client exit=130 cancellation_terminals=1",
+      "artefacts": []
+    },
+    {
+      "label": "missing_credential",
+      "status": "PASS",
+      "evidence_line": "case=missing-credential exit=65 error_code=no_active_account provider_requests=0",
+      "artefacts": []
+    },
+    {
+      "label": "no_orphan_daemons",
+      "status": "PASS",
+      "evidence_line": "no_orphan_daemons pids=72153 stop=stopped_cleanly alive_after=false",
+      "artefacts": []
+    }
+  ],
+  "wall_ms": 2402,
+  "artefacts": [],
+  "timed": false,
+  "measurement_accepted": null,
+  "budget": {
+    "total_ms": 336000,
+    "parts": [
+      {
+        "name": "daemon startup deadline",
+        "milliseconds": 30000,
+        "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+      },
+      {
+        "name": "headless check --timeout",
+        "milliseconds": 10000,
+        "source": "qa-gate run --timeout 10s; crates/haider-client/src/headless.rs:67-75 terminal grace follows"
+      },
+      {
+        "name": "terminal cancellation grace",
+        "milliseconds": 2000,
+        "source": "crates/haider-client/src/headless.rs:67-75 DEFAULT_TERMINAL_GRACE"
+      },
+      {
+        "name": "daemon startup deadline",
+        "milliseconds": 30000,
+        "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+      },
+      {
+        "name": "headless timeout case",
+        "milliseconds": 2000,
+        "source": "haider run --timeout 2s; crates/haider-cli/src/run.rs:460-485"
+      },
+      {
+        "name": "terminal cancellation grace",
+        "milliseconds": 2000,
+        "source": "crates/haider-client/src/headless.rs:67-75 DEFAULT_TERMINAL_GRACE"
+      },
+      {
+        "name": "daemon startup deadline",
+        "milliseconds": 30000,
+        "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+      },
+      {
+        "name": "headless check --timeout",
+        "milliseconds": 10000,
+        "source": "qa-gate run --timeout 10s; crates/haider-client/src/headless.rs:67-75 terminal grace follows"
+      },
+      {
+        "name": "terminal cancellation grace",
+        "milliseconds": 2000,
+        "source": "crates/haider-client/src/headless.rs:67-75 DEFAULT_TERMINAL_GRACE"
+      },
+      {
+        "name": "daemon startup deadline",
+        "milliseconds": 30000,
+        "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+      },
+      {
+        "name": "SIGINT streaming-state arm",
+        "milliseconds": 10000,
+        "source": "qa-gate waits for the JSONL streaming fact while the client services keepalive"
+      },
+      {
+        "name": "terminal cancellation grace",
+        "milliseconds": 2000,
+        "source": "crates/haider-client/src/headless.rs:67-75 DEFAULT_TERMINAL_GRACE"
+      },
+      {
+        "name": "post-stop process-exit observation grace",
+        "milliseconds": 2000,
+        "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+      },
+      {
+        "name": "daemon startup deadline",
+        "milliseconds": 30000,
+        "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "client request timeout",
+        "milliseconds": 60000,
+        "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+      },
+      {
+        "name": "daemon stop timeout",
+        "milliseconds": 20000,
+        "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+      },
+      {
+        "name": "post-stop process-exit observation grace",
+        "milliseconds": 2000,
+        "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+      },
+      {
+        "name": "post-stop process-exit observation grace",
+        "milliseconds": 2000,
+        "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+      }
+    ]
+  },
+  "segments": 4,
+  "turns_expected": 4,
+  "expected_fail_until": null
+}
