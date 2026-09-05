@@ -137,6 +137,10 @@ pub struct BoundedResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolResultData {
+    InvalidToolCall {
+        tool: String,
+        message: String,
+    },
     FsSearch {
         matches: Vec<FsSearchMatch>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
