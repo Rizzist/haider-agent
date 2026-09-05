@@ -292,6 +292,8 @@ fn workflow_capabilities_are_sparse_and_grant_scoped() {
 #[test]
 fn session_permission_overrides_grant_only_their_named_effect_families() {
     let metadata = |permission_overrides| SessionMetadataV1 {
+        provider_base_url: None,
+        provider_rebind_id: None,
         cwd: "/tmp".into(),
         provider: "fake".into(),
         account_alias: None,
@@ -450,6 +452,8 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
 #[test]
 fn autonomous_effect_defaults_allow_every_ask_class() {
     let metadata = |permission_overrides| SessionMetadataV1 {
+        provider_base_url: None,
+        provider_rebind_id: None,
         cwd: "/tmp".into(),
         provider: "fake".into(),
         account_alias: None,
@@ -571,6 +575,8 @@ fn autonomous_effect_defaults_allow_every_ask_class() {
 #[test]
 fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
     let metadata = |permission_overrides| SessionMetadataV1 {
+        provider_base_url: None,
+        provider_rebind_id: None,
         cwd: "/tmp".into(),
         provider: "fake".into(),
         account_alias: None,

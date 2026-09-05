@@ -967,6 +967,7 @@ struct LockdownTurnBinding {
 }
 
 struct HubInner {
+    provider_rebind_revision: Arc<AtomicU64>,
     store: SqliteStoreHandle,
     append_committer: AppendCommitter,
     append_commit_task: Mutex<Option<JoinHandle<()>>>,
@@ -1917,6 +1918,11 @@ enum ActorCommand {
         command: SessionSelectAgentTypeCommand,
         completed: oneshot::Sender<Result<SessionSelectAgentTypeOutcome, HaiderError>>,
     },
+    RebindProvider {
+        revision: Arc<AtomicU64>,
+        command: haider_store::SessionProviderRebindCommand,
+        completed: oneshot::Sender<Result<haider_store::SessionProviderRebindOutcome, HaiderError>>,
+    },
     SelectFast {
         command: SessionSelectFastCommand,
         completed: oneshot::Sender<Result<SessionSelectFastOutcome, HaiderError>>,
@@ -2405,6 +2411,7 @@ impl SessionHub {
             haider_code_plan_changes: haider_code_plan_changes.clone(),
         });
         let inner = Arc::new(HubInner {
+            provider_rebind_revision: Arc::new(AtomicU64::new(0)),
             store,
             append_committer,
             append_commit_task: Mutex::new(Some(append_commit_task)),
@@ -5524,6 +5531,31 @@ impl SessionHub {
         actor
             .commands
             .send(ActorCommand::SelectAgentType { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn provider_rebind_revision(&self) -> u64 {
+        self.inner.provider_rebind_revision.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn rebind_session_provider(
+        &self,
+        command: haider_store::SessionProviderRebindCommand,
+    ) -> Result<haider_store::SessionProviderRebindOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::RebindProvider {
+                command,
+                completed,
+                revision: Arc::clone(&self.inner.provider_rebind_revision),
+            })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result

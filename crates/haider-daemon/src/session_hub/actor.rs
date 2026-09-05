@@ -915,6 +915,38 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
+            ActorCommand::RebindProvider {
+                command,
+                completed,
+                revision,
+            } => {
+                // Commit the route before waking any request-boundary readers.
+                let result = store.rebind_session_provider(command).await;
+                if let Ok(haider_store::SessionProviderRebindOutcome::Committed {
+                    envelope, ..
+                }) = &result
+                {
+                    revision.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    head = envelope.seq;
+                    authority_epoch = envelope.authority_epoch;
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    publish(
+                        &mut attachments,
+                        std::slice::from_ref(envelope.as_ref()),
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                }
+                let _ = completed.send(result);
+            }
             ActorCommand::SelectFast { command, completed } => {
                 // G3 clone of the SelectModel arm for the fast toggle.
                 let result = store.select_session_fast(command).await;

@@ -30,6 +30,7 @@ pub(crate) mod provider;
 pub(crate) mod run;
 pub(crate) mod session_config;
 pub(crate) mod session_item;
+pub(crate) mod session_provider;
 pub(crate) mod session_recover;
 pub(crate) mod session_seen;
 pub(crate) mod session_workspace;
@@ -420,6 +421,11 @@ async fn dispatch(args: &[String]) -> ExitCode {
         {
             session_item::session_item_command(session_id, seq, rest).await
         }
+        [command, provider, rebind, rest @ ..]
+            if command == "session" && provider == "provider" && rebind == "rebind" =>
+        {
+            session_provider::command(rest).await
+        }
         [command, rest @ ..] if command == "session" => observe::session_command(rest).await,
         [command, rest @ ..] if command == "account" => account::account_command(rest).await,
         [command, rest @ ..] if command == "provider" => provider::provider_command(rest).await,
@@ -486,6 +492,7 @@ async fn dispatch(args: &[String]) -> ExitCode {
                  session <id> [--json|--watch] [--no-spawn], \
                  session <id> config [--json] [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>], \
                  session <id> seen, session <id> recover [--json] [--probe|--mark-done|--retry|--abandon], \
+                 session provider rebind --session <id> --provider <id> [--base-url <url>] [--account <name>], \
                  session workspace set <path>, session <id> workspace set <path>, \
                  session <id> item <seq> --json [--masked] [--no-spawn], \
                  account list [--json], account use <alias> [--confirm], account source list [--json], account source add <codex|claude_file|grok|kimi_code_home> <root> [--label <label>], account source remove <source-id>, account source scan [--json], account import <codex|claude-code> [--confirm], account refresh <alias>, account remove <alias> --confirm, \

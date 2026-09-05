@@ -251,3 +251,56 @@ Read against the final uncommitted tree before verification. “checked: none”
 - #77 checked — no unsafe code was added; `cargo clippy --workspace -- -D warnings` passes
 - #78-#93 checked: none — no affected surface
 - #94-#96 checked — no deadline, negotiated-connection wait, or turn-performance policy changed
+
+## v0.0.970 providerrebind delta walk
+
+- #1-#18 checked — no new dependency, platform backend, global credential mutation or secret-bearing output; typed CLI/RPC validation and registry guards are covered by focused tests.
+- #19 checked — Rust formatting and whitespace checks apply to the merged tree.
+- #20 checked — test baseline is regenerated with `xtask test-count --update` after the added regressions.
+- #21-#28 checked — additive serde fields preserve absent legacy bytes; status golden and event-schema changelog pins exercise the contract.
+- #29-#30 checked — real daemon/proxy tests retain exact session/run identity, receipt replay and owned cleanup.
+- #31-#40 checked — journal/event/receipt commit shape remains atomic; no dependency or collection ownership policy changes.
+- #41 checked — hermetic profiles and short temporary IPC roots are retained.
+- #42-#43 checked — benchmark siblings are frozen by build; no installed user daemon is reused.
+- #44 checked — native UDS and real loopback HTTP tests exercise the serving path on macOS; Windows/Linux are by inspection.
+- #45-#56 checked — no TUI layout/backend change; the exhaustive session event projection recognizes the new additive kind.
+- #57 checked — CLI usage, client RPC/feature tables, automation contract and advertised feature pin are updated together.
+- #58-#63 checked — no packaging, credential-store format, OAuth or asset changes.
+- #64 checked — prebuilt debug `haiderd` is 199,140,464 bytes, exceeding 10 MiB; benchmark artifacts are reported in the lane evidence.
+- #65-#70 checked — no changed external agent or device workflow.
+- #71 checked — production account factory, registry validation, wire RPC and HTTP adapters are exercised together.
+- #72 checked — discovery disabled and deterministic test-device identity used for builds/tests.
+- #73-#93 checked — sandbox roots/permission ceilings retained; provider-view CAS and durable request markers were not moved or weakened.
+- #94 checked — new integration wait bound is configured provider-open budget plus the shared RPC/journal observation budget; no production deadline was added.
+- #95 checked — negotiated clients service Ping/Pong while waiting; request snapshots retain in-flight adapter ownership.
+- #96 checked — warm ABBA uses the existing harness, exact provider ledger/cardinality gates, 5+25 samples and its load gate. Results and any environmental rejection are recorded in `docs/testing/v0.0.970/providerrebind.md`; no outlier deletion or relaxed correctness gates.
+
+## v0.0.970 providerrebind clippy continuation delta walk
+
+Scope: the uncommitted `session_provider.rs` initializer correction and two
+`provider_rebind_tests.rs` lint fixes on committed merge HEAD `45f3d5c5`. Gate evidence is in
+`docs/testing/v0.0.970/providerrebind-clippy-continuation/README.md`.
+
+- #1-#8 checked: none — the added `ClientConfig` import names the existing public type; no API, field, dependency, ownership, or platform boundary changed.
+- #9-#18 fixed: `crates/haider-cli/src/session_provider.rs:70` — initialize `EnsureOptions` and its nested `ClientConfig` with struct literals and `..Default::default()`, removing `field_reassign_with_default` without a lint suppression.
+- #11/#15 fixed: `crates/haider-daemon/src/provider_rebind_tests.rs:500` and `:572` — replace `.last()` with `.next_back()` on the double-ended slice/filter iterator, and `.err().expect(...)` with `.expect_err(...)`. Terminal selection and recovery-refusal assertions retain their meaning. Both diagnostics came from the first exact clippy `--tests` run (exit 101); keep that log alongside the final gate.
+- #19 checked — workspace rustfmt and whitespace checks are recorded with the gate evidence.
+- #20 checked — recount `test-baseline.txt` with `xtask test-count --update`; source-marker counts are reported separately from executed libtest totals.
+- #21 checked — all build/test/count commands use `RUST_MIN_STACK=8388608` and the full lane ENV LAW.
+- #22-#53 checked: none — no global state, schema, receipt, platform behavior, timing bound, fixture, test registration, or UI layout changed.
+- #54 checked — preserve the corrected 8 MiB stack law; the exact workspace gate uses `--no-fail-fast` and its real process exit.
+- #55-#63 checked: none — no cfg seam, exit mapping, rendering, CAS threshold, public return type, or archive handling changed.
+- #64 checked — freshly built `haiderd` is 199,587,392 bytes, above 10 MiB; both siblings are Mach-O arm64 executables. Disk checks precede build-capable commands and enforce the 700 MiB floor.
+- #65-#66 checked: none — no platform error mapping or STT changes.
+- #67 checked — build both `haider` and `haiderd` before enabling `HAIDER_TEST_SIBLINGS_PREBUILT=1` for the full workspace gate.
+- #68-#76 checked: none — no cleanup, process discovery, CI dispatch, credential discovery, source pins, global profile state, shutdown, or wire projection changed.
+- #77 checked: none — no unsafe block, dependency, generated fixture, workflow, or repository-guard policy changed; this continuation's exact landing-gate evidence does not claim a new release or cross-platform gate.
+- #78-#80 checked: none — no release dispatch, benchmark bound, or CI job changed.
+- #81 checked — fresh sibling build completed on the already merged tree before trusting prebuilt binaries.
+- #82-#84 checked: none — OAuth, hook, and session-hub tests are unmodified; no failure is suppressed or relabeled by this correction.
+- #85-#86 checked — run `cargo test -q --workspace --no-fail-fast` across every workspace crate, with the full result totals and exit recorded.
+- #87 fixed — run `cargo clippy --workspace --tests -- -D warnings` verbatim; `cli_tests.rs:25` includes `../src/main.rs`, so the production initializer must also satisfy test-target linting.
+- #88-#91 checked: none — the real merge and `SessionMetadataV1` completion are already committed; no merge recreation, prompt/tool edit, fixture hand-merge, or byte-pin change is needed. Recount the merged test baseline.
+- #92 checked — build-capable commands record disk headroom; the gate retains failures and missing-executable diagnostics in its raw log.
+- #93 checked: none — no class #93 is defined in the supplied registry.
+- #94-#96 checked: none — no deadline, negotiated-connection wait, provider durability boundary, or performance policy changed. Windows/Linux behavior is by inspection; gates here run on macOS arm64.

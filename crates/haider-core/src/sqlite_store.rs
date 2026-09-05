@@ -1017,6 +1017,32 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.select_session_fast(&command))).await
     }
 
+    /// Read the durable rebind receipt before mutable registry validation.
+    pub async fn session_provider_rebind_receipt(
+        &self,
+        command_id: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_store::ReboundSessionProvider>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.session_provider_rebind_receipt(&command_id, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    /// Atomically commit one validated per-session provider route.
+    pub async fn rebind_session_provider(
+        &self,
+        command: haider_store::SessionProviderRebindCommand,
+    ) -> Result<haider_store::SessionProviderRebindOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.rebind_session_provider(&command)))
+            .await
+    }
+
     pub async fn create_delegation(
         &self,
         record: DelegationRecord,

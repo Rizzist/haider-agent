@@ -73,6 +73,8 @@ fn seed(model: &mut AppModel, summary: SessionSummary) {
 
 fn metadata(title: &str, cwd: &str, model: &str, created_at_ms: u64) -> SessionMetadataV1 {
     SessionMetadataV1 {
+        provider_base_url: None,
+        provider_rebind_id: None,
         cwd: cwd.to_owned(),
         provider: "openai".into(),
         account_alias: None,

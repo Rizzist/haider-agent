@@ -1,0 +1,27 @@
+{
+  "merged_wave_commit": "7694ef9cbd2fbbcedb24fee14dbf4b12b1c4cd39",
+  "workspace_test_command": "cargo test --workspace --no-fail-fast",
+  "workspace_exit_code": 0,
+  "test_baseline": 4860,
+  "qa_gate_tests_passed": 65,
+  "qa_gate_tests_failed": 0,
+  "format_check_exit_code": 0,
+  "diff_check_exit_code": 0,
+  "instruct_pipe_bytes_before": 13552,
+  "instruct_pipe_bytes_after": 13552,
+  "debug_binary_bytes": {
+    "haider": 110060336,
+    "haiderd": 199140464
+  },
+  "platform_executed": "macOS",
+  "other_platforms": "Windows/Linux by inspection",
+  "release_abba": {
+    "passed": true,
+    "attempts": 1,
+    "measurement_accepted": true,
+    "correctness_passed": true,
+    "order": "A B B A",
+    "summary": "abba/summary.json",
+    "binary_manifest": "abba/release-manifest.json"
+  }
+}

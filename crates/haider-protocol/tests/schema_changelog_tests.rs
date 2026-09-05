@@ -147,6 +147,7 @@ session_config_kinds! {
     SessionConfigEventPayload::SessionSeen { .. } => "session_seen",
     SessionConfigEventPayload::EffortSelected(_) => "effort_selected",
     SessionConfigEventPayload::FastModeSelected(_) => "fast_mode_selected",
+    SessionConfigEventPayload::SessionProviderRebound(_) => "session_provider_rebound",
     SessionConfigEventPayload::AgentTypeSelected(_) => "agent_type_selected",
 }
 

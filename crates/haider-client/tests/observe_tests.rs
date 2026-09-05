@@ -308,6 +308,17 @@ async fn one_shot_status_is_exactly_one_scalar_rpc() {
                 providers_loaded: true,
                 idle_ttl_ms: Some(30_000),
                 warm: true,
+                caching: Some(haider_rpc::DaemonCachingWire {
+                    prompt_cache: true,
+                    provider_view_cas: true,
+                    session_reuse: haider_rpc::SessionReuseWire::Resident,
+                    idle_ttl_ms: Some(30_000),
+                    cache_regime: Some(haider_rpc::ProviderCacheRegimeWire::AutomaticPrefix),
+                    cache_regimes_by_provider: std::collections::BTreeMap::from([(
+                        "openai".into(),
+                        Some(haider_rpc::ProviderCacheRegimeWire::AutomaticPrefix),
+                    )]),
+                }),
             },
         )
         .await;
@@ -330,6 +341,22 @@ async fn one_shot_status_is_exactly_one_scalar_rpc() {
     assert!(status.providers_loaded);
     assert_eq!(status.idle_ttl_ms, Some(30_000));
     assert!(status.warm);
+    let caching = status.caching.as_ref().expect("daemon caching declaration");
+    assert!(caching.prompt_cache);
+    assert!(caching.provider_view_cas);
+    assert_eq!(
+        caching.session_reuse,
+        haider_rpc::SessionReuseWire::Resident
+    );
+    assert_eq!(caching.idle_ttl_ms, Some(30_000));
+    assert_eq!(
+        caching.cache_regime,
+        Some(haider_rpc::ProviderCacheRegimeWire::AutomaticPrefix)
+    );
+    assert_eq!(
+        caching.cache_regimes_by_provider["openai"],
+        caching.cache_regime
+    );
     assert_eq!(
         status.socket_path.as_deref(),
         Some(profile.endpoint_path.to_string_lossy().as_ref())

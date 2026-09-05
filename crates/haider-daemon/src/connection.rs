@@ -2351,6 +2351,7 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_REQUEST_BUDGET_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned(),
+        haider_rpc::FEATURE_SESSION_PROVIDER_REBIND_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned(),
         FEATURE_SESSION_CONFIG_V1.to_owned(),
         haider_rpc::FEATURE_SESSION_CREATE_ADMISSION_V1.to_owned(),

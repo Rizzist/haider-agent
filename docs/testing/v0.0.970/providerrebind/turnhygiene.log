@@ -1,0 +1,17 @@
+   Compiling haider-cli v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-cli)
+    Finished `test` profile [unoptimized] target(s) in 1.06s
+     Running tests/turnhygiene_pin_tests.rs (target/debug/deps/turnhygiene_pin_tests-a0499b453628cad3)
+
+running 9 tests
+test run_jsonl_text_turn_matches_the_normalized_golden ... ok
+test run_jsonl_tool_turn_matches_the_normalized_golden ... ok
+test detached_run_journals_the_same_envelopes_as_an_attached_run ... ok
+test replay_of_a_tool_call_turn_equals_the_live_run_scoped_jsonl ... ok
+test custom_provider_binds_from_explicit_flags_a_model_selector_and_the_profile_default ... ok
+test resident_daemon_discovers_a_hook_installed_between_runs_and_scopes_it_by_cwd ... ok
+test provider_request_body_is_budget_independent_and_matches_the_golden_ledger ... ok
+test resident_daemon_rediscovers_project_instructions_across_runs_and_cwds ... ok
+test jsonl_envelopes_reach_stdout_before_a_later_provider_delay_elapses ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.11s
+

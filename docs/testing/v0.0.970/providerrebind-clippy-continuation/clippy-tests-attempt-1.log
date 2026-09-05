@@ -1,0 +1,48 @@
+    Checking haider-daemon v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-daemon)
+    Checking haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-core)
+    Checking haider-store v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-store)
+    Checking haider-tui v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-tui)
+    Checking haider-stt v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-stt)
+    Checking haider-client v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-client)
+    Checking haider-pdf v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-pdf)
+    Checking haider-provider v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-provider)
+    Checking haider-rpc v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-rpc)
+    Checking haider-accounts v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-accounts)
+    Checking haider-platform v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-platform)
+    Checking haider-protocol v0.0.969 (/Users/rizzist/haider-run/lane-970-providerrebind/crates/haider-protocol)
+error: called `Iterator::last` on a `DoubleEndedIterator`; this will needlessly iterate the entire iterator
+   --> crates/haider-daemon/src/provider_rebind_tests.rs:486:38
+    |
+486 |                   if let Some(state) = store
+    |  ______________________________________^
+487 | |                     .read(&session_id, 0, 1024)
+488 | |                     .await
+489 | |                     .expect("journal")
+...   |
+499 | |                     })
+500 | |                     .last()
+    | |___________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#double_ended_iterator_last
+    = note: `-D clippy::double-ended-iterator-last` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::double_ended_iterator_last)]`
+help: try
+    |
+500 -                     .last()
+500 +                     .next_back()
+    |
+
+error: called `.err().expect()` on a `Result` value
+   --> crates/haider-daemon/src/provider_rebind_tests.rs:572:18
+    |
+572 |                   .err()
+    |  __________________^
+573 | |                 .expect("frozen mismatch must reject recovery");
+    | |_______________________^ help: try: `expect_err`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#err_expect
+    = note: `-D clippy::err-expect` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::err_expect)]`
+
+error: could not compile `haider-daemon` (lib test) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...

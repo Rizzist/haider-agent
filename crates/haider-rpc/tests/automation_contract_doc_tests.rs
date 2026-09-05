@@ -1,12 +1,13 @@
 #![allow(clippy::expect_used)]
 
-use haider_rpc::{RequestBody, ResponseBody, WireFrame};
+use haider_rpc::{DaemonCachingWire, RequestBody, ResponseBody, WireFrame};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 const AUTOMATION_CONTRACT: &str = include_str!("../../../docs/automation-contract-v1.md");
 const WIRE_TRANSCRIPT: &str = include_str!("fixtures/wire_transcript.json");
 const METHOD_MATRIX: &str = include_str!("fixtures/client_contract_methods_v1.json");
+const CLI_STATUS: &str = include_str!("../../haider-cli/tests/fixtures/observe_status.json");
 
 fn json_examples() -> Vec<(usize, &'static str, String)> {
     let lines = AUTOMATION_CONTRACT.lines().collect::<Vec<_>>();
@@ -20,7 +21,7 @@ fn json_examples() -> Vec<(usize, &'static str, String)> {
         let tag = tag.trim();
         assert!(
             !tag.is_empty(),
-            "JSON fence at line {} must name its real frame/body type",
+            "JSON fence at line {} must name its real frame/body/value type",
             index + 1
         );
         let start_line = index + 1;
@@ -104,6 +105,7 @@ fn assert_catalog_coverage(
         "wire.event",
         "wire.attach_caught_up",
         "wire.menu_answer",
+        "value.daemon_caching",
     ] {
         assert!(tags.contains(tag), "automation contract is missing {tag}");
     }
@@ -181,13 +183,14 @@ fn every_automation_contract_json_example_decodes_and_matches_a_golden() {
     let examples = json_examples();
     assert_eq!(
         examples.len(),
-        39,
+        40,
         "the method catalog JSON example inventory changed"
     );
 
     let wire_goldens = wire_fixture_values();
     let request_goldens = method_fixture_values("request");
     let response_goldens = method_fixture_values("response");
+    let status_golden: Value = serde_json::from_str(CLI_STATUS).expect("CLI status golden JSON");
     let mut tags = BTreeSet::new();
     let mut request_methods = BTreeSet::new();
     let mut response_methods = BTreeSet::new();
@@ -257,6 +260,21 @@ fn every_automation_contract_json_example_decodes_and_matches_a_golden() {
                 assert!(
                     response_goldens.contains(&value),
                     "response body at line {line} is not copied from client_contract_methods_v1.json"
+                );
+            }
+            "value.daemon_caching" => {
+                let caching: DaemonCachingWire = serde_json::from_value(value.clone())
+                    .unwrap_or_else(|error| {
+                        panic!("invalid DaemonCachingWire fence at line {line}: {error}")
+                    });
+                assert_eq!(
+                    serde_json::to_value(caching).expect("caching wire roundtrip"),
+                    value,
+                    "caching declaration at line {line} must preserve every typed field"
+                );
+                assert_eq!(
+                    value, status_golden["daemon"]["caching"],
+                    "caching declaration at line {line} must match observe_status.json"
                 );
             }
             other => panic!("unsupported JSON fence tag {other} at line {line}"),
