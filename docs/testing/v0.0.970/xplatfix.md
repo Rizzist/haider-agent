@@ -256,3 +256,298 @@ aggregate: findings=5, real=4, noise=1.
 Release acceptance is proven only when `ci` and `xplat-check` are green on the
 landed `wave-970` commit. Local Mac checks or a green run on the base cannot
 establish that acceptance.
+
+## Round 2 — Windows test job
+
+Base: `471b9d680610b62c4cdd4a8be7b6ee7faf3959d3`. Final forward-merge
+target: `f211be0e9fb6ca960d0fa73e0dbc970f2a04fb37` (agentcli).
+Read the supplied lane instructions and turnperf/turnperf2 evidence before
+implementation. Those historical performance estimates are not Windows timing
+measurements and those supplied documents are excluded from the commit.
+
+### Claim audit
+
+Read the complete log with `gh run view --job 101322816225 --log`, from
+[xplat-check 33972289990](https://github.com/Rizzist/haider-agent/actions/runs/33972289990/job/101322816225).
+It contains six failing tests in **three crates / four test binaries** (daemon
+lib and daemon integration tests are separate binaries), not four crates.
+All six panic citations match the base. The CLI citations at 446 and 657 are
+shared assertion/wait helpers rather than the named tests' definitions. The
+sidecar test lives under daemon `tests/`, not `src/`. Symbols were located before
+editing; source lines shift with these repairs.
+
+1. **Instruct-pipe byte pin — confirmed, exact difference identified.**
+   `worker.rs` advertises `process_exec.command.description` as
+   `Exact shell program passed to /bin/zsh -c when available, otherwise /bin/sh -c`
+   (78 bytes) or
+   `Exact PowerShell program passed to the absolute System32 Windows PowerShell`
+   (75 bytes). The expected Windows total was incorrectly 5,670; actual is
+   5,667. The test now pins the platform-invariant 5,670 − 78 = 5,592 bytes and
+   adds the JSON-escaped byte contribution of this actual schema field (excluding
+   its two framing quotes). Thus a manual edit cannot silently leave a stale
+   three-byte offset. POSIX remains 5,670; Windows becomes 5,667. The 50% reduction
+   requirement, tool counts, semantics and validation constraints remain pinned.
+
+2. **Verified provenance guard — underbudget proven; exact Windows stall not
+   measured.** The original ten-second observation encloses `process_exec`
+   with its default sixty-second wall budget. Its command is `echo verified`,
+   valid for Windows PowerShell; execution is explicitly authorized and the
+   graph guard is cfg-neutral. Graph-only sibling confirmations passed on this
+   Windows run. The log records only `Elapsed(())` and test-completion timestamps,
+   not this process's spawn/exit timestamps, so it cannot distinguish cold
+   PowerShell latency from another stall. The helper now derives its one-process
+   observer BudgetSum as 10s graph/journal + 30s existing cold-PowerShell fixture
+   allowance (`haider-daemond/tests/support/mod.rs`) + 60s `ProcessBounds` wall +
+   2s termination + 2s pipe drain + two 500ms workspace receipts = **105s**.
+   The 30s component is inherited fixture policy, not a measurement from this
+   runner. Graph-only fixtures retain ten seconds. No sleep or product deadline
+   is added. Incremental journal observations record elapsed time and sequence,
+   fail immediately on typed tool/run failure or an unexpected blocking menu,
+   and print the reason and progress on exhaustion. All original process-signal
+   provenance, slim result, replay and explicit abandonment assertions remain.
+   Failure queues a best-effort drain wake; it does not claim completed cleanup.
+
+3. **Native pipe I/O failure — the claimed retained old tail is contradicted by
+   the log.** Actual bytes contain the correct durable user row and coverage 2,
+   both in generation **1**; the injected stale file was generation **9** with
+   seq 999. The actor's append only enqueues asynchronous sidecar maintenance.
+   The original fixture removed the obstruction and wrote generation 9 without
+   joining that writer. A first-touch generation-1 rebuild can therefore overwrite
+   the fixture's stale file. The repair moves the named test into
+   `pipe_native_tests.rs`, where the existing private constructor can retain the
+   **same `Arc<PipeNativeWriter>`** across two hub lifetimes. It joins the first
+   actor while the obstruction still exists and asserts actual dirty state before
+   removing it. The second hub uses that same writer and must rebuild generation
+   9 → 10, match the complete durable bytes, clear dirty state, and confirm exact
+   coverage. Independent review strengthened the stale file to plausible coverage
+   1 with incorrect text: bypassing dirty repair must now fail, whereas seq 999
+   independently caused a rebuild even without dirty handling. The expected
+   generation-10 result was not weakened. The product also now refuses to
+   classify an observed non-directory `pipe` parent as a missing sidecar:
+   Windows `ERROR_PATH_NOT_FOUND` maps to Rust `NotFound`, whereas an executed
+   macOS open beneath a file returned ENOTDIR. Root-open error classification
+   checks the parent on the error path and preserves other I/O failures. A
+   portable regression supplies Windows' ambiguous NotFound for absent-parent,
+   absent-leaf and obstructed-parent cases, plus a non-NotFound failure. Rust
+   1.95's installed Windows error-mapping source was inspected; no Windows API
+   was executed. This fixes the classification, but cannot eliminate arbitrary
+   external file-creation races or uniquely reconstruct the failed run's timing.
+   No file-handle, rename or CRLF failure is established by the old log.
+
+4. **Provider request golden — confirmed, only one differing JSON value.**
+   Parsed both complete CI bodies and recursively diffed them: the sole pointer
+   is `/tools/7/function/parameters/properties/command/description`, exactly the
+   platform manual from claim 1. The comparison validates the native description
+   against explicit platform prose, then replaces its single serialized string
+   with `<PLATFORM_PROCESS_COMMAND_DESCRIPTION>`. All other request bytes,
+   ordering and formatting remain sensitive. The existing native cold/warm/budget
+   byte comparisons run before this normalization. A new regression checks both
+   platform descriptions normalize identically while a changed `maxLength`
+   remains different. There is one golden, regenerated through `UPDATE_FIXTURES=1`.
+
+5. **Resident hook — real fixture interpreter mismatch.** Windows hooks execute
+   `cmd.exe /D /S /C`, while the fixture supplied raw PowerShell syntax. This is
+   distinct from the `process_exec` interpreter. The fixture now explicitly
+   invokes absolute System32 PowerShell with `-NoProfile -NonInteractive
+   -EncodedCommand`, encoding its script as UTF-16LE/base64 so cmd cannot
+   reinterpret script or capture-path bytes. This follows the existing daemon
+   hook-test pattern and adds only the workspace base64 dev dependency. Discovery
+   between resident runs, two captured lines, session/run identity and cwd-scoping
+   assertions remain intact.
+
+6. **Monitor cwd — ancestor protection already passed; child cwd needed a
+   compatible path and identity-based verification.** The original failure
+   occurs after the ancestor-rename denial succeeds. Its log omitted actual cwd,
+   so it does not uniquely prove a PowerShell reset versus Windows short/long
+   pathname spelling. Canonical Windows `\\?\` paths have documented child-tool
+   compatibility limitations ([Rust canonicalize documentation](https://doc.rust-lang.org/stable/std/fs/fn.canonicalize.html),
+   [Rust PowerShell cwd report](https://github.com/rust-lang/rust/issues/133553)).
+   `WorkspaceDirectory::process_path` now constructs a DOS/UNC spelling, opens
+   its full chain, and checks its file identity against the retained original
+   handle before returning it. A changed identity or unsupported namespace fails
+   closed. Original root-to-cwd handles still deny delete-sharing and remain alive
+   through CreateProcess. The shared setter propagates errors through the normal
+   effect finalizer for foreground and background processes; monitor preparation
+   also propagates them. Two Windows platform tests cover drive/UNC conversion
+   and rejection of trailing-dot normalization that names a different directory.
+   The monitor test retains ancestor-swap denial, compares reported/expected
+   directory identities (the runner uses 8.3 temp spellings), and requires a
+   relative sentinel read from the prepared directory, with actual cwd/stderr
+   diagnostics. This is a product-path repair plus stronger security evidence;
+   native Windows execution remains required.
+
+### Round 2 verification
+
+All Cargo commands use rustup Rust 1.95.0 and the ENV LAW:
+`RUST_MIN_STACK=8388608 HAIDER_DISCOVERY_DISABLED=1
+HAIDER_TEST_DEVICE_NAME=test-mac CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`.
+Builds use two jobs; test runs use four threads. `df -m /` is checked before
+each build-capable command with a 700 MiB minimum. CLI/daemon siblings are prebuilt before daemon/workspace tests and
+`HAIDER_TEST_SIBLINGS_PREBUILT=1` is set only afterward. Logs are under
+`/tmp/xplatfix-round2-evidence/`; raw Windows job log is
+`/tmp/xplatfix-windows-job.log`.
+
+Executed focused checks on macOS:
+
+| Repair | Executed host evidence | Windows evidence |
+| --- | --- | --- |
+| Instruct-pipe pin | Named daemon lib test PASS, actual 5,670 bytes. | Pin/schema arithmetic inspected; affected-crate cross check/Clippy blocked in native dependencies. |
+| Provenance guard | All nine `worker::g1_todo_runtime_tests` PASS (1.67s); named provenance confirmation observed at about 606ms on this Mac. | Interpreter/guard path inspected; exact runner latency unknown; cross check/Clippy blocked before daemon test compilation. |
+| Native pipe | All four `pipe_native::pipe_native_tests` PASS. Dirty-branch mutant FAILS with stale generation 9 versus expected durable generation 10, exit 101, 0.18s; exact source restoration then PASS (0.15s). | Ambiguous NotFound classification executed through the portable seam on Mac; actual Windows API inspected only. |
+| Request golden | `UPDATE_FIXTURES=1 cargo test -p haider-cli --test turnhygiene_pin_tests provider_request_body_is_budget_independent_and_matches_the_golden_ledger -- --nocapture` PASS. Regenerated JSON diff has exactly one field. Entire 12-test binary also PASS. | Parsed actual/golden CI bodies; sole platform-manual difference proved. Windows CLI test cfg inspected; cross check/Clippy blocked in dependencies. |
+| Resident hook | Named test PASS in all 12 `turnhygiene_pin_tests` (7.16s). This executes the POSIX fixture on Mac. | cmd/PowerShell encoded fixture, stdin EOF and cwd assertions inspected; no Windows hook executed. |
+| Monitor cwd | Host compilation and final workspace gate cover shared callers/Unix implementations. | Platform-only Windows check AND Clippy with `--all-targets --features blake3/pure` PASS, compiling the new helper and two Windows tests. Tools monitor/foreground/background Windows cfg inspected, not compiled past native dependency blockers or run locally. |
+
+Exact affected-crate Windows attempts were both executed under ENV LAW:
+`cargo check -p haider-platform -p haider-tools -p haider-daemon -p haider-cli
+--target x86_64-pc-windows-msvc --all-targets --keep-going`, and the same
+`cargo clippy ... -- -D warnings`. Both exit **101**: missing `ml64.exe` and
+Windows SDK C headers (`stdlib.h`, `windows.h`, also native crypto/SQLite
+requirements). These are not passing Windows checks. Supplemental
+`cargo check -p haider-platform --target x86_64-pc-windows-msvc --all-targets
+--features blake3/pure` and the same Clippy command with `-- -D warnings` both
+exit **0**; they use BLAKE3's supported pure-Rust backend, not a fake SDK or
+forced host cfg. They do not execute Windows binaries or compile the dependent
+CLI/daemon/tools Windows paths.
+These exact default and pure-platform commands were repeated on the resolved
+`f211be0e` forward merge in the integration clone: default check/Clippy again
+exit 101 in native dependencies, while both platform-only commands exit 0.
+Their logs have the `merged-windows-` prefix. The same four commands were
+repeated after the subsequent `6c6164c9` docsync merge: affected-crate check
+and Clippy again exit 101 (missing ml64/Windows SDK); platform-only pure-Rust
+check and Clippy exit 0. Those logs/status files use `docsync-windows-`.
+
+The first focused G1 run found a new diagnostic-helper defect: blanket
+`decode_event` rejected daemon-owned `project_instructions_loaded` facts outside
+`EventPayload`. Restricting strict decoding to the six observed wire kinds while
+advancing the cursor over every fact corrected it; the entire nine-test suite
+then passed. This was found by execution, separately from the independent
+verifier tally. No failed run is counted as a pass.
+
+The first full workspace invocation stopped during test linking with
+`errno=28 (No space left on device)`: the filesystem dropped to 139 MiB,
+below the 700 MiB ENV LAW floor. No later build was started until space was
+recovered. The failed log and status are preserved as
+`workspace-test-unstripped-environment-blocked.log` and
+`host-gate-status-unstripped-environment-blocked.tsv`. Only this lane's generated
+`target/` tree was removed, recovering 8,592 MiB; no other lane's artifacts or
+source files were deleted. The restarted gate retains every ENV LAW setting and
+adds `CARGO_PROFILE_DEV_STRIP=symbols CARGO_PROFILE_TEST_STRIP=symbols` to bound
+Mach-O artifact size. This strips binary symbols, changes no test assertions or
+product source, and applies consistently to freshly rebuilt siblings and tests.
+
+On the resolved forward merge, the named instruct-pipe test passed again at
+**5,670 → 5,670 POSIX bytes** (derived Windows expectation 5,667). The provider
+golden was regenerated and its named test passed again; its SHA-256 stayed
+identical to the pre-regeneration merged fixture, so there was no additional
+golden drift after either forward merge. On the final docsync snapshot, the
+full-manifest pin also passed at **20,770 Mac bytes**; its inspected Windows
+expectation is 20,769. The added monitor/spawn capability test and exact
+spawn-manual pin both passed.
+
+Final macOS gate on the resolved `6c6164c9` merge, with the ENV LAW and symbol
+stripping described above:
+
+- `cargo build -q -p haider-cli -p haider-daemond`: PASS; fresh siblings were
+  81,357,104 and 144,318,992 bytes, both above the 10 MiB guard.
+- `cargo test -q --workspace --no-fail-fast`: PASS, exit 0. The long TUI
+  two-test group passed in 418.09s; it was not skipped or weakened.
+- `cargo clippy --workspace --tests -- -D warnings`: PASS, exit 0, both before
+  the test run and afterward (final pass 1.07s).
+- `cargo run -q -p xtask -- test-count --update`: PASS, **5,033**.
+  `cargo run -q -p xtask -- check`: PASS; its nine existing soft LOC warnings
+  are non-fatal, and the source count matches the baseline.
+- `cargo fmt --all --check`, `python3 scripts/check-unsafe-counts.py`, and
+  `git diff --check`: PASS. Unsafe counts remain **189 production / 20 test**.
+
+The final statuses are in `host-gate-status.tsv`; final logs retain the plain
+step names (`workspace-test.log`, `workspace-clippy.log`, etc.). All 2,693
+tracked files had zero content changes throughout the gate. Only this report
+was updated afterward to record the completed results.
+
+The first merged workspace test command returned zero, but its following
+Clippy pass exposed stale pre-merge metadata: it reported missing upstream
+`AgentSpawnSpecV1` / `HarnessConfig.agent_spawn` despite both being present in
+the resolved source. Copying with preserved timestamps had put changed source
+before the pre-merge Clippy fingerprints. That test pass is therefore not used
+as final fresh-build evidence. Its logs/status are preserved under the
+`merged-stale-metadata-` prefix. `cargo clean -p ...` removed only this
+worktree’s workspace-package artifacts (all 17 workspace members), retaining
+third-party dependencies. The complete sibling build, pins, baseline, workspace
+test and strict Clippy gate were restarted; a fresh strict Clippy pass before
+the expensive test run checks that the stale metadata failure is gone. That
+fresh strict Clippy pass returned **0** in 3m 30s, with no source change needed.
+
+The baseline before this round is
+4,997 source test markers; the first `xtask test-count --update` produced
+5,001. The forward merge supplies upstream's 5,027 baseline; recounting the
+resolved tree produces **5,031**. Docsync subsequently supplies upstream
+5,029; the actual recount of that merged tree produces **5,033**. Moving the
+sidecar test preserves its count, while one normalizer, one missing-parent and two Windows directory tests add
+four. This is distinct from the number of tests executed on Mac.
+
+### Round 2 merge, commit and acceptance
+
+The user explicitly requests a commit, overriding the older uncommitted-lane
+instruction. The worktree's `.git` points outside the writable sandbox. Actual
+fetch and merge attempts failed at `FETCH_HEAD` and `ORIG_HEAD.lock`. A writable
+shared clone at `/tmp/xplatfix-round2-integration`, on `lane-970-xplatfix`, fetched
+`origin/wave-970` and ran `git merge --no-commit origin/wave-970` before the gate.
+Initial checks found `471b9d68` up to date. During the long host gate, the
+remote advanced to `f211be0e` (agentcli). The lane changes were committed in the
+clone as `f53c6d70`, then `git merge --no-commit origin/wave-970` performed the
+actual forward merge. The shared session-hub test file merged cleanly, preserving
+both the input-owner acknowledgement assertions and this lane's moved sidecar
+regression. Registry-walk additions were unioned; the baseline conflict was
+resolved by the repository test-count tool, not by choosing either side's number.
+All 557 paths changed from the original base were copied back before the f211
+host gate; all 2,691 tracked files matched the resolved clone byte-for-byte. The clone is the
+commit location; source changes remain present in the original worktree. No push.
+
+The remote then advanced to `6c6164c9` (docsync) while the fresh f211 gate was
+running. The first forward merge was committed locally as `d67ce24f`, followed
+by another actual `git merge --no-commit origin/wave-970`. The overlap in
+`permissions_core_tests.rs` retains the derived 5,592 + actual-description
+core pin and every new upstream capability/full-manifest/30% reduction
+assertion. Registry entries were unioned again; xtask produced 5,033.
+Independent review found no new material issue. A source-string byte count
+confirmed the new full-manifest Windows arithmetic: computer description
+126 Mac / 128 Windows (+2), process command 78 / 75 (−3), neither needing
+additional JSON escapes. Full catalog 20,770 + 2 − 3 = 20,769; the core pack
+excludes computer, so 5,592 + 75 = 5,667. Python byte counting was executed;
+registration/filtering was inspected, with no Windows execution. The fresh f211 gate kept
+its source frozen and completed with workspace tests, strict Clippy, xtask,
+formatting and unsafe-count PASS (189 production / 20 test unsafe sites); its
+long TUI group passed in 581.62s. These logs use `f211-fresh-`. The final
+docsync snapshot copied 16 changed paths with fresh timestamps before its
+full gate; all 2,693 tracked files matched the resolved clone. The source
+manifest is `docsync-source-before-gate.json`.
+
+A stop attempt for the superseded pre-merge TUI benchmark was refused by the
+sandbox (`operation not permitted`); it was not stopped or disabled and completed
+naturally in 630.86s. The pre-merge workspace test, strict Clippy, xtask,
+formatting and unsafe gates all subsequently passed. Their logs are preserved
+with the `premerge-` prefix; acceptance uses the complete gate on the merged
+source tree.
+
+Independent reviewers found two issues that changed tests: the dirty-tail
+fixture could pass without dirty handling, and the monitor assertion compared
+path spellings rather than directory identities. Both were repaired. A concern
+that the guard would hide the failure reason behind Errored was rejected because
+`RunFailed` precedes Errored atomically. A best-effort-cleanup comment was clarified;
+that editorial correction is not counted as an additional behavioral finding.
+A final read-only review against the forward-merged upstream found no new
+material issues: all six repairs remained, and the shared session-hub file
+preserved upstream assertions.
+Round 2 aggregate: **findings=3, real=2, noise=1**.
+
+The handoff is the `lane-970-xplatfix` branch in the writable integration clone
+and `/tmp/xplatfix-round2.bundle`, including both forward merges from the
+original `471b9d68` base. Commit messages have no trailers. The original
+worktree’s Git metadata stays unchanged; its source files match the committed
+result. Supplied LANE-COMMON, LANE-BRIEF, turnperf and turnperf2 inputs are not
+included in the lane delta. No push is performed.
+
+**Release acceptance is proven only when xplat-check is green on the landed
+`wave-970` commit.** A local Mac pass or Windows source inspection does not prove
+that acceptance; this lane does not run Windows binaries locally or push CI.

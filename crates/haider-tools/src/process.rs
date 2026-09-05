@@ -750,7 +750,9 @@ impl EffectBroker {
         #[cfg(unix)]
         set_anchored_current_dir(&mut command, cwd_fd);
         #[cfg(windows)]
-        set_anchored_current_dir(&mut command, &cwd_fd);
+        if let Err(error) = set_anchored_current_dir(&mut command, &cwd_fd) {
+            return self.finish(&intent, Err(error)).await;
+        }
         haider_platform::configure_process_group(&mut command);
         #[cfg(windows)]
         let process_trace = windows_test_process_trace_enabled();
@@ -2143,8 +2145,12 @@ pub(crate) fn set_anchored_current_dir(command: &mut Command, cwd_fd: OwnedFd) {
 }
 
 #[cfg(windows)]
-pub(crate) fn set_anchored_current_dir(command: &mut Command, cwd: &OwnedFd) {
-    command.current_dir(cwd.path());
+pub(crate) fn set_anchored_current_dir(command: &mut Command, cwd: &OwnedFd) -> ToolResult<()> {
+    let process_path = cwd
+        .process_path()
+        .map_err(|error| ToolError::io("prepare Windows process cwd", cwd.path(), error))?;
+    command.current_dir(process_path);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2322,7 +2328,7 @@ pub fn monitor_process_command(
     #[cfg(unix)]
     set_anchored_current_dir(&mut command, cwd_dir);
     #[cfg(windows)]
-    set_anchored_current_dir(&mut command, &cwd_dir);
+    set_anchored_current_dir(&mut command, &cwd_dir)?;
     haider_platform::configure_process_group(&mut command);
     Ok(PreparedMonitorProcess {
         command,
@@ -2495,8 +2501,16 @@ mod windows_monitor_command_tests {
         let parent = workspace.path().join("parent");
         let cwd = parent.join("cwd");
         std::fs::create_dir_all(&cwd).expect("create monitor cwd");
+        std::fs::write(cwd.join("prepared-cwd.txt"), "prepared directory")
+            .expect("write prepared cwd sentinel");
+        std::fs::write(workspace.path().join("prepared-cwd.txt"), "workspace root")
+            .expect("write wrong cwd sentinel");
         let moved = workspace.path().join("moved-parent");
-        let argv = monitor_shell_argv("[Console]::Out.Write((Get-Location).Path)");
+        let argv = monitor_shell_argv(concat!(
+            "$ErrorActionPreference = 'Stop'; ",
+            "[Console]::Out.WriteLine((Get-Location).Path); ",
+            "[Console]::Out.Write((Get-Content -LiteralPath './prepared-cwd.txt' -Raw))",
+        ));
         let prepared = monitor_process_command(&argv, workspace.path(), &cwd, &[])
             .expect("prepare anchored monitor command");
         let rename_result = Arc::new(Mutex::new(None));
@@ -2527,11 +2541,34 @@ mod windows_monitor_command_tests {
                 .is_some_and(Result::is_err),
             "retained cwd anchors must deny ancestor replacement until spawn"
         );
-        assert!(
-            String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .eq_ignore_ascii_case(&cwd.to_string_lossy()),
-            "spawned process must retain the prepared cwd"
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut lines = stdout.lines();
+        let actual_cwd = lines.next().expect("child reports its cwd");
+        // The runner may spell its temp root RUNNER~1 while PowerShell
+        // expands the same directory to its long name. Compare directory
+        // identities, then require the relative read below to hit its sentinel.
+        let reported = haider_platform::open_workspace_directory(Path::new(actual_cwd))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "open reported cwd: {error}; expected={}, actual={actual_cwd:?}, stderr={}",
+                    cwd.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        let expected =
+            haider_platform::open_workspace_directory(&cwd).expect("open expected prepared cwd");
+        assert_eq!(
+            haider_platform::workspace_directory_identity(&reported)
+                .expect("reported cwd identity"),
+            haider_platform::workspace_directory_identity(&expected)
+                .expect("prepared cwd identity"),
+            "spawned process must retain the prepared cwd: expected={}, actual={actual_cwd:?}",
+            cwd.display(),
+        );
+        assert_eq!(
+            lines.next(),
+            Some("prepared directory"),
+            "relative reads must use the prepared directory: stdout={stdout:?}"
         );
     }
 }

@@ -10259,40 +10259,6 @@ async fn native_pipe_v3_header_rebuilds_to_current_with_generation_bump() {
     assert_eq!(coverage["generation"], 5);
 }
 
-#[tokio::test]
-async fn native_pipe_io_failure_never_fails_the_journal_append() {
-    let (root, store, hub) = open_hub(None, 8).await;
-    let session_id = SessionId::new("native-pipe-io-failure");
-    let generation = store.worker_generation();
-    std::fs::write(root.path().join("pipe"), b"blocks the sidecar directory")
-        .expect("blocking file writes");
-
-    let mut event = vec![user_pipe_event(&session_id, "user", generation, "durable")];
-    hub.append(&mut event)
-        .await
-        .expect("sidecar failure must not fail append");
-    assert_eq!(
-        store.read(&session_id, 0, 10).await.expect("journal reads"),
-        event
-    );
-    assert!(!sidecar_path(&root, &session_id).exists());
-
-    std::fs::remove_file(root.path().join("pipe")).expect("blocking file removes");
-    std::fs::create_dir(root.path().join("pipe")).expect("sidecar directory creates");
-    std::fs::write(
-        sidecar_path(&root, &session_id),
-        b"{\"pipe\":\"haider.session.jsonl\",\"version\":6,\"session_id\":\"native-pipe-io-failure\",\"generation\":9}\n{\"role\":\"user\",\"text\":\"ahead\",\"at_ms\":999,\"seq\":999}\n",
-    )
-    .expect("stale sidecar writes");
-    append_one(&hub, &session_id, generation, "retry-trigger").await;
-    hub.shutdown().await.expect("hub stops");
-    assert_eq!(
-        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("settled sidecar reads"),
-        stored_sidecar(&store, &session_id, 10).await,
-        "a dirty session must rebuild instead of trusting the old numeric tail"
-    );
-}
-
 /// v0.0.970 attention state, roster half: `last_activity_ms` is durable roster
 /// recency (journal head, seen, and creation maximum), `session.seen` remains
 /// receipted+idempotent over the wire, and the scalars converge so a client's

@@ -27,6 +27,71 @@ impl WorkspaceDirectory {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Returns a DOS/UNC cwd that Windows PowerShell and other .NET Framework
+    /// children can consume. A canonical `\\?\` path can make those children
+    /// discard the requested working directory during initialization.
+    ///
+    /// Removing the verbatim prefix can change pathname semantics (for example,
+    /// a trailing dot). Check the resulting directory identity while retaining
+    /// the original root-to-cwd handles, and fail closed if it names another
+    /// object. The caller must retain `self` until CreateProcess returns.
+    pub fn process_path(&self) -> std::io::Result<PathBuf> {
+        let path = process_directory_spelling(&self.path)?;
+        let candidate = open_workspace_directory(&path)?;
+        if workspace_directory_identity(&candidate)? != workspace_directory_identity(self)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "process cwd changes identity without the Windows verbatim prefix",
+            ));
+        }
+        Ok(path)
+    }
+}
+
+#[cfg(windows)]
+fn process_directory_spelling(path: &Path) -> std::io::Result<PathBuf> {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let mut result = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", char::from(drive))),
+            Prefix::VerbatimUNC(server, share) => {
+                let mut unc = std::ffi::OsString::from(r"\\");
+                unc.push(server);
+                unc.push(r"\");
+                unc.push(share);
+                PathBuf::from(unc)
+            }
+            Prefix::Disk(_) | Prefix::UNC(_, _) => return Ok(path.to_path_buf()),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "process cwd has no DOS or UNC spelling",
+                ));
+            }
+        },
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "process cwd must be an absolute DOS or UNC path",
+            ));
+        }
+    };
+    for component in components {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => result.push(name),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "process cwd must be canonical before changing its spelling",
+                ));
+            }
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(windows)]
@@ -336,4 +401,51 @@ pub fn windows_file_identity(file: &std::fs::File) -> std::io::Result<WindowsFil
         file_index: u64::from(information.nFileIndexHigh) << 32
             | u64::from(information.nFileIndexLow),
     })
+}
+
+#[cfg(all(test, windows))]
+mod windows_process_directory_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn process_directory_spelling_preserves_drive_and_unc_components() {
+        for (verbatim, ordinary) in [
+            (r"\\?\C:\workspace\cwd", r"C:\workspace\cwd"),
+            (
+                r"\\?\UNC\server\share\workspace\cwd",
+                r"\\server\share\workspace\cwd",
+            ),
+        ] {
+            assert_eq!(
+                process_directory_spelling(Path::new(verbatim)).expect("process cwd spelling"),
+                Path::new(ordinary)
+            );
+        }
+    }
+
+    #[test]
+    fn process_directory_rejects_normalized_alias_to_another_directory() {
+        let workspace = tempfile::tempdir().expect("process cwd workspace");
+        let canonical = std::fs::canonicalize(workspace.path()).expect("canonical workspace");
+        // NTFS permits a literal trailing dot through the verbatim namespace.
+        // Removing that prefix would silently select the other directory.
+        let ordinary = canonical.join("cwd");
+        let verbatim = canonical.join("cwd.");
+        std::fs::create_dir(&ordinary).expect("create ordinary cwd");
+        std::fs::create_dir(&verbatim).expect("create distinct verbatim cwd");
+        let ordinary = open_workspace_directory(&ordinary).expect("anchor ordinary cwd");
+        let verbatim = open_workspace_directory(&verbatim).expect("anchor verbatim cwd");
+        assert_ne!(
+            workspace_directory_identity(&ordinary).expect("ordinary identity"),
+            workspace_directory_identity(&verbatim).expect("verbatim identity"),
+            "fixture directories must have distinct identities"
+        );
+        let error = verbatim
+            .process_path()
+            .expect_err("process cwd must not change identity");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("changes identity"));
+    }
 }

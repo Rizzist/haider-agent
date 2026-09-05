@@ -279,7 +279,9 @@ impl EffectBroker {
         #[cfg(unix)]
         set_anchored_current_dir(&mut command, cwd_fd);
         #[cfg(windows)]
-        set_anchored_current_dir(&mut command, &cwd_fd);
+        if let Err(error) = set_anchored_current_dir(&mut command, &cwd_fd) {
+            return self.finish(&intent, Err(error)).await;
+        }
         haider_platform::configure_process_group(&mut command);
         haider_platform::configure_background_process(&mut command);
         let mut child = match command.spawn() {

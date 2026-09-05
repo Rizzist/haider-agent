@@ -1607,16 +1607,16 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // Keep wave's stricter pre-diet comparator (before docsync's +304 bytes).
     // Provider-dialect JSON framing is measured separately by AHRB.
     const PRE_DIET_INSTRUCT_PIPE_BYTES: usize = 13_552;
-    // Merge measurement: docsync's 13_856 -> 5_670 on macOS. The default pack
-    // now has seven coding tools + list_tools, native semantics once and no
-    // system manual. Monitor/spawn semantics survive in promoted descriptions.
-    // Windows is 5_670 -> 5_667 by inspection: process_exec.command's retained
-    // parameter description is 75 bytes there versus 78 on Unix. Computer is
-    // absent from this coding pack, so its platform prose cannot offset -3.
-    #[cfg(not(target_os = "windows"))]
-    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 5_670;
-    #[cfg(target_os = "windows")]
-    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 5_667;
+    // Docsync keeps the default v5 core pack: seven coding tools + list_tools,
+    // with monitor/spawn semantics in promoted descriptions. Native prose
+    // once and no system manual, preserving parameter constraints and semantics.
+    // POSIX 13_552 -> 5_670 (-58.2%); do not trim validation bounds to save tokens.
+    // The only platform-specific bytes are process_exec.command.description:
+    // POSIX names /bin/zsh and /bin/sh (78 bytes), Windows names the absolute
+    // System32 PowerShell (75 bytes). Pin the other 5_670 - 78 = 5_592 bytes
+    // and derive this field's contribution from its actual schema string, so
+    // future manual edits cannot leave a stale hard-coded Windows offset.
+    const EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES: usize = 5_592;
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let authorized =
         advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
@@ -1661,6 +1661,21 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();
+    let process_command_description = tools
+        .iter()
+        .find(|tool| tool.name == "process_exec")
+        .expect("advertised process_exec")
+        .input_schema["properties"]["command"]["description"]
+        .as_str()
+        .expect("platform-specific process command description");
+    // Count JSON-escaped bytes because tool_bytes measures serialized schemas.
+    // Remove the two framing quotes, which remain in the invariant byte pin.
+    let process_command_description_bytes = serde_json::to_vec(process_command_description)
+        .expect("process command description JSON")
+        .len()
+        - 2;
+    let expected_pipe_bytes =
+        EXPECTED_PLATFORM_INVARIANT_PIPE_BYTES + process_command_description_bytes;
     assert_eq!(registered_tools().len(), 30);
     assert_eq!(
         tools.len(),
@@ -1703,7 +1718,7 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     );
     assert_eq!(
         (full_prefix, pipe_bytes),
-        (EXPECTED_FULL_PREFIX_BYTES, EXPECTED_INSTRUCT_PIPE_BYTES),
+        (EXPECTED_FULL_PREFIX_BYTES, expected_pipe_bytes),
         "full-manifest and default instruct-pipe byte pins"
     );
     assert!(pipe_bytes * 2 <= PRE_DIET_INSTRUCT_PIPE_BYTES);
@@ -1712,10 +1727,7 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         (full_prefix - pipe_bytes) * 10 >= full_prefix * 3,
         "instruct pipe must retain the full-manifest reduction floor of 30%"
     );
-    assert_eq!(
-        system.len() + tool_bytes,
-        606 + EXPECTED_INSTRUCT_PIPE_BYTES
-    );
+    assert_eq!(system.len() + tool_bytes, 606 + expected_pipe_bytes);
 }
 
 /// C1 MUTATION CHECK: drop the node walk or the agent-type/task rendering.
