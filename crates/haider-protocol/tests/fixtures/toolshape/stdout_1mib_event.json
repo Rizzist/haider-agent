@@ -1,0 +1,20 @@
+{
+  "type": "tool_result",
+  "call_id": "call-stdout-1mib",
+  "result": {
+    "preview": "STDOUT-BEGIN\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n{\"haider_elision_v1\":{\"omitted_bytes\":1047769,\"omitted_bytes_exact\":true,\"omitted_item_unit\":null,\"omitted_items_at_least\":null,\"retained_head_bytes\":201,\"retained_tail_bytes\":606,\"scope\":\"process_output_byte_cap\"}}\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nSTDOUT-END\n[haider:truncated truncated=true original_bytes=1048576 payload_bytes=1024 sha256=693cf61417f03d09face28b9d86d3afdfdbaf3f9234b6282ccd5feef62835484]",
+    "truncated": true,
+    "truncation": {
+      "truncated": true,
+      "original_bytes": 1048576,
+      "payload_bytes": 1024,
+      "sha256": "693cf61417f03d09face28b9d86d3afdfdbaf3f9234b6282ccd5feef62835484"
+    }
+  },
+  "truncation": {
+    "truncated": true,
+    "original_bytes": 1048576,
+    "payload_bytes": 1024,
+    "sha256": "693cf61417f03d09face28b9d86d3afdfdbaf3f9234b6282ccd5feef62835484"
+  }
+}

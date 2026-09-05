@@ -127,6 +127,8 @@ impl ToolDispatcher for CountingSnapshotDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "done".into(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),

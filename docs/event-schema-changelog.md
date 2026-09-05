@@ -21,6 +21,27 @@ them and because the changelog pin needs a complete current kind set.
 
 `SCHEMA_VERSION` remains 1 (`crates/haider-protocol/src/envelope.rs:14-16`).
 
+### v0.0.970 — recoverable invalid tool calls
+
+`tool_result.result.data` adds `kind: "invalid_tool_call"` with `tool` and
+`message` strings. The result has failed status and an `invalid-tool-call`
+presentation subcode; its JSON preview also carries `error.kind:
+"invalid_tool_call"` and repair instructions. Raw malformed arguments remain
+in the failed tool item. Provider history uses an empty argument object paired
+with this result, identically for live continuation and replay. One malformed
+call permits a repair continuation within existing request/budget limits; a
+second consecutive malformed call is a terminal provider failure. A valid
+tool-argument frame resets this allowance.
+The prompt-omitted `tool_call_repair_reset` extension records that reset before
+dispatch, only after a malformed call. Recovery reads invalid results and reset
+markers in durable order across request epochs, including deferred tool calls.
+
+Unique case/underscore matches in the advertised tool pack use the canonical
+name and add `tool_name_correction: {requested, resolved}` to the result preview.
+Exact names take precedence, and ambiguous or unadvertised names are not repaired.
+Legacy bounded results retain their existing encodings. The protocol round-trip
+pin is `invalid_tool_call_data_has_a_typed_round_trip_without_changing_legacy_results`.
+
 ### v0.0.964 — contract baseline and additive payload
 
 Diff audited for the baseline addition: `v0.0.963..v0.0.964` over the same
@@ -354,3 +375,33 @@ Optional `RunBudgetV1.request_budget` and
 client so older daemons cannot silently ignore the settings. Default policy
 is 32 soft / 64 hard. The schema version remains 1; unknown extension data and
 new error codes retain the established forward-compatibility behavior.
+
+### v0.0.970 — tool-result truncation provenance and applied file effects
+
+- Optional `payload.truncation` and `payload.effects` on `tool_result`, mirrored
+  on `payload.result` / standalone `BoundedResult`. They are absent when unused;
+  legacy results decode with no metadata. `SCHEMA_VERSION` remains 1.
+- Truncation has exactly `truncated: true`, unsigned `original_bytes` and
+  `payload_bytes`, and `sha256` (64 lowercase hexadecimal digits of the ORIGINAL
+  captured bytes). The text preview appends one standalone final line:
+  `[haider:truncated truncated=true original_bytes=<uint> payload_bytes=<uint> sha256=<hex64>]`.
+  The former preview and its prefix/suffix policy are retained; the new marker
+  and its added separator are excluded from `payload_bytes`.
+- Applied file effects are ordered `{kind,name,path,absolute_path,bytes}` records,
+  with `kind` in `write|create|edit|delete`; relative and absolute paths agree with
+  the workspace receipt. Moves declare source delete then destination create/write.
+  Counts describe installed bytes (removed bytes for delete; zero for directory
+  structure). Failures before application add no invented effect; post-apply
+  failures retain effects while preserving the original failure disposition.
+- SHA-256 is accumulated on original process bytes before lossless capture is
+  bounded or bytes are converted to text; existing BLAKE3 receipt digests retain
+  their meanings. Raw replay preserves the metadata. Fatal post-apply failures
+  record one failed tool result with landed effects before existing cleanup;
+  event kinds, terminal semantics, sequence allocation rules, and persistence
+  boundaries stay the same. Details and byte-count scope are
+  in [the run JSONL contract](jsonl-run-contract-v1.md#tool-result-byte-provenance-and-file-effects-v00970).
+
+- Optional `output_sha256` on `task_completed` persists original background
+  output provenance for eviction/recovery; legacy facts omit it. Optional
+  `truncation` on `SshShellResultWire` carries the same typed captured-byte
+  provenance. Both are additive and are omitted when unavailable/unused.

@@ -95,6 +95,103 @@ and optional `previous_path` (present on current producers, absent on legacy
 facts). Both payload kinds are additive and must be preserved by raw-envelope
 readers.
 
+## Autonomous permissions and explicit denials
+
+`haider run` creates an autonomous session. All Haider permission-policy Ask
+defaults resolve to ordinary journaled `Allow`, including workspace writes and
+process execution; no allow flag is required. Explicit user deny rules and
+provider-lockdown hard denies retain precedence, and workspace containment is
+unchanged.
+
+An explicit brokered-effect deny produces an `effect` / `authorized` envelope with
+`verdict == "deny"` and its stable reason, followed by a typed rejected
+`tool_result` that the model can read. The aggregate JSON result also includes
+that reason in `permission_denials`; it is never synthesized from a menu label.
+For a direct filesystem write under `--read-only`, the exact reason is `write
+denied: run is --read-only`. The option also denies local/remote process, Git,
+desktop-control, and peer-message effects that could write indirectly, using
+route-specific reasons. The client first requires the additive
+`session_read_only_v1` feature so an older daemon cannot silently ignore this
+explicit deny. After the model observes such a typed refusal, the terminal is
+`failure` with `error_code == "permission_denied"` and the same reason.
+The plan-gated `loom_register` route has no effect class; read-only therefore
+rejects it directly with a typed `tool_result` and the exact terminal reason
+`registry mutation denied: run is --read-only`, before any registry CAS or
+installer job exists.
+
+## Tool-result byte provenance and file effects (v0.0.970)
+
+These fields are additive; `schema_version` stays 1. On a durable
+`payload.type == "tool_result"`, `/truncation` and `/effects` below are JSON
+pointers relative to `payload`. The same typed fields are available on its
+`result` object, and on standalone bounded tool results. Omitted fields stay
+absent, rather than `null` or an empty array, on legacy/unaffected results.
+
+When captured tool output is reduced, `result.preview` retains the existing
+prefix/suffix or tool-specific projection and ends with exactly this standalone
+line (decimal unsigned integers and lowercase SHA-256):
+
+```text
+[haider:truncated truncated=true original_bytes=<uint> payload_bytes=<uint> sha256=<64 lowercase hex of the ORIGINAL bytes>]
+```
+
+`/truncation` is its typed mirror:
+
+```json
+{"truncated":true,"original_bytes":1048576,"payload_bytes":1234,"sha256":"<hex64>"}
+```
+
+`original_bytes` counts the original captured bytes before the preview's
+reduction; `sha256` hashes those bytes, not the retained prefix/suffix, a
+lossy UTF-8 conversion, or the JSON wrapper. For a process, stdout and stderr
+are hashed in capture order. Bytes observed while draining after a process
+limit also count; bytes never read from a terminated producer cannot count.
+Enumeration/execution limits retain their existing separate incompleteness
+facts. For filesystem search/glob, the original is the materialized result
+text, not unvisited files. `payload_bytes` counts UTF-8 bytes of the unchanged
+preview before the new footer, excluding the footer and any LF added to put
+it on its own line. Existing payload bytes, including an existing trailing LF,
+are preserved. JSON-in-text consumers can slice the first `payload_bytes`
+bytes before parsing. The process's existing nested `context_savings_detail`
+still measures that legacy payload; provider-bound accounting includes the
+footer overhead without changing source-omission facts. Additional model-boundary
+projection keeps the former cap and prefix/suffix bytes and remeasures
+`payload_bytes` for its own final footer. No marker or typed mirror is added to an untruncated result.
+
+Applied filesystem write/create/edit/delete results carry `/effects` in the
+same order as the workspace receipt and change ledger paths:
+
+```json
+{"effects":[{"kind":"create","name":"fixture.txt","path":"fixtures/fixture.txt","absolute_path":"/workspace/fixtures/fixture.txt","bytes":12}]}
+```
+
+The locked fields are `kind` (`write`, `create`, `edit`, or `delete`), `name`
+(basename), `path` (workspace-relative), `absolute_path`, and unsigned `bytes`.
+`/effects/0/path` and `/effects/0/name` identify the first applied effect.
+Byte counts are the installed file size for write/create/edit and the removed
+file size for delete. A move declares source delete then destination
+create/write; a copy declares destination create/write. Structural directory
+operations carry zero content bytes. Paths and sizes are captured by the
+mutation, without rereading mutable paths after completion. Attempts that fail before applying a mutation do not invent effects. A failure
+after application retains its effects and failed disposition; fatal storage or
+ledger errors still fail the run. A fatal post-apply error records one failed
+tool result with its landed effects before the existing fatal cleanup. Live
+JSONL and replay retain the same facts, using the existing call ids, cursor
+allocation rules, and durability boundaries.
+
+Background task completion facts add optional `output_sha256`, the digest of
+all observed output before ring-buffer retention. New `task_output` results
+use it for both live and completed/evicted tasks. Legacy completion records
+without an original digest remain valid and do not fabricate one. Delegated
+report results hash the full child summary before bounding it, including any
+existing report prefix; recollection derives that provenance from the retained
+child journal. SSH shell result wires also add optional `truncation`; received
+stdout/stderr bytes are hashed before their shared cap. Web-fetch provenance
+covers observed response-body bytes before extraction/capping, including a
+received overflow/look-ahead chunk; bytes never fetched remain outside that
+count. Model-catalog truncation hashes its complete serialized filtered page.
+Lockdown sandbox file-write paths are relative to that effective sandbox root.
+
 ## Exactly one typed terminal
 
 An attached run ends with exactly one terminal envelope. It is still the

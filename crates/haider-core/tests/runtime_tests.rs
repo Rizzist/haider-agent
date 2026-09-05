@@ -2240,6 +2240,8 @@ impl ToolDispatcher for CompletingDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "done".into(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -2270,6 +2272,8 @@ impl ToolDispatcher for CountingCompletingDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "done once".into(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -2300,6 +2304,8 @@ impl ToolDispatcher for DelayedCompletingDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "done after a long tool wait".into(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -2404,6 +2410,8 @@ impl ToolDispatcher for LargeResultDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: self.preview.clone(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -2433,6 +2441,8 @@ impl ToolDispatcher for ForgedImageDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "forged image".into(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: vec![self.image.clone()],
@@ -2758,67 +2768,635 @@ async fn malformed_frame_is_errored_with_typed_error() {
     ));
 }
 
-/// v0.0.959 conformance: malformed model-authored tool JSON is a structured
-/// failed tool plus a typed terminal failure. It is never dispatched, repaired
-/// into a second provider request, or allowed to end as a clean success.
-#[tokio::test]
-async fn malformed_tool_json_fails_the_tool_and_run_without_dispatch_or_repair() {
-    let (handle, store, provider) = runtime(vec![
+// v0.0.970 intentionally replaces the old terminal-on-first-malformed pin:
+// malformed calls still never dispatch, and their failure remains durable;
+// only the first consecutive malformed call may request a correction.
+fn malformed_tool_steps(call_id: &str, arguments: &str) -> Vec<FakeStep> {
+    vec![
         FakeStep::EmitToolCallStart {
-            call_id: "bad-1".into(),
-            name: "demo".into(),
+            call_id: call_id.into(),
+            name: "inspect".into(),
         },
         FakeStep::EmitToolArgsDelta {
-            call_id: "bad-1".into(),
-            fragment: "{broken".into(),
+            call_id: call_id.into(),
+            fragment: arguments.into(),
         },
         FakeStep::EmitToolCallEnd {
-            call_id: "bad-1".into(),
+            call_id: call_id.into(),
         },
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
         },
-        // A regression that treats the malformed call as recoverable reaches
-        // this second response and incorrectly reports Done.
+    ]
+}
+
+async fn toolrepair_run(
+    cfg: HarnessConfig,
+    script: Vec<FakeStep>,
+) -> (
+    haider_core::TurnOutcome,
+    Vec<RawEnvelope>,
+    Vec<TurnRequest>,
+    usize,
+) {
+    let provider = Arc::new(FakeProvider::new(script));
+    let store = Arc::new(MemoryStore::new());
+    let dispatcher = Arc::new(CountingCompletingDispatcher {
+        calls: AtomicUsize::new(0),
+    });
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        cfg,
+        provider.clone(),
+        store.clone(),
+        Some(dispatcher.clone()),
+    );
+    let task = tokio::spawn(actor.run());
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("repair the tool call"))
+        .await
+        .expect("submit")
+        .wait()
+        .await
+        .expect("outcome");
+    let events = store.events(&SessionId::new(SESSION)).await;
+    assert_items_closed_before_terminal(&events);
+    handle.stop().await.expect("stop");
+    task.await.expect("actor joined");
+    (
+        outcome,
+        events,
+        provider.requests(),
+        dispatcher.calls.load(Ordering::SeqCst),
+    )
+}
+
+#[tokio::test]
+async fn malformed_tool_json_is_durable_invalid_result_with_one_repair_continuation() {
+    let mut script = malformed_tool_steps("bad-1", "{broken");
+    script.extend([
+        FakeStep::ExpectToolResult {
+            call_id: "bad-1".into(),
+        },
         FakeStep::Finish {
             reason: FinishReason::EndTurn,
         },
     ]);
-    let turn = handle
-        .submit_turn(SubmitTurn::new("make a tool call"))
+    let (outcome, events, requests, calls) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(calls, 0, "malformed arguments never dispatch");
+    let (result_index, result) = events
+        .iter()
+        .enumerate()
+        .find_map(|(index, event)| match typed(event) {
+            EventPayload::ToolResult { call_id, result } if call_id == "bad-1" => {
+                Some((index, result))
+            }
+            _ => None,
+        })
+        .expect("durable invalid result");
+    assert_eq!(
+        result.status,
+        haider_protocol::tool::ToolResultStatus::Failed
+    );
+    assert_eq!(
+        serde_json::to_value(result.data.as_ref().expect("typed data")).expect("serialize")["kind"],
+        "invalid_tool_call"
+    );
+    assert_eq!(
+        result
+            .presentation
+            .as_ref()
+            .expect("presentation")
+            .subcode
+            .as_str(),
+        "invalid-tool-call"
+    );
+    assert!(result.preview.contains("key must be a string"));
+    assert!(result.preview.contains("inspect"));
+    assert!(events[result_index + 1..].iter().any(|event| matches!(typed(event),
+        EventPayload::Item(ItemEvent::Completed { item: TurnItem::ToolCall { args, status: ToolStatus::Failed, .. }, .. })
+            if args == serde_json::json!("{broken")
+    )));
+    assert!(requests[1].messages.iter().flat_map(|message| &message.blocks).any(|block| matches!(block,
+        Block::ToolCall { call_id, args, .. } if call_id == "bad-1" && args == &serde_json::json!({})
+    )));
+    assert!(requests[1].messages.iter().flat_map(|message| &message.blocks).any(|block| matches!(block,
+        Block::ToolResult { call_id, preview, .. } if call_id == "bad-1" && preview == &result.preview
+    )));
+    let next_request_index = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            completed_extension(event, CACHE_REQUEST_ATTEMPT_EXTENSION_KIND).then_some(index)
+        })
+        .next_back()
+        .expect("durable repair attempt");
+    assert!(
+        result_index < next_request_index,
+        "result is durable before repair attempt"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(typed(event), EventPayload::RunFailed { .. }))
+    );
+}
+
+#[tokio::test]
+async fn second_consecutive_malformed_tool_json_terminates_after_one_repair() {
+    let mut script = malformed_tool_steps("bad-1", "{broken");
+    script.extend(malformed_tool_steps("bad-2", "["));
+    script.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let (outcome, events, requests, calls) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(requests.len(), 2, "no second repair continuation");
+    assert_eq!(calls, 0);
+    assert_eq!(events.iter().filter(|event| matches!(typed(event), EventPayload::ToolResult { ref result, .. }
+        if result.presentation.as_ref().is_some_and(|value| value.subcode.as_str() == "invalid-tool-call")
+    )).count(), 2);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(typed(event), EventPayload::RunFailed { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcome
+            .error
+            .expect("typed failure")
+            .details
+            .expect("provider details")["provider_error_kind"],
+        "MalformedFrame"
+    );
+}
+
+#[tokio::test]
+async fn two_malformed_calls_in_one_response_terminate_without_a_repair_send() {
+    let mut script = malformed_tool_steps("bad-1", "{");
+    script.pop();
+    script.extend(malformed_tool_steps("bad-2", "{"));
+    let (outcome, _, requests, calls) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(calls, 0);
+}
+
+#[tokio::test]
+async fn valid_tool_call_resets_malformed_repair_allowance() {
+    let mut script = malformed_tool_steps("bad-1", "{broken");
+    script.extend([
+        FakeStep::EmitToolCall {
+            call_id: "good".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ]);
+    script.extend(malformed_tool_steps("bad-2", "{broken"));
+    script.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let (outcome, _, requests, calls) = toolrepair_run(config(), script).await;
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(requests.len(), 4);
+    assert_eq!(calls, 1);
+}
+
+#[tokio::test]
+async fn non_object_tool_arguments_are_repairable_invalid_calls() {
+    for arguments in ["null", "[]", "42", r#""text""#] {
+        let mut script = malformed_tool_steps("bad", arguments);
+        script.push(FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        });
+        let (outcome, events, requests, calls) = toolrepair_run(config(), script).await;
+        assert_eq!(outcome.state, RunState::Done);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(calls, 0);
+        assert!(events.iter().any(
+            |event| matches!(typed(event), EventPayload::ToolResult { result, .. }
+                if result.preview.contains("expected a JSON object")
+            )
+        ));
+    }
+}
+
+fn toolrepair_config(names: &[&str]) -> HarnessConfig {
+    let mut cfg = config();
+    cfg.enforce_advertised_tool_ceiling = true;
+    cfg.tools = names
+        .iter()
+        .map(|name| haider_provider::ToolDefinition {
+            name: (*name).into(),
+            description: "test tool".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        })
+        .collect();
+    cfg
+}
+
+#[tokio::test]
+async fn tool_name_case_and_underscore_repair_is_reported_in_durable_and_live_result() {
+    for requested in ["FS_READ", "FsRead", "fs__read"] {
+        let (outcome, events, requests, calls) = toolrepair_run(
+            toolrepair_config(&["fs_read"]),
+            vec![
+                FakeStep::EmitToolCall {
+                    call_id: "repair-name".into(),
+                    name: requested.into(),
+                    args: serde_json::json!({}),
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::ToolUse,
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::EndTurn,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(outcome.state, RunState::Done);
+        assert_eq!(calls, 1);
+        let preview = events
+            .iter()
+            .find_map(|event| match typed(event) {
+                EventPayload::ToolResult { result, .. } => Some(result.preview),
+                _ => None,
+            })
+            .expect("durable result");
+        let value: serde_json::Value = serde_json::from_str(&preview).expect("correction JSON");
+        assert_eq!(value["tool_name_correction"]["requested"], requested);
+        assert_eq!(value["tool_name_correction"]["resolved"], "fs_read");
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .flat_map(|message| &message.blocks)
+                .any(|block| matches!(block,
+                    Block::ToolResult { preview: text, .. } if text == &preview
+                ))
+        );
+        assert!(events.iter().any(
+            |event| matches!(typed(event), EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::ToolCall { name, status: ToolStatus::Completed, .. }, ..
+        }) if name == "fs_read")
+        ));
+    }
+}
+
+#[tokio::test]
+async fn tool_name_repair_does_not_resolve_ambiguous_or_unadvertised_names() {
+    for requested in ["F_SREAD", "FS_WRITE"] {
+        let (_, events, _, calls) = toolrepair_run(
+            toolrepair_config(&["fs_read", "fsread"]),
+            vec![
+                FakeStep::EmitToolCall {
+                    call_id: "denied".into(),
+                    name: requested.into(),
+                    args: serde_json::json!({}),
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::ToolUse,
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::EndTurn,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(calls, 0);
+        assert!(events.iter().any(|event| matches!(typed(event), EventPayload::ToolResult { result, .. }
+            if result.status == haider_protocol::tool::ToolResultStatus::Rejected && result.preview.contains("grant_ceiling_violation")
+        )));
+    }
+    let (_, events, _, calls) = toolrepair_run(
+        toolrepair_config(&["fs_read", "fsread"]),
+        vec![
+            FakeStep::EmitToolCall {
+                call_id: "exact".into(),
+                name: "fs_read".into(),
+                args: serde_json::json!({}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ],
+    )
+    .await;
+    assert_eq!(
+        calls, 1,
+        "exact spelling wins even with normalized collision"
+    );
+    assert!(!events.iter().any(
+        |event| matches!(typed(event), EventPayload::ToolResult { result, .. }
+            if result.preview.contains("tool_name_correction")
+        )
+    ));
+}
+
+#[tokio::test]
+async fn malformed_tool_result_replays_with_the_same_provider_safe_arguments() {
+    let mut script = malformed_tool_steps("bad-replay", "{broken");
+    script.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let (_, mut events, requests, _) = toolrepair_run(config(), script).await;
+    let store = MemoryStore::new();
+    StoreHandle::append(&store, &mut events)
         .await
-        .expect("submit");
-    let outcome = timeout(Duration::from_secs(2), turn.wait())
+        .expect("copy durable journal");
+    let artifacts = GenericArtifactReader {
+        artifact: ArtifactRef::new("unused"),
+        bytes: vec![],
+    };
+    let replay = PromptHistoryCompiler::compile_idle_with_artifacts(
+        &store,
+        &artifacts,
+        &SessionId::new(SESSION),
+        None,
+        None,
+    )
+    .await
+    .expect("compile durable history");
+    assert_eq!(
+        replay, requests[1].messages,
+        "durable replay and live repair must agree"
+    );
+}
+
+#[tokio::test]
+async fn recovered_malformed_tool_keeps_safe_arguments_and_consumed_repair_allowance() {
+    let mut original_script = malformed_tool_steps("bad-recovered", "{broken");
+    original_script.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let (_, events, _, _) = toolrepair_run(config(), original_script).await;
+    let result = events
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::ToolResult { result, .. } => Some(result),
+            _ => None,
+        })
+        .expect("durable invalid result");
+    let run_id = events[0].run_id.clone().expect("run id");
+    // Retain exactly the committed first response, before its repair request.
+    let second_attempt = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            completed_extension(event, CACHE_REQUEST_ATTEMPT_EXTENSION_KIND).then_some(index)
+        })
+        .nth(1)
+        .expect("second attempt");
+    let mut prefix = events[..second_attempt - 1].to_vec();
+    let store = Arc::new(MemoryStore::new());
+    StoreHandle::append(store.as_ref(), &mut prefix)
         .await
-        .expect("malformed JSON failure must remain bounded")
+        .expect("restore journal prefix");
+    let mut replay_script = malformed_tool_steps("bad-recovered", "{broken");
+    replay_script.extend(malformed_tool_steps("bad-next", "{broken"));
+    replay_script.push(FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    });
+    let provider = Arc::new(FakeProvider::new(replay_script));
+    let handle = HarnessActor::spawn(config(), provider.clone(), store.clone());
+    let outcome = handle
+        .submit_route_wait_turn(SubmitRouteWaitTurn {
+            run_id,
+            messages: vec![Message::user_text("repair the tool call")],
+            checkpoint: RouteWaitCheckpoint {
+                completed_tools: vec![haider_core::RouteWaitCompletedToolCheckpoint {
+                    call_id: "bad-recovered".into(),
+                    name: "inspect".into(),
+                    args: serde_json::json!("{broken"),
+                    result: Some(result),
+                }],
+                structured_events: vec![
+                    haider_protocol::provider::StreamEvent::ToolCallStart {
+                        call_id: "bad-recovered".into(),
+                        name: "inspect".into(),
+                    },
+                    haider_protocol::provider::StreamEvent::ToolCallArgsDelta {
+                        call_id: "bad-recovered".into(),
+                        args_fragment: "{broken".into(),
+                    },
+                    haider_protocol::provider::StreamEvent::ToolCallEnd {
+                        call_id: "bad-recovered".into(),
+                    },
+                ],
+                ..RouteWaitCheckpoint::default()
+            },
+        })
+        .await
+        .expect("resume")
+        .wait()
+        .await
         .expect("outcome");
     assert_eq!(outcome.state, RunState::Errored);
-    assert_eq!(provider.requests().len(), 1, "no repair request is issued");
-    let events = store.events(&SessionId::new(SESSION)).await;
-    assert!(events.iter().any(|event| matches!(
-        typed(event),
-        EventPayload::Item(ItemEvent::Completed {
-            item: TurnItem::ToolCall {
-                ref call_id,
-                status: ToolStatus::Failed,
-                ..
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "one replay send and one repair, no extra repair"
+    );
+    assert!(requests[1].messages.iter().flat_map(|message| &message.blocks).any(|block| matches!(block,
+        Block::ToolCall { call_id, args, .. } if call_id == "bad-recovered" && args == &serde_json::json!({})
+    )));
+    handle.stop().await.expect("stop");
+}
+
+#[tokio::test]
+async fn repair_allowance_survives_restart_after_a_new_request_epoch() {
+    for valid_between in [false, true] {
+        let mut script = malformed_tool_steps("bad-before-restart", "{broken");
+        if valid_between {
+            script.extend([
+                FakeStep::EmitToolCall {
+                    call_id: "valid-reset".into(),
+                    name: "inspect".into(),
+                    args: serde_json::json!({}),
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::ToolUse,
+                },
+            ]);
+        }
+        script.push(FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        });
+        let (_, events, _, _) = toolrepair_run(config(), script).await;
+        let run_id = events[0].run_id.clone().expect("run id");
+        let epoch = if valid_between { 2 } else { 1 };
+        let attempt = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                completed_extension(event, haider_core::ROUTE_REPLAY_ATTEMPT_EXTENSION_KIND)
+                    .then_some(index)
+            })
+            .nth(epoch - 1) // Epoch zero has no separate replay-attempt marker.
+            .expect("new request epoch marker");
+        let mut prefix = events[..=attempt].to_vec();
+        let store = Arc::new(MemoryStore::new());
+        StoreHandle::append(store.as_ref(), &mut prefix)
+            .await
+            .expect("restore new request prefix");
+        let mut script = malformed_tool_steps("bad-after-restart", "{broken");
+        script.push(FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        });
+        let provider = Arc::new(FakeProvider::new(script));
+        let handle = HarnessActor::spawn(config(), provider.clone(), store);
+        let outcome = handle
+            .submit_route_wait_turn(SubmitRouteWaitTurn {
+                run_id,
+                // The production compiler omits current-run tool results; only
+                // durable repair facts can restore the allowance across epochs.
+                messages: vec![Message::user_text("repair the tool call")],
+                checkpoint: RouteWaitCheckpoint {
+                    response_epoch: epoch as u64,
+                    ..RouteWaitCheckpoint::default()
+                },
+            })
+            .await
+            .expect("resume new epoch")
+            .wait()
+            .await
+            .expect("outcome");
+        assert_eq!(
+            outcome.state,
+            if valid_between {
+                RunState::Done
+            } else {
+                RunState::Errored
+            }
+        );
+        assert_eq!(provider.requests().len(), if valid_between { 2 } else { 1 });
+        handle.stop().await.expect("stop");
+    }
+}
+
+#[tokio::test]
+async fn recovered_tool_name_correction_survives_a_checkpoint() {
+    let cfg = toolrepair_config(&["fs_read"]);
+    let (_, events, _, _) = toolrepair_run(
+        cfg.clone(),
+        vec![
+            FakeStep::EmitToolCall {
+                call_id: "name-resume".into(),
+                name: "FS_READ".into(),
+                args: serde_json::json!({}),
             },
-            ..
-        }) if call_id == "bad-1"
-    )));
-    assert!(events.iter().any(|event| matches!(
-        typed(event),
-        EventPayload::ToolResult { ref result, .. }
-            if result.status == haider_protocol::tool::ToolResultStatus::Failed
-    )));
-    assert!(events.iter().any(|event| matches!(
-        typed(event),
-        EventPayload::RunFailed {
-            presentation: Some(ref presentation),
-            ..
-        } if presentation.subcode.as_str() == "malformed-tool-arguments"
-    )));
-    handle.stop().await.expect("actor stops");
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ],
+    )
+    .await;
+    let run_id = events[0].run_id.clone().expect("run id");
+    let item_id = events
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::Item(ItemEvent::Started {
+                item_id,
+                item: TurnItem::ToolCall { .. },
+            }) => Some(item_id),
+            _ => None,
+        })
+        .expect("open tool item");
+    let running = events
+        .iter()
+        .position(|event| matches!(typed(event), EventPayload::RunState(RunState::RunningTool)))
+        .expect("effect boundary");
+    let mut prefix = events[..running].to_vec();
+    let store = Arc::new(MemoryStore::new());
+    StoreHandle::append(store.as_ref(), &mut prefix)
+        .await
+        .expect("restore open tool");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "name-resume".into(),
+            name: "FS_READ".into(),
+            args: serde_json::json!({}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        cfg,
+        provider.clone(),
+        store.clone(),
+        Some(Arc::new(CompletingDispatcher)),
+    );
+    let task = tokio::spawn(actor.run());
+    let outcome = handle
+        .submit_route_wait_turn(SubmitRouteWaitTurn {
+            run_id,
+            messages: vec![Message::user_text("repair the tool call")],
+            checkpoint: RouteWaitCheckpoint {
+                tools: vec![RouteWaitToolCheckpoint {
+                    item_id,
+                    call_id: "name-resume".into(),
+                    name: "fs_read".into(),
+                    args: "{}".into(),
+                }],
+                structured_events: vec![
+                    haider_protocol::provider::StreamEvent::ToolCallStart {
+                        call_id: "name-resume".into(),
+                        name: "FS_READ".into(),
+                    },
+                    haider_protocol::provider::StreamEvent::ToolCallArgsDelta {
+                        call_id: "name-resume".into(),
+                        args_fragment: "{}".into(),
+                    },
+                ],
+                ..RouteWaitCheckpoint::default()
+            },
+        })
+        .await
+        .expect("resume")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    let events = store.events(&SessionId::new(SESSION)).await;
+    let preview = events
+        .iter()
+        .find_map(|event| match typed(event) {
+            EventPayload::ToolResult { result, .. } => Some(result.preview),
+            _ => None,
+        })
+        .expect("durable result");
+    let correction: serde_json::Value = serde_json::from_str(&preview).expect("corrected JSON");
+    assert_eq!(correction["tool_name_correction"]["requested"], "FS_READ");
+    assert_eq!(correction["tool_name_correction"]["resolved"], "fs_read");
+    assert!(
+        provider.requests()[1]
+            .messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .any(|block| matches!(block,
+                Block::ToolResult { preview: live, .. } if live == &preview
+            ))
+    );
+    handle.stop().await.expect("stop");
+    task.await.expect("join");
 }
 
 #[tokio::test]
@@ -3540,6 +4118,8 @@ async fn recovered_route_wait_restores_completed_effect_without_redispatch() {
                     result: Some(BoundedResult {
                         preview: "done once".into(),
                         truncated: false,
+                        truncation: None,
+                        effects: Vec::new(),
                         data: None,
                         artifact: None,
                         images: Vec::new(),
@@ -4781,6 +5361,8 @@ impl ToolDispatcher for BoundaryRecordingDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "done".into(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -5191,6 +5773,8 @@ struct BatchRecordingStore {
     inner: MemoryStore,
     batches: Mutex<Vec<Vec<EventPayload>>>,
     reject_tool_settlement: bool,
+    reject_repair_reset: bool,
+    reject_repair_read: bool,
     rejected_tool_settlement: AtomicBool,
 }
 
@@ -5200,6 +5784,8 @@ impl BatchRecordingStore {
             inner: MemoryStore::new(),
             batches: Mutex::new(Vec::new()),
             reject_tool_settlement: false,
+            reject_repair_reset: false,
+            reject_repair_read: false,
             rejected_tool_settlement: AtomicBool::new(false),
         }
     }
@@ -5238,6 +5824,12 @@ impl StoreHandle for BatchRecordingStore {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if self.reject_repair_reset && batch.iter().any(|payload| matches!(payload,
+            EventPayload::Item(ItemEvent::Completed { item: TurnItem::Extension { kind, .. }, .. })
+                if kind == "tool_call_repair_reset"
+        )) {
+            return Err(HaiderError::new(ErrorCode::Internal, "injected repair reset failure", false));
+        }
         let reject_tool_settlement = self.reject_tool_settlement
             && matches!(
                 batch.as_slice(),
@@ -5272,6 +5864,13 @@ impl StoreHandle for BatchRecordingStore {
         since_seq: u64,
         limit: usize,
     ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        if self.reject_repair_read {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "injected repair recovery read failure",
+                false,
+            ));
+        }
         self.inner.read(session_id, since_seq, limit).await
     }
 
@@ -5309,6 +5908,8 @@ impl ToolDispatcher for TruncatedToolDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: format!("HEAD:{}:TAIL_FAILURE", "x".repeat(10_000)),
             truncated: true,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -5343,6 +5944,8 @@ impl ToolDispatcher for DurableRunningToolDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "atomic result".into(),
             truncated: false,
+            truncation: None,
+            effects: Vec::new(),
             data: None,
             artifact: None,
             images: Vec::new(),
@@ -5665,6 +6268,132 @@ async fn output_savings_is_one_atomic_child_event_and_replay_uses_only_the_bound
 
     handle.stop().await.expect("actor stops");
     actor_task.await.expect("actor joins");
+}
+
+#[tokio::test]
+async fn repair_reset_store_failure_closes_pending_tools_without_dispatch() {
+    let store = Arc::new(BatchRecordingStore {
+        reject_repair_reset: true,
+        ..BatchRecordingStore::new()
+    });
+    let mut script = malformed_tool_steps("invalid-before-reset", "{broken");
+    script.extend([
+        FakeStep::EmitToolCall {
+            call_id: "valid-reset-fails".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+    ]);
+    let provider = Arc::new(FakeProvider::new(script));
+    let dispatcher = Arc::new(CountingCompletingDispatcher {
+        calls: AtomicUsize::new(0),
+    });
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        config(),
+        provider,
+        store.clone(),
+        Some(dispatcher.clone()),
+    );
+    let task = tokio::spawn(actor.run());
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("fail the reset commit"))
+        .await
+        .expect("submit")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert!(
+        outcome
+            .error
+            .expect("store error")
+            .message
+            .contains("repair reset failure")
+    );
+    assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 0);
+    assert_items_closed_before_terminal(&store.inner.events(&SessionId::new(SESSION)).await);
+    handle.stop().await.expect("stop");
+    task.await.expect("join");
+}
+
+#[tokio::test]
+async fn repair_recovery_read_failure_leaves_the_checkpoint_recoverable() {
+    let (_, events, _, _) = toolrepair_run(
+        config(),
+        vec![
+            FakeStep::EmitToolCall {
+                call_id: "open-on-restart".into(),
+                name: "inspect".into(),
+                args: serde_json::json!({}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ],
+    )
+    .await;
+    let run_id = events[0].run_id.clone().expect("run id");
+    let (index, item_id) = events
+        .iter()
+        .enumerate()
+        .find_map(|(index, event)| match typed(event) {
+            EventPayload::Item(ItemEvent::Started {
+                item_id,
+                item: TurnItem::ToolCall { .. },
+            }) => Some((index, item_id)),
+            _ => None,
+        })
+        .expect("open item");
+    let mut prefix = events[..=index].to_vec();
+    let store = Arc::new(BatchRecordingStore {
+        reject_repair_read: true,
+        ..BatchRecordingStore::new()
+    });
+    StoreHandle::append(&store.inner, &mut prefix)
+        .await
+        .expect("restore durable open item");
+    let provider = Arc::new(FakeProvider::new(vec![]));
+    let handle = HarnessActor::spawn(config(), provider.clone(), store.clone());
+    let outcome = handle
+        .submit_route_wait_turn(SubmitRouteWaitTurn {
+            run_id,
+            messages: vec![Message::user_text("recover")],
+            checkpoint: RouteWaitCheckpoint {
+                tools: vec![RouteWaitToolCheckpoint {
+                    item_id,
+                    call_id: "open-on-restart".into(),
+                    name: "inspect".into(),
+                    args: "{}".into(),
+                }],
+                ..RouteWaitCheckpoint::default()
+            },
+        })
+        .await
+        .expect("resume")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert!(
+        outcome
+            .error
+            .expect("store read error")
+            .message
+            .contains("recovery read failure")
+    );
+    assert!(provider.requests().is_empty());
+    assert_eq!(
+        store.inner.events(&SessionId::new(SESSION)).await,
+        prefix,
+        "read failure must not seal the still-open checkpoint"
+    );
+    handle.stop().await.expect("stop");
 }
 
 /// MUTATION CHECK: replace the four-envelope settlement append with sequential
@@ -6371,3 +7100,160 @@ async fn pause_turn_resends_the_paused_assistant_unchanged_and_journals_web_acti
 
 #[path = "support/request_budget_laws.rs"]
 mod request_budget_laws;
+
+struct AppliedFailureDispatcher {
+    calls: AtomicUsize,
+    effects: Vec<haider_protocol::tool::ToolFileEffect>,
+}
+
+#[async_trait]
+impl ToolDispatcher for AppliedFailureDispatcher {
+    async fn execute(
+        &self,
+        _run_id: &RunId,
+        _item_id: &ItemId,
+        _call_id: &str,
+        _name: &str,
+        _args: serde_json::Value,
+        _cancel: &haider_core::CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut error = HaiderError::new(
+            ErrorCode::Internal,
+            "change ledger failed: injected post-apply evidence failure",
+            false,
+        );
+        error.details = Some(serde_json::json!({"applied_effects": self.effects}));
+        Err(error)
+    }
+}
+
+/// A fatal post-apply failure remains fatal, while the already-applied file
+/// effects are journaled once before the failed tool closes and the run ends.
+#[tokio::test]
+async fn toolshape_fatal_applied_effects_are_journaled_once_before_errored_and_replay() {
+    use haider_protocol::tool::{ToolFileEffect, ToolFileEffectKind, ToolResultStatus};
+    let effects = vec![
+        ToolFileEffect {
+            kind: ToolFileEffectKind::Delete,
+            name: "before.txt".into(),
+            path: "before.txt".into(),
+            absolute_path: "/workspace/before.txt".into(),
+            bytes: 14,
+        },
+        ToolFileEffect {
+            kind: ToolFileEffectKind::Create,
+            name: "after.txt".into(),
+            path: "after.txt".into(),
+            absolute_path: "/workspace/after.txt".into(),
+            bytes: 14,
+        },
+    ];
+    let dispatcher = Arc::new(AppliedFailureDispatcher {
+        calls: AtomicUsize::new(0),
+        effects: effects.clone(),
+    });
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "applied-fixture".into(),
+            name: "fs_path".into(),
+            args: serde_json::json!({"operation":"move","source":"before.txt","destination":"after.txt"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(MemoryStore::new());
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        config(),
+        provider.clone(),
+        store.clone(),
+        Some(dispatcher.clone()),
+    );
+    let actor_task = tokio::spawn(actor.run());
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("move fixture"))
+        .await
+        .expect("accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    let error = outcome.error.expect("original fatal error");
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(
+        error.message,
+        "change ledger failed: injected post-apply evidence failure"
+    );
+    assert!(!error.retryable);
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "fatal failure cannot request another provider response"
+    );
+    assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+    let events = store.events(&SessionId::new(SESSION)).await;
+    assert_items_closed_before_terminal(&events);
+    let results: Vec<_> = events
+        .iter()
+        .filter_map(|event| match typed(event) {
+            EventPayload::ToolResult { call_id, result } => Some((event, call_id, result)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 1);
+    let (envelope, call_id, result) = &results[0];
+    assert_eq!(call_id, "applied-fixture");
+    assert_eq!(result.status, ToolResultStatus::Failed);
+    assert_eq!(result.effects, effects);
+    assert!(result.truncation.is_none());
+    let payload = envelope.payload.to_json_value();
+    assert_eq!(
+        payload
+            .pointer("/effects/0/path")
+            .and_then(serde_json::Value::as_str),
+        Some("before.txt")
+    );
+    assert_eq!(
+        payload
+            .pointer("/effects/1/name")
+            .and_then(serde_json::Value::as_str),
+        Some("after.txt")
+    );
+    let failed_item = events.iter().find(|event| matches!(typed(event), EventPayload::Item(ItemEvent::Completed { item: TurnItem::ToolCall { ref call_id, status: ToolStatus::Failed, .. }, .. }) if call_id == "applied-fixture")).expect("failed item closes");
+    assert!(envelope.seq < failed_item.seq);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(typed(event), EventPayload::RunState(RunState::Errored)))
+            .count(),
+        1
+    );
+    let mut replay = Vec::new();
+    let mut cursor = 0;
+    loop {
+        let page = store
+            .read(&SessionId::new(SESSION), cursor, 7)
+            .await
+            .expect("replay page");
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().expect("nonempty page").seq;
+        replay.extend(page);
+    }
+    assert_eq!(
+        serde_json::to_vec(&replay).expect("replay JSON"),
+        serde_json::to_vec(&events).expect("live journal JSON")
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "replay has no provider effects"
+    );
+    handle.stop().await.expect("stop actor");
+    actor_task.await.expect("join actor");
+}

@@ -16,6 +16,20 @@ use tokio::net::TcpListener;
 async fn spawn_loopback_server(
     routes: Vec<(&'static str, String)>,
 ) -> (String, tokio::task::JoinHandle<()>) {
+    spawn_loopback_byte_server(
+        routes
+            .into_iter()
+            .map(|(path, response)| (path, response.into_bytes()))
+            .collect(),
+    )
+    .await
+}
+
+/// Keep response bodies as raw bytes so source-digest tests can distinguish
+/// the actual body from the lossy UTF-8 projection used for readable output.
+async fn spawn_loopback_byte_server(
+    routes: Vec<(&'static str, Vec<u8>)>,
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("binds loopback listener");
@@ -54,10 +68,10 @@ async fn spawn_loopback_server(
                     .unwrap_or_default()
                     .to_owned();
                 let response = routes.iter().find(|(route, _)| *route == path).map_or_else(
-                    || "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".to_owned(),
+                    || b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".to_vec(),
                     |(_, response)| response.clone(),
                 );
-                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.write_all(&response).await;
                 let _ = socket.shutdown().await;
             });
         }
@@ -298,9 +312,16 @@ async fn source_cap_boundary_truncation_is_off_by_one_honest() {
         "the exact body is the cap to the byte"
     );
     let over = make(SOURCE_CAP + 1);
-    let (base, _server) = spawn_loopback_server(vec![
+    let mut changed_discarded_byte = over.clone();
+    changed_discarded_byte.replace_range(SOURCE_CAP.., "!");
+    assert_eq!(&over[..SOURCE_CAP], &changed_discarded_byte[..SOURCE_CAP]);
+    let (base, server) = spawn_loopback_server(vec![
         ("/exact", text_response("text/html", &exact)),
         ("/over", text_response("text/html", &over)),
+        (
+            "/changed-discarded-byte",
+            text_response("text/html", &changed_discarded_byte),
+        ),
     ])
     .await;
 
@@ -316,6 +337,7 @@ async fn source_cap_boundary_truncation_is_off_by_one_honest() {
         !at.truncated,
         "a body EXACTLY at the source cap with a clean EOF is NOT truncated"
     );
+    assert!(at.truncation.is_none(), "exact-cap EOF has no typed marker");
 
     let past = fetch_public_url(&format!("{base}/over"), None)
         .await
@@ -323,6 +345,67 @@ async fn source_cap_boundary_truncation_is_off_by_one_honest() {
     assert!(past.truncated, "one byte past the source cap IS truncated");
     assert!(past.text.contains("\"haider_elision_v1\""));
     assert!(past.text.contains("\"omitted_bytes_exact\":false"));
+    let provenance = past.truncation.as_ref().expect("source-cap provenance");
+    assert!(provenance.truncated);
+    assert_eq!(provenance.original_bytes, (SOURCE_CAP + 1) as u64);
+    assert_eq!(
+        provenance.sha256, "dc0935c82d0358225cda8e000411be8a277b429dc53e37b880146e6c8de6d136",
+        "digest includes the one observed overflow/lookahead byte"
+    );
+
+    let changed = fetch_public_url(&format!("{base}/changed-discarded-byte"), None)
+        .await
+        .expect("changed discarded suffix fetch succeeds");
+    assert_eq!(
+        changed.text, past.text,
+        "retained response bytes are identical"
+    );
+    let changed_provenance = changed.truncation.expect("changed source-cap provenance");
+    assert_eq!(changed_provenance.original_bytes, provenance.original_bytes);
+    assert_eq!(
+        changed_provenance.sha256,
+        "0c8bfe1f4e3259caf3695d89715bc08a10cef038281a1f55784f51a71d937f3a"
+    );
+    assert_ne!(changed_provenance.sha256, provenance.sha256);
+    server.abort();
+}
+
+/// The production response reader hashes raw body bytes before UTF-8
+/// replacement and output capping, including invalid sequences discarded by
+/// the readable projection. The digest was independently pinned with SHA-256.
+#[tokio::test]
+async fn truncated_invalid_utf8_response_hashes_original_body_bytes() {
+    let mut body = vec![b'x'; 4096];
+    body[..4].copy_from_slice(&[0xff, 0xc3, b'(', 0x80]);
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(&body);
+    let (base, server) = spawn_loopback_byte_server(vec![("/invalid", response)]).await;
+    let outcome = fetch_public_url(&format!("{base}/invalid"), Some(512))
+        .await
+        .expect("invalid UTF-8 still produces bounded readable output");
+    assert!(outcome.truncated);
+    assert!(outcome.text.starts_with("��(�"));
+    assert!(outcome.text.len() <= 512);
+    let provenance = outcome.truncation.expect("output-cap source provenance");
+    assert_eq!(provenance.original_bytes, body.len() as u64);
+    assert_eq!(
+        provenance.sha256,
+        "50988e81d87e6a68088f37f1d6137fd67cb5beb6499e260214587d3bb1745cd2"
+    );
+    assert_ne!(
+        provenance.sha256,
+        haider_protocol::tool::ToolTruncation::from_bytes(
+            String::from_utf8_lossy(&body).as_bytes(),
+            0,
+        )
+        .sha256,
+        "lossy UTF-8 bytes must not become the original-byte hash"
+    );
+    server.abort();
 }
 
 /// LAW (LW6, content-type gate): `text/*` and `application/json` pass;

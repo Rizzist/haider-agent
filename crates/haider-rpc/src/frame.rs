@@ -370,6 +370,10 @@ pub const FEATURE_MONITOR_MUTATE_V1: &str = "monitor_mutate_v1";
 pub const FEATURE_MONITOR_DELIVERY_V1: &str = "monitor_delivery_v1";
 /// Daemon persists and applies typed per-session write/exec permission overrides.
 pub const FEATURE_SESSION_PERMISSION_OVERRIDES_V1: &str = "session_permission_overrides_v1";
+/// Daemon understands and fail-closed applies the additive `read_only`
+/// permission override. Clients must negotiate this separately so an older
+/// daemon cannot ignore the deny while accepting legacy allow fields.
+pub const FEATURE_SESSION_READ_ONLY_V1: &str = "session_read_only_v1";
 /// Daemon persists and applies the explicit interactive/autonomous session mode.
 pub const FEATURE_AUTONOMOUS_INTERACTION_V1: &str = "autonomous_interaction_v1";
 /// Daemon implements the read-only, journal-derived session observation digest.
@@ -1652,6 +1656,8 @@ pub struct SshShellResultWire {
     pub stdout_truncated: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub stderr_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<haider_protocol::tool::ToolTruncation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     pub timed_out: bool,

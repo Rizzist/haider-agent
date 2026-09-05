@@ -1373,14 +1373,24 @@ fn continuation_seen(events: &[EventPayload], marker: &str) -> bool {
     })
 }
 
-fn tool_preview<'a>(events: &'a [EventPayload], call_id: &str) -> &'a str {
+fn tool_payload<'a>(events: &'a [EventPayload], call_id: &str) -> &'a str {
     events
         .iter()
         .find_map(|payload| match payload {
             EventPayload::ToolResult {
                 call_id: seen,
                 result,
-            } if seen == call_id => Some(result.preview.as_str()),
+            } if seen == call_id => {
+                if result.truncated {
+                    let marker = result
+                        .truncation
+                        .as_ref()
+                        .expect("original tool provenance");
+                    assert_eq!(marker.payload_bytes, result.payload_text().len() as u64);
+                    assert!(result.preview.ends_with(&marker.marker()));
+                }
+                Some(result.payload_text())
+            }
             _ => None,
         })
         .unwrap_or_else(|| panic!("missing tool result for {call_id}"))
@@ -2325,6 +2335,7 @@ async fn tool_calls_execute_and_continue_over_real_rpc() {
     )
     .await;
     let overrides = SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: true,
         allow_exec: true,
         allow_mobile: false,
@@ -2360,7 +2371,7 @@ async fn tool_calls_execute_and_continue_over_real_rpc() {
         observed.insert(
             *call_id,
             (
-                tool_preview(&events, call_id).to_owned(),
+                tool_payload(&events, call_id).to_owned(),
                 stdout_bytes(&events),
             ),
         );

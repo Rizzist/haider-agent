@@ -450,6 +450,11 @@ async fn process_exec_streams_exact_bytes_freezes_overflow_and_journals_four_pha
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(result.output_bytes, 4);
     assert_eq!(
+        result.output_sha256,
+        haider_protocol::tool::ToolTruncation::from_bytes(&[0xff, b'a', b'b', b'c'], 0).sha256,
+        "hash original bytes before lossy UTF-8 conversion",
+    );
+    assert_eq!(
         result.transcript_digest,
         format!(
             "blake3:{}",
@@ -498,6 +503,44 @@ async fn process_exec_streams_exact_bytes_freezes_overflow_and_journals_four_pha
         }
     ));
     broker.close().await.expect("broker closes");
+}
+
+#[tokio::test]
+async fn toolshape_one_mib_stdout_hashes_original_before_model_truncation() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (mut broker, _) = broker(workspace.path());
+    let result = broker
+        .process_exec(
+            &ProcessExec::new("one-mib", "head -c 1048576 /dev/zero | tr '\\000' x"),
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds::default(),
+        )
+        .await
+        .expect("start process")
+        .wait()
+        .await
+        .expect("process completes");
+    assert_eq!(result.status, ToolStatus::Completed);
+    assert_eq!(result.output_bytes, 1024 * 1024);
+    assert_eq!(result.source_output_elided_bytes_at_least, 0);
+    assert_eq!(
+        result.output_sha256,
+        "8f990ba0b577b51cf009ea049368c16bbda1b21e1b93be07a824758bb253c39b"
+    );
+    let retained: Vec<u8> = result
+        .inline_output
+        .iter()
+        .flat_map(|chunk| BASE64.decode(&chunk.chunk_b64).expect("base64"))
+        .collect();
+    assert_eq!(retained.len(), result.output_bytes);
+    assert_eq!(retained, vec![b'x'; retained.len()]);
+    assert_eq!(
+        result.output_sha256,
+        haider_protocol::tool::ToolTruncation::from_bytes(&retained, 0).sha256
+    );
+    broker.close().await.expect("close broker");
 }
 
 #[tokio::test]

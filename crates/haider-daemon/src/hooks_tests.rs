@@ -28,6 +28,7 @@ use haider_protocol::hook::{
 };
 use haider_protocol::ids::{ArtifactRef, DeviceId, EffectId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::menu::{AnswerVia, DecisionKind, Menu, MenuKind, MenuOption, MenuScope};
+use haider_protocol::session::SessionPermissionOverridesV1;
 use haider_protocol::state::RunState;
 use haider_protocol::tool::AttachmentBlock;
 use haider_protocol::workspace::{
@@ -803,6 +804,11 @@ struct EngineFixture {
     run_id: RunId,
 }
 
+struct EngineSessionSettings {
+    bind_full: bool,
+    permission_overrides: Option<SessionPermissionOverridesV1>,
+}
+
 impl EngineFixture {
     async fn start(command: &str, timeout_ms: u64, decision: bool, kind: &str) -> Self {
         Self::start_with_trust(command, timeout_ms, decision, kind, true).await
@@ -816,6 +822,28 @@ impl EngineFixture {
             "exec",
             true,
             "user_message",
+        )
+        .await
+    }
+
+    async fn start_read_only_user_message(command: &str) -> Self {
+        Self::start_with_event_trust_binding_and_permissions(
+            command,
+            USER_MESSAGE_CAPTURE_TIMEOUT_MS,
+            false,
+            "exec",
+            true,
+            "user_message",
+            EngineSessionSettings {
+                bind_full: true,
+                permission_overrides: Some(SessionPermissionOverridesV1 {
+                    read_only: true,
+                    allow_writes: true,
+                    allow_exec: true,
+                    allow_mobile: false,
+                    auto_allow: true,
+                }),
+            },
         )
         .await
     }
@@ -875,6 +903,30 @@ impl EngineFixture {
         event: &str,
         bind_full: bool,
     ) -> Self {
+        Self::start_with_event_trust_binding_and_permissions(
+            command,
+            timeout_ms,
+            decision,
+            kind,
+            trust,
+            event,
+            EngineSessionSettings {
+                bind_full,
+                permission_overrides: None,
+            },
+        )
+        .await
+    }
+
+    async fn start_with_event_trust_binding_and_permissions(
+        command: &str,
+        timeout_ms: u64,
+        decision: bool,
+        kind: &str,
+        trust: bool,
+        event: &str,
+        settings: EngineSessionSettings,
+    ) -> Self {
         let workspace_guard = tempfile::tempdir().expect("workspace");
         let profile_guard = tempfile::tempdir().expect("profile");
         let workspace = canonical(workspace_guard.path());
@@ -906,7 +958,7 @@ impl EngineFixture {
             provider: "fake".into(),
             model: "fake-model".into(),
             max_tokens: 4096,
-            permission_overrides: None,
+            permission_overrides: settings.permission_overrides,
             effort: None,
             fast: false,
             cache_policy: Default::default(),
@@ -916,7 +968,7 @@ impl EngineFixture {
         })
         .await
         .expect("create session");
-        if bind_full {
+        if settings.bind_full {
             hub.bind_lockdown_turn(
                 &session_id,
                 &run_id,
@@ -2411,6 +2463,36 @@ async fn matcher_fires_only_after_commit() {
     )
     .await
     .expect("hook marker");
+    fixture.close().await;
+}
+
+/// MUTATION CHECK: let explicit run trust or profile trust bypass read-only,
+/// or silently discard the matching hook. Expected failure: the marker is
+/// created or the typed notice naming `--read-only` disappears.
+#[tokio::test]
+async fn read_only_run_suppresses_trusted_hook_process_with_typed_notice() {
+    let marker_dir = tempfile::tempdir().expect("marker dir");
+    let marker = marker_dir.path().join("read-only-hook-fired");
+    let command = write_command("forbidden", &marker);
+    let fixture = EngineFixture::start_read_only_user_message(&command).await;
+    fixture
+        .accept_user_message(
+            "read-only-hook",
+            "inspect only",
+            DeliveryMode::Steer,
+            Vec::new(),
+        )
+        .await;
+    wait_for_hook_outbox_drain(&fixture.store, ASYNC_HOOK_STATE_OBSERVATION_TIMEOUT).await;
+    assert!(!marker.exists());
+    assert!(fixture.events().await.iter().any(|event| {
+        matches!(
+            HookEventPayload::from_payload_value(event.payload.clone().into()),
+            Ok(HookEventPayload::HookNotice(ref notice))
+                if notice.reason == super::READ_ONLY_HOOK_DENIAL
+                    && notice.hook.as_deref() == Some("test_hook")
+        )
+    }));
     fixture.close().await;
 }
 

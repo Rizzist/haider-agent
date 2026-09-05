@@ -938,6 +938,8 @@ mod reducer_filter_tests {
             result: BoundedResult {
                 preview: "committed".into(),
                 truncated: false,
+                truncation: None,
+                effects: Vec::new(),
                 data: None,
                 artifact: None,
                 images: Vec::new(),
@@ -976,6 +978,7 @@ mod reducer_filter_tests {
             state: TaskTerminalState::Completed { exit_code: Some(0) },
             elapsed_ms: 1,
             output_bytes: 0,
+            output_sha256: None,
             tail: String::new(),
             artifact: None,
             full_output_unavailable: false,

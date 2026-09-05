@@ -33,10 +33,8 @@
 //! - **Intent-bound authorization.** Lifecycle state retains the complete
 //!   journaled intent. Authorization and later transitions accept that intent,
 //!   and reject a reused effect id whose digest or other fields differ.
-//! - **Explicit deny wins** over every form of approval. A non-interactive
-//!   residual-Ask fallback is deliberately lower priority than an explicit
-//!   grant, but still journals `Deny`; `Dispatched`/`Outcome` can only follow
-//!   an `Allow` authorization (enforced by `require_state`).
+//! - **Explicit deny wins** over every form of approval. `Dispatched`/`Outcome`
+//!   can only follow an `Allow` authorization (enforced by `require_state`).
 //! - The journal sink never leaves the broker. Tests inspect a broker-owned,
 //!   read-only snapshot of successfully appended phases instead of recovering
 //!   or mutating the sink.
@@ -286,10 +284,10 @@ struct DenyRule {
 
 /// Permission policy keyed by normalized effect class.
 ///
-/// Classes absent from all three lists default to `Ask`. An optional fallback
-/// can turn only that residual `Ask` into a typed denial for a non-interactive
-/// caller. Overlaps are resolved conservatively: explicit deny, exact
-/// always-allow, session/class allow, unresolved-ask fallback, ask.
+/// Classes absent from all three lists default to `Ask`. An autonomous caller
+/// may promote that final Ask to Allow. Overlaps are resolved conservatively:
+/// hard/explicit deny, exact always-allow, session/class allow, autonomous
+/// Ask promotion, Ask.
 #[derive(Debug, Clone, Default)]
 pub struct PermissionPolicy {
     /// Immutable daemon ceilings. User answers and session grants are
@@ -300,7 +298,7 @@ pub struct PermissionPolicy {
     denylist: Vec<DenyRule>,
     always_allow: Vec<AlwaysAllowRule>,
     session_allow: Vec<SessionGrant>,
-    unresolved_ask_denial: Option<String>,
+    auto_allow_asks: bool,
 }
 
 impl PermissionPolicy {
@@ -358,11 +356,10 @@ impl PermissionPolicy {
         });
     }
 
-    /// Denies only effects that would otherwise require a human answer.
-    /// Explicit deny rules retain highest priority, while exact and durable
-    /// session grants remain effective before this fallback is consulted.
-    pub fn deny_unresolved_asks(&mut self, reason: impl Into<String>) {
-        self.unresolved_ask_denial = Some(reason.into());
+    /// Resolves every otherwise-unanswered Ask to ordinary Allow. Explicit
+    /// deny rules and daemon hard denies are evaluated first and still win.
+    pub fn auto_allow_asks(&mut self) {
+        self.auto_allow_asks = true;
     }
 
     pub fn always_allow(&mut self, intent: &EffectIntent) {
@@ -473,10 +470,8 @@ impl PermissionPolicy {
         {
             return PolicyDecision::Allow;
         }
-        if let Some(reason) = &self.unresolved_ask_denial {
-            return PolicyDecision::Deny {
-                reason: reason.clone(),
-            };
+        if self.auto_allow_asks {
+            return PolicyDecision::Allow;
         }
         PolicyDecision::Ask
     }
@@ -1421,11 +1416,16 @@ impl EffectBroker {
     ) -> ToolResult<AuthorizationVerdict> {
         self.require_state(&intent.effect, LifecycleState::Intent)?;
         let recorded = self.require_recorded_intent(intent)?;
-        let decision = match policy.decision(&recorded) {
-            PolicyDecision::Ask => self
+        let policy_decision = policy.decision(&recorded);
+        let decision = match policy_decision {
+            // Current hard/explicit policy denies are the highest authority.
+            PolicyDecision::Deny { .. } => policy_decision,
+            // A previously committed answer is explicit user intent for this
+            // exact class+argument digest. It must beat both ordinary policy
+            // allows and Autonomous's residual-Ask promotion.
+            PolicyDecision::Allow | PolicyDecision::Ask => self
                 .take_one_shot_decision(&recorded)
-                .unwrap_or(PolicyDecision::Ask),
-            decision => decision,
+                .unwrap_or(policy_decision),
         };
         let mut pending_permission = None;
         let verdict = match decision {
@@ -1998,9 +1998,9 @@ impl EffectBroker {
         }
     }
 
-    /// Consumes (single use) a stored menu decision for this exact
-    /// class + digest. One-shot rules are consulted only when the base policy
-    /// would ask, so a policy-level allow or deny always wins.
+    /// Consumes (single use) a stored menu decision for this exact class and
+    /// digest. A current explicit/hard policy deny wins first; otherwise this
+    /// committed user decision precedes ordinary and autonomous allows.
     fn take_one_shot_decision(&mut self, intent: &EffectIntent) -> Option<PolicyDecision> {
         let index = self.one_shot_rules.iter().position(|rule| {
             rule.class == intent.class && rule.args_digest == intent.args_digest

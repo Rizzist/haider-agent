@@ -1,0 +1,9 @@
+Independent review confirms both parser contracts and inherited resume permissions.
+Original tests remain intact; two regression matrices cover the conflict.
+
+Verified workspace totals: 5,206 passed, 0 failed, 13 ignored.
+Clippy exit 0; baseline 4,799. Whitespace and unresolved-index checks are clean.
+Changes remain uncommitted.
+
+VERIFIER: findings=0 real=0 noise=0 — no findings
+SHIP

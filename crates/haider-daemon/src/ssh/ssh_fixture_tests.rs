@@ -160,7 +160,15 @@ impl server::Handler for FixtureHandler {
         if command.contains("fixture-drop") {
             return Err(russh::Error::Disconnect);
         }
-        session.data(channel, format!("stdout:{command}\n").into_bytes())?;
+        let stdout = if command == "toolshape-overflow" {
+            // An invalid wire byte proves the digest precedes lossy UTF-8,
+            // even when the SSH receive window ends exactly at the cap.
+            session.extended_data(channel, 1, vec![0xff])?;
+            vec![b'x'; haider_tools::PROCESS_MAX_OUTPUT_BYTES + 32_768]
+        } else {
+            format!("stdout:{command}\n").into_bytes()
+        };
+        session.data(channel, stdout)?;
         session.extended_data(channel, 1, format!("stderr:{command}\n").into_bytes())?;
         let code = u32::from(command.contains("exit-7")) * 7;
         session.exit_status_request(channel, code)?;
@@ -448,6 +456,53 @@ async fn pure_russh_fixture_key_auth_tofu_exec_stream_and_exit_code() {
     assert!(result.stderr.contains("stderr:stream exit-7"));
     assert_eq!(result.exit_code, Some(7));
     assert_eq!(server.state.public_key_auths.load(Ordering::Relaxed), 1);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn toolshape_ssh_hashes_original_bytes_before_lossy_utf8_and_output_cap() {
+    let mut server = FixtureServer::start(SERVER_KEY_A, None).await;
+    let store = SshProfileStore::new(Arc::new(MemoryVault::default()));
+    let key_ref = store
+        .put_auth_secret("hash-fixture", CLIENT_KEY.as_bytes())
+        .expect("client key");
+    store
+        .add(network_profile(
+            "hash-fixture",
+            server.port(),
+            SshAuth::KeyMaterial { vault_ref: key_ref },
+        ))
+        .expect("profile");
+    let runtime = SshRuntime::new(store);
+    let result = runtime
+        .exec(exec_request("hash-fixture", "toolshape-overflow"))
+        .await
+        .expect("capped SSH exec");
+    assert!(result.stdout_truncated);
+    let marker = result.truncation.expect("original SSH provenance");
+    assert_eq!(result.stderr, "\u{fffd}");
+    assert_eq!(
+        result.stdout.len() + 1,
+        haider_tools::PROCESS_MAX_OUTPUT_BYTES
+    );
+    assert!(marker.original_bytes >= haider_tools::PROCESS_MAX_OUTPUT_BYTES as u64);
+    let mut original = vec![0xff];
+    original.extend(vec![b'x'; haider_tools::PROCESS_MAX_OUTPUT_BYTES + 32_768]);
+    let observed = original
+        .get(..marker.original_bytes as usize)
+        .expect("observed interleaved output prefix");
+    assert_eq!(
+        marker.sha256,
+        haider_protocol::tool::ToolTruncation::from_bytes(observed, 0).sha256
+    );
+    assert_ne!(
+        marker.sha256,
+        haider_protocol::tool::ToolTruncation::from_bytes(
+            format!("{}{}", result.stderr, result.stdout).as_bytes(),
+            0,
+        )
+        .sha256
+    );
     server.stop().await;
 }
 

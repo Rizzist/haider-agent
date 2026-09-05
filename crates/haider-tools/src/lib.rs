@@ -13,6 +13,8 @@ mod checkpoint_tests;
 mod computer;
 mod error;
 mod filesystem;
+mod filesystem_aliases;
+mod filesystem_edit_diagnostic;
 mod graph_evidence;
 mod ledger;
 mod list_models;
@@ -69,6 +71,7 @@ pub use filesystem::{
     SEARCH_STRUCTURED_LINE_BYTES, SEARCH_WALL_TIME_BUDGET, TurnAttribution, fs_edit_manifest,
     fs_glob_manifest, fs_path_manifest, fs_read_manifest, fs_search_manifest, fs_write_manifest,
 };
+pub use filesystem_aliases::{edit_manifest, write_manifest};
 pub use graph_evidence::{GraphEvidence, graph_evidence_manifest};
 pub use haider_protocol::computer::{ComputerAction, ScreenPoint, ScrollDirection};
 pub use haider_protocol::context::{

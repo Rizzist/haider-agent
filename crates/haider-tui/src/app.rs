@@ -3539,8 +3539,7 @@ pub enum AppRequest {
     /// from the OS on the keystroke. The read is SHELL-owned for exactly
     /// the reason [`Self::AttachRead`] is: the reducer performs no IO. The
     /// outcome re-enters through [`crate::runtime::clipboard_paste_effects`]
-    /// — a chip + upload, an image notice, or nothing at all when the
-    /// clipboard holds text (which the terminal's own paste already owns).
+    /// — text through the paste reducer, a chip + upload, or an image notice.
     ClipboardRead,
     /// Upload one attachment's bytes into the daemon CAS (B4b) — the
     /// receipt-free `artifact.put` (content-addressed, naturally
@@ -4645,6 +4644,7 @@ pub fn update_version_label(version: &str) -> String {
 /// every time a new consumer picked the wrong lane. The clipboard bytes
 /// crossterm itself buffered are upstream of this boundary and out of our
 /// hands; OUR copy is wiped.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Pasted(zeroize::Zeroizing<String>);
 
 impl Pasted {
@@ -5981,25 +5981,28 @@ impl AppModel {
         self.dirty = true;
     }
 
-    /// ⌃V / ⌘V / ⌃⇧V — attach the OS clipboard's IMAGE (970 owner bug 2).
-    ///
-    /// This is `/attach` with a different source of bytes, so it holds
-    /// EXACTLY the same gates in the same order, and the bytes land through
-    /// the same seam ([`Self::begin_attachment_upload`]) wearing the same
-    /// chip. Two differences, both deliberate:
-    ///
-    /// * the read is issued blind. The reducer cannot know whether the
-    ///   clipboard holds an image, text or nothing without performing IO,
-    ///   so the vision gate is re-checked in the shell effect once the
-    ///   content is actually known — a picture is refused there, and TEXT
-    ///   never reaches the gate at all;
-    /// * a wrong-surface press is SILENT. ⌃V is a keystroke, not a typed
-    ///   command: flashing "session only" at someone who reflex-pasted on
-    ///   the launcher would be noise, where `/attach` was a deliberate ask
-    ///   that deserves an answer.
-    fn paste_clipboard_image(&mut self) {
-        if self.screen != Screen::Session {
+    /// A forwarded paste chord or captured right-click reads the clipboard.
+    /// The terminal consumes its own paste gesture OR forwards input to us;
+    /// when forwarded, text must be inserted here as well as images.
+    pub fn request_clipboard_paste(&mut self) {
+        let text_field = self.login.is_some()
+            || self.talk_setup.is_some()
+            || self.custom_add.is_some()
+            || self.ssh_form.is_some()
+            || self.ssh_terminal.is_some();
+        if !text_field && !self.clipboard_composer_visible() {
             return;
+        }
+        self.requests.push(AppRequest::ClipboardRead);
+        self.dirty = true;
+    }
+
+    /// Apply attachment gates only AFTER the clipboard is known to hold an
+    /// image. Text paste must work without vision, a daemon store, or a free
+    /// attachment slot. Shared by the real OS read and headless CI.
+    pub fn accepts_clipboard_image(&mut self) -> bool {
+        if self.screen != Screen::Session || !self.clipboard_composer_visible() {
+            return false;
         }
         // Same live-mode law as `/attach`: attachments are daemon CAS
         // truth, and the demo has no store to hold bytes.
@@ -6007,27 +6010,23 @@ impl AppModel {
             self.flash =
                 Some("· paste — live only; attachments ride the daemon's store".to_owned());
             self.dirty = true;
-            return;
+            return false;
         }
         if !self.daemon_serves(haider_rpc::FEATURE_ARTIFACT_PUT_V1) {
             self.flash = Some(self.stale_daemon_note("attachments"));
             self.dirty = true;
-            return;
+            return false;
         }
         if self.composer.attachments().len() >= MAX_TURN_ATTACHMENTS {
             self.flash = Some("· 5 attachments a turn — ⌫ at the start removes one".to_owned());
             self.dirty = true;
-            return;
+            return false;
         }
-        // The vision gate BEFORE the read, when the answer is already
-        // known: a pair that declares no vision never pays for a clipboard
-        // round trip. The draft is kept, untouched.
         if let Some(notice) = self.image_refusal() {
             self.set_composer_notice(notice);
-            return;
+            return false;
         }
-        self.requests.push(AppRequest::ClipboardRead);
-        self.dirty = true;
+        true
     }
 
     /// `/rename <name>` (G2): rename the attached session. Live rides the
@@ -6838,6 +6837,20 @@ impl AppModel {
                 // moving on. Cleared BEFORE dispatch so the very key that
                 // raises a new one (⌃V) still shows it.
                 self.composer_notice = None;
+                // If the terminal forwards its paste chord, fetch the OS
+                // clipboard before a modal can ignore it or type a literal
+                // 'v'. Text re-enters the existing zeroizing Paste route,
+                // including masked fields. Loom retains Ctrl+V validation.
+                if matches!(key.code, KeyCode::Char('v' | 'V'))
+                    && (key.modifiers == KeyModifiers::CONTROL
+                        || key.modifiers == KeyModifiers::SUPER
+                        || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                        || key.modifiers == (KeyModifiers::SUPER | KeyModifiers::SHIFT))
+                    && self.screen != Screen::Loom
+                {
+                    self.request_clipboard_paste();
+                    return;
+                }
                 // The masked login card OWNS the keyboard while it is open
                 // (W3c3 M3): a key must never reach the composer, the
                 // palette, the input ring or a selection gate, because
@@ -6859,6 +6872,19 @@ impl AppModel {
                 // keep editing — `talk_key` settles the session and
                 // returns false so the char flows the NORMAL path).
                 if self.talk.engaged() && self.talk_key(&key) {
+                    return;
+                }
+                // Windows/Linux copy chord. Handle both case spellings
+                // before clear-on-keypress, and never navigate/quit when
+                // there is no selection. Release-to-copy remains intact.
+                if matches!(key.code, KeyCode::Char('c' | 'C'))
+                    && key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                {
+                    if self.selection.is_some() {
+                        self.requests.push(AppRequest::CopySelection);
+                    } else if self.clipboard_composer_visible() {
+                        self.selection_key(&key);
+                    }
                     return;
                 }
                 // TUI5 item 4 — the selection gates run BEFORE the
@@ -7057,7 +7083,9 @@ impl AppModel {
             self.composer.clear_selection();
             return true;
         }
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if matches!(key.code, KeyCode::Char('c' | 'C'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
             if let Some(text) = self.composer.selected_text() {
                 self.requests.push(AppRequest::CopyText(text.to_owned()));
             }
@@ -7820,28 +7848,6 @@ impl AppModel {
                 KeyCode::Char('f') => self.tree_fork_selected(),
                 _ => {}
             }
-            return;
-        }
-
-        // 970 owner bug 2 — the PASTE-IMAGE chord, ahead of the plain ⌃
-        // block so it catches every spelling terminals actually send:
-        // ⌃V (passed through everywhere), ⌘V (macOS terminals speaking the
-        // kitty keyboard protocol, which report SUPER), and ⌃⇧V (the Linux
-        // terminal paste chord, when the emulator forwards it instead of
-        // answering it). A terminal that answers the chord ITSELF sends a
-        // bracketed paste instead — that is the TEXT path, and it is
-        // untouched by this arm.
-        //
-        // Loom keeps its own ⌃V (`/validate`), so it is excluded rather
-        // than shadowed.
-        if matches!(key.code, KeyCode::Char('v' | 'V'))
-            && key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
-            && self.screen != Screen::Loom
-            && self.composer_owns_input()
-        {
-            self.paste_clipboard_image();
             return;
         }
 
@@ -8810,6 +8816,26 @@ impl AppModel {
             && self.talk_setup.is_none()
             && !self.talk.engaged()
             && self.composer_owns_input()
+    }
+
+    /// Clipboard gestures can arrive before screen-specific key handlers.
+    /// Do not let them read/copy the parked draft behind a read-only view
+    /// or a modal; modal text paste has its own AppEvent::Paste targets.
+    fn clipboard_composer_visible(&self) -> bool {
+        matches!(
+            self.screen,
+            Screen::Launcher | Screen::Session | Screen::Subagent | Screen::Aura | Screen::Loom
+        ) && self.composer_owns_input()
+            && !self.lockdown_overlay
+            && self.login.is_none()
+            && self.talk_setup.is_none()
+            && self.custom_add.is_none()
+            && self.ssh_form.is_none()
+            && self.ssh_terminal.is_none()
+            && !self
+                .loom_authoring
+                .as_ref()
+                .is_some_and(|authoring| self.screen == Screen::Loom && authoring.pending)
     }
 
     fn composer_owns_input(&self) -> bool {

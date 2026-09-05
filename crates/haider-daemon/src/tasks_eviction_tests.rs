@@ -153,6 +153,7 @@ fn durable_staging_keeps_running_tasks_killable() {
         state: TaskTerminalState::Completed { exit_code: Some(0) },
         elapsed_ms: 1,
         output_bytes: 6,
+        output_sha256: None,
         tail: "abcdef".into(),
         artifact: Some(haider_protocol::ids::ArtifactRef::new("blake3:buffer-test")),
         full_output_unavailable: false,
@@ -169,4 +170,162 @@ fn durable_staging_keeps_running_tasks_killable() {
     assert_eq!(entry.state, TaskLiveState::Running);
     assert!(entry.output.is_none());
     assert!(entry.kill.is_some());
+}
+
+#[tokio::test]
+async fn toolshape_task_output_original_hash_survives_completion_eviction_and_adoption() {
+    let profile = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(profile.path())
+        .await
+        .expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let facade = TaskFacade::new(hub.clone());
+    let registry = hub.task_registry();
+    let session = SessionId::new("toolshape-task-session");
+    hub.create_internal_session(haider_core::SessionCreateCommand {
+        command_id: "toolshape-create-session".into(),
+        request_digest: "toolshape-create-session-digest".into(),
+        request_json: "{}".into(),
+        session_id: session.clone(),
+        cwd: profile.path().to_string_lossy().into_owned(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("toolshape-session-created"),
+        device_id: hub.device_id(),
+    })
+    .await
+    .expect("durable session");
+    let task = TaskId::new("toolshape-task");
+    let output = shared_task_output(8, 4);
+    let original = b"original\0\xff-stream-beyond-retention-tail";
+    lock_task_output(&output).append(original);
+    let live_buffer = Arc::downgrade(&output);
+    assert!(registry.begin_adoption(&session));
+    let entry = running_entry(&task, Arc::clone(&output));
+    let mut started = [facade.task_fact_envelope(
+        &session,
+        &entry.run_id,
+        None,
+        None,
+        "toolshape-task-started",
+        TaskStarted {
+            task: task.clone(),
+            name: entry.name.clone(),
+            command: "fixture".into(),
+            pid: entry.pid,
+            started_at_ms: entry.started_at_ms,
+        }
+        .to_payload_value()
+        .expect("start payload"),
+        PromptRender::Omit,
+    )];
+    hub.append(&mut started).await.expect("durable start");
+    registry.insert(&session, entry);
+    drop(output);
+    let mut live = Vec::new();
+    for cursor in [None, Some(0), Some(8)] {
+        let result = facade
+            .task_output(&session, task.as_str(), cursor)
+            .await
+            .expect("live output");
+        let marker = result.truncation.as_ref().expect("live provenance");
+        assert_eq!(marker.original_bytes, original.len() as u64);
+        assert_eq!(
+            marker.sha256,
+            "01a8c9fc3f120663a00ea7d97b30d8a701ad198800bf3e4b0bfca2794bb0a5a4"
+        );
+        assert_eq!(marker.payload_bytes, result.payload_text().len() as u64);
+        assert!(result.preview.ends_with(&marker.marker()));
+        live.push(result);
+    }
+    facade
+        .complete_task(
+            &session,
+            &task,
+            BackgroundExitStatus {
+                exit_code: Some(0),
+                signal: None,
+                killed: false,
+                fault: None,
+                workspace_mutation: None,
+            },
+        )
+        .await;
+    assert!(live_buffer.upgrade().is_none());
+    let scan = facade
+        .scan_session_tasks(&session)
+        .await
+        .expect("durable completed fact");
+    let completed = scan.completed.get(&task).expect("completion journaled");
+    assert_eq!(
+        completed.output_sha256.as_deref(),
+        Some("01a8c9fc3f120663a00ea7d97b30d8a701ad198800bf3e4b0bfca2794bb0a5a4")
+    );
+    assert_eq!(completed.output_bytes, original.len() as u64);
+    assert!(completed.truncated);
+    let mut terminal = Vec::new();
+    for (cursor, live) in [None, Some(0), Some(8)].into_iter().zip(live) {
+        let result = facade
+            .task_output(&session, task.as_str(), cursor)
+            .await
+            .expect("terminal output");
+        assert_eq!(
+            result
+                .truncation
+                .as_ref()
+                .expect("terminal provenance")
+                .sha256,
+            live.truncation.as_ref().expect("live provenance").sha256
+        );
+        let mut before: serde_json::Value =
+            serde_json::from_str(live.payload_text()).expect("live JSON");
+        let mut after: serde_json::Value =
+            serde_json::from_str(result.payload_text()).expect("terminal JSON");
+        before.as_object_mut().expect("live object").remove("state");
+        after
+            .as_object_mut()
+            .expect("terminal object")
+            .remove("state");
+        assert_eq!(before, after, "only lifecycle state changes at completion");
+        terminal.push(result);
+    }
+    registry.remove_session(&session);
+    for (cursor, expected) in [None, Some(0), Some(8)].into_iter().zip(terminal) {
+        assert_eq!(
+            facade
+                .task_output(&session, task.as_str(), cursor)
+                .await
+                .expect("readopted output"),
+            expected
+        );
+    }
+    let mut legacy_json = completed.to_payload_value().expect("completed JSON");
+    legacy_json
+        .as_object_mut()
+        .expect("completed object")
+        .remove("output_sha256");
+    let legacy = TaskEventPayload::from_payload_value(&legacy_json).expect("legacy task decode");
+    let TaskEventPayload::TaskCompleted(legacy) = legacy else {
+        panic!("completion variant")
+    };
+    assert!(legacy.output_sha256.is_none());
+    registry.set_terminal(&session, &task, legacy.state.clone(), legacy);
+    let legacy_output = facade
+        .task_output(&session, task.as_str(), None)
+        .await
+        .expect("legacy output");
+    assert!(legacy_output.truncated);
+    assert!(
+        legacy_output.truncation.is_none(),
+        "unknown original hash must not be fabricated"
+    );
+    assert!(serde_json::from_str::<serde_json::Value>(&legacy_output.preview).is_ok());
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
 }

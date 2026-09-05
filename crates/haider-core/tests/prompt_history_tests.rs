@@ -2037,6 +2037,8 @@ async fn tree_compilation_is_byte_identical_to_journal_rendering() {
                 result: BoundedResult {
                     preview: "exact\nresult".into(),
                     truncated: true,
+                    truncation: None,
+                    effects: Vec::new(),
                     data: None,
                     artifact: None,
                     images: Vec::new(),
@@ -4498,6 +4500,8 @@ async fn tool_result_is_presented_after_its_completed_tool_call() {
                 result: BoundedResult {
                     preview: "contents".into(),
                     truncated: false,
+                    truncation: None,
+                    effects: Vec::new(),
                     data: None,
                     artifact: None,
                     images: Vec::new(),
@@ -4577,6 +4581,8 @@ async fn journal_keeps_full_tool_output_while_replay_builds_the_same_compact_mod
     let durable_result = BoundedResult {
         preview: raw.clone(),
         truncated: false,
+        truncation: None,
+        effects: Vec::new(),
         data: None,
         artifact: None,
         images: Vec::new(),
@@ -5735,6 +5741,7 @@ async fn task_facts_reach_the_next_turn_prompt_and_omit_is_the_off_switch() {
         state: TaskTerminalState::Completed { exit_code: Some(0) },
         elapsed_ms: 42_000,
         output_bytes: 900_000,
+        output_sha256: None,
         tail: "test result: ok\n".into(),
         artifact: Some(ArtifactRef::new("blake3:task-output")),
         truncated: true,
@@ -5748,6 +5755,7 @@ async fn task_facts_reach_the_next_turn_prompt_and_omit_is_the_off_switch() {
         state: TaskTerminalState::Killed,
         elapsed_ms: 1_000,
         output_bytes: 0,
+        output_sha256: None,
         tail: String::new(),
         artifact: None,
         truncated: false,
@@ -5892,6 +5900,8 @@ async fn cancelled_and_errored_runs_keep_their_committed_history() {
                 result: BoundedResult {
                     preview: "grep output".into(),
                     truncated: false,
+                    truncation: None,
+                    effects: Vec::new(),
                     data: None,
                     artifact: None,
                     images: Vec::new(),
@@ -6352,6 +6362,8 @@ async fn structural_selection_replays_from_the_append_only_journal_after_restart
                 result: BoundedResult {
                     preview: "complete stale file contents".into(),
                     truncated: false,
+                    truncation: None,
+                    effects: Vec::new(),
                     data: None,
                     artifact: None,
                     images: Vec::new(),
@@ -6475,6 +6487,8 @@ async fn structural_selection_replays_from_the_append_only_journal_after_restart
                 result: BoundedResult {
                     preview: "current tool result must survive".into(),
                     truncated: false,
+                    truncation: None,
+                    effects: Vec::new(),
                     data: None,
                     artifact: None,
                     images: Vec::new(),

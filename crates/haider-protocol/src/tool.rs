@@ -106,6 +106,12 @@ pub struct ToolInventorySnapshot {
 pub struct BoundedResult {
     pub preview: String,
     pub truncated: bool,
+    /// Exact byte provenance for an output projection that discarded bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<ToolTruncation>,
+    /// Applied file mutations, in workspace-receipt order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<ToolFileEffect>,
     /// Additive, tool-specific structured facts. Text previews remain stable
     /// for legacy consumers; typed clients can consume these facts directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,11 +138,144 @@ pub struct BoundedResult {
     pub presentation: Option<ErrorPresentation>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolTruncation {
+    pub truncated: bool,
+    pub original_bytes: u64,
+    pub payload_bytes: u64,
+    pub sha256: String,
+}
+
+impl ToolTruncation {
+    pub fn from_bytes(original: &[u8], payload_bytes: usize) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            truncated: true,
+            original_bytes: original.len() as u64,
+            payload_bytes: payload_bytes as u64,
+            sha256: format!("{:x}", Sha256::digest(original)),
+        }
+    }
+
+    pub fn marker(&self) -> String {
+        format!(
+            "[haider:truncated truncated=true original_bytes={} payload_bytes={} sha256={}]",
+            self.original_bytes, self.payload_bytes, self.sha256,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolFileEffectKind {
+    Write,
+    Create,
+    Edit,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolFileEffect {
+    pub kind: ToolFileEffectKind,
+    pub name: String,
+    pub path: String,
+    pub absolute_path: String,
+    pub bytes: u64,
+}
+
+impl BoundedResult {
+    /// Keep the existing payload bytes intact; the final line is additive.
+    pub fn declare_truncation(&mut self, mut truncation: ToolTruncation) {
+        if self.truncation.is_some() {
+            self.preview = self.payload_text().to_owned();
+        }
+        truncation.payload_bytes = self.preview.len() as u64;
+        if !self.preview.is_empty() && !self.preview.ends_with('\n') {
+            self.preview.push('\n');
+        }
+        self.preview.push_str(&truncation.marker());
+        self.truncated = true;
+        self.truncation = Some(truncation);
+    }
+
+    /// The legacy payload without the declared final marker or its separator.
+    /// Slice only when the typed byte count and exact suffix agree.
+    pub fn payload_text(&self) -> &str {
+        if let Some(marker) = &self.truncation
+            && let Ok(len) = usize::try_from(marker.payload_bytes)
+            && let Some(payload) = self.preview.get(..len)
+        {
+            let separator = if payload.is_empty() || payload.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            if self.preview[len..] == format!("{separator}{}", marker.marker()) {
+                return payload;
+            }
+        }
+        &self.preview
+    }
+}
+
+/// Keep the legacy `result` object and expose the locked metadata pointers on
+/// the durable tool-result payload itself. Direct BoundedResult users also get
+/// the typed facts; both representations deserialize through the same type.
+pub(crate) mod tool_result_payload {
+    use super::{BoundedResult, ToolFileEffect, ToolTruncation};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        result: &BoundedResult,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            result: &'a BoundedResult,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            truncation: &'a Option<ToolTruncation>,
+            #[serde(skip_serializing_if = "<[ToolFileEffect]>::is_empty")]
+            effects: &'a [ToolFileEffect],
+        }
+        Payload {
+            result,
+            truncation: &result.truncation,
+            effects: &result.effects,
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BoundedResult, D::Error> {
+        #[derive(Deserialize)]
+        struct Payload {
+            result: BoundedResult,
+            #[serde(default)]
+            truncation: Option<ToolTruncation>,
+            #[serde(default)]
+            effects: Vec<ToolFileEffect>,
+        }
+        let mut payload = Payload::deserialize(deserializer)?;
+        if payload.truncation.is_some() {
+            payload.result.truncation = payload.truncation;
+        }
+        if !payload.effects.is_empty() {
+            payload.result.effects = payload.effects;
+        }
+        Ok(payload.result)
+    }
+}
+
 /// Structured facts emitted by bounded tool results without replacing their
 /// compact, backwards-compatible text preview.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolResultData {
+    InvalidToolCall {
+        tool: String,
+        message: String,
+    },
     FsSearch {
         matches: Vec<FsSearchMatch>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

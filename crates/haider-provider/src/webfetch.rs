@@ -59,6 +59,8 @@ pub struct WebFetchOutcome {
     pub text: String,
     /// Whether the source or the reduced output was cut at a cap.
     pub truncated: bool,
+    /// Captured response bytes before text extraction and output capping.
+    pub truncation: Option<haider_protocol::tool::ToolTruncation>,
 }
 
 /// Result of the production GET retry seam. `attempts` is always one or two
@@ -527,18 +529,20 @@ async fn fetch_public_url_inner(
             .then(|| valid_last_modified(response.headers()))
             .flatten();
         let content_type = declared_media_type(&response)?;
-        let (bytes, source_truncated) = read_body_bounded(response, deadline).await?;
+        let (bytes, source_truncated, original) = read_body_bounded(response, deadline).await?;
         let text = if content_type == "text/html" {
             reduce_html_to_text(&String::from_utf8_lossy(&bytes))
         } else {
             String::from_utf8_lossy(&bytes).into_owned()
         };
         let (text, truncated) = cap_output(text, output_cap, source_truncated);
+        let truncation = truncated.then_some(original);
         let outcome = WebFetchOutcome {
             final_url: current.to_string(),
             content_type,
             text,
             truncated,
+            truncation,
         };
         if etag.is_some() || last_modified.is_some() {
             with_validator_cache(|cache| {
@@ -778,25 +782,46 @@ fn valid_last_modified(
 async fn read_body_bounded(
     mut response: reqwest::Response,
     deadline: tokio::time::Instant,
-) -> Result<(Vec<u8>, bool), ProviderError> {
+) -> Result<(Vec<u8>, bool, haider_protocol::tool::ToolTruncation), ProviderError> {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    let mut original_bytes = 0u64;
+    let finish = |body, truncated, original_bytes, hasher: Sha256| {
+        (
+            body,
+            truncated,
+            haider_protocol::tool::ToolTruncation {
+                truncated: true,
+                original_bytes,
+                payload_bytes: 0,
+                sha256: format!("{:x}", hasher.finalize()),
+            },
+        )
+    };
     let mut body = Vec::new();
     loop {
         let Some(chunk) = next_chunk(&mut response, deadline).await? else {
-            return Ok((body, false)); // Clean EOF: nothing was truncated.
+            return Ok(finish(body, false, original_bytes, hasher)); // Clean EOF.
         };
+        original_bytes = original_bytes.saturating_add(chunk.len() as u64);
+        hasher.update(&*chunk);
         // body.len() < cap here — the `== cap` branch always returns below.
         let remaining = WEB_FETCH_SOURCE_CAP_BYTES - body.len();
         if chunk.len() > remaining {
             body.extend_from_slice(&chunk[..remaining]);
-            return Ok((body, true)); // More bytes than the cap can hold.
+            return Ok(finish(body, true, original_bytes, hasher));
         }
         body.extend_from_slice(&chunk);
         if body.len() == WEB_FETCH_SOURCE_CAP_BYTES {
             // M9 off-by-one: a body that lands EXACTLY on the cap is only
             // truncated if MORE bytes follow — one honest extra read decides,
             // instead of blindly flagging truncation at the boundary.
-            let more = next_chunk(&mut response, deadline).await?.is_some();
-            return Ok((body, more));
+            let more = next_chunk(&mut response, deadline).await?;
+            if let Some(chunk) = &more {
+                original_bytes = original_bytes.saturating_add(chunk.len() as u64);
+                hasher.update(&**chunk);
+            }
+            return Ok(finish(body, more.is_some(), original_bytes, hasher));
         }
     }
 }
@@ -1295,6 +1320,7 @@ mod retry_tests {
             content_type: "text/plain".into(),
             text: "ok".into(),
             truncated: false,
+            truncation: None,
         }
     }
 

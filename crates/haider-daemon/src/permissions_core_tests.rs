@@ -3,14 +3,15 @@
 use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
 use crate::worker::{
     BrokerToolFactory, PendingShellExec, RegisteredToolRoute, TurnToolFactory,
-    WebCapabilityDegrade, advertised_tool_definitions, cli_scope_admits, defer_shell_handoff,
+    WebCapabilityDegrade, advertised_tool_definitions, autonomous_permission_resolution_command,
+    cli_scope_admits, defer_shell_handoff, durable_read_only_terminal_failure,
     durable_session_tool_state, effective_permission_defaults, explicit_computer_auto_grant_value,
     explicit_computer_use_intent, grant_admits_manifest_effect, loom_inventory_line, loom_run_tail,
     loom_task_type_id, plan_gate_admits, registered_tool_route, registered_tools,
     scoped_network_hosts, stub_schema, tool_inventory_snapshot, tool_manual, tool_manual_line,
     typed_child_grant, typed_tool_result, web_fetch_host_allowed,
 };
-use haider_core::{MemoryStore, SqliteStoreHandle, StoreHandle};
+use haider_core::{MemoryStore, RequestInputCheckpoint, SqliteStoreHandle, StoreHandle};
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase, FileFreshness,
@@ -355,6 +356,7 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
     );
 
     let writes = metadata(Some(SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: true,
         allow_exec: false,
         allow_mobile: false,
@@ -370,6 +372,7 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
     );
 
     let exec = metadata(Some(SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: false,
         allow_exec: true,
         allow_mobile: false,
@@ -415,6 +418,7 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
     );
 
     let mobile = metadata(Some(SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: false,
         allow_exec: false,
         allow_mobile: true,
@@ -441,11 +445,10 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
     }
 }
 
-/// Autonomous mode applies its no-human denial as the broker's residual-Ask
-/// fallback, not as a high-priority class deny. Registry defaults must stay
-/// `Ask` so durable and command-derived grants can still authorize first.
+/// Autonomous mode resolves every registry Ask to ordinary Allow. Explicit
+/// deny rules are applied separately by the broker and still win.
 #[test]
-fn autonomous_effect_defaults_preserve_explicit_grant_precedence() {
+fn autonomous_effect_defaults_allow_every_ask_class() {
     let metadata = |permission_overrides| SessionMetadataV1 {
         cwd: "/tmp".into(),
         provider: "fake".into(),
@@ -471,6 +474,18 @@ fn autonomous_effect_defaults_preserve_explicit_grant_precedence() {
     };
 
     let baseline = metadata(None);
+    for (class, default) in effective_permission_defaults(&baseline) {
+        assert_ne!(
+            default,
+            ToolPermissionDefault::Ask,
+            "autonomous mode left {class:?} unresolved"
+        );
+        assert_ne!(
+            default,
+            ToolPermissionDefault::Deny,
+            "a registry default denied {class:?} without an explicit user rule"
+        );
+    }
     for class in [
         EffectClass::FsWrite,
         EffectClass::ProcessExec,
@@ -480,10 +495,11 @@ fn autonomous_effect_defaults_preserve_explicit_grant_precedence() {
         EffectClass::MobileObserve,
         EffectClass::MobileControl,
     ] {
-        assert_eq!(decision(&baseline, class), ToolPermissionDefault::Ask);
+        assert_eq!(decision(&baseline, class), ToolPermissionDefault::Allow);
     }
 
     let explicit = metadata(Some(SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: true,
         allow_exec: true,
         allow_mobile: false,
@@ -499,8 +515,53 @@ fn autonomous_effect_defaults_preserve_explicit_grant_precedence() {
     );
     assert_eq!(
         decision(&explicit, EffectClass::ScreenObserve),
-        ToolPermissionDefault::Ask
+        ToolPermissionDefault::Allow
     );
+
+    let read_only = metadata(Some(SessionPermissionOverridesV1 {
+        read_only: true,
+        allow_writes: true,
+        allow_exec: true,
+        allow_mobile: false,
+        auto_allow: true,
+    }));
+    assert_eq!(
+        decision(&read_only, EffectClass::FsWrite),
+        ToolPermissionDefault::Deny,
+        "explicit read-only must win over every autonomous allow"
+    );
+    assert_eq!(
+        decision(&read_only, EffectClass::ProcessExec),
+        ToolPermissionDefault::Deny,
+        "read-only must block shell commands that can write indirectly"
+    );
+    assert_eq!(
+        decision(&read_only, EffectClass::RemoteExecution),
+        ToolPermissionDefault::Deny,
+        "read-only must block remote commands that can write indirectly"
+    );
+    assert_eq!(
+        decision(&read_only, EffectClass::ScreenControl),
+        ToolPermissionDefault::Deny,
+        "read-only must block desktop control that can write indirectly"
+    );
+    assert_eq!(
+        decision(&read_only, EffectClass::ScreenObserve),
+        ToolPermissionDefault::Allow,
+        "read-only still permits non-mutating observation"
+    );
+    assert_eq!(
+        decision(&read_only, EffectClass::PeerMessage),
+        ToolPermissionDefault::Deny,
+        "read-only must not delegate mutation to an existing writable peer"
+    );
+    for class in [EffectClass::GitOp, EffectClass::GuiAct] {
+        assert_eq!(
+            decision(&read_only, class.clone()),
+            ToolPermissionDefault::Deny,
+            "read-only must install an explicit {class:?} deny even before a registry tool advertises it"
+        );
+    }
 }
 
 /// MUTATION CHECK: make `auto_allow` a no-op, scope it to only writes/exec, or
@@ -527,6 +588,7 @@ fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
         agent_type: None,
     };
     let defaults = effective_permission_defaults(&metadata(Some(SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: false,
         allow_exec: false,
         allow_mobile: false,
@@ -756,6 +818,8 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             "fs_search",
             "fs_write",
             "fs_edit",
+            "write",
+            "edit",
             "fs_path",
             "process_exec",
             "spawn_subagent",
@@ -888,6 +952,55 @@ async fn durable_tool_state_reduces_latest_freshness_per_session() {
     );
 }
 
+#[tokio::test]
+async fn read_only_terminal_failure_rehydrates_from_committed_tool_result_per_run() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("read-only-terminal-session");
+    let run_id = RunId::new("denied-run");
+    let result = typed_tool_result(&ToolError::PermissionDenied {
+        reason: "registry mutation denied: run is --read-only".into(),
+    })
+    .expect("typed read-only denial");
+    let mut event = envelope(
+        &session_id,
+        "read-only-tool-result",
+        EventPayload::ToolResult {
+            call_id: "register-1".into(),
+            result,
+        },
+    );
+    event.run_id = Some(run_id.clone());
+    store
+        .append(&mut [event])
+        .await
+        .expect("append durable denial");
+
+    let failure = durable_read_only_terminal_failure(&store, &session_id, &run_id, true)
+        .await
+        .expect("reduce terminal failure")
+        .expect("read-only terminal is rehydrated");
+    assert_eq!(
+        failure.code,
+        haider_protocol::error::ErrorCode::PermissionDenied
+    );
+    assert_eq!(
+        failure.message,
+        "registry mutation denied: run is --read-only"
+    );
+    assert!(
+        durable_read_only_terminal_failure(&store, &session_id, &RunId::new("other-run"), true,)
+            .await
+            .expect("reduce unrelated run")
+            .is_none()
+    );
+    assert!(
+        durable_read_only_terminal_failure(&store, &session_id, &run_id, false)
+            .await
+            .expect("ignore colliding reason outside read-only mode")
+            .is_none()
+    );
+}
+
 /// MUTATION CHECK: collapse C1 errors into invalid_argument/path_changed or
 /// omit the match count/remedy. Expected RUNTIME failure: one of the literal
 /// kind/details assertions fails.
@@ -917,6 +1030,7 @@ fn c1_freshness_and_anchor_errors_are_typed_for_the_model() {
         path: PathBuf::from("anchor.txt"),
         matches: 7,
         replace_all: false,
+        nearest_candidate: None,
     }))
     .expect("typed anchor result");
     let anchor: serde_json::Value = serde_json::from_str(&anchor.preview).expect("anchor JSON");
@@ -1032,6 +1146,79 @@ fn append_permission_checkpoint(
         event.branch_id = branch_id.clone();
     }
     store.append(&mut events).expect("append checkpoint");
+}
+
+#[test]
+fn autonomous_recovery_cas_selects_typed_allow_once() {
+    let menu = Menu {
+        id: MenuId::new("autonomous-recovery-menu"),
+        kind: MenuKind::Permission {
+            effect_summary: "write exact file".into(),
+        },
+        title: "Permission".into(),
+        body: Vec::new(),
+        options: vec![
+            MenuOption {
+                key: "reject-first".into(),
+                label: "Reject".into(),
+                detail: None,
+                decision: Some(DecisionKind::RejectOnce),
+            },
+            MenuOption {
+                key: "allow-typed".into(),
+                label: "Allow".into(),
+                detail: None,
+                decision: Some(DecisionKind::AllowOnce),
+            },
+        ],
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "effect_broker".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    };
+    let checkpoint = RequestInputCheckpoint {
+        menu: menu.clone(),
+        request_seq: 41,
+        opening_generation: 7,
+        tool_item_id: ItemId::new("recovered-tool"),
+        call_id: "recovered-call".into(),
+        tool_name: "fs_write".into(),
+        args: "{}".into(),
+    };
+    let command = autonomous_permission_resolution_command(
+        &SessionId::new("autonomous-session"),
+        &DeviceId::new("daemon"),
+        8,
+        &checkpoint,
+    )
+    .expect("enumerated AllowOnce resolution");
+    assert_eq!(command.request_seq, 41);
+    assert_eq!(command.worker_generation, 7);
+    assert!(command.allow_prior_generation);
+    assert_eq!(command.answer.option_key.as_deref(), Some("allow-typed"));
+    assert_eq!(command.answer.option_index, 1);
+    assert_eq!(command.answer.via, AnswerVia::Hook);
+
+    let unavailable = RequestInputCheckpoint {
+        menu: Menu {
+            options: vec![menu.options[0].clone()],
+            ..menu
+        },
+        ..checkpoint
+    };
+    let error = autonomous_permission_resolution_command(
+        &SessionId::new("autonomous-session"),
+        &DeviceId::new("daemon"),
+        8,
+        &unavailable,
+    )
+    .expect_err("malformed autonomous permission menu must not park");
+    assert_eq!(
+        error.code,
+        haider_protocol::error::ErrorCode::PermissionDenied
+    );
+    assert!(error.message.contains("has no AllowOnce resolution"));
 }
 
 /// MUTATION CHECK: accept only `PermissionRequired` or only historical
@@ -1203,7 +1390,7 @@ fn every_advertised_tool_is_manual_described_and_native_prose_is_scoped() {
         );
         let should_have_native_prose = matches!(
             tool.name.as_str(),
-            "fs_glob" | "fs_search" | "fs_write" | "fs_edit" | "fs_path"
+            "fs_glob" | "fs_search" | "fs_write" | "fs_edit" | "write" | "edit" | "fs_path"
         );
         assert_eq!(
             !tool.description.is_empty(),
@@ -1293,27 +1480,27 @@ fn search_and_mutation_tool_schema_descriptions_are_pinned() {
 /// instruct pipe stops being a material (at least 30%) net reduction.
 #[test]
 fn instruct_pipe_shrinks_the_advertised_wire_pack() {
-    const EXPECTED_REGISTERED_TOOLS: usize = 27;
-    const EXPECTED_ADVERTISED_TOOLS: usize = 24;
+    const EXPECTED_REGISTERED_TOOLS: usize = 29;
+    const EXPECTED_ADVERTISED_TOOLS: usize = 26;
     // The full-prefix comparison deliberately includes the platform-specific
     // computer manifest description. Linux documents X11/Wayland (+49 bytes
     // over macOS), while Windows is one byte shorter than macOS.
-    // v0.0.970 adds spawn_subagent.request_budget: +367 full-schema bytes and
-    // +143 stub-schema bytes. Tool inventory and the 30% savings law stay fixed.
+    // Turnbudget adds 367 full-schema bytes and 143 stub-schema bytes for
+    // spawn_subagent.request_budget. Toolrepair adds the two flat aliases.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_621;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_785;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_572;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_736;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_571;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_735;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 18_566;
-    // v0.0.969 pinned 11_246 bytes. Before actbias, merged monitor/list_models
-    // inventory additions had already moved this wave-970 baseline to 12_122.
-    // Turnbudget adds 143 stub-schema bytes: 12_122 + 143 = 12_265.
-    // Actbias restores five native descriptions: 12_265 + 499 = 12_764.
-    const PRE_ACTBIAS_INSTRUCT_PIPE_BYTES: usize = 12_265;
-    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 12_764;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 19_730;
+    // Wave-970's pipe is 12_764 bytes: 12_265 schema/manual + 499 native
+    // descriptions. Toolrepair adds 597 schema/manual bytes and 191 native
+    // description bytes: 12_764 + 788 = 13_552 (lane's 13_409 + 143 budget
+    // schema bytes). Keep the seven-description accounting and 30% floor.
+    const PRE_ACTBIAS_INSTRUCT_PIPE_BYTES: usize = 12_862;
+    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 13_552;
 
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let stubbed =
@@ -1358,7 +1545,7 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     assert_eq!(
         new_total - native_description_bytes,
         PRE_ACTBIAS_INSTRUCT_PIPE_BYTES,
-        "only the five native descriptions may explain the actbias pipe delta"
+        "only the seven native descriptions may explain the pipe delta"
     );
     assert!(full_prefix > 0 && new_total < full_prefix);
     assert!(

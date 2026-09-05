@@ -43,6 +43,7 @@ use tokio::time::{Duration, timeout};
 
 fn overrides() -> Option<SessionPermissionOverridesV1> {
     Some(SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: true,
         allow_exec: true,
         allow_mobile: false,
@@ -303,10 +304,8 @@ async fn process_effect_phases(
         .collect()
 }
 
-/// The production monitor dispatcher must honor the broker's Ask/Allow/Deny
-/// result before a daemon-owned command can start. Ask and Deny never create
-/// their marker; Allow records authorization and dispatch durably before the
-/// runner is installed and the marker can appear.
+/// The production monitor dispatcher must honor interactive Ask and both
+/// autonomous/explicit Allow before a daemon-owned command can start.
 #[tokio::test]
 async fn monitor_command_dispatch_waits_for_durable_broker_authorization() {
     let profile = tempfile::tempdir().expect("monitor dispatcher profile");
@@ -368,51 +367,66 @@ async fn monitor_command_dispatch_waits_for_durable_broker_authorization() {
         .await
         .expect("cancel parked Ask dispatcher");
 
-    let deny_session = create_task_session(&hub, "monitor-dispatch-deny", &cwd).await;
-    let deny_run = RunId::new("monitor-dispatch-deny-run");
-    prepare_tool_run(&hub, &deny_session, &deny_run, "monitor-dispatch-deny").await;
-    let deny_dispatcher = task_dispatcher_with_monitor_policy(
+    let autonomous_session = create_task_session(&hub, "monitor-dispatch-autonomous", &cwd).await;
+    let autonomous_run = RunId::new("monitor-dispatch-autonomous-run");
+    prepare_tool_run(
         &hub,
-        &deny_session,
+        &autonomous_session,
+        &autonomous_run,
+        "monitor-dispatch-autonomous",
+    )
+    .await;
+    let autonomous_dispatcher = task_dispatcher_with_monitor_policy(
+        &hub,
+        &autonomous_session,
         &cwd,
-        "monitor-dispatch-deny",
-        &deny_run,
+        "monitor-dispatch-autonomous",
+        &autonomous_run,
         None,
         SessionInteractionModeV1::Autonomous,
     )
     .await;
-    let deny_marker = workspace.path().join("deny-marker");
-    let denied = deny_dispatcher
+    let autonomous_marker = workspace.path().join("autonomous-marker");
+    let autonomous = autonomous_dispatcher
         .execute(
-            &deny_run,
-            &ItemId::new("monitor-dispatch-deny-item"),
-            "monitor-dispatch-deny-call",
+            &autonomous_run,
+            &ItemId::new("monitor-dispatch-autonomous-item"),
+            "monitor-dispatch-autonomous-call",
             "monitor",
-            monitor_process_args(&deny_marker),
+            monitor_process_args(&autonomous_marker),
             &CancelToken::new(),
         )
         .await
-        .expect_err("autonomous unresolved Ask must fail closed");
-    assert!(denied.to_string().contains("no_human_available"));
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(!deny_marker.exists(), "Deny started the monitor command");
-    let deny_phases = process_effect_phases(&store, &deny_session).await;
-    assert!(deny_phases.iter().any(|phase| matches!(
+        .expect("autonomous Ask resolves to Allow");
+    assert!(matches!(autonomous, ToolDispatchResult::Completed(_)));
+    timeout(Duration::from_secs(3), async {
+        while !autonomous_marker.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("autonomous monitor command did not start");
+    let autonomous_phases = process_effect_phases(&store, &autonomous_session).await;
+    assert!(autonomous_phases.iter().any(|phase| matches!(
         phase,
         EffectPhase::Authorized {
-            verdict: AuthorizationVerdict::Deny { .. },
+            verdict: AuthorizationVerdict::Allow,
             ..
         }
     )));
     assert!(
-        !deny_phases
+        autonomous_phases
             .iter()
             .any(|phase| matches!(phase, EffectPhase::Dispatched { .. }))
     );
-    deny_dispatcher
+    assert_eq!(
+        std::fs::read_to_string(&autonomous_marker).expect("read autonomous marker"),
+        "authorized"
+    );
+    autonomous_dispatcher
         .close()
         .await
-        .expect("close denied dispatcher");
+        .expect("close autonomous dispatcher");
 
     let allow_session = create_task_session(&hub, "monitor-dispatch-allow", &cwd).await;
     let allow_run = RunId::new("monitor-dispatch-allow-run");
@@ -553,7 +567,7 @@ async fn dispatch(
     let ToolDispatchResult::Completed(result) = result else {
         panic!("tool `{name}` must complete, got a non-completed dispatch");
     };
-    serde_json::from_str(&result.preview).expect("tool preview is JSON")
+    serde_json::from_str(result.payload_text()).expect("tool preview is JSON")
 }
 
 async fn read_all(store: &SqliteStoreHandle, session_id: &SessionId) -> Vec<RawEnvelope> {

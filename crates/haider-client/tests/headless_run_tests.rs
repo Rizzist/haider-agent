@@ -554,6 +554,42 @@ async fn budget_feature_is_required_before_session_mutation() {
     peer.await.expect("peer");
 }
 
+/// MUTATION CHECK: rely on the older, broader permission-overrides feature for
+/// the additive read-only deny. Expected RUNTIME failure: the client sends a
+/// session.create to a daemon that may ignore `read_only` while accepting the
+/// legacy allow fields.
+#[tokio::test]
+async fn read_only_feature_is_required_before_session_mutation() {
+    let (_root, profile) = profile();
+    let listener = UnixListener::bind(&profile.endpoint_path).expect("bind read-only peer");
+    let mut advertised = welcome(&profile);
+    advertised
+        .features
+        .insert(haider_rpc::FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned());
+    let peer = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener, advertised).await;
+        assert!(peer.try_next().await.is_none());
+    });
+    let mut run = request(None);
+    run.permission_overrides = SessionPermissionOverridesV1 {
+        read_only: true,
+        allow_writes: true,
+        allow_exec: true,
+        allow_mobile: false,
+        auto_allow: true,
+    };
+    let (sender, _receiver) = mpsc::channel(1);
+    let error = run_headless(&profile, EnsureOptions::default(), run, sender)
+        .await
+        .expect_err("missing read-only feature");
+    assert!(matches!(
+        error,
+        HeadlessRunError::Ensure(EnsureError::MissingFeatures { ref missing, .. })
+            if missing == &BTreeSet::from([haider_rpc::FEATURE_SESSION_READ_ONLY_V1.to_owned()])
+    ));
+    peer.await.expect("peer");
+}
+
 fn provider_summary_fixture(
     provider: &str,
     default_model: Option<&str>,
@@ -1820,10 +1856,10 @@ async fn withheld_recovery_barrier_cannot_defeat_run_and_grace_deadlines() {
 
 /// MUTATION CHECK: choose a permission option by label/index or treat the
 /// PermissionRequired parked state as terminal. Expected RUNTIME failure:
-/// the peer does not receive the enumerated RejectOnce key at index 1, or
-/// the eventual Done/denial result is not observed.
+/// the peer does not receive the enumerated AllowOnce key at index 0, or
+/// the eventual Done result is not observed.
 #[tokio::test]
-async fn permission_menu_selects_typed_reject_once_and_continues_to_done() {
+async fn permission_menu_selects_typed_allow_once_and_continues_to_done() {
     let (_root, profile) = profile();
     let peer = spawn_peer(&profile, |mut peer| async move {
         let (session_id, attachment_id) = accept_create_and_attach(&mut peer).await;
@@ -1870,7 +1906,7 @@ async fn permission_menu_selects_typed_reject_once_and_continues_to_done() {
                     options: vec![
                         MenuOption {
                             key: "allow".into(),
-                            label: "Reject once".into(),
+                            label: "Allow once".into(),
                             detail: None,
                             decision: Some(DecisionKind::AllowOnce),
                         },
@@ -1899,8 +1935,8 @@ async fn permission_menu_selects_typed_reject_once_and_continues_to_done() {
                 ..
             } => {
                 assert_eq!(answered, menu_id);
-                assert_eq!(option_key, "typed-reject");
-                assert_eq!(option_index, 1);
+                assert_eq!(option_key, "allow");
+                assert_eq!(option_index, 0);
                 request_id
             }
             other => panic!("expected typed menu answer, got {other:?}"),
@@ -1919,8 +1955,8 @@ async fn permission_menu_selects_typed_reject_once_and_continues_to_done() {
                 3,
                 EventPayload::MenuAnswered(MenuAnswer {
                     menu: menu_id,
-                    option_key: Some("typed-reject".into()),
-                    option_index: 1,
+                    option_key: Some("allow".into()),
+                    option_index: 0,
                     value: None,
                     via: AnswerVia::Rpc,
                 }),
@@ -1943,12 +1979,12 @@ async fn permission_menu_selects_typed_reject_once_and_continues_to_done() {
     let (result, events) = run_with_events(profile, request(None), 8, Duration::ZERO).await;
     peer.await.expect("peer");
     assert_eq!(result.outcome, HeadlessOutcome::Done);
-    assert_eq!(result.permission_denials.len(), 1);
-    assert!(events.iter().any(|event| matches!(
-        event,
-        HeadlessEvent::PermissionDenied(denial)
-            if denial.effect_summary == "write /tmp/output"
-    )));
+    assert!(result.permission_denials.is_empty());
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, HeadlessEvent::PermissionDenied(_)))
+    );
 }
 
 /// MUTATION CHECK: discard a permission action after socket enqueue, reuse
@@ -2006,10 +2042,10 @@ async fn permission_answer_response_loss_replays_then_retries_current_generation
                     title: "Allow execution?".into(),
                     body: Vec::new(),
                     options: vec![MenuOption {
-                        key: "reject".into(),
-                        label: "Reject".into(),
+                        key: "allow".into(),
+                        label: "Allow".into(),
                         detail: None,
-                        decision: Some(DecisionKind::RejectOnce),
+                        decision: Some(DecisionKind::AllowOnce),
                     }],
                     blocking: true,
                     scope: MenuScope::Session,
@@ -2089,7 +2125,7 @@ async fn permission_answer_response_loss_replays_then_retries_current_generation
                 3,
                 EventPayload::MenuAnswered(MenuAnswer {
                     menu: menu_id,
-                    option_key: Some("reject".into()),
+                    option_key: Some("allow".into()),
                     option_index: 0,
                     value: None,
                     via: AnswerVia::Rpc,
@@ -2113,11 +2149,11 @@ async fn permission_answer_response_loss_replays_then_retries_current_generation
     let (result, _) = run_with_events(profile, request(None), 8, Duration::ZERO).await;
     peer.await.expect("peer");
     assert_eq!(result.outcome, HeadlessOutcome::Done);
-    assert_eq!(result.permission_denials.len(), 1);
+    assert!(result.permission_denials.is_empty());
 }
 
 /// MUTATION CHECK: treat any replayed menu answer as proof that headless's
-/// selected RejectOnce won. Expected RUNTIME failure: a competing AllowOnce
+/// selected AllowOnce won. Expected RUNTIME failure: a competing RejectOnce
 /// resolution is accepted as success instead of producing the typed blocked
 /// reason and one durable cancellation.
 #[tokio::test]
@@ -2197,9 +2233,9 @@ async fn competing_permission_resolution_is_fail_closed_and_cancelled() {
             WireFrame::MenuAnswer {
                 request_id: Some(_),
                 ref option_key,
-                option_index: 1,
+                option_index: 0,
                 ..
-            } if option_key == "reject"
+            } if option_key == "allow"
         ));
         drop(first);
 
@@ -2239,8 +2275,8 @@ async fn competing_permission_resolution_is_fail_closed_and_cancelled() {
                 3,
                 EventPayload::MenuAnswered(MenuAnswer {
                     menu: menu_id,
-                    option_key: Some("allow".into()),
-                    option_index: 0,
+                    option_key: Some("reject".into()),
+                    option_index: 1,
                     value: None,
                     via: AnswerVia::Rpc,
                 }),
@@ -2982,10 +3018,11 @@ async fn nonpermission_input_and_unknown_effect_cancel_with_typed_reasons() {
 }
 
 #[test]
-fn override_feature_is_required_only_when_a_flag_is_present() {
+fn override_and_read_only_features_are_required_only_when_used() {
     let no_flags =
         haider_client::required_headless_features(SessionPermissionOverridesV1::default());
     let flags = haider_client::required_headless_features(SessionPermissionOverridesV1 {
+        read_only: false,
         allow_writes: true,
         allow_exec: false,
         allow_mobile: false,
@@ -3001,6 +3038,23 @@ fn override_feature_is_required_only_when_a_flag_is_present() {
             .cloned()
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([haider_rpc::FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned()])
+    );
+    let read_only = haider_client::required_headless_features(SessionPermissionOverridesV1 {
+        read_only: true,
+        allow_writes: false,
+        allow_exec: false,
+        allow_mobile: false,
+        auto_allow: false,
+    });
+    assert_eq!(
+        read_only
+            .difference(&no_flags)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            haider_rpc::FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_READ_ONLY_V1.to_owned(),
+        ])
     );
     let attachments = haider_client::required_headless_features_with_attachments(
         SessionPermissionOverridesV1::default(),

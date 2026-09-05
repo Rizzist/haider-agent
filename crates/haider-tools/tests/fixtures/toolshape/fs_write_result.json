@@ -1,0 +1,26 @@
+{
+  "call_id": "fixture-write",
+  "effects": [
+    {
+      "absolute_path": "<WORKSPACE>/fixture.txt",
+      "bytes": 14,
+      "kind": "create",
+      "name": "fixture.txt",
+      "path": "fixture.txt"
+    }
+  ],
+  "result": {
+    "effects": [
+      {
+        "absolute_path": "<WORKSPACE>/fixture.txt",
+        "bytes": 14,
+        "kind": "create",
+        "name": "fixture.txt",
+        "path": "fixture.txt"
+      }
+    ],
+    "preview": "wrote 14 bytes to <WORKSPACE>/fixture.txt",
+    "truncated": false
+  },
+  "type": "tool_result"
+}
