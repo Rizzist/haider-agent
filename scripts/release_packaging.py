@@ -52,11 +52,13 @@ def _windows_url(version: str) -> str:
     return f"{REPOSITORY}/releases/download/v{version}/{artifact}"
 
 
+ICON_URL = "https://haidercode.ai/logo.svg"
+
+
 def _icon_url(version: str) -> str:
-    return (
-        "https://cdn.jsdelivr.net/gh/Rizzist/haider-agent"
-        f"@v{version}/packaging/chocolatey/icon.png"
-    )
+    """The package icon is served statically by haidercode.ai; it does not depend on the tag."""
+    del version
+    return ICON_URL
 
 
 def windows_artifact_sha256(artifact: Path, version: str) -> str:
