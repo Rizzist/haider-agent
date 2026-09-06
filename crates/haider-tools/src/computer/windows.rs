@@ -695,9 +695,10 @@ impl WindowsComputerBackend {
             ComputerAction::MiddleClick => {
                 self.click(MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, false, cancel)?
             }
-            ComputerAction::DoubleClick => {
-                self.click(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, true, cancel)?;
-                self.click(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, true, cancel)?;
+            ComputerAction::DoubleClick | ComputerAction::TripleClick => {
+                for _ in 0..action.click_count().unwrap_or(2) {
+                    self.click(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, true, cancel)?;
+                }
             }
             ComputerAction::LeftMouseDown => {
                 Self::send_button(MOUSEEVENTF_LEFTDOWN)?;
@@ -794,15 +795,34 @@ impl ComputerBackend for WindowsComputerBackend {
     }
 
     fn set_viewport(&self, width: u32, height: u32) -> ComputerResult<()> {
+        self.set_viewport_region(width, height, None)
+    }
+
+    fn set_viewport_region(
+        &self,
+        width: u32,
+        height: u32,
+        crop: Option<super::ComputerScreenshotCrop>,
+    ) -> ComputerResult<()> {
         if width == 0 || height == 0 {
             return Err(ComputerError::InvalidAction {
                 message: "CU-1 returned an empty computer screenshot viewport".into(),
             });
         }
         let mut state = self.lock_state()?;
-        let screen = state.pending_screen.ok_or_else(|| ComputerError::Backend {
+        let mut screen = state.pending_screen.ok_or_else(|| ComputerError::Backend {
             message: "CU-1 viewport arrived without a matching Windows capture".into(),
         })?;
+        if let Some(crop) = crop {
+            screen.left += i32::try_from(crop.x).map_err(|_| ComputerError::InvalidAction {
+                message: "region x exceeds native range".into(),
+            })?;
+            screen.top += i32::try_from(crop.y).map_err(|_| ComputerError::InvalidAction {
+                message: "region y exceeds native range".into(),
+            })?;
+            screen.width = crop.width;
+            screen.height = crop.height;
+        }
         state.viewport = Some(Viewport {
             screen,
             image_width: width,
@@ -1089,6 +1109,7 @@ fn action_name(action: &ComputerAction) -> &'static str {
         ComputerAction::RightClick => "right_click",
         ComputerAction::MiddleClick => "middle_click",
         ComputerAction::DoubleClick => "double_click",
+        ComputerAction::TripleClick => "triple_click",
         ComputerAction::LeftMouseDown => "left_mouse_down",
         ComputerAction::LeftMouseUp => "left_mouse_up",
         ComputerAction::MouseMove { .. } => "mouse_move",

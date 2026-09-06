@@ -62,6 +62,8 @@ type KeyCode = u8;
 
 #[derive(Debug, Clone, Copy)]
 struct Viewport {
+    origin_x: u32,
+    origin_y: u32,
     display_width: u32,
     display_height: u32,
     image_width: u32,
@@ -458,16 +460,20 @@ impl LinuxComputerBackend {
         let point = self.current_native_point()?;
         if point.x < 0
             || point.y < 0
-            || u32::from(point.x as u16) >= viewport.display_width
-            || u32::from(point.y as u16) >= viewport.display_height
+            || u32::from(point.x as u16) < viewport.origin_x
+            || u32::from(point.y as u16) < viewport.origin_y
+            || u32::from(point.x as u16) >= viewport.origin_x + viewport.display_width
+            || u32::from(point.y as u16) >= viewport.origin_y + viewport.display_height
         {
             return Err(ComputerError::InvalidAction {
                 message: "cursor is outside the X11 root window captured by the latest computer screenshot".into(),
             });
         }
-        let x = u64::from(point.x as u16) * u64::from(viewport.image_width)
+        let x = u64::from(u32::from(point.x as u16) - viewport.origin_x)
+            * u64::from(viewport.image_width)
             / u64::from(viewport.display_width);
-        let y = u64::from(point.y as u16) * u64::from(viewport.image_height)
+        let y = u64::from(u32::from(point.y as u16) - viewport.origin_y)
+            * u64::from(viewport.image_height)
             / u64::from(viewport.display_height);
         Ok((x as u32, y as u32))
     }
@@ -784,9 +790,10 @@ impl LinuxComputerBackend {
             }
             ComputerAction::RightClick => self.click(BUTTON_RIGHT, cancel)?,
             ComputerAction::MiddleClick => self.click(BUTTON_MIDDLE, cancel)?,
-            ComputerAction::DoubleClick => {
-                self.click(BUTTON_LEFT, cancel)?;
-                self.click(BUTTON_LEFT, cancel)?;
+            ComputerAction::DoubleClick | ComputerAction::TripleClick => {
+                for _ in 0..action.click_count().unwrap_or(2) {
+                    self.click(BUTTON_LEFT, cancel)?;
+                }
             }
             ComputerAction::LeftMouseDown => {
                 self.fake_button(BUTTON_LEFT, true)?;
@@ -896,8 +903,17 @@ impl ComputerBackend for LinuxComputerBackend {
     }
 
     fn set_viewport(&self, width: u32, height: u32) -> ComputerResult<()> {
+        self.set_viewport_region(width, height, None)
+    }
+
+    fn set_viewport_region(
+        &self,
+        width: u32,
+        height: u32,
+        crop: Option<super::ComputerScreenshotCrop>,
+    ) -> ComputerResult<()> {
         if let Some(wayland) = &self.wayland {
-            return wayland.set_viewport(width, height);
+            return wayland.set_viewport_region(width, height, crop);
         }
         if width == 0 || height == 0 {
             return Err(ComputerError::InvalidAction {
@@ -912,8 +928,10 @@ impl ComputerBackend for LinuxComputerBackend {
                     message: "CU-1 viewport arrived without a matching Linux X11 capture".into(),
                 })?;
         state.viewport = Some(Viewport {
-            display_width,
-            display_height,
+            origin_x: crop.map_or(0, |crop| crop.x),
+            origin_y: crop.map_or(0, |crop| crop.y),
+            display_width: crop.map_or(display_width, |crop| crop.width),
+            display_height: crop.map_or(display_height, |crop| crop.height),
             image_width: width,
             image_height: height,
         });
@@ -1108,10 +1126,11 @@ fn map_delivered_pixel(viewport: Viewport, point: ScreenPoint) -> ComputerResult
             ),
         });
     }
-    let x =
-        u64::from(point.x) * u64::from(viewport.display_width) / u64::from(viewport.image_width);
-    let y =
-        u64::from(point.y) * u64::from(viewport.display_height) / u64::from(viewport.image_height);
+    let x = u64::from(viewport.origin_x)
+        + u64::from(point.x) * u64::from(viewport.display_width) / u64::from(viewport.image_width);
+    let y = u64::from(viewport.origin_y)
+        + u64::from(point.y) * u64::from(viewport.display_height)
+            / u64::from(viewport.image_height);
     let x = i16::try_from(x).map_err(|_| ComputerError::InvalidAction {
         message: "mapped X11 x coordinate exceeds the core event range".into(),
     })?;
@@ -1184,6 +1203,7 @@ fn action_name(action: &ComputerAction) -> &'static str {
         ComputerAction::RightClick => "right_click",
         ComputerAction::MiddleClick => "middle_click",
         ComputerAction::DoubleClick => "double_click",
+        ComputerAction::TripleClick => "triple_click",
         ComputerAction::LeftMouseDown => "left_mouse_down",
         ComputerAction::LeftMouseUp => "left_mouse_up",
         ComputerAction::MouseMove { .. } => "mouse_move",
@@ -1208,6 +1228,8 @@ mod tests {
     #[test]
     fn delivered_cu1_pixels_map_to_x11_root_without_assuming_native_size() {
         let viewport = Viewport {
+            origin_x: 0,
+            origin_y: 0,
             display_width: 3_200,
             display_height: 1_800,
             image_width: 1_600,
@@ -1220,6 +1242,25 @@ mod tests {
         assert_eq!(point.x, 1_600);
         assert_eq!(point.y, 900);
         assert!(map_delivered_pixel(viewport, ScreenPoint { x: 1_600, y: 0 }).is_err());
+    }
+
+    #[test]
+    fn region_pixels_map_to_offset_x11_root() {
+        let viewport = Viewport {
+            origin_x: 200,
+            origin_y: 400,
+            display_width: 600,
+            display_height: 800,
+            image_width: 300,
+            image_height: 400,
+        };
+        let point = map_delivered_pixel(viewport, ScreenPoint { x: 150, y: 200 })
+            .unwrap_or_else(|error| panic!("region center must map: {error}"));
+        assert_eq!((point.x, point.y), (500, 800));
+        let origin = map_delivered_pixel(viewport, ScreenPoint { x: 0, y: 0 })
+            .unwrap_or_else(|error| panic!("region origin must map: {error}"));
+        assert_eq!((origin.x, origin.y), (200, 400));
+        assert!(map_delivered_pixel(viewport, ScreenPoint { x: 300, y: 0 }).is_err());
     }
 
     #[test]

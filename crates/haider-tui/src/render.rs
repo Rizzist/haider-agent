@@ -14201,7 +14201,8 @@ fn computer_action_desc(action: &str, args: &serde_json::Value) -> String {
         })
     };
     match action {
-        "left_click" | "right_click" | "middle_click" | "double_click" | "mouse_move" => {
+        "left_click" | "right_click" | "middle_click" | "double_click" | "triple_click"
+        | "mouse_move" => {
             format!("{action}{}", xy())
         }
         "left_click_drag" => format!("drag {} → {}", point("from"), point("to")),

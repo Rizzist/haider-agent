@@ -412,7 +412,7 @@ fn translate_computer_input(
                 ensure_only_fields(object, &["action"])?;
                 Ok(serde_json::json!({"action": action}))
             }
-            "right_click" | "middle_click" | "double_click" => {
+            "right_click" | "middle_click" | "double_click" | "triple_click" => {
                 // Anthropic permits both an optional coordinate and a held-key
                 // modifier on these actions. The neutral variants operate at
                 // the current cursor and cannot express either field
@@ -490,7 +490,8 @@ fn translate_computer_input(
             )),
         },
         ComputerInputDirection::ToAnthropic => match action {
-            "screenshot" | "cursor_position" | "right_click" | "middle_click" | "double_click"
+            "screenshot" if object.contains_key("region") => Err("screenshot.region requires the generic computer tool; native Anthropic replay cannot drop its crop".into()),
+            "screenshot" | "cursor_position" | "right_click" | "middle_click" | "double_click" | "triple_click"
             | "left_mouse_down" | "left_mouse_up" => Ok(serde_json::json!({"action": action})),
             "left_click" | "mouse_move" => Ok(serde_json::json!({
                 "action": action,

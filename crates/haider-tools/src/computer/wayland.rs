@@ -34,8 +34,10 @@ static HELD_LEFT_OWNER: Mutex<Option<u64>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Copy)]
 struct Viewport {
-    display_width: u32,
-    display_height: u32,
+    origin_x: f64,
+    origin_y: f64,
+    display_width: f64,
+    display_height: f64,
     image_width: u32,
     image_height: u32,
 }
@@ -316,6 +318,8 @@ impl WaylandComputerBackend {
             message: "take a screenshot before using Wayland coordinates or input".into(),
         })?;
         Ok(json!({
+            "origin_x": viewport.origin_x,
+            "origin_y": viewport.origin_y,
             "display_width": viewport.display_width,
             "display_height": viewport.display_height,
             "image_width": viewport.image_width,
@@ -499,6 +503,15 @@ impl ComputerBackend for WaylandComputerBackend {
     }
 
     fn set_viewport(&self, width: u32, height: u32) -> ComputerResult<()> {
+        self.set_viewport_region(width, height, None)
+    }
+
+    fn set_viewport_region(
+        &self,
+        width: u32,
+        height: u32,
+        crop: Option<super::ComputerScreenshotCrop>,
+    ) -> ComputerResult<()> {
         if width == 0 || height == 0 {
             return Err(ComputerError::InvalidAction {
                 message: "CU-1 returned an empty computer screenshot viewport".into(),
@@ -513,8 +526,18 @@ impl ComputerBackend for WaylandComputerBackend {
                         .into(),
                 })?;
         state.viewport = Some(Viewport {
-            display_width,
-            display_height,
+            origin_x: crop.map_or(0.0, |crop| {
+                f64::from(crop.x) * f64::from(display_width) / f64::from(crop.source_width)
+            }),
+            origin_y: crop.map_or(0.0, |crop| {
+                f64::from(crop.y) * f64::from(display_height) / f64::from(crop.source_height)
+            }),
+            display_width: crop.map_or(f64::from(display_width), |crop| {
+                f64::from(crop.width) * f64::from(display_width) / f64::from(crop.source_width)
+            }),
+            display_height: crop.map_or(f64::from(display_height), |crop| {
+                f64::from(crop.height) * f64::from(display_height) / f64::from(crop.source_height)
+            }),
             image_width: width,
             image_height: height,
         });
@@ -671,6 +694,7 @@ fn action_name(action: &ComputerAction) -> &'static str {
         ComputerAction::RightClick => "right_click",
         ComputerAction::MiddleClick => "middle_click",
         ComputerAction::DoubleClick => "double_click",
+        ComputerAction::TripleClick => "triple_click",
         ComputerAction::LeftMouseDown => "left_mouse_down",
         ComputerAction::LeftMouseUp => "left_mouse_up",
         ComputerAction::MouseMove { .. } => "mouse_move",
@@ -691,6 +715,37 @@ async fn wait_for_cancel(cancel: &ComputerCancelToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn region_preserves_fractional_portal_logical_coordinates() {
+        let backend = WaylandComputerBackend::new(1);
+        backend
+            .lock_mapping()
+            .unwrap_or_else(|error| panic!("mapping: {error}"))
+            .pending_display_size = Some((1600, 900));
+        backend
+            .set_viewport_region(
+                301,
+                201,
+                Some(super::super::ComputerScreenshotCrop {
+                    x: 101,
+                    y: 51,
+                    width: 603,
+                    height: 403,
+                    source_width: 3200,
+                    source_height: 1800,
+                }),
+            )
+            .unwrap_or_else(|error| panic!("region: {error}"));
+        let viewport = backend
+            .viewport_json()
+            .unwrap_or_else(|error| panic!("viewport: {error}"));
+        assert_eq!(viewport["origin_x"], json!(50.5));
+        assert_eq!(viewport["origin_y"], json!(25.5));
+        assert_eq!(viewport["display_width"], json!(301.5));
+        assert_eq!(viewport["display_height"], json!(201.5));
+        assert_eq!(viewport["image_width"], json!(301));
+    }
 
     #[test]
     fn response_identity_and_denial_are_fail_closed() {

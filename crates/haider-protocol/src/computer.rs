@@ -46,6 +46,7 @@ pub enum ComputerAction {
     RightClick,
     MiddleClick,
     DoubleClick,
+    TripleClick,
     LeftMouseDown,
     LeftMouseUp,
     MouseMove {
@@ -74,6 +75,16 @@ pub enum ComputerAction {
 }
 
 impl ComputerAction {
+    /// Native click-state count for repeated left clicks at the current cursor.
+    #[must_use]
+    pub const fn click_count(&self) -> Option<u8> {
+        match self {
+            Self::DoubleClick => Some(2),
+            Self::TripleClick => Some(3),
+            _ => None,
+        }
+    }
+
     /// The permission class for this exact dynamic action.
     #[must_use]
     pub const fn effect_class(&self) -> crate::effect::EffectClass {
@@ -87,6 +98,7 @@ impl ComputerAction {
             Self::LeftClick { .. }
             | Self::RightClick
             | Self::MiddleClick
+            | Self::TripleClick
             | Self::DoubleClick
             | Self::LeftMouseDown
             | Self::LeftMouseUp

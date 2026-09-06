@@ -14611,7 +14611,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
     // from the argument name.
     Some(match name {
         "computer" => {
-            "computer(action, x?, y?, from?, to?, text?, keys?, direction?, amount?, ms?) — control the local desktop. Call screenshot first; x/y and from/to are pixels in the latest screenshot; text=type, keys=shortcut like cmd+shift+4; direction+amount scroll; ms=wait ≤60000"
+            "computer(action, region?, x?, y?, from?, to?, text?, keys?, direction?, amount?, ms?) — control the local desktop. Screenshot first; region crops a full-display reference (x,y,width,height,reference_width,reference_height); input uses the latest image. Right/middle/double/triple click at cursor; keys=cmd+shift+4; direction+amount scroll; ms=wait ≤60000"
         }
         "mobile" => {
             "mobile(action, element_id?, x?, y?, from?, to?, text?, key?, package?, name?, folder?, since?, limit?) — observe or control an explicitly activated mobile capability; screenshot returns an image, accessibility/apps/SMS return JSON"
@@ -16795,10 +16795,29 @@ impl BrokerToolDispatcher {
         png: Vec<u8>,
         cancel: &ComputerCancelToken,
     ) -> ToolResult<ImageBlockRef> {
+        self.admit_computer_screenshot_region(png, cancel, None)
+            .await
+            .map(|(image, _)| image)
+    }
+
+    async fn admit_computer_screenshot_region(
+        &self,
+        png: Vec<u8>,
+        cancel: &ComputerCancelToken,
+        region: Option<haider_tools::ComputerScreenshotRegion>,
+    ) -> ToolResult<(ImageBlockRef, Option<haider_tools::ComputerScreenshotCrop>)> {
         cancel.check().map_err(ToolError::Computer)?;
         let policy = Arc::clone(&self.screenshot_redaction);
-        let redacted = tokio::task::spawn_blocking(move || {
-            policy.redact_png(&png).map(std::borrow::Cow::into_owned)
+        let (redacted, crop) = tokio::task::spawn_blocking(move || {
+            let redacted = policy.redact_png(&png)?;
+            // Redact in the original native capture space before cropping.
+            // Applying the policy to the crop would shift protected regions.
+            if let Some(region) = region {
+                haider_tools::crop_screenshot_png(&redacted, region)
+                    .map(|(png, crop)| (png, Some(crop)))
+            } else {
+                Ok((redacted.into_owned(), None))
+            }
         })
         .await
         .map_err(|error| ToolError::Runtime {
@@ -16807,7 +16826,9 @@ impl BrokerToolDispatcher {
         .map_err(ToolError::Computer)?;
         cancel.check().map_err(ToolError::Computer)?;
         let mut cas = self.cas.lock().await;
-        cas.put_image(redacted, "image/png").await
+        cas.put_image(redacted, "image/png")
+            .await
+            .map(|image| (image, crop))
     }
 
     async fn admit_mobile_screenshot(
@@ -19921,12 +19942,12 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     match self.computer.execute(operation.action(), &action_cancel).await {
                         Ok(ComputerOutput::ScreenshotPng(png)) => {
                             let stored = self
-                                .admit_computer_screenshot(png, &action_cancel)
+                                .admit_computer_screenshot_region(png, &action_cancel, operation.region())
                                 .await;
                             match stored {
-                                Ok(image) => {
+                                Ok((image, crop)) => {
                                     if let Err(error) =
-                                        self.computer.set_viewport(image.width, image.height)
+                                        self.computer.set_viewport_region(image.width, image.height, crop)
                                     {
                                         let tool_error = ToolError::Computer(error.clone());
                                         broker
@@ -20007,7 +20028,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             })
                         }
                         Ok(ComputerOutput::Inspection {
-                            inspection,
+                            mut inspection,
                             screenshot_png,
                         }) => {
                             let stored = self
@@ -20017,7 +20038,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 Ok(image) => {
                                     if let Err(error) =
                                         self.computer.set_viewport(image.width, image.height)
+                                            .and_then(|()| self.computer.finalize_inspection(&mut inspection))
                                     {
+                                        let _ = self.computer.discard_inspection();
                                         let tool_error = ToolError::Computer(error.clone());
                                         broker
                                             .journal_computer_outcome(
@@ -20082,6 +20105,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     }
                                 }
                                 Err(error) => {
+                                    let _ = self.computer.discard_inspection();
                                     broker
                                         .journal_computer_outcome(
                                             &intent,

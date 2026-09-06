@@ -25,6 +25,10 @@ mod wayland;
 #[path = "computer/windows.rs"]
 mod windows;
 
+#[path = "computer/region.rs"]
+mod region;
+pub use region::{ComputerScreenshotCrop, ComputerScreenshotRegion, crop_screenshot_png};
+
 use crate::broker::EffectOperation;
 use crate::{ToolError, ToolResult};
 use async_trait::async_trait;
@@ -394,6 +398,31 @@ pub trait ComputerBackend: Send + Sync {
         Ok(())
     }
 
+    /// Installs the exact native crop and delivered dimensions together.
+    fn set_viewport_region(
+        &self,
+        width: u32,
+        height: u32,
+        crop: Option<ComputerScreenshotCrop>,
+    ) -> ComputerResult<()> {
+        if crop.is_some() {
+            return Err(ComputerError::InvalidAction {
+                message: "screenshot regions are unsupported by this backend".into(),
+            });
+        }
+        self.set_viewport(width, height)
+    }
+
+    /// Finalizes metadata against the image dimensions actually delivered.
+    fn finalize_inspection(&self, _inspection: &mut ComputerInspection) -> ComputerResult<()> {
+        Ok(())
+    }
+
+    /// Drops any native metadata retained for an undelivered inspection.
+    fn discard_inspection(&self) -> ComputerResult<()> {
+        Ok(())
+    }
+
     /// Releases any input state retained across actions. Dispatcher close
     /// invokes this on ESC before the broker records cancellation.
     async fn emergency_stop(&self) -> ComputerResult<()> {
@@ -485,20 +514,42 @@ pub fn open_system_permission_settings(permission: SystemPermission) -> Computer
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComputerOperation {
     action: ComputerAction,
+    region: Option<ComputerScreenshotRegion>,
 }
 
 impl ComputerOperation {
-    pub fn from_tool_args(arguments: Value) -> ToolResult<Self> {
+    pub fn from_tool_args(mut arguments: Value) -> ToolResult<Self> {
         validate_argument_keys(&arguments)?;
+        let region = arguments
+            .as_object_mut()
+            .and_then(|object| object.remove("region"))
+            .map(serde_json::from_value::<ComputerScreenshotRegion>)
+            .transpose()
+            .map_err(|error| {
+                ToolError::invalid_argument(format!("invalid screenshot region: {error}"))
+            })?;
+        if let Some(region) = region {
+            region.validate().map_err(ToolError::Computer)?;
+        }
         let action = serde_json::from_value(arguments).map_err(|error| {
             ToolError::invalid_argument(format!("invalid computer action: {error}"))
         })?;
-        Self::new(action)
+        let mut operation = Self::new(action)?;
+        operation.region = region;
+        Ok(operation)
     }
 
     pub fn new(action: ComputerAction) -> ToolResult<Self> {
         validate_action(&action)?;
-        Ok(Self { action })
+        Ok(Self {
+            action,
+            region: None,
+        })
+    }
+
+    #[must_use]
+    pub fn region(&self) -> Option<ComputerScreenshotRegion> {
+        self.region
     }
 
     #[must_use]
@@ -516,7 +567,8 @@ fn validate_argument_keys(arguments: &Value) -> ToolResult<()> {
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::invalid_argument("computer action requires string `action`"))?;
     let allowed: &[&str] = match action {
-        "screenshot" | "cursor_position" | "right_click" | "middle_click" | "double_click"
+        "screenshot" => &["action", "region"],
+        "cursor_position" | "right_click" | "middle_click" | "double_click" | "triple_click"
         | "left_mouse_down" | "left_mouse_up" => &["action"],
         "inspect" | "left_click" | "mouse_move" => &["action", "x", "y"],
         "left_click_drag" => &["action", "from", "to"],
@@ -544,9 +596,15 @@ impl EffectOperation for ComputerOperation {
     }
 
     fn arguments(&self) -> ToolResult<Value> {
-        serde_json::to_value(&self.action).map_err(|error| ToolError::InvalidArgument {
-            message: format!("cannot encode computer action: {error}"),
-        })
+        let mut value =
+            serde_json::to_value(&self.action).map_err(|error| ToolError::InvalidArgument {
+                message: format!("cannot encode computer action: {error}"),
+            })?;
+        if let Some(region) = self.region {
+            value["region"] = serde_json::to_value(region)
+                .map_err(|error| ToolError::invalid_argument(error.to_string()))?;
+        }
+        Ok(value)
     }
 
     fn approval_preview(&self) -> Vec<String> {
@@ -607,6 +665,31 @@ fn validate_action(action: &ComputerAction) -> ToolResult<()> {
         ComputerAction::Key { keys } if keys.trim().is_empty() => Err(ToolError::invalid_argument(
             "computer key action requires non-empty `keys`",
         )),
+        ComputerAction::Key { keys } => {
+            let mut parts = keys.split('+').map(str::trim);
+            let key = parts.next_back().unwrap_or_default();
+            if key.is_empty()
+                || parts.any(|modifier| {
+                    !matches!(
+                        modifier.to_ascii_lowercase().as_str(),
+                        "cmd"
+                            | "command"
+                            | "meta"
+                            | "super"
+                            | "ctrl"
+                            | "control"
+                            | "alt"
+                            | "option"
+                            | "shift"
+                    )
+                })
+            {
+                return Err(ToolError::invalid_argument(
+                    "computer key chord requires modifier names joined by + followed by a key",
+                ));
+            }
+            Ok(())
+        }
         ComputerAction::Scroll { amount: 0, .. } => Err(ToolError::invalid_argument(
             "computer scroll `amount` must be greater than zero",
         )),
@@ -626,6 +709,7 @@ fn action_name(action: &ComputerAction) -> &'static str {
         ComputerAction::RightClick => "right_click",
         ComputerAction::MiddleClick => "middle_click",
         ComputerAction::DoubleClick => "double_click",
+        ComputerAction::TripleClick => "triple_click",
         ComputerAction::LeftMouseDown => "left_mouse_down",
         ComputerAction::LeftMouseUp => "left_mouse_up",
         ComputerAction::MouseMove { .. } => "mouse_move",
@@ -665,11 +749,21 @@ pub fn computer_manifest() -> ToolManifest {
                     "type": "string",
                     "enum": [
                         "screenshot", "cursor_position", "inspect", "left_click", "right_click",
-                        "middle_click", "double_click", "left_mouse_down",
+                        "middle_click", "double_click", "triple_click", "left_mouse_down",
                         "left_mouse_up", "mouse_move", "left_click_drag", "type",
                         "key", "scroll", "wait"
                     ],
-                    "description": "Computer action to perform"
+                    "description": "Computer action to perform; right/middle/double/triple click at current cursor (mouse_move first)"
+                },
+                "region": {
+                    "type": "object",
+                    "description": "Optional screenshot crop/zoom. Coordinates use a FULL-display reference screenshot; supply its width/height as reference_width/reference_height. Crops retain native detail. Subsequent input coordinates use the returned crop. Omit to restore full-display coordinates.",
+                    "required": ["x", "y", "width", "height", "reference_width", "reference_height"],
+                    "properties": {
+                        "x": {"type": "integer"}, "y": {"type": "integer"},
+                        "width": {"type": "integer"}, "height": {"type": "integer"},
+                        "reference_width": {"type": "integer"}, "reference_height": {"type": "integer"}
+                    }
                 },
                 "x": {"type": "integer", "description": "X pixel in the latest delivered screenshot"},
                 "y": {"type": "integer", "description": "Y pixel in the latest delivered screenshot"},
@@ -692,7 +786,7 @@ pub fn computer_manifest() -> ToolManifest {
                     "description": "Drag end pixel in the latest delivered screenshot"
                 },
                 "text": {"type": "string", "description": "Text to type"},
-                "keys": {"type": "string", "description": "Shortcut such as cmd+shift+4"},
+                "keys": {"type": "string", "description": "Key chord: modifiers joined with + then a key, e.g. cmd+shift+4 or ctrl+alt+delete; issue sequential key actions for multi-step shortcuts"},
                 "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
                 "amount": {"type": "integer", "description": "Positive scroll-line count"},
                 "ms": {"type": "integer", "description": "Wait duration from 0 through 60000 milliseconds"}

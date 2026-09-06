@@ -562,3 +562,32 @@ fn bounded_ref_validation_rejects_a_generic_artifact_and_dishonest_dimensions() 
     };
     assert!(validate_image_block(&encoded, &wrong_address).is_err());
 }
+
+#[test]
+fn admitted_desktop_edges_keep_contrast_and_pixel_location() {
+    let root = tempfile::tempdir().expect("CAS root");
+    let cas = FileCas::open(root.path()).expect("open CAS");
+    let source = image::RgbaImage::from_fn(4096, 32, |x, _| {
+        if x < 2048 {
+            image::Rgba([0, 0, 0, 255])
+        } else {
+            image::Rgba([255, 255, 255, 255])
+        }
+    });
+    let png = encode_image(&DynamicImage::ImageRgba8(source)).expect("encode edge");
+    let block = cas.put_image(png, "image/png").expect("admit edge");
+    let bytes = cas.get(&block.artifact).expect("stored PNG");
+    let decoded = image::load_from_memory(&bytes)
+        .expect("decode edge")
+        .into_rgba8();
+    assert_eq!((block.width, block.height), (2048, 16));
+    // The transition stays at x=1024. Lanczos retains >90% edge contrast;
+    // Triangle's 32/223 neighbors violate this measured sharpness bound.
+    for y in 0..16 {
+        assert!(decoded.get_pixel(1023, y)[0] <= 20);
+        assert!(decoded.get_pixel(1024, y)[0] >= 235);
+        assert_eq!(decoded.get_pixel(1018, y)[0], 0);
+        assert_eq!(decoded.get_pixel(1029, y)[0], 255);
+    }
+    validate_image_block(&bytes, &block).expect("bounded metadata matches pixels");
+}
