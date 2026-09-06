@@ -101,12 +101,6 @@ def render_chocolatey_tree(
     substitutions = (
         (output / "haider.nuspec", "__HAIDER_VERSION__", version, "nuspec version"),
         (
-            output / "haider.nuspec",
-            "__HAIDER_ICON_VERSION__",
-            version,
-            "nuspec iconUrl version",
-        ),
-        (
             output / "tools" / "chocolateyinstall.ps1",
             "__HAIDER_VERSION__",
             version,
