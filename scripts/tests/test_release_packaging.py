@@ -44,7 +44,7 @@ def _template(root: Path, newline: bytes) -> Path:
             b'<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">',
             b"  <metadata>",
             b"    <version>__HAIDER_VERSION__</version>",
-            b"    <iconUrl>https://cdn.jsdelivr.net/gh/Rizzist/haider-agent@v__HAIDER_ICON_VERSION__/packaging/chocolatey/icon.png</iconUrl>",
+            b"    <iconUrl>https://haidercode.ai/logo.svg</iconUrl>",
             b"  </metadata>",
             b"</package>",
             b"",
