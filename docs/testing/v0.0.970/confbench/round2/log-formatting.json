@@ -1,0 +1,44 @@
+[
+  {
+    "path": "gate/pipe-pin.log",
+    "before_sha256": "24a0893e7a24ace7757ba9a62ae2dc274098a9a6635e97a079bc55e6d880e13c",
+    "after_sha256": "01a3a67d9b646909e564bcaad02e85dec0bdf69de95e95a30799b44cedba62cb",
+    "change": "remove redundant blank lines at EOF; no interior bytes changed"
+  },
+  {
+    "path": "gate/workspace-test.log",
+    "before_sha256": "ad76fdbdac834a30ef45a9b06914b97175fbb08b1863accbd621a2940b55594b",
+    "after_sha256": "ac2c0eaa29f8b8cabfd2b53d9b47c5ae5da653c3529f1932e8ae0740d76a9a21",
+    "change": "remove redundant blank lines at EOF and one trailing space on the concurrent_process_writer_child progress line; test words and results unchanged"
+  },
+  {
+    "path": "gate/malformed.log",
+    "before_sha256": "53f4fbbee2be6e1c075e89ba51e90a143cdcb401e90fba31ee437f0a7b22b425",
+    "after_sha256": "56ba7f60c8afc8a6269f3b0105533756df15df43dad54f93923855501d0d207c",
+    "change": "remove redundant blank lines at EOF; no interior bytes changed"
+  },
+  {
+    "path": "gate/jsonl-replay.log",
+    "before_sha256": "89f2b60fb07d5bbafb7fbfc2d0d94214b76503d8ce392b97654f6511329c78ce",
+    "after_sha256": "3509003d4758170d8665d3325118595db71c612d6c1aaf8994a24fc5a8a3c794",
+    "change": "remove redundant blank lines at EOF; no interior bytes changed"
+  },
+  {
+    "path": "gate/golden.log",
+    "before_sha256": "4bc2d4de8f3ebb780ab9e457477361e89d1533ea78031fcd9686a392e2dd0fe3",
+    "after_sha256": "1a0513fe9858475de66280431caa706203115730ae100a660bd3245394182e65",
+    "change": "remove redundant blank lines at EOF; no interior bytes changed"
+  },
+  {
+    "path": "gate/protocol.log",
+    "before_sha256": "9282fae1d977bc660f7c3d79796088595d6d9780e4a1b76c6795f13626a0c3cc",
+    "after_sha256": "a8dfd3abf63c04c138a3ac99bb3b254c28c5260bba1f9d4578017256df81ca96",
+    "change": "remove redundant blank lines at EOF; no interior bytes changed"
+  },
+  {
+    "path": "gate/core-exposure.log",
+    "before_sha256": "4ec34697e6e98dd390a805833472b24116cdcd7cbbd8760a45f2c303a3dca8fe",
+    "after_sha256": "10f12540eca0af4803912ba1ae7dcb886e3d68d2ef3a936b6c7f5ed45b1a4439",
+    "change": "remove redundant blank lines at EOF; no interior bytes changed"
+  }
+]

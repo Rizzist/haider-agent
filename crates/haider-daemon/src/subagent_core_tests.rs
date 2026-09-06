@@ -2174,7 +2174,11 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
             provider_factory: Arc::new(FixedProviderFactory {
                 provider: provider.clone(),
             }),
-            tool_factory: delegation_tool_factory(),
+            // Exercise the unpromoted default coding surface; no explicit
+            // spawn exposure may conceal a conformance regression.
+            tool_factory: crate::worker::DaemonDependencies::default()
+                .with_tool_exposure(Some(Vec::new()))
+                .tool_factory,
             delegation: None,
             web_search: None,
         },
@@ -2343,6 +2347,14 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
         "spawn outcome must commit before child provider work: {requests:?}"
     );
     assert_eq!(requests.len(), 3);
+    assert!(requests.iter().all(|request| request.model == "fake-model"));
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "spawn_subagent"),
+        "the first parent request advertises delegation without discovery"
+    );
     // W6c deliberately supersedes W6a's nonrecursive assertion: children
     // retain the tool so the depth cap can return a provider-readable result.
     assert!(
@@ -2498,6 +2510,8 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
         .await
         .expect("child metadata read")
         .expect("child metadata present");
+    assert_eq!(child_metadata.provider, "fake");
+    assert_eq!(child_metadata.model, "fake-model");
     let overrides = child_metadata
         .permission_overrides
         .expect("child overrides present");

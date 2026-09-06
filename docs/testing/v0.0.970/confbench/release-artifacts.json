@@ -1,0 +1,17 @@
+{
+  "recorded_at_utc": "2026-09-05T21:55:05.631501+00:00",
+  "merged_parent": "620fc1ce2faf0344c2d27c172fabe2c2f99bd253",
+  "lane_changes": "candidate source diff committed with this manifest; commit ID in delivery message",
+  "executables": {
+    "haider": {
+      "size_bytes": 35543568,
+      "sha256": "c05509bfa0c226c03e793536f9154e4189b8e56f7f473610d5db500c0920612d",
+      "version_stdout": "haider 0.0.969"
+    },
+    "haiderd": {
+      "size_bytes": 55349440,
+      "sha256": "211c4d90622efbb52b00b7490a616376ddaccc8faed03de1505af21b90c56177",
+      "version_stdout": "haiderd 0.0.969"
+    }
+  }
+}

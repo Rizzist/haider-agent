@@ -1,0 +1,71 @@
+{
+  "malformed_tool": {
+    "exit_code": 0,
+    "provider_requests": 2,
+    "completion_seq": 27,
+    "completion_status": "failed",
+    "terminal_seq": 51,
+    "terminal_kind": "success",
+    "run_failed_count": 0,
+    "normalized_completion": [
+      {
+        "type": "tool_finished",
+        "raw_index": 27,
+        "rule": "tool-finish",
+        "tool_call_id": "call-1",
+        "tool_name": "process_exec",
+        "status": "failed",
+        "evidence_origin": "harness"
+      }
+    ],
+    "requests": [
+      {
+        "path": "/v1/chat/completions",
+        "model": "deepseek-v4-flash"
+      },
+      {
+        "path": "/v1/chat/completions",
+        "model": "deepseek-v4-flash"
+      }
+    ],
+    "result_seq": 26,
+    "repair_request_seq": 39,
+    "failed_boolean_crosses_adapter": false
+  },
+  "auxiliary_probe": {
+    "exit_code": 0,
+    "provider_requests": 3,
+    "completion_seq": 51,
+    "completion_status": "completed",
+    "terminal_seq": 71,
+    "terminal_kind": "success",
+    "run_failed_count": 0,
+    "normalized_completion": [
+      {
+        "type": "tool_finished",
+        "raw_index": 51,
+        "rule": "tool-finish",
+        "tool_call_id": "call-1",
+        "tool_name": "spawn_subagent",
+        "status": "completed",
+        "evidence_origin": "harness"
+      }
+    ],
+    "requests": [
+      {
+        "path": "/v1/chat/completions",
+        "model": "deepseek-v4-flash"
+      },
+      {
+        "path": "/v1/chat/completions",
+        "model": "deepseek-v4-flash"
+      },
+      {
+        "path": "/v1/chat/completions",
+        "model": "deepseek-v4-flash"
+      }
+    ],
+    "agent_spawned_seq": 31,
+    "child_result_seq": 49
+  }
+}

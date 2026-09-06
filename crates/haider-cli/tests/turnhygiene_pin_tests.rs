@@ -1061,6 +1061,7 @@ fn provider_request_body_is_budget_independent_and_matches_the_golden_ledger() {
             "fs_write",
             "fs_edit",
             "process_exec",
+            "spawn_subagent",
         ],
         "cold, warm and budgeted coding turns retain the exact core tier"
     );
