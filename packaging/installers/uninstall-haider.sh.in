@@ -1,0 +1,70 @@
+#!/bin/sh
+# Haider standalone/pkg uninstaller. Package-manager users should use their manager.
+set -eu
+prefix=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+keep_state=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --prefix) [ "$#" -ge 2 ] || exit 2; prefix=$2; shift 2 ;;
+    --keep-state) keep_state=1; shift ;;
+    *) echo 'usage: uninstall-haider.sh [--prefix BIN_DIRECTORY] [--keep-state]' >&2; exit 2 ;;
+  esac
+done
+case "$prefix" in /*) ;; *) echo 'prefix must be absolute' >&2; exit 2 ;; esac
+[ "$prefix" != / ] || exit 2
+user_home=${HOME:?HOME must be set}
+user_id=$(id -u)
+if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+  user_id=$(id -u "$SUDO_USER")
+  if [ "$(uname -s)" = Darwin ]; then
+    user_home=$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')
+  else
+    user_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+  fi
+fi
+case "$user_home" in ''|/|/root|/var/root) keep_state=1 ;; esac
+# Refuse partial deletion if another installation or a user replaced any binary.
+while read -r expected member; do
+  [ -n "$member" ] || continue
+  file="$prefix/$member"
+  if [ -L "$file" ]; then echo "Refusing symlink: $file" >&2; exit 1; fi
+  if [ -e "$file" ]; then
+    if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum "$file"); else actual=$(shasum -a 256 "$file"); fi
+    actual=${actual%% *}
+    [ "$actual" = "$expected" ] || { echo "Refusing changed binary: $file" >&2; exit 1; }
+  fi
+done <<'HAIDER_EXPECTED_HASHES'
+@HASHES@
+HAIDER_EXPECTED_HASHES
+for member in @MEMBERS@; do
+  rm -f -- "$prefix/$member"
+done
+if [ "$(uname -s)" = Darwin ]; then
+  # These are the only supported Haider launch-agent labels; never glob user agents.
+  for label in ai.haidercode.haider ai.haidercode.haiderd; do
+    agent="$user_home/Library/LaunchAgents/$label.plist"
+    if [ -f "$agent" ]; then
+      launchctl bootout "gui/$user_id" "$agent" >/dev/null 2>&1 || true
+      rm -f -- "$agent"
+    fi
+    agent="/Library/LaunchAgents/$label.plist"
+    if [ "$prefix" = /usr/local/bin ] && [ -f "$agent" ]; then
+      launchctl bootout "gui/$user_id" "$agent" >/dev/null 2>&1 || true
+      rm -f -- "$agent"
+    fi
+  done
+  if [ "$prefix" = /usr/local/bin ]; then
+    rm -f /usr/local/share/haider/installer-manifest.json
+    rmdir /usr/local/share/haider 2>/dev/null || true
+    if pkgutil --pkg-info ai.haidercode.haider >/dev/null 2>&1; then
+      pkgutil --forget ai.haidercode.haider >/dev/null
+    fi
+  fi
+fi
+rm -f -- "$prefix/uninstall-haider.sh"
+if [ "$keep_state" = 0 ] && [ -d "$user_home/.haider" ] && [ -t 0 ]; then
+  printf 'Delete Haider user state at %s/.haider? [y/N] ' "$user_home"
+  read -r answer
+  case "$answer" in y|Y|yes|YES) rm -rf -- "$user_home/.haider" ;; esac
+fi
+printf 'Haider binaries removed. User state is preserved unless explicitly confirmed.\n'

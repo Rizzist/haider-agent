@@ -122,8 +122,8 @@ jobs:
           set -euo pipefail
 
           if [ -z "${MACOS_SIGNING_CERT_P12_BASE64:-}" ] || [ -z "${MACOS_SIGNING_CERT_PASSWORD:-}" ]; then
-            echo "Developer ID signing secrets are required for macOS releases" >&2
-            exit 1
+            echo "SKIP: macOS binary signing; Developer ID secrets are absent"
+            exit 0
           fi
 
           P12="$RUNNER_TEMP/haider-developer-id.p12"
@@ -234,13 +234,15 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MACOS_SIGNING_CERT_P12_BASE64: ${{ secrets.MACOS_SIGNING_CERT_P12_BASE64 }}
+          MACOS_SIGNING_CERT_PASSWORD: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
         run: |
           set -euo pipefail
 
-          for name in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+          for name in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID MACOS_SIGNING_CERT_P12_BASE64 MACOS_SIGNING_CERT_PASSWORD; do
             if [ -z "${!name:-}" ]; then
-              echo "Apple notarization secret is unavailable: $name" >&2
-              exit 1
+              echo "SKIP: macOS binary notarization; secret $name is absent"
+              exit 0
             fi
           done
 
@@ -390,8 +392,108 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  publish:
+  installers:
+    name: Additional installers (${{ matrix.target }})
     needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: distribution-${{ matrix.target }}
+          path: archives
+      - name: Freeze exact archive members and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          echo "INSTALLER_VERSION=$VERSION" >> "$GITHUB_ENV"
+          python scripts/installer_payload.py --archives archives --output payload \
+            --version "$VERSION" --target '${{ matrix.target }}'
+          EXE=""; [ "$RUNNER_OS" != Windows ] || EXE=.exe
+          test "$(payload/haider$EXE --version)" = "haider $VERSION"
+      - name: Packaging regression tests
+        shell: bash
+        run: python -m unittest discover -s scripts/tests -p 'test_*.py'
+      - name: Install native Linux package tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y dpkg-dev rpm cpio libasound2t64 libglib2.0-0t64
+      - name: Build and inspect deb/rpm
+        if: runner.os == 'Linux'
+        run: |
+          python3 packaging/installers/linux-build.py --payload payload --output installers \
+            --version "$INSTALLER_VERSION" --target '${{ matrix.target }}'
+      - name: Linux T1 install upgrade remove purge in containers
+        if: runner.os == 'Linux'
+        run: bash scripts/qa-gate/installers-linux.sh payload installers "$INSTALLER_VERSION" '${{ matrix.target }}'
+      - name: Build inspect sign notarize macOS pkg and dmg
+        if: runner.os == 'macOS'
+        env:
+          MACOS_SIGNING_CERT_P12_BASE64: ${{ secrets.MACOS_SIGNING_CERT_P12_BASE64 }}
+          MACOS_SIGNING_CERT_PASSWORD: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+          MACOS_INSTALLER_CERT_P12_BASE64: ${{ secrets.MACOS_INSTALLER_CERT_P12_BASE64 }}
+          MACOS_INSTALLER_CERT_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash packaging/installers/macos-build.sh payload installers "$INSTALLER_VERSION" '${{ matrix.target }}'
+      - name: Install Inno Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (!(Test-Path "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe")) {
+            choco install innosetup --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
+          }
+      - name: Build sign and inspect Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: |
+          ./packaging/installers/windows-build.ps1 -Payload payload -Manifest payload/manifest.json `
+            -Version $env:INSTALLER_VERSION -Target '${{ matrix.target }}' -Output installers
+      - name: Publish tarball uninstaller as additional asset
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          NAME="haider-v${INSTALLER_VERSION}-${{ matrix.target }}-uninstall-haider.sh"
+          cp payload/uninstall-haider.sh "installers/$NAME"
+          (cd installers && shasum -a 256 "$NAME" > "$NAME.sha256")
+      - name: Upload verified additional assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.target }}
+          path: |
+            installers/*.exe
+            installers/*.pkg
+            installers/*.dmg
+            installers/*.deb
+            installers/*.rpm
+            installers/*-uninstall-haider.sh
+            installers/*.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: [build, installers]
     if: github.event_name == 'push'   # only tag pushes cut a release
     runs-on: ubuntu-latest
     steps:
@@ -402,6 +504,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: distribution-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installers-*
           path: dist
           merge-multiple: true
       - name: download Android APK artifact when available
@@ -472,7 +579,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          NOTES="Cross-platform release (macOS aarch64/x86_64, Linux x86_64/arm64, Windows x86_64). macOS binaries are Developer ID signed and Apple-notarized. Verify the sha256. Linux: chmod +x. Windows is currently unsigned; unzip and allow via SmartScreen → More info → Run anyway."
+          NOTES="Cross-platform release (macOS aarch64/x86_64, Linux x86_64/arm64, Windows x86_64). Additional Windows EXE, macOS PKG/DMG, and Linux DEB/RPM installers are included. Signing and notarization depend on configured repository credentials; see installer job logs for SIGNED/SKIP status. Verify each SHA-256 sidecar."
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
           else

@@ -272,3 +272,16 @@ threshold_i = max(3 * MAD, 0.20 * previous.wall_ms_i)
 A `WALL` line is printed when `abs(delta_i) > threshold_i`. Diff exits 1 for an
 added, removed, or status-flipped check; wall-only diagnostics do not change its
 exit code.
+
+## Native installer lifecycle (T1-style)
+
+The standalone `installers-linux.sh`, `installers-macos.sh`, and
+`installers-windows.ps1` checks exercise native install → version upgrade →
+uninstall with state sentinels and package-file/registry cleanup assertions.
+They run separately from the regular daemon QA loader because they require
+Docker, a disposable macOS system installation, or a Windows CI user profile.
+See [installer lane evidence and commands](../../docs/testing/v0.0.970/installers.md).
+Linux/Windows use an explicitly synthetic older metadata version with current
+release bytes; macOS takes an actual older PKG. Stop active daemons and close
+clients first. The macOS check refuses collisions and requires
+`HAIDER_INSTALLER_QA_ALLOW_SYSTEM=1` on a disposable account/runner.
