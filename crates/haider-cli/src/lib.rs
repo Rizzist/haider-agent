@@ -428,18 +428,6 @@ pub fn front_door_exit_code(error: &haider_client::EnsureError) -> u8 {
     }
 }
 
-#[cfg(test)]
-mod runtime_tests {
-    use super::footprint_hold_ms;
-    #[test]
-    fn footprint_hold_is_opt_in_and_bounded() {
-        assert_eq!(footprint_hold_ms("60000"), Some(60_000));
-        assert_eq!(footprint_hold_ms("0"), None);
-        assert_eq!(footprint_hold_ms("300001"), None);
-        assert_eq!(footprint_hold_ms("not-a-duration"), None);
-    }
-}
-
 /// Explorer destroys a double-clicked console as soon as the process exits.
 /// Preserve the already-printed failure until a key is pressed, but only when
 /// Win32 proves this process is alone, every standard stream is still attached
@@ -462,4 +450,16 @@ pub fn hold_explorer_console_on_failure(code: ExitCode) {
     eprintln!("haider: press any key to close this window");
     let _ = io::stderr().flush();
     let _ = console.wait_for_keypress();
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::footprint_hold_ms;
+    #[test]
+    fn footprint_hold_is_opt_in_and_bounded() {
+        assert_eq!(footprint_hold_ms("60000"), Some(60_000));
+        assert_eq!(footprint_hold_ms("0"), None);
+        assert_eq!(footprint_hold_ms("300001"), None);
+        assert_eq!(footprint_hold_ms("not-a-duration"), None);
+    }
 }

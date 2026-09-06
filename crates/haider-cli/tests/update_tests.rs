@@ -1918,6 +1918,8 @@ impl StageVerifier for AllSignaturesBeforeSmoke {
 
 /// Running each member's sign and smoke in one concurrent worker violates the
 /// dependency barrier: CLI smoke may execute a sibling still being signed.
+// Packaged release staging uses the macOS-only archive pipeline.
+#[cfg(target_os = "macos")]
 #[test]
 fn concurrent_staging_verifies_all_signatures_before_any_smoke() {
     let install = install_fixture();

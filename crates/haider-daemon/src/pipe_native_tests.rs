@@ -385,3 +385,54 @@ async fn retraction_rebuilds_hot_cold_and_crash_reconciled_transcripts() {
     drop(writer);
     store.close().await.expect("close");
 }
+
+/// MUTATION CHECK: changing the 256-envelope threshold in either direction
+/// fails at 255 or 256. Exercise the hot renderer directly because the hub's
+/// asynchronous head-only notifications use journal reconciliation instead.
+#[test]
+fn native_pipe_coalesces_255_non_rows_and_covers_the_256th() {
+    let session_id = SessionId::new("pipe-hot-coverage-threshold");
+    let deltas: Vec<_> = (2..=257)
+        .map(|seq| {
+            projected_envelope(
+                &session_id,
+                seq,
+                EventPayload::Item(ItemEvent::Delta {
+                    item_id: ItemId::new("coverage-item"),
+                    delta: haider_protocol::item::ItemDelta::Text {
+                        text: "delta".into(),
+                    },
+                }),
+            )
+        })
+        .collect();
+    let cursor = SidecarCursor {
+        seq: 1,
+        pending_seq: 1,
+        generation: 1,
+        segment: 0,
+    };
+    let mut projector = TranscriptProjector::default();
+    let (before, cursor) = render_hot_batch(&deltas[..255], 256, cursor, &mut projector)
+        .expect("255 non-row deltas render");
+    assert!(
+        before.is_empty(),
+        "255 deltas must not emit coverage: {before}"
+    );
+    assert_eq!(cursor.seq, 1, "coverage remains at the seed");
+    assert_eq!(cursor.pending_seq, 256, "all 255 deltas were processed");
+
+    let (after, cursor) = render_hot_batch(&deltas[255..], 257, cursor, &mut projector)
+        .expect("256th non-row delta renders");
+    assert_eq!(
+        after.lines().count(),
+        1,
+        "exactly one coverage line: {after}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&after).expect("coverage JSON"),
+        serde_json::json!({"coverage": 257, "generation": 1})
+    );
+    assert_eq!(cursor.seq, 257);
+    assert_eq!(cursor.pending_seq, 257);
+}

@@ -9740,29 +9740,26 @@ async fn native_pipe_inspection_never_repairs_through_a_successor_symlink() {
     );
 }
 
-/// MUTATION CHECK: removing the zero-row coalescing threshold either writes a
-/// watermark too early or leaves the sidecar cursor stale at the 256th delta.
+/// One atomic append fixes the journal head before the asynchronous writer can
+/// reconcile it. Hot-batch threshold coverage lives in pipe_native_tests.
 #[tokio::test]
-async fn native_pipe_coalesces_255_non_rows_and_covers_the_256th() {
+async fn native_pipe_atomic_non_row_batch_settles_to_one_coverage_line() {
     let (root, store, hub) = open_hub(None, 8).await;
     let session_id = SessionId::new("native-pipe-coverage-coalesce");
     let generation = store.worker_generation();
-    // #6 (935): sidecar maintenance is off the publish path — the writer
-    // task drains at shutdown, so coalescing is now a SETTLED-STATE law:
-    // 255 non-row deltas plus the 256th collapse to exactly ONE coverage
-    // line at seq+256, observed after the drain, not via live file timing.
-    let mut seed = vec![user_pipe_event(&session_id, "seed", generation, "seed")];
-    hub.append(&mut seed).await.expect("seed commits");
-    let path = sidecar_path(&root, &session_id);
-
-    let mut deltas: Vec<RawEnvelope> = (0..255)
-        .map(|index| delta_pipe_event(&session_id, &format!("coalesce-{index}"), generation))
-        .collect();
-    hub.append(&mut deltas).await.expect("255 deltas commit");
-    append_delta(&hub, &session_id, generation, "coalesce-256").await;
+    // Separate commits allow head-only writer notifications to reconcile at
+    // 256 and then 257 (two valid coverage lines). Commit the whole fixture
+    // atomically so this assertion is independent of writer scheduling.
+    let mut batch = vec![user_pipe_event(&session_id, "seed", generation, "seed")];
+    batch.extend(
+        (0..256)
+            .map(|index| delta_pipe_event(&session_id, &format!("coalesce-{index}"), generation)),
+    );
+    hub.append(&mut batch).await.expect("atomic batch commits");
     hub.shutdown().await.expect("hub stops");
 
-    let settled = stable_sidecar(&path).await;
+    let settled =
+        std::fs::read_to_string(sidecar_path(&root, &session_id)).expect("drained sidecar reads");
     let coverage_lines: Vec<&str> = settled
         .lines()
         .filter(|line| line.contains("\"coverage\""))
@@ -9770,11 +9767,11 @@ async fn native_pipe_coalesces_255_non_rows_and_covers_the_256th() {
     assert_eq!(
         coverage_lines.len(),
         1,
-        "255 coalesced deltas plus the 256th settle to one coverage line: {settled}"
+        "one atomic batch settles to one coverage line: {settled}"
     );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(coverage_lines[0]).expect("coverage JSON"),
-        serde_json::json!({"coverage": seed[0].seq + 256, "generation": 1})
+        serde_json::json!({"coverage": batch[0].seq + 256, "generation": 1})
     );
 }
 
