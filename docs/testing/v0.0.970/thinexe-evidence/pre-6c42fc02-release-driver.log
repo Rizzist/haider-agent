@@ -1,0 +1,30 @@
+START release-final-build
+END release-final-build: PASS
+START compat-release-build
+END compat-release-build: PASS
+{
+  "haider": {
+    "path": "/private/tmp/thinexe-after/haider",
+    "bytes": 23144352,
+    "sha256": "da188c777e100b0ed41ee308fc7d288c63cc57e5572d0a85c3f4132ad59cee35",
+    "version": "haider 0.0.970"
+  },
+  "haiderd": {
+    "path": "/private/tmp/thinexe-after/haiderd",
+    "bytes": 56589536,
+    "sha256": "d68251821e01e4d81105f5068e8be460206f4f49c47bee2d968d6763b01f554c",
+    "version": "haiderd 0.0.970"
+  },
+  "haider-tui": {
+    "path": "/private/tmp/thinexe-after/haider-tui",
+    "bytes": 25511904,
+    "sha256": "d251b3daa72fa62e9d5c2fbd4fe06569fbd1399acb9c9ebe85bf7f392177284c",
+    "version": "haider-tui 0.0.970"
+  },
+  "haider-compat": {
+    "path": "/private/tmp/thinexe-after/haider-compat",
+    "bytes": 49578096,
+    "sha256": "3bdcac2018959477026d637b384843f02501d629c6fbc4470c1457b3b66e8f20",
+    "version": "haider 0.0.970"
+  }
+}

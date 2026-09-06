@@ -1,9 +1,13 @@
 # thinexe — thin control executable and on-demand interactive payload
 
-Branch `lane-970-thinexe`; workspace version `0.0.970`. Work remains uncommitted.
+Branch `lane-970-thinexe`; workspace version `0.0.970`. Verdict: **NO_SHIP**.
+The final merged source gate passes, and the thin executable is 34.9% smaller,
+but no accepted paired RSS measurement exists; the installed runtime grows
+15.8%. Public installation, the historical auto-spawn upgrade, and installer
+watchdog provenance retain the additional acceptance blockers detailed below.
+The original worktree remains uncommitted and preserved.
 The common rules, brief, `turnperf/`, and `turnperf2/` inputs were read first and
-are unchanged. This is a working verification record; pending checks are not
-passing evidence.
+are unchanged and excluded from the held delivery.
 
 ## Implementation
 
@@ -12,6 +16,8 @@ passing evidence.
 graph excludes TUI, STT, image decoding, core/store/tools/provider/accounts.
 Store/provider remain test-only fixture dependencies. `haider-client` retains
 its wire/RPC and file-attachment support; no image decoder is introduced there.
+Existing PDF text extraction and SQLite-backed offline export remain in the
+thin binary; the excluded store dependency is the `haider-store` crate.
 
 One typed grammar in `haider-cli/src/routing.rs` serves both executables. The
 thin process selects interactive commands before runtime or profile creation.
@@ -116,8 +122,8 @@ were denied. A writable shared checkout at `target/thinexe-merge` fetched
 commit, and applied the lane patch with three-way conflict resolution. Incoming
 source changes were copied back, preserving both sides. The incoming CLI retraction
 route was projected into the shared grammar and help. Golden regeneration passed all four selected fixtures through the repository
-tooling. The instruct-pipe pin remains 6,244 → 6,244 bytes (6,166 invariant
-plus 78 POSIX bytes), and the source test count is 5,096.
+tooling. At that merge the instruct-pipe pin remained 6,244 → 6,244 bytes
+(6,166 invariant plus 78 POSIX bytes), and the source test count was 5,096.
 `thinexe-evidence/isolated-{fetch,merge,apply}*` records the operations. The
 orchestrator must record the merge in the original Git metadata.
 
@@ -135,19 +141,39 @@ no lane command requested this deletion. `target-disappearance.json` and
 checkout at `tmp/thinexe/merged-checkout` fetched and merged the same 229122b5
 base, and a replacement gate uses `CARGO_TARGET_DIR=$PWD/tmp/thinexe/cargo-target`.
 
+The last fetch advanced wave to `6c42fc02bccadce76aec55b388bfb55b90e7c5a7`
+(Esc-to-retract TUI). Its source delta applied cleanly; the generated test-count
+conflict was resolved through the repository tool at 5,109. The recovery
+checkout now lives at `/private/tmp/thinexe-970-merged-checkout`: keeping a full
+checkout inside `tmp/` caused the recursive test counter to include it twice,
+so that transient 10,218 result was rejected and the checkout moved outside
+the scan root before recounting. The merge is resolved in the writable checkout;
+`wave-6c42fc02.patch` and `merge-6c42fc02.log` retain its source delta and merge.
+The frozen 229122b5 artifact evidence is preserved with `pre-6c42fc02-` prefixes.
+The final merged gate passes: 5,604 summed libtest passes, zero failures,
+13 unchanged pre-existing ignores, strict workspace/tests Clippy clean, and
+authoritative source count 5,109. All four regenerated goldens and the exact
+6,244-byte instruct-pipe pin pass on this merged source.
+
 ## Measurement record
 
 Baseline artifacts are frozen in `/private/tmp/thinexe-before`; source was the
 starting 969 tree. Release build passed in 38m35s. Exact hashes are in
 `thinexe-evidence/baseline.json`.
 
+The following table compares the frozen baseline with the final **6c42fc02 +
+thinexe** candidate in `/private/tmp/thinexe-after-final`. Its source manifest,
+versions, file sizes and full SHA-256 hashes are in
+`thinexe-evidence/release-final.json`. Earlier 229122b5 results remain in the
+separate `pre-6c42fc02-release-final.json` record.
+
 | Artifact | Before bytes | After bytes |
 | --- | ---: | ---: |
 | haider | 35,543,584 | 23,144,352 (−34.9%) |
 | haiderd | 55,365,968 | 56,589,536 (+2.2%) |
-| haider-tui | absent | 25,511,904 |
-| Installed runtime total | 90,909,552 | 105,245,792 (+15.8%) |
-| Legacy migration launcher | absent | 49,578,096 |
+| haider-tui | absent | 25,528,448 |
+| Installed runtime total | 90,909,552 | 105,262,336 (+15.8%) |
+| Legacy migration launcher | absent | 49,594,608 |
 
 The before artifact predates the merged retraction lane; the final candidate
 includes it. Comparisons must state both source identities rather than attributing
@@ -161,9 +187,10 @@ wait4 CPU/RSS. Existing harness process-tree CPU remains separate from additive
 sampled own-client CPU, explicitly labeled a lower bound. Artifacts are hashed
 before/after; failed/rejected peer reports stay failed/rejected.
 
-The final release and embedded compatibility builds passed, with unchanged Rust
-source hashes across both builds. Frozen candidate paths, versions, sizes and
-SHA-256 hashes are recorded in `thinexe-evidence/release-final.json`. The CLI
+The final runtime release build passed in 39m39s and the embedded compatibility
+build passed in 14m06s. Rust sources and Cargo manifests remained unchanged
+across both builds. The observed Rust/Cargo 1.95.0 arm64 macOS toolchain is
+recorded in `thinexe-evidence/final-toolchain.json`. The CLI
 shrinks, while the installed runtime total grows; the compatibility executable
 is an additional legacy delivery mechanism, not part of the fresh three-member
 installed total. These are local arm64 release executables with the repository's
@@ -176,10 +203,13 @@ normal release profile, not notarized/compressed release download sizes.
 | Warm sampled client peak RSS/CPU | unmeasured → unmeasured | 0 | ENVIRONMENT-BLOCKED |
 | Conformance client rows | unmeasured → unmeasured | 0 | ENVIRONMENT-BLOCKED |
 
-The actual fixed ABBA command exited 75 before any sample: one-minute load
-4.52978515625 exceeded the unchanged 3.0 limit. See
-`thinexe-evidence/abba/abba.json` and `abba-driver.log`. Earlier `/bin/ps` proof
-was denied with EPERM; no alternative bypass was used. No null value is treated
+The final fixed ABBA command exited 75 before any sample: one-minute load
+3.24755859375 exceeded the unchanged 3.0 limit. See
+`thinexe-evidence/abba-final/abba.json` and `abba-final-driver.log`. A subsequent
+quiet-host retry reached the process-inventory check but was denied with EPERM
+before any binary was launched (`abba-final-quiet-retry/abba.json`). The earlier
+4.52978515625-load rejection remains in `abba/abba.json`. No guard was bypassed,
+sample count changed, or rejected result relabeled. No null value is treated
 as zero and no historical sample is substituted for this missing pair. The
 HOLD-OUT verdict is **NO_SHIP** without accepted same-machine RSS evidence.
 
@@ -187,18 +217,21 @@ HOLD-OUT verdict is **NO_SHIP** without accepted same-machine RSS evidence.
 export RUST_MIN_STACK=8388608 HAIDER_DISCOVERY_DISABLED=1
 export HAIDER_TEST_DEVICE_NAME=test-mac CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
 export CARGO_BUILD_JOBS=1
+export CARGO_TARGET_DIR="$PWD/tmp/thinexe/cargo-target"
 df -m /
 cargo build --release --locked -p haider-cli -p haider-daemond -p haider-tui-exe
 df -m /
-HAIDER_THIN_EXE="$PWD/target/release/haider" HAIDER_TUI_EXE="$PWD/target/release/haider-tui" \
+HAIDER_THIN_EXE="$CARGO_TARGET_DIR/release/haider" HAIDER_TUI_EXE="$CARGO_TARGET_DIR/release/haider-tui" \
   cargo build --release --locked -p haider-compat --features embedded-bundle
 python3 scripts/qa-gate/thinexe_abba.py boundary \
-  --candidate /private/tmp/thinexe-after \
+  --candidate /private/tmp/thinexe-after-final \
   --output docs/testing/v0.0.970/thinexe-evidence/boundary-final.json
 python3 scripts/qa-gate/thinexe_abba.py measure \
-  --baseline /private/tmp/thinexe-before --candidate /private/tmp/thinexe-after \
+  --baseline /private/tmp/thinexe-before --candidate /private/tmp/thinexe-after-final \
   --conformance-root /Users/rizzist/haider-run/bench-fix \
-  --output-dir docs/testing/v0.0.970/thinexe-evidence/abba
+  --output-dir docs/testing/v0.0.970/thinexe-evidence/abba-final
+# Same fixed command's quiet-host retry used --output-dir
+# docs/testing/v0.0.970/thinexe-evidence/abba-final-quiet-retry.
 ```
 
 Baseline build command and environment are retained verbatim in
@@ -211,39 +244,102 @@ counts and ABBA order; the peer benchmark is unchanged.
 - Candidate normal targets: PASS (`check-3.log`).
 - Candidate all affected Rust targets before merge: PASS (`check-all-targets-2.log`).
 - ABBA orchestrator/turnperf Python tests: 28 PASS.
-- Continuation Python installer/packaging/ABBA/legacy/turnperf regressions: 59 PASS;
+- Continuation Python installer/packaging/ABBA/legacy/turnperf regressions: 60 PASS;
   the nine packaging tests also pass after the 229122b5 forward merge.
-- Continuation native debug siblings: PASS; `haiderd` is 202,614,752 bytes,
-  exceeding the required 10 MiB. Source test-count is updated to 5,096.
+- Final merged native debug siblings: PASS; `haiderd` is 202,614,624 bytes,
+  exceeding the required 10 MiB. Source test-count is updated to 5,109.
 - Normal-edge dependency proof over all targets: 127 crates, zero forbidden
   dependencies. Final native `nm`, `otool`, `objdump` and raw-byte/source-marker
   inspection also pass (`boundary-final.json`).
 - Unsafe-count gate: PASS, production=189/test=20. Formatting/diff checks pass.
-- Final merged release build and embedded compatibility build: PASS.
+- Final merged runtime release and embedded compatibility builds: PASS, with
+  stable source manifests and all four versions equal to 0.0.970.
 - Regenerated JSONL goldens: 4 PASS. Instruct-pipe pin: 6,244 → 6,244, PASS.
-- Native macOS release installer suite: 5 PASS, 34.650 seconds. Fresh install,
+- Native macOS final release installer suite: 5 PASS, 62.672 seconds. Fresh install,
   missing/wrong payload refusal, npm publication, and retained recovery marker
-  execute actual frozen binaries (`native-installer-release.log`).
+  execute actual final frozen binaries (`native-installer-final.log`).
 - Official `t1.store.previous_release_upgrade`: PASS (v966 → v970, schema
   equality, preserved sessions, new completed turn and exact-daemon cleanup).
+  Final-candidate results are in `t1-install-final/checks.json`.
 - Official `t1.install.paths`: FAIL, installer curl exit56 / HTTP404 for the
   unpublished v970 split asset. The raw result remains FAIL; the local native
   fixture is separate evidence. Both rows retain orphan-daemon cleanup PASS.
-- Expanded historical updater fixture: retained auto-spawn case FAIL at
-  post-commit drain; strict three-member archive negative PASS. Persistent old
-  daemon update exits 0, but its exact signed-reference assertion fails; this
-  is not yet an accepted migration result. `legacy-upgrade-rerun.json` retains
-  all three results and failed scratch diagnostics.
-- First workspace retry: FAIL at compilation on two omitted optional-member
-  match arms; repaired and supplemented with three native portal tests. First
-  Clippy attempt: FAIL ENOENT after `target/` disappeared. The source recount
-  passed at 5,096. Clean sibling/test/clippy rebuild is in progress under the
-  replacement target directory; these attempts are not green evidence.
-- Fixed ABBA attempt: ENVIRONMENT-BLOCKED before any sample; NO_SHIP.
+- Final historical updater fixture (`legacy-upgrade-merged.json`): persistent
+  v969 daemon → compatibility entrypoint → thin/payload migration PASS, with
+  exact signed bytes, old PID exit, preserved restarted PID, matching versions,
+  transaction cleanup and explicit final daemon-stop proof. Historical strict
+  three-member archive refusal PASS. Auto-spawn v969 daemon case still FAIL at
+  post-commit drain; overall FAIL is retained. Frozen inputs are unchanged.
+  The prior final-candidate fixture remains in `legacy-upgrade-final.json`.
+  Original and intermediate reference-oracle failures remain in
+  `legacy-upgrade.json` and `legacy-upgrade-rerun.json`; failed scratch paths,
+  markers, canonical hashes and log tails are retained. A canonical-basename
+  codesign diagnostic explains the corrected exact-byte reference; no hash
+  assertion was removed or relaxed. Final failed scratch is retained at
+  `/private/tmp/htlu-jrpff3xb`, including recovery markers and cleanup diagnostics.
+- Final merged full workspace gate: PASS (`workspace-tests-retry-3.log`),
+  5,604 summed libtest passes, zero failures, 13 unchanged pre-existing ignores;
+  elapsed 1,853.69 seconds. Strict `cargo clippy --workspace --tests -- -D warnings`
+  PASS; authoritative test-count update PASS at 5,109. Exact command/env/disk
+  records are in `gates-resumed.json`, with totals in `final-test-totals.json`.
+- Earlier failures remain separate evidence: omitted optional-member match
+  arms were repaired and supplemented with three native portal tests; Clippy
+  ENOENT followed the unexplained target-directory loss. Test retry 2 exposed
+  the missing payload warmup (2.103224s versus the unchanged 950ms limit) and
+  the shared serde type-name regression. Both are repaired and pass the final
+  full gate. No failed attempt is relabeled as passing.
+- Final artifact audit: PASS, current Rust/Cargo source matches the final build,
+  both frozen artifact sets remain unchanged after all probes, and only the TUI
+  among the three runtime siblings contains the contiguous payload marker
+  (`final-artifact-audit.json`).
+- Fixed ABBA attempts: ENVIRONMENT-BLOCKED before any sample; zero accepted
+  pairs, NO_SHIP. The quiet retry establishes the denied process-inventory proof.
+
+Exact validation commands (run from this worktree):
+
+```sh
+export RUST_MIN_STACK=8388608 HAIDER_DISCOVERY_DISABLED=1
+export HAIDER_TEST_DEVICE_NAME=test-mac CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
+export CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=4
+export CARGO_TARGET_DIR="$PWD/tmp/thinexe/cargo-target"
+df -m /
+cargo build --locked -p haider-cli -p haider-daemond -p haider-tui-exe -p haider-tools --bins
+export HAIDER_TEST_SIBLINGS_PREBUILT=1
+df -m /
+cargo test -q --workspace --no-fail-fast
+df -m /
+cargo clippy --workspace --tests -- -D warnings
+df -m /
+cargo run -q -p xtask -- test-count --update
+df -m /
+UPDATE_FIXTURES=1 cargo test -q -p haider-cli --test turnhygiene_pin_tests golden -- --test-threads=1
+df -m /
+cargo test -q -p haider-daemon --lib instruct_pipe_shrinks_the_advertised_wire_pack -- --nocapture
+HAIDER_INSTALL_TEST_BIN_DIR=/private/tmp/thinexe-after-final \
+  python3 -m unittest -v scripts/tests/test_install_bundle_native.py
+PYTHONPATH=scripts/qa-gate python3 -m unittest \
+  scripts/tests/test_release_packaging.py scripts/tests/test_install_bundle.py \
+  scripts/qa-gate/tests/test_thinexe_abba.py scripts/qa-gate/tests/test_thinexe_legacy_upgrade.py \
+  scripts/qa-gate/tests/test_turnperf.py
+python3 tmp/thinexe/run-install-t1.py
+python3 scripts/qa-gate/thinexe_legacy_upgrade.py \
+  --baseline /private/tmp/thinexe-before --candidate /private/tmp/thinexe-after-final \
+  --compat /private/tmp/thinexe-after-final/haider-compat --version 0.0.970 \
+  --output docs/testing/v0.0.970/thinexe-evidence/legacy-upgrade-merged.json
+```
+
+The golden and pin commands were rerun successfully on the final merged source
+after fresh sibling builds and before the final full workspace gate.
+The T1 driver invokes only `t1.install.paths` and
+`t1.store.previous_release_upgrade` through `runner.execute_check`, retaining
+mandatory cleanup and `measurement_accepted=false`; it does not change either
+check's result or deadline. Exact per-command environment, disk and exit records
+are in `gates-resumed.json`. The first ENOSPC and later ENOENT attempts remain
+visible and do not count as completed gates.
 
 ## Independent review corrections
 
-Unique findings accepted so far (duplicate lock finding counted once):
+Unique findings accepted (duplicate lock finding counted once):
 
 1. Launcher lock default permissions prevented future updates: set 0600 and
    validate regular-file/owner/mode, with compatibility test.
@@ -279,7 +375,11 @@ prefix finding once across reviewers):
 
 14. CI self-test, TUI ladder/footprint and Android builds/packages omitted the
     required payload: build/stage the missing runtime siblings; Android retains
-    its prior TUI compilation coverage. Native Windows/Linux/Android execution
+    its prior TUI compilation coverage. The native per-crate CI runner explicitly
+    builds ordinary CLI/daemon/payload/tools executables before exporting
+    prebuilt proof: `cargo test --no-run` alone can produce only a payload test
+    harness. A failed sibling build clears inherited proof and is logged and
+    aggregated. Native Windows/Linux/Android execution
     is still CI-only, not claimed as a local pass.
 15. The live PTY probe copied only the old two-member bundle: require and copy
     the payload, and make ladder preflight reject incomplete bundles.
@@ -288,7 +388,7 @@ prefix finding once across reviewers):
     explicitly identified as unproven under registry #94. Six version probes
     alone have a 180-second sum of existing allowances; no fictional arithmetic
     or cap relaxation is presented as a fix. This remains a separate hold-out
-    issue even though the actual five-test native suite passes in 34.650 seconds.
+    issue even though the final five-test native suite passes in 62.672 seconds.
 
 17. The legacy migration fixture conflated the 969 auto-spawn lifecycle with
     migration and used obsolete forced-signature expectations. It now keeps
@@ -298,17 +398,47 @@ prefix finding once across reviewers):
     launcher-idle demand followed by the updater SIGTERM escalates to forced
     shutdown; increasing TTL alone cannot repair that historical interaction.
 
+18. The auto-spawn timing fixture warmed the CLI and daemon but omitted the
+    newly executed payload inode. Warm `haider-tui --version` before its
+    existing timer; retain the 950ms local and 10s CI limits and every runtime
+    assertion. The observed 2.103224s failure stays in the original full-gate log.
+19. The same fixture ignored the explicit prebuilt-sibling proof and launched
+    nested Cargo builds on Linux or missing siblings. Require the existing
+    `HAIDER_TEST_SIBLINGS_PREBUILT=1` convention and fail explicitly for missing
+    daemon/payload files, matching the other subprocess fixtures; no fallback
+    can replace a sibling during test setup.
+
+20. Shared subagent serde validation exposed `SpawnSubagentArguments` in
+    malformed-input errors despite the legacy rename attribute. Keep the actual
+    derive authority named `SpawnSubagent` and re-export the unchanged public
+    alias; this preserves scalar and sequence expectations (including the
+    10-element wording), fields, validation and tool error class. The existing
+    full-field/error-vocabulary regression is retained unchanged.
+
 An earlier review rejected stopping at a migration-design report: the migration
 is implementable engineering work. That changed the implementation/verdict path;
 this report supersedes the earlier incomplete investigation draft. Counting that
-earlier verdict-changing observation gives 18 unique accepted findings; the
-other 17 code/test/verdict corrections are enumerated above. No independent
+earlier verdict-changing observation gives 21 unique accepted findings; the
+other 20 code/test/verdict corrections are enumerated above. No independent
 finding was rejected as noise. Duplicate observations are counted once.
+
+## Held delivery
+
+The original Git metadata is outside the writable sandbox. The requested
+fallback is `tmp/thinexe/thinexe.bundle`, with a binary patch at
+`tmp/thinexe/thinexe.patch` and exact base, held commit, changed paths and hashes
+in `tmp/thinexe/bundle.json`. The writable recovery checkout at
+`/private/tmp/thinexe-970-merged-checkout` records the resolved forward merge on
+`lane-970-thinexe`; the bundle is verified against origin/wave-970 at 6c42fc02.
+The commit has no trailer. Nothing was pushed, and this held branch is not a
+performance acceptance or landing approval. Supplied lane/common and turnperf
+inputs are excluded from both the commit and patch.
 
 ## CI registry walk
 
-- #5/#7/#10/#19: platform imports and declared dependencies audited; final
-  formatting, all-targets checking and scoped clippy required.
+- #5/#7/#10/#19: platform imports and declared dependencies audited; formatting
+  and strict workspace/tests Clippy pass. Native cross-platform execution remains
+  CI-only; local macOS evidence does not establish a Windows/Linux pass.
 - #20: recount through xtask after all added/moved/merged tests.
 - #29/#41/#44/#64/#71/#72/#74: real prebuilt siblings, short throwaway profiles,
   hermetic HOME/discovery/device settings; no stub daemon or inferred binary gate.
@@ -321,7 +451,9 @@ finding was rejected as noise. Duplicate observations are counted once.
   this remains explicitly unresolved. #95: no additional negotiated RPC wait
   is introduced by pre-runtime handoff or install-directory helper.
 - #96: no performance acceptance while compilation/load/proof restrictions fail.
-- Remaining registry entries: final affected-crate gate and review pending;
-  no blanket clean claim made before that evidence exists.
+- Remaining registry entries: final merged workspace gate and independent
+  source review complete; no additional changed-surface issue found. Performance,
+  public installation, historical auto-spawn upgrade and watchdog-provenance
+  acceptance blockers remain explicitly recorded above.
 
 NO_SHIP

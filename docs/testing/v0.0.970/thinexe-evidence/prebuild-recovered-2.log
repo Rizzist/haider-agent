@@ -438,3 +438,9 @@
    Compiling termbg v0.6.2
    Compiling haider-stt v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-stt)
    Compiling arboard v3.6.1
+   Compiling haider-cli v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli)
+   Compiling haider-verify v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-verify)
+   Compiling haider-tui v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-tui)
+   Compiling haider-tui-exe v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-tui-exe)
+   Compiling haider-daemond v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-daemond)
+    Finished `dev` profile [unoptimized] target(s) in 7m 43s

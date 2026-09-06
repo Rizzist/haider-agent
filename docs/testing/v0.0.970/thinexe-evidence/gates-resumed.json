@@ -271,6 +271,288 @@
     "df": "Filesystem     1M-blocks   Used Available Capacity iused     ifree %iused  Mounted on\n/dev/disk3s1s1    233752  12062     17472    41%  458732 178913360    0%   /\n",
     "available_mib": 17472,
     "started_unix": 1788663485.48129,
-    "status": "RUNNING"
+    "status": "PASS",
+    "exit_code": 0,
+    "elapsed_seconds": 463.8503201007843
+  },
+  {
+    "label": "workspace-tests-retry-2",
+    "argv": [
+      "cargo",
+      "test",
+      "-q",
+      "--workspace",
+      "--no-fail-fast"
+    ],
+    "env": {
+      "RUST_MIN_STACK": "8388608",
+      "HAIDER_DISCOVERY_DISABLED": "1",
+      "HAIDER_TEST_DEVICE_NAME": "test-mac",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_BUILD_JOBS": "1",
+      "RUST_TEST_THREADS": "4",
+      "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+      "CARGO_TARGET_DIR": "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/cargo-target"
+    },
+    "extra_env": {},
+    "df": "Filesystem     1M-blocks   Used Available Capacity iused     ifree %iused  Mounted on\n/dev/disk3s1s1    233752  12062     34214    27%  458732 350360360    0%   /\n",
+    "available_mib": 34214,
+    "started_unix": 1788663949.344853,
+    "status": "FAIL",
+    "exit_code": 101,
+    "elapsed_seconds": 1554.619677066803
+  },
+  {
+    "label": "workspace-clippy-2",
+    "argv": [
+      "cargo",
+      "clippy",
+      "--workspace",
+      "--tests",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "env": {
+      "RUST_MIN_STACK": "8388608",
+      "HAIDER_DISCOVERY_DISABLED": "1",
+      "HAIDER_TEST_DEVICE_NAME": "test-mac",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_BUILD_JOBS": "1",
+      "RUST_TEST_THREADS": "4",
+      "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+      "CARGO_TARGET_DIR": "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/cargo-target"
+    },
+    "extra_env": {},
+    "df": "Filesystem     1M-blocks   Used Available Capacity iused     ifree %iused  Mounted on\n/dev/disk3s1s1    233752  12062     25781    32%  458732 263999360    0%   /\n",
+    "available_mib": 25781,
+    "started_unix": 1788665503.9683368,
+    "status": "PASS",
+    "exit_code": 0,
+    "elapsed_seconds": 351.76500129699707
+  },
+  {
+    "label": "test-count-final-2",
+    "argv": [
+      "cargo",
+      "run",
+      "-q",
+      "-p",
+      "xtask",
+      "--",
+      "test-count",
+      "--update"
+    ],
+    "env": {
+      "RUST_MIN_STACK": "8388608",
+      "HAIDER_DISCOVERY_DISABLED": "1",
+      "HAIDER_TEST_DEVICE_NAME": "test-mac",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_BUILD_JOBS": "1",
+      "RUST_TEST_THREADS": "4",
+      "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+      "CARGO_TARGET_DIR": "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/cargo-target"
+    },
+    "extra_env": {},
+    "df": "Filesystem     1M-blocks   Used Available Capacity iused     ifree %iused  Mounted on\n/dev/disk3s1s1    233752  12062     25865    32%  458732 264865080    0%   /\n",
+    "available_mib": 25865,
+    "started_unix": 1788665855.741465,
+    "status": "PASS",
+    "exit_code": 0,
+    "elapsed_seconds": 2.1398699283599854
+  },
+  {
+    "label": "prebuild-recovered-3",
+    "argv": [
+      "cargo",
+      "build",
+      "--locked",
+      "-p",
+      "haider-cli",
+      "-p",
+      "haider-daemond",
+      "-p",
+      "haider-tui-exe",
+      "-p",
+      "haider-tools",
+      "--bins"
+    ],
+    "env": {
+      "RUST_MIN_STACK": "8388608",
+      "HAIDER_DISCOVERY_DISABLED": "1",
+      "HAIDER_TEST_DEVICE_NAME": "test-mac",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_BUILD_JOBS": "1",
+      "RUST_TEST_THREADS": "4",
+      "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+      "CARGO_TARGET_DIR": "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/cargo-target"
+    },
+    "extra_env": {},
+    "df": "Filesystem     1M-blocks   Used Available Capacity iused     ifree %iused  Mounted on\n/dev/disk3s1s1    233752  12062     25197    33%  458732 258025720    0%   /\n",
+    "available_mib": 25197,
+    "started_unix": 1788665965.703234,
+    "status": "PASS",
+    "exit_code": 0,
+    "elapsed_seconds": 200.369402885437
+  },
+  {
+    "label": "regenerate-goldens-final-3",
+    "argv": [
+      "cargo",
+      "test",
+      "-q",
+      "-p",
+      "haider-cli",
+      "--test",
+      "turnhygiene_pin_tests",
+      "golden",
+      "--",
+      "--test-threads=1"
+    ],
+    "env": {
+      "RUST_MIN_STACK": "8388608",
+      "HAIDER_DISCOVERY_DISABLED": "1",
+      "HAIDER_TEST_DEVICE_NAME": "test-mac",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_BUILD_JOBS": "1",
+      "RUST_TEST_THREADS": "4",
+      "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+      "CARGO_TARGET_DIR": "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/cargo-target"
+    },
+    "extra_env": {
+      "UPDATE_FIXTURES": "1"
+    },
+    "df": "Filesystem     1M-blocks   Used Available Capacity iused     ifree %iused  Mounted on\n/dev/disk3s1s1    233752  12062     24362    34%  458732 249475240    0%   /\n",
+    "available_mib": 24362,
+    "started_unix": 1788666166.078379,
+    "status": "PASS",
+    "exit_code": 0,
+    "elapsed_seconds": 114.1457941532135
+  },
+  {
+    "label": "instruct-pipe-pin-final-3",
+    "argv": [
+      "cargo",
+      "test",
+      "-q",
+      "-p",
+      "haider-daemon",
+      "--lib",
+      "instruct_pipe_shrinks_the_advertised_wire_pack",
+      "--",
+      "--nocapture"
+    ],
+    "env": {
+      "RUST_MIN_STACK": "8388608",
+      "HAIDER_DISCOVERY_DISABLED": "1",
+      "HAIDER_TEST_DEVICE_NAME": "test-mac",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_BUILD_JOBS": "1",
+      "RUST_TEST_THREADS": "4",
+      "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+      "CARGO_TARGET_DIR": "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/cargo-target"
+    },
+    "extra_env": {},
+    "df": "Filesystem     1M-blocks   Used Available Capacity iused     ifree %iused  Mounted on\n/dev/disk3s1s1    233752  12062     19408    39%  458732 198744520    0%   /\n",
+    "available_mib": 19408,
+    "started_unix": 1788666280.243179,
+    "status": "PASS",
+    "exit_code": 0,
+    "elapsed_seconds": 220.48930191993713
+  },
+  {
+    "label": "workspace-tests-retry-3",
+    "argv": [
+      "cargo",
+      "test",
+      "-q",
+      "--workspace",
+      "--no-fail-fast"
+    ],
+    "env": {
+      "RUST_MIN_STACK": "8388608",
+      "HAIDER_DISCOVERY_DISABLED": "1",
+      "HAIDER_TEST_DEVICE_NAME": "test-mac",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_BUILD_JOBS": "1",
+      "RUST_TEST_THREADS": "4",
+      "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+      "CARGO_TARGET_DIR": "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/cargo-target"
+    },
+    "extra_env": {},
+    "df": "Filesystem     1M-blocks   Used Available Capacity iused     ifree %iused  Mounted on\n/dev/disk3s1s1    233752  12062     16027    43%  458732 164119360    0%   /\n",
+    "available_mib": 16027,
+    "started_unix": 1788666500.73718,
+    "status": "PASS",
+    "exit_code": 0,
+    "elapsed_seconds": 1853.694475889206
+  },
+  {
+    "label": "workspace-clippy-3",
+    "argv": [
+      "cargo",
+      "clippy",
+      "--workspace",
+      "--tests",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "env": {
+      "RUST_MIN_STACK": "8388608",
+      "HAIDER_DISCOVERY_DISABLED": "1",
+      "HAIDER_TEST_DEVICE_NAME": "test-mac",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_BUILD_JOBS": "1",
+      "RUST_TEST_THREADS": "4",
+      "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+      "CARGO_TARGET_DIR": "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/cargo-target"
+    },
+    "extra_env": {},
+    "df": "Filesystem     1M-blocks   Used Available Capacity iused     ifree %iused  Mounted on\n/dev/disk3s1s1    233752  12062     17757    41%  458732 181836400    0%   /\n",
+    "available_mib": 17757,
+    "started_unix": 1788668354.4524539,
+    "status": "PASS",
+    "exit_code": 0,
+    "elapsed_seconds": 1.3216633796691895
+  },
+  {
+    "label": "test-count-final-3",
+    "argv": [
+      "cargo",
+      "run",
+      "-q",
+      "-p",
+      "xtask",
+      "--",
+      "test-count",
+      "--update"
+    ],
+    "env": {
+      "RUST_MIN_STACK": "8388608",
+      "HAIDER_DISCOVERY_DISABLED": "1",
+      "HAIDER_TEST_DEVICE_NAME": "test-mac",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_BUILD_JOBS": "1",
+      "RUST_TEST_THREADS": "4",
+      "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+      "CARGO_TARGET_DIR": "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/cargo-target"
+    },
+    "extra_env": {},
+    "df": "Filesystem     1M-blocks   Used Available Capacity iused     ifree %iused  Mounted on\n/dev/disk3s1s1    233752  12062     17756    41%  458732 181831120    0%   /\n",
+    "available_mib": 17756,
+    "started_unix": 1788668355.7812932,
+    "status": "PASS",
+    "exit_code": 0,
+    "elapsed_seconds": 1.2135798931121826
   }
 ]

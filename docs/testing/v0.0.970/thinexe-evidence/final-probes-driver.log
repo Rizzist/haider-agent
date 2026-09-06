@@ -1,0 +1,10 @@
+START boundary-final
+END boundary-final: exit=0
+START native-installer-final
+END native-installer-final: exit=0
+START t1-install-final-driver
+END t1-install-final-driver: exit=1
+START legacy-upgrade-merged
+END legacy-upgrade-merged: exit=1
+START abba-final-driver
+END abba-final-driver: exit=75

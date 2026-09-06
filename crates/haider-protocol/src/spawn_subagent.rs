@@ -18,8 +18,7 @@ pub const MAX_SELECTOR_BYTES: usize = 128;
 /// (`skip_serializing_if`), so historical receipts and effect summaries are
 /// unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename = "SpawnSubagent")]
-pub struct SpawnSubagentArguments {
+pub struct SpawnSubagent {
     pub task: String,
     pub prompt: String,
     /// Per-turn request tranche and hard ceiling pinned for this child.
@@ -48,7 +47,13 @@ pub struct SpawnSubagentArguments {
     pub agent_type: Option<String>,
 }
 
-impl SpawnSubagentArguments {
+// Serde derives both scalar and short-sequence expectations from the Rust
+// name. A rename does not change them, while expecting overrides the sequence
+// element-count suffix too. Keep the legacy name as the derive authority and
+// expose the shared arguments under their existing public alias.
+pub use SpawnSubagent as SpawnSubagentArguments;
+
+impl SpawnSubagent {
     pub fn from_tool_args(args: Value) -> Result<Self, String> {
         let request: Self = serde_json::from_value(args)
             .map_err(|error| format!("invalid spawn_subagent arguments: {error}"))?;

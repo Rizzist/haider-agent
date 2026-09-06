@@ -1,0 +1,129 @@
+[
+  {
+    "label": "boundary-final",
+    "argv": [
+      "python3",
+      "scripts/qa-gate/thinexe_abba.py",
+      "boundary",
+      "--candidate",
+      "/private/tmp/thinexe-after-final",
+      "--output",
+      "/Users/rizzist/haider-run/lane-970-thinexe/docs/testing/v0.0.970/thinexe-evidence/boundary-final.json"
+    ],
+    "started_unix": 1788671672.673268,
+    "environment": {
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_TARGET_DIR": "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/cargo-target",
+      "RUST_MIN_STACK": "8388608",
+      "HAIDER_DISCOVERY_DISABLED": "1",
+      "HAIDER_TEST_DEVICE_NAME": "test-mac",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+      "HAIDER_INSTALL_TEST_BIN_DIR": "/private/tmp/thinexe-after-final"
+    },
+    "exit_code": 0,
+    "elapsed_seconds": 0.8256509304046631
+  },
+  {
+    "label": "native-installer-final",
+    "argv": [
+      "python3",
+      "-m",
+      "unittest",
+      "-v",
+      "scripts/tests/test_install_bundle_native.py"
+    ],
+    "started_unix": 1788671673.499132,
+    "environment": {
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_TARGET_DIR": "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/cargo-target",
+      "RUST_MIN_STACK": "8388608",
+      "HAIDER_DISCOVERY_DISABLED": "1",
+      "HAIDER_TEST_DEVICE_NAME": "test-mac",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+      "HAIDER_INSTALL_TEST_BIN_DIR": "/private/tmp/thinexe-after-final"
+    },
+    "exit_code": 0,
+    "elapsed_seconds": 62.73181104660034
+  },
+  {
+    "label": "t1-install-final-driver",
+    "argv": [
+      "python3",
+      "tmp/thinexe/run-install-t1.py"
+    ],
+    "started_unix": 1788671736.231245,
+    "environment": {
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_TARGET_DIR": "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/cargo-target",
+      "RUST_MIN_STACK": "8388608",
+      "HAIDER_DISCOVERY_DISABLED": "1",
+      "HAIDER_TEST_DEVICE_NAME": "test-mac",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+      "HAIDER_INSTALL_TEST_BIN_DIR": "/private/tmp/thinexe-after-final"
+    },
+    "exit_code": 1,
+    "elapsed_seconds": 39.96495580673218
+  },
+  {
+    "label": "legacy-upgrade-merged",
+    "argv": [
+      "python3",
+      "scripts/qa-gate/thinexe_legacy_upgrade.py",
+      "--baseline",
+      "/private/tmp/thinexe-before",
+      "--candidate",
+      "/private/tmp/thinexe-after-final",
+      "--compat",
+      "/private/tmp/thinexe-after-final/haider-compat",
+      "--version",
+      "0.0.970",
+      "--output",
+      "/Users/rizzist/haider-run/lane-970-thinexe/docs/testing/v0.0.970/thinexe-evidence/legacy-upgrade-merged.json"
+    ],
+    "started_unix": 1788671776.1964831,
+    "environment": {
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_TARGET_DIR": "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/cargo-target",
+      "RUST_MIN_STACK": "8388608",
+      "HAIDER_DISCOVERY_DISABLED": "1",
+      "HAIDER_TEST_DEVICE_NAME": "test-mac",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+      "HAIDER_INSTALL_TEST_BIN_DIR": "/private/tmp/thinexe-after-final"
+    },
+    "exit_code": 1,
+    "elapsed_seconds": 117.8992109298706
+  },
+  {
+    "label": "abba-final-driver",
+    "argv": [
+      "python3",
+      "scripts/qa-gate/thinexe_abba.py",
+      "measure",
+      "--baseline",
+      "/private/tmp/thinexe-before",
+      "--candidate",
+      "/private/tmp/thinexe-after-final",
+      "--conformance-root",
+      "/Users/rizzist/haider-run/bench-fix",
+      "--output-dir",
+      "/Users/rizzist/haider-run/lane-970-thinexe/docs/testing/v0.0.970/thinexe-evidence/abba-final"
+    ],
+    "started_unix": 1788671894.0959842,
+    "environment": {
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_TARGET_DIR": "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/cargo-target",
+      "RUST_MIN_STACK": "8388608",
+      "HAIDER_DISCOVERY_DISABLED": "1",
+      "HAIDER_TEST_DEVICE_NAME": "test-mac",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+      "HAIDER_INSTALL_TEST_BIN_DIR": "/private/tmp/thinexe-after-final"
+    },
+    "exit_code": 75,
+    "elapsed_seconds": 0.09010577201843262
+  }
+]

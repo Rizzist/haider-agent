@@ -1,0 +1,344 @@
+[
+  {
+    "id": "t1.install.paths",
+    "area": "install",
+    "status": "FAIL",
+    "evidence": [
+      {
+        "label": "install_paths",
+        "status": "FAIL",
+        "evidence_line": "install.sh expected_exit=0 actual=56 timed_out=false stderr='curl: (56) The requested URL returned error: 404'",
+        "artefacts": [
+          "/private/tmp/haider-probe-qa-igxsg_gt/artefacts/source-version.txt",
+          "/private/tmp/haider-probe-qa-igxsg_gt/artefacts/install-script.txt"
+        ]
+      },
+      {
+        "label": "no_orphan_daemons",
+        "status": "PASS",
+        "evidence_line": "no_orphan_daemons spawn=none",
+        "artefacts": []
+      }
+    ],
+    "wall_ms": 1077,
+    "artefacts": [
+      "/private/tmp/haider-probe-qa-igxsg_gt",
+      "/private/tmp/haider-probe-qa-igxsg_gt/artefacts/install-script.txt",
+      "/private/tmp/haider-probe-qa-igxsg_gt/artefacts/source-version.txt"
+    ],
+    "timed": true,
+    "measurement_accepted": false,
+    "budget": {
+      "total_ms": 468000,
+      "parts": [
+        {
+          "name": "cold binary version query",
+          "milliseconds": 30000,
+          "source": "qa-gate --version ceiling; registry #42 cold-inode allowance is nested here"
+        },
+        {
+          "name": "installer two-fetch outer ceiling",
+          "milliseconds": 120000,
+          "source": "qa-gate 60s allowance per fetch; scripts/install.sh:18-25 has no internal timeout and scripts/install.sh:74-75 performs the archive and checksum fetches"
+        },
+        {
+          "name": "installer checksum extraction and prefix copy",
+          "milliseconds": 30000,
+          "source": "scripts/install.sh:77-119 checksum, tar extraction, and executable copies"
+        },
+        {
+          "name": "cold binary version query",
+          "milliseconds": 30000,
+          "source": "qa-gate --version ceiling; registry #42 cold-inode allowance is nested here"
+        },
+        {
+          "name": "cold binary version query",
+          "milliseconds": 30000,
+          "source": "qa-gate --version ceiling; registry #42 cold-inode allowance is nested here"
+        },
+        {
+          "name": "cold binary version query",
+          "milliseconds": 30000,
+          "source": "qa-gate --version ceiling; registry #42 cold-inode allowance is nested here"
+        },
+        {
+          "name": "daemon startup deadline",
+          "milliseconds": 30000,
+          "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+        },
+        {
+          "name": "client request timeout",
+          "milliseconds": 60000,
+          "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+        },
+        {
+          "name": "daemon stop timeout",
+          "milliseconds": 20000,
+          "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+        },
+        {
+          "name": "post-stop process-exit observation grace",
+          "milliseconds": 2000,
+          "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+        },
+        {
+          "name": "post-stop process-exit observation grace",
+          "milliseconds": 2000,
+          "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+        },
+        {
+          "name": "client request timeout",
+          "milliseconds": 60000,
+          "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+        },
+        {
+          "name": "daemon stop timeout",
+          "milliseconds": 20000,
+          "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+        },
+        {
+          "name": "post-stop process-exit observation grace",
+          "milliseconds": 2000,
+          "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+        },
+        {
+          "name": "post-stop process-exit observation grace",
+          "milliseconds": 2000,
+          "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+        }
+      ]
+    },
+    "segments": 1,
+    "turns_expected": 0,
+    "expected_fail_until": null,
+    "daemon_versions": []
+  },
+  {
+    "id": "t1.store.previous_release_upgrade",
+    "area": "store",
+    "status": "PASS",
+    "evidence": [
+      {
+        "label": "previous_release_upgrade",
+        "status": "PASS",
+        "evidence_line": "source=v0.0.966 sha256=69735f821cb4406f12baad5d2e10981182a260edf1e52d35081d1e964b30dd6e old_user_version=27 old_sessions=2 listed_after_upgrade=true current_turn=done new_user_version=28 fresh_user_version=28 sqlite_master_equal=true schema_sha256=8480a1a1a2727166c89bdb158b9bd9909b530a822e8e0d7552c39386c3591054 fixture=next-release-profile-v0.0.970-from-v0.0.966.tar.xz",
+        "artefacts": [
+          "/Users/rizzist/haider-run/lane-970-thinexe/docs/testing/v0.0.970/thinexe-evidence/t1-install-final/t1.store.previous_release_upgrade/next-release-profile-v0.0.970-from-v0.0.966.tar.xz",
+          "/Users/rizzist/haider-run/lane-970-thinexe/docs/testing/v0.0.970/thinexe-evidence/t1-install-final/t1.store.previous_release_upgrade/next-release-profile-v0.0.970-from-v0.0.966.tar.xz.sha256",
+          "/Users/rizzist/haider-run/lane-970-thinexe/docs/testing/v0.0.970/thinexe-evidence/t1-install-final/t1.store.previous_release_upgrade/next-release-profile-v0.0.970-from-v0.0.966.tar.xz.json"
+        ]
+      },
+      {
+        "label": "no_orphan_daemons",
+        "status": "PASS",
+        "evidence_line": "no_orphan_daemons pids=37853,37883,37888 stop=not_running alive_after=false",
+        "artefacts": []
+      }
+    ],
+    "wall_ms": 38795,
+    "artefacts": [
+      "/Users/rizzist/haider-run/lane-970-thinexe/docs/testing/v0.0.970/thinexe-evidence/t1-install-final/t1.store.previous_release_upgrade/next-release-profile-v0.0.970-from-v0.0.966.tar.xz",
+      "/Users/rizzist/haider-run/lane-970-thinexe/docs/testing/v0.0.970/thinexe-evidence/t1-install-final/t1.store.previous_release_upgrade/next-release-profile-v0.0.970-from-v0.0.966.tar.xz.json",
+      "/Users/rizzist/haider-run/lane-970-thinexe/docs/testing/v0.0.970/thinexe-evidence/t1-install-final/t1.store.previous_release_upgrade/next-release-profile-v0.0.970-from-v0.0.966.tar.xz.sha256"
+    ],
+    "timed": true,
+    "measurement_accepted": false,
+    "budget": {
+      "total_ms": 901000,
+      "parts": [
+        {
+          "name": "one pinned GitHub release fetch",
+          "milliseconds": 60000,
+          "source": "curl --max-time 60 for the pinned archive or checksum sidecar"
+        },
+        {
+          "name": "one pinned GitHub release fetch",
+          "milliseconds": 60000,
+          "source": "curl --max-time 60 for the pinned archive or checksum sidecar"
+        },
+        {
+          "name": "release archive verification and XZ extraction",
+          "milliseconds": 30000,
+          "source": "stdlib SHA-256 plus traversal-checked tarfile r:xz extraction"
+        },
+        {
+          "name": "cold binary version query",
+          "milliseconds": 30000,
+          "source": "qa-gate --version ceiling; registry #42 cold-inode allowance is nested here"
+        },
+        {
+          "name": "cold binary version query",
+          "milliseconds": 30000,
+          "source": "qa-gate --version ceiling; registry #42 cold-inode allowance is nested here"
+        },
+        {
+          "name": "daemon startup deadline",
+          "milliseconds": 30000,
+          "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+        },
+        {
+          "name": "qa attached run --timeout",
+          "milliseconds": 30000,
+          "source": "haider run --timeout 30s (crates/haider-client/src/headless.rs:2583-2591)"
+        },
+        {
+          "name": "terminal cancellation grace",
+          "milliseconds": 2000,
+          "source": "crates/haider-client/src/headless.rs:67-75 DEFAULT_TERMINAL_GRACE"
+        },
+        {
+          "name": "qa attached run --timeout",
+          "milliseconds": 30000,
+          "source": "haider run --timeout 30s (crates/haider-client/src/headless.rs:2583-2591)"
+        },
+        {
+          "name": "terminal cancellation grace",
+          "milliseconds": 2000,
+          "source": "crates/haider-client/src/headless.rs:67-75 DEFAULT_TERMINAL_GRACE"
+        },
+        {
+          "name": "client request timeout",
+          "milliseconds": 60000,
+          "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+        },
+        {
+          "name": "client request timeout",
+          "milliseconds": 60000,
+          "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+        },
+        {
+          "name": "v0.0.966 PID-file executable identity",
+          "milliseconds": 10000,
+          "source": "one bounded lsof/procfs identity proof for the legacy status-derived PID file"
+        },
+        {
+          "name": "daemon stop timeout",
+          "milliseconds": 20000,
+          "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+        },
+        {
+          "name": "post-stop process-exit observation grace",
+          "milliseconds": 2000,
+          "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+        },
+        {
+          "name": "daemon graceful drain deadline",
+          "milliseconds": 5000,
+          "source": "crates/haider-daemon/src/config.rs:108 DaemonConfig::new drain_timeout"
+        },
+        {
+          "name": "post-stop process-exit observation grace",
+          "milliseconds": 2000,
+          "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+        },
+        {
+          "name": "daemon startup deadline",
+          "milliseconds": 30000,
+          "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+        },
+        {
+          "name": "client request timeout",
+          "milliseconds": 60000,
+          "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+        },
+        {
+          "name": "qa attached run --timeout",
+          "milliseconds": 30000,
+          "source": "haider run --timeout 30s (crates/haider-client/src/headless.rs:2583-2591)"
+        },
+        {
+          "name": "terminal cancellation grace",
+          "milliseconds": 2000,
+          "source": "crates/haider-client/src/headless.rs:67-75 DEFAULT_TERMINAL_GRACE"
+        },
+        {
+          "name": "client request timeout",
+          "milliseconds": 60000,
+          "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+        },
+        {
+          "name": "daemon stop timeout",
+          "milliseconds": 20000,
+          "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+        },
+        {
+          "name": "post-stop process-exit observation grace",
+          "milliseconds": 2000,
+          "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+        },
+        {
+          "name": "post-stop process-exit observation grace",
+          "milliseconds": 2000,
+          "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+        },
+        {
+          "name": "daemon startup deadline",
+          "milliseconds": 30000,
+          "source": "crates/haider-client/src/spawn.rs:58 STARTUP_DEADLINE"
+        },
+        {
+          "name": "client request timeout",
+          "milliseconds": 60000,
+          "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+        },
+        {
+          "name": "daemon stop timeout",
+          "milliseconds": 20000,
+          "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+        },
+        {
+          "name": "post-stop process-exit observation grace",
+          "milliseconds": 2000,
+          "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+        },
+        {
+          "name": "post-stop process-exit observation grace",
+          "milliseconds": 2000,
+          "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+        },
+        {
+          "name": "SQLite inspection and next-release fixture capture",
+          "milliseconds": 30000,
+          "source": "read-only PRAGMA/sqlite_master comparison plus stopped-profile XZ capture"
+        },
+        {
+          "name": "client request timeout",
+          "milliseconds": 60000,
+          "source": "crates/haider-client/src/client.rs:41-46 REQUEST_TIMEOUT"
+        },
+        {
+          "name": "daemon stop timeout",
+          "milliseconds": 20000,
+          "source": "crates/haider-cli/src/daemon.rs:22 DEFAULT_STOP_TIMEOUT"
+        },
+        {
+          "name": "post-stop process-exit observation grace",
+          "milliseconds": 2000,
+          "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+        },
+        {
+          "name": "post-stop process-exit observation grace",
+          "milliseconds": 2000,
+          "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+        },
+        {
+          "name": "post-stop process-exit observation grace",
+          "milliseconds": 2000,
+          "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+        },
+        {
+          "name": "post-stop process-exit observation grace",
+          "milliseconds": 2000,
+          "source": "qa-gate bounded kill-0 observation after daemon stop reports process_exited"
+        }
+      ]
+    },
+    "segments": 3,
+    "turns_expected": 3,
+    "expected_fail_until": null,
+    "daemon_versions": [
+      "0.0.966",
+      "0.0.970"
+    ]
+  }
+]

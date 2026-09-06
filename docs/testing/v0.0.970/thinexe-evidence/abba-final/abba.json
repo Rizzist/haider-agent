@@ -1,0 +1,15 @@
+{
+  "comparison": {},
+  "created_at_utc": "2026-09-06T05:18:14.155811+00:00",
+  "host": {
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "python": "3.14.7"
+  },
+  "load_limit_one_minute": 3.0,
+  "measurements_complete": false,
+  "order": "ABBA",
+  "reason": "one-minute load 3.24755859375 must be below 3.0",
+  "runs": [],
+  "schema": "haider.thinexe.abba.v1",
+  "status": "ENVIRONMENT-BLOCKED"
+}

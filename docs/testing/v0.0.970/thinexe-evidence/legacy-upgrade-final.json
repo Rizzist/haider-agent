@@ -1,0 +1,974 @@
+{
+  "commands": [
+    {
+      "argv": [
+        "/private/tmp/thinexe-before/haider",
+        "--version"
+      ],
+      "elapsed_seconds": 0.01195124990772456,
+      "pid": 4748,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "haider 0.0.969\n",
+      "timed_out": false
+    },
+    {
+      "argv": [
+        "/private/tmp/thinexe-after/haider",
+        "--version"
+      ],
+      "elapsed_seconds": 0.009365292033180594,
+      "pid": 4751,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "haider 0.0.970\n",
+      "timed_out": false
+    },
+    {
+      "argv": [
+        "/private/tmp/thinexe-after/haider-tui",
+        "--version"
+      ],
+      "elapsed_seconds": 0.008057207916863263,
+      "pid": 4752,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "haider-tui 0.0.970\n",
+      "timed_out": false
+    },
+    {
+      "argv": [
+        "/private/tmp/thinexe-after/haiderd",
+        "--version"
+      ],
+      "elapsed_seconds": 0.01158829196356237,
+      "pid": 4754,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "haiderd 0.0.970\n",
+      "timed_out": false
+    },
+    {
+      "argv": [
+        "/private/tmp/thinexe-after/haider-compat",
+        "--version"
+      ],
+      "elapsed_seconds": 0.004239083034917712,
+      "pid": 4756,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "haider 0.0.970\n",
+      "timed_out": false
+    }
+  ],
+  "error": "historical_autospawn: historical updater failed exit=70: haider update: active turns on this profile may be cancelled by drain; daemons for other profiles are outside this update and are not restarted\nhaider update: daemon disconnected without a drain notice; recovery assets remain\n",
+  "errors": [
+    "historical_autospawn: historical updater failed exit=70: haider update: active turns on this profile may be cancelled by drain; daemons for other profiles are outside this update and are not restarted\nhaider update: daemon disconnected without a drain notice; recovery assets remain\n"
+  ],
+  "frozen_inputs_unchanged": true,
+  "historical_autospawn": {
+    "after_cleanup": {
+      "logs": [
+        {
+          "bytes": 2561,
+          "path": "/private/tmp/htlu-dgqozi1j/historical_autospawn/profile/daemon.log",
+          "tail": "haiderd: ephemeral-lifecycle event=guard_armed result=registered_or_already_signaled\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=launcher_liveness result=launcher_exited\nhaiderd: ephemeral-lifecycle event=idle_shutdown_armed reason=launcher_vanished idle_linger_ms=1746000\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=connection_retired reason=task_error attached_clients=0 task_cancelled=true task_panicked=false\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=barrier_overrun\nhaiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/.haiderd-pid-79e05ad843ce5f369e897c6e\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon-private temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/tmp/.haiderd-tmp-8722409b95f1b7ded700cb54\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/tmp\nhaiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=barrier_overrun\n"
+        },
+        {
+          "bytes": 2561,
+          "path": "/private/tmp/htlu-dgqozi1j/historical_autospawn/profile/daemon-logs/haiderd-5657-1788664007004295000-0.log",
+          "tail": "haiderd: ephemeral-lifecycle event=guard_armed result=registered_or_already_signaled\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=launcher_liveness result=launcher_exited\nhaiderd: ephemeral-lifecycle event=idle_shutdown_armed reason=launcher_vanished idle_linger_ms=1746000\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=connection_retired reason=task_error attached_clients=0 task_cancelled=true task_panicked=false\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=barrier_overrun\nhaiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/.haiderd-pid-79e05ad843ce5f369e897c6e\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon-private temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/tmp/.haiderd-tmp-8722409b95f1b7ded700cb54\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/tmp\nhaiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=barrier_overrun\n"
+        }
+      ],
+      "marker": {
+        "bytes": 721,
+        "path": "/private/tmp/htlu-dgqozi1j/historical_autospawn/bin/.haider-update-transaction.json",
+        "raw": "{\"backup_haider\":\".haider-old-5662-1788664017377679000\",\"backup_haiderd\":\".haiderd-old-5662-1788664017377679000\",\"old_haider_digest\":\"352bbde7010f0a9e80e91aa134f34c28602f9fa6cc1f7898058ed9b0bca0c566\",\"old_haiderd_digest\":\"ae892f70a8191758f1b9c449e7522dd1a73b3b29ad62b2a8a1b380cd1c36464d\",\"old_version\":\"0.0.969\",\"phase\":\"drain_signaled\",\"schema\":\"haider.update.transaction.v1\",\"source_archive_digest\":\"b8428e48221c96246e6b86853c81ffa89cdbe83451c66bea843f549e18b3e479\",\"target_haider_digest\":\"3881c6f58b3a34672772e3812ba09dc48b0b4201b5123bbf58c258383967c3f9\",\"target_haiderd_digest\":\"51cfcdde51aca70fdc10ddd7bdc4f93ff8e574dad9e6c8c5d6fb46b4a0471602\",\"target_version\":\"0.0.970\",\"transaction_id\":\"5662-1788664017377679000\"}\n",
+        "sha256": "a8c5808c70fa5b1067b144e3de251cb7414f1f3b94aeca45543c8495a4046cfa"
+      },
+      "members": {
+        "haider": {
+          "bytes": 49307952,
+          "inode": 241314388,
+          "mode": 448,
+          "sha256": "3881c6f58b3a34672772e3812ba09dc48b0b4201b5123bbf58c258383967c3f9"
+        },
+        "haider-tui": null,
+        "haiderd": {
+          "bytes": 56278672,
+          "inode": 241314480,
+          "mode": 448,
+          "sha256": "51cfcdde51aca70fdc10ddd7bdc4f93ff8e574dad9e6c8c5d6fb46b4a0471602"
+        }
+      },
+      "transaction_assets": [
+        ".haider-old-5662-1788664017377679000",
+        ".haider-update-transaction.json",
+        ".haider-update.lock",
+        ".haiderd-old-5662-1788664017377679000"
+      ],
+      "transaction_phase": "drain_signaled"
+    },
+    "after_update_diagnostics": {
+      "logs": [
+        {
+          "bytes": 2561,
+          "path": "/private/tmp/htlu-dgqozi1j/historical_autospawn/profile/daemon.log",
+          "tail": "haiderd: ephemeral-lifecycle event=guard_armed result=registered_or_already_signaled\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=launcher_liveness result=launcher_exited\nhaiderd: ephemeral-lifecycle event=idle_shutdown_armed reason=launcher_vanished idle_linger_ms=1746000\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=connection_retired reason=task_error attached_clients=0 task_cancelled=true task_panicked=false\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=barrier_overrun\nhaiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/.haiderd-pid-79e05ad843ce5f369e897c6e\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon-private temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/tmp/.haiderd-tmp-8722409b95f1b7ded700cb54\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/tmp\nhaiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=barrier_overrun\n"
+        },
+        {
+          "bytes": 2561,
+          "path": "/private/tmp/htlu-dgqozi1j/historical_autospawn/profile/daemon-logs/haiderd-5657-1788664007004295000-0.log",
+          "tail": "haiderd: ephemeral-lifecycle event=guard_armed result=registered_or_already_signaled\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=launcher_liveness result=launcher_exited\nhaiderd: ephemeral-lifecycle event=idle_shutdown_armed reason=launcher_vanished idle_linger_ms=1746000\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=connection_retired reason=task_error attached_clients=0 task_cancelled=true task_panicked=false\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=barrier_overrun\nhaiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/.haiderd-pid-79e05ad843ce5f369e897c6e\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon-private temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/tmp/.haiderd-tmp-8722409b95f1b7ded700cb54\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/tmp\nhaiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=barrier_overrun\n"
+        }
+      ],
+      "marker": {
+        "bytes": 721,
+        "path": "/private/tmp/htlu-dgqozi1j/historical_autospawn/bin/.haider-update-transaction.json",
+        "raw": "{\"backup_haider\":\".haider-old-5662-1788664017377679000\",\"backup_haiderd\":\".haiderd-old-5662-1788664017377679000\",\"old_haider_digest\":\"352bbde7010f0a9e80e91aa134f34c28602f9fa6cc1f7898058ed9b0bca0c566\",\"old_haiderd_digest\":\"ae892f70a8191758f1b9c449e7522dd1a73b3b29ad62b2a8a1b380cd1c36464d\",\"old_version\":\"0.0.969\",\"phase\":\"drain_signaled\",\"schema\":\"haider.update.transaction.v1\",\"source_archive_digest\":\"b8428e48221c96246e6b86853c81ffa89cdbe83451c66bea843f549e18b3e479\",\"target_haider_digest\":\"3881c6f58b3a34672772e3812ba09dc48b0b4201b5123bbf58c258383967c3f9\",\"target_haiderd_digest\":\"51cfcdde51aca70fdc10ddd7bdc4f93ff8e574dad9e6c8c5d6fb46b4a0471602\",\"target_version\":\"0.0.970\",\"transaction_id\":\"5662-1788664017377679000\"}\n",
+        "sha256": "a8c5808c70fa5b1067b144e3de251cb7414f1f3b94aeca45543c8495a4046cfa"
+      },
+      "members": {
+        "haider": {
+          "bytes": 49307952,
+          "inode": 241314388,
+          "mode": 448,
+          "sha256": "3881c6f58b3a34672772e3812ba09dc48b0b4201b5123bbf58c258383967c3f9"
+        },
+        "haider-tui": null,
+        "haiderd": {
+          "bytes": 56278672,
+          "inode": 241314480,
+          "mode": 448,
+          "sha256": "51cfcdde51aca70fdc10ddd7bdc4f93ff8e574dad9e6c8c5d6fb46b4a0471602"
+        }
+      },
+      "transaction_assets": [
+        ".haider-old-5662-1788664017377679000",
+        ".haider-update-transaction.json",
+        ".haider-update.lock",
+        ".haiderd-old-5662-1788664017377679000"
+      ],
+      "transaction_phase": "drain_signaled"
+    },
+    "archive": {
+      "members": [
+        "haider",
+        "haiderd"
+      ],
+      "sha256": "b8428e48221c96246e6b86853c81ffa89cdbe83451c66bea843f549e18b3e479"
+    },
+    "before": {
+      "haider": {
+        "bytes": 35543584,
+        "inode": 241308802,
+        "mode": 448,
+        "sha256": "352bbde7010f0a9e80e91aa134f34c28602f9fa6cc1f7898058ed9b0bca0c566"
+      },
+      "haider-tui": null,
+      "haiderd": {
+        "bytes": 55365968,
+        "inode": 241308803,
+        "mode": 448,
+        "sha256": "ae892f70a8191758f1b9c449e7522dd1a73b3b29ad62b2a8a1b380cd1c36464d"
+      }
+    },
+    "before_cleanup": {
+      "logs": [
+        {
+          "bytes": 2561,
+          "path": "/private/tmp/htlu-dgqozi1j/historical_autospawn/profile/daemon.log",
+          "tail": "haiderd: ephemeral-lifecycle event=guard_armed result=registered_or_already_signaled\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=launcher_liveness result=launcher_exited\nhaiderd: ephemeral-lifecycle event=idle_shutdown_armed reason=launcher_vanished idle_linger_ms=1746000\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=connection_retired reason=task_error attached_clients=0 task_cancelled=true task_panicked=false\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=barrier_overrun\nhaiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/.haiderd-pid-79e05ad843ce5f369e897c6e\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon-private temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/tmp/.haiderd-tmp-8722409b95f1b7ded700cb54\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/tmp\nhaiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=barrier_overrun\n"
+        },
+        {
+          "bytes": 2561,
+          "path": "/private/tmp/htlu-dgqozi1j/historical_autospawn/profile/daemon-logs/haiderd-5657-1788664007004295000-0.log",
+          "tail": "haiderd: ephemeral-lifecycle event=guard_armed result=registered_or_already_signaled\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=launcher_liveness result=launcher_exited\nhaiderd: ephemeral-lifecycle event=idle_shutdown_armed reason=launcher_vanished idle_linger_ms=1746000\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=connection_retired reason=task_error attached_clients=0 task_cancelled=true task_panicked=false\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=barrier_overrun\nhaiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/.haiderd-pid-79e05ad843ce5f369e897c6e\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon-private temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/tmp/.haiderd-tmp-8722409b95f1b7ded700cb54\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/tmp\nhaiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=barrier_overrun\n"
+        }
+      ],
+      "marker": {
+        "bytes": 721,
+        "path": "/private/tmp/htlu-dgqozi1j/historical_autospawn/bin/.haider-update-transaction.json",
+        "raw": "{\"backup_haider\":\".haider-old-5662-1788664017377679000\",\"backup_haiderd\":\".haiderd-old-5662-1788664017377679000\",\"old_haider_digest\":\"352bbde7010f0a9e80e91aa134f34c28602f9fa6cc1f7898058ed9b0bca0c566\",\"old_haiderd_digest\":\"ae892f70a8191758f1b9c449e7522dd1a73b3b29ad62b2a8a1b380cd1c36464d\",\"old_version\":\"0.0.969\",\"phase\":\"drain_signaled\",\"schema\":\"haider.update.transaction.v1\",\"source_archive_digest\":\"b8428e48221c96246e6b86853c81ffa89cdbe83451c66bea843f549e18b3e479\",\"target_haider_digest\":\"3881c6f58b3a34672772e3812ba09dc48b0b4201b5123bbf58c258383967c3f9\",\"target_haiderd_digest\":\"51cfcdde51aca70fdc10ddd7bdc4f93ff8e574dad9e6c8c5d6fb46b4a0471602\",\"target_version\":\"0.0.970\",\"transaction_id\":\"5662-1788664017377679000\"}\n",
+        "sha256": "a8c5808c70fa5b1067b144e3de251cb7414f1f3b94aeca45543c8495a4046cfa"
+      },
+      "members": {
+        "haider": {
+          "bytes": 49307952,
+          "inode": 241314388,
+          "mode": 448,
+          "sha256": "3881c6f58b3a34672772e3812ba09dc48b0b4201b5123bbf58c258383967c3f9"
+        },
+        "haider-tui": null,
+        "haiderd": {
+          "bytes": 56278672,
+          "inode": 241314480,
+          "mode": 448,
+          "sha256": "51cfcdde51aca70fdc10ddd7bdc4f93ff8e574dad9e6c8c5d6fb46b4a0471602"
+        }
+      },
+      "transaction_assets": [
+        ".haider-old-5662-1788664017377679000",
+        ".haider-update-transaction.json",
+        ".haider-update.lock",
+        ".haiderd-old-5662-1788664017377679000"
+      ],
+      "transaction_phase": "drain_signaled"
+    },
+    "commands": [
+      {
+        "argv": [
+          "/usr/bin/curl",
+          "--fail",
+          "--silent",
+          "--show-error",
+          "--max-time",
+          "15",
+          "https://api.github.com/repos/Rizzist/haider-agent/releases?per_page=100&page=1"
+        ],
+        "elapsed_seconds": 0.014580707997083664,
+        "pid": 5656,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "[{\"tag_name\": \"v0.0.970\", \"draft\": false, \"prerelease\": false, \"assets\": [{\"name\": \"haider-v0.0.970-aarch64-apple-darwin.tar.xz\", \"browser_download_url\": \"https://github.com/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-aarch64-apple-darwin.tar.xz\"}, {\"name\": \"haider-v0.0.970-aarch64-apple-darwin.tar.xz.sha256\", \"browser_download_url\": \"https://github.com/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-aarch64-apple-darwin.tar.xz.sha256\"}]}]",
+        "timed_out": false
+      },
+      {
+        "argv": [
+          "/private/tmp/htlu-dgqozi1j/historical_autospawn/bin/haider",
+          "--ready"
+        ],
+        "elapsed_seconds": 2.34670262504369,
+        "pid": 5657,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "haider 0.0.969 \u2014 daemon ready (spawned): profile ee0140e41b85 at /private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock (daemon v0.0.969, generation 1)\n",
+        "timed_out": false
+      },
+      {
+        "argv": [
+          "/private/tmp/htlu-dgqozi1j/historical_autospawn/bin/haider",
+          "status",
+          "--json",
+          "--no-spawn"
+        ],
+        "elapsed_seconds": 0.00649483292363584,
+        "pid": 5661,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "{\"account\":null,\"daemon\":{\"generation\":1,\"pid\":5659,\"pid_file_path\":\"/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/haiderd.pid\",\"pipe_dir\":\"/private/tmp/htlu-dgqozi1j/historical_autospawn/profile/pipe\",\"ready\":true,\"ready_since\":1788664008483,\"providers_loaded\":true,\"idle_ttl_ms\":1746000,\"warm\":true,\"caching\":{\"prompt_cache\":true,\"provider_view_cas\":true,\"session_reuse\":\"resident\",\"idle_ttl_ms\":1746000,\"cache_regime\":null,\"cache_regimes_by_provider\":{\"anthropic\":\"explicit-breakpoints\",\"anthropic-oauth\":\"explicit-breakpoints\",\"bedrock\":\"explicit-breakpoints\",\"deepseek\":\"automatic-prefix\",\"gemini\":null,\"google-antigravity\":null,\"grok-oauth\":\"automatic-prefix\",\"haider-code\":\"automatic-prefix\",\"kimi-oauth\":\"automatic-prefix\",\"openai\":\"automatic-prefix\",\"openai-compatible\":\"automatic-prefix\",\"openai-oauth\":\"automatic-prefix\",\"vertex\":\"explicit-breakpoints\",\"xai\":\"automatic-prefix\"}},\"socket_path\":\"/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock\",\"version\":\"0.0.969\"},\"features\":[\"account_device_discovery_v1\",\"account_identity_v1\",\"account_label_v1\",\"account_list_watch_v1\",\"account_login_api_v1\",\"account_management_v1\",\"account_oauth_device_v1\",\"account_oauth_import_sources_v1\",\"account_oauth_import_v1\",\"account_oauth_pkce_v1\",\"account_rotation_v1\",\"account_sources_v1\",\"agent_cancel_v1\",\"agent_cli_v1\",\"agent_message_v1\",\"artifact_put_binary_v1\",\"artifact_put_v1\",\"autonomous_interaction_v1\",\"branch_create_v1\",\"checkpoint_v1\",\"command_door_v1\",\"compaction_guard_v1\",\"computer_permission_actions_v1\",\"context_compaction_v1\",\"convergence_graph_v1\",\"convergence_graph_v2\",\"convergence_graph_v3\",\"convergence_graph_v4\",\"effect_recovery_v1\",\"export_seq_v1\",\"fallback_chain_v1\",\"haider_code_plan_status_v1\",\"headless_run_v1\",\"hooks_server_v1\",\"hooks_v1\",\"input_mirror_attachments_v1\",\"input_mirror_v1\",\"loom_authoring_v1\",\"loom_cli_presence_v1\",\"loom_pipe_dag_v1\",\"loom_registry_archive_v1\",\"loom_registry_cas_v1\",\"loom_registry_watch_v1\",\"loom_v1\",\"loom_validation_v1\",\"models_list_v1\",\"monitor_control_v1\",\"monitor_delivery_v1\",\"monitor_mutate_v1\",\"monitor_v1\",\"peer_messaging_v1\",\"pipe_native_v2\",\"pipe_tool_status_v1\",\"provider_configure_v1\",\"provider_lockdown_v1\",\"provider_management_v1\",\"provider_models_probe_v1\",\"provider_models_v1\",\"provider_remove_v1\",\"queue_control_v1\",\"request_budget_v1\",\"resident_session_binding_token_v1\",\"resident_session_binding_v1\",\"resident_turn_submit_v1\",\"run_budget_v1\",\"run_retry_v1\",\"session_account_select_v1\",\"session_agent_type_select_v1\",\"session_attach_sealed_v1\",\"session_config_v1\",\"session_create_admission_v1\",\"session_descendant_stream_v1\",\"session_effort_select_v1\",\"session_fast_select_v1\",\"session_fleet_identity_v1\",\"session_fleet_v1\",\"session_fork_v1\",\"session_lineage_v1\",\"session_list_recency_v1\",\"session_list_watch_v1\",\"session_model_select_v1\",\"session_mutation_v1\",\"session_needs_input_v1\",\"session_observe_batch_v1\",\"session_observe_v1\",\"session_permission_overrides_v1\",\"session_prompt_fork_v1\",\"session_provider_rebind_v1\",\"session_read_only_v1\",\"session_rename_v1\",\"session_run_id_v1\",\"session_seen_v1\",\"session_workflow_state_v1\",\"session_workspace_set_v1\",\"shell_exec_v1\",\"shell_registry_v1\",\"ssh_profiles_v1\",\"status_runtime_v1\",\"status_segment_structured_v1\",\"status_segment_v1\",\"status_snapshot_v1\",\"store_health_v1\",\"tool_inventory_v1\",\"transcription_v1\",\"tui_attach_announce_v1\",\"turn_control_v1\",\"typed_agent_install_cancel_v1\",\"typed_agent_install_control_v1\",\"typed_agent_install_v1\",\"usage_history_v1\",\"usage_report_v1\",\"user_command_v1\",\"vault_stage_v1\",\"wire_msgpack_v1\",\"workflow_catalog_v1\",\"workflow_graph_v1\",\"workflow_instance_v1\"],\"kind\":\"status\",\"profile_path\":\"/private/tmp/htlu-dgqozi1j/historical_autospawn/profile\",\"runtime_dir\":\"/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75\",\"runtime_dir_resolution\":{\"source\":\"haider_runtime_dir\"},\"schema\":\"haider.observe.v1\",\"session_count\":0,\"waiting_for_route_count\":0,\"update\":{\"current_version\":\"0.0.969\",\"error\":null,\"latest_version\":null,\"status\":\"check_due\"}}\n",
+        "timed_out": false
+      },
+      {
+        "argv": [
+          "/private/tmp/htlu-dgqozi1j/historical_autospawn/bin/haider",
+          "update"
+        ],
+        "elapsed_seconds": 10.062176582985558,
+        "pid": 5662,
+        "returncode": 70,
+        "stderr": "haider update: active turns on this profile may be cancelled by drain; daemons for other profiles are outside this update and are not restarted\nhaider update: daemon disconnected without a drain notice; recovery assets remain\n",
+        "stdout": "",
+        "timed_out": false
+      }
+    ],
+    "daemon_start_mode": "autospawn",
+    "error": "historical updater failed exit=70: haider update: active turns on this profile may be cancelled by drain; daemons for other profiles are outside this update and are not restarted\nhaider update: daemon disconnected without a drain notice; recovery assets remain\n",
+    "old_daemon": {
+      "caching": {
+        "cache_regime": null,
+        "cache_regimes_by_provider": {
+          "anthropic": "explicit-breakpoints",
+          "anthropic-oauth": "explicit-breakpoints",
+          "bedrock": "explicit-breakpoints",
+          "deepseek": "automatic-prefix",
+          "gemini": null,
+          "google-antigravity": null,
+          "grok-oauth": "automatic-prefix",
+          "haider-code": "automatic-prefix",
+          "kimi-oauth": "automatic-prefix",
+          "openai": "automatic-prefix",
+          "openai-compatible": "automatic-prefix",
+          "openai-oauth": "automatic-prefix",
+          "vertex": "explicit-breakpoints",
+          "xai": "automatic-prefix"
+        },
+        "idle_ttl_ms": 1746000,
+        "prompt_cache": true,
+        "provider_view_cas": true,
+        "session_reuse": "resident"
+      },
+      "generation": 1,
+      "idle_ttl_ms": 1746000,
+      "pid": 5659,
+      "pid_file_path": "/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/haiderd.pid",
+      "pipe_dir": "/private/tmp/htlu-dgqozi1j/historical_autospawn/profile/pipe",
+      "providers_loaded": true,
+      "ready": true,
+      "ready_since": 1788664008483,
+      "socket_path": "/private/tmp/htlu-dgqozi1j/historical_autospawn/runtime/ee0140e41b85f1a1eb75/h.sock",
+      "version": "0.0.969",
+      "warm": true
+    },
+    "passed": false,
+    "pre_mutation_checks": [
+      "canonical hashes/modes/inodes unchanged; no update lock",
+      "canonical hashes/modes/inodes unchanged; no update lock"
+    ],
+    "proxy_errors": [],
+    "requests": [
+      {
+        "host": "api.github.com",
+        "path": "/repos/Rizzist/haider-agent/releases?per_page=100&page=1",
+        "status": 200
+      },
+      {
+        "host": "api.github.com",
+        "path": "/repos/Rizzist/haider-agent/releases?per_page=100&page=1",
+        "status": 200
+      },
+      {
+        "host": "github.com",
+        "path": "/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-aarch64-apple-darwin.tar.xz",
+        "status": 200
+      },
+      {
+        "host": "github.com",
+        "path": "/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-aarch64-apple-darwin.tar.xz.sha256",
+        "status": 200
+      }
+    ],
+    "status": "FAIL"
+  },
+  "historical_source_observation": {
+    "cause": "--ready exits after auto-spawn; request_after_idle sets requests=1, so the updater's first SIGTERM is treated as a repeated shutdown request and selects Forced",
+    "commit": "14750e31",
+    "phase": "restart after canonical executable commit; not archive/staging refusal",
+    "references": [
+      "crates/haider-daemon/src/lifecycle.rs:393",
+      "crates/haider-daemon/src/lifecycle.rs:463",
+      "crates/haider-cli/src/update/restart.rs:151"
+    ]
+  },
+  "inputs": {
+    "baseline/haider": {
+      "bytes": 35543584,
+      "inode": 240803897,
+      "mode": 493,
+      "path": "/private/tmp/thinexe-before/haider",
+      "sha256": "352bbde7010f0a9e80e91aa134f34c28602f9fa6cc1f7898058ed9b0bca0c566"
+    },
+    "baseline/haiderd": {
+      "bytes": 55365968,
+      "inode": 240807485,
+      "mode": 493,
+      "path": "/private/tmp/thinexe-before/haiderd",
+      "sha256": "ae892f70a8191758f1b9c449e7522dd1a73b3b29ad62b2a8a1b380cd1c36464d"
+    },
+    "candidate/compat": {
+      "bytes": 49578096,
+      "inode": 241185940,
+      "mode": 493,
+      "path": "/private/tmp/thinexe-after/haider-compat",
+      "sha256": "3bdcac2018959477026d637b384843f02501d629c6fbc4470c1457b3b66e8f20"
+    },
+    "candidate/haider": {
+      "bytes": 23144352,
+      "inode": 241185913,
+      "mode": 493,
+      "path": "/private/tmp/thinexe-after/haider",
+      "sha256": "da188c777e100b0ed41ee308fc7d288c63cc57e5572d0a85c3f4132ad59cee35"
+    },
+    "candidate/haider-tui": {
+      "bytes": 25511904,
+      "inode": 241185938,
+      "mode": 493,
+      "path": "/private/tmp/thinexe-after/haider-tui",
+      "sha256": "d251b3daa72fa62e9d5c2fbd4fe06569fbd1399acb9c9ebe85bf7f392177284c"
+    },
+    "candidate/haiderd": {
+      "bytes": 56589536,
+      "inode": 241185933,
+      "mode": 493,
+      "path": "/private/tmp/thinexe-after/haiderd",
+      "sha256": "d68251821e01e4d81105f5068e8be460206f4f49c47bee2d968d6763b01f554c"
+    }
+  },
+  "limitations": "Native macOS correctness fixture, not performance evidence. Windows/Linux legacy self-update is unsupported. HTTPS is terminated locally; system trust/DNS/proxy settings are unchanged. Persistent-daemon migration and the historical auto-spawn drain limitation remain distinct assertions. Frozen969 staging forces ad-hoc signing; new directory staging preserves valid signatures, including the already re-signed daemon.",
+  "negative": {
+    "after_cleanup": {
+      "logs": [],
+      "members": {
+        "haider": {
+          "bytes": 35543584,
+          "inode": 241315019,
+          "mode": 448,
+          "sha256": "352bbde7010f0a9e80e91aa134f34c28602f9fa6cc1f7898058ed9b0bca0c566"
+        },
+        "haider-tui": null,
+        "haiderd": {
+          "bytes": 55365968,
+          "inode": 241315020,
+          "mode": 448,
+          "sha256": "ae892f70a8191758f1b9c449e7522dd1a73b3b29ad62b2a8a1b380cd1c36464d"
+        }
+      },
+      "transaction_assets": []
+    },
+    "after_update_diagnostics": {
+      "logs": [],
+      "members": {
+        "haider": {
+          "bytes": 35543584,
+          "inode": 241315019,
+          "mode": 448,
+          "sha256": "352bbde7010f0a9e80e91aa134f34c28602f9fa6cc1f7898058ed9b0bca0c566"
+        },
+        "haider-tui": null,
+        "haiderd": {
+          "bytes": 55365968,
+          "inode": 241315020,
+          "mode": 448,
+          "sha256": "ae892f70a8191758f1b9c449e7522dd1a73b3b29ad62b2a8a1b380cd1c36464d"
+        }
+      },
+      "transaction_assets": []
+    },
+    "archive": {
+      "members": [
+        "haider",
+        "haiderd",
+        "haider-tui"
+      ],
+      "sha256": "3ec39b60177dfba7b8cf35a7e4c9532b14eef663c342ba6909187fb5404ab4ca"
+    },
+    "before": {
+      "haider": {
+        "bytes": 35543584,
+        "inode": 241315019,
+        "mode": 448,
+        "sha256": "352bbde7010f0a9e80e91aa134f34c28602f9fa6cc1f7898058ed9b0bca0c566"
+      },
+      "haider-tui": null,
+      "haiderd": {
+        "bytes": 55365968,
+        "inode": 241315020,
+        "mode": 448,
+        "sha256": "ae892f70a8191758f1b9c449e7522dd1a73b3b29ad62b2a8a1b380cd1c36464d"
+      }
+    },
+    "before_cleanup": {
+      "logs": [],
+      "members": {
+        "haider": {
+          "bytes": 35543584,
+          "inode": 241315019,
+          "mode": 448,
+          "sha256": "352bbde7010f0a9e80e91aa134f34c28602f9fa6cc1f7898058ed9b0bca0c566"
+        },
+        "haider-tui": null,
+        "haiderd": {
+          "bytes": 55365968,
+          "inode": 241315020,
+          "mode": 448,
+          "sha256": "ae892f70a8191758f1b9c449e7522dd1a73b3b29ad62b2a8a1b380cd1c36464d"
+        }
+      },
+      "transaction_assets": []
+    },
+    "commands": [
+      {
+        "argv": [
+          "/usr/bin/curl",
+          "--fail",
+          "--silent",
+          "--show-error",
+          "--max-time",
+          "15",
+          "https://api.github.com/repos/Rizzist/haider-agent/releases?per_page=100&page=1"
+        ],
+        "elapsed_seconds": 0.0166197499493137,
+        "pid": 6016,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "[{\"tag_name\": \"v0.0.970\", \"draft\": false, \"prerelease\": false, \"assets\": [{\"name\": \"haider-v0.0.970-aarch64-apple-darwin.tar.xz\", \"browser_download_url\": \"https://github.com/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-aarch64-apple-darwin.tar.xz\"}, {\"name\": \"haider-v0.0.970-aarch64-apple-darwin.tar.xz.sha256\", \"browser_download_url\": \"https://github.com/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-aarch64-apple-darwin.tar.xz.sha256\"}]}]",
+        "timed_out": false
+      },
+      {
+        "argv": [
+          "/private/tmp/htlu-dgqozi1j/negative/bin/haider",
+          "update"
+        ],
+        "elapsed_seconds": 2.824363208026625,
+        "pid": 6017,
+        "returncode": 70,
+        "stderr": "haider update: archive contains unexpected or unsafe member `haider-v0.0.970-aarch64-apple-darwin/haider-tui`\n",
+        "stdout": "",
+        "timed_out": false
+      }
+    ],
+    "daemon_start_mode": "none",
+    "passed": true,
+    "pre_mutation_checks": [
+      "canonical hashes/modes/inodes unchanged; no update lock",
+      "canonical hashes/modes/inodes unchanged; no update lock"
+    ],
+    "proxy_errors": [],
+    "requests": [
+      {
+        "host": "api.github.com",
+        "path": "/repos/Rizzist/haider-agent/releases?per_page=100&page=1",
+        "status": 200
+      },
+      {
+        "host": "api.github.com",
+        "path": "/repos/Rizzist/haider-agent/releases?per_page=100&page=1",
+        "status": 200
+      },
+      {
+        "host": "github.com",
+        "path": "/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-aarch64-apple-darwin.tar.xz",
+        "status": 200
+      },
+      {
+        "host": "github.com",
+        "path": "/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-aarch64-apple-darwin.tar.xz.sha256",
+        "status": 200
+      }
+    ],
+    "status": "PASS"
+  },
+  "passed": false,
+  "positive": {
+    "after_cleanup": {
+      "logs": [
+        {
+          "bytes": 2084,
+          "path": "/private/tmp/htlu-dgqozi1j/positive/persistent-daemon.log",
+          "tail": "haiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=connection_retired reason=daemon_shutdown attached_clients=0 drain_outcome=NoticeDelivered\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=completed barrier_breached=false\nhaiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/.haiderd-pid-8569fc6d1df4da4cf2e0a7f0\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon-private temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/tmp/.haiderd-tmp-a2c62438c676ab2356052589\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/tmp\nhaiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=completed barrier_breached=false\n"
+        },
+        {
+          "bytes": 2242,
+          "path": "/private/tmp/htlu-dgqozi1j/positive/profile/daemon.log",
+          "tail": "haiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=connection_retired reason=daemon_shutdown attached_clients=0 drain_outcome=NoticeDelivered\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=completed barrier_breached=false\nhaiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/.haiderd-pid-2e9b54ce53f9d8497b3d66c1\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon-private temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/tmp/.haiderd-tmp-18ffc1e9987a6517af205c12\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/tmp\nhaiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=completed barrier_breached=false\n"
+        },
+        {
+          "bytes": 2242,
+          "path": "/private/tmp/htlu-dgqozi1j/positive/profile/daemon-logs/haiderd-5164-1788663967729433000-0.log",
+          "tail": "haiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=connection_retired reason=daemon_shutdown attached_clients=0 drain_outcome=NoticeDelivered\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=completed barrier_breached=false\nhaiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/.haiderd-pid-2e9b54ce53f9d8497b3d66c1\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon-private temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/tmp/.haiderd-tmp-18ffc1e9987a6517af205c12\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/tmp\nhaiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=completed barrier_breached=false\n"
+        }
+      ],
+      "members": {
+        "haider": {
+          "bytes": 23144352,
+          "inode": 241308711,
+          "mode": 448,
+          "sha256": "da188c777e100b0ed41ee308fc7d288c63cc57e5572d0a85c3f4132ad59cee35"
+        },
+        "haider-tui": {
+          "bytes": 25511904,
+          "inode": 241308710,
+          "mode": 448,
+          "sha256": "d251b3daa72fa62e9d5c2fbd4fe06569fbd1399acb9c9ebe85bf7f392177284c"
+        },
+        "haiderd": {
+          "bytes": 56278672,
+          "inode": 241308695,
+          "mode": 448,
+          "sha256": "51cfcdde51aca70fdc10ddd7bdc4f93ff8e574dad9e6c8c5d6fb46b4a0471602"
+        }
+      },
+      "transaction_assets": [
+        ".haider-update.lock"
+      ]
+    },
+    "after_legacy_update": {
+      "haider": {
+        "bytes": 49307952,
+        "inode": 241308389,
+        "mode": 448,
+        "sha256": "3881c6f58b3a34672772e3812ba09dc48b0b4201b5123bbf58c258383967c3f9"
+      },
+      "haider-tui": null,
+      "haiderd": {
+        "bytes": 56278672,
+        "inode": 241308390,
+        "mode": 448,
+        "sha256": "51cfcdde51aca70fdc10ddd7bdc4f93ff8e574dad9e6c8c5d6fb46b4a0471602"
+      }
+    },
+    "after_migration": {
+      "haider": {
+        "bytes": 23144352,
+        "inode": 241308711,
+        "mode": 448,
+        "sha256": "da188c777e100b0ed41ee308fc7d288c63cc57e5572d0a85c3f4132ad59cee35"
+      },
+      "haider-tui": {
+        "bytes": 25511904,
+        "inode": 241308710,
+        "mode": 448,
+        "sha256": "d251b3daa72fa62e9d5c2fbd4fe06569fbd1399acb9c9ebe85bf7f392177284c"
+      },
+      "haiderd": {
+        "bytes": 56278672,
+        "inode": 241308695,
+        "mode": 448,
+        "sha256": "51cfcdde51aca70fdc10ddd7bdc4f93ff8e574dad9e6c8c5d6fb46b4a0471602"
+      }
+    },
+    "after_update_diagnostics": {
+      "logs": [
+        {
+          "bytes": 2084,
+          "path": "/private/tmp/htlu-dgqozi1j/positive/persistent-daemon.log",
+          "tail": "haiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=connection_retired reason=daemon_shutdown attached_clients=0 drain_outcome=NoticeDelivered\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=completed barrier_breached=false\nhaiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/.haiderd-pid-8569fc6d1df4da4cf2e0a7f0\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon-private temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/tmp/.haiderd-tmp-a2c62438c676ab2356052589\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/tmp\nhaiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=completed barrier_breached=false\n"
+        },
+        {
+          "bytes": 158,
+          "path": "/private/tmp/htlu-dgqozi1j/positive/profile/daemon.log",
+          "tail": "haiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\n"
+        },
+        {
+          "bytes": 158,
+          "path": "/private/tmp/htlu-dgqozi1j/positive/profile/daemon-logs/haiderd-5164-1788663967729433000-0.log",
+          "tail": "haiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\n"
+        }
+      ],
+      "members": {
+        "haider": {
+          "bytes": 49307952,
+          "inode": 241308389,
+          "mode": 448,
+          "sha256": "3881c6f58b3a34672772e3812ba09dc48b0b4201b5123bbf58c258383967c3f9"
+        },
+        "haider-tui": null,
+        "haiderd": {
+          "bytes": 56278672,
+          "inode": 241308390,
+          "mode": 448,
+          "sha256": "51cfcdde51aca70fdc10ddd7bdc4f93ff8e574dad9e6c8c5d6fb46b4a0471602"
+        }
+      },
+      "transaction_assets": [
+        ".haider-update.lock"
+      ]
+    },
+    "archive": {
+      "members": [
+        "haider",
+        "haiderd"
+      ],
+      "sha256": "b8428e48221c96246e6b86853c81ffa89cdbe83451c66bea843f549e18b3e479"
+    },
+    "before": {
+      "haider": {
+        "bytes": 35543584,
+        "inode": 241307289,
+        "mode": 448,
+        "sha256": "352bbde7010f0a9e80e91aa134f34c28602f9fa6cc1f7898058ed9b0bca0c566"
+      },
+      "haider-tui": null,
+      "haiderd": {
+        "bytes": 55365968,
+        "inode": 241307290,
+        "mode": 448,
+        "sha256": "ae892f70a8191758f1b9c449e7522dd1a73b3b29ad62b2a8a1b380cd1c36464d"
+      }
+    },
+    "before_cleanup": {
+      "logs": [
+        {
+          "bytes": 2084,
+          "path": "/private/tmp/htlu-dgqozi1j/positive/persistent-daemon.log",
+          "tail": "haiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=connection_retired reason=daemon_shutdown attached_clients=0 drain_outcome=NoticeDelivered\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=completed barrier_breached=false\nhaiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/.haiderd-pid-8569fc6d1df4da4cf2e0a7f0\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon-private temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/tmp/.haiderd-tmp-a2c62438c676ab2356052589\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/tmp\nhaiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=completed barrier_breached=false\n"
+        },
+        {
+          "bytes": 2242,
+          "path": "/private/tmp/htlu-dgqozi1j/positive/profile/daemon.log",
+          "tail": "haiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=connection_retired reason=daemon_shutdown attached_clients=0 drain_outcome=NoticeDelivered\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=completed barrier_breached=false\nhaiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/.haiderd-pid-2e9b54ce53f9d8497b3d66c1\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon-private temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/tmp/.haiderd-tmp-18ffc1e9987a6517af205c12\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/tmp\nhaiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=completed barrier_breached=false\n"
+        },
+        {
+          "bytes": 2242,
+          "path": "/private/tmp/htlu-dgqozi1j/positive/profile/daemon-logs/haiderd-5164-1788663967729433000-0.log",
+          "tail": "haiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=connection_retired reason=eof attached_clients=0\nhaiderd: ephemeral-lifecycle event=connection_admitted attached_clients=1\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=connection_retired reason=daemon_shutdown attached_clients=0 drain_outcome=NoticeDelivered\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_flush outcome=completed barrier_breached=false\nhaiderd: ephemeral-lifecycle event=cleanup step=endpoint_remove outcome=owned_endpoint_removed_or_absent_or_replacement_preserved path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\nhaiderd: ephemeral-lifecycle event=cleanup step=pid_file_remove outcome=owned_claim_removal_requested path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/.haiderd-pid-2e9b54ce53f9d8497b3d66c1\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon-private temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/tmp/.haiderd-tmp-18ffc1e9987a6517af205c12\nhaiderd: ephemeral-lifecycle event=cleanup step=remove daemon temporary directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/tmp\nhaiderd: ephemeral-lifecycle event=cleanup step=remove profile runtime directory outcome=removed_exact_owned_directory path=/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=started\nhaiderd: ephemeral-lifecycle event=cleanup_step step=store_close outcome=completed barrier_breached=false\n"
+        }
+      ],
+      "members": {
+        "haider": {
+          "bytes": 23144352,
+          "inode": 241308711,
+          "mode": 448,
+          "sha256": "da188c777e100b0ed41ee308fc7d288c63cc57e5572d0a85c3f4132ad59cee35"
+        },
+        "haider-tui": {
+          "bytes": 25511904,
+          "inode": 241308710,
+          "mode": 448,
+          "sha256": "d251b3daa72fa62e9d5c2fbd4fe06569fbd1399acb9c9ebe85bf7f392177284c"
+        },
+        "haiderd": {
+          "bytes": 56278672,
+          "inode": 241308695,
+          "mode": 448,
+          "sha256": "51cfcdde51aca70fdc10ddd7bdc4f93ff8e574dad9e6c8c5d6fb46b4a0471602"
+        }
+      },
+      "transaction_assets": [
+        ".haider-update.lock"
+      ]
+    },
+    "commands": [
+      {
+        "argv": [
+          "/usr/bin/curl",
+          "--fail",
+          "--silent",
+          "--show-error",
+          "--max-time",
+          "15",
+          "https://api.github.com/repos/Rizzist/haider-agent/releases?per_page=100&page=1"
+        ],
+        "elapsed_seconds": 0.01692929200362414,
+        "pid": 5155,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "[{\"tag_name\": \"v0.0.970\", \"draft\": false, \"prerelease\": false, \"assets\": [{\"name\": \"haider-v0.0.970-aarch64-apple-darwin.tar.xz\", \"browser_download_url\": \"https://github.com/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-aarch64-apple-darwin.tar.xz\"}, {\"name\": \"haider-v0.0.970-aarch64-apple-darwin.tar.xz.sha256\", \"browser_download_url\": \"https://github.com/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-aarch64-apple-darwin.tar.xz.sha256\"}]}]",
+        "timed_out": false
+      },
+      {
+        "argv": [
+          "/private/tmp/htlu-dgqozi1j/positive/bin/haiderd"
+        ],
+        "daemon_start_mode": "persistent",
+        "log": "/private/tmp/htlu-dgqozi1j/positive/persistent-daemon.log",
+        "pid": 5156,
+        "returncode": 0
+      },
+      {
+        "argv": [
+          "/private/tmp/htlu-dgqozi1j/positive/bin/haider",
+          "status",
+          "--json",
+          "--no-spawn"
+        ],
+        "elapsed_seconds": 1.454623790923506,
+        "pid": 5157,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "{\"account\":null,\"daemon\":{\"generation\":1,\"pid\":5156,\"pid_file_path\":\"/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/haiderd.pid\",\"pipe_dir\":\"/private/tmp/htlu-dgqozi1j/positive/profile/pipe\",\"ready\":true,\"ready_since\":1788663955786,\"providers_loaded\":true,\"idle_ttl_ms\":null,\"warm\":false,\"caching\":{\"prompt_cache\":true,\"provider_view_cas\":true,\"session_reuse\":\"resident\",\"idle_ttl_ms\":null,\"cache_regime\":null,\"cache_regimes_by_provider\":{\"anthropic\":\"explicit-breakpoints\",\"anthropic-oauth\":\"explicit-breakpoints\",\"bedrock\":\"explicit-breakpoints\",\"deepseek\":\"automatic-prefix\",\"gemini\":null,\"google-antigravity\":null,\"grok-oauth\":\"automatic-prefix\",\"haider-code\":\"automatic-prefix\",\"kimi-oauth\":\"automatic-prefix\",\"openai\":\"automatic-prefix\",\"openai-compatible\":\"automatic-prefix\",\"openai-oauth\":\"automatic-prefix\",\"vertex\":\"explicit-breakpoints\",\"xai\":\"automatic-prefix\"}},\"socket_path\":\"/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\",\"version\":\"0.0.969\"},\"features\":[\"account_device_discovery_v1\",\"account_identity_v1\",\"account_label_v1\",\"account_list_watch_v1\",\"account_login_api_v1\",\"account_management_v1\",\"account_oauth_device_v1\",\"account_oauth_import_sources_v1\",\"account_oauth_import_v1\",\"account_oauth_pkce_v1\",\"account_rotation_v1\",\"account_sources_v1\",\"agent_cancel_v1\",\"agent_cli_v1\",\"agent_message_v1\",\"artifact_put_binary_v1\",\"artifact_put_v1\",\"autonomous_interaction_v1\",\"branch_create_v1\",\"checkpoint_v1\",\"command_door_v1\",\"compaction_guard_v1\",\"computer_permission_actions_v1\",\"context_compaction_v1\",\"convergence_graph_v1\",\"convergence_graph_v2\",\"convergence_graph_v3\",\"convergence_graph_v4\",\"effect_recovery_v1\",\"export_seq_v1\",\"fallback_chain_v1\",\"haider_code_plan_status_v1\",\"headless_run_v1\",\"hooks_server_v1\",\"hooks_v1\",\"input_mirror_attachments_v1\",\"input_mirror_v1\",\"loom_authoring_v1\",\"loom_cli_presence_v1\",\"loom_pipe_dag_v1\",\"loom_registry_archive_v1\",\"loom_registry_cas_v1\",\"loom_registry_watch_v1\",\"loom_v1\",\"loom_validation_v1\",\"models_list_v1\",\"monitor_control_v1\",\"monitor_delivery_v1\",\"monitor_mutate_v1\",\"monitor_v1\",\"peer_messaging_v1\",\"pipe_native_v2\",\"pipe_tool_status_v1\",\"provider_configure_v1\",\"provider_lockdown_v1\",\"provider_management_v1\",\"provider_models_probe_v1\",\"provider_models_v1\",\"provider_remove_v1\",\"queue_control_v1\",\"request_budget_v1\",\"resident_session_binding_token_v1\",\"resident_session_binding_v1\",\"resident_turn_submit_v1\",\"run_budget_v1\",\"run_retry_v1\",\"session_account_select_v1\",\"session_agent_type_select_v1\",\"session_attach_sealed_v1\",\"session_config_v1\",\"session_create_admission_v1\",\"session_descendant_stream_v1\",\"session_effort_select_v1\",\"session_fast_select_v1\",\"session_fleet_identity_v1\",\"session_fleet_v1\",\"session_fork_v1\",\"session_lineage_v1\",\"session_list_recency_v1\",\"session_list_watch_v1\",\"session_model_select_v1\",\"session_mutation_v1\",\"session_needs_input_v1\",\"session_observe_batch_v1\",\"session_observe_v1\",\"session_permission_overrides_v1\",\"session_prompt_fork_v1\",\"session_provider_rebind_v1\",\"session_read_only_v1\",\"session_rename_v1\",\"session_run_id_v1\",\"session_seen_v1\",\"session_workflow_state_v1\",\"session_workspace_set_v1\",\"shell_exec_v1\",\"shell_registry_v1\",\"ssh_profiles_v1\",\"status_runtime_v1\",\"status_segment_structured_v1\",\"status_segment_v1\",\"status_snapshot_v1\",\"store_health_v1\",\"tool_inventory_v1\",\"transcription_v1\",\"tui_attach_announce_v1\",\"turn_control_v1\",\"typed_agent_install_cancel_v1\",\"typed_agent_install_control_v1\",\"typed_agent_install_v1\",\"usage_history_v1\",\"usage_report_v1\",\"user_command_v1\",\"vault_stage_v1\",\"wire_msgpack_v1\",\"workflow_catalog_v1\",\"workflow_graph_v1\",\"workflow_instance_v1\"],\"kind\":\"status\",\"profile_path\":\"/private/tmp/htlu-dgqozi1j/positive/profile\",\"runtime_dir\":\"/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5\",\"runtime_dir_resolution\":{\"source\":\"haider_runtime_dir\"},\"schema\":\"haider.observe.v1\",\"session_count\":0,\"waiting_for_route_count\":0,\"update\":{\"current_version\":\"0.0.969\",\"error\":null,\"latest_version\":null,\"status\":\"check_due\"}}\n",
+        "timed_out": false
+      },
+      {
+        "argv": [
+          "/private/tmp/htlu-dgqozi1j/positive/bin/haider",
+          "update"
+        ],
+        "elapsed_seconds": 12.07672516698949,
+        "pid": 5164,
+        "returncode": 0,
+        "stderr": "haider update: active turns on this profile may be cancelled by drain; daemons for other profiles are outside this update and are not restarted\n",
+        "stdout": "updated haider to 0.0.970\n",
+        "timed_out": false
+      },
+      {
+        "argv": [
+          "/private/tmp/htlu-dgqozi1j/positive/bin/haider",
+          "status",
+          "--json",
+          "--no-spawn"
+        ],
+        "elapsed_seconds": 6.823876834008843,
+        "pid": 5247,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "{\"account\":null,\"daemon\":{\"generation\":2,\"pid\":5239,\"pid_file_path\":\"/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/haiderd.pid\",\"pipe_dir\":\"/private/tmp/htlu-dgqozi1j/positive/profile/pipe\",\"ready\":true,\"ready_since\":1788663968106,\"providers_loaded\":true,\"idle_ttl_ms\":null,\"warm\":false,\"caching\":{\"prompt_cache\":true,\"provider_view_cas\":true,\"session_reuse\":\"resident\",\"idle_ttl_ms\":null,\"cache_regime\":null,\"cache_regimes_by_provider\":{\"anthropic\":\"explicit-breakpoints\",\"anthropic-oauth\":\"explicit-breakpoints\",\"bedrock\":\"explicit-breakpoints\",\"deepseek\":\"automatic-prefix\",\"gemini\":null,\"google-antigravity\":null,\"grok-oauth\":\"automatic-prefix\",\"haider-code\":\"automatic-prefix\",\"kimi-oauth\":\"automatic-prefix\",\"openai\":\"automatic-prefix\",\"openai-compatible\":\"automatic-prefix\",\"openai-oauth\":\"automatic-prefix\",\"vertex\":\"explicit-breakpoints\",\"xai\":\"automatic-prefix\"}},\"socket_path\":\"/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock\",\"version\":\"0.0.970\"},\"features\":[\"account_device_discovery_v1\",\"account_identity_v1\",\"account_label_v1\",\"account_list_watch_v1\",\"account_login_api_v1\",\"account_management_v1\",\"account_oauth_device_v1\",\"account_oauth_import_sources_v1\",\"account_oauth_import_v1\",\"account_oauth_pkce_v1\",\"account_rotation_v1\",\"account_sources_v1\",\"agent_cancel_v1\",\"agent_cli_v1\",\"agent_message_v1\",\"artifact_put_binary_v1\",\"artifact_put_v1\",\"autonomous_interaction_v1\",\"branch_create_v1\",\"checkpoint_v1\",\"command_door_v1\",\"compaction_guard_v1\",\"computer_permission_actions_v1\",\"context_compaction_v1\",\"convergence_graph_v1\",\"convergence_graph_v2\",\"convergence_graph_v3\",\"convergence_graph_v4\",\"effect_recovery_v1\",\"export_seq_v1\",\"fallback_chain_v1\",\"haider_code_plan_status_v1\",\"headless_run_v1\",\"hooks_server_v1\",\"hooks_v1\",\"input_mirror_attachments_v1\",\"input_mirror_v1\",\"loom_authoring_v1\",\"loom_cli_presence_v1\",\"loom_pipe_dag_v1\",\"loom_registry_archive_v1\",\"loom_registry_cas_v1\",\"loom_registry_watch_v1\",\"loom_v1\",\"loom_validation_v1\",\"models_list_v1\",\"monitor_control_v1\",\"monitor_delivery_v1\",\"monitor_mutate_v1\",\"monitor_v1\",\"peer_messaging_v1\",\"pipe_native_v2\",\"pipe_tool_status_v1\",\"provider_configure_v1\",\"provider_lockdown_v1\",\"provider_management_v1\",\"provider_models_probe_v1\",\"provider_models_v1\",\"provider_remove_v1\",\"queue_control_v1\",\"request_budget_v1\",\"resident_session_binding_token_v1\",\"resident_session_binding_v1\",\"resident_turn_submit_v1\",\"run_budget_v1\",\"run_retry_v1\",\"session_account_select_v1\",\"session_agent_type_select_v1\",\"session_attach_sealed_v1\",\"session_config_v1\",\"session_create_admission_v1\",\"session_descendant_stream_v1\",\"session_effort_select_v1\",\"session_fast_select_v1\",\"session_fleet_identity_v1\",\"session_fleet_v1\",\"session_fork_v1\",\"session_lineage_v1\",\"session_list_recency_v1\",\"session_list_watch_v1\",\"session_model_select_v1\",\"session_mutation_v1\",\"session_needs_input_v1\",\"session_observe_batch_v1\",\"session_observe_v1\",\"session_permission_overrides_v1\",\"session_prompt_fork_v1\",\"session_provider_rebind_v1\",\"session_read_only_v1\",\"session_rename_v1\",\"session_run_id_v1\",\"session_seen_v1\",\"session_workflow_state_v1\",\"session_workspace_set_v1\",\"shell_exec_v1\",\"shell_registry_v1\",\"ssh_profiles_v1\",\"status_runtime_v1\",\"status_segment_structured_v1\",\"status_segment_v1\",\"status_snapshot_v1\",\"store_health_v1\",\"tool_inventory_v1\",\"transcription_v1\",\"tui_attach_announce_v1\",\"turn_control_v1\",\"turn_retract_v1\",\"typed_agent_install_cancel_v1\",\"typed_agent_install_control_v1\",\"typed_agent_install_v1\",\"usage_history_v1\",\"usage_report_v1\",\"user_command_v1\",\"vault_stage_v1\",\"wire_msgpack_v1\",\"workflow_catalog_v1\",\"workflow_graph_v1\",\"workflow_instance_v1\"],\"kind\":\"status\",\"profile_path\":\"/private/tmp/htlu-dgqozi1j/positive/profile\",\"runtime_dir\":\"/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5\",\"runtime_dir_resolution\":{\"source\":\"haider_runtime_dir\"},\"schema\":\"haider.observe.v1\",\"session_count\":0,\"waiting_for_route_count\":0,\"update\":{\"current_version\":\"0.0.970\",\"error\":null,\"latest_version\":null,\"status\":\"check_due\"}}\n",
+        "timed_out": false
+      },
+      {
+        "argv": [
+          "/private/tmp/htlu-dgqozi1j/positive/bin/haider",
+          "--version"
+        ],
+        "elapsed_seconds": 0.005803541978821158,
+        "pid": 5286,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "haider 0.0.970\n",
+        "timed_out": false
+      },
+      {
+        "argv": [
+          "/private/tmp/htlu-dgqozi1j/positive/bin/haider",
+          "daemon",
+          "stop",
+          "--json"
+        ],
+        "elapsed_seconds": 0.03378854098264128,
+        "pid": 5287,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "{\"schema\":\"haider.daemon-stop.v1\",\"outcome\":\"stopped_cleanly\",\"elapsed_ms\":28,\"daemon\":{\"instance_id\":\"63ebdda6fbddad372872bcd216aa249d\",\"generation\":2,\"pid\":5239,\"shutdown_acknowledged\":true,\"drain_deadline_unix_ms\":1788663980371,\"completion\":\"graceful\",\"process_exited\":true}}\n",
+        "timed_out": false
+      }
+    ],
+    "daemon_start_mode": "persistent",
+    "migrated_daemon": {
+      "caching": {
+        "cache_regime": null,
+        "cache_regimes_by_provider": {
+          "anthropic": "explicit-breakpoints",
+          "anthropic-oauth": "explicit-breakpoints",
+          "bedrock": "explicit-breakpoints",
+          "deepseek": "automatic-prefix",
+          "gemini": null,
+          "google-antigravity": null,
+          "grok-oauth": "automatic-prefix",
+          "haider-code": "automatic-prefix",
+          "kimi-oauth": "automatic-prefix",
+          "openai": "automatic-prefix",
+          "openai-compatible": "automatic-prefix",
+          "openai-oauth": "automatic-prefix",
+          "vertex": "explicit-breakpoints",
+          "xai": "automatic-prefix"
+        },
+        "idle_ttl_ms": null,
+        "prompt_cache": true,
+        "provider_view_cas": true,
+        "session_reuse": "resident"
+      },
+      "generation": 2,
+      "idle_ttl_ms": null,
+      "pid": 5239,
+      "pid_file_path": "/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/haiderd.pid",
+      "pipe_dir": "/private/tmp/htlu-dgqozi1j/positive/profile/pipe",
+      "providers_loaded": true,
+      "ready": true,
+      "ready_since": 1788663968106,
+      "socket_path": "/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock",
+      "version": "0.0.970",
+      "warm": false
+    },
+    "old_daemon": {
+      "caching": {
+        "cache_regime": null,
+        "cache_regimes_by_provider": {
+          "anthropic": "explicit-breakpoints",
+          "anthropic-oauth": "explicit-breakpoints",
+          "bedrock": "explicit-breakpoints",
+          "deepseek": "automatic-prefix",
+          "gemini": null,
+          "google-antigravity": null,
+          "grok-oauth": "automatic-prefix",
+          "haider-code": "automatic-prefix",
+          "kimi-oauth": "automatic-prefix",
+          "openai": "automatic-prefix",
+          "openai-compatible": "automatic-prefix",
+          "openai-oauth": "automatic-prefix",
+          "vertex": "explicit-breakpoints",
+          "xai": "automatic-prefix"
+        },
+        "idle_ttl_ms": null,
+        "prompt_cache": true,
+        "provider_view_cas": true,
+        "session_reuse": "resident"
+      },
+      "generation": 1,
+      "idle_ttl_ms": null,
+      "pid": 5156,
+      "pid_file_path": "/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/haiderd.pid",
+      "pipe_dir": "/private/tmp/htlu-dgqozi1j/positive/profile/pipe",
+      "providers_loaded": true,
+      "ready": true,
+      "ready_since": 1788663955786,
+      "socket_path": "/private/tmp/htlu-dgqozi1j/positive/runtime/b3c61a3fd7833b9299e5/h.sock",
+      "version": "0.0.969",
+      "warm": false
+    },
+    "passed": true,
+    "pre_mutation_checks": [
+      "canonical hashes/modes/inodes unchanged; no update lock",
+      "canonical hashes/modes/inodes unchanged; no update lock"
+    ],
+    "proxy_errors": [],
+    "requests": [
+      {
+        "host": "api.github.com",
+        "path": "/repos/Rizzist/haider-agent/releases?per_page=100&page=1",
+        "status": 200
+      },
+      {
+        "host": "api.github.com",
+        "path": "/repos/Rizzist/haider-agent/releases?per_page=100&page=1",
+        "status": 200
+      },
+      {
+        "host": "github.com",
+        "path": "/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-aarch64-apple-darwin.tar.xz",
+        "status": 200
+      },
+      {
+        "host": "github.com",
+        "path": "/Rizzist/haider-agent/releases/download/v0.0.970/haider-v0.0.970-aarch64-apple-darwin.tar.xz.sha256",
+        "status": 200
+      }
+    ],
+    "restarted_daemon_pid": 5239,
+    "status": "PASS",
+    "stop_receipt": {
+      "daemon": {
+        "completion": "graceful",
+        "drain_deadline_unix_ms": 1788663980371,
+        "generation": 2,
+        "instance_id": "63ebdda6fbddad372872bcd216aa249d",
+        "pid": 5239,
+        "process_exited": true,
+        "shutdown_acknowledged": true
+      },
+      "elapsed_ms": 28,
+      "outcome": "stopped_cleanly",
+      "schema": "haider.daemon-stop.v1"
+    }
+  },
+  "schema": "haider.thinexe.legacy-upgrade.v1",
+  "scratch": "/private/tmp/htlu-dgqozi1j",
+  "scratch_retained_for_failure": true,
+  "signed_references": {
+    "historical": {
+      "compat": {
+        "bytes": 49307952,
+        "inode": 241307281,
+        "mode": 448,
+        "sha256": "3881c6f58b3a34672772e3812ba09dc48b0b4201b5123bbf58c258383967c3f9"
+      },
+      "haiderd": {
+        "bytes": 56278672,
+        "inode": 241307284,
+        "mode": 448,
+        "sha256": "51cfcdde51aca70fdc10ddd7bdc4f93ff8e574dad9e6c8c5d6fb46b4a0471602"
+      }
+    },
+    "migration": {
+      "haider": {
+        "bytes": 23144352,
+        "inode": 241307285,
+        "mode": 448,
+        "sha256": "da188c777e100b0ed41ee308fc7d288c63cc57e5572d0a85c3f4132ad59cee35"
+      },
+      "haider-tui": {
+        "bytes": 25511904,
+        "inode": 241307286,
+        "mode": 448,
+        "sha256": "d251b3daa72fa62e9d5c2fbd4fe06569fbd1399acb9c9ebe85bf7f392177284c"
+      },
+      "haiderd": {
+        "bytes": 56278672,
+        "inode": 241307284,
+        "mode": 448,
+        "sha256": "51cfcdde51aca70fdc10ddd7bdc4f93ff8e574dad9e6c8c5d6fb46b4a0471602"
+      }
+    }
+  },
+  "status": "FAIL",
+  "target": "aarch64-apple-darwin"
+}

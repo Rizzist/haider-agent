@@ -1,1 +1,8 @@
 START prebuild-recovered-2: cargo build --locked -p haider-cli -p haider-daemond -p haider-tui-exe -p haider-tools --bins
+END prebuild-recovered-2: PASS exit=0
+START workspace-tests-retry-2: cargo test -q --workspace --no-fail-fast
+END workspace-tests-retry-2: FAIL exit=101
+START workspace-clippy-2: cargo clippy --workspace --tests -- -D warnings
+END workspace-clippy-2: PASS exit=0
+START test-count-final-2: cargo run -q -p xtask -- test-count --update
+END test-count-final-2: PASS exit=0

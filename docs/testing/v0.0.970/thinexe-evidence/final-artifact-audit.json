@@ -1,0 +1,18 @@
+{
+  "source_matches_final_build": true,
+  "frozen_binaries_unchanged_after_probes": true,
+  "baseline_binaries_unchanged_after_probes": true,
+  "runtime_payload_marker": {
+    "haider": false,
+    "haiderd": false,
+    "haider-tui": true
+  },
+  "before_runtime_bytes": 90909552,
+  "after_runtime_bytes": 105262336,
+  "installed_runtime_delta_percent": 15.787982323353656,
+  "thin_delta_percent": -34.88458563998498,
+  "abba_status": "ENVIRONMENT-BLOCKED",
+  "abba_runs": 0,
+  "abba_reason": "one-minute load 3.24755859375 must be below 3.0",
+  "source_test_count": 5109
+}

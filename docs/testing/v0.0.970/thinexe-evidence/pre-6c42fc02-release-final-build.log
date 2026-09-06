@@ -1,0 +1,4 @@
+   Compiling haider-cli v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli)
+   Compiling haider-tui-exe v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-tui-exe)
+   Compiling haider-daemond v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-daemond)
+    Finished `release` profile [optimized + debuginfo] target(s) in 13m 36s

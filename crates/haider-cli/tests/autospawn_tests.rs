@@ -20,54 +20,52 @@ fn haider_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_haider"))
 }
 
-/// The sibling `haiderd` next to the `haider` under test — fingerprint-checked
-/// on Linux and built on demand elsewhere when this test crate runs alone.
+/// Validate the externally prebuilt daemon and payload beside the thin CLI.
+/// Bare invocations starting a daemon execute all three before readiness.
 fn ensure_haiderd_built() -> PathBuf {
-    static BUILD: std::sync::Once = std::sync::Once::new();
-    let sibling = haider_binary()
-        .parent()
-        .expect("haider binary has a parent directory")
-        .join("haiderd");
-    // A persistent Linux target directory can contain a sibling built from
-    // older sources even though this package's test artifacts are current.
-    // Enter Cargo's fingerprint/build lock once on Linux instead of trusting
-    // existence alone; this also prevents another integration-test process
-    // from replacing `haiderd` while this suite starts it. Non-Linux retains
-    // the historical existence-only behavior.
-    if cfg!(target_os = "linux") || !sibling.exists() {
-        BUILD.call_once(|| {
-            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-            let mut command = Command::new(cargo);
-            command.arg("build");
-            #[cfg(target_os = "linux")]
-            command.arg("--locked");
-            let status = command
-                .args(["-p", "haider-daemond", "--bin", "haiderd"])
-                .status()
-                .expect("build haiderd for auto-spawn tests");
-            assert!(status.success(), "haiderd build failed");
-        });
-    }
-    assert!(
-        sibling.exists(),
-        "haiderd sibling missing at {}",
-        sibling.display()
+    // Match the other CLI subprocess fixtures: the caller owns fresh sibling
+    // builds. Recursively entering Cargo here can contend with its parent or
+    // replace an image after this process's Once warmup has completed.
+    assert_eq!(
+        std::env::var("HAIDER_TEST_SIBLINGS_PREBUILT").as_deref(),
+        Ok("1"),
+        "auto-spawn fixtures require freshly prebuilt runtime siblings; run \
+         `cargo build -p haider-cli -p haider-daemond -p haider-tui-exe --bins` \
+         first, then set HAIDER_TEST_SIBLINGS_PREBUILT=1 for the test command"
     );
-    warm_autospawn_binaries(&haider_binary(), &sibling);
+    let haider = haider_binary();
+    let directory = haider
+        .parent()
+        .expect("haider binary has a parent directory");
+    let sibling = directory.join("haiderd");
+    let payload = directory.join("haider-tui");
+    for (name, binary) in [("haiderd", &sibling), ("haider-tui", &payload)] {
+        assert!(
+            binary.is_file(),
+            "prebuilt {name} sibling missing at {}",
+            binary.display()
+        );
+    }
+    warm_autospawn_binaries(&haider, &payload, &sibling);
     sibling
 }
 
-fn warm_autospawn_binaries(haider: &Path, haiderd: &Path) {
+fn warm_autospawn_binaries(haider: &Path, payload: &Path, haiderd: &Path) {
     static WARM: std::sync::Once = std::sync::Once::new();
     WARM.call_once(|| {
         // macOS validates each newly written Mach-O inode before entering
         // `main`: measured cold launches were 4.975 s and 4.79 s, while the
         // same inodes then launched in 0.23 s, 0.20 s, and 0.24 s. Charge
         // that one-time validation to this process fixture, not the 950 ms
-        // own-child authentication assertion. Both binaries handle
-        // `--version` before profile/store/runtime-directory/socket setup, so warming
-        // cannot create a daemon or mutate a test profile.
-        for (name, binary) in [("haider", haider), ("haiderd", haiderd)] {
+        // own-child authentication assertion. The thin CLI's local --version
+        // does not execute its payload, so warm that separate inode too.
+        // All three version paths precede profile/store/runtime-directory/
+        // socket setup; warming cannot start a daemon or mutate a profile.
+        for (name, binary) in [
+            ("haider", haider),
+            ("haider-tui", payload),
+            ("haiderd", haiderd),
+        ] {
             let status = Command::new(binary)
                 .arg("--version")
                 .stdin(std::process::Stdio::null())

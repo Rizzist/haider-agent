@@ -534,16 +534,23 @@ Both lane walks are retained verbatim below, ordered by first registry number.
   test recount and generated goldens. Disk dropped below 700 MiB during the
   first full gate, which failed ENOSPC and was stopped; failed evidence remains.
   After recovery, builds run serially with one Cargo job. Final gate results
-  are recorded in `thinexe-evidence/gates-resumed.json` and the lane report.
+  after merging wave `6c42fc02`: full workspace PASS (5,604 summed libtest passes,
+  zero failures, 13 unchanged pre-existing ignores), exact workspace/tests Clippy
+  PASS, source count 5,109, four regenerated goldens PASS, and instruct-pipe
+  6,244→6,244 bytes PASS. The actual prebuilt daemon is 202,614,624 bytes.
+  Commands/env/disk checks remain in `thinexe-evidence/gates-resumed.json`.
 - #52/#57/#76: user-facing interactive verbs keep the TUI surface; headless
   controls stay in the thin process. Native routing, optional Wayland member,
   installation rollback/recovery, legacy pins and signature preservation have
   regression coverage. Windows/Linux/Android workflow execution is by inspection
-  here; their build/package/live-probe paths include the payload.
+  here; their build/package/live-probe paths include the payload. The per-crate
+  CI runner explicitly builds ordinary runtime siblings before asserting prebuilt
+  proof, clears inherited proof on failure, and retains failure aggregation.
 - #77: no ignored tests, raised acceptance thresholds or raw FAIL relabeling.
   The native macOS release installer suite passes 5/5. Official store upgrade
   passes; public install.paths fails HTTP404 for the unpublished 970 split asset.
-  The 969 auto-spawn updater's post-commit drain failure remains raw evidence.
+  The persistent 969 migration and strict-archive negative pass; the auto-spawn 969
+  post-commit drain failure remains raw evidence and keeps the overall probe FAIL.
 - #94: version probes use the shared 30-second VERSION_QUERY. The native
   install fixture retains its original 120-second watchdog, whose derivation
   is unproven (six staged/installed version allowances already total 180s).
@@ -551,8 +558,15 @@ Both lane walks are retained verbatim below, ordered by first registry number.
   cap is used. #95: no new negotiated RPC wait is introduced by thin dispatch.
 - #96: frozen before/after artifact hashes and exact commands are retained.
   haider 35,543,584→23,144,352 bytes; installed runtime total
-  90,909,552→105,245,792 bytes. ABBA exited 75 before sampling at load 4.5298,
-  above the unchanged 3.0 ceiling; no accepted RSS/CPU pair exists. NO_SHIP.
+  90,909,552→105,262,336 bytes. The final runtime and embedded compatibility
+  builds pass with stable source manifests (wave `6c42fc02` + thinexe). Final
+  ABBA exited 75 before sampling at load 3.2476, above the unchanged 3.0 ceiling;
+  a quiet retry reached process inventory and failed EPERM before any binary
+  launch. The earlier 4.5298 rejection remains recorded. Frozen A/B hashes are
+  unchanged after the final probes. No accepted RSS/CPU pair exists. NO_SHIP.
 - Remaining registry entries were reviewed for the changed surface; no additional
   platform, provider or wire-policy behavior is claimed. The report records
-  independent reviewer corrections and every remaining acceptance blocker.
+  21 unique accepted independent reviewer findings, zero noise, and every
+  remaining acceptance blocker. The shared serde authority preserves historical
+  error names, and the auto-spawn fixture warms all three sibling inodes before
+  its unchanged limit and forbids nested Cargo builds.

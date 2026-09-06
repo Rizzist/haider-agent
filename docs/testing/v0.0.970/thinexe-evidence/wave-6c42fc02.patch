@@ -1,0 +1,1887 @@
+diff --git a/crates/haider-tui/src/app.rs b/crates/haider-tui/src/app.rs
+index a86aeaa6..8e1d0324 100644
+--- a/crates/haider-tui/src/app.rs
++++ b/crates/haider-tui/src/app.rs
+@@ -3582,6 +3582,18 @@ pub enum AppRequest {
+     Interrupt {
+         branch: Option<haider_protocol::ids::BranchId>,
+     },
++    /// escretract (v0.0.970 owner QoL): Esc BEFORE the first response token —
++    /// cancel the run AND take the prompt back into the composer to edit and
++    /// resend. `turn.retract`, not `turn.cancel`.
++    ///
++    /// The reducer never decides the outcome: a prompt whose response won the
++    /// durable writer race comes back typed `too_late` and the driver falls
++    /// back to one ordinary cancel for the SAME run, leaving the transcript
++    /// exactly as a plain Esc would have. `branch` is captured at issuance
++    /// (B2b) — client-side identity; the wire pins the run by `run_id`.
++    RetractPrompt {
++        branch: Option<haider_protocol::ids::BranchId>,
++    },
+     /// Manual `/compact` (sim tui.js:1791-1806). `branch` is captured at
+     /// issuance (B2b): a later switch cannot retarget the compaction.
+     Compact {
+@@ -5409,6 +5421,16 @@ pub struct AppModel {
+     pub requests: Vec<AppRequest>,
+     /// True while a demo turn is playing (submits are ignored, honestly).
+     pub turn_active: bool,
++    /// escretract: a `turn.retract` is in flight and its outcome is unknown.
++    ///
++    /// The prompt bytes are still ONLY on the wire — the transcript row is
++    /// going away and the composer has not been seeded yet — so a second
++    /// Enter here would resend a prompt that may still be accepted. Submit is
++    /// refused for exactly this window, which the daemon closes in one round
++    /// trip (retract receipt, `too_late` → cancel receipt, or a typed
++    /// failure). Every one of those paths clears it, and so does a disconnect,
++    /// so Enter can never be left permanently dead.
++    pub retract_pending: bool,
+     /// Wheel scroll-back offset in the session transcript (0 = follow
+     /// bottom; wheel up increases, wheel down decreases). A `Cell` because
+     /// RENDER is the single scroll authority (review r3 P2-2). The wheel
+@@ -5747,6 +5769,7 @@ impl Default for AppModel {
+             outbox: Vec::new(),
+             requests: Vec::new(),
+             turn_active: false,
++            retract_pending: false,
+             scroll_back: std::cell::Cell::new(0),
+             bottom_watermark: std::cell::Cell::new(0),
+             scroll_max: std::cell::Cell::new(0),
+@@ -8667,6 +8690,19 @@ impl AppModel {
+                     // held queue drops with the turn (sim tui.js:1557).
+                     self.turn_active = false;
+                     self.msg_queue.clear();
++                    // escretract (owner QoL 2026-09-03): before the first
++                    // response token Esc RETRACTS — the run is cancelled and
++                    // the prompt comes back to the composer to edit and
++                    // resend. Once a token has landed it is a plain cancel:
++                    // the message and the partial reply both stay.
++                    if self.can_retract_prompt() {
++                        self.retract_pending = true;
++                        self.requests.push(AppRequest::RetractPrompt {
++                            branch: self.branch_state.active().cloned(),
++                        });
++                        self.dirty = true;
++                        return;
++                    }
+                     self.requests.push(AppRequest::Interrupt {
+                         branch: self.branch_state.active().cloned(),
+                     });
+@@ -9120,6 +9156,25 @@ impl AppModel {
+         // Slash submits take SILENTLY — execute_slash records the
+         // canonical form (review P3-9, one entry per invocation).
+         let is_slash = self.composer.text().trim().starts_with('/');
++        // escretract: a `turn.retract` is on the wire and its outcome is not
++        // known yet. The prompt may still be accepted, so a second Enter here
++        // would resend a turn that is still in flight — and the retract
++        // receipt is about to seed this composer anyway. Refuse BEFORE the
++        // take so the draft survives untouched; the daemon closes this window
++        // in one round trip. Slash commands issue no turn and pass.
++        // Scoped exactly like the B4b upload guard below: the retraction
++        // belongs to the SESSION surface. An open menu still needs its answer,
++        // and the launcher's Enter must keep working — `retract_pending` is
++        // model-global and outlives a surface switch by up to one round trip.
++        if !is_slash
++            && self.retract_pending
++            && self.screen == Screen::Session
++            && self.projection.open_menu().is_none()
++        {
++            self.flash = Some("· retracting the prompt — a moment".to_owned());
++            self.dirty = true;
++            return;
++        }
+         // B4b: a REAL turn must not ride while a chip's upload is still
+         // in flight — its block has no verified ref yet and a submit
+         // without it would silently shed the attachment. Refuse BEFORE
+@@ -15706,6 +15761,30 @@ impl AppModel {
+                 // registry (they surface only on `/hooks` and the decision
+                 // chip; every transcript surface keeps the display gate).
+                 self.hook_facts.note_envelope(envelope);
++                // escretract: the first-response boundary is the SAME class of
++                // fact — `render.ui == false` turn-control truth, recorded for
++                // Apply AND Skip. It decides whether the next Esc retracts the
++                // prompt or plainly cancels, and no display surface moves for
++                // it.
++                // Both are scoped to THIS session's own turns, exactly as the
++                // prompt-history recorder below is: the daemon stamps
++                // `agent_id` on both facts, and a subagent's first response
++                // must not close the parent's editing window, nor its
++                // retraction disturb the parent's prompt chooser.
++                if envelope.agent_id.is_none()
++                    && !crate::session::route_response_boundary(&mut self.projection, envelope)
++                    // escretract: prompt history is a SEPARATE surface from
++                    // the transcript, with its own durable coordinates, so the
++                    // retraction fact has to drop the recalled prompt here as
++                    // well — on live delivery and on replay alike. The
++                    // projection's own row removal stays where it is.
++                    && let Some(fact) =
++                        haider_protocol::retraction::PromptRetractedV1::from_payload_value(
++                            &envelope.payload,
++                        )
++                {
++                    self.forget_retracted_prompt(fact.prompt_seq);
++                }
+                 if let crate::branch::AdmittedNote::BranchInstalled(id) = &note {
+                     // The daemon's journal fact is the ONLY materializer;
+                     // if OUR fork's receipt already armed activation, the
+@@ -16901,6 +16980,131 @@ impl AppModel {
+         true
+     }
+ 
++    /// escretract: may THIS Esc retract the prompt instead of plainly
++    /// cancelling the run?
++    ///
++    /// Three conditions, each necessary:
++    /// - the daemon advertises `turn_retract_v1` — an older daemon has no such
++    ///   method and the wire gate would reject the frame outright;
++    /// - this client is not fabricating its own turns — a demo/mock turn has
++    ///   no durable prompt for a daemon to hand back (the fabrication law);
++    /// - this run has committed no first-response boundary yet.
++    ///
++    /// The last read is deliberately OPTIMISTIC: it is only ever as fresh as
++    /// the last envelope this client received, so a boundary committed while
++    /// the keystroke was in flight still looks open here. That race is not
++    /// won by guessing harder — the daemon answers typed `too_late` and the
++    /// driver falls back to one ordinary cancel for the same run.
++    #[must_use]
++    pub fn can_retract_prompt(&self) -> bool {
++        !self.mode.fabricates_locally()
++            && self.daemon_serves(haider_rpc::FEATURE_TURN_RETRACT_V1)
++            && !self.projection.response_started()
++    }
++
++    /// escretract: the retraction is over, however it ended — re-enable
++    /// submit. Every terminal path calls this, including the `too_late`
++    /// fallback's cancel receipt and a dropped socket, so Enter is never
++    /// left permanently dead.
++    pub const fn retract_settled(&mut self) {
++        self.retract_pending = false;
++    }
++
++    /// escretract: drop a retracted prompt from the Esc-Esc chooser.
++    ///
++    /// The daemon's projection hides the transcript row, but prompt history is
++    /// a SEPARATE surface with its own durable coordinates. Leaving the row
++    /// there would offer a prompt the daemon says never happened — and a
++    /// `session.fork` at its hidden cut is refused, so the entry could only
++    /// disappoint. Keyed by the exact `prompt_seq`, never by text: equal text
++    /// in another turn must survive.
++    pub fn forget_retracted_prompt(&mut self, prompt_seq: u64) {
++        self.prompt_history
++            .retain(|entry| entry.seq != Some(prompt_seq));
++        self.close_backtrack();
++    }
++
++    /// escretract: the daemon gave the prompt back — seed the composer with it
++    /// so the user can edit and resend.
++    ///
++    /// Attachments are restored from the receipt's CAS blocks exactly as a
++    /// fork's draft is: the bytes are already content-addressed and verified,
++    /// so the chips carry the daemon's own blocks and NO upload is issued.
++    ///
++    /// Anything the user typed during the (one round trip, submit-disabled)
++    /// window is kept and follows the restored prompt — the retraction must
++    /// never cost the user text, and that includes text it did not author.
++    ///
++    /// The receipt is addressed to a SESSION, not to whatever is on screen. By
++    /// the time it lands the daemon has already committed `prompt_retracted`,
++    /// so the transcript row and the history entry are both gone — dropping
++    /// the draft because the user stepped to another surface in that one round
++    /// trip would destroy the only remaining copy. So a receipt for a session
++    /// that is not on screen seeds THAT session's parked draft, which is
++    /// exactly where a surface switch would have left it, and it is waiting
++    /// when the user returns.
++    pub fn restore_retracted_prompt(
++        &mut self,
++        session: &SessionId,
++        text: String,
++        attachments: &[haider_protocol::tool::AttachmentBlock],
++    ) {
++        self.retract_settled();
++        let Some(surface) = self
++            .sessions
++            .iter()
++            .find(|row| &row.id == session)
++            .map(|row| DraftKey::Session(row.ui_gen))
++        else {
++            // No roster row at all: this client has nowhere to park bytes it
++            // cannot show. The journal still holds the prompt.
++            return;
++        };
++        let live = self.surface_key() == surface;
++        // Mint the chip identities BEFORE borrowing the target composer.
++        let mut carried = Vec::with_capacity(attachments.len());
++        let mut unrepresentable = 0_usize;
++        for block in attachments {
++            self.upload_seq += 1;
++            match crate::composer::PendingAttachment::carrying(self.upload_seq, block.clone()) {
++                Some(chip) => carried.push(chip),
++                None => unrepresentable += 1,
++            }
++        }
++        let composer = if live {
++            &mut self.composer
++        } else {
++            self.drafts.entry(surface).or_default()
++        };
++        let typed = composer.text().to_owned();
++        let restored = if typed.is_empty() {
++            text
++        } else {
++            format!("{text}\n{typed}")
++        };
++        // `set_text` leaves the cursor at the end and clears any selection.
++        composer.set_text(restored);
++        for chip in carried {
++            if composer.attachments().len() >= MAX_TURN_ATTACHMENTS {
++                unrepresentable += 1;
++                continue;
++            }
++            composer.push_attachment(chip);
++        }
++        // A parked draft paints nothing; the notice belongs to the surface
++        // the user is actually looking at.
++        if live {
++            let mut note = "· prompt retracted — edit and resend".to_owned();
++            if unrepresentable > 0 {
++                note.push_str(&format!(
++                    " · {unrepresentable} attachment(s) could not be carried"
++                ));
++            }
++            self.flash = Some(note);
++        }
++        self.dirty = true;
++    }
++
+     /// Learn (or re-learn) a LIVE session row (W3c3 M2). Idempotent: a
+     /// session the model already holds keeps its row, its transcript and
+     /// its generation, so a `session.list` after every reconnect neither
+diff --git a/crates/haider-tui/src/link.rs b/crates/haider-tui/src/link.rs
+index 0d415e39..b51ed5be 100644
+--- a/crates/haider-tui/src/link.rs
++++ b/crates/haider-tui/src/link.rs
+@@ -508,6 +508,13 @@ async fn issue(
+                 | LiveCommand::CheckpointRollbackTurn { .. }
+                 | LiveCommand::ProviderSetTrust { .. }
+                 | LiveCommand::WorkspaceSet { .. }
++                // escretract: a retract MUST be answered. Falling through to
++                // the bare `return false` would leave the durable command in
++                // the outbox with nothing to retire it — resent and re-dropped
++                // on every reconnect — while Esc silently did nothing. The
++                // typed failure reaches the driver's retract fallback, which
++                // turns it into the plain cancel an older daemon does serve.
++                | LiveCommand::Retract { .. }
+         ) {
+             let _ = replies
+                 .send(LiveReply::Failed {
+@@ -630,6 +637,7 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
+         }
+         LiveCommand::LoomInstallStatus { .. } => &[haider_rpc::FEATURE_TYPED_AGENT_INSTALL_V1],
+         LiveCommand::AgentCancel { .. } => &[haider_rpc::FEATURE_AGENT_CANCEL_V1],
++        LiveCommand::Retract { .. } => &[haider_rpc::FEATURE_TURN_RETRACT_V1],
+         LiveCommand::CheckpointList { .. }
+         | LiveCommand::CheckpointUndo { .. }
+         | LiveCommand::CheckpointRedo { .. }
+@@ -1082,6 +1090,21 @@ pub fn request_body_for_features(
+             worker_generation,
+             run_id,
+         },
++        // escretract: like the cancel above, the branch is a CLIENT-side
++        // capture — `turn.retract` pins the run by `run_id`, which its
++        // acceptance already branch-pinned.
++        LiveCommand::Retract {
++            command_id,
++            session,
++            worker_generation,
++            run_id,
++            branch: _,
++        } => RequestBody::TurnRetract {
++            command_id,
++            session_id: session,
++            worker_generation,
++            run_id,
++        },
+         LiveCommand::Compact {
+             command_id,
+             session,
+@@ -1893,6 +1916,25 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
+             .command_id
+             .clone()
+             .map_or_else(Vec::new, |id| vec![LiveReply::Cancelled { command_id: id }]),
++        // escretract: the receipt carries the EXACT accepted draft. Its
++        // `prompt_seq`/`retracted_seq` are journal coordinates the durable
++        // `prompt_retracted` fact already carries to every projection, so the
++        // reply forwards only what the composer needs to be seeded.
++        ResponseBody::TurnRetract {
++            session_id,
++            run_id,
++            text,
++            attachments,
++            ..
++        } => context.command_id.clone().map_or_else(Vec::new, |id| {
++            vec![LiveReply::PromptRetracted {
++                command_id: id,
++                session: session_id,
++                run_id,
++                text,
++                attachments,
++            }]
++        }),
+         ResponseBody::SessionCompact { .. } | ResponseBody::SessionCompactOnBranch { .. } => {
+             context
+                 .command_id
+diff --git a/crates/haider-tui/src/live.rs b/crates/haider-tui/src/live.rs
+index ea403b3f..6d5a437e 100644
+--- a/crates/haider-tui/src/live.rs
++++ b/crates/haider-tui/src/live.rs
+@@ -271,6 +271,18 @@ pub enum LiveCommand {
+         /// branch-pinned by its acceptance.
+         branch: Option<haider_protocol::ids::BranchId>,
+     },
++    /// escretract: `turn.retract` — cancel the run AND take the accepted
++    /// prompt back for editing. Carries the same run pin as [`Self::Cancel`]
++    /// because the fallback for a lost race IS that cancel, issued for this
++    /// exact run. `branch` is client-side capture (B2b) and never reaches the
++    /// wire.
++    Retract {
++        command_id: CommandId,
++        session: SessionId,
++        worker_generation: u64,
++        run_id: RunId,
++        branch: Option<haider_protocol::ids::BranchId>,
++    },
+     /// `session.compact` — receipt-backed, idle-only manual compaction
+     /// (W7b). The daemon's own journal events drive every visible state
+     /// change; the reply only retires the outbox entry.
+@@ -1130,6 +1142,7 @@ impl LiveCommand {
+             | Self::SessionDiagnostic { command_id, .. }
+             | Self::Submit { command_id, .. }
+             | Self::Cancel { command_id, .. }
++            | Self::Retract { command_id, .. }
+             | Self::RunRetry { command_id, .. }
+             | Self::WorkspaceSet { command_id, .. }
+             | Self::Compact { command_id, .. }
+@@ -1448,6 +1461,19 @@ pub enum LiveReply {
+         worker_generation: u64,
+         draft: haider_protocol::session_fork::SessionForkDraft,
+     },
++    /// escretract: `turn.retract` committed. The run is cancelled and the
++    /// daemon returned the EXACT accepted draft — original text plus complete
++    /// attachment blocks, already in the CAS. The receipt retires the outbox
++    /// entry and seeds the composer; the transcript row is removed by the
++    /// daemon's own `prompt_retracted` fact on the stream, not from here, so
++    /// live and replay agree by construction.
++    PromptRetracted {
++        command_id: CommandId,
++        session: SessionId,
++        run_id: RunId,
++        text: String,
++        attachments: Vec<haider_protocol::tool::AttachmentBlock>,
++    },
+     Checkpoints {
+         session: SessionId,
+         branch: Option<haider_protocol::ids::BranchId>,
+@@ -2567,6 +2593,38 @@ impl LiveDriver {
+         CommandId::new(format!("{}-{}", self.instance, self.next_command))
+     }
+ 
++    /// escretract: the run coordinates of an in-flight `turn.retract`, if
++    /// `command_id` names one. The outbox is already the authority on what is
++    /// in flight, so the fallback reads its pin from there rather than keeping
++    /// a second copy that could disagree with it.
++    fn retract_flight(
++        &self,
++        command_id: &CommandId,
++    ) -> Option<(
++        SessionId,
++        u64,
++        RunId,
++        Option<haider_protocol::ids::BranchId>,
++    )> {
++        self.outbox
++            .iter()
++            .find_map(|pending| match &pending.command {
++                LiveCommand::Retract {
++                    command_id: pinned,
++                    session,
++                    worker_generation,
++                    run_id,
++                    branch,
++                } if pinned == command_id => Some((
++                    session.clone(),
++                    *worker_generation,
++                    run_id.clone(),
++                    branch.clone(),
++                )),
++                _ => None,
++            })
++    }
++
+     /// One `monitor.mutate` for the active session: pause, resume, or
+     /// trigger. Durable — the three share the outbox path exactly as the
+     /// wire shares one receipt-backed RPC for them.
+@@ -3906,6 +3964,25 @@ impl LiveDriver {
+                 model.dirty = true;
+                 Vec::new()
+             }
++            LiveReply::PromptRetracted {
++                command_id,
++                session,
++                // Wire truth the receipt carries; the restore is gated on the
++                // SESSION alone. A successful retraction terminalizes the run,
++                // which drops it from `active_run` — gating on the run here
++                // would make the receipt lose a race with its own cancel and
++                // silently swallow the user's prompt.
++                run_id: _,
++                text,
++                attachments,
++            } => {
++                self.retire(&command_id);
++                // Addressed to the SESSION, not to whatever is on screen: the
++                // model parks it when the user has stepped away, because by now
++                // the daemon has already hidden the prompt everywhere else.
++                model.restore_retracted_prompt(&session, text, &attachments);
++                Vec::new()
++            }
+             LiveReply::PromptForked {
+                 command_id,
+                 source_session,
+@@ -4785,6 +4862,36 @@ impl LiveDriver {
+                 retryable,
+                 presentation,
+             } => {
++                // escretract: a retraction that did not commit becomes ONE
++                // ordinary cancel for the same run — which is exactly what
++                // plain Esc would have done — and the transcript keeps the
++                // prompt and any partial reply. This runs before every other
++                // failure arm because it is true for EVERY failure code,
++                // typed `too_late` and unexpected alike.
++                if let Some(id) = command_id.clone()
++                    && let Some((session, worker_generation, run_id, branch)) =
++                        self.retract_flight(&id)
++                {
++                    self.retire(&id);
++                    // The prompt is not coming back, so nothing is left to
++                    // protect the composer from: submit re-opens now rather
++                    // than waiting on the cancel receipt.
++                    model.retract_settled();
++                    model.flash = Some(if code == haider_rpc::ERROR_CODE_TOO_LATE {
++                        "· too late to retract — cancelled".to_owned()
++                    } else {
++                        format!("· retract failed — cancelled · {message}")
++                    });
++                    model.dirty = true;
++                    let command_id = self.mint();
++                    return vec![self.enqueue(LiveCommand::Cancel {
++                        command_id,
++                        session,
++                        worker_generation,
++                        run_id,
++                        branch,
++                    })];
++                }
+                 if code == "feature_missing" {
+                     if let Some(id) = command_id.as_ref()
+                         && self
+@@ -5279,6 +5386,12 @@ impl LiveDriver {
+                 // Round 3: capability facts die with the socket as well; the
+                 // reconnect handshake re-grounds them before work resumes.
+                 model.daemon_features.clear();
++                // escretract: the retraction's fate died with the socket. The
++                // outbox may still replay it on reconnect, but the user must
++                // not be left unable to send in the meantime — and a receipt
++                // that does arrive later still seeds the composer, keeping
++                // anything typed since.
++                model.retract_settled();
+                 // The run survives the socket; the ATTACHMENT does not.
+                 // `active_run` is stream-derived and the reattach replays
+                 // whatever moved while we were away.
+@@ -6629,6 +6742,30 @@ impl LiveDriver {
+                     branch,
+                 })]
+             }
++            AppRequest::RetractPrompt { branch } => {
++                // Same run authority as Interrupt: the COMMITTED stream says
++                // which run is active, and an invented run id would be a
++                // command the daemon can only reject. With nothing to retract
++                // the guard must lift here — otherwise Enter stays refused
++                // waiting for a reply that was never asked for.
++                let Some(session) = model.active_session.clone() else {
++                    model.retract_settled();
++                    return Vec::new();
++                };
++                let Some(run_id) = self.active_run.get(&session).cloned() else {
++                    model.retract_settled();
++                    return Vec::new();
++                };
++                let command_id = self.mint();
++                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
++                vec![self.enqueue(LiveCommand::Retract {
++                    command_id,
++                    session,
++                    worker_generation,
++                    run_id,
++                    branch,
++                })]
++            }
+             AppRequest::ShellExec { command, branch } => {
+                 // W8b law 5/6: one durable daemon command, no UserMessage,
+                 // no client-side spawn, no shell re-quoting — the exact
+@@ -7338,6 +7475,7 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
+         LiveCommand::Submit { session, .. }
+         | LiveCommand::SessionDiagnostic { session, .. }
+         | LiveCommand::Cancel { session, .. }
++        | LiveCommand::Retract { session, .. }
+         | LiveCommand::Compact { session, .. }
+         | LiveCommand::BranchCreate { session, .. }
+         | LiveCommand::SessionForkPrompt { session, .. }
+diff --git a/crates/haider-tui/src/projection.rs b/crates/haider-tui/src/projection.rs
+index b2fbf60c..22478bbe 100644
+--- a/crates/haider-tui/src/projection.rs
++++ b/crates/haider-tui/src/projection.rs
+@@ -386,6 +386,15 @@ pub struct SessionProjection {
+     /// delta), reset at each new turn's start; approximate tokens are derived
+     /// as `chars / 4`.
+     streamed_output_chars: u64,
++    /// escretract (v0.0.970): has THIS run's first semantic response boundary
++    /// been observed? The daemon commits `response_started` as a
++    /// `render.ui == false` fact and arbitrates retraction against it in the
++    /// session writer, so this is the same authority the daemon uses — not a
++    /// guess from rendered rows. It gates Esc's meaning (retract vs plain
++    /// cancel); the typed `too_late` reply remains the correctness backstop
++    /// for the genuine race, because this flag can only be as fresh as the
++    /// last envelope this client received.
++    response_started: bool,
+     /// tpsfix (v0.0.970): a monotone TURN counter, bumped on every genuine turn
+     /// opening (idle/none → non-terminal). It is the identity the throughput
+     /// estimator resets on, and the gate that stops a usage frame committed by
+@@ -716,6 +725,12 @@ impl SessionProjection {
+                 let was_idle = self.run.as_ref().is_none_or(RunState::is_terminal);
+                 if was_idle && !run.is_terminal() {
+                     self.streamed_output_chars = 0;
++                    // escretract: the SAME opening edge closes the previous
++                    // turn's retraction window. The boundary is per-run daemon
++                    // truth, so every new run starts with it unseen — without
++                    // this reset an earlier turn's response would make every
++                    // later Esc a plain cancel forever.
++                    self.response_started = false;
+                     // Availability is re-probed by the daemon for every new
+                     // turn. Drop a prior run's notice at the opening edge; if
+                     // the root is still unavailable, this run's durable fact
+@@ -1662,6 +1677,20 @@ impl SessionProjection {
+         matches!(self.run, Some(RunState::Streaming | RunState::RunningTool))
+     }
+ 
++    /// escretract: record the daemon's committed first-response boundary for
++    /// the current run. Idempotent — the boundary commits at most once per
++    /// run, and a re-delivery must never reopen the editing window.
++    pub const fn note_response_started(&mut self) {
++        self.response_started = true;
++    }
++
++    /// escretract: true once this run's first semantic response has been
++    /// committed, which is exactly when the prompt stops being retractable.
++    #[must_use]
++    pub const fn response_started(&self) -> bool {
++        self.response_started
++    }
++
+     /// W-G: an APPROXIMATE output-token count for this turn, derived from the
+     /// streamed assistant-text characters (~4 chars per token). Used only as
+     /// the honest fallback when the provider reports no incremental usage —
+diff --git a/crates/haider-tui/src/runtime.rs b/crates/haider-tui/src/runtime.rs
+index 03291bc0..7146e126 100644
+--- a/crates/haider-tui/src/runtime.rs
++++ b/crates/haider-tui/src/runtime.rs
+@@ -1710,6 +1710,15 @@ impl DemoDriver {
+                     meters.clear();
+                 }
+             }
++            // escretract: retraction is a DAEMON round trip — it hands back
++            // the exact accepted draft the journal holds. The demo twin has no
++            // such journal, and inventing a restored prompt here would be the
++            // fabrication this reducer refuses everywhere else, so the demo
++            // reducer never asks for one ([`AppModel::can_retract_prompt`]
++            // requires a non-fabricating mode). Reaching this arm at all means
++            // that gate moved, so the guard is lifted rather than silently
++            // stranding the composer's send.
++            AppRequest::RetractPrompt { .. } => model.retract_settled(),
+             AppRequest::Interrupt { .. } => {
+                 // Esc mid-turn cancels THIS session's turn (sim
+                 // tui.js:1551-1567 touches only the run token, the queue and
+diff --git a/crates/haider-tui/src/session.rs b/crates/haider-tui/src/session.rs
+index f12ff4f9..5a016bb3 100644
+--- a/crates/haider-tui/src/session.rs
++++ b/crates/haider-tui/src/session.rs
+@@ -368,6 +368,23 @@ impl SessionState {
+                 // background too — the attached twin does the same, so a
+                 // later checkout carries the decision chip and firings.
+                 self.hook_facts.note_envelope(envelope);
++                // escretract: and so are the retraction facts, for the same
++                // reason. A first-response boundary that lands while this
++                // session is parked still closes ITS editing window, or a
++                // later checkout would offer a retraction the daemon has
++                // already refused; and a retraction that lands here still has
++                // to drop the prompt from THIS session's chooser, because
++                // nothing re-delivers the fact when the user comes back.
++                if envelope.agent_id.is_none()
++                    && !route_response_boundary(&mut self.projection, envelope)
++                    && let Some(fact) =
++                        haider_protocol::retraction::PromptRetractedV1::from_payload_value(
++                            &envelope.payload,
++                        )
++                {
++                    self.prompt_history
++                        .retain(|entry| entry.seq != Some(fact.prompt_seq));
++                }
+                 if let crate::branch::AdmittedNote::BranchInstalled(id) = &note {
+                     // The fork this session itself issued: the receipt is
+                     // already in and armed activation — the JOURNAL fact is
+@@ -833,6 +850,31 @@ pub fn route_permission_event(projection: &mut SessionProjection, envelope: &Raw
+     true
+ }
+ 
++/// escretract: record the daemon's committed FIRST-RESPONSE boundary.
++///
++/// The boundary rides a `render.ui == false` envelope — display state never
++/// moves for it — so this router is deliberately a COMMAND-STATE hook in the
++/// sense the branch registry and the hook-fact recorder already established:
++/// it runs for admitted-and-skipped envelopes alike, because the retraction
++/// window is turn-control truth, not a transcript row.
++///
++/// Returns whether the payload WAS the boundary. The raw-envelope hook may
++/// ignore it: the boundary is committed `render.ui == false`, so it is admitted
++/// as `Skip` and never reaches the decode chain that counts unknown payloads.
++/// The value is here for callers that DO route by it, and for tests.
++pub fn route_response_boundary(projection: &mut SessionProjection, envelope: &RawEnvelope) -> bool {
++    if envelope
++        .payload
++        .get("type")
++        .and_then(serde_json::Value::as_str)
++        != Some("response_started")
++    {
++        return false;
++    }
++    projection.note_response_started();
++    true
++}
++
+ /// Route the additive workspace event union without treating it as a client /
+ /// daemon compatibility mismatch.
+ pub fn route_workspace_event(projection: &mut SessionProjection, envelope: &RawEnvelope) -> bool {
+diff --git a/crates/haider-tui/tests/w970_escretract_ui_tests.rs b/crates/haider-tui/tests/w970_escretract_ui_tests.rs
+new file mode 100644
+index 00000000..943975c3
+--- /dev/null
++++ b/crates/haider-tui/tests/w970_escretract_ui_tests.rs
+@@ -0,0 +1,950 @@
++//! escretract-ui (v0.0.970 owner QoL, 2026-09-03) — Esc BEFORE the first
++//! response token retracts the prompt back into the composer.
++//!
++//! The daemon/contract half already landed: `turn.retract`, the durable
++//! `prompt_retracted` fact, the typed `too_late` arbitration and the
++//! transcript projection that hides the exact retracted node. What is pinned
++//! here is the CLIENT half — which key issues which command, what the
++//! composer gets back, what protects the user from resending a prompt that is
++//! still in flight, and that none of it invents state the daemon did not
++//! commit.
++//!
++//! The `LiveDriver` is a pure state machine, so every law below is pinned
++//! without a daemon; the wire shapes go through the real `link` mapping so a
++//! rename on either side fails here rather than in production.
++#![allow(clippy::expect_used)]
++
++use haider_protocol::EventPayload;
++use haider_protocol::envelope::{EventEnvelope, PromptRender, RawEnvelope, RenderTargets};
++use haider_protocol::history::{NodeKind, TreeNode};
++use haider_protocol::ids::{ArtifactRef, DeviceId, EventId, NodeId, RunId, SessionId};
++use haider_protocol::state::RunState;
++use haider_protocol::tool::AttachmentBlock;
++use haider_rpc::{AttachmentId, CommandId, SessionSummary};
++use haider_tui::app::{AppModel, AppRequest, DraftKey, RuntimeMode, Screen};
++use haider_tui::link::{CommandContext, map_response, request_body};
++use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
++use haider_tui::projection::TranscriptEntry;
++use ratatui::crossterm::event::KeyCode;
++
++mod common;
++use common::{key, launcher_model};
++
++const RUN: &str = "run-escretract-1";
++const NODE: &str = "node-escretract-1";
++const PROMPT: &str = "rewrite the boundary test";
++const PROMPT_SEQ: u64 = 1;
++
++fn sid() -> SessionId {
++    SessionId::new("s-escretract")
++}
++
++fn attachment_id() -> AttachmentId {
++    AttachmentId::new("att-escretract")
++}
++
++fn summary() -> SessionSummary {
++    SessionSummary {
++        session_id: sid(),
++        head_seq: 0,
++        worker_generation: 7,
++        run_state: None,
++        run_id: None,
++        seen_at_ms: None,
++        last_activity_ms: None,
++        waiting_why: None,
++        needs_input: None,
++        metadata: None,
++        provider: None,
++        workspace_cwd: None,
++        turn_count: None,
++        footprint_tokens: None,
++        footprint_truth: None,
++        title: None,
++        agent_metrics: None,
++        last_model: None,
++        cache_lifetime_hit_basis_points: None,
++        cache_reread_hit_basis_points: None,
++        parent_session_id: None,
++        kind: None,
++        agent_type: None,
++        effort: None,
++        fast: None,
++        account_alias: None,
++        forked_from: None,
++    }
++}
++
++/// One raw envelope. `ui` is a parameter because the first-response boundary
++/// is committed `render.ui == false` on purpose — a display surface must never
++/// move for it — and the whole point of this lane is that the client still
++/// LEARNS from it.
++fn raw(seq: u64, payload: serde_json::Value, ui: bool) -> RawEnvelope {
++    EventEnvelope {
++        schema_version: 1,
++        event_id: EventId::new(format!("evt-{seq}")),
++        seq,
++        session_id: sid(),
++        branch_id: None,
++        run_id: Some(RunId::new(RUN)),
++        agent_id: None,
++        device_id: DeviceId::new("live-device"),
++        authority_epoch: 1,
++        worker_generation: 9,
++        causation_id: None,
++        correlation_id: None,
++        committed_at_ms: 0,
++        render: RenderTargets {
++            ui,
++            durable: true,
++            prompt: PromptRender::Omit,
++        },
++        payload: payload.into(),
++    }
++}
++
++fn event(payload: &EventPayload, seq: u64) -> RawEnvelope {
++    raw(
++        seq,
++        serde_json::to_value(payload).expect("payload serializes"),
++        true,
++    )
++}
++
++fn image_block() -> AttachmentBlock {
++    AttachmentBlock::Image {
++        artifact: ArtifactRef::new(format!("blake3:{:0>64}", "escretract")),
++        mime: "image/png".to_owned(),
++        width: Some(800),
++        height: Some(600),
++    }
++}
++
++/// The exact durable fact the daemon commits when a retraction wins.
++fn retraction_fact() -> serde_json::Value {
++    haider_protocol::retraction::PromptRetractedV1 {
++        prompt_seq: PROMPT_SEQ,
++        prompt_node_id: NodeId::new(NODE),
++        text: PROMPT.to_owned(),
++        attachments: vec![image_block()],
++    }
++    .to_payload_value()
++    .expect("retraction fact")
++}
++
++/// The daemon's first-response boundary — `response_started`, `ui == false`.
++fn boundary(seq: u64) -> RawEnvelope {
++    raw(
++        seq,
++        haider_protocol::retraction::response_started_payload(
++            serde_json::json!({"type": "text_delta", "text": "Sure"}),
++        ),
++        false,
++    )
++}
++
++fn deliver(driver: &mut LiveDriver, model: &mut AppModel, envelope: RawEnvelope) {
++    driver.apply(
++        model,
++        LiveReply::Event {
++            attachment: attachment_id(),
++            session: sid(),
++            envelope: Box::new(envelope),
++        },
++    );
++}
++
++/// A live session, attached and open, with an accepted prompt whose run is
++/// live and whose first response has NOT arrived — the exact state the owner's
++/// QoL request is about.
++fn accepted_turn() -> (LiveDriver, AppModel) {
++    let mut model = launcher_model();
++    model.mode = RuntimeMode::Live;
++    model.sessions.clear();
++    model
++        .daemon_features
++        .insert(haider_rpc::FEATURE_TURN_RETRACT_V1.to_owned());
++    let mut driver = LiveDriver::new("escretract-test");
++    driver.apply(
++        &mut model,
++        LiveReply::Listed {
++            sessions: vec![summary()],
++            next_cursor: None,
++        },
++    );
++    driver.ensure_attached(&model, &sid());
++    driver.apply(
++        &mut model,
++        LiveReply::Attached {
++            session: sid(),
++            attachment: attachment_id(),
++            worker_generation: 7,
++            replay_through_seq: 0,
++        },
++    );
++    model.open_session(&sid());
++
++    // The committed prompt, its durable node anchor, then the live run.
++    deliver(
++        &mut driver,
++        &mut model,
++        event(
++            &EventPayload::UserMessage {
++                text: PROMPT.to_owned(),
++                attachments: vec![image_block()],
++                mode: haider_protocol::DeliveryMode::Steer,
++            },
++            PROMPT_SEQ,
++        ),
++    );
++    deliver(
++        &mut driver,
++        &mut model,
++        event(
++            &EventPayload::NodeCommitted(TreeNode {
++                node: NodeId::new(NODE),
++                parent: None,
++                kind: NodeKind::UserTurn {
++                    text: PROMPT.to_owned(),
++                    attachments: vec![image_block()],
++                },
++            }),
++            2,
++        ),
++    );
++    deliver(
++        &mut driver,
++        &mut model,
++        event(&EventPayload::RunState(RunState::Streaming), 3),
++    );
++    model.requests.clear();
++    (driver, model)
++}
++
++fn user_rows(model: &AppModel) -> Vec<String> {
++    model
++        .projection
++        .entries()
++        .iter()
++        .filter_map(|entry| match entry {
++            TranscriptEntry::User { text, .. } => Some(text.clone()),
++            _ => None,
++        })
++        .collect()
++}
++
++/// Press Esc and drain the reducer's request into the driver, returning the
++/// commands it issued.
++fn esc(driver: &mut LiveDriver, model: &mut AppModel) -> Vec<LiveCommand> {
++    model.handle(key(KeyCode::Esc));
++    let requests: Vec<AppRequest> = model.requests.drain(..).collect();
++    requests
++        .into_iter()
++        .flat_map(|request| driver.handle_request(model, request))
++        .collect()
++}
++
++#[test]
++fn esc_before_the_first_token_retracts_and_restores_text_and_attachments() {
++    // The owner's request end to end: the turn is cancelled, the prompt row
++    // leaves the transcript, and the exact bytes — text AND attachments — come
++    // back to the composer to edit and resend.
++    //
++    // MUTATION CHECK: make `AppModel::can_retract_prompt` return `false` and
++    // the command below is a `Cancel`, failing the retract assertion; make it
++    // ignore `response_started` and
++    // `a_committed_response_boundary_makes_esc_a_plain_cancel` fails instead.
++    let (mut driver, mut model) = accepted_turn();
++    assert!(model.turn_active, "the accepted turn is live");
++    assert_eq!(user_rows(&model), [PROMPT], "the prompt is on screen");
++    assert!(model.can_retract_prompt(), "no response has arrived yet");
++
++    let commands = esc(&mut driver, &mut model);
++    assert!(
++        model.retract_pending,
++        "the outcome is unknown until the daemon answers"
++    );
++    assert!(!model.turn_active, "the turn is over either way");
++    let Some(command @ LiveCommand::Retract { .. }) = commands.first() else {
++        panic!("Esc before the first token must retract, got {commands:?}");
++    };
++    let LiveCommand::Retract {
++        command_id,
++        session,
++        run_id,
++        ..
++    } = command.clone()
++    else {
++        unreachable!("matched above")
++    };
++    assert_eq!(session, sid());
++    assert_eq!(run_id, RunId::new(RUN), "the run the stream named");
++
++    // The real wire shape — not a hand-written frame.
++    let context = CommandContext::of(command);
++    assert!(
++        matches!(
++            request_body(command.clone()),
++            haider_rpc::RequestBody::TurnRetract { run_id, session_id, .. }
++                if run_id == RunId::new(RUN) && session_id == sid()
++        ),
++        "turn.retract, never turn.cancel"
++    );
++
++    // The daemon commits the fact on the stream; the projection drops the
++    // exact node. This is what makes live and replay agree.
++    deliver(&mut driver, &mut model, raw(4, retraction_fact(), true));
++    assert!(
++        user_rows(&model).is_empty(),
++        "the retracted prompt leaves the transcript"
++    );
++
++    // Then the receipt, mapped through the real response path.
++    let replies = map_response(
++        &context,
++        haider_rpc::ResponseBody::TurnRetract {
++            session_id: sid(),
++            run_id: RunId::new(RUN),
++            prompt_seq: PROMPT_SEQ,
++            retracted_seq: 4,
++            text: PROMPT.to_owned(),
++            attachments: vec![image_block()],
++        },
++    );
++    assert!(
++        matches!(
++            replies.first(),
++            Some(LiveReply::PromptRetracted { command_id: id, .. }) if *id == command_id
++        ),
++        "the receipt correlates by its own command id, got {replies:?}"
++    );
++    for reply in replies {
++        driver.apply(&mut model, reply);
++    }
++
++    assert_eq!(
++        model.composer.text(),
++        PROMPT,
++        "the prompt is editable again"
++    );
++    assert_eq!(
++        model.composer.cursor(),
++        PROMPT.len(),
++        "cursor at the end, ready to edit"
++    );
++    assert_eq!(
++        model.composer.attachments().len(),
++        1,
++        "the attachment chip is restored from the CAS reference"
++    );
++    assert_eq!(
++        model.composer.attachments()[0].ready_block(),
++        Some(image_block()),
++        "the chip carries the daemon's exact block — no re-upload"
++    );
++    assert_eq!(
++        model.flash.as_deref(),
++        Some("· prompt retracted — edit and resend")
++    );
++    assert!(
++        !model.retract_pending,
++        "the window is closed; sending is possible again"
++    );
++}
++
++#[test]
++fn too_late_falls_back_to_one_plain_cancel_and_keeps_the_prompt_on_screen() {
++    // The race the daemon arbitrates: the response won the durable writer
++    // race, so the prompt is NOT retractable. Esc must then behave exactly as
++    // it always has — one ordinary cancel for the same run, the message and
++    // any partial reply staying put — and it must cost exactly one extra
++    // round trip, never a second retract attempt.
++    //
++    // MUTATION CHECK: delete the `retract_flight` arm at the top of the
++    // `Failed` handler and no cancel is issued at all — Esc silently does
++    // nothing and `retract_pending` strands the composer.
++    let (mut driver, mut model) = accepted_turn();
++    let commands = esc(&mut driver, &mut model);
++    let Some(LiveCommand::Retract { command_id, .. }) = commands.first().cloned() else {
++        panic!("expected a retract, got {commands:?}");
++    };
++
++    let fallback = driver.apply(
++        &mut model,
++        LiveReply::Failed {
++            command_id: Some(command_id),
++            code: haider_rpc::ERROR_CODE_TOO_LATE.to_owned(),
++            message: "the response already committed".to_owned(),
++            retryable: false,
++            presentation: None,
++        },
++    );
++    assert!(
++        matches!(
++            fallback.as_slice(),
++            [LiveCommand::Cancel { run_id, session, .. }]
++                if *run_id == RunId::new(RUN) && *session == sid()
++        ),
++        "exactly one ordinary cancel for the same run, got {fallback:?}"
++    );
++    assert_eq!(
++        user_rows(&model),
++        [PROMPT],
++        "a too-late Esc keeps the message exactly as a plain cancel would"
++    );
++    assert!(model.composer.is_empty(), "nothing is restored");
++    assert_eq!(
++        model.flash.as_deref(),
++        Some("· too late to retract — cancelled")
++    );
++    assert!(
++        !model.retract_pending,
++        "with no prompt coming back there is nothing left to guard"
++    );
++}
++
++#[test]
++fn an_unexpected_retract_failure_still_cancels_and_names_the_error() {
++    // "On any other error: plain cancel + the error in the status line; never
++    // lose the user's text." An unexpected code must not leave the run alive
++    // after the user asked for it to stop.
++    let (mut driver, mut model) = accepted_turn();
++    let commands = esc(&mut driver, &mut model);
++    let Some(LiveCommand::Retract { command_id, .. }) = commands.first().cloned() else {
++        panic!("expected a retract, got {commands:?}");
++    };
++
++    let fallback = driver.apply(
++        &mut model,
++        LiveReply::Failed {
++            command_id: Some(command_id),
++            code: "internal".to_owned(),
++            message: "writer unavailable".to_owned(),
++            retryable: false,
++            presentation: None,
++        },
++    );
++    assert!(
++        matches!(fallback.as_slice(), [LiveCommand::Cancel { run_id, .. }]
++            if *run_id == RunId::new(RUN)),
++        "an unexpected failure still cancels the run, got {fallback:?}"
++    );
++    assert_eq!(
++        model.flash.as_deref(),
++        Some("· retract failed — cancelled · writer unavailable"),
++        "the reason is public, not swallowed"
++    );
++    assert!(!model.retract_pending);
++    assert_eq!(user_rows(&model), [PROMPT], "the transcript is untouched");
++}
++
++#[test]
++fn enter_cannot_resend_a_prompt_while_its_retraction_is_still_in_flight() {
++    // The race the brief names: between Esc and the daemon's answer the prompt
++    // may still be accepted, so a second Enter would resend a turn that is
++    // already running. Submit is refused for exactly that window — and the
++    // text the user typed into it is never lost.
++    //
++    // MUTATION CHECK: drop the `retract_pending` guard from
++    // `submit_composer` and the `SubmitText` assertion below fails.
++    let (mut driver, mut model) = accepted_turn();
++    let commands = esc(&mut driver, &mut model);
++    let Some(LiveCommand::Retract { command_id, .. }) = commands.first().cloned() else {
++        panic!("expected a retract, got {commands:?}");
++    };
++    assert!(model.retract_pending);
++
++    for character in "second".chars() {
++        model.handle(key(KeyCode::Char(character)));
++    }
++    model.handle(key(KeyCode::Enter));
++    assert!(
++        model.requests.is_empty(),
++        "no turn may be submitted while the retraction is unresolved, got {:?}",
++        model.requests
++    );
++    assert_eq!(
++        model.flash.as_deref(),
++        Some("· retracting the prompt — a moment")
++    );
++    assert_eq!(
++        model.composer.text(),
++        "second",
++        "the refusal happens BEFORE the take — the draft survives"
++    );
++
++    // The receipt then restores the prompt without discarding what was typed
++    // into the guarded window.
++    driver.apply(
++        &mut model,
++        LiveReply::PromptRetracted {
++            command_id,
++            session: sid(),
++            run_id: RunId::new(RUN),
++            text: PROMPT.to_owned(),
++            attachments: Vec::new(),
++        },
++    );
++    assert_eq!(
++        model.composer.text(),
++        format!("{PROMPT}\nsecond"),
++        "the retraction never costs the user text — including text it did not author"
++    );
++    assert!(!model.retract_pending, "the guard lifts with the receipt");
++
++    // And now Enter works again.
++    model.handle(key(KeyCode::Enter));
++    assert!(
++        model
++            .requests
++            .iter()
++            .any(|request| matches!(request, AppRequest::SubmitText { .. })),
++        "sending is possible once the retraction resolved"
++    );
++}
++
++#[test]
++fn a_committed_response_boundary_makes_esc_a_plain_cancel() {
++    // The window closes on the daemon's own authority — the `response_started`
++    // fact it arbitrates retraction against — and NOT on a guess from rendered
++    // rows. The fact is committed `render.ui == false`, so this also pins that
++    // a skipped envelope still teaches the client something.
++    //
++    // MUTATION CHECK: remove the `route_response_boundary` call from
++    // `absorb_raw_active` and Esc keeps retracting after the first token.
++    let (mut driver, mut model) = accepted_turn();
++    assert!(model.can_retract_prompt(), "still open before the boundary");
++
++    deliver(&mut driver, &mut model, boundary(4));
++    assert!(
++        model.projection.response_started(),
++        "the ui==false boundary is recorded as turn-control truth"
++    );
++    assert!(
++        user_rows(&model) == [PROMPT] && model.projection.entries().len() == 1,
++        "and no display surface moved for it"
++    );
++    assert!(
++        !model.can_retract_prompt(),
++        "once a token has landed the prompt is no longer retractable"
++    );
++
++    let commands = esc(&mut driver, &mut model);
++    assert!(
++        matches!(commands.as_slice(), [LiveCommand::Cancel { run_id, .. }]
++            if *run_id == RunId::new(RUN)),
++        "Esc after the first token is a plain cancel, got {commands:?}"
++    );
++    assert!(
++        !model.retract_pending,
++        "a plain cancel never guards the composer"
++    );
++    assert_eq!(
++        user_rows(&model),
++        [PROMPT],
++        "the message stays, exactly as it always has"
++    );
++}
++
++#[test]
++fn a_new_turn_reopens_the_retraction_window_the_previous_response_closed() {
++    // The boundary is PER RUN. Without the reset at the turn-opening edge one
++    // answered turn would make every later Esc a plain cancel for the rest of
++    // the session.
++    //
++    // MUTATION CHECK: delete `self.response_started = false` from the opening
++    // edge in `SessionProjection::apply` and this fails.
++    let (mut driver, mut model) = accepted_turn();
++    deliver(&mut driver, &mut model, boundary(4));
++    deliver(
++        &mut driver,
++        &mut model,
++        event(&EventPayload::RunState(RunState::Done), 5),
++    );
++    assert!(!model.can_retract_prompt(), "that turn was answered");
++
++    deliver(
++        &mut driver,
++        &mut model,
++        event(&EventPayload::RunState(RunState::Streaming), 6),
++    );
++    assert!(
++        model.can_retract_prompt(),
++        "a genuinely new turn starts with its window open again"
++    );
++}
++
++#[test]
++fn a_retracted_prompt_is_gone_from_replay_and_from_the_esc_esc_chooser() {
++    // Reopening the session must not show the retracted prompt anywhere: not
++    // in the transcript rebuilt from the journal, and not in prompt history —
++    // a separate surface with its own durable coordinates, whose entry could
++    // only disappoint (a fork at its hidden cut is refused).
++    //
++    // MUTATION CHECK: delete the `forget_retracted_prompt` call in
++    // `absorb_raw_active` and the history assertion fails while the transcript
++    // one still passes — they are genuinely different surfaces.
++    let stream = |model: &mut AppModel, driver: &mut LiveDriver| {
++        deliver(
++            driver,
++            model,
++            event(
++                &EventPayload::UserMessage {
++                    text: PROMPT.to_owned(),
++                    attachments: Vec::new(),
++                    mode: haider_protocol::DeliveryMode::Steer,
++                },
++                PROMPT_SEQ,
++            ),
++        );
++        deliver(
++            driver,
++            model,
++            event(
++                &EventPayload::NodeCommitted(TreeNode {
++                    node: NodeId::new(NODE),
++                    parent: None,
++                    kind: NodeKind::UserTurn {
++                        text: PROMPT.to_owned(),
++                        attachments: Vec::new(),
++                    },
++                }),
++                2,
++            ),
++        );
++        // A LATER prompt with the exact same text must survive: identity is
++        // the durable node/seq, never the bytes.
++        deliver(
++            driver,
++            model,
++            event(
++                &EventPayload::UserMessage {
++                    text: PROMPT.to_owned(),
++                    attachments: Vec::new(),
++                    mode: haider_protocol::DeliveryMode::Steer,
++                },
++                3,
++            ),
++        );
++        deliver(driver, model, raw(4, retraction_fact(), true));
++    };
++
++    let (mut driver, mut model) = accepted_turn();
++    // Rebuild from an empty projection so this is a genuine replay, not the
++    // live model the fixture already moved.
++    let mut replay = launcher_model();
++    replay.mode = RuntimeMode::Live;
++    replay.sessions.clear();
++    let mut replay_driver = LiveDriver::new("escretract-replay");
++    replay_driver.apply(
++        &mut replay,
++        LiveReply::Listed {
++            sessions: vec![summary()],
++            next_cursor: None,
++        },
++    );
++    replay_driver.ensure_attached(&replay, &sid());
++    replay_driver.apply(
++        &mut replay,
++        LiveReply::Attached {
++            session: sid(),
++            attachment: attachment_id(),
++            worker_generation: 7,
++            replay_through_seq: 0,
++        },
++    );
++    replay.open_session(&sid());
++    stream(&mut replay, &mut replay_driver);
++
++    assert_eq!(
++        user_rows(&replay),
++        [PROMPT],
++        "exactly one row survives — the retracted one is hidden, its equal-text \
++         neighbour is not"
++    );
++    assert_eq!(
++        replay
++            .prompt_history
++            .iter()
++            .filter(|entry| entry.seq == Some(PROMPT_SEQ))
++            .count(),
++        0,
++        "the retracted prompt is not offered by the Esc-Esc chooser"
++    );
++    assert_eq!(
++        replay
++            .prompt_history
++            .iter()
++            .filter(|entry| entry.seq == Some(3))
++            .count(),
++        1,
++        "the equal-text prompt that was NOT retracted stays recallable"
++    );
++
++    // The live model reaches the same place from the same facts.
++    deliver(&mut driver, &mut model, raw(4, retraction_fact(), true));
++    assert!(user_rows(&model).is_empty());
++    assert!(
++        model
++            .prompt_history
++            .iter()
++            .all(|entry| entry.seq != Some(PROMPT_SEQ))
++    );
++}
++
++#[test]
++fn a_receipt_for_a_session_the_user_left_parks_the_prompt_instead_of_losing_it() {
++    // By the time the receipt lands the daemon has already committed the
++    // retraction: the transcript row is gone and so is the history entry. If a
++    // surface switch inside that one round trip made the client DROP the
++    // draft, the user's text would have no remaining copy anywhere in the UI.
++    // It is parked on the session it belongs to — exactly where a surface
++    // switch would have left it — and is waiting on return.
++    //
++    // MUTATION CHECK: restore the old `active_session != session -> return`
++    // early exit in the `PromptRetracted` arm and the parked-draft assertions
++    // below fail.
++    let (mut driver, mut model) = accepted_turn();
++    let ui_gen = model
++        .sessions
++        .iter()
++        .find(|row| row.id == sid())
++        .expect("the session is on the roster")
++        .ui_gen;
++    let commands = esc(&mut driver, &mut model);
++    let Some(LiveCommand::Retract { command_id, .. }) = commands.first().cloned() else {
++        panic!("expected a retract, got {commands:?}");
++    };
++    // The user steps to the launcher inside the round trip.
++    model.screen = Screen::Launcher;
++    model.active_session = None;
++
++    driver.apply(
++        &mut model,
++        LiveReply::PromptRetracted {
++            command_id,
++            session: sid(),
++            run_id: RunId::new(RUN),
++            text: PROMPT.to_owned(),
++            attachments: vec![image_block()],
++        },
++    );
++    assert!(
++        model.composer.is_empty(),
++        "the surface the user is looking at is never seeded behind their back"
++    );
++    let parked = model
++        .drafts
++        .get(&DraftKey::Session(ui_gen))
++        .expect("the prompt is parked on its own session");
++    assert_eq!(
++        parked.text(),
++        PROMPT,
++        "the exact prompt survives the switch"
++    );
++    assert_eq!(
++        parked.attachments().len(),
++        1,
++        "and so do its attachment chips"
++    );
++    assert!(
++        !model.retract_pending,
++        "the guard lifts — the user must not be stranded"
++    );
++}
++
++#[test]
++fn a_daemon_that_drops_the_retract_frame_still_gets_one_cancel() {
++    // `turn.retract` is feature-gated in the link. A gate that answered
++    // NOTHING would leave the durable command in the outbox forever — resent
++    // and re-dropped on every reconnect — while Esc appeared to do nothing at
++    // all. The typed failure must reach the fallback.
++    //
++    // MUTATION CHECK: remove `LiveCommand::Retract` from the feature_missing
++    // allowlist in link.rs and the real client drops this frame silently; this
++    // test pins the driver half of that contract.
++    let (mut driver, mut model) = accepted_turn();
++    let commands = esc(&mut driver, &mut model);
++    let Some(LiveCommand::Retract { command_id, .. }) = commands.first().cloned() else {
++        panic!("expected a retract, got {commands:?}");
++    };
++    assert_eq!(
++        haider_tui::link::command_required_features(&commands[0]),
++        &[haider_rpc::FEATURE_TURN_RETRACT_V1],
++        "the command declares the gate that can reject it"
++    );
++
++    let fallback = driver.apply(
++        &mut model,
++        LiveReply::Failed {
++            command_id: Some(command_id),
++            code: "feature_missing".to_owned(),
++            message: "connected daemon does not advertise turn_retract_v1".to_owned(),
++            retryable: false,
++            presentation: None,
++        },
++    );
++    assert!(
++        matches!(fallback.as_slice(), [LiveCommand::Cancel { run_id, .. }]
++            if *run_id == RunId::new(RUN)),
++        "a rejected retract still stops the run, got {fallback:?}"
++    );
++    assert!(!model.retract_pending);
++    assert_eq!(user_rows(&model), [PROMPT]);
++}
++
++#[test]
++fn esc_with_no_live_run_lifts_the_guard_instead_of_stranding_the_composer() {
++    // The driver refuses to invent a run id (the Interrupt law). If it issues
++    // nothing, nothing will ever answer — so the guard has to lift right here
++    // or Enter stays refused forever.
++    //
++    // MUTATION CHECK: delete the `retract_settled()` calls from the
++    // `RetractPrompt` arm and `retract_pending` stays true with no command in
++    // flight.
++    let (mut driver, mut model) = accepted_turn();
++    deliver(
++        &mut driver,
++        &mut model,
++        event(&EventPayload::RunState(RunState::Done), 4),
++    );
++    model.turn_active = true; // the reducer's own flag, deliberately forced
++    model.requests.clear();
++
++    let commands = esc(&mut driver, &mut model);
++    assert!(
++        commands.is_empty(),
++        "no run means no command — never an invented run id, got {commands:?}"
++    );
++    assert!(
++        !model.retract_pending,
++        "and the composer is not left permanently unable to send"
++    );
++}
++
++#[test]
++fn a_demo_turn_never_asks_for_a_retraction_it_would_have_to_invent() {
++    // The demo twin has no journal, so there is no accepted draft for a daemon
++    // to hand back. Esc there stays the local interrupt it has always been.
++    let mut model = launcher_model();
++    for character in "walk me through the harness".chars() {
++        model.handle(key(KeyCode::Char(character)));
++    }
++    model.handle(key(KeyCode::Enter));
++    assert!(model.turn_active, "the demo turn is playing");
++    assert!(
++        !model.can_retract_prompt(),
++        "a fabricating mode has no durable prompt to retract"
++    );
++    model.requests.clear();
++
++    model.handle(key(KeyCode::Esc));
++    assert!(
++        model
++            .requests
++            .iter()
++            .any(|request| matches!(request, AppRequest::Interrupt { .. })),
++        "demo Esc stays a plain interrupt, got {:?}",
++        model.requests
++    );
++    assert!(!model.retract_pending);
++}
++
++#[test]
++fn an_older_daemon_that_cannot_retract_gets_the_cancel_it_understands() {
++    // `turn.retract` is feature-gated on the wire. Sending it to a daemon that
++    // never advertised `turn_retract_v1` is a frame it can only reject, which
++    // the user reads as "Esc did nothing".
++    let (mut driver, mut model) = accepted_turn();
++    model.daemon_features.clear();
++    assert!(!model.can_retract_prompt());
++
++    let commands = esc(&mut driver, &mut model);
++    assert!(
++        matches!(commands.as_slice(), [LiveCommand::Cancel { .. }]),
++        "Esc falls back to the cancel every daemon serves, got {commands:?}"
++    );
++    assert_eq!(
++        haider_tui::link::command_required_features(&LiveCommand::Retract {
++            command_id: CommandId::new("c"),
++            session: sid(),
++            worker_generation: 7,
++            run_id: RunId::new(RUN),
++            branch: None,
++        }),
++        &[haider_rpc::FEATURE_TURN_RETRACT_V1],
++        "and the command declares the gate it needs"
++    );
++}
++
++#[test]
++fn a_parked_session_records_the_boundary_and_forgets_its_retracted_prompt() {
++    // `SessionState` is the BACKGROUND twin of the attached reducer, and it
++    // already mirrors the other `render.ui == false` command-state hooks for
++    // this exact reason. Without the retraction pair it drifts:
++    //
++    // * a first response that lands while the session is parked would not
++    //   close its window, so checking the session back in would offer a
++    //   retraction the daemon has already refused — a spurious "too late"
++    //   round trip in the user's face;
++    // * a retraction that lands while parked would leave the prompt in THAT
++    //   session's chooser for good, because nothing re-delivers the fact.
++    //
++    // MUTATION CHECK: delete the escretract hook from `SessionState::absorb_raw`
++    // and both halves below fail.
++    use haider_tui::session::SessionState;
++
++    let mut parked = SessionState::neutral(sid(), haider_tui::identity::UiGeneration::new(1));
++    assert!(
++        !parked.projection.response_started(),
++        "a fresh session has an open window"
++    );
++
++    parked.absorb_raw(&event(
++        &EventPayload::UserMessage {
++            text: PROMPT.to_owned(),
++            attachments: Vec::new(),
++            mode: haider_protocol::DeliveryMode::Steer,
++        },
++        PROMPT_SEQ,
++    ));
++    parked.absorb_raw(&event(
++        &EventPayload::NodeCommitted(TreeNode {
++            node: NodeId::new(NODE),
++            parent: None,
++            kind: NodeKind::UserTurn {
++                text: PROMPT.to_owned(),
++                attachments: Vec::new(),
++            },
++        }),
++        2,
++    ));
++    assert_eq!(
++        parked
++            .prompt_history
++            .iter()
++            .filter(|entry| entry.seq == Some(PROMPT_SEQ))
++            .count(),
++        1,
++        "the parked session recalls its own prompt"
++    );
++
++    // The `ui == false` boundary still teaches the parked twin.
++    parked.absorb_raw(&boundary(3));
++    assert!(
++        parked.projection.response_started(),
++        "a response that arrives while parked still closes that session's window"
++    );
++
++    // And its retraction still prunes that session's own chooser.
++    parked.absorb_raw(&raw(4, retraction_fact(), true));
++    assert_eq!(
++        parked
++            .prompt_history
++            .iter()
++            .filter(|entry| entry.seq == Some(PROMPT_SEQ))
++            .count(),
++        0,
++        "nothing re-delivers this fact, so the parked twin must apply it now"
++    );
++}
+diff --git a/docs/testing/v0.0.970/escretract-ui.md b/docs/testing/v0.0.970/escretract-ui.md
+new file mode 100644
+index 00000000..c2f5e22d
+--- /dev/null
++++ b/docs/testing/v0.0.970/escretract-ui.md
+@@ -0,0 +1,255 @@
++# escretract-ui — v0.0.970 client/TUI evidence
++
++Branch: `lane-970-escretract-ui`, cut from `wave-970` @ `b8635f88` (the merge
++that landed the daemon/contract half, `9dc967b8`). Executed host: macOS arm64.
++
++Owner QoL (2026-09-03): the user sends a prompt and presses Esc before any
++response token arrives. Today that only cancels. Wanted: the turn is cancelled
++**and** the message leaves the transcript and reappears in the composer — text
++and attachments — to edit and resend. Once a token has arrived, Esc stays a
++plain cancel and both the message and the partial reply remain.
++
++The daemon half already shipped `turn.retract`, the durable `prompt_retracted`
++fact, the typed `too_late` arbitration, and the transcript projection that
++hides the exact retracted node. This lane is the keyboard binding, the composer
++application of the returned draft, and the race UX. **No daemon, store,
++protocol or RPC source changed** — the wire already existed.
++
++## Implemented behaviour
++
++**Which command Esc issues.** `AppModel::can_retract_prompt` gates the Esc
++mid-turn branch on three necessary conditions: the mode does not fabricate its
++own turns (a demo turn has no durable prompt for a daemon to hand back), the
++daemon advertised `turn_retract_v1`, and this run has committed no first
++response. It emits `AppRequest::RetractPrompt`, which the live driver turns
++into `LiveCommand::Retract` pinned to the run the *committed stream* named —
++the same authority the existing Interrupt arm uses, so no run id is ever
++invented. Any condition failing leaves the existing `AppRequest::Interrupt`
++path byte-for-byte unchanged, which is what keeps an older daemon, the demo
++twin and every existing Esc test working.
++
++**How the window is known to be open.** Not by counting rendered rows. The
++daemon commits `response_started` — the same fact its session writer arbitrates
++retraction against — and the client records it through
++`session::route_response_boundary`. That envelope is deliberately
++`render.ui == false`, so it is admitted as `Skip` and no display surface moves
++for it; the router is therefore hooked in `absorb_raw_active` beside the branch
++registry and hook-fact recorders, which the file's own doc comment already
++establishes as the place for `ui == false` **command-state** truth. The flag
++resets at the same turn-opening edge that resets the throughput tally, so the
++window is genuinely per-run.
++
++This read is optimistic by construction — it can only be as fresh as the last
++envelope received — so it is an honest UI decision, never the correctness
++authority. The daemon's typed `too_late` is.
++
++**What happens on each outcome.** On success the receipt seeds the composer
++with the exact returned text, cursor at the end, and rebuilds the attachment
++chips from the receipt's CAS blocks via `PendingAttachment::carrying` — the
++same constructor the `session.fork` draft uses, so the chips carry the daemon's
++own verified blocks and **no upload is issued**. The transcript row is removed
++by the daemon's `prompt_retracted` fact arriving on the stream, not by the
++receipt, so the live view and a replay reach the identical entry list by
++construction rather than by a second code path. On `too_late` — and on *any*
++other failure code — the driver issues exactly one ordinary `turn.cancel` for
++the same run and the transcript keeps the prompt and any partial reply; the
++status line separates the two cases ("too late to retract — cancelled" versus
++"retract failed — cancelled · <reason>").
++
++**Race UX.** `retract_pending` refuses submit between Esc and the daemon's
++answer, because in that window the prompt may still be accepted and the bytes
++exist only on the wire. Every terminal path clears it — the receipt, the
++`too_late`/error fallback, a driver that found no run to retract, a receipt for
++a session the user has since left, and a disconnect — so Enter can never be
++left permanently dead. The refusal happens *before* the composer take, so the
++draft survives; and anything typed into the guarded window is kept and follows
++the restored prompt rather than being overwritten by it.
++
++## Adjacent surface this lane had to fix
++
++`apply_prompt_retraction` hides the transcript row, but **prompt history is a
++separate surface** with its own durable coordinates. Left alone, the Esc-Esc
++chooser kept offering a prompt the daemon says never happened — and a
++`session.fork` at its hidden cut is refused by the daemon half, so the entry
++could only disappoint. `AppModel::forget_retracted_prompt` drops it, keyed on
++the exact `prompt_seq` and never on text, so an equal-text prompt in another
++turn survives. It is driven from the durable fact, so it holds on replay too.
++Mutation check M4 below confirms the two surfaces are genuinely independent.
++
++## Citation audit
++
++Every construct was re-grepped rather than trusted from the brief. **The line
++numbers below are coordinates in the baseline, `b8635f88`** — this lane's own
++diff moves `app.rs` and `link.rs`, so worktree lines differ (the Esc arm is
++8673, the cancel map 1072, `open_forked_session` 16917 as committed here). The
++construct, not the number, is the claim.
++
++| Claim | Audit |
++| --- | --- |
++| Esc mid-turn arm, `app.rs:8650` | **Correct** — `KeyCode::Esc if self.screen == Screen::Session`, `turn_active` branch pushing `Interrupt`. |
++| `LiveCommand::Cancel` wire map, `link.rs:1071` | **Correct** — the new `Retract` arm sits beside it and reuses its branch-capture comment. |
++| Fork draft restores text + attachments, `app.rs:16852` | **Correct** — `open_forked_session`; its chip loop is the template the restore copies. |
++| `turn.retract` needs the `TurnRetraction` client loop | **Rejected as unsuitable.** `haider-client::TurnRetraction::execute` is a blocking `async` loop over `&RpcClient`; the TUI's driver is a synchronous outbox state machine. Using it would have required a second command path outside the outbox, losing reconnect replay and receipt retirement. The `too_late` fallback is instead expressed as one enqueued `Cancel`, which is the same one-extra-round-trip the client loop performs. The CLI keeps using the client loop. |
++| "the TUI cannot locally know whether the window is open" | **Superseded.** The boundary envelope reaches `absorb_raw_active` as `Skip`; recording it there needs no `render.ui` change and no daemon edit. |
++| `streamed_output_chars > 0` as the first-delta proxy | **Rejected.** It counts text/reasoning/tool-arg characters only — strictly NARROWER than `is_response_delta`, which also counts refusals, web sources, tool-call start/end, server tool use and provider-opaque events. A tool-call-first or web-sources-first response would have read as "no response yet" and offered a retraction the daemon had already closed. |
++
++Territory: `crates/haider-tui` only — six source files, one of them a single
++match arm in the demo driver that the exhaustiveness check required. No daemon,
++store, core, protocol, RPC or client source changed. No dependency changed.
++Windows
++and Linux behaviour is **by inspection** — this is reducer/state-machine logic
++with no platform surface; the executed host is macOS arm64.
++
++## Named regressions
++
++`crates/haider-tui/tests/w970_escretract_ui_tests.rs` — 13 tests.
++
++| Behaviour | Test |
++| --- | --- |
++| Retract before the first token; node gone; text, cursor, chip and status restored; real wire shapes both ways | `esc_before_the_first_token_retracts_and_restores_text_and_attachments` |
++| Typed `too_late` → exactly one plain cancel, prompt and reply retained | `too_late_falls_back_to_one_plain_cancel_and_keeps_the_prompt_on_screen` |
++| Any other failure → plain cancel with the public reason | `an_unexpected_retract_failure_still_cancels_and_names_the_error` |
++| Double-Enter guard; draft survives the refusal; typed text kept; Enter works after | `enter_cannot_resend_a_prompt_while_its_retraction_is_still_in_flight` |
++| `ui == false` boundary closes the window; no display surface moves | `a_committed_response_boundary_makes_esc_a_plain_cancel` |
++| The window is per-run, not per-session | `a_new_turn_reopens_the_retraction_window_the_previous_response_closed` |
++| Replay parity + history, with an equal-text neighbour that must survive | `a_retracted_prompt_is_gone_from_replay_and_from_the_esc_esc_chooser` |
++| A receipt for a session the user left PARKS the prompt rather than losing it | `a_receipt_for_a_session_the_user_left_parks_the_prompt_instead_of_losing_it` |
++| No live run → no invented command, and no stranded composer | `esc_with_no_live_run_lifts_the_guard_instead_of_stranding_the_composer` |
++| Demo twin never asks for a retraction it would have to invent | `a_demo_turn_never_asks_for_a_retraction_it_would_have_to_invent` |
++| Feature-gated: an older daemon gets the cancel it understands | `an_older_daemon_that_cannot_retract_gets_the_cancel_it_understands` |
++| A link-gate rejection is answered, not dropped, and still cancels | `a_daemon_that_drops_the_retract_frame_still_gets_one_cancel` |
++| The background twin records the boundary and prunes its own chooser | `a_parked_session_records_the_boundary_and_forgets_its_retracted_prompt` |
++
++### Mutation checks — executed, not asserted
++
++Each mutation was applied to the working tree, the suite run, and the tree
++restored and re-verified green.
++
++| # | Mutation | Result |
++| --- | --- | --- |
++| M1 | `can_retract_prompt` → `false` | **7 failed** |
++| M2 | `route_response_boundary` call deleted from `absorb_raw_active` | **2 failed** |
++| M3 | `retract_pending` guard deleted from `submit_composer` | **1 failed** (the double-Enter law) |
++| M4 | `forget_retracted_prompt` call deleted | **1 failed** — the history test only, proving transcript and history are independent surfaces |
++| M5 | `response_started = false` reset deleted from the turn-opening edge | **1 failed** (the per-run law) |
++| M6 | the discard-on-left-session early exit restored in the `PromptRetracted` arm | **1 failed** (the parked-draft law) |
++| M7 | the escretract hook deleted from `SessionState::absorb_raw` | **1 failed** (the background twin) |
++
++M7 initially killed **nothing** — the background twin had no test at all. That
++gap was found by review, not by the suite, and the test was written to close
++it. Restored tree: **13 passed, 0 failed**.
++
++## Gate results
++
++Required ENV LAW throughout (`RUST_MIN_STACK=8388608`,
++`HAIDER_DISCOVERY_DISABLED=1`, `HAIDER_TEST_DEVICE_NAME=test-mac`,
++`CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_BUILD_JOBS=4`),
++`CARGO_TARGET_DIR=/private/tmp/haider-escretract-ui-target`. `haider` and
++`haiderd` were prebuilt before the daemon-touching suites and
++`HAIDER_TEST_SIBLINGS_PREBUILT=1` set; built `haiderd` is 193 MiB, over the
++10 MiB floor (registry #64). Disk was checked before each build-capable gate.
++
++### Executed
++
++| Gate | Result |
++| --- | --- |
++| `cargo test -q -p haider-tui --no-fail-fast` | **1,468 passed, 0 failed** |
++| `cargo test -q -p haider-cli --no-fail-fast` | **760 passed, 0 failed** |
++| `cargo test -q -p haider-daemond --no-fail-fast` | **154 passed, 0 failed** |
++| `cargo clippy --workspace --tests -- -D warnings` | **pass, 0 errors** |
++| `cargo clippy -p haider-tui --all-targets -- -D warnings` | **pass** |
++| `cargo fmt --all -- --check` | **pass** |
++| `git diff --check` | **clean** |
++| `cargo run -p xtask -- test-count --update` | **5,056 -> 5,069** (+13, exactly this lane's tests), re-verified `ok` |
++
++Summed executed libtest: **2,382 passed, 0 failed** across the three crates.
++
++`haider-cli` and `haider-daemond` are not incidental — they are the **only two
++crates in the workspace that depend on `haider-tui`** (`grep haider-tui
++crates/*/Cargo.toml`), so together with `haider-tui` itself they are the
++complete blast radius of this change.
++
++### Not executed, and why
++
++`cargo test --workspace --no-fail-fast` was **not run to completion**. Free disk
++on the shared host fell to **0 GB** mid-lane and stabilised at **4 GB** —
++exactly the stop floor — with **27 GB held by two other lanes' target
++directories** (`peermsg-target` 14 GB, `confbench-debug` 13 GB) that the
++disk-guard law forbids this lane from touching, and a peer lane (`thinexe`)
++actively building. Linking test binaries for the remaining thirteen crates would
++have driven the host back to zero and taken the peer's build down with it, so
++the builds were stopped rather than forced.
++
++What that leaves uncovered is narrow and stated plainly: the **execution** of
++the thirteen crates that do not depend on `haider-tui`. Their test code is
++**not** unverified — `cargo clippy --workspace --tests` compiled and linted
++every crate's tests against this change and passed with zero errors — and no
++source outside `crates/haider-tui` was modified, so there is no path by which
++this lane could move them. The orchestrator's landing gate remains the
++independent authority.
++
++Windows and Linux: **by inspection** (reducer/state-machine logic, no platform
++surface). `xtask loc-lint` warns that `app.rs` exceeds the 10k soft cap — it was
++already 19,369 lines at the baseline and this lane adds 204; the warning is
++pre-existing and non-blocking.
++
++## Independent verifier value
++
++Two independent reviews ran against the finished diff: a code verifier and a
++claim auditor. **Six findings changed the code, the tests or the doc**; four
++were rejected with evidence.
++
++Changed:
++
++1. **P1 — a rejected `turn.retract` was dropped, not answered.** The command
++   declares `turn_retract_v1` in `command_required_features`, but was missing
++   from the allowlist in `link.rs` that turns a missing feature into a typed
++   `LiveReply::Failed`. It fell through to a bare `return false`: no reply, no
++   retire, so the durable command sat in the outbox forever and was re-sent and
++   re-dropped on every reconnect while Esc appeared to do nothing. Reachable on
++   a reconnect to a downgraded daemon. `Retract` added to the allowlist; the
++   typed failure now reaches the fallback and becomes the plain cancel.
++   Regression: `a_daemon_that_drops_the_retract_frame_still_gets_one_cancel`.
++2. **P1 — a receipt for a session the user had left destroyed the prompt.** The
++   original arm returned early when the receipt's session was not on screen.
++   But by then the daemon has committed the retraction, so the transcript row
++   AND the history entry are already gone — that early return was the only
++   remaining copy being dropped. Now parked on the owning session's draft, the
++   same place a surface switch parks it. Regression:
++   `a_receipt_for_a_session_the_user_left_parks_the_prompt_instead_of_losing_it`.
++3. **P2 — the background twin was not updated.** `SessionState::absorb_raw`
++   already mirrors the other `render.ui == false` command-state hooks; it now
++   mirrors these two. Without it, a boundary arriving while a session is parked
++   left a stale open window (a spurious "too late" round trip on return), and a
++   retraction arriving while parked left the prompt in that session's chooser
++   for good. Regression: `a_parked_session_records_the_boundary_and_forgets_its_retracted_prompt`.
++4. **P2 — the submit guard was unscoped.** `retract_pending` is model-global
++   and outlives a surface switch by up to one round trip, so it refused Enter
++   on the launcher and blocked menu answers. Now scoped to the session surface
++   with no open menu, matching the adjacent B4b upload guard.
++5. **P2 — the two raw hooks were not agent-scoped**, unlike the prompt-history
++   recorder fifteen lines below, and the daemon stamps `agent_id` on both
++   facts. A subagent's first response would have closed the parent's editing
++   window, and a subagent retraction would have closed a chooser the user had
++   just opened. Both now guarded on `agent_id.is_none()`.
++6. **Doc — three false or drifted claims** (a test name missing a word; line
++   numbers presented as worktree coordinates when they are baseline ones, which
++   this lane's own diff shifts; and an inverted clause calling
++   `streamed_output_chars` "wider" than `is_response_delta` when it is strictly
++   narrower — the very reason it was rejected). All corrected above.
++
++Rejected with evidence: that the `too_late` fallback could issue two cancels
++(the fresh `mint()` cannot re-match `retract_flight`); that a non-retract
++command could take the new failure arm (it matches on variant *and* exact id);
++that the boundary reset could clobber itself (acceptance commits a non-terminal
++`RunState::Queued` first, and the boundary envelope's payload no longer decodes
++as `RunState`); and that the new `Failed` arm shadows the arms it precedes
++(they key off `pending_workspace_set`, `retired_logins` and `oauth_flight`,
++none of which can hold a retract id).
++
++Two accepted limitations, both documented rather than fixed: a
++`AttachmentBlock::Skill` cannot be carried back into a chip (identical to the
++existing fork-draft behaviour, and counted in the visible notice), and a
++retraction whose socket dies is re-sent from the outbox on reconnect while the
++guard is already lifted — bounded, idempotent at the daemon, and the late
++receipt still restores the text rather than dropping it.
