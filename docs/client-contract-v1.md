@@ -1774,6 +1774,17 @@ feature is advertised, an omitted request field creates an interactive
 session and an omitted `interaction_mode` inside present `SessionMetadataV1`
 means interactive. If the outer metadata is absent, the mode is unknown.
 
+The v0.0.970 shipped front door continues autonomously: an injected
+`request_input` still produces a tool result, but opens no pending input card.
+The default advertised tool surface excludes `request_input`; this result does
+not imply that a user answered or that a declared choice was selected. The live
+PTY gate checks zero `menu_opened`, `menu_answered`, and `menu_resolutions` for
+the call's session, exactly one tool result, and continuation on both attached
+and cold-replayed terminals without a pending card. The explicit interactive
+protocol and legacy parked-menu recovery contracts below remain available.
+`/voice` is independently demo-only: in live mode it flashes that limitation
+without creating a locally unanswerable menu.
+
 The mode is the durable human-availability contract. For Haider's permission
 broker it is also decisive: an `Ask` has meaning only when a human is available,
 so autonomous mode resolves an Ask to ordinary policy `Allow`. This is not

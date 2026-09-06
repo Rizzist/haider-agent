@@ -14685,7 +14685,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
             "workflow_author(template) — replace this workflow child's initial graph with one bounded validated DAG (template: name, version, start_node, nodes)"
         }
         "request_input" => {
-            "request_input(kind, title, body?, options?) — ask the user one blocking prompt; options=[{key, label, detail?}] for a choice"
+            "request_input(kind, title, body?, options?, default?) — interactive: ask one question or choice; autonomous: return the declared default or no_human_available without waiting; options=[{key, label, detail?}] for a choice"
         }
         "loom_register" => {
             "loom_register(kind, source?|record?) — register a Loom workflow (kind=workflow, source=pipe text `name: In -> Out` + node lines) or agent type (kind=agent_type, record={id,name,job,in_type,out_type,clis,apis,skills,scripts,color,glyph}); refused unless a previously presented plan body contains the registration content"
@@ -21551,7 +21551,7 @@ fn graph_evidence_rejection(
 fn request_input_definition() -> ToolDefinition {
     ToolDefinition {
         name: "request_input".into(),
-        description: "Ask the user one blocking question or a server-enumerated choice".into(),
+        description: "Request one question or choice: interactive sessions wait for human input; autonomous sessions return the declared default or no_human_available without waiting".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {

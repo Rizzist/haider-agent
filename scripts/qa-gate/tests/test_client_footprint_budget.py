@@ -134,9 +134,9 @@ class ClientFootprintBudgetTests(unittest.TestCase):
         self.assertIn(
             "calibrate_surface status-post-command status 2938637", workflow
         )
-        self.assertIn("calibrate_surface run-post-command run 3794948", workflow)
+        self.assertIn("calibrate_surface run-post-command run 4326503", workflow)
         self.assertIn(
-            "calibrate_surface tui-demo-sixel tui-sixel 6110043", workflow
+            "calibrate_surface tui-demo-sixel tui-sixel 6795712", workflow
         )
 
     def test_hermetic_env_removes_all_proxy_routes_and_pins_loopback_bypass(self):

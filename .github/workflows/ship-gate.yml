@@ -173,10 +173,12 @@ jobs:
             fi
           }
 
-          # Runner evidence and provisional gaps are documented in cfbcal.md.
+          # N=5 release runner calibration: docs/testing/v0.0.970/shipgate.md.
+          # Freed allocator pages explain the run/Sixel drift; retain 10%
+          # median headroom and enforce every sample (no percentile waiver).
           calibrate_surface status-post-command status 2938637
-          calibrate_surface run-post-command run 3794948
-          calibrate_surface tui-demo-sixel tui-sixel 6110043
+          calibrate_surface run-post-command run 4326503
+          calibrate_surface tui-demo-sixel tui-sixel 6795712
           if (( failures != 0 )); then
             echo "$failures client-footprint surface(s) failed; available calibration evidence was retained" >&2
             exit 1
