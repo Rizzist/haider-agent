@@ -1,6 +1,6 @@
 VERIFICATION
 
-The haider.exe and haiderd.exe binaries are downloaded from the public GitHub
+The haider.exe, haider-tui.exe, and haiderd.exe binaries are downloaded from the public GitHub
 Release for this package version:
 
 https://github.com/Rizzist/haider-agent/releases/tag/v__HAIDER_VERSION__

@@ -1,0 +1,10 @@
+test_direct_installer_fresh_prefix_contains_matching_runtime_siblings (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_direct_installer_fresh_prefix_contains_matching_runtime_siblings) ... ok
+test_direct_installer_missing_payload_preserves_existing_binaries (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_direct_installer_missing_payload_preserves_existing_binaries) ... ok
+test_direct_installer_rejects_wrong_payload_identity_before_publication (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_direct_installer_rejects_wrong_payload_identity_before_publication) ... ok
+test_npm_installs_with_real_shared_helper (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_npm_installs_with_real_shared_helper) ... ok
+test_npm_refusal_keeps_existing_recovery_marker_and_binaries (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_npm_refusal_keeps_existing_recovery_marker_and_binaries) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 34.650s
+
+OK

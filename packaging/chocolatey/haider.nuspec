@@ -11,7 +11,7 @@
     <packageSourceUrl>https://github.com/Rizzist/haider-agent</packageSourceUrl>
     <licenseUrl>https://github.com/Rizzist/haider-agent/blob/main/LICENSE.md</licenseUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
-    <description>Provider-agnostic coding-agent TUI and runtime. Installs both haider and its required sibling daemon haiderd.</description>
+    <description>Provider-agnostic coding-agent TUI and runtime. Installs haider and its required siblings haider-tui and haiderd.</description>
     <summary>Haider coding-agent terminal interface.</summary>
     <tags>haider cli tui ai agent developer-tools</tags>
   </metadata>

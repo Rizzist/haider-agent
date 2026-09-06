@@ -58,6 +58,11 @@ class CommandResult:
     ended_unix_micros: int
     observed_pid: int | None
     timed_out: bool = False
+    # Own-process CPU from the same live native sampler as client RSS. Unlike
+    # cpu_ms this excludes reaped descendants, but misses work after the last
+    # successful sample and is therefore a measured lower bound, not exit CPU.
+    sampled_client_cpu_ms: float | None = None
+    client_cpu_sample_count: int = 0
 
 
 def run_command(
@@ -88,6 +93,8 @@ def run_command(
     sampled_observed_peak_rss_kib = 0
     sampled_combined_peak_rss_kib = 0
     sampled_observed_pid = observe_pid
+    sampled_client_cpu_ms: float | None = None
+    client_cpu_sample_count = 0
     sampling_done = threading.Event()
 
     def sample_peak() -> None:
@@ -95,8 +102,16 @@ def run_command(
         nonlocal sampled_observed_peak_rss_kib
         nonlocal sampled_combined_peak_rss_kib
         nonlocal sampled_observed_pid
+        nonlocal sampled_client_cpu_ms
+        nonlocal client_cpu_sample_count
         while not sampling_done.is_set():
-            value = process_rss_kib(process.pid)
+            # Reuse the existing native usage call: it returns own CPU and
+            # resident RSS together, so retaining CPU adds no sampling syscall.
+            native = _process_usage(process.pid)
+            value = native[1] if native is not None else process_rss_kib(process.pid)
+            if native is not None:
+                sampled_client_cpu_ms = max(sampled_client_cpu_ms or 0.0, native[0])
+                client_cpu_sample_count += 1
             dynamic_pid = observe_pid
             if dynamic_pid is None and observe_pid_resolver is not None:
                 dynamic_pid = observe_pid_resolver()
@@ -153,6 +168,8 @@ def run_command(
         ended_unix_micros=ended_unix_micros,
         observed_pid=sampled_observed_pid,
         timed_out=timed_out,
+        sampled_client_cpu_ms=sampled_client_cpu_ms,
+        client_cpu_sample_count=client_cpu_sample_count,
     )
 
 

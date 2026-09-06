@@ -17,7 +17,7 @@ use haider_rpc::{
 };
 
 #[allow(dead_code)]
-#[path = "../src/main.rs"]
+#[path = "../src/lib.rs"]
 mod cli_main;
 
 use cli_main::observe::{

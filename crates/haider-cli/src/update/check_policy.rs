@@ -9,13 +9,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Profile-local state written before an automatic release check begins.
-pub(crate) const UPDATE_CHECK_STAMP_FILE: &str = "update-check.timestamp";
-pub(crate) const UPDATE_CHECK_INTERVAL_SECS: u64 = 6 * 60 * 60;
+pub const UPDATE_CHECK_STAMP_FILE: &str = "update-check.timestamp";
+pub const UPDATE_CHECK_INTERVAL_SECS: u64 = 6 * 60 * 60;
 
 static STAMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CheckReservation {
+pub enum CheckReservation {
     Due,
     Skipped,
 }
@@ -24,25 +24,25 @@ pub(crate) enum CheckReservation {
 /// and local policy failures all become `Silent`; a background check must
 /// never turn an unavailable release service into a TUI error surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BackgroundCheckOutcome {
+pub enum BackgroundCheckOutcome {
     Available { version: String },
     Silent,
 }
 
 /// True when the command-line twin or `HAIDER_NO_UPDATE_CHECK=1` disables
 /// automatic checks. Other environment values are intentionally not truthy.
-pub(crate) fn automatic_checks_disabled(flag: bool) -> bool {
+pub fn automatic_checks_disabled(flag: bool) -> bool {
     automatic_checks_disabled_with(flag, std::env::var_os("HAIDER_NO_UPDATE_CHECK").as_deref())
 }
 
-pub(crate) fn automatic_checks_disabled_with(flag: bool, env_value: Option<&OsStr>) -> bool {
+pub fn automatic_checks_disabled_with(flag: bool, env_value: Option<&OsStr>) -> bool {
     flag || env_value == Some(OsStr::new("1"))
 }
 
 /// Pure rate-limit decision over an injected clock. A future stamp is treated
 /// as recent, avoiding a check storm after a backwards wall-clock adjustment.
 #[must_use]
-pub(crate) fn check_due(last_checked: Option<u64>, now_unix_seconds: u64) -> bool {
+pub fn check_due(last_checked: Option<u64>, now_unix_seconds: u64) -> bool {
     match last_checked {
         None => true,
         Some(last) if now_unix_seconds < last => false,
@@ -51,7 +51,7 @@ pub(crate) fn check_due(last_checked: Option<u64>, now_unix_seconds: u64) -> boo
 }
 
 #[must_use]
-pub(crate) fn unix_timestamp_now() -> u64 {
+pub fn unix_timestamp_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
@@ -61,7 +61,7 @@ pub(crate) fn unix_timestamp_now() -> u64 {
 /// caller supplies the clock so the six-hour law is testable without sleep.
 /// `bypass_rate_limit` is for an explicit `/update`; it still refreshes the
 /// stamp so a later on-open check does not immediately repeat the request.
-pub(crate) fn reserve_check(
+pub fn reserve_check(
     profile_dir: &Path,
     now_unix_seconds: u64,
     bypass_rate_limit: bool,
@@ -78,11 +78,11 @@ pub(crate) fn reserve_check(
 /// Runs release discovery with `haider update --check` semantics but collapses
 /// every non-actionable result to silence. In particular, equal/older
 /// releases and offline GitHub discovery never surface as startup errors.
-pub(crate) fn background_check() -> BackgroundCheckOutcome {
+pub fn background_check() -> BackgroundCheckOutcome {
     background_outcome_from_discovery(check_update_availability())
 }
 
-pub(crate) fn background_outcome_from_discovery(
+pub fn background_outcome_from_discovery(
     outcome: Result<UpdateAvailability, super::UpdateError>,
 ) -> BackgroundCheckOutcome {
     match outcome {
@@ -96,7 +96,7 @@ pub(crate) fn background_outcome_from_discovery(
 /// Reads the last recorded automatic-check time without mutating the stamp
 /// or touching the network (`haider status` reports from this cache instead
 /// of running its own discovery).
-pub(crate) fn last_check_stamp(profile_dir: &Path) -> Option<u64> {
+pub fn last_check_stamp(profile_dir: &Path) -> Option<u64> {
     read_stamp(&profile_dir.join(UPDATE_CHECK_STAMP_FILE))
         .ok()
         .flatten()

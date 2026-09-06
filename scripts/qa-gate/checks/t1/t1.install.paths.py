@@ -1,4 +1,4 @@
-"""Install the tagged tarball into a scratch prefix and exercise that pair."""
+"""Install the tagged tarball into a scratch prefix and exercise all three siblings."""
 
 from __future__ import annotations
 
@@ -40,12 +40,14 @@ INSTALL_EXTRACT_COPY = BudgetPart(
     "scripts/install.sh:77-119 checksum, tar extraction, and executable copies",
 )
 # Registry #94: source version 30; installer outer 120+30; installed version
-# 30; ready 30; status 60; stop 20+2 and PID observation 2; cleanup status
-# 60 + stop 20+2 + historical PID observation 2. Total = 408s.
+# CLI/payload/daemon 3*30; ready 30; status 60; stop 20+2 and PID observation 2; cleanup status
+# 60 + stop 20+2 + historical PID observation 2. Total = 468s.
 budget = (
     VERSION_QUERY
     + INSTALL_FETCH_OUTER
     + INSTALL_EXTRACT_COPY
+    + VERSION_QUERY
+    + VERSION_QUERY
     + VERSION_QUERY
     + DAEMON_STARTUP
     + STATUS_REQUEST
@@ -164,6 +166,7 @@ def run(ctx) -> list[Evidence]:
     results.append(("install-script", install))
     installed_haider = install_prefix / "haider"
     installed_haiderd = install_prefix / "haiderd"
+    installed_payload = install_prefix / "haider-tui"
     if install.timed_out or install.returncode != 0:
         status = ENV_BLOCKED if _network_failure(install.stderr) else FAIL
         return [
@@ -175,10 +178,11 @@ def run(ctx) -> list[Evidence]:
                 [ctx.command_artefact(name, result) for name, result in results],
             )
         ]
-    if not installed_haider.is_file() or not installed_haiderd.is_file():
+    if not all(path.is_file() for path in (installed_haider, installed_payload, installed_haiderd)):
         failures.append(
-            "scratch prefix pair expected=haider,haiderd actual="
-            f"{installed_haider.is_file()},{installed_haiderd.is_file()} prefix={install_prefix}"
+            "scratch prefix siblings expected=haider,haider-tui,haiderd actual="
+            f"{installed_haider.is_file()},{installed_payload.is_file()},"
+            f"{installed_haiderd.is_file()} prefix={install_prefix}"
         )
     if failures:
         return [
@@ -204,6 +208,16 @@ def run(ctx) -> list[Evidence]:
             f"installed version expected={expected!r}/0 actual={actual_version!r}/"
             f"{installed_version.returncode}"
         )
+
+    for binary, product in ((installed_payload, "haider-tui"), (installed_haiderd, "haiderd")):
+        version_result = ctx.run_binary(binary, ["--version"], timeout=VERSION_QUERY)
+        results.append((f"installed-{product}-version", version_result))
+        actual = _version(version_result.stdout, product)
+        if version_result.timed_out or version_result.returncode != 0 or actual != expected:
+            failures.append(
+                f"installed {product} version expected={expected!r}/0 actual={actual!r}/"
+                f"{version_result.returncode}"
+            )
 
     ready = ctx.run_binary(
         installed_haider, ["--ready"], timeout=DAEMON_STARTUP, may_spawn=True

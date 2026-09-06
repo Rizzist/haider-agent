@@ -17,11 +17,13 @@ members = [
     "crates/haider-stt",
     "crates/haider-tui",
     "crates/haider-cli",
+    "crates/haider-tui-exe",
+    "crates/haider-compat",
     "xtask",
 ]
 
 [workspace.package]
-version = "0.0.969"
+version = "0.0.970"
 edition = "2024"
 license = "LicenseRef-KOA-P-1.0"
 repository = "https://github.com/Rizzist/haider-agent"

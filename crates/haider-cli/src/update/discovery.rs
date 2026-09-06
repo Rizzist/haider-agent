@@ -16,23 +16,23 @@ const MAX_RELEASE_PAGES: usize = 20;
 const MAX_RELEASE_RESPONSE: usize = 8 * 1024 * 1024;
 const CURL: &str = "/usr/bin/curl";
 
-pub(crate) type DiscoveryCancellation = Arc<dyn Fn() -> bool + Send + Sync>;
+pub type DiscoveryCancellation = Arc<dyn Fn() -> bool + Send + Sync>;
 // Registry #94: the existing QA TUI_EXIT budget is 2.5s
 // (scripts/qa-gate/gate/tui_probe.py:42 and scripts/tui-probes/probelib.py reap).
 // Observe closure within one tenth of that budget, reserving the remainder
 // for kill, reap, the joined watcher, and Tokio runtime teardown.
-pub(crate) const UPDATE_CHECK_EXIT_BUDGET: Duration = Duration::from_millis(2_500);
+pub const UPDATE_CHECK_EXIT_BUDGET: Duration = Duration::from_millis(2_500);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum CurlRequestObservation {
+pub enum CurlRequestObservation {
     Spawned(u32),
     Reaped { pid: u32, status: ExitStatus },
     WatcherJoined,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReleaseSelection {
+pub struct ReleaseSelection {
     pub version: SemVersion,
     pub archive_name: String,
     pub archive_url: String,
@@ -41,13 +41,13 @@ pub(crate) struct ReleaseSelection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DiscoveryOutcome {
+pub enum DiscoveryOutcome {
     Current(SemVersion),
     Update(ReleaseSelection),
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ReleaseSource {
+pub struct ReleaseSource {
     pub api_base: String,
     pub repository: String,
     /// Tests may point the same strict client at a loopback HTTP fixture.
@@ -66,15 +66,15 @@ impl ReleaseSource {
     }
 }
 
-pub(crate) trait UpdateTransport {
+pub trait UpdateTransport {
     fn get_bytes(&mut self, url: &str, limit: usize) -> Result<Vec<u8>, UpdateError>;
     fn download(&mut self, url: &str, path: &Path, limit: u64) -> Result<(), UpdateError>;
 }
 
-pub(crate) struct CurlTransport {
+pub struct CurlTransport {
     token: Option<String>,
     cancellation: Option<DiscoveryCancellation>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     request_observer: Option<Arc<dyn Fn(CurlRequestObservation) + Send + Sync>>,
 }
 
@@ -91,7 +91,7 @@ impl CurlTransport {
         Self {
             token,
             cancellation: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             request_observer: None,
         }
     }
@@ -101,7 +101,7 @@ impl CurlTransport {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]
     pub fn without_token() -> Self {
         Self {
@@ -111,7 +111,7 @@ impl CurlTransport {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]
     pub fn with_token_for_test(token: &str) -> Self {
         Self {
@@ -121,7 +121,7 @@ impl CurlTransport {
         }
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(all(any(test, feature = "test-support"), unix))]
     pub fn with_request_observer_for_test(
         mut self,
         observer: Arc<dyn Fn(CurlRequestObservation) + Send + Sync>,
@@ -435,12 +435,12 @@ impl CurlTransport {
             process: command.spawn().map_err(|error| {
                 UpdateError::network(format!("cannot start release request: {error}"))
             })?,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             observer: self.request_observer.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             reaped_observed: false,
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(observer) = &self.request_observer {
             observer(CurlRequestObservation::Spawned(child.process.id()));
         }
@@ -452,7 +452,7 @@ impl CurlTransport {
         let watcher = RequestWatcher::spawn(
             child,
             cancellation.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             self.request_observer.clone(),
         )?;
         let response = (|| {
@@ -496,7 +496,7 @@ impl CurlTransport {
         Ok(body)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]
     pub fn authenticated_get_for_test(
         &self,
@@ -506,7 +506,7 @@ impl CurlTransport {
         self.request_bytes(url, limit, true)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]
     pub fn authenticated_asset_for_test(
         &self,
@@ -526,9 +526,9 @@ fn discovery_cancelled() -> UpdateError {
 /// unwinding/error path kills and waits; a successfully waited child is a no-op.
 struct RequestChild {
     process: Child,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     observer: Option<Arc<dyn Fn(CurlRequestObservation) + Send + Sync>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     reaped_observed: bool,
 }
 
@@ -551,7 +551,7 @@ impl RequestChild {
     }
 
     fn observe_reaped(&mut self, _status: ExitStatus) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if !self.reaped_observed {
             self.reaped_observed = true;
             if let Some(observer) = &self.observer {
@@ -579,7 +579,7 @@ impl Drop for RequestChild {
 struct RequestWatcher {
     stop: mpsc::Sender<()>,
     worker: Option<std::thread::JoinHandle<Result<ExitStatus, UpdateError>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     observer: Option<Arc<dyn Fn(CurlRequestObservation) + Send + Sync>>,
 }
 
@@ -587,7 +587,9 @@ impl RequestWatcher {
     fn spawn(
         mut child: RequestChild,
         cancellation: DiscoveryCancellation,
-        #[cfg(test)] observer: Option<Arc<dyn Fn(CurlRequestObservation) + Send + Sync>>,
+        #[cfg(any(test, feature = "test-support"))] observer: Option<
+            Arc<dyn Fn(CurlRequestObservation) + Send + Sync>,
+        >,
     ) -> Result<Self, UpdateError> {
         let (stop, stopped) = mpsc::channel();
         let worker = std::thread::Builder::new()
@@ -620,7 +622,7 @@ impl RequestWatcher {
         Ok(Self {
             stop,
             worker: Some(worker),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             observer,
         })
     }
@@ -639,7 +641,7 @@ impl RequestWatcher {
         let outcome = worker.join().map_err(|_| {
             UpdateError::Internal("release request cancellation watcher failed".into())
         });
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(observer) = &self.observer {
             observer(CurlRequestObservation::WatcherJoined);
         }
@@ -750,7 +752,7 @@ fn validate_transport_url(url: &str) -> Result<(), UpdateError> {
     }
 }
 
-pub(crate) fn compiled_target() -> Result<&'static str, UpdateError> {
+pub fn compiled_target() -> Result<&'static str, UpdateError> {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         Ok("aarch64-apple-darwin")
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
@@ -762,7 +764,7 @@ pub(crate) fn compiled_target() -> Result<&'static str, UpdateError> {
     }
 }
 
-pub(crate) fn discover<T: UpdateTransport>(
+pub fn discover<T: UpdateTransport>(
     transport: &mut T,
     source: &ReleaseSource,
     current: &str,
@@ -815,7 +817,7 @@ pub(crate) fn discover<T: UpdateTransport>(
         .next_back()
         .ok_or_else(|| UpdateError::Refused("no published releases were found".into()))?;
 
-    let archive_name = format!("haider-v{}-{target}.tar.xz", latest.version);
+    let archive_name = format!("haider-v{}-{target}-split.tar.xz", latest.version);
     let checksum_name = format!("{archive_name}.sha256");
     let archive_urls = latest.asset_urls(&archive_name);
     let checksum_urls = latest.asset_urls(&checksum_name);
@@ -977,7 +979,7 @@ fn repository_slug(repository: &str) -> Result<String, UpdateError> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SemVersion {
+pub struct SemVersion {
     major: u64,
     minor: u64,
     patch: u64,

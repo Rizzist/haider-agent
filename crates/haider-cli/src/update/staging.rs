@@ -2,6 +2,7 @@
 
 use super::UpdateError;
 use super::discovery::{ReleaseSelection, UpdateTransport};
+use super::members::{ALL_BUNDLE_MEMBERS, BUNDLE_MEMBERS, BundleMember};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -15,21 +16,27 @@ const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TRAILING_ARCHIVE_BYTES: usize = 64 * 1024;
 const XZ_MAGIC: [u8; 6] = [0xfd, b'7', b'z', b'X', b'Z', 0x00];
 const TAR: &str = "/usr/bin/tar";
-const SHASUM: &str = "/usr/bin/shasum";
+#[cfg(target_os = "macos")]
 const XATTR: &str = "/usr/bin/xattr";
+#[cfg(target_os = "macos")]
 const CODESIGN: &str = "/usr/bin/codesign";
 
-pub(crate) trait StageVerifier {
+pub trait StageVerifier {
     fn remove_quarantine(&self, path: &Path) -> Result<(), UpdateError>;
     fn sign(&self, path: &Path) -> Result<(), UpdateError>;
     fn verify_signature(&self, path: &Path) -> Result<(), UpdateError>;
-    fn smoke_haider(&self, path: &Path, target: &str) -> Result<(), UpdateError>;
-    fn smoke_haiderd(&self, path: &Path, target: &str) -> Result<(), UpdateError>;
+    fn smoke_binary(
+        &self,
+        path: &Path,
+        member: BundleMember,
+        target: &str,
+    ) -> Result<(), UpdateError>;
 }
 
-pub(crate) struct SystemStageVerifier;
+pub struct SystemStageVerifier;
 
 impl StageVerifier for SystemStageVerifier {
+    #[cfg(target_os = "macos")]
     fn remove_quarantine(&self, path: &Path) -> Result<(), UpdateError> {
         let output =
             bounded_command_output(Command::new(XATTR).arg(path), 64 * 1024, "list xattrs")?;
@@ -49,15 +56,24 @@ impl StageVerifier for SystemStageVerifier {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
     fn sign(&self, path: &Path) -> Result<(), UpdateError> {
+        // Preserve the release's Developer ID signature and notarized bytes.
+        // Locally built unsigned fixtures still need an ad-hoc signature, but
+        // omitting --force ensures an invalid existing signature is rejected
+        // instead of silently replacing its identity with an ad-hoc one.
+        if self.verify_signature(path).is_ok() {
+            return Ok(());
+        }
         command_success(
             Command::new(CODESIGN)
-                .args(["--force", "--sign", "-", "--timestamp=none"])
+                .args(["--sign", "-", "--timestamp=none"])
                 .arg(path),
-            "ad-hoc sign staged binary",
+            "ad-hoc sign unsigned staged binary",
         )
     }
 
+    #[cfg(target_os = "macos")]
     fn verify_signature(&self, path: &Path) -> Result<(), UpdateError> {
         command_success(
             Command::new(CODESIGN)
@@ -67,46 +83,60 @@ impl StageVerifier for SystemStageVerifier {
         )
     }
 
-    fn smoke_haider(&self, path: &Path, target: &str) -> Result<(), UpdateError> {
-        let output = bounded_command_output(
-            Command::new(path).arg("--version"),
-            4096,
-            "smoke staged haider",
-        )?;
-        if output != format!("haider {target}\n").as_bytes() {
-            return Err(UpdateError::Refused(format!(
-                "staged haider reported an unexpected version; expected {target}"
-            )));
-        }
-        let self_test = bounded_command_output(
-            Command::new(path).arg("self-test"),
-            64 * 1024,
-            "self-test staged haider",
-        )?;
-        let report: serde_json::Value = serde_json::from_slice(&self_test).map_err(|error| {
-            UpdateError::Refused(format!("staged haider self-test was not JSON: {error}"))
-        })?;
-        if report.get("schema").and_then(serde_json::Value::as_str) != Some("haider.selftest.v0")
-            || report.get("version").and_then(serde_json::Value::as_str) != Some(target)
-            || report.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
-        {
-            return Err(UpdateError::Refused(
-                "staged haider self-test did not report exact versioned success".into(),
-            ));
-        }
+    // Linux/Windows packages currently carry no updater-managed OS signature
+    // authority. Their installer path still requires exact member hashes,
+    // executable version identity and the real offline CLI self-test.
+    #[cfg(not(target_os = "macos"))]
+    fn remove_quarantine(&self, _path: &Path) -> Result<(), UpdateError> {
         Ok(())
     }
 
-    fn smoke_haiderd(&self, path: &Path, target: &str) -> Result<(), UpdateError> {
+    #[cfg(not(target_os = "macos"))]
+    fn sign(&self, _path: &Path) -> Result<(), UpdateError> {
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn verify_signature(&self, _path: &Path) -> Result<(), UpdateError> {
+        Ok(())
+    }
+
+    fn smoke_binary(
+        &self,
+        path: &Path,
+        member: BundleMember,
+        target: &str,
+    ) -> Result<(), UpdateError> {
         let output = bounded_command_output(
             Command::new(path).arg("--version"),
             4096,
-            "smoke staged haiderd",
+            "smoke staged executable version",
         )?;
-        if output != format!("haiderd {target}\n").as_bytes() {
+        let name = member.name();
+        if output != format!("{name} {target}\n").as_bytes() {
             return Err(UpdateError::Refused(format!(
-                "staged haiderd reported an unexpected version; expected {target}"
+                "staged {name} reported an unexpected version; expected {target}"
             )));
+        }
+        if member == BundleMember::Cli {
+            let self_test = bounded_command_output(
+                Command::new(path).arg("self-test"),
+                64 * 1024,
+                "self-test staged haider",
+            )?;
+            let report: serde_json::Value =
+                serde_json::from_slice(&self_test).map_err(|error| {
+                    UpdateError::Refused(format!("staged haider self-test was not JSON: {error}"))
+                })?;
+            if report.get("schema").and_then(serde_json::Value::as_str)
+                != Some("haider.selftest.v0")
+                || report.get("version").and_then(serde_json::Value::as_str) != Some(target)
+                || report.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+            {
+                return Err(UpdateError::Refused(
+                    "staged haider self-test did not report exact versioned success".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -115,47 +145,72 @@ impl StageVerifier for SystemStageVerifier {
 /// Capability produced only after transport, archive, signing, and smoke
 /// verification. Commit consumes this type, so partial or SHA-failed input
 /// cannot reach canonical installation paths by construction.
-pub(crate) struct VerifiedStagedPair {
+pub struct VerifiedStagedPair {
     _stage: StageDirectory,
-    haider: PathBuf,
-    haiderd: PathBuf,
+    binaries: Vec<StagedBinary>,
     version: String,
-    haider_digest: String,
-    haiderd_digest: String,
     source_digest: String,
 }
 
+struct StagedBinary {
+    member: BundleMember,
+    path: PathBuf,
+    digest: String,
+}
+
 impl VerifiedStagedPair {
-    pub fn haider_path(&self) -> &Path {
-        &self.haider
+    pub fn path(&self, member: BundleMember) -> &Path {
+        &self.binary(member).path
     }
 
+    pub fn digest(&self, member: BundleMember) -> &str {
+        &self.binary(member).digest
+    }
+
+    fn binary(&self, member: BundleMember) -> &StagedBinary {
+        self.binaries
+            .iter()
+            .find(|binary| binary.member == member)
+            .unwrap_or_else(|| unreachable!("requested member is absent from this verified bundle"))
+    }
+
+    pub fn members(&self) -> impl Iterator<Item = BundleMember> + '_ {
+        self.binaries.iter().map(|binary| binary.member)
+    }
+
+    #[cfg(test)]
+    pub fn haider_path(&self) -> &Path {
+        self.path(BundleMember::Cli)
+    }
+
+    #[cfg(test)]
     pub fn haiderd_path(&self) -> &Path {
-        &self.haiderd
+        self.path(BundleMember::Daemon)
+    }
+
+    #[cfg(test)]
+    pub fn haider_digest(&self) -> &str {
+        self.digest(BundleMember::Cli)
+    }
+
+    #[cfg(test)]
+    pub fn haiderd_digest(&self) -> &str {
+        self.digest(BundleMember::Daemon)
     }
 
     pub fn version(&self) -> &str {
         &self.version
     }
 
-    pub fn haider_digest(&self) -> &str {
-        &self.haider_digest
-    }
-
-    pub fn haiderd_digest(&self) -> &str {
-        &self.haiderd_digest
-    }
-
     pub fn source_digest(&self) -> &str {
         &self.source_digest
     }
 
-    /// Revalidates the opaque capability immediately before transaction entry.
+    /// Revalidates every member immediately before transaction entry.
     pub fn verify_immutable(&self) -> Result<(), UpdateError> {
-        for (path, digest, name) in [
-            (&self.haider, &self.haider_digest, "haider"),
-            (&self.haiderd, &self.haiderd_digest, "haiderd"),
-        ] {
+        for member in self.members() {
+            let path = self.path(member);
+            let name = member.name();
             let metadata = fs::symlink_metadata(path)
                 .map_err(|error| UpdateError::io("inspect staged binary", error))?;
             if metadata.file_type().is_symlink()
@@ -167,7 +222,7 @@ impl VerifiedStagedPair {
                     "verified staged `{name}` is no longer immutable"
                 )));
             }
-            if sha256_file(path)? != *digest {
+            if sha256_file(path)? != self.digest(member) {
                 return Err(UpdateError::Refused(format!(
                     "verified staged `{name}` digest changed before commit"
                 )));
@@ -177,14 +232,63 @@ impl VerifiedStagedPair {
     }
 }
 
-/// Builds the same opaque capability from already-verified fixture binaries.
-/// Test-only: production has no bypass around transport/signature/smoke.
+fn freeze_binaries(
+    directory: &Path,
+    members: &[BundleMember],
+) -> Result<Vec<StagedBinary>, UpdateError> {
+    let mut binaries: Vec<_> = members
+        .iter()
+        .map(|&member| StagedBinary {
+            member,
+            path: directory.join(member.file_name()),
+            digest: String::new(),
+        })
+        .collect();
+    for binary in &mut binaries {
+        // Hold a writable flush handle before setting the immutable/read-only
+        // attribute; Windows FlushFileBuffers requires write access.
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&binary.path)
+            .map_err(|error| UpdateError::io("open staged binary for durability", error))?;
+        haider_platform::set_mode(&binary.path, 0o500)
+            .map_err(|error| UpdateError::io("protect staged binary", error))?;
+        file.sync_all()
+            .map_err(|error| UpdateError::io("fsync staged binary", error))?;
+        drop(file);
+        binary.digest = sha256_file(&binary.path)?;
+    }
+    sync_dir(directory)?;
+    Ok(binaries)
+}
+
+/// Test-only fixture capability; production always checks transport and signatures.
 #[cfg(test)]
 #[allow(dead_code)]
-pub(crate) fn verified_pair_for_test(
+pub fn verified_pair_for_test(
     install_dir: &Path,
     haider_source: &Path,
+    haider_tui_source: &Path,
     haiderd_source: &Path,
+    version: &str,
+) -> Result<VerifiedStagedPair, UpdateError> {
+    verified_bundle_for_test(
+        install_dir,
+        &[
+            (BundleMember::Daemon, haiderd_source),
+            (BundleMember::Tui, haider_tui_source),
+            (BundleMember::Cli, haider_source),
+        ],
+        version,
+    )
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn verified_bundle_for_test(
+    install_dir: &Path,
+    sources: &[(BundleMember, &Path)],
     version: &str,
 ) -> Result<VerifiedStagedPair, UpdateError> {
     let stage = StageDirectory {
@@ -193,30 +297,27 @@ pub(crate) fn verified_pair_for_test(
     let binary_dir = stage.path.join("verified-fixture");
     fs::create_dir(&binary_dir)
         .map_err(|error| UpdateError::io("create verified fixture directory", error))?;
-    let haider = binary_dir.join("haider");
-    let haiderd = binary_dir.join("haiderd");
-    fs::copy(haider_source, &haider)
-        .map_err(|error| UpdateError::io("copy verified fixture haider", error))?;
-    fs::copy(haiderd_source, &haiderd)
-        .map_err(|error| UpdateError::io("copy verified fixture haiderd", error))?;
-    for binary in [&haider, &haiderd] {
-        haider_platform::set_mode(binary, 0o500)
-            .map_err(|error| UpdateError::io("chmod verified fixture binary", error))?;
-        File::open(binary)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| UpdateError::io("fsync verified fixture binary", error))?;
+    let members: Vec<_> = ALL_BUNDLE_MEMBERS
+        .into_iter()
+        .filter(|member| sources.iter().any(|(candidate, _)| candidate == member))
+        .collect();
+    for member in &members {
+        let (_, source) = sources
+            .iter()
+            .find(|(candidate, _)| candidate == member)
+            .ok_or_else(|| UpdateError::Internal("fixture member lacks source".into()))?;
+        fs::copy(source, binary_dir.join(member.file_name()))
+            .map_err(|error| UpdateError::io("copy verified fixture binary", error))?;
     }
-    sync_dir(&binary_dir)?;
-    let haider_digest = sha256_file(&haider)?;
-    let haiderd_digest = sha256_file(&haiderd)?;
+    let binaries = freeze_binaries(&binary_dir, &members)?;
     Ok(VerifiedStagedPair {
         _stage: stage,
-        haider,
-        haiderd,
+        source_digest: binaries
+            .first()
+            .map(|binary| binary.digest.clone())
+            .unwrap_or_default(),
+        binaries,
         version: version.to_owned(),
-        source_digest: haider_digest.clone(),
-        haider_digest,
-        haiderd_digest,
     })
 }
 
@@ -226,7 +327,30 @@ struct StageDirectory {
 
 impl Drop for StageDirectory {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        clear_private_stage_readonly(&self.path);
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(windows)]
+fn clear_private_stage_readonly(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            clear_private_stage_readonly(&path);
+        } else if metadata.is_file() {
+            let _ = haider_platform::set_mode(&path, 0o700);
+        }
     }
 }
 
@@ -234,9 +358,9 @@ impl Drop for StageDirectory {
 ///
 /// MUTATION SAFETY: all writes are confined to a new owner-only directory
 /// beneath `install_dir`; every runtime failure removes that directory when
-/// the returned capability is dropped. Canonical `haider`/`haiderd` paths
+/// the returned capability is dropped. Canonical executable paths
 /// are never accepted by this API.
-pub(crate) fn stage_release<T: UpdateTransport, V: StageVerifier>(
+pub fn stage_release<T: UpdateTransport, V: StageVerifier>(
     transport: &mut T,
     verifier: &V,
     install_dir: &Path,
@@ -262,10 +386,17 @@ pub(crate) fn stage_release<T: UpdateTransport, V: StageVerifier>(
     }
 
     let top = format!(
-        "haider-v{}-{}",
+        "haider-v{}-{}-split",
         selection.version,
         super::discovery::compiled_target()?
     );
+    if selection.archive_name != format!("{top}.tar.xz")
+        || selection.checksum_name != format!("{top}.tar.xz.sha256")
+    {
+        return Err(UpdateError::Refused(
+            "update selection is not an exact split-bundle asset".into(),
+        ));
+    }
     let extracted = root.join(&top);
     fs::create_dir(&extracted)
         .map_err(|error| UpdateError::io("create extracted staging directory", error))?;
@@ -273,38 +404,206 @@ pub(crate) fn stage_release<T: UpdateTransport, V: StageVerifier>(
         .map_err(|error| UpdateError::io("protect extracted staging directory", error))?;
     extract_strict(&archive, root, &top)?;
 
-    let haider = extracted.join("haider");
-    let haiderd = extracted.join("haiderd");
-    for binary in [&haider, &haiderd] {
-        verifier.remove_quarantine(binary)?;
-        verifier.sign(binary)?;
-        verifier.verify_signature(binary)?;
-    }
-    verifier.smoke_haider(&haider, &selection.version.to_string())?;
-    verifier.smoke_haiderd(&haiderd, &selection.version.to_string())?;
-
-    for binary in [&haider, &haiderd] {
-        haider_platform::set_mode(binary, 0o500)
-            .map_err(|error| UpdateError::io("protect staged binary", error))?;
-        File::open(binary)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| UpdateError::io("fsync staged binary", error))?;
-    }
-    sync_dir(&extracted)?;
+    let binaries = verify_and_freeze(
+        verifier,
+        &extracted,
+        &selection.version.to_string(),
+        &BUNDLE_MEMBERS,
+    )?;
     sync_dir(root)?;
-    let haider_digest = sha256_file(&haider)?;
-    let haiderd_digest = sha256_file(&haiderd)?;
     let pair = VerifiedStagedPair {
         _stage: stage,
-        haider,
-        haiderd,
+        binaries,
         version: selection.version.to_string(),
-        haider_digest,
-        haiderd_digest,
         source_digest: actual_digest,
     };
     pair.verify_immutable()?;
     Ok(pair)
+}
+
+/// Stages the exact executable bytes embedded in a compatibility entrypoint.
+/// The canonical daemon is copied into the same owner-only staging directory,
+/// then every member receives the normal signature, exact-version and CLI
+/// self-test checks before the immutable commit capability can be constructed.
+/// No canonical path or update lock is modified here.
+pub fn stage_embedded_bundle(
+    thin: &[u8],
+    payload: &[u8],
+    daemon_source: &Path,
+    install_dir: &Path,
+    version: &str,
+) -> Result<VerifiedStagedPair, UpdateError> {
+    super::discovery::compiled_target()?;
+    super::discovery::SemVersion::parse(version).map_err(UpdateError::Refused)?;
+    let stage = StageDirectory {
+        path: create_stage_dir(install_dir)?,
+    };
+    let extracted = stage.path.join("embedded-bundle");
+    fs::create_dir(&extracted)
+        .map_err(|error| UpdateError::io("create embedded staging directory", error))?;
+    haider_platform::set_mode(&extracted, 0o700)
+        .map_err(|error| UpdateError::io("protect embedded staging directory", error))?;
+    let mut source_manifest = String::new();
+    for member in BUNDLE_MEMBERS {
+        let destination = extracted.join(member.file_name());
+        create_private_file(&destination)?;
+        match member {
+            BundleMember::Cli => write_embedded_binary(&destination, thin)?,
+            BundleMember::Tui => write_embedded_binary(&destination, payload)?,
+            BundleMember::Daemon => {
+                let metadata = fs::symlink_metadata(daemon_source).map_err(|error| {
+                    UpdateError::io("inspect embedded bundle daemon source", error)
+                })?;
+                if !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                    || metadata.len() == 0
+                    || metadata.len() > MAX_BINARY_BYTES
+                    || !haider_platform::metadata_is_current_user(&metadata)
+                {
+                    return Err(UpdateError::Refused(
+                        "embedded bundle daemon is not a trusted bounded regular file".into(),
+                    ));
+                }
+                fs::copy(daemon_source, &destination)
+                    .map_err(|error| UpdateError::io("copy embedded bundle daemon", error))?;
+            }
+            BundleMember::WaylandPortal => {
+                unreachable!("embedded migration has only required members")
+            }
+        }
+        haider_platform::set_mode(&destination, 0o700)
+            .map_err(|error| UpdateError::io("make embedded stage executable", error))?;
+        use std::fmt::Write as _;
+        writeln!(
+            &mut source_manifest,
+            "{} {}",
+            member.name(),
+            sha256_file(&destination)?
+        )
+        .map_err(|error| {
+            UpdateError::Internal(format!("encode embedded source manifest: {error}"))
+        })?;
+    }
+    let manifest = stage.path.join("embedded-sources.sha256");
+    create_private_file(&manifest)?;
+    fs::write(&manifest, source_manifest.as_bytes())
+        .map_err(|error| UpdateError::io("write embedded source manifest", error))?;
+    let source_digest = sha256_file(&manifest)?;
+    let binaries = verify_and_freeze(&SystemStageVerifier, &extracted, version, &BUNDLE_MEMBERS)?;
+    sync_dir(&stage.path)?;
+    let bundle = VerifiedStagedPair {
+        _stage: stage,
+        binaries,
+        version: version.to_owned(),
+        source_digest,
+    };
+    bundle.verify_immutable()?;
+    Ok(bundle)
+}
+
+/// Copies an unpacked, checksum-verified installer bundle into private staging.
+/// Directory installers and the network updater share all subsequent member
+/// verification, publication, rollback and recovery code.
+pub fn stage_directory_bundle(
+    source: &Path,
+    install_dir: &Path,
+    version: &str,
+) -> Result<VerifiedStagedPair, UpdateError> {
+    super::discovery::SemVersion::parse(version).map_err(UpdateError::Refused)?;
+    let stage = StageDirectory {
+        path: create_stage_dir(install_dir)?,
+    };
+    let extracted = stage.path.join("directory-bundle");
+    fs::create_dir(&extracted)
+        .map_err(|error| UpdateError::io("create directory-bundle staging", error))?;
+    haider_platform::set_mode(&extracted, 0o700)
+        .map_err(|error| UpdateError::io("protect directory-bundle staging", error))?;
+    let portal = source.join(BundleMember::WaylandPortal.file_name());
+    let has_portal = match fs::symlink_metadata(&portal) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(UpdateError::io("inspect optional portal source", error)),
+    };
+    let members: Vec<_> = ALL_BUNDLE_MEMBERS
+        .into_iter()
+        .filter(|member| *member != BundleMember::WaylandPortal || has_portal)
+        .collect();
+    let mut source_manifest = String::new();
+    for &member in &members {
+        let original = source.join(member.file_name());
+        let metadata = fs::symlink_metadata(&original)
+            .map_err(|error| UpdateError::io("inspect installer source executable", error))?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() == 0
+            || metadata.len() > MAX_BINARY_BYTES
+        {
+            return Err(UpdateError::Refused(format!(
+                "installer source {} is not a bounded regular executable",
+                member.file_name()
+            )));
+        }
+        let source_digest = sha256_file(&original)?;
+        let destination = extracted.join(member.file_name());
+        create_private_file(&destination)?;
+        fs::copy(&original, &destination)
+            .map_err(|error| UpdateError::io("copy installer source executable", error))?;
+        if sha256_file(&destination)? != source_digest {
+            return Err(UpdateError::Refused(
+                "installer source changed while staging".into(),
+            ));
+        }
+        haider_platform::set_mode(&destination, 0o700)
+            .map_err(|error| UpdateError::io("make directory stage executable", error))?;
+        use std::fmt::Write as _;
+        writeln!(&mut source_manifest, "{} {source_digest}", member.name()).map_err(|error| {
+            UpdateError::Internal(format!("encode directory source manifest: {error}"))
+        })?;
+    }
+    let manifest = stage.path.join("directory-sources.sha256");
+    create_private_file(&manifest)?;
+    fs::write(&manifest, source_manifest.as_bytes())
+        .map_err(|error| UpdateError::io("write directory source manifest", error))?;
+    let source_digest = sha256_file(&manifest)?;
+    let binaries = verify_and_freeze(&SystemStageVerifier, &extracted, version, &members)?;
+    sync_dir(&stage.path)?;
+    let bundle = VerifiedStagedPair {
+        _stage: stage,
+        binaries,
+        version: version.to_owned(),
+        source_digest,
+    };
+    bundle.verify_immutable()?;
+    Ok(bundle)
+}
+
+fn write_embedded_binary(path: &Path, bytes: &[u8]) -> Result<(), UpdateError> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_BINARY_BYTES {
+        return Err(UpdateError::Refused(
+            "embedded executable is empty or oversized".into(),
+        ));
+    }
+    fs::write(path, bytes).map_err(|error| UpdateError::io("write embedded executable", error))
+}
+
+fn verify_and_freeze<V: StageVerifier>(
+    verifier: &V,
+    directory: &Path,
+    version: &str,
+    members: &[BundleMember],
+) -> Result<Vec<StagedBinary>, UpdateError> {
+    // Sign the entire bundle before any smoke: the CLI self-test can execute
+    // the staged daemon sibling, so every dependency must already be verified.
+    for &member in members {
+        let binary = directory.join(member.file_name());
+        verifier.remove_quarantine(&binary)?;
+        verifier.sign(&binary)?;
+        verifier.verify_signature(&binary)?;
+    }
+    for &member in members {
+        verifier.smoke_binary(&directory.join(member.file_name()), member, version)?;
+    }
+    freeze_binaries(directory, members)
 }
 
 fn create_stage_dir(install_dir: &Path) -> Result<PathBuf, UpdateError> {
@@ -340,7 +639,7 @@ fn create_private_file(path: &Path) -> Result<(), UpdateError> {
     Ok(())
 }
 
-pub(crate) fn parse_checksum(path: &Path, archive_name: &str) -> Result<String, UpdateError> {
+pub fn parse_checksum(path: &Path, archive_name: &str) -> Result<String, UpdateError> {
     let bytes = fs::read(path).map_err(|error| UpdateError::io("read release checksum", error))?;
     if bytes.len() > usize::try_from(MAX_CHECKSUM_BYTES).unwrap_or(usize::MAX) {
         return Err(UpdateError::Refused("checksum file is oversized".into()));
@@ -380,24 +679,22 @@ pub(crate) fn parse_checksum(path: &Path, archive_name: &str) -> Result<String, 
     Ok(fields[0].to_ascii_lowercase())
 }
 
-pub(crate) fn sha256_file(path: &Path) -> Result<String, UpdateError> {
-    let output = bounded_command_output(
-        Command::new(SHASUM).args(["-a", "256"]).arg(path),
-        4096,
-        "hash file",
-    )?;
-    let text = std::str::from_utf8(&output)
-        .map_err(|_| UpdateError::Refused("shasum output was not UTF-8".into()))?;
-    let fields = text.split_whitespace().collect::<Vec<_>>();
-    if fields.len() < 2
-        || fields[0].len() != 64
-        || !fields[0].bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(UpdateError::Refused(
-            "shasum returned malformed output".into(),
-        ));
+pub fn sha256_file(path: &Path) -> Result<String, UpdateError> {
+    use sha2::{Digest as _, Sha256};
+    let mut file =
+        File::open(path).map_err(|error| UpdateError::io("open file for SHA-256", error))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| UpdateError::io("read file for SHA-256", error))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
     }
-    Ok(fields[0].to_ascii_lowercase())
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn extract_strict(archive: &Path, root: &Path, top: &str) -> Result<(), UpdateError> {
@@ -439,13 +736,9 @@ fn extract_strict(archive: &Path, root: &Path, top: &str) -> Result<(), UpdateEr
 
 fn parse_ustar(reader: &mut impl Read, root: &Path, top: &str) -> Result<(), UpdateError> {
     let expected_dir = format!("{top}/");
-    let expected_haider = format!("{top}/haider");
-    let expected_haiderd = format!("{top}/haiderd");
-    let expected = BTreeSet::from([
-        expected_dir.clone(),
-        expected_haider.clone(),
-        expected_haiderd.clone(),
-    ]);
+    let expected: BTreeSet<_> = std::iter::once(expected_dir.clone())
+        .chain(BUNDLE_MEMBERS.map(|member| format!("{top}/{}", member.name())))
+        .collect();
     let mut seen = BTreeSet::new();
     let mut zero_blocks = 0_u8;
 
@@ -507,11 +800,8 @@ fn parse_ustar(reader: &mut impl Read, root: &Path, top: &str) -> Result<(), Upd
                     "archive binary `{name}` is empty or oversized"
                 )));
             }
-            let destination = if name == expected_haider {
-                root.join(top).join("haider")
-            } else {
-                root.join(top).join("haiderd")
-            };
+            // Exact allowlist membership above already excludes every other path.
+            let destination = root.join(&name);
             extract_member(reader, &destination, size)?;
         }
         if name == expected_dir {
@@ -523,7 +813,7 @@ fn parse_ustar(reader: &mut impl Read, root: &Path, top: &str) -> Result<(), Upd
 
     if seen != expected {
         return Err(UpdateError::Refused(
-            "archive is missing the top directory or one of the two binaries".into(),
+            "archive is missing the top directory or a required bundle executable".into(),
         ));
     }
     let mut trailing = Vec::new();
@@ -677,6 +967,7 @@ fn read_exact_archive(
         .map_err(|error| UpdateError::io(what, error))
 }
 
+#[cfg(target_os = "macos")]
 fn command_success(command: &mut Command, operation: &'static str) -> Result<(), UpdateError> {
     let status = command
         .stdin(Stdio::null())
@@ -690,7 +981,7 @@ fn command_success(command: &mut Command, operation: &'static str) -> Result<(),
     Ok(())
 }
 
-pub(crate) fn bounded_command_output(
+pub fn bounded_command_output(
     command: &mut Command,
     limit: usize,
     operation: &'static str,
@@ -727,6 +1018,6 @@ pub(crate) fn bounded_command_output(
     Ok(output)
 }
 
-pub(crate) fn sync_dir(path: &Path) -> Result<(), UpdateError> {
+pub fn sync_dir(path: &Path) -> Result<(), UpdateError> {
     haider_platform::sync_directory(path).map_err(|error| UpdateError::io("fsync directory", error))
 }

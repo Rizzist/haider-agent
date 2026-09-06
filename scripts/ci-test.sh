@@ -26,7 +26,7 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}"
 export HAIDER_TEST_DEVICE_NAME=test-mac
 
 crates="haider-platform haider-protocol haider-accounts haider-core haider-pdf \
-haider-provider haider-daemon haider-daemond haider-rpc haider-tui haider-cli \
+haider-provider haider-daemon haider-daemond haider-rpc haider-tui haider-tui-exe haider-cli haider-compat \
 haider-store haider-tools haider-client haider-verify haider-stt xtask"
 
 log_dir="${HAIDER_CI_TEST_LOG_DIR:-target/ci-test-logs}"

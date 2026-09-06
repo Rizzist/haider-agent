@@ -1,0 +1,43 @@
+Applied patch to 'Cargo.lock' cleanly.
+Applied patch to 'Cargo.toml' cleanly.
+Applied patch to 'crates/haider-cli/Cargo.toml' cleanly.
+Applied patch to 'crates/haider-cli/src/agent.rs' cleanly.
+Applied patch to 'crates/haider-cli/src/daemon.rs' cleanly.
+Applied patch to 'crates/haider-cli/src/export.rs' cleanly.
+Applied patch to 'crates/haider-cli/src/main.rs' with conflicts.
+Applied patch to 'crates/haider-cli/src/observe.rs' cleanly.
+Applied patch to 'crates/haider-cli/src/run.rs' cleanly.
+Applied patch to 'crates/haider-cli/src/session_item.rs' cleanly.
+Applied patch to 'crates/haider-cli/src/ssh.rs' cleanly.
+Applied patch to 'crates/haider-cli/src/update/check_policy.rs' cleanly.
+Applied patch to 'crates/haider-cli/src/update/discovery.rs' cleanly.
+Applied patch to 'crates/haider-cli/src/update/mod.rs' cleanly.
+Applied patch to 'crates/haider-cli/src/update/restart.rs' cleanly.
+Applied patch to 'crates/haider-cli/src/update/staging.rs' cleanly.
+Applied patch to 'crates/haider-cli/src/update/transaction.rs' cleanly.
+Falling back to direct application...
+Applied patch to 'crates/haider-cli/src/update/tui_restart.rs' cleanly.
+Falling back to direct application...
+Applied patch to 'crates/haider-cli/tests/cli_tests.rs' cleanly.
+Applied patch to 'crates/haider-cli/tests/observe_cli_tests.rs' cleanly.
+Applied patch to 'crates/haider-cli/tests/session_config_cli_tests.rs' cleanly.
+Applied patch to 'crates/haider-cli/tests/update_cli_tests.rs' cleanly.
+Applied patch to 'crates/haider-cli/tests/update_restart_tests.rs' cleanly.
+Applied patch to 'crates/haider-cli/tests/update_tests.rs' cleanly.
+Applied patch to 'crates/haider-client/src/lib.rs' cleanly.
+Applied patch to 'crates/haider-core/src/actor.rs' cleanly.
+Applied patch to 'crates/haider-daemond/Cargo.toml' cleanly.
+Applied patch to 'crates/haider-daemond/src/main.rs' cleanly.
+Applied patch to 'crates/haider-protocol/src/lib.rs' cleanly.
+Applied patch to 'crates/haider-tools/src/spawn_subagent.rs' cleanly.
+Applied patch to 'crates/haider-tools/tests/spawn_subagent_tests.rs' cleanly.
+Applied patch to 'crates/haider-tui/src/agent_metrics.rs' cleanly.
+Applied patch to 'crates/haider-tui/src/fleet.rs' cleanly.
+Applied patch to 'crates/haider-tui/src/format.rs' cleanly.
+Applied patch to 'crates/haider-tui/src/notify.rs' cleanly.
+Applied patch to 'scripts/ci-test.sh' cleanly.
+Applied patch to 'scripts/qa-gate/turn_wall_harness.py' cleanly.
+Applied patch to 'scripts/qa-gate/turnperf_support.py' cleanly.
+Applied patch to 'test-baseline.txt' with conflicts.
+U crates/haider-cli/src/main.rs
+U test-baseline.txt

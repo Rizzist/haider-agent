@@ -291,6 +291,8 @@ def run_one_shot_harness(
                         # The CLI reaps its owned daemon, so RUSAGE_CHILDREN for
                         # the CLI process includes the daemon it waited for.
                         "process_tree_cpu_ms": result.cpu_ms,
+                        "client_sampled_cpu_lower_bound_ms": result.sampled_client_cpu_ms,
+                        "client_cpu_sample_count": result.client_cpu_sample_count,
                         "client_peak_rss_kib": result.child_peak_rss_kib,
                         "daemon_peak_rss_kib": result.observed_peak_rss_kib,
                         "combined_peak_rss_kib": result.combined_peak_rss_kib,
@@ -596,6 +598,8 @@ def run_harness(
                     "case_id": case_id,
                     "wall_ms": result.wall_ms,
                     "client_cpu_ms": result.cpu_ms,
+                    "client_sampled_cpu_lower_bound_ms": result.sampled_client_cpu_ms,
+                    "client_cpu_sample_count": result.client_cpu_sample_count,
                     "daemon_cpu_ms": daemon_cpu_ms,
                     "combined_cpu_ms": result.cpu_ms + daemon_cpu_ms,
                     "client_peak_rss_kib": result.child_peak_rss_kib,

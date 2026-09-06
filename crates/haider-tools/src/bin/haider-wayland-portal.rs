@@ -1,15 +1,25 @@
 //! Linux companion for the daemon's bounded Wayland portal protocol.
 
-#[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("haider-wayland-portal is available only on Linux");
-    std::process::exit(1);
-}
+    // Bundle installation probes every executable before publication. Report
+    // build identity without creating a runtime or connecting to the portal.
+    if std::env::args_os()
+        .skip(1)
+        .eq([std::ffi::OsString::from("--version")])
+    {
+        println!("haider-wayland-portal {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
 
-#[cfg(target_os = "linux")]
-fn main() {
+    #[cfg(target_os = "linux")]
     if let Err(error) = linux::run() {
         eprintln!("haider-wayland-portal: {error}");
+        std::process::exit(1);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        eprintln!("haider-wayland-portal is available only on Linux");
         std::process::exit(1);
     }
 }

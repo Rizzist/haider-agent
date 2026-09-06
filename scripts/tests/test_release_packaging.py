@@ -214,5 +214,73 @@ class SiblingPackagerTests(unittest.TestCase):
                 release_packaging.verify_npm_archive(package, STALE_VERSION)
 
 
+class SplitArchiveTests(unittest.TestCase):
+    def archive(self, root, *, windows, missing="", bad_checksum=False, legacy=False):
+        target = release_packaging.WINDOWS_TARGET if windows else "aarch64-apple-darwin"
+        top = f"haider-v{VERSION}-{target}" + ("" if legacy else "-split")
+        artifact = root / (top + (".zip" if windows else ".tar.xz"))
+        names = [name for name in ("haider", "haider-tui", "haiderd") if name != missing]
+        if windows:
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr(top + "/", b"")
+                for name in names:
+                    archive.writestr(f"{top}/{name}.exe", b"binary")
+                archive.writestr(f"{top}/haider.cmd", b"launcher")
+                archive.writestr(f"{top}/README.txt", b"readme")
+        else:
+            with tarfile.open(artifact, "w:xz") as archive:
+                info = tarfile.TarInfo(top)
+                info.type = tarfile.DIRTYPE
+                archive.addfile(info)
+                for name in names:
+                    info = tarfile.TarInfo(f"{top}/{name}")
+                    info.mode = 0o755
+                    info.size = 6
+                    archive.addfile(info, io.BytesIO(b"binary"))
+        digest = "00" * 32 if bad_checksum else hashlib.sha256(artifact.read_bytes()).hexdigest()
+        artifact.with_name(artifact.name + ".sha256").write_text(f"{digest}  {artifact.name}\n")
+        return artifact, target
+
+    def test_actual_tar_and_zip_payloads_require_all_siblings_and_checksum(self):
+        for windows in (False, True):
+            for missing, bad_checksum in (("", False), ("haider-tui", False), ("", True)):
+                with self.subTest(windows=windows, missing=missing, bad_checksum=bad_checksum), tempfile.TemporaryDirectory() as temporary:
+                    artifact, target = self.archive(Path(temporary), windows=windows, missing=missing, bad_checksum=bad_checksum)
+                    if missing or bad_checksum:
+                        with self.assertRaises(release_packaging.PackagingError):
+                            release_packaging.verify_split_bundle(artifact, target)
+                    else:
+                        release_packaging.verify_split_bundle(artifact, target)
+
+    def test_legacy_canonical_mac_archive_accepts_only_original_pair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact, target = self.archive(root, windows=False, missing="haider-tui", legacy=True)
+            release_packaging.verify_legacy_bundle(artifact, target)
+            with self.assertRaises(release_packaging.PackagingError):
+                release_packaging.verify_legacy_bundle(artifact, release_packaging.WINDOWS_TARGET)
+            artifact, target = self.archive(root, windows=False, legacy=True)
+            with self.assertRaisesRegex(release_packaging.PackagingError, "unexpected or empty"):
+                release_packaging.verify_legacy_bundle(artifact, target)
+
+    def test_release_and_manager_templates_preserve_split_format_and_public_entrypoint(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        for fragment in ("-p haider-tui-exe", 'cp "$BIN" "$TBIN" "$DBIN"', "haider-tui --version", "verify-bundle"):
+            if fragment == "haider-tui --version":
+                self.assertIn('"$TBIN" --version', workflow)
+            else:
+                self.assertIn(fragment, workflow)
+        formula = (ROOT / "packaging/homebrew/haider.rb").read_text()
+        self.assertIn('"#{source}/haider-tui"', formula)
+        scoop = json.loads((ROOT / "packaging/scoop/haider.json").read_text())
+        self.assertEqual(scoop["bin"], ["haider.exe"])
+        self.assertIn("haider-tui.exe", "\n".join(scoop["pre_install"]))
+        npm = json.loads((ROOT / "packaging/npm/package.json").read_text())
+        self.assertEqual(npm["bin"], {"haider": "bin/haider.js"})
+        choco = (ROOT / "packaging/chocolatey/tools/chocolateyinstall.ps1").read_text()
+        self.assertIn("haider-tui.exe", choco)
+        self.assertIn("$binary.ignore", choco)
+
+
 if __name__ == "__main__":
     unittest.main()

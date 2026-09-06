@@ -520,3 +520,39 @@ Both lane walks are retained verbatim below, ordered by first registry number.
   decodes are corrected with explicit validation, with failures retained in
   the lane gate summary. After the final CLI test build, another unchanged
   matrix pass is 52/52 with hashes matching the delivered artifacts.
+
+### v0.0.970 thinexe — thin control executable and sibling payload (HOLD-OUT)
+
+- #1–#18/#22/#29/#30/#33/#38/#49/#75/#76: one typed command grammar,
+  exhaustive headless/payload dispatch, shared client display/validation seams,
+  protocol-owned subagent validation and trace ordinal. The normal dependency
+  graph excludes TUI/STT/image/core/store/provider/tools/accounts; final native
+  artifact inspection also passes. The moved-seam projection ledger is in
+  `docs/testing/v0.0.970/thinexe.md`; no split-owned wire/JSONL schema change.
+- #19/#20/#21/#41/#42/#44/#54/#64/#67/#71/#72/#74/#81/#92: ENV LAW, real
+  prebuilt daemon/CLI/payload, >10 MiB daemon, scratch profiles, authoritative
+  test recount and generated goldens. Disk dropped below 700 MiB during the
+  first full gate, which failed ENOSPC and was stopped; failed evidence remains.
+  After recovery, builds run serially with one Cargo job. Final gate results
+  are recorded in `thinexe-evidence/gates-resumed.json` and the lane report.
+- #52/#57/#76: user-facing interactive verbs keep the TUI surface; headless
+  controls stay in the thin process. Native routing, optional Wayland member,
+  installation rollback/recovery, legacy pins and signature preservation have
+  regression coverage. Windows/Linux/Android workflow execution is by inspection
+  here; their build/package/live-probe paths include the payload.
+- #77: no ignored tests, raised acceptance thresholds or raw FAIL relabeling.
+  The native macOS release installer suite passes 5/5. Official store upgrade
+  passes; public install.paths fails HTTP404 for the unpublished 970 split asset.
+  The 969 auto-spawn updater's post-commit drain failure remains raw evidence.
+- #94: version probes use the shared 30-second VERSION_QUERY. The native
+  install fixture retains its original 120-second watchdog, whose derivation
+  is unproven (six staged/installed version allowances already total 180s).
+  This is an explicit hold-out issue; no invented phase arithmetic or increased
+  cap is used. #95: no new negotiated RPC wait is introduced by thin dispatch.
+- #96: frozen before/after artifact hashes and exact commands are retained.
+  haider 35,543,584→23,144,352 bytes; installed runtime total
+  90,909,552→105,245,792 bytes. ABBA exited 75 before sampling at load 4.5298,
+  above the unchanged 3.0 ceiling; no accepted RSS/CPU pair exists. NO_SHIP.
+- Remaining registry entries were reviewed for the changed surface; no additional
+  platform, provider or wire-policy behavior is claimed. The report records
+  independent reviewer corrections and every remaining acceptance blocker.

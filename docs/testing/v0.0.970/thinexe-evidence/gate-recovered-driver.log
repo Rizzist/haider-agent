@@ -1,0 +1,1 @@
+START prebuild-recovered-2: cargo build --locked -p haider-cli -p haider-daemond -p haider-tui-exe -p haider-tools --bins

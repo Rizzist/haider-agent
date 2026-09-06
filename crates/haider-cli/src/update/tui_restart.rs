@@ -6,7 +6,7 @@ use std::process::Command;
 
 /// The platform-specific process hand-off selected for a restarted TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RestartMode {
+pub enum RestartMode {
     /// Replace this process after the terminal guard has been dropped.
     Exec,
     /// Start a detached successor, then let this process exit cleanly.
@@ -15,7 +15,7 @@ pub(crate) enum RestartMode {
 
 /// A pure description of the successor process.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TuiRestartPlan {
+pub struct TuiRestartPlan {
     pub executable: PathBuf,
     /// Arguments after argv[0], preserved byte-for-byte from this process.
     pub args: Vec<OsString>,
@@ -24,7 +24,7 @@ pub(crate) struct TuiRestartPlan {
 
 /// Construct a plan for the current target without starting a process.
 #[must_use]
-pub(crate) fn restart_plan(executable: PathBuf, original_argv: &[OsString]) -> TuiRestartPlan {
+pub fn restart_plan(executable: PathBuf, original_argv: &[OsString]) -> TuiRestartPlan {
     restart_plan_for(executable, original_argv, cfg!(windows))
 }
 
@@ -33,7 +33,7 @@ pub(crate) fn restart_plan(executable: PathBuf, original_argv: &[OsString]) -> T
 /// newly committed canonical binary, so only the remaining arguments are
 /// forwarded.
 #[must_use]
-pub(crate) fn restart_plan_for(
+pub fn restart_plan_for(
     executable: PathBuf,
     original_argv: &[OsString],
     windows: bool,
@@ -53,7 +53,7 @@ pub(crate) fn restart_plan_for(
 ///
 /// On Unix success never returns. On Windows the successor is detached and
 /// success returns so the caller can exit normally.
-pub(crate) fn execute_restart(plan: TuiRestartPlan) -> std::io::Result<()> {
+pub fn execute_restart(plan: TuiRestartPlan) -> std::io::Result<()> {
     let mut command = Command::new(&plan.executable);
     command.args(&plan.args);
     match plan.mode {

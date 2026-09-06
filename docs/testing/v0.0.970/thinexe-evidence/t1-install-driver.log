@@ -1,0 +1,4 @@
+START t1.install.paths
+END t1.install.paths: FAIL
+START t1.store.previous_release_upgrade
+END t1.store.previous_release_upgrade: PASS

@@ -19,11 +19,11 @@ const RELEASE = `https://github.com/Rizzist/haider-agent/releases/download/v${VE
 function artifactForCurrentPlatform() {
   const key = `${process.platform}-${process.arch}`;
   const artifacts = {
-    "darwin-arm64": `haider-v${VERSION}-aarch64-apple-darwin.tar.xz`,
-    "darwin-x64": `haider-v${VERSION}-x86_64-apple-darwin.tar.xz`,
-    "linux-x64": `haider-v${VERSION}-x86_64-unknown-linux-gnu.tar.xz`,
-    "linux-arm64": `haider-v${VERSION}-aarch64-unknown-linux-gnu.tar.xz`,
-    "win32-x64": `haider-v${VERSION}-x86_64-pc-windows-msvc.zip`
+    "darwin-arm64": `haider-v${VERSION}-aarch64-apple-darwin-split.tar.xz`,
+    "darwin-x64": `haider-v${VERSION}-x86_64-apple-darwin-split.tar.xz`,
+    "linux-x64": `haider-v${VERSION}-x86_64-unknown-linux-gnu-split.tar.xz`,
+    "linux-arm64": `haider-v${VERSION}-aarch64-unknown-linux-gnu-split.tar.xz`,
+    "win32-x64": `haider-v${VERSION}-x86_64-pc-windows-msvc-split.zip`
   };
   return artifacts[key] || null;
 }
@@ -95,7 +95,7 @@ function findEndOfCentralDirectory(buffer) {
 }
 
 function extractZipBinaries(archiveBuffer, destDir) {
-  const wanted = new Set(["haider.exe", "haiderd.exe"]);
+  const wanted = new Set(["haider.exe", "haider-tui.exe", "haiderd.exe"]);
   const extracted = new Set();
   const eocd = findEndOfCentralDirectory(archiveBuffer);
   const entries = archiveBuffer.readUInt16LE(eocd + 10);
@@ -120,6 +120,9 @@ function extractZipBinaries(archiveBuffer, destDir) {
     const basename = name.replace(/\\/g, "/").split("/").pop();
 
     if (wanted.has(basename)) {
+      if (extracted.has(basename)) {
+        throw new Error(`Archive contains duplicate ${basename}`);
+      }
       if (archiveBuffer.readUInt32LE(localOffset) !== 0x04034b50) {
         throw new Error("Invalid zip: local file header not found");
       }
@@ -172,7 +175,7 @@ function extractTarXzBinaries(archiveBuffer, artifact, destDir) {
     }
 
     const bundleDir = path.join(unpackDir, artifact.slice(0, -".tar.xz".length));
-    const binaries = ["haider", "haiderd"];
+    const binaries = ["haider", "haider-tui", "haiderd"];
     if (process.platform === "linux") {
       binaries.push("haider-wayland-portal");
     }
@@ -185,6 +188,29 @@ function extractTarXzBinaries(archiveBuffer, artifact, destDir) {
     }
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+// Archive checksum validation precedes this call. The extracted thin binary
+// owns all publication, locking, verification and durable recovery. Never erase
+// vendor or its recovery marker when the helper refuses or is interrupted.
+function installArchive(archive, artifact, vendorDir, runInstaller = spawnSync) {
+  const stage = fs.mkdtempSync(path.join(os.tmpdir(), "haider-npm-stage-"));
+  try {
+    if (artifact.endsWith(".zip")) {
+      extractZipBinaries(archive, stage);
+    } else {
+      extractTarXzBinaries(archive, artifact, stage);
+    }
+    for (const binary of fs.readdirSync(stage)) {
+      fs.chmodSync(path.join(stage, binary), 0o755);
+    }
+    const binary = path.join(stage, artifact.endsWith(".zip") ? "haider.exe" : "haider");
+    const result = runInstaller(binary, ["--install-bundle", stage, vendorDir], { stdio: "inherit" });
+    if (result.error) throw new Error(`Could not start bundle installer: ${result.error.message}`);
+    if (result.status !== 0) throw new Error(`Bundle installation failed with exit code ${result.status}`);
+  } finally {
+    fs.rmSync(stage, { recursive: true, force: true });
   }
 }
 
@@ -214,24 +240,12 @@ async function main() {
     throw new Error(`Checksum mismatch for ${artifact}: expected ${expected}, got ${actual}`);
   }
 
-  fs.rmSync(VENDOR_DIR, { recursive: true, force: true });
-  fs.mkdirSync(VENDOR_DIR, { recursive: true });
-
-  if (artifact.endsWith(".zip")) {
-    extractZipBinaries(archive, VENDOR_DIR);
-  } else {
-    extractTarXzBinaries(archive, artifact, VENDOR_DIR);
-  }
-
-  for (const binary of fs.readdirSync(VENDOR_DIR)) {
-    fs.chmodSync(path.join(VENDOR_DIR, binary), 0o755);
-  }
+  installArchive(archive, artifact, VENDOR_DIR);
   console.log(`Installed Haider binaries to ${VENDOR_DIR}`);
 }
 
 if (require.main === module) {
   main().catch((error) => {
-    fs.rmSync(VENDOR_DIR, { recursive: true, force: true });
     console.error(`Failed to install haider: ${error.message}`);
     console.error(
       "GitHub releases are public and do not require GITHUB_TOKEN. " +
@@ -242,6 +256,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  installArchive,
+  artifactForCurrentPlatform,
   expectedHash,
   extractTarXzBinaries,
   extractZipBinaries

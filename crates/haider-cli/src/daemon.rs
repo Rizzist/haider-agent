@@ -1,6 +1,5 @@
 //! Scriptable daemon lifecycle controls.
 
-use std::fs::{OpenOptions, TryLockError};
 use std::io::{self, Write as _};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -552,33 +551,7 @@ async fn wait_for_profile_lock(
 }
 
 fn profile_lock_held(store_dir: &std::path::Path) -> Result<bool, StopFailure> {
-    let lock_path = store_dir.join("lock");
-    let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(StopFailure::io(format!(
-                "cannot open existing profile lock {}: {error}",
-                lock_path.display()
-            )));
-        }
-    };
-    match file.try_lock() {
-        Ok(()) => {
-            file.unlock().map_err(|error| {
-                StopFailure::io(format!(
-                    "cannot release profile lock probe {}: {error}",
-                    lock_path.display()
-                ))
-            })?;
-            Ok(false)
-        }
-        Err(TryLockError::WouldBlock) => Ok(true),
-        Err(TryLockError::Error(error)) => Err(StopFailure::io(format!(
-            "cannot inspect profile lock {}: {error}",
-            lock_path.display()
-        ))),
-    }
+    haider_client::profile_lock::profile_lock_held(store_dir).map_err(StopFailure::io)
 }
 
 async fn wait_to_retry(deadline: Instant) -> bool {

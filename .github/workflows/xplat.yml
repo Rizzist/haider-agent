@@ -59,9 +59,13 @@ jobs:
       - name: check (all targets; report every reachable error)
         if: matrix.phase == 'check'
         run: cargo check --workspace --all-targets --locked --keep-going --target ${{ matrix.target }}
-      - name: release packaging regression tests (Windows)
-        if: matrix.phase == 'check' && runner.os == 'Windows'
-        run: python -m unittest scripts/tests/test_release_packaging.py
+      - uses: actions/setup-node@v4
+        if: matrix.phase != 'clippy'
+        with:
+          node-version: 20
+      - name: split archive and wrapper delegation regression tests
+        if: matrix.phase == 'check'
+        run: python -m unittest scripts/tests/test_release_packaging.py scripts/tests/test_install_bundle.py
       - name: clippy (all targets; report every reachable error)
         if: matrix.phase == 'clippy'
         run: cargo clippy --workspace --all-targets --locked --keep-going --target ${{ matrix.target }} -- -D warnings
@@ -71,6 +75,17 @@ jobs:
         # ci-test.sh preserves the 8 MiB stack, hermetic discovery/device env,
         # sibling-binary compile phase, and the Windows-only streamed test.
         run: bash scripts/ci-test.sh
+      - name: native durable bundle installation and version checks
+        if: matrix.phase == 'test'
+        env:
+          HAIDER_INSTALL_TEST_BIN_DIR: target/debug
+          RUST_MIN_STACK: 8388608
+          HAIDER_DISCOVERY_DISABLED: 1
+          HAIDER_TEST_DEVICE_NAME: test-mac
+        run: python -m unittest scripts/tests/test_install_bundle_native.py
+      - name: thin executable dependency and binary boundary
+        if: matrix.phase == 'test'
+        run: python scripts/qa-gate/thinexe_abba.py boundary --candidate target/debug --target ${{ matrix.target }} --output target/ci-test-logs/thinexe-boundary.json
       - name: native Windows clipboard write and paste gate (no terminal)
         if: matrix.phase == 'test' && runner.os == 'Windows'
         env:
@@ -142,7 +157,7 @@ jobs:
           echo "AR_aarch64_linux_android=$toolchain/llvm-ar" >> "$GITHUB_ENV"
           echo "RANLIB_aarch64_linux_android=$toolchain/llvm-ranlib" >> "$GITHUB_ENV"
       - name: build Android Phase 1 binaries
-        run: cargo build --locked --target aarch64-linux-android -p haider-cli -p haider-daemond
+        run: cargo build --locked --target aarch64-linux-android -p haider-cli -p haider-daemond -p haider-tui-exe
       - name: compile Android Kotlin app
         working-directory: android
         run: gradle :app:compileReleaseKotlin --no-daemon --stacktrace

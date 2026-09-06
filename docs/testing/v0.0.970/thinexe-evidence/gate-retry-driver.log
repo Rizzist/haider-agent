@@ -1,0 +1,6 @@
+START workspace-tests-retry-1: cargo test -q --workspace --no-fail-fast
+END workspace-tests-retry-1: FAIL exit=101
+START workspace-clippy-1: cargo clippy --workspace --tests -- -D warnings
+END workspace-clippy-1: FAIL exit=101
+START test-count-final-1: cargo run -q -p xtask -- test-count --update
+END test-count-final-1: PASS exit=0

@@ -10,25 +10,24 @@ rust-version.workspace = true
 name = "haider"
 path = "src/main.rs"
 
+[features]
+test-support = []
+
 [dependencies]
 haider-protocol = { path = "../haider-protocol" }
-haider-store = { path = "../haider-store" }
-haider-core = { path = "../haider-core" }
-haider-provider = { path = "../haider-provider" }
-haider-tools = { path = "../haider-tools" }
-haider-verify = { path = "../haider-verify" }
-haider-accounts = { path = "../haider-accounts" }
 haider-client = { path = "../haider-client" }
 haider-platform = { path = "../haider-platform" }
 haider-rpc = { path = "../haider-rpc" }
-haider-tui = { path = "../haider-tui" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+haider-store = { path = "../haider-store" }
+haider-provider = { path = "../haider-provider" }
 async-trait.workspace = true
 base64.workspace = true
 tempfile.workspace = true

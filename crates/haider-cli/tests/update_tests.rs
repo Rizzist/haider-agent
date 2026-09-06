@@ -3,16 +3,17 @@
 #![allow(clippy::expect_used)]
 #![allow(dead_code)]
 
-#[path = "../src/main.rs"]
+#[path = "../src/lib.rs"]
 mod cli_main;
 
 use cli_main::update::discovery::{
     CurlTransport, DiscoveryOutcome, ReleaseSelection, ReleaseSource, SemVersion, UpdateTransport,
     discover,
 };
+use cli_main::update::members::{BUNDLE_MEMBERS, BundleMember};
 #[cfg(target_os = "macos")]
 use cli_main::update::stage_then_acquire;
-use cli_main::update::staging::{StageVerifier, sha256_file, stage_release};
+use cli_main::update::staging::{StageVerifier, SystemStageVerifier, sha256_file, stage_release};
 use cli_main::update::transaction::{
     CommitBoundary, FaultInjector, InstallLayout, InstalledPairVerifier, PreparedTransaction,
     TransactionPhase,
@@ -77,7 +78,7 @@ fn releases_url(page: usize) -> String {
 fn release_json(tag: &str, targets: &[&str]) -> serde_json::Value {
     let mut assets = Vec::new();
     for target in targets {
-        let archive = format!("haider-{tag}-{target}.tar.xz");
+        let archive = format!("haider-{tag}-{target}-split.tar.xz");
         assets.push(serde_json::json!({
             "name": archive,
             "browser_download_url": format!("http://fixture.invalid/{target}/archive")
@@ -124,7 +125,7 @@ fn discovery_includes_prereleases_orders_semver_and_selects_both_targets() {
         assert_eq!(selection.version.to_string(), "0.0.11-beta.2");
         assert_eq!(
             selection.archive_name,
-            format!("haider-v0.0.11-beta.2-{target}.tar.xz")
+            format!("haider-v0.0.11-beta.2-{target}-split.tar.xz")
         );
         assert_eq!(transport.get_calls, 1);
         assert_eq!(transport.download_calls, 0);
@@ -270,6 +271,7 @@ fn truncated_local_http_response_has_no_local_mutation() {
     let install = tempfile::tempdir().expect("install fixture");
     write_executable(&install.path().join("haider"), b"old-cli");
     write_executable(&install.path().join("haiderd"), b"old-daemon");
+    write_executable(&install.path().join("haider-tui"), b"old-tui");
     let before = pair_snapshot(install.path());
     let source = ReleaseSource {
         api_base: format!("http://{address}"),
@@ -413,7 +415,9 @@ enum VerifyFailure {
     Sign,
     Signature,
     SmokeCli,
+    SmokeTui,
     SmokeDaemon,
+    SmokePortal,
 }
 
 struct FakeVerifier {
@@ -437,14 +441,20 @@ impl StageVerifier for FakeVerifier {
         fail_if(self.failure == VerifyFailure::Signature, "signature")
     }
 
-    fn smoke_haider(&self, _path: &Path, _target: &str) -> Result<(), UpdateError> {
+    fn smoke_binary(
+        &self,
+        _path: &Path,
+        member: BundleMember,
+        _target: &str,
+    ) -> Result<(), UpdateError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        fail_if(self.failure == VerifyFailure::SmokeCli, "CLI smoke")
-    }
-
-    fn smoke_haiderd(&self, _path: &Path, _target: &str) -> Result<(), UpdateError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        fail_if(self.failure == VerifyFailure::SmokeDaemon, "daemon smoke")
+        let failure = match member {
+            BundleMember::Cli => VerifyFailure::SmokeCli,
+            BundleMember::Tui => VerifyFailure::SmokeTui,
+            BundleMember::Daemon => VerifyFailure::SmokeDaemon,
+            BundleMember::WaylandPortal => VerifyFailure::SmokePortal,
+        };
+        fail_if(self.failure == failure, "binary smoke")
     }
 }
 
@@ -466,7 +476,7 @@ struct Member {
 }
 
 fn expected_members(version: &str, target: &str) -> Vec<Member> {
-    let top = format!("haider-v{version}-{target}");
+    let top = format!("haider-v{version}-{target}-split");
     vec![
         Member {
             name: format!("{top}/"),
@@ -487,6 +497,13 @@ fn expected_members(version: &str, target: &str) -> Vec<Member> {
             kind: b'0',
             mode: 0o755,
             data: b"new-daemon".to_vec(),
+            declared_size: None,
+        },
+        Member {
+            name: format!("{top}/haider-tui"),
+            kind: b'0',
+            mode: 0o755,
+            data: b"new-tui".to_vec(),
             declared_size: None,
         },
     ]
@@ -556,7 +573,7 @@ fn selection_and_transport(
 ) -> (ReleaseSelection, FakeTransport) {
     let version = "9.0.0";
     let target = fixture_target();
-    let name = format!("haider-v{version}-{target}.tar.xz");
+    let name = format!("haider-v{version}-{target}-split.tar.xz");
     let archive = archive_bytes(root, members);
     let archive_file = root.join("digest-input.tar.xz");
     fs::write(&archive_file, &archive).expect("digest archive");
@@ -601,6 +618,11 @@ fn staging_accepts_exact_workflow_checksum_basename() {
         fs::read(staged.haiderd_path()).expect("staged daemon"),
         b"new-daemon"
     );
+    assert_eq!(
+        fs::read(staged.path(BundleMember::Tui)).expect("staged payload"),
+        b"new-tui"
+    );
+    staged.verify_immutable().expect("all members frozen");
 }
 
 /// MUTATION CHECK: admit wrong, ambiguous, or basename-mismatched checksum.
@@ -643,7 +665,7 @@ fn wrong_content_digest_with_valid_checksum_refuses_before_extraction() {
     let install = install_fixture();
     let before = pair_snapshot(install.path());
     let wrong_digest_checksum = format!(
-        "{}  dist/haider-v9.0.0-{target}.tar.xz
+        "{}  dist/haider-v9.0.0-{target}-split.tar.xz
 ",
         "0".repeat(64)
     );
@@ -667,7 +689,7 @@ fn wrong_content_digest_with_valid_checksum_refuses_before_extraction() {
 #[test]
 fn strict_archive_rejects_every_forbidden_member_shape() {
     let target = fixture_target();
-    let top = format!("haider-v9.0.0-{target}");
+    let top = format!("haider-v9.0.0-{target}-split");
     let valid = expected_members("9.0.0", target);
     let mut cases: Vec<(&str, Vec<Member>)> = Vec::new();
     let mut traversal = valid.clone();
@@ -699,8 +721,15 @@ fn strict_archive_rejects_every_forbidden_member_shape() {
         declared_size: None,
     });
     cases.push(("extra", extra));
-    cases.push(("missing-cli", vec![valid[0].clone(), valid[2].clone()]));
-    cases.push(("missing-daemon", vec![valid[0].clone(), valid[1].clone()]));
+    cases.push((
+        "missing-cli",
+        vec![valid[0].clone(), valid[2].clone(), valid[3].clone()],
+    ));
+    cases.push((
+        "missing-daemon",
+        vec![valid[0].clone(), valid[1].clone(), valid[3].clone()],
+    ));
+    cases.push(("missing-payload", valid[..3].to_vec()));
     let mut oversized = valid.clone();
     oversized[1].declared_size = Some(256 * 1024 * 1024 + 1);
     oversized[1].data.clear();
@@ -729,6 +758,52 @@ fn strict_archive_rejects_every_forbidden_member_shape() {
     }
 }
 
+/// The split updater must never fall back to the legacy two-member artifact
+/// name: old releases and new compatibility entrypoints have a distinct format.
+/// MUTATION CHECK: accept a canonical asset under the split contract. Expected
+/// RUNTIME failure: it reaches staged verification or creates transaction state.
+#[cfg(target_os = "macos")]
+#[test]
+fn canonical_assets_do_not_enter_split_bundle_transaction() {
+    let target = fixture_target();
+    let members = expected_members("9.0.0", target);
+    let install = install_fixture();
+    let before = pair_snapshot(install.path());
+    let (mut selection, mut transport) = selection_and_transport(install.path(), &members, None);
+    selection.archive_name = format!("haider-v9.0.0-{target}.tar.xz");
+    selection.checksum_name = format!("{}.sha256", selection.archive_name);
+    let digest = sha256_file(&install.path().join("digest-input.tar.xz")).expect("digest");
+    transport.downloads.insert(
+        "checksum".into(),
+        format!("{digest}  {}\n", selection.archive_name).into_bytes(),
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let verifier = FakeVerifier {
+        failure: VerifyFailure::None,
+        calls: Arc::clone(&calls),
+    };
+    let result = stage_then_acquire(
+        &mut transport,
+        &verifier,
+        InstallLayout::for_test(install.path().to_path_buf()),
+        &selection,
+    );
+    let Err(UpdateError::Refused(message)) = result else {
+        panic!("canonical archive must not enter a split-bundle transaction")
+    };
+    assert_eq!(
+        message,
+        "update selection is not an exact split-bundle asset"
+    );
+    assert_eq!(transport.download_calls, 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(pair_snapshot(install.path()), before);
+    assert!(!has_entry(install.path(), ".haider-update"));
+    for member in BUNDLE_MEMBERS {
+        assert!(!has_entry(install.path(), &member.backup_prefix()));
+    }
+}
+
 /// MUTATION CHECK: ignore xattr/sign/signature/smoke failures. Expected
 /// RUNTIME failure: a failure category returns a capability or changes the
 /// byte/inode/mode snapshot of either canonical path.
@@ -742,6 +817,7 @@ fn every_staged_verification_failure_leaves_installed_pair_exact() {
         VerifyFailure::Sign,
         VerifyFailure::Signature,
         VerifyFailure::SmokeCli,
+        VerifyFailure::SmokeTui,
         VerifyFailure::SmokeDaemon,
     ] {
         let install = install_fixture();
@@ -780,9 +856,9 @@ fn partial_download_cannot_escape_immutable_staging() {
     let target = fixture_target();
     let selection = ReleaseSelection {
         version: SemVersion::parse("9.0.0").expect("version"),
-        archive_name: format!("haider-v9.0.0-{target}.tar.xz"),
+        archive_name: format!("haider-v9.0.0-{target}-split.tar.xz"),
         archive_url: "partial-archive".into(),
-        checksum_name: format!("haider-v9.0.0-{target}.tar.xz.sha256"),
+        checksum_name: format!("haider-v9.0.0-{target}-split.tar.xz.sha256"),
         checksum_url: "never-reached".into(),
     };
     let calls = Arc::new(AtomicUsize::new(0));
@@ -823,9 +899,9 @@ fn failed_staging_cannot_enter_transaction_or_recover_a_pending_marker() {
     let target = fixture_target();
     let selection = ReleaseSelection {
         version: SemVersion::parse("10.0.0").expect("version"),
-        archive_name: format!("haider-v10.0.0-{target}.tar.xz"),
+        archive_name: format!("haider-v10.0.0-{target}-split.tar.xz"),
         archive_url: "partial-archive".into(),
-        checksum_name: format!("haider-v10.0.0-{target}.tar.xz.sha256"),
+        checksum_name: format!("haider-v10.0.0-{target}-split.tar.xz.sha256"),
         checksum_url: "never-reached".into(),
     };
     let verifier = FakeVerifier {
@@ -870,6 +946,7 @@ impl InstalledPairVerifier for BytePairVerifier {
     ) -> Result<(), UpdateError> {
         if fs::read(&layout.haider).expect("live CLI") == b"new-cli"
             && fs::read(&layout.haiderd).expect("live daemon") == b"new-daemon"
+            && fs::read(&layout.haider_tui).expect("live payload") == b"new-tui"
         {
             Ok(())
         } else {
@@ -909,17 +986,20 @@ fn verified_pair(install: &Path) -> cli_main::update::staging::VerifiedStagedPai
 }
 
 /// MUTATION CHECK: omit rollback or move a fault hook before its named
-/// boundary. Expected RUNTIME failure: one of all eight rows does not restore
+/// boundary. Expected RUNTIME failure: one of all eleven rows does not restore
 /// the exact old inode/bytes/mode pair, or a restart entry becomes possible.
 #[cfg(target_os = "macos")]
 #[test]
 fn every_commit_boundary_fault_restores_exact_old_pair() {
     for boundary in [
         CommitBoundary::BackupDaemon,
+        CommitBoundary::BackupTui,
         CommitBoundary::BackupCli,
         CommitBoundary::RenameDaemon,
+        CommitBoundary::RenameTui,
         CommitBoundary::RenameCli,
         CommitBoundary::ChmodDaemon,
+        CommitBoundary::ChmodTui,
         CommitBoundary::ChmodCli,
         CommitBoundary::InstallDirFsync,
         CommitBoundary::InstalledPairVerify,
@@ -994,10 +1074,13 @@ fn every_marker_phase_recovers_to_a_never_mixed_old_pair() {
     for phase in [
         TransactionPhase::Prepared,
         TransactionPhase::BackupDaemon,
+        TransactionPhase::BackupTui,
         TransactionPhase::BackupsReady,
         TransactionPhase::DaemonInstalled,
+        TransactionPhase::TuiInstalled,
         TransactionPhase::PairInstalled,
         TransactionPhase::DaemonWritable,
+        TransactionPhase::TuiWritable,
         TransactionPhase::PairWritable,
         TransactionPhase::PairSynced,
         TransactionPhase::PairVerified,
@@ -1036,26 +1119,48 @@ fn every_marker_phase_recovers_to_a_never_mixed_old_pair() {
 fn shape_crash_fixture(dir: &Path, layout: &InstallLayout, phase: TransactionPhase) {
     let cli_backup = find_entry(dir, ".haider-old-");
     let daemon_backup = find_entry(dir, ".haiderd-old-");
+    let tui_backup = find_entry(dir, ".haider-tui-old-");
     match phase {
+        TransactionPhase::BackupPortal
+        | TransactionPhase::PortalInstalled
+        | TransactionPhase::PortalWritable => {
+            panic!("portal phases require the four-member fixture in bundle_install_tests")
+        }
         TransactionPhase::Prepared => {
             fs::rename(daemon_backup, &layout.haiderd).expect("restore prepared daemon");
+            fs::rename(tui_backup, &layout.haider_tui).expect("restore prepared payload");
             fs::rename(cli_backup, &layout.haider).expect("restore prepared CLI");
         }
         TransactionPhase::BackupDaemon => {
             replace_from_backup(&daemon_backup, &layout.haiderd, "daemon");
             fs::rename(cli_backup, &layout.haider).expect("restore one-backup CLI");
+            fs::rename(tui_backup, &layout.haider_tui).expect("restore one-backup payload");
+        }
+        TransactionPhase::BackupTui => {
+            replace_from_backup(&daemon_backup, &layout.haiderd, "daemon");
+            replace_from_backup(&tui_backup, &layout.haider_tui, "tui");
+            fs::rename(cli_backup, &layout.haider).expect("restore two-backup CLI");
         }
         TransactionPhase::BackupsReady => {
+            replace_from_backup(&tui_backup, &layout.haider_tui, "tui");
             replace_from_backup(&daemon_backup, &layout.haiderd, "daemon");
             replace_from_backup(&cli_backup, &layout.haider, "cli");
         }
         TransactionPhase::DaemonInstalled => {
+            replace_from_backup(&tui_backup, &layout.haider_tui, "tui");
             replace_from_backup(&cli_backup, &layout.haider, "cli");
             assert_eq!(
                 fs::read(&layout.haiderd).expect("mixed daemon"),
                 b"new-daemon"
             );
             assert_eq!(fs::read(&layout.haider).expect("mixed CLI"), b"old-cli");
+        }
+        TransactionPhase::TuiInstalled => {
+            replace_from_backup(&cli_backup, &layout.haider, "cli");
+            assert_eq!(
+                fs::read(&layout.haider_tui).expect("new payload"),
+                b"new-tui"
+            );
         }
         TransactionPhase::RollingBack => {
             fs::rename(daemon_backup, &layout.haiderd).expect("first rollback rename");
@@ -1066,6 +1171,7 @@ fn shape_crash_fixture(dir: &Path, layout: &InstallLayout, phase: TransactionPha
             assert_eq!(fs::read(&layout.haider).expect("new CLI"), b"new-cli");
         }
         TransactionPhase::PairInstalled => {
+            set_mode(&layout.haider_tui, 0o500);
             set_mode(&layout.haiderd, 0o500);
             set_mode(&layout.haider, 0o500);
             assert_eq!(
@@ -1078,6 +1184,7 @@ fn shape_crash_fixture(dir: &Path, layout: &InstallLayout, phase: TransactionPha
             );
         }
         TransactionPhase::DaemonWritable => {
+            set_mode(&layout.haider_tui, 0o500);
             set_mode(&layout.haider, 0o500);
             assert_eq!(
                 fs::metadata(&layout.haiderd).expect("daemon mode").mode() & 0o777,
@@ -1086,6 +1193,16 @@ fn shape_crash_fixture(dir: &Path, layout: &InstallLayout, phase: TransactionPha
             assert_eq!(
                 fs::metadata(&layout.haider).expect("CLI mode").mode() & 0o777,
                 0o500
+            );
+        }
+        TransactionPhase::TuiWritable => {
+            set_mode(&layout.haider, 0o500);
+            assert_eq!(
+                fs::metadata(&layout.haider_tui)
+                    .expect("payload mode")
+                    .mode()
+                    & 0o777,
+                0o700
             );
         }
         TransactionPhase::PairWritable
@@ -1211,10 +1328,491 @@ fn reacquire_succeeds_while_a_stale_duplicate_of_the_released_lock_survives() {
     drop(stale);
 }
 
+/// MUTATION CHECK: select the canonical compatibility asset when both release
+/// formats exist. Expected runtime failure: discovery returns its legacy name.
+#[test]
+fn discovery_selects_split_asset_beside_legacy_compatibility_asset() {
+    let target = "aarch64-apple-darwin";
+    let mut release = release_json("v9.0.0", &[target]);
+    for suffix in ["", ".sha256"] {
+        release["assets"]
+            .as_array_mut()
+            .expect("assets")
+            .push(serde_json::json!({
+                "name": format!("haider-v9.0.0-{target}.tar.xz{suffix}"),
+                "browser_download_url": format!("http://fixture.invalid/legacy{suffix}"),
+            }));
+    }
+    let mut transport = discovery_transport(vec![release]);
+    let DiscoveryOutcome::Update(selection) =
+        discover(&mut transport, &source(), "1.0.0", target).expect("discover split")
+    else {
+        panic!("new split release is available")
+    };
+    assert_eq!(
+        selection.archive_name,
+        format!("haider-v9.0.0-{target}-split.tar.xz")
+    );
+    assert_eq!(
+        selection.archive_url,
+        "http://fixture.invalid/aarch64-apple-darwin/archive"
+    );
+}
+
+struct MemberStepFailure {
+    member: BundleMember,
+    step: &'static str,
+}
+
+impl MemberStepFailure {
+    fn check(&self, path: &Path, step: &str) -> Result<(), UpdateError> {
+        fail_if(
+            path.file_name().and_then(|name| name.to_str()) == Some(self.member.name())
+                && step == self.step,
+            "member step",
+        )
+    }
+}
+
+impl StageVerifier for MemberStepFailure {
+    fn remove_quarantine(&self, path: &Path) -> Result<(), UpdateError> {
+        self.check(path, "xattr")
+    }
+
+    fn sign(&self, path: &Path) -> Result<(), UpdateError> {
+        self.check(path, "sign")
+    }
+
+    fn verify_signature(&self, path: &Path) -> Result<(), UpdateError> {
+        self.check(path, "verify")
+    }
+
+    fn smoke_binary(
+        &self,
+        path: &Path,
+        _member: BundleMember,
+        _target: &str,
+    ) -> Result<(), UpdateError> {
+        self.check(path, "smoke")
+    }
+}
+
+/// MUTATION CHECK: skip any verification operation for any executable, notably
+/// the payload. Expected runtime failure: that injected failure is not reached,
+/// and staging returns a capability instead of refusing before the update lock.
+#[cfg(target_os = "macos")]
+#[test]
+fn every_bundle_member_verification_step_precedes_install_mutation() {
+    for member in BUNDLE_MEMBERS {
+        for step in ["xattr", "sign", "verify", "smoke"] {
+            let install = install_fixture();
+            let before = pair_snapshot(install.path());
+            let (selection, mut transport) = selection_and_transport(
+                install.path(),
+                &expected_members("9.0.0", fixture_target()),
+                None,
+            );
+            let result = stage_then_acquire(
+                &mut transport,
+                &MemberStepFailure { member, step },
+                InstallLayout::for_test(install.path().to_path_buf()),
+                &selection,
+            );
+            assert!(
+                matches!(result, Err(UpdateError::Refused(message)) if message == "injected member step failure"),
+                "{member:?} {step}"
+            );
+            assert_eq!(pair_snapshot(install.path()), before);
+            assert!(!has_entry(install.path(), ".haider-update"));
+        }
+    }
+}
+
+/// MUTATION CHECK: treat the payload's --version as the CLI version or accept a
+/// different release. Expected runtime failure: the mismatch becomes successful.
+#[test]
+fn payload_smoke_requires_its_own_exact_version_identity() {
+    let fixture = tempfile::tempdir().expect("payload smoke fixture");
+    let payload = fixture.path().join("haider-tui");
+    for reported in ["haider 9.0.0", "haider-tui 8.0.0", "haider-tui 9.0.0 extra"] {
+        write_executable(
+            &payload,
+            format!("#!/bin/sh\nprintf '%s\\n' '{reported}'\n").as_bytes(),
+        );
+        assert!(
+            SystemStageVerifier
+                .smoke_binary(&payload, BundleMember::Tui, "9.0.0")
+                .is_err(),
+            "{reported}"
+        );
+    }
+    write_executable(&payload, b"#!/bin/sh\nprintf 'haider-tui 9.0.0\\n'\n");
+    SystemStageVerifier
+        .smoke_binary(&payload, BundleMember::Tui, "9.0.0")
+        .expect("exact payload version");
+}
+
+#[test]
+fn payload_update_layout_resolves_the_canonical_cli_sibling() {
+    let install = install_fixture();
+    let layout = InstallLayout::from_executable_for_test(&install.path().join("haider-tui"))
+        .expect("payload layout");
+    assert_eq!(layout.haider, install.path().join("haider"));
+    assert_eq!(layout.haiderd, install.path().join("haiderd"));
+    assert_eq!(layout.haider_tui, install.path().join("haider-tui"));
+    assert!(InstallLayout::from_executable_for_test(&install.path().join("other")).is_err());
+}
+
+/// MUTATION CHECK: omit the payload from capability revalidation or restart
+/// eligibility. Expected runtime failure: changed payload bytes are admitted.
+#[cfg(target_os = "macos")]
+#[test]
+fn payload_digest_is_checked_before_commit_and_before_restart() {
+    let install = install_fixture();
+    let before = pair_snapshot(install.path());
+    let pair = verified_pair(install.path());
+    let payload = pair.path(BundleMember::Tui);
+    set_mode(payload, 0o700);
+    fs::write(payload, b"changed-stage-payload").expect("tamper staged payload");
+    set_mode(payload, 0o500);
+    let layout = InstallLayout::for_test(install.path().to_path_buf());
+    let prepared = PreparedTransaction::acquire(layout.clone()).expect("prepare");
+    assert!(commit_pair(prepared, pair, &NoFaults, &BytePairVerifier, "1.0.0").is_err());
+    assert_eq!(pair_snapshot(install.path()), before);
+    assert!(!marker_path(&layout).exists());
+    for member in BUNDLE_MEMBERS {
+        assert!(!has_entry(install.path(), &member.backup_prefix()));
+    }
+    let pair = verified_pair(install.path());
+    let prepared = PreparedTransaction::acquire(layout.clone()).expect("prepare again");
+    let mut committed =
+        commit_pair(prepared, pair, &NoFaults, &BytePairVerifier, "1.0.0").expect("commit");
+    fs::write(&layout.haider_tui, b"changed-installed-payload").expect("tamper installed payload");
+    assert!(committed.verify_target_pair().is_err());
+    committed.rollback().expect("restore all old members");
+    assert_eq!(pair_snapshot(install.path()), before);
+}
+
+/// Migration records the absence of the old payload, so every failed commit
+/// restores the historic two-member install without leaving an orphan payload.
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_pair_migration_restores_payload_absence_at_every_commit_boundary() {
+    for boundary in [
+        CommitBoundary::BackupDaemon,
+        CommitBoundary::BackupTui,
+        CommitBoundary::BackupCli,
+        CommitBoundary::RenameDaemon,
+        CommitBoundary::RenameTui,
+        CommitBoundary::RenameCli,
+        CommitBoundary::ChmodDaemon,
+        CommitBoundary::ChmodTui,
+        CommitBoundary::ChmodCli,
+        CommitBoundary::InstallDirFsync,
+        CommitBoundary::InstalledPairVerify,
+    ] {
+        let install = install_fixture();
+        fs::remove_file(install.path().join("haider-tui")).expect("legacy payload absence");
+        let before = pair_snapshot(install.path());
+        let layout = InstallLayout::for_test(install.path().to_path_buf());
+        let pair = verified_pair(install.path());
+        let prepared = PreparedTransaction::acquire(layout.clone()).expect("prepare migration");
+        assert!(
+            commit_pair(
+                prepared,
+                pair,
+                &BoundaryFault(boundary),
+                &BytePairVerifier,
+                "1.0.0"
+            )
+            .is_err(),
+            "{boundary:?}"
+        );
+        assert_eq!(pair_snapshot(install.path()), before, "{boundary:?}");
+        assert!(!marker_path(&layout).exists());
+        for member in BUNDLE_MEMBERS {
+            assert!(!has_entry(install.path(), &member.backup_prefix()));
+        }
+    }
+}
+
+/// MUTATION CHECK: silently ignore payload membership/digest/backup fields in
+/// v2 recovery. Expected runtime failure: the malformed transaction is accepted.
+#[cfg(target_os = "macos")]
+#[test]
+fn split_recovery_requires_complete_unique_safe_member_projection() {
+    for mutation in ["missing", "duplicate", "digest", "backup", "absent-cli"] {
+        let install = install_fixture();
+        let layout = InstallLayout::for_test(install.path().to_path_buf());
+        let pair = verified_pair(install.path());
+        let prepared = PreparedTransaction::acquire(layout.clone()).expect("prepare");
+        let committed =
+            commit_pair(prepared, pair, &NoFaults, &BytePairVerifier, "1.0.0").expect("commit");
+        let before = pair_snapshot(install.path());
+        drop(committed);
+        let path = marker_path(&layout);
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("marker")).expect("marker JSON");
+        let members = marker["members"].as_array_mut().expect("members");
+        let tui_index = members
+            .iter()
+            .position(|member| member["name"] == "haider-tui")
+            .expect("payload projection");
+        match mutation {
+            "missing" => {
+                members.remove(tui_index);
+            }
+            "duplicate" => {
+                members[tui_index]["name"] = "haider".into();
+            }
+            "digest" => {
+                members[tui_index]["target_digest"] = "bad".into();
+            }
+            "backup" => {
+                members[tui_index]["backup"] = "../haider-tui".into();
+            }
+            "absent-cli" => {
+                let cli = members
+                    .iter_mut()
+                    .find(|member| member["name"] == "haider")
+                    .expect("CLI");
+                cli["old_digest"] = serde_json::Value::Null;
+            }
+            _ => unreachable!(),
+        }
+        fs::write(
+            &path,
+            serde_json::to_vec(&marker).expect("encode mutated marker"),
+        )
+        .expect("write mutated marker");
+        assert!(PreparedTransaction::acquire(layout).is_err(), "{mutation}");
+        assert_eq!(pair_snapshot(install.path()), before, "{mutation}");
+        assert!(path.exists());
+    }
+}
+
+/// A two-member v1 transaction predates the payload. Recover it using its exact
+/// old digests and retain any independent payload, with no v2 member assumption.
+#[cfg(target_os = "macos")]
+#[test]
+fn historic_v1_marker_recovers_the_exact_old_pair() {
+    for phase in [
+        "prepared",
+        "backup_daemon",
+        "backups_ready",
+        "daemon_installed",
+        "pair_installed",
+        "daemon_writable",
+        "pair_writable",
+        "pair_synced",
+        "pair_verified",
+        "restart_pending",
+        "drain_signaled",
+        "lock_released",
+        "child_spawned",
+        "rolling_back",
+        "finalizing",
+    ] {
+        let install = install_fixture();
+        fs::remove_file(install.path().join("haider-tui")).expect("old install has no payload");
+        let layout = InstallLayout::for_test(install.path().to_path_buf());
+        let old = pair_snapshot(install.path());
+        let cli_digest = sha256_file(&layout.haider).expect("old CLI hash");
+        let daemon_digest = sha256_file(&layout.haiderd).expect("old daemon hash");
+        let backup_cli = ".haider-old-123-456";
+        let backup_daemon = ".haiderd-old-123-456";
+        fs::hard_link(&layout.haider, install.path().join(backup_cli)).expect("legacy CLI backup");
+        fs::hard_link(&layout.haiderd, install.path().join(backup_daemon))
+            .expect("legacy daemon backup");
+        let new_cli = install.path().join("new-cli-source");
+        let new_daemon = install.path().join("new-daemon-source");
+        write_executable(&new_cli, b"new-cli");
+        write_executable(&new_daemon, b"new-daemon");
+        fs::rename(new_cli, &layout.haider).expect("install target CLI");
+        fs::rename(new_daemon, &layout.haiderd).expect("install target daemon");
+        let target = pair_snapshot(install.path());
+        let marker = serde_json::json!({
+            "schema": "haider.update.transaction.v1",
+            "transaction_id": "123-456", "old_version": "1.0.0", "target_version": "9.0.0",
+            "old_haider_digest": cli_digest, "old_haiderd_digest": daemon_digest,
+            "target_haider_digest": sha256_file(&layout.haider).expect("target CLI hash"),
+            "target_haiderd_digest": sha256_file(&layout.haiderd).expect("target daemon hash"),
+            "source_archive_digest": "0".repeat(64), "backup_haider": backup_cli, "backup_haiderd": backup_daemon,
+            "phase": phase,
+        });
+        fs::write(
+            marker_path(&layout),
+            serde_json::to_vec(&marker).expect("legacy marker JSON"),
+        )
+        .expect("legacy marker");
+        set_mode(&marker_path(&layout), 0o600);
+        let recovered = PreparedTransaction::acquire(layout.clone())
+            .unwrap_or_else(|error| panic!("v1 {phase}: {error}"));
+        assert_eq!(
+            pair_snapshot(install.path()),
+            if phase == "finalizing" { target } else { old },
+            "v1 {phase}"
+        );
+        assert!(!marker_path(&layout).exists());
+        assert!(!install.path().join(backup_cli).exists());
+        assert!(!install.path().join(backup_daemon).exists());
+        drop(recovered);
+    }
+}
+
+struct CliLastObserver {
+    install: PathBuf,
+    saw_payload: AtomicBool,
+    saw_cli: AtomicBool,
+}
+
+impl FaultInjector for CliLastObserver {
+    fn after(&self, boundary: CommitBoundary) -> Result<(), UpdateError> {
+        if boundary == CommitBoundary::RenameTui {
+            assert_eq!(
+                fs::read(self.install.join("haiderd")).expect("daemon published first"),
+                b"new-daemon"
+            );
+            assert_eq!(
+                fs::read(self.install.join("haider-tui")).expect("payload published second"),
+                b"new-tui"
+            );
+            assert_eq!(
+                fs::read(self.install.join("haider")).expect("old CLI retained"),
+                b"old-cli"
+            );
+            self.saw_payload.store(true, Ordering::SeqCst);
+        }
+        if boundary == CommitBoundary::RenameCli {
+            assert!(self.saw_payload.load(Ordering::SeqCst));
+            assert_eq!(
+                fs::read(self.install.join("haider")).expect("CLI published last"),
+                b"new-cli"
+            );
+            self.saw_cli.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn transaction_publishes_payload_before_thin_cli() {
+    let install = install_fixture();
+    let layout = InstallLayout::for_test(install.path().to_path_buf());
+    let pair = verified_pair(install.path());
+    let prepared = PreparedTransaction::acquire(layout).expect("prepare");
+    let observer = CliLastObserver {
+        install: install.path().to_path_buf(),
+        saw_payload: AtomicBool::new(false),
+        saw_cli: AtomicBool::new(false),
+    };
+    let mut committed =
+        commit_pair(prepared, pair, &observer, &BytePairVerifier, "1.0.0").expect("commit");
+    assert!(observer.saw_cli.load(Ordering::SeqCst));
+    committed.finalize().expect("finalize bundle");
+}
+
+/// MUTATION CHECK: validate the payload restore source after restoring another
+/// member. Expected runtime failure: corrupt payload backup changes live bytes.
+#[cfg(target_os = "macos")]
+#[test]
+fn corrupt_payload_backup_refuses_recovery_before_any_restore() {
+    let install = install_fixture();
+    let layout = InstallLayout::for_test(install.path().to_path_buf());
+    let pair = verified_pair(install.path());
+    let prepared = PreparedTransaction::acquire(layout.clone()).expect("prepare");
+    let committed =
+        commit_pair(prepared, pair, &NoFaults, &BytePairVerifier, "1.0.0").expect("commit");
+    let before = pair_snapshot(install.path());
+    let backup = find_entry(install.path(), ".haider-tui-old-");
+    fs::write(&backup, b"corrupt-payload-backup").expect("corrupt backup");
+    drop(committed);
+    assert!(PreparedTransaction::acquire(layout.clone()).is_err());
+    assert_eq!(pair_snapshot(install.path()), before);
+    assert!(marker_path(&layout).exists());
+    for member in BUNDLE_MEMBERS {
+        assert!(has_entry(install.path(), &member.backup_prefix()));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn interrupted_pair_migration_recovers_absence_and_finalized_migration_keeps_payload() {
+    for finalize in [false, true] {
+        let install = install_fixture();
+        fs::remove_file(install.path().join("haider-tui")).expect("historic payload absence");
+        let old = pair_snapshot(install.path());
+        let layout = InstallLayout::for_test(install.path().to_path_buf());
+        let pair = verified_pair(install.path());
+        let prepared = PreparedTransaction::acquire(layout.clone()).expect("prepare migration");
+        let mut committed = commit_pair(prepared, pair, &NoFaults, &BytePairVerifier, "1.0.0")
+            .expect("commit migration");
+        let target = pair_snapshot(install.path());
+        if finalize {
+            committed
+                .set_phase(TransactionPhase::Finalizing)
+                .expect("durable success decision");
+        }
+        drop(committed);
+        let recovered = PreparedTransaction::acquire(layout.clone()).expect("recover migration");
+        assert_eq!(
+            pair_snapshot(install.path()),
+            if finalize { target } else { old }
+        );
+        assert!(!marker_path(&layout).exists());
+        for member in BUNDLE_MEMBERS {
+            assert!(!has_entry(install.path(), &member.backup_prefix()));
+        }
+        drop(recovered);
+    }
+}
+
+/// Embedded bootstrap staging has the same pre-transaction failure boundary
+/// as a downloaded bundle, including empty embedded members and unsafe sources.
+#[cfg(target_os = "macos")]
+#[test]
+fn invalid_embedded_bundle_never_mutates_installed_members() {
+    use cli_main::update::staging::stage_embedded_bundle;
+    for missing_payload in [false, true] {
+        let install = install_fixture();
+        let before = pair_snapshot(install.path());
+        let (thin, payload): (&[u8], &[u8]) = if missing_payload {
+            (b"thin", b"")
+        } else {
+            (b"", b"payload")
+        };
+        let result = stage_embedded_bundle(
+            thin,
+            payload,
+            &install.path().join("haiderd"),
+            install.path(),
+            "9.0.0",
+        );
+        assert!(
+            matches!(result, Err(UpdateError::Refused(message)) if message == "embedded executable is empty or oversized")
+        );
+        assert_eq!(pair_snapshot(install.path()), before);
+        assert!(!has_entry(install.path(), ".haider-update"));
+    }
+    let install = install_fixture();
+    let before = pair_snapshot(install.path());
+    let daemon_alias = install.path().join("daemon-alias");
+    std::os::unix::fs::symlink(install.path().join("haiderd"), &daemon_alias)
+        .expect("unsafe source link");
+    let result = stage_embedded_bundle(b"thin", b"payload", &daemon_alias, install.path(), "9.0.0");
+    assert!(
+        matches!(result, Err(UpdateError::Refused(message)) if message.contains("not a trusted bounded regular file"))
+    );
+    assert_eq!(pair_snapshot(install.path()), before);
+    assert!(!has_entry(install.path(), ".haider-update"));
+}
+
 fn install_fixture() -> tempfile::TempDir {
     let install = tempfile::tempdir().expect("install fixture");
     write_executable(&install.path().join("haider"), b"old-cli");
     write_executable(&install.path().join("haiderd"), b"old-daemon");
+    write_executable(&install.path().join("haider-tui"), b"old-tui");
     install
 }
 
@@ -1230,10 +1828,13 @@ struct FileSnapshot {
     inode: u64,
 }
 
-fn pair_snapshot(dir: &Path) -> (FileSnapshot, FileSnapshot) {
+fn pair_snapshot(dir: &Path) -> (FileSnapshot, FileSnapshot, Option<FileSnapshot>) {
     (
         snapshot(&dir.join("haider")),
         snapshot(&dir.join("haiderd")),
+        dir.join("haider-tui")
+            .exists()
+            .then(|| snapshot(&dir.join("haider-tui"))),
     )
 }
 

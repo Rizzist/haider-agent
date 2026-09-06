@@ -79,7 +79,7 @@ jobs:
           }
       - name: build
         if: runner.os != 'Windows'
-        run: cargo build --release --locked -p haider-cli -p haider-daemond --target ${{ matrix.target }}
+        run: cargo build --release --locked -p haider-cli -p haider-tui-exe -p haider-daemond --target ${{ matrix.target }}
       # WINDOWS ONLY: thin LTO across 16 codegen units instead of fat LTO in one.
       #
       # v0.0.965 added russh for cross-platform SSH, which pulls 76 crates of
@@ -108,7 +108,7 @@ jobs:
         env:
           CARGO_PROFILE_RELEASE_LTO: thin
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
-        run: cargo build --release --locked -p haider-cli -p haider-daemond --target ${{ matrix.target }}
+        run: cargo build --release --locked -p haider-cli -p haider-tui-exe -p haider-daemond --target ${{ matrix.target }}
       - name: build Wayland portal companion (Linux only)
         if: runner.os == 'Linux'
         run: cargo build --release --locked -p haider-tools --bin haider-wayland-portal --target ${{ matrix.target }}
@@ -170,17 +170,40 @@ jobs:
             target/${{ matrix.target }}/release/haiderd
 
           codesign --verify --strict --verbose=4 target/${{ matrix.target }}/release/haider
+          codesign --force --options runtime --timestamp \
+            --sign "$IDENTITY" \
+            --identifier ai.haidercode.haider-tui \
+            target/${{ matrix.target }}/release/haider-tui
+          codesign --verify --strict --verbose=4 target/${{ matrix.target }}/release/haider-tui
           codesign --verify --strict --verbose=4 target/${{ matrix.target }}/release/haiderd
+
+          # Installed <=969 updaters accept exactly haider + haiderd. Embed the
+          # already signed split executables as data, then sign this legacy
+          # entry point. Its staging probes are read-only; first normal use
+          # publishes the embedded bundle through the same durable transaction.
+          HAIDER_THIN_EXE="$PWD/target/${{ matrix.target }}/release/haider" \
+          HAIDER_TUI_EXE="$PWD/target/${{ matrix.target }}/release/haider-tui" \
+            cargo build --release --locked -p haider-compat \
+              --features embedded-bundle --target ${{ matrix.target }}
+          codesign --force --options runtime --timestamp \
+            --identifier ai.haidercode.haider.compat \
+            --sign "$IDENTITY" \
+            target/${{ matrix.target }}/release/haider-compat
+          codesign --verify --strict --verbose=4 target/${{ matrix.target }}/release/haider-compat
+          target/${{ matrix.target }}/release/haider-compat self-test | grep '"ok":true'
       - name: smoke (binary runs + self-test; strict version match on tag builds)
         shell: bash
         run: |
           EXE=""; [ "$RUNNER_OS" = "Windows" ] && EXE=".exe"
           BIN=target/${{ matrix.target }}/release/haider$EXE
+          TBIN=target/${{ matrix.target }}/release/haider-tui$EXE
+          "$TBIN" --version
           "$BIN" self-test | grep '"ok":true'
           if [ "$RUNNER_OS" != "Windows" ]; then file "$BIN"; fi
           if [ "${{ github.event_name }}" = "push" ]; then
             TAG="${GITHUB_REF_NAME#v}"
             test "$("$BIN" --version)" = "haider $TAG"
+            test "$("$TBIN" --version)" = "haider-tui $TAG"
           else
             "$BIN" --version
           fi
@@ -249,6 +272,8 @@ jobs:
           RESULT="$RUNNER_TEMP/haider-notarization-result.json"
           mkdir -p "$PAYLOAD"
           cp target/${{ matrix.target }}/release/haider "$PAYLOAD/"
+          cp target/${{ matrix.target }}/release/haider-tui "$PAYLOAD/"
+          cp target/${{ matrix.target }}/release/haider-compat "$PAYLOAD/"
           cp target/${{ matrix.target }}/release/haiderd "$PAYLOAD/"
           ditto -c -k --keepParent "$PAYLOAD" "$ARCHIVE"
 
@@ -298,15 +323,14 @@ jobs:
         run: |
           EXE=""; [ "$RUNNER_OS" = "Windows" ] && EXE=".exe"
           BIN=target/${{ matrix.target }}/release/haider$EXE
+          TBIN=target/${{ matrix.target }}/release/haider-tui$EXE
           DBIN=target/${{ matrix.target }}/release/haiderd$EXE
           WBIN=target/${{ matrix.target }}/release/haider-wayland-portal
           REF="${GITHUB_REF_NAME:-manual}"
-          NAME=haider-${REF}-${{ matrix.target }}
+          NAME=haider-${REF}-${{ matrix.target }}-split
           mkdir -p dist/$NAME
-          # BOTH binaries: bare `haider` spawns the SIBLING `haiderd` next to
-          # current_exe() (haider-client/src/spawn.rs) — a bundle without the
-          # daemon cannot enter live mode (v0.0.12 first-cut gap).
-          cp "$BIN" "$DBIN" dist/$NAME/
+          # All runtime siblings belong to the same versioned split bundle.
+          cp "$BIN" "$TBIN" "$DBIN" dist/$NAME/
           if [ "$RUNNER_OS" = "Linux" ]; then cp "$WBIN" dist/$NAME/; fi
           if [ "$RUNNER_OS" = "Windows" ]; then
             # haider.exe is a CONSOLE binary. Double-clicked from Explorer,
@@ -356,9 +380,9 @@ jobs:
               '  SHA-256 next to the zip:' \
               '      certutil -hashfile <the-zip-you-downloaded> SHA256' \
               '' \
-              'KEEP BOTH FILES TOGETHER' \
-              '  haider.exe starts haiderd.exe from its own folder. Moving one' \
-              '  without the other breaks it. To put haider on PATH, add this' \
+              'KEEP ALL THREE FILES TOGETHER' \
+              '  haider.exe starts haider-tui.exe and haiderd.exe from its folder.' \
+              '  Moving any sibling breaks it. To put haider on PATH, add this' \
               '  whole folder rather than copying haider.exe elsewhere.' \
               '' \
               'Source, releases and issues:' \
@@ -371,6 +395,25 @@ jobs:
             tar -C dist -cJf dist/$NAME.tar.xz $NAME
             (cd dist && shasum -a 256 "$NAME.tar.xz" > "$NAME.tar.xz.sha256")
           fi
+      - name: verify complete split archive and checksum
+        shell: bash
+        run: |
+          EXT=tar.xz; [ "$RUNNER_OS" = "Windows" ] && EXT=zip
+          NAME=haider-${GITHUB_REF_NAME:-manual}-${{ matrix.target }}-split
+          python scripts/release_packaging.py verify-bundle --artifact "dist/$NAME.$EXT" --target "${{ matrix.target }}"
+      - name: package compatibility assets for installed two-member macOS updaters
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME=haider-${GITHUB_REF_NAME:-manual}-${{ matrix.target }}
+          mkdir -p "dist/$NAME"
+          cp target/${{ matrix.target }}/release/haider-compat "dist/$NAME/haider"
+          cp target/${{ matrix.target }}/release/haiderd "dist/$NAME/haiderd"
+          tar -C dist -cJf "dist/$NAME.tar.xz" "$NAME"
+          (cd dist && shasum -a 256 "$NAME.tar.xz" > "$NAME.tar.xz.sha256")
+          python3 scripts/release_packaging.py verify-legacy-bundle \
+            --artifact "dist/$NAME.tar.xz" --target ${{ matrix.target }}
       - name: upload distribution archives
         uses: actions/upload-artifact@v4
         with:
@@ -572,11 +615,11 @@ jobs:
           export SHA_LINUX_ARM64
           export SHA_LINUX_X64
           export SHA_WIN_X64
-          SHA_DARWIN_ARM=$(sha_file "haider-v${VERSION}-aarch64-apple-darwin.tar.xz")
-          SHA_DARWIN_X64=$(sha_file "haider-v${VERSION}-x86_64-apple-darwin.tar.xz")
-          SHA_LINUX_ARM64=$(sha_file "haider-v${VERSION}-aarch64-unknown-linux-gnu.tar.xz")
-          SHA_LINUX_X64=$(sha_file "haider-v${VERSION}-x86_64-unknown-linux-gnu.tar.xz")
-          SHA_WIN_X64=$(sha_file "haider-v${VERSION}-x86_64-pc-windows-msvc.zip")
+          SHA_DARWIN_ARM=$(sha_file "haider-v${VERSION}-aarch64-apple-darwin-split.tar.xz")
+          SHA_DARWIN_X64=$(sha_file "haider-v${VERSION}-x86_64-apple-darwin-split.tar.xz")
+          SHA_LINUX_ARM64=$(sha_file "haider-v${VERSION}-aarch64-unknown-linux-gnu-split.tar.xz")
+          SHA_LINUX_X64=$(sha_file "haider-v${VERSION}-x86_64-unknown-linux-gnu-split.tar.xz")
+          SHA_WIN_X64=$(sha_file "haider-v${VERSION}-x86_64-pc-windows-msvc-split.zip")
 
           python3 scripts/release_packaging.py repin-manifests \
             --packaging-root packaging \
@@ -691,7 +734,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $Version = $env:GITHUB_REF_NAME.TrimStart('v')
           $Target = 'x86_64-pc-windows-msvc'
-          $Zip = "haider-v$Version-$Target.zip"
+          $Zip = "haider-v$Version-$Target-split.zip"
           $ArtifactPath = "artifacts\$Zip"
           python scripts\release_packaging.py render-chocolatey `
             --source packaging\chocolatey `

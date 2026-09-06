@@ -25,7 +25,7 @@ brew trust Rizzist/tap
 Upgrades work normally (`brew upgrade haidercode`), which the previous raw-URL
 install did not support.
 
-The formula installs `haider` and its required sibling `haiderd` together. On
+The formula installs `haider` and its required siblings `haider-tui` and `haiderd` together. On
 Linux it also installs `haider-wayland-portal`. macOS assets are Developer ID
 signed and Apple-notarized; Linux assets are currently unsigned and are verified
 with their release SHA-256 values.

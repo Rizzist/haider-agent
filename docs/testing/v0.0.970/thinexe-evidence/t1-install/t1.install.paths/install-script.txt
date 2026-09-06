@@ -1,0 +1,6 @@
+argv=['/bin/sh', '/Users/rizzist/haider-run/lane-970-thinexe/scripts/install.sh']
+returncode=56 timed_out=False wall_ms=1165
+--- stdout ---
+Downloading haider-v0.0.970-aarch64-apple-darwin-split.tar.xz
+--- stderr ---
+curl: (56) The requested URL returned error: 404

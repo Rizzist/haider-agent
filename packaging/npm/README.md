@@ -14,7 +14,7 @@ release workflow replaces that placeholder with `X.Y.Z` immediately before
 
 The postinstall script downloads the platform archive from the matching GitHub
 release, verifies its release-provided SHA-256 sidecar, and stores `haider` and
-its required sibling daemon `haiderd` together under this package's `vendor/`
+its required siblings `haider-tui` and `haiderd` together under this package's `vendor/`
 directory. Linux packages also retain `haider-wayland-portal`.
 
 macOS release binaries are Developer ID signed and Apple-notarized. Linux and

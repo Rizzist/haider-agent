@@ -1,0 +1,50 @@
+error[E0004]: non-exhaustive patterns: `BundleMember::WaylandPortal` not covered
+   --> crates/haider-cli/tests/update_tests.rs:450:29
+    |
+450 |         let failure = match member {
+    |                             ^^^^^^ pattern `BundleMember::WaylandPortal` not covered
+    |
+note: `BundleMember` defined here
+   --> crates/haider-cli/tests/../src/update/members.rs:4:10
+    |
+  4 | pub enum BundleMember {
+    |          ^^^^^^^^^^^^
+...
+  8 |     WaylandPortal = 3,
+    |     ------------- not covered
+    = note: the matched value is of type `BundleMember`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+    |
+453 ~             BundleMember::Daemon => VerifyFailure::SmokeDaemon,
+454 ~             BundleMember::WaylandPortal => todo!(),
+    |
+
+error[E0004]: non-exhaustive patterns: `TransactionPhase::BackupPortal`, `TransactionPhase::PortalInstalled` and `TransactionPhase::PortalWritable` not covered
+    --> crates/haider-cli/tests/update_tests.rs:1121:11
+     |
+1121 |     match phase {
+     |           ^^^^^ patterns `TransactionPhase::BackupPortal`, `TransactionPhase::PortalInstalled` and `TransactionPhase::PortalWritable` not covered
+     |
+note: `TransactionPhase` defined here
+    --> crates/haider-cli/tests/../src/update/transaction.rs:349:10
+     |
+ 349 | pub enum TransactionPhase {
+     |          ^^^^^^^^^^^^^^^^
+...
+ 353 |     BackupPortal,
+     |     ------------ not covered
+...
+ 357 |     PortalInstalled,
+     |     --------------- not covered
+...
+ 361 |     PortalWritable,
+     |     -------------- not covered
+     = note: the matched value is of type `TransactionPhase`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern, a match arm with multiple or-patterns as shown, or multiple match arms
+     |
+1214 ~         },
+1215 +         TransactionPhase::BackupPortal | TransactionPhase::PortalInstalled | TransactionPhase::PortalWritable => todo!()
+     |
+
+For more information about this error, try `rustc --explain E0004`.
+error: could not compile `haider-cli` (test "update_tests") due to 2 previous errors

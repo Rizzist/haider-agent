@@ -6,9 +6,7 @@ use haider_client::{
     ClientConfig, ConnectError, Connected, ConnectionState, ResolvedProfile, RpcClient, connect,
     required_live_features, spawn_daemon_retained,
 };
-use haider_protocol::error::ErrorCode;
 use haider_rpc::{LifecyclePhase, Welcome, WireFrame};
-use haider_store::Store;
 use std::collections::BTreeSet;
 use std::process::Child;
 use std::time::Duration;
@@ -20,7 +18,7 @@ const LOCK_DEADLINE: Duration = Duration::from_secs(20);
 const HEALTH_DEADLINE: Duration = Duration::from_secs(30);
 const POLL_BACKOFF: Duration = Duration::from_millis(50);
 
-pub(crate) trait RestartHooks {
+pub trait RestartHooks {
     /// Must synchronously observe both canonical paths before any other
     /// restart action is allowed.
     fn observe_committed_pair(&self, committed: &CommittedUpdate) -> Result<(), UpdateError>;
@@ -43,16 +41,14 @@ impl RestartHooks for SystemRestartHooks {
     }
 }
 
-pub(crate) struct Incumbent {
+pub struct Incumbent {
     client: RpcClient,
     events: mpsc::Receiver<WireFrame>,
     welcome: Welcome,
     pid: u32,
 }
 
-pub(crate) async fn detect_incumbent(
-    profile: &ResolvedProfile,
-) -> Result<Option<Incumbent>, UpdateError> {
+pub async fn detect_incumbent(profile: &ResolvedProfile) -> Result<Option<Incumbent>, UpdateError> {
     let mut config = ClientConfig {
         client_name: "haider-update".into(),
         client_instance_id: format!("update-{}", std::process::id()),
@@ -103,7 +99,7 @@ fn incumbent_from_connected(
 /// SIGTERM. A drain timeout retains marker/backups and sends no second signal.
 /// Health failure stops/reaps the retained child, restores both backups, and
 /// starts the old sibling before returning [`UpdateError::Health`].
-pub(crate) async fn restart_committed(
+pub async fn restart_committed(
     committed: &mut CommittedUpdate,
     incumbent: Option<Incumbent>,
     profile: &ResolvedProfile,
@@ -120,7 +116,7 @@ pub(crate) async fn restart_committed(
 
 #[cfg(test)]
 #[allow(dead_code)]
-pub(crate) async fn restart_committed_for_test<H: RestartHooks>(
+pub async fn restart_committed_for_test<H: RestartHooks>(
     committed: &mut CommittedUpdate,
     incumbent: Option<Incumbent>,
     profile: &ResolvedProfile,
@@ -294,16 +290,12 @@ async fn wait_for_profile_lock(
 ) -> Result<(), UpdateError> {
     let deadline = Instant::now() + timeout;
     loop {
-        match Store::acquire_profile(&profile.store_dir) {
-            Ok(lease) => {
-                drop(lease);
-                return Ok(());
-            }
-            Err(error) if error.code == ErrorCode::StoreLocked => {}
+        match haider_client::profile_lock::profile_lock_held(&profile.store_dir) {
+            Ok(false) => return Ok(()),
+            Ok(true) => {}
             Err(error) => {
                 return Err(UpdateError::Io(format!(
-                    "cannot prove profile lock release: {}",
-                    error.message
+                    "cannot prove profile lock release: {error}"
                 )));
             }
         }

@@ -1792,7 +1792,7 @@ fn adapt_events_to(
                 // provisional Created sequence.
                 if client_turn_trace_enabled() {
                     turn_trace = Some((
-                        haider_core::turn_trace_ordinal(&session_id, head_seq),
+                        haider_protocol::trace::turn_trace_ordinal(&session_id, head_seq),
                         Instant::now(),
                     ));
                 }
@@ -2105,7 +2105,7 @@ fn write_run_json(mut output: impl Write, result: &HeadlessRunResult) -> io::Res
 /// everything else stays silent. Non-interactive/piped runs emit nothing (the
 /// non-tty suppression law).
 fn emit_headless_attention(result: &HeadlessRunResult) {
-    use haider_tui::notify::{self, Attention};
+    use haider_client::notify::{self, Attention};
     let attention = match result.outcome {
         HeadlessOutcome::Done => Attention::Done,
         HeadlessOutcome::Errored => Attention::Errored,

@@ -1,0 +1,12 @@
+[
+  {
+    "path": "target/release/deps/haider-7389042a0dec5cdc.dSYM",
+    "bytes": 157452704,
+    "reason": "obsolete baseline 969 debug-symbol cache; frozen baseline executables retained unchanged"
+  },
+  {
+    "path": "target/release/deps/haiderd-580a50cc79d46688.dSYM",
+    "bytes": 263951196,
+    "reason": "obsolete baseline 969 debug-symbol cache; frozen baseline executables retained unchanged"
+  }
+]

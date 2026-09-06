@@ -21,13 +21,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use haider_client::notify::mask_text;
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorPresentation;
 use haider_protocol::history::NodeKind;
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::pipe::{TranscriptJoiner, TranscriptProjector, escape_pipe_field};
-use haider_tui::notify::mask_text;
 use serde_json::{Value, json};
 
 /// The session-level facts an export needs, sourced from the durable

@@ -28,11 +28,20 @@ class Haider < Formula
     bundle = Dir["haider-v#{version}-*"].first
     source = bundle || "."
     bin.install "#{source}/haider", "#{source}/haiderd"
+    # Keep the currently published legacy pin installable until release CI
+    # re-pins this formula to the first split archive.
+    if version >= Version.new("0.0.970")
+      bin.install "#{source}/haider-tui"
+    end
     portal = "#{source}/haider-wayland-portal"
     bin.install portal if OS.linux? && File.exist?(portal)
   end
 
   test do
-    assert_match version.to_s, shell_output("#{bin}/haider --version")
+    assert_equal "haider #{version}\n", shell_output("#{bin}/haider --version")
+    assert_equal "haiderd #{version}\n", shell_output("#{bin}/haiderd --version")
+    if version >= Version.new("0.0.970")
+      assert_equal "haider-tui #{version}\n", shell_output("#{bin}/haider-tui --version")
+    end
   end
 end

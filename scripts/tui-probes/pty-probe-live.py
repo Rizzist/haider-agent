@@ -52,8 +52,9 @@ here = os.path.dirname(os.path.abspath(__file__))
 root = os.path.abspath(os.path.join(here, "..", ".."))
 haider = sys.argv[3] if len(sys.argv) > 3 else os.path.join(root, "target/release/haider")
 haiderd = sys.argv[4] if len(sys.argv) > 4 else os.path.join(root, "target/release/haiderd")
+haider_tui = os.path.join(os.path.dirname(os.path.abspath(haider)), "haider-tui")
 
-for binary in (haider, haiderd):
+for binary in (haider, haiderd, haider_tui):
     if not os.access(binary, os.X_OK):
         print(f"live-probe: missing binary {binary}", file=sys.stderr)
         sys.exit(2)
@@ -118,12 +119,13 @@ os.makedirs(profile, exist_ok=True)
 store = os.path.join(profile, "profile")
 os.makedirs(store, exist_ok=True)
 
-# `haider` spawns its SIBLING haiderd (never one from PATH), so the probe
-# runs both from a private directory it controls.
+# `haider` resolves its sibling daemon and TUI payload, never PATH copies,
+# so the probe stages the complete runtime bundle in its private directory.
 bindir = os.path.join(profile, "bin")
 os.makedirs(bindir, exist_ok=True)
 shutil.copy2(haider, os.path.join(bindir, "haider"))
 shutil.copy2(haiderd, os.path.join(bindir, "haiderd"))
+shutil.copy2(haider_tui, os.path.join(bindir, "haider-tui"))
 probe_haider = os.path.join(bindir, "haider")
 
 def write(fd, data):
