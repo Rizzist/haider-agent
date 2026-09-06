@@ -1,0 +1,10 @@
+{
+  "base": "b8635f88",
+  "incoming": "229122b552e6c1583cf930b47923bb05e2ab0def",
+  "files": [
+    "packaging/chocolatey/haider.nuspec",
+    "scripts/release_packaging.py",
+    "scripts/tests/test_release_packaging.py"
+  ],
+  "all_incoming_paths_exact": true
+}

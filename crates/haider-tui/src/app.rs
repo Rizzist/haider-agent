@@ -3582,6 +3582,18 @@ pub enum AppRequest {
     Interrupt {
         branch: Option<haider_protocol::ids::BranchId>,
     },
+    /// escretract (v0.0.970 owner QoL): Esc BEFORE the first response token —
+    /// cancel the run AND take the prompt back into the composer to edit and
+    /// resend. `turn.retract`, not `turn.cancel`.
+    ///
+    /// The reducer never decides the outcome: a prompt whose response won the
+    /// durable writer race comes back typed `too_late` and the driver falls
+    /// back to one ordinary cancel for the SAME run, leaving the transcript
+    /// exactly as a plain Esc would have. `branch` is captured at issuance
+    /// (B2b) — client-side identity; the wire pins the run by `run_id`.
+    RetractPrompt {
+        branch: Option<haider_protocol::ids::BranchId>,
+    },
     /// Manual `/compact` (sim tui.js:1791-1806). `branch` is captured at
     /// issuance (B2b): a later switch cannot retarget the compaction.
     Compact {
@@ -5409,6 +5421,16 @@ pub struct AppModel {
     pub requests: Vec<AppRequest>,
     /// True while a demo turn is playing (submits are ignored, honestly).
     pub turn_active: bool,
+    /// escretract: a `turn.retract` is in flight and its outcome is unknown.
+    ///
+    /// The prompt bytes are still ONLY on the wire — the transcript row is
+    /// going away and the composer has not been seeded yet — so a second
+    /// Enter here would resend a prompt that may still be accepted. Submit is
+    /// refused for exactly this window, which the daemon closes in one round
+    /// trip (retract receipt, `too_late` → cancel receipt, or a typed
+    /// failure). Every one of those paths clears it, and so does a disconnect,
+    /// so Enter can never be left permanently dead.
+    pub retract_pending: bool,
     /// Wheel scroll-back offset in the session transcript (0 = follow
     /// bottom; wheel up increases, wheel down decreases). A `Cell` because
     /// RENDER is the single scroll authority (review r3 P2-2). The wheel
@@ -5747,6 +5769,7 @@ impl Default for AppModel {
             outbox: Vec::new(),
             requests: Vec::new(),
             turn_active: false,
+            retract_pending: false,
             scroll_back: std::cell::Cell::new(0),
             bottom_watermark: std::cell::Cell::new(0),
             scroll_max: std::cell::Cell::new(0),
@@ -8667,6 +8690,19 @@ impl AppModel {
                     // held queue drops with the turn (sim tui.js:1557).
                     self.turn_active = false;
                     self.msg_queue.clear();
+                    // escretract (owner QoL 2026-09-03): before the first
+                    // response token Esc RETRACTS — the run is cancelled and
+                    // the prompt comes back to the composer to edit and
+                    // resend. Once a token has landed it is a plain cancel:
+                    // the message and the partial reply both stay.
+                    if self.can_retract_prompt() {
+                        self.retract_pending = true;
+                        self.requests.push(AppRequest::RetractPrompt {
+                            branch: self.branch_state.active().cloned(),
+                        });
+                        self.dirty = true;
+                        return;
+                    }
                     self.requests.push(AppRequest::Interrupt {
                         branch: self.branch_state.active().cloned(),
                     });
@@ -9120,6 +9156,25 @@ impl AppModel {
         // Slash submits take SILENTLY — execute_slash records the
         // canonical form (review P3-9, one entry per invocation).
         let is_slash = self.composer.text().trim().starts_with('/');
+        // escretract: a `turn.retract` is on the wire and its outcome is not
+        // known yet. The prompt may still be accepted, so a second Enter here
+        // would resend a turn that is still in flight — and the retract
+        // receipt is about to seed this composer anyway. Refuse BEFORE the
+        // take so the draft survives untouched; the daemon closes this window
+        // in one round trip. Slash commands issue no turn and pass.
+        // Scoped exactly like the B4b upload guard below: the retraction
+        // belongs to the SESSION surface. An open menu still needs its answer,
+        // and the launcher's Enter must keep working — `retract_pending` is
+        // model-global and outlives a surface switch by up to one round trip.
+        if !is_slash
+            && self.retract_pending
+            && self.screen == Screen::Session
+            && self.projection.open_menu().is_none()
+        {
+            self.flash = Some("· retracting the prompt — a moment".to_owned());
+            self.dirty = true;
+            return;
+        }
         // B4b: a REAL turn must not ride while a chip's upload is still
         // in flight — its block has no verified ref yet and a submit
         // without it would silently shed the attachment. Refuse BEFORE
@@ -15711,6 +15766,30 @@ impl AppModel {
                 // registry (they surface only on `/hooks` and the decision
                 // chip; every transcript surface keeps the display gate).
                 self.hook_facts.note_envelope(envelope);
+                // escretract: the first-response boundary is the SAME class of
+                // fact — `render.ui == false` turn-control truth, recorded for
+                // Apply AND Skip. It decides whether the next Esc retracts the
+                // prompt or plainly cancels, and no display surface moves for
+                // it.
+                // Both are scoped to THIS session's own turns, exactly as the
+                // prompt-history recorder below is: the daemon stamps
+                // `agent_id` on both facts, and a subagent's first response
+                // must not close the parent's editing window, nor its
+                // retraction disturb the parent's prompt chooser.
+                if envelope.agent_id.is_none()
+                    && !crate::session::route_response_boundary(&mut self.projection, envelope)
+                    // escretract: prompt history is a SEPARATE surface from
+                    // the transcript, with its own durable coordinates, so the
+                    // retraction fact has to drop the recalled prompt here as
+                    // well — on live delivery and on replay alike. The
+                    // projection's own row removal stays where it is.
+                    && let Some(fact) =
+                        haider_protocol::retraction::PromptRetractedV1::from_payload_value(
+                            &envelope.payload,
+                        )
+                {
+                    self.forget_retracted_prompt(fact.prompt_seq);
+                }
                 if let crate::branch::AdmittedNote::BranchInstalled(id) = &note {
                     // The daemon's journal fact is the ONLY materializer;
                     // if OUR fork's receipt already armed activation, the
@@ -16904,6 +16983,131 @@ impl AppModel {
         }
         self.flash = Some(note);
         true
+    }
+
+    /// escretract: may THIS Esc retract the prompt instead of plainly
+    /// cancelling the run?
+    ///
+    /// Three conditions, each necessary:
+    /// - the daemon advertises `turn_retract_v1` — an older daemon has no such
+    ///   method and the wire gate would reject the frame outright;
+    /// - this client is not fabricating its own turns — a demo/mock turn has
+    ///   no durable prompt for a daemon to hand back (the fabrication law);
+    /// - this run has committed no first-response boundary yet.
+    ///
+    /// The last read is deliberately OPTIMISTIC: it is only ever as fresh as
+    /// the last envelope this client received, so a boundary committed while
+    /// the keystroke was in flight still looks open here. That race is not
+    /// won by guessing harder — the daemon answers typed `too_late` and the
+    /// driver falls back to one ordinary cancel for the same run.
+    #[must_use]
+    pub fn can_retract_prompt(&self) -> bool {
+        !self.mode.fabricates_locally()
+            && self.daemon_serves(haider_rpc::FEATURE_TURN_RETRACT_V1)
+            && !self.projection.response_started()
+    }
+
+    /// escretract: the retraction is over, however it ended — re-enable
+    /// submit. Every terminal path calls this, including the `too_late`
+    /// fallback's cancel receipt and a dropped socket, so Enter is never
+    /// left permanently dead.
+    pub const fn retract_settled(&mut self) {
+        self.retract_pending = false;
+    }
+
+    /// escretract: drop a retracted prompt from the Esc-Esc chooser.
+    ///
+    /// The daemon's projection hides the transcript row, but prompt history is
+    /// a SEPARATE surface with its own durable coordinates. Leaving the row
+    /// there would offer a prompt the daemon says never happened — and a
+    /// `session.fork` at its hidden cut is refused, so the entry could only
+    /// disappoint. Keyed by the exact `prompt_seq`, never by text: equal text
+    /// in another turn must survive.
+    pub fn forget_retracted_prompt(&mut self, prompt_seq: u64) {
+        self.prompt_history
+            .retain(|entry| entry.seq != Some(prompt_seq));
+        self.close_backtrack();
+    }
+
+    /// escretract: the daemon gave the prompt back — seed the composer with it
+    /// so the user can edit and resend.
+    ///
+    /// Attachments are restored from the receipt's CAS blocks exactly as a
+    /// fork's draft is: the bytes are already content-addressed and verified,
+    /// so the chips carry the daemon's own blocks and NO upload is issued.
+    ///
+    /// Anything the user typed during the (one round trip, submit-disabled)
+    /// window is kept and follows the restored prompt — the retraction must
+    /// never cost the user text, and that includes text it did not author.
+    ///
+    /// The receipt is addressed to a SESSION, not to whatever is on screen. By
+    /// the time it lands the daemon has already committed `prompt_retracted`,
+    /// so the transcript row and the history entry are both gone — dropping
+    /// the draft because the user stepped to another surface in that one round
+    /// trip would destroy the only remaining copy. So a receipt for a session
+    /// that is not on screen seeds THAT session's parked draft, which is
+    /// exactly where a surface switch would have left it, and it is waiting
+    /// when the user returns.
+    pub fn restore_retracted_prompt(
+        &mut self,
+        session: &SessionId,
+        text: String,
+        attachments: &[haider_protocol::tool::AttachmentBlock],
+    ) {
+        self.retract_settled();
+        let Some(surface) = self
+            .sessions
+            .iter()
+            .find(|row| &row.id == session)
+            .map(|row| DraftKey::Session(row.ui_gen))
+        else {
+            // No roster row at all: this client has nowhere to park bytes it
+            // cannot show. The journal still holds the prompt.
+            return;
+        };
+        let live = self.surface_key() == surface;
+        // Mint the chip identities BEFORE borrowing the target composer.
+        let mut carried = Vec::with_capacity(attachments.len());
+        let mut unrepresentable = 0_usize;
+        for block in attachments {
+            self.upload_seq += 1;
+            match crate::composer::PendingAttachment::carrying(self.upload_seq, block.clone()) {
+                Some(chip) => carried.push(chip),
+                None => unrepresentable += 1,
+            }
+        }
+        let composer = if live {
+            &mut self.composer
+        } else {
+            self.drafts.entry(surface).or_default()
+        };
+        let typed = composer.text().to_owned();
+        let restored = if typed.is_empty() {
+            text
+        } else {
+            format!("{text}\n{typed}")
+        };
+        // `set_text` leaves the cursor at the end and clears any selection.
+        composer.set_text(restored);
+        for chip in carried {
+            if composer.attachments().len() >= MAX_TURN_ATTACHMENTS {
+                unrepresentable += 1;
+                continue;
+            }
+            composer.push_attachment(chip);
+        }
+        // A parked draft paints nothing; the notice belongs to the surface
+        // the user is actually looking at.
+        if live {
+            let mut note = "· prompt retracted — edit and resend".to_owned();
+            if unrepresentable > 0 {
+                note.push_str(&format!(
+                    " · {unrepresentable} attachment(s) could not be carried"
+                ));
+            }
+            self.flash = Some(note);
+        }
+        self.dirty = true;
     }
 
     /// Learn (or re-learn) a LIVE session row (W3c3 M2). Idempotent: a

@@ -1,0 +1,48 @@
+{
+  "integration_ref": "6c42fc02bccadce76aec55b388bfb55b90e7c5a7",
+  "linked_worktree_head": "14750e312a0189caba3420a5ff845ae7aba50abf",
+  "bundle_branch": "lane-970-peermsg-verified",
+  "integration_checkout": "/private/tmp/peermsg-integration-continuation",
+  "test_source_count": 5093,
+  "verifier": {
+    "findings": 15,
+    "real": 13,
+    "noise": 2
+  },
+  "store_rt": {
+    "agents": 3,
+    "quiet_ms": 1200,
+    "before": {
+      "quiet": 0,
+      "list": 19
+    },
+    "after": {
+      "quiet": 0,
+      "list": 19
+    }
+  },
+  "instruct_pipe_bytes": 6244,
+  "full_prefix_bytes": 20770,
+  "features": 119,
+  "rpc_methods": 136,
+  "covered_pairs": 68,
+  "gates": {
+    "workspace-tests": 0,
+    "clippy-final": 0,
+    "repo-guards-final": 0,
+    "test-count-update": 0,
+    "request-golden": 0,
+    "instruct-pin": 0,
+    "build-siblings-final": 0,
+    "core-compaction": 0,
+    "export-tests": 0,
+    "fmt": 0,
+    "unsafe-counts": 0,
+    "packaging-tests": 0
+  },
+  "binaries": {
+    "haider": 113304336,
+    "haiderd": 203067344
+  },
+  "log_normalization": "Only trailing empty lines removed from committed text copies; raw logs remain under tmp/peermsg and /private/tmp/peermsg-evidence."
+}

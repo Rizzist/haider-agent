@@ -1,0 +1,8 @@
+   Compiling haider-core v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-core)
+    Finished `test` profile [unoptimized] target(s) in 6.81s
+     Running unittests src/lib.rs (/private/tmp/peermsg-target/debug/deps/haider_core-28dc89dcc47e1c09)
+
+running 1 test
+test actor::actor_request_attempt_tests::promoted_terminal_fence_preserves_agent_input_between_human_messages ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 0.00s

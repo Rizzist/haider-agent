@@ -386,6 +386,15 @@ pub struct SessionProjection {
     /// delta), reset at each new turn's start; approximate tokens are derived
     /// as `chars / 4`.
     streamed_output_chars: u64,
+    /// escretract (v0.0.970): has THIS run's first semantic response boundary
+    /// been observed? The daemon commits `response_started` as a
+    /// `render.ui == false` fact and arbitrates retraction against it in the
+    /// session writer, so this is the same authority the daemon uses — not a
+    /// guess from rendered rows. It gates Esc's meaning (retract vs plain
+    /// cancel); the typed `too_late` reply remains the correctness backstop
+    /// for the genuine race, because this flag can only be as fresh as the
+    /// last envelope this client received.
+    response_started: bool,
     /// tpsfix (v0.0.970): a monotone TURN counter, bumped on every genuine turn
     /// opening (idle/none → non-terminal). It is the identity the throughput
     /// estimator resets on, and the gate that stops a usage frame committed by
@@ -716,6 +725,12 @@ impl SessionProjection {
                 let was_idle = self.run.as_ref().is_none_or(RunState::is_terminal);
                 if was_idle && !run.is_terminal() {
                     self.streamed_output_chars = 0;
+                    // escretract: the SAME opening edge closes the previous
+                    // turn's retraction window. The boundary is per-run daemon
+                    // truth, so every new run starts with it unseen — without
+                    // this reset an earlier turn's response would make every
+                    // later Esc a plain cancel forever.
+                    self.response_started = false;
                     // Availability is re-probed by the daemon for every new
                     // turn. Drop a prior run's notice at the opening edge; if
                     // the root is still unavailable, this run's durable fact
@@ -1661,6 +1676,20 @@ impl SessionProjection {
     #[must_use]
     pub const fn is_streaming(&self) -> bool {
         matches!(self.run, Some(RunState::Streaming | RunState::RunningTool))
+    }
+
+    /// escretract: record the daemon's committed first-response boundary for
+    /// the current run. Idempotent — the boundary commits at most once per
+    /// run, and a re-delivery must never reopen the editing window.
+    pub const fn note_response_started(&mut self) {
+        self.response_started = true;
+    }
+
+    /// escretract: true once this run's first semantic response has been
+    /// committed, which is exactly when the prompt stops being retractable.
+    #[must_use]
+    pub const fn response_started(&self) -> bool {
+        self.response_started
     }
 
     /// W-G: an APPROXIMATE output-token count for this turn, derived from the

@@ -1,0 +1,59 @@
+{
+  "base": "229122b552e6c1583cf930b47923bb05e2ab0def",
+  "incoming": "6c42fc02bccadce76aec55b388bfb55b90e7c5a7",
+  "rows": [
+    {
+      "path": "crates/haider-tui/src/app.rs",
+      "dir": "/Users/rizzist/haider-run/lane-970-peermsg/tmp/peermsg/merge-ui/0",
+      "status": 0
+    },
+    {
+      "path": "crates/haider-tui/src/link.rs",
+      "dir": "/Users/rizzist/haider-run/lane-970-peermsg/tmp/peermsg/merge-ui/1",
+      "status": 0
+    },
+    {
+      "path": "crates/haider-tui/src/live.rs",
+      "dir": "/Users/rizzist/haider-run/lane-970-peermsg/tmp/peermsg/merge-ui/2",
+      "status": 0
+    },
+    {
+      "path": "crates/haider-tui/src/projection.rs",
+      "dir": "/Users/rizzist/haider-run/lane-970-peermsg/tmp/peermsg/merge-ui/3",
+      "status": 0
+    },
+    {
+      "path": "crates/haider-tui/src/runtime.rs",
+      "dir": "/Users/rizzist/haider-run/lane-970-peermsg/tmp/peermsg/merge-ui/4",
+      "status": 0
+    },
+    {
+      "path": "crates/haider-tui/src/session.rs",
+      "dir": "/Users/rizzist/haider-run/lane-970-peermsg/tmp/peermsg/merge-ui/5",
+      "status": 0
+    },
+    {
+      "path": "crates/haider-tui/tests/w970_escretract_ui_tests.rs",
+      "dir": "/Users/rizzist/haider-run/lane-970-peermsg/tmp/peermsg/merge-ui/6",
+      "status": 0
+    },
+    {
+      "path": "docs/testing/v0.0.970/escretract-ui.md",
+      "dir": "/Users/rizzist/haider-run/lane-970-peermsg/tmp/peermsg/merge-ui/7",
+      "status": 0
+    },
+    {
+      "path": "test-baseline.txt",
+      "dir": "/Users/rizzist/haider-run/lane-970-peermsg/tmp/peermsg/merge-ui/8",
+      "status": 1
+    }
+  ],
+  "resolved": true,
+  "test_baseline_resolution": {
+    "tool": "cargo run --locked -p xtask -- test-count --update",
+    "incoming": 5069,
+    "previous_lane": 5080,
+    "final": 5093
+  },
+  "git_merge_checkout": "/private/tmp/peermsg-integration-continuation"
+}

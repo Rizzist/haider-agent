@@ -520,3 +520,28 @@ Both lane walks are retained verbatim below, ordered by first registry number.
   decodes are corrected with explicit validation, with failures retained in
   the lane gate summary. After the final CLI test build, another unchanged
   matrix pass is 52/52 with hashes matching the delivered artifacts.
+
+## v0.0.970 peermsg continuation — final merged gate
+
+Full class 1–102 applicability and evidence walk:
+[peermsg report](../../docs/testing/v0.0.970/peermsg.md#ci-error-registry-walk).
+
+- Wave `6c42fc02` was merged before the final gate; earlier retraction and
+  packaging additions are retained. The only new merge conflict was the
+  baseline, resolved by `xtask test-count --update`: 5,080 → 5,093.
+- Required full workspace tests with `--no-fail-fast`, workspace Clippy with
+  `--tests -- -D warnings`, formatting, repository guards, and locked sibling
+  prebuild pass under ENV LAW. Unsafe counts remain 189 / 20.
+- Provider-request golden regenerated through its test; instruct-pipe pin
+  remains 6,244 bytes (full prefix 20,770). Feature/method/pair pins: 119/136/68.
+- Actual approval mutation fails its wire-refusal assertion; restored code
+  passes. Missing peer queue projections and an invalid compaction fixture
+  order were fixed without weakening tests. Exports retain agent identity.
+- Migration explains legacy transcript replay, ignored pending `.q` files,
+  explicit resend, and mixed-version transport refusal. Linux/Windows are
+  by inspection; executed socket/subprocess coverage is macOS arm64.
+- Protected linked Git metadata prevented a direct lane commit. The isolated
+  verified bundle preserves wave ancestry and excludes investigation inputs,
+  temporary tools, and binaries. No push; adopt with a literal branch refspec.
+- Verifier totals: 15 findings, 13 real, 2 rejected with reasons documented in
+  the report. The final gate is independent of those inspection verdicts.

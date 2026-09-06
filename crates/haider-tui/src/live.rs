@@ -271,6 +271,18 @@ pub enum LiveCommand {
         /// branch-pinned by its acceptance.
         branch: Option<haider_protocol::ids::BranchId>,
     },
+    /// escretract: `turn.retract` — cancel the run AND take the accepted
+    /// prompt back for editing. Carries the same run pin as [`Self::Cancel`]
+    /// because the fallback for a lost race IS that cancel, issued for this
+    /// exact run. `branch` is client-side capture (B2b) and never reaches the
+    /// wire.
+    Retract {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        run_id: RunId,
+        branch: Option<haider_protocol::ids::BranchId>,
+    },
     /// `session.compact` — receipt-backed, idle-only manual compaction
     /// (W7b). The daemon's own journal events drive every visible state
     /// change; the reply only retires the outbox entry.
@@ -1130,6 +1142,7 @@ impl LiveCommand {
             | Self::SessionDiagnostic { command_id, .. }
             | Self::Submit { command_id, .. }
             | Self::Cancel { command_id, .. }
+            | Self::Retract { command_id, .. }
             | Self::RunRetry { command_id, .. }
             | Self::WorkspaceSet { command_id, .. }
             | Self::Compact { command_id, .. }
@@ -1447,6 +1460,19 @@ pub enum LiveReply {
         session: SessionId,
         worker_generation: u64,
         draft: haider_protocol::session_fork::SessionForkDraft,
+    },
+    /// escretract: `turn.retract` committed. The run is cancelled and the
+    /// daemon returned the EXACT accepted draft — original text plus complete
+    /// attachment blocks, already in the CAS. The receipt retires the outbox
+    /// entry and seeds the composer; the transcript row is removed by the
+    /// daemon's own `prompt_retracted` fact on the stream, not from here, so
+    /// live and replay agree by construction.
+    PromptRetracted {
+        command_id: CommandId,
+        session: SessionId,
+        run_id: RunId,
+        text: String,
+        attachments: Vec<haider_protocol::tool::AttachmentBlock>,
     },
     Checkpoints {
         session: SessionId,
@@ -2565,6 +2591,38 @@ impl LiveDriver {
     fn mint(&mut self) -> CommandId {
         self.next_command += 1;
         CommandId::new(format!("{}-{}", self.instance, self.next_command))
+    }
+
+    /// escretract: the run coordinates of an in-flight `turn.retract`, if
+    /// `command_id` names one. The outbox is already the authority on what is
+    /// in flight, so the fallback reads its pin from there rather than keeping
+    /// a second copy that could disagree with it.
+    fn retract_flight(
+        &self,
+        command_id: &CommandId,
+    ) -> Option<(
+        SessionId,
+        u64,
+        RunId,
+        Option<haider_protocol::ids::BranchId>,
+    )> {
+        self.outbox
+            .iter()
+            .find_map(|pending| match &pending.command {
+                LiveCommand::Retract {
+                    command_id: pinned,
+                    session,
+                    worker_generation,
+                    run_id,
+                    branch,
+                } if pinned == command_id => Some((
+                    session.clone(),
+                    *worker_generation,
+                    run_id.clone(),
+                    branch.clone(),
+                )),
+                _ => None,
+            })
     }
 
     /// One `monitor.mutate` for the active session: pause, resume, or
@@ -3906,6 +3964,25 @@ impl LiveDriver {
                 model.dirty = true;
                 Vec::new()
             }
+            LiveReply::PromptRetracted {
+                command_id,
+                session,
+                // Wire truth the receipt carries; the restore is gated on the
+                // SESSION alone. A successful retraction terminalizes the run,
+                // which drops it from `active_run` — gating on the run here
+                // would make the receipt lose a race with its own cancel and
+                // silently swallow the user's prompt.
+                run_id: _,
+                text,
+                attachments,
+            } => {
+                self.retire(&command_id);
+                // Addressed to the SESSION, not to whatever is on screen: the
+                // model parks it when the user has stepped away, because by now
+                // the daemon has already hidden the prompt everywhere else.
+                model.restore_retracted_prompt(&session, text, &attachments);
+                Vec::new()
+            }
             LiveReply::PromptForked {
                 command_id,
                 source_session,
@@ -4785,6 +4862,36 @@ impl LiveDriver {
                 retryable,
                 presentation,
             } => {
+                // escretract: a retraction that did not commit becomes ONE
+                // ordinary cancel for the same run — which is exactly what
+                // plain Esc would have done — and the transcript keeps the
+                // prompt and any partial reply. This runs before every other
+                // failure arm because it is true for EVERY failure code,
+                // typed `too_late` and unexpected alike.
+                if let Some(id) = command_id.clone()
+                    && let Some((session, worker_generation, run_id, branch)) =
+                        self.retract_flight(&id)
+                {
+                    self.retire(&id);
+                    // The prompt is not coming back, so nothing is left to
+                    // protect the composer from: submit re-opens now rather
+                    // than waiting on the cancel receipt.
+                    model.retract_settled();
+                    model.flash = Some(if code == haider_rpc::ERROR_CODE_TOO_LATE {
+                        "· too late to retract — cancelled".to_owned()
+                    } else {
+                        format!("· retract failed — cancelled · {message}")
+                    });
+                    model.dirty = true;
+                    let command_id = self.mint();
+                    return vec![self.enqueue(LiveCommand::Cancel {
+                        command_id,
+                        session,
+                        worker_generation,
+                        run_id,
+                        branch,
+                    })];
+                }
                 if code == "feature_missing" {
                     if let Some(id) = command_id.as_ref()
                         && self
@@ -5279,6 +5386,12 @@ impl LiveDriver {
                 // Round 3: capability facts die with the socket as well; the
                 // reconnect handshake re-grounds them before work resumes.
                 model.daemon_features.clear();
+                // escretract: the retraction's fate died with the socket. The
+                // outbox may still replay it on reconnect, but the user must
+                // not be left unable to send in the meantime — and a receipt
+                // that does arrive later still seeds the composer, keeping
+                // anything typed since.
+                model.retract_settled();
                 // The run survives the socket; the ATTACHMENT does not.
                 // `active_run` is stream-derived and the reattach replays
                 // whatever moved while we were away.
@@ -6629,6 +6742,30 @@ impl LiveDriver {
                     branch,
                 })]
             }
+            AppRequest::RetractPrompt { branch } => {
+                // Same run authority as Interrupt: the COMMITTED stream says
+                // which run is active, and an invented run id would be a
+                // command the daemon can only reject. With nothing to retract
+                // the guard must lift here — otherwise Enter stays refused
+                // waiting for a reply that was never asked for.
+                let Some(session) = model.active_session.clone() else {
+                    model.retract_settled();
+                    return Vec::new();
+                };
+                let Some(run_id) = self.active_run.get(&session).cloned() else {
+                    model.retract_settled();
+                    return Vec::new();
+                };
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                vec![self.enqueue(LiveCommand::Retract {
+                    command_id,
+                    session,
+                    worker_generation,
+                    run_id,
+                    branch,
+                })]
+            }
             AppRequest::ShellExec { command, branch } => {
                 // W8b law 5/6: one durable daemon command, no UserMessage,
                 // no client-side spawn, no shell re-quoting — the exact
@@ -7338,6 +7475,7 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
         LiveCommand::Submit { session, .. }
         | LiveCommand::SessionDiagnostic { session, .. }
         | LiveCommand::Cancel { session, .. }
+        | LiveCommand::Retract { session, .. }
         | LiveCommand::Compact { session, .. }
         | LiveCommand::BranchCreate { session, .. }
         | LiveCommand::SessionForkPrompt { session, .. }
