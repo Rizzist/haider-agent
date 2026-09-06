@@ -1648,14 +1648,16 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // Other hosts retain platform deltas: Linux +49, Windows -1, Unix -6.
     // Computer remains a stub in the default pipe: invariant 6_166 -> 6_166;
     // manual bytes remain zero. Full schema growth cannot waive the pipe gate.
+    // Shipgate clarifies interactive/autonomous request_input prose (+96
+    // UTF-8 bytes). Default pipe remains 6_166: request_input is undisclosed.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_590;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_686;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_541;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_637;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_540;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_636;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_535;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_631;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();

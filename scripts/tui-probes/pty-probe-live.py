@@ -10,20 +10,18 @@ binary end to end under a PTY:
     launcher -> type a prompt -> session.create -> attach -> turn.submit
              -> streamed reply on screen
              -> a SECOND terminal attaches and replays the same history
-             -> a REAL daemon `request_input` card opens
-             -> a THIRD, COLD terminal reconstructs that pending card from
-                committed history and ANSWERS it
-             -> the one worker resumes; both surfaces show the continuation
-                and neither still shows the card
+             -> a REAL daemon `request_input` resolves automatically
+             -> both attached terminals show its tool-result continuation,
+                with NO pending card
+             -> a THIRD, COLD terminal reconstructs the continuation from
+                committed history, still with NO pending card
              -> quit
 
-That last leg is §6.4's "menu answers from either control attachment
-resume the one worker exactly once" row. It used to be backed by
-`checks.append((..., True))` — a literal, which is not a gate (design
-review D1-3). The card is now the daemon's own: `FakeStep::EmitRequestInput`
-(JSON `emit_request_input`) makes the actor allocate and journal a protocol
-menu, so every sentinel below travels provider -> actor -> journal -> RPC
--> projection -> frame. Nothing in this file can fabricate one.
+v0.0.970 defaults to autonomous interaction. `FakeStep::EmitRequestInput`
+(JSON `emit_request_input`) must return exactly one tool result without
+opening, answering, or resolving a menu. `expect_tool_result` refuses the
+continuation unless that result actually reaches the next provider request.
+The journal and forced full frames enforce this contract independently.
 
 Every step is an ENFORCED check on probelib's harness (hermetic env, clean
 child exit, at least one alt-screen entry, panic text is failure).
@@ -59,18 +57,9 @@ for binary in (haider, haiderd, haider_tui):
         print(f"live-probe: missing binary {binary}", file=sys.stderr)
         sys.exit(2)
 
-# Four sentinels, each planted at a different point of the daemon's own
-# pipeline so a check can name WHICH hop broke:
-#   REPLY   — a streamed agent message (provider -> item journal -> frame)
-#   CARD    — the `request_input` menu TITLE (provider -> actor-allocated
-#             `MenuOpened` -> frame). Under height pressure the title is the
-#             second row a card sheds, so it is asserted with…
-#   PICK    — …an OPTION LABEL, which `menu_block` NEVER sheds. A local
-#             `/voice`-style card could never carry it: the labels are the
-#             daemon's, verbatim from the journal.
-#   RESUMED — text from the segment the provider only reaches once the
-#             ANSWER came back as a tool result. Seeing it is the proof the
-#             one worker resumed.
+# REPLY identifies the first streamed turn. CARD and PICK identify forbidden
+# request_input UI. RESUMED proves the provider received CALL's automatic tool
+# result, including on live peers and a cold attachment replaying the journal.
 REPLY = "LIVEPROBEREPLY"
 CARD = "LIVEPROBECARD"
 PICK = "LIVEPROBEPICK"
@@ -81,11 +70,11 @@ CALL = "live-probe-input-1"
 # so the probe — not a sleep — decides when each hop happens:
 #   1. turn one: one text item, clean finish.
 #   2. turn two: the `request_input` call, finished with `tool_use`. The
-#      actor parks the run in `InputRequired` and journals `MenuOpened`.
+#      autonomous actor returns a tool result without opening a menu.
 #   3. the RESUMPTION, gated by `expect_tool_result`: the fake provider
 #      REFUSES this segment (typed Internal error) unless the request
-#      actually carries the answer for `CALL`, so RESUMED on screen can
-#      only mean the answer completed the round trip.
+#      actually carries the tool result for `CALL`, so RESUMED on screen can
+#      only mean the result completed the round trip.
 # The script is FINITE and ends here: a worker that resumed twice would run
 # a turn with no segment left, and a stream that ends without a finish event
 # is journaled as `run_failed` — which is why the ERRORED/run_failed checks
@@ -147,10 +136,58 @@ daemon_pids_after = []
 journal = None
 
 try:
+    # The daemon also locks down its home-level state and resolves runtime
+    # paths independently of HAIDER_PROFILE_DIR. Keep every root private,
+    # matching the QA harness: no chmod/read of the invoking user's ~/.haider.
+    probe_home = os.path.join(profile, "home")
+    probe_runtime = os.path.join(profile, "runtime")
     env_extra = {
+        "HOME": probe_home,
+        "USERPROFILE": probe_home,
+        "XDG_CACHE_HOME": os.path.join(probe_home, ".cache"),
+        "XDG_CONFIG_HOME": os.path.join(probe_home, ".config"),
+        "XDG_DATA_HOME": os.path.join(probe_home, ".local", "share"),
+        "XDG_STATE_HOME": os.path.join(probe_home, ".local", "state"),
+        "XDG_RUNTIME_DIR": probe_runtime,
         "HAIDER_PROFILE_DIR": store,
+        "HAIDER_RUNTIME_DIR": probe_runtime,
+        "HAIDER_DISCOVERY_DISABLED": "1",
+        "HAIDER_NO_UPDATE_CHECK": "1",
+        "HAIDER_TEST_DEVICE_NAME": "test-mac",
         "HAIDER_TEST_FAKE_PROVIDER": SCRIPT,
     }
+    for directory in (probe_home, probe_runtime):
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+
+    inherited_environment = os.environ.copy()
+
+    def live_environment():
+        environment = inherited_environment.copy()
+        for var in tuple(environment):
+            if var.startswith("HAIDER_") or var.endswith(("_API_KEY", "_TOKEN", "_SECRET")):
+                environment.pop(var, None)
+        for var in ("NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR", "COLORTERM"):
+            environment.pop(var, None)
+        environment["TERM"] = "xterm-256color"
+        environment.update(env_extra)
+        return environment
+
+    def daemon_processes(stage):
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", os.path.join(bindir, "haiderd")],
+                capture_output=True, text=True, check=False,
+            )
+        except OSError as error:
+            checks.append((f"{stage} process inspection unavailable: {error}", False))
+            return [], False
+        available = result.returncode in (0, 1)
+        if not available:
+            checks.append((
+                f"{stage} pgrep failed: rc={result.returncode}, stderr={result.stderr.strip()}",
+                False,
+            ))
+        return ([p for p in result.stdout.split() if p] if available else []), available
 
     def spawn_live(cols, rows, binary):
         """probelib.spawn, but for bare `haider` with the live env pinned."""
@@ -161,16 +198,8 @@ try:
 
         child, child_fd = pty.fork()
         if child == 0:
-            for var in (
-                "NO_COLOR",
-                "CLICOLOR",
-                "CLICOLOR_FORCE",
-                "FORCE_COLOR",
-                "COLORTERM",
-            ):
-                os.environ.pop(var, None)
-            os.environ["TERM"] = "xterm-256color"
-            os.environ.update(env_extra)
+            os.environ.clear()
+            os.environ.update(live_environment())
             os.execv(binary, [binary])
         fcntl.ioctl(child_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         os.kill(child, signal.SIGWINCH)
@@ -239,13 +268,12 @@ try:
         return child_sink[0][mark:]
 
     def read_journal():
-        """The daemon's own ledger for the one thing the PTY cannot show:
-        HOW MANY times the menu resolved. `menu_resolutions` is the CAS
-        table the answer path writes through (one row per menu, by primary
-        key); the event counts come from the committed envelopes. The planted
-        card identifies this probe's menu, session and run so unrelated
-        profile activity cannot change these counts. Read read-only, while the
-        daemon still lives, so its WAL is readable."""
+        """Count automatic completion and forbidden menus in the daemon ledger.
+
+        Scope by the planted call's session, not by menu coordinates: correct
+        autonomous behavior creates no menu coordinate to count against. Read
+        read-only while the daemon lives so its WAL remains available.
+        """
         counts = {
             "menu_opened": 0,
             "menu_answered": None,
@@ -290,63 +318,30 @@ try:
                 envelopes.append(decoded)
             counts["decoded"] = len(envelopes)
 
-            def is_sentinel_menu(payload):
-                options = payload.get("options", [])
-                kind = payload.get("kind")
-                return (
-                    payload.get("type") == "menu_opened"
-                    # MenuKind has serialized as the nested
-                    # {"kind": {"kind": "choice"}} since v0.0.2. The
-                    # v0.0.950 scoped matcher accidentally assumed a flat
-                    # string; the durable payload shape itself never moved.
-                    and isinstance(kind, dict)
-                    and kind.get("kind") == "choice"
-                    and payload.get("title") == f"{CARD} choose a target"
-                    and payload.get("body") == ["the daemon owns this list"]
-                    and payload.get("origin") == "request_input"
-                    and any(
-                        option.get("key") == "alpha"
-                        and option.get("label") == f"{PICK} alpha"
-                        for option in options
-                    )
-                )
-
-            openings = [
-                envelope
-                for envelope in envelopes
-                if is_sentinel_menu(envelope.get("payload", {}))
-            ]
-            menu_coordinates = {
-                (envelope.get("session_id"), envelope["payload"].get("id"))
-                for envelope in openings
-            }
             call_results = [
                 envelope
                 for envelope in envelopes
                 if envelope.get("payload", {}).get("type") == "tool_result"
                 and envelope["payload"].get("call_id") == CALL
             ]
+            session_ids = {envelope.get("session_id") for envelope in call_results}
             run_coordinates = {
                 (envelope.get("session_id"), envelope.get("run_id"))
-                for envelope in openings + call_results
+                for envelope in call_results
                 if envelope.get("run_id") is not None
             }
-
-            counts["menu_opened"] = len(openings)
-            if menu_coordinates:
+            if session_ids:
+                scoped = [e for e in envelopes if e.get("session_id") in session_ids]
+                counts["menu_opened"] = sum(
+                    e.get("payload", {}).get("type") == "menu_opened" for e in scoped
+                )
                 counts["menu_answered"] = sum(
-                    envelope.get("payload", {}).get("type") == "menu_answered"
-                    and (
-                        envelope.get("session_id"),
-                        envelope["payload"].get("menu"),
-                    )
-                    in menu_coordinates
-                    for envelope in envelopes
+                    e.get("payload", {}).get("type") == "menu_answered" for e in scoped
                 )
                 counts["resolutions"] = sum(
-                    (session_id, menu_id) in menu_coordinates
-                    for session_id, menu_id in connection.execute(
-                        "select session_id, menu_id from menu_resolutions"
+                    session_id in session_ids
+                    for session_id, in connection.execute(
+                        "select session_id from menu_resolutions"
                     )
                 )
             counts["tool_result"] = len(call_results)
@@ -374,13 +369,7 @@ try:
 
     # 2. A daemon is actually running for this profile.
     time.sleep(1.0)
-    running = subprocess.run(
-        ["pgrep", "-f", os.path.join(bindir, "haiderd")],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    daemon_pids_after = [p for p in running.stdout.split() if p]
+    daemon_pids_after, _ = daemon_processes("startup")
     checks.append(("exactly one detached haiderd for the profile", len(daemon_pids_after) == 1))
 
     # 3. Type a prompt on the launcher and submit it. In live mode NOTHING
@@ -420,35 +409,29 @@ try:
         )
     )
 
-    # 6. THE DAEMON'S OWN CARD. A second turn drives script segment 2:
-    #    `emit_request_input` -> the actor allocates the menu, journals
-    #    `MenuOpened`, and parks the run in `InputRequired`. Both the title
-    #    and an option label are asserted: the title is what a reader looks
-    #    for, the option label is what a LOCAL card could never invent (and
-    #    what the card never sheds under height pressure). If this goes
-    #    quiet, the answer legs below have nothing to answer — read
-    #    `daemon.log` before suspecting the TUI.
-    before_card = len(sink[0])
-    write(fd, b"open the card\r")
-    card_on_first = wait_for(pump, sink, PICK, 40, before_card) and seen(
-        sink, CARD, before_card
-    )
-    checks.append(("a REAL daemon request_input card opened on a real frame", card_on_first))
-
-    # 6b. The second terminal is still attached and still on the session
-    #     surface: it must paint the SAME card from the live stream, with no
-    #     action of its own. A card only the submitting terminal can see is
-    #     not a shared session.
-    checks.append(
-        (
-            "…and the second terminal sees that same card on the live stream",
-            wait_for(second_pump, second_sink, PICK, 25),
-        )
-    )
+    # 6. Autonomous request_input returns to the provider with no human key.
+    #    The finite script makes duplicate continuation fail the run.
+    before_request = len(sink[0])
+    write(fd, b"resolve the request automatically\r")
+    checks.append((
+        "request_input automatically continued on the first terminal",
+        wait_for(pump, sink, RESUMED, 40, before_request),
+    ))
+    checks.append((
+        "the second terminal sees the same automatic continuation live",
+        wait_for(second_pump, second_sink, RESUMED, 25),
+    ))
+    second_screen = repaint(second_fd, second_pump, second_sink)
+    checks.append((
+        "the live second terminal has no pending request_input card",
+        RESUMED.encode() in second_screen
+        and CARD.encode() not in second_sink[0]
+        and PICK.encode() not in second_sink[0],
+    ))
 
     # 6c. Retire the second terminal HERE (it has proved replay + live
     #     stream). R8 again: a client leaving never takes the daemon or the
-    #     parked menu with it — the cold terminal below inherits both.
+    #     committed continuation with it — the cold terminal inherits history.
     for _ in range(3):
         try:
             os.write(second_fd, b"\x03")
@@ -464,76 +447,35 @@ try:
         )
     )
 
-    # 7. §6.4's "preserves/reconstructs a pending `request_input`": a THIRD,
-    #    COLD terminal — started after the card opened, so it never saw the
-    #    opening event live — attaches and must rebuild the parked card out
-    #    of committed history alone.
+    # 7. A cold attachment must reconstruct the completed automatic turn,
+    #    not resurrect a pending request_input card from committed history.
     third_pid, third_fd, third_sink, third_pump = boot(cols, rows)
     checks.append(
         ("a cold third terminal reaches the live launcher", b"\x1b[?1049h" in third_sink[0])
     )
-    cold_card = attach_row_one(third_fd, third_pump, third_sink, PICK, 0) and seen(
-        third_sink, CARD
-    )
-    checks.append(
-        ("…and RECONSTRUCTS the pending card from committed history alone", cold_card)
-    )
+    checks.append((
+        "the cold terminal reconstructs the automatic continuation from history",
+        attach_row_one(third_fd, third_pump, third_sink, RESUMED, 0),
+    ))
 
-    # 8. §6.4's headline row: THE ANSWER COMES FROM THE OTHER CONTROL
-    #    ATTACHMENT. The terminal that submitted the turn never touches the
-    #    card; the cold one answers it with digit 1. That only works if this
-    #    connection recorded the menu's COMMITTED coordinates (request_seq +
-    #    worker_generation) while replaying, because `LiveDriver` refuses to
-    #    send an answer it has no coordinates for — the exact silent-drop
-    #    that made `/voice` cards unclosable in live mode.
-    before_answer_third = len(third_sink[0])
-    before_answer_first = len(sink[0])
-    write(third_fd, b"1")
-    deadline = time.time() + 40
-    while time.time() < deadline and not (
-        seen(third_sink, RESUMED, before_answer_third)
-        and seen(sink, RESUMED, before_answer_first)
-    ):
-        third_pump(0.2)
-        pump(0.2)
-    checks.append(
-        (
-            "answering from the OTHER attachment resumed the one worker",
-            seen(third_sink, RESUMED, before_answer_third),
-        )
-    )
-    # The resumption is not the answering client's private event: the
-    # continuation is journaled, so the terminal that OWNS the turn shows it
-    # too. (`expect_tool_result` guards the other half — the provider only
-    # emits RESUMED at all if the answer arrived as the tool result for CALL.)
-    checks.append(
-        (
-            "…and the committed continuation reached the FIRST terminal too",
-            seen(sink, RESUMED, before_answer_first),
-        )
-    )
-
-    # 9. AND THE CARD IS GONE — on both. A card that took an answer but
-    #    never closed is precisely the bug class this lane fixed, and it is
-    #    invisible on a diff-painting stream, so each surface is forced to
-    #    repaint in full. The presence half (RESUMED) makes the absence half
-    #    non-vacuous: an empty repaint fails instead of passing.
+    # 8. Full repaints pair absence with continuation presence, so empty
+    #    output cannot pass. Captured streams also reject a transient card.
     first_screen = repaint(fd, pump, sink)
     third_screen = repaint(third_fd, third_pump, third_sink)
     checks.append(
         (
-            "the answered card is gone from the first terminal's full screen",
+            "the first terminal has no pending request_input card",
             RESUMED.encode() in first_screen
-            and CARD.encode() not in first_screen
-            and PICK.encode() not in first_screen,
+            and CARD.encode() not in sink[0]
+            and PICK.encode() not in sink[0],
         )
     )
     checks.append(
         (
-            "…and gone from the answering terminal's full screen",
+            "the cold terminal reconstructs no pending request_input card",
             RESUMED.encode() in third_screen
-            and CARD.encode() not in third_screen
-            and PICK.encode() not in third_screen,
+            and CARD.encode() not in third_sink[0]
+            and PICK.encode() not in third_sink[0],
         )
     )
     # The PTY half of "exactly once": one resumption is painted, not two.
@@ -566,11 +508,11 @@ try:
         except OSError:
             break
         third_pump(0.5)
-    checks.append(("the answering terminal exits cleanly", probelib.reap(third_pid)))
+    checks.append(("the cold terminal exits cleanly", probelib.reap(third_pid)))
     third_text = third_sink[0].decode("utf-8", "replace")
     checks.append(
         (
-            "the answering terminal never panicked",
+            "the cold terminal never panicked",
             "panicked" not in third_text and "RUST_BACKTRACE" not in third_text,
         )
     )
@@ -578,7 +520,8 @@ try:
     # 10. Bonus (W3c3.1, review D1-2): `/voice` must NOT mint a card in live
     #     mode. It has no committed opening envelope, so the live loop could
     #     never close it — one press would block every later card, including
-    #     the daemon's own `request_input` above. Live mode owes an honest
+    #     any future daemon menu. This is independent of autonomous
+    #     request_input policy: /voice is still demo-only. Live mode owes an honest
     #     flash instead, exactly as `/reset` does.
     before_voice = len(sink[0])
     write(fd, b"/voice\r")
@@ -611,13 +554,7 @@ finally:
     # The daemon must survive the client's exit (R8: closing a connection
     # never implies daemon shutdown) — then the probe reaps it.
     time.sleep(0.5)
-    still = subprocess.run(
-        ["pgrep", "-f", os.path.join(bindir, "haiderd")],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    survivors = [p for p in still.stdout.split() if p]
+    survivors, process_inspection_available = daemon_processes("shutdown")
     checks.append(("the daemon outlives the TUI (R8 shutdown policy)", len(survivors) == 1))
     for stray in survivors:
         try:
@@ -630,15 +567,37 @@ finally:
             os.kill(int(stray), signal.SIGKILL)
         except (ProcessLookupError, ValueError):
             pass
-    if not os.environ.get("LIVE_PROBE_PROFILE"):
+    cleanup_ok = True
+    if not process_inspection_available:
+        # The advisory haiderd.pid contains only a PID, not profile identity.
+        # Use the CLI's profile/Welcome + peer-credential authenticated stop
+        # path instead of signalling an unverified (possibly recycled) PID.
+        # 22.5s = daemon stop's existing 20s budget + probelib.reap's 2.5s
+        # child-exit allowance. This is cleanup only, never an R8 witness.
+        try:
+            cleanup = subprocess.run(
+                [probe_haider, "daemon", "stop", "--json", "--timeout", "20s"],
+                env=live_environment(), capture_output=True, text=True,
+                check=False, timeout=22.5,
+            )
+            cleanup_ok = cleanup.returncode == 0
+            checks.append((
+                f"authenticated private daemon cleanup: rc={cleanup.returncode}, "
+                f"stderr={cleanup.stderr.strip()}",
+                cleanup_ok,
+            ))
+        except (OSError, subprocess.TimeoutExpired) as error:
+            cleanup_ok = False
+            checks.append((f"authenticated private daemon cleanup failed: {error}", False))
+    if not cleanup_ok:
+        print(f"live-probe: preserving profile after failed cleanup: {profile}", file=sys.stderr)
+    if cleanup_ok and not os.environ.get("LIVE_PROBE_PROFILE"):
         shutil.rmtree(profile, ignore_errors=True)
 
 # The half of "exactly once" no terminal can show: the daemon's ledger. Keep
-# these as five separately reported facts: a bare composite False hid which
-# behavior was wrong for 25 releases. Menu facts are scoped to the planted
-# card's (session, menu), failures to its (session, run), and ToolResult to the
-# planted call id. `menu_resolutions` can hold only one row for that coordinate
-# because (session_id, menu_id) is its primary key.
+# these as five separately reported facts. Menu facts are scoped to the
+# planted call's session even when no menu exists; tool results to CALL and
+# failures to its run. No inferred menu coordinate can make absence vacuous.
 #
 # Print how much the reader actually SAW before reporting what it matched.
 # On v0.0.950 every scoped count read 0 or UNAVAILABLE, which is equally
@@ -648,9 +607,9 @@ finally:
 # opens it read-only while the daemon is still writing, so an empty read is a
 # live hypothesis rather than a wild one.
 for key, label, expected in (
-    ("menu_opened", "sentinel menu_opened events", 1),
-    ("menu_answered", "sentinel menu_answered events", 1),
-    ("resolutions", "sentinel menu_resolutions rows", 1),
+    ("menu_opened", "sentinel-session menu_opened events", 0),
+    ("menu_answered", "sentinel-session menu_answered events", 0),
+    ("resolutions", "sentinel-session menu_resolutions rows", 0),
     ("tool_result", f"tool_result events for call_id {CALL}", 1),
     ("run_failed", "sentinel-run run_failed events", 0),
 ):
@@ -690,7 +649,7 @@ checks.append(
         True,
     )
 )
-checks.append(("no `sk-` key material in any frame", not re.search(r"sk-[A-Za-z0-9_\-]{8,}", text)))
+checks.append(("no `sk-` key material in any frame", not re.search(rb"sk-[A-Za-z0-9_\-]{8,}", sink[0] + second_sink[0] + third_sink[0])))
 
 child_clean = probelib.reap(pid) if pid is not None else False
 if os.environ.get("LIVE_PROBE_DUMP"):
