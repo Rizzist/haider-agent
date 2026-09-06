@@ -873,3 +873,145 @@ no-trailer lane commit via `tmp/thinexe/thinexe-round4.bundle`; no push.
 
 VERIFIER: findings=0 real=0 noise=0 — no new findings
 SHIP
+
+
+## Round 5 — launch lock
+
+### Root cause and deterministic repair
+
+The landing failure citation is correct: the prior exclusive acquisition was
+at `crates/haider-cli/src/payload.rs:139`. This is a test lifetime assumption,
+not a second open in `install_read_lock`. The helper opens exactly one file;
+`OpenOptions`, `symlink_metadata`, and `File::metadata` retain no duplicate.
+The test passes `tempfile::tempdir()/haider-tui` explicitly, so its lock is in
+that unique temporary directory, never `target/debug/deps`. The payload test
+is compiled into the library harness and seven integration harnesses importing
+`../src/lib.rs`, once per module in each harness; their invocations have
+independent temporary paths.
+
+Parallel `update_restart_tests` call `CapturedDaemon::spawn` (line 454), then
+`spawn_daemon_with_piped_stderr`; `configure_daemon` installs `pre_exec` at
+`crates/haider-platform/src/spawn.rs:937`. Fork temporarily duplicates the
+parent's open descriptors, including this unrelated shared lock, until the
+child descriptor sweep or exec. CLOEXEC does not close descriptors at fork.
+Consequently parent `drop(File)` is synchronous close, but is not necessarily
+the last close and does not imply synchronous flock release. This mechanism
+is reproduced locally with pipe-synchronized fork, without sleeps or retries:
+parent close leaves exclusive acquisition blocked; child close releases it.
+The historical failing process was not traced, so identification of its exact
+fork interval is inferred from this call path and reproduced OS behavior.
+See Apple's [flock documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/flock.2.html)
+and Rust's [File lock/unlock contract](https://doc.rust-lang.org/stable/std/fs/struct.File.html).
+
+The same owner-only contract test now explicitly unlocks through the acquiring
+descriptor before the exclusive attempt. It retains the regular-file and mode
+assertions, adds a current-owner assertion, and proves an independently opened
+updater descriptor receives `WouldBlock` while the launch lock is held. A
+`try_clone()` stays alive across unlock, original descriptor drop, and successful
+exclusive acquisition, deterministically modeling the inherited reference.
+The updater lock is explicitly released too. Removing the shared-lock unlock
+would leave that deliberate duplicate holding the lock on flock platforms.
+No retries, sleeps, ignored tests, thread-count reductions, or production
+launch/exec changes are introduced. Linux/Windows are by inspection locally.
+
+Evidence is under `/private/tmp/thinexe-round5/`, including
+`flock-fork-reproduction.py` and `.log`. The supplied lane rules and round-2
+lens evidence were read and remain excluded from the commit. The earlier
+R2-08 citation audit and performance claims are unchanged.
+
+### Merge, gates, and delivery
+
+The shared Git directory rejects FETCH_HEAD writes under the sandbox. A
+writable Git copy uses this worktree and the lane branch; its successful
+`fetch origin wave-970` and `merge --no-commit origin/wave-970` reported already
+up to date at `ea0b9a6b996c1ca8af0a372aa38ad781b8c90833`, before the gates.
+No incoming goldens or instruct-pipe inputs changed, so no regeneration or
+byte repin was needed. Commit delivery uses the writable lane branch and a
+bundle; the shared original ref cannot be advanced here. No push or trailer.
+
+The sibling prebuild passed in **241.62 seconds**; binaries are haider
+69,078,864 bytes, haiderd **203,365,264 bytes** (>10 MiB), and haider-tui
+96,040,352 bytes. An initial command named the daemon library package rather
+than `haider-daemond` and failed target selection before compilation; the
+corrected prebuild is recorded separately.
+
+The requested serial loop of `cargo test -q -p haider-cli --test
+update_restart_tests` passed **30/30**, **83 tests each**, **2,490 passes**, zero
+failures/ignores. Total command wall time was **2,379.88 seconds**, including
+initial compilation and waiting for the sibling prebuild. Each invocation
+overlapped successful `cargo build -p haider-cli --bin haider` work in the
+separate `/private/tmp/haider-thinexe-round5-load-target` directory; that
+separation prevents Cargo's target lock from serializing the intended load
+away. The initial build was followed by a driver rebuilding the CLI package
+until all iterations completed. After initial high host load, the load driver
+used one Cargo job and one codegen unit; the tested target remained at two
+build jobs and four test threads. All **393 background builds** passed, and
+both background drivers exited. `stress-evidence.json` records each test
+result and overlapping build intervals. The raw loop record's `load_running`
+field refers only to the first background process at iteration end; it does
+not include the continuing rebuild driver. No overlap claim relies on it.
+
+All tested commands use Rust 1.95.0 with `RUST_MIN_STACK=8388608`,
+`HAIDER_DISCOVERY_DISABLED=1`, `HAIDER_TEST_DEVICE_NAME=test-mac`,
+`CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=0`,
+`HAIDER_TEST_SIBLINGS_PREBUILT=1`,
+`CARGO_TARGET_DIR=/private/tmp/haider-thinexe-target`, `CARGO_BUILD_JOBS=2`,
+and **`RUST_TEST_THREADS=4`**. Every build/test/count command checks `df -m /`
+and stops below 700 MiB. No test or production deadline was changed.
+
+The first full workspace test gate completed in **1965.26 seconds**,
+including fresh workspace test compilation: **5615 summed passes**,
+**3 failures**, **13 unchanged ignores**. The failures were:
+
+- `parent_exit_leaves_the_daemon_running`: 2.8298145 seconds versus its
+  unchanged 950 ms deadline, the failure class already recorded in Round 4.
+- `racing_launcher_never_owns_the_other_launchers_winner` and
+  `closed_handshake_is_retried_only_after_a_spawnable_failure_authorizes_a_candidate`:
+  their two-second candidate-marker observation deadlines expired. Both
+  recorded their script's expected exit 75 by the outer five-second timeout.
+
+The latter two are in the separate haider-client integration binary, which
+does not compile the edited payload test. They use unique temp directories
+and explicit shell-script candidates, not the real CLI/payload. Their marker
+creation is the first shell operation, so the logs fit delayed startup under
+contention; exact timing is inferred because fixture teardown removed their
+temporary logs. Host load was around 32 near initial failures. No production
+code, startup deadlines, protected OAuth files, or client tests were modified.
+The first gate's failures remain recorded; it is not relabeled as a pass.
+
+Final verification on unchanged source:
+
+- `cargo clippy --workspace --tests -- -D warnings`: **PASS**, **267.61 seconds**.
+- `cargo run -q -p xtask -- test-count --update`: **PASS**, **1.74 seconds**;
+  authoritative baseline **5,136 → 5,136** (existing test strengthened, no new test).
+- Complete `haider-client --test client_tests` recheck: **20 PASS**, plus one
+  nested probe; **37.17 seconds** including compilation, **1.22 seconds** in libtest.
+- Final `cargo test -q --workspace --no-fail-fast`: **PASS**, **611.94 seconds**,
+  **5,618 summed libtest passes**, **5,607 unfiltered passes**,
+  **zero failures**, **13 unchanged ignores**. All three startup failures
+  from the first gate passed with the same environment and original assertions.
+- **1,110 source/build inputs**, **zero drift** across the stress loop and gates.
+  Formatting and whitespace checks passed. No platform gate or ignore was added.
+- A refreshed successful fetch/merge immediately before the final run again
+  reported already up to date at **ea0b9a6b**; `fetch-final.log` and
+  `merge-final.log` retain it. Instruct-pipe remains **6,244 → 6,244** and its
+  existing regression passed; no prompt/tool golden required regeneration.
+
+Registry walk: #19/#20 retain formatting, test-target Clippy and authoritative
+recount; #64 real prebuilt siblings exceed the daemon floor; #76/#77 preserve
+owner-only lock and bundle verification contracts; #94 adds no deadline or
+retry; #95 adds no negotiated wait; #103 replaces the fork-sensitive last-close
+assumption with explicit OS unlock and a deliberately live duplicated descriptor.
+Production payload execution and every protected/parallel-owned source file
+remain unchanged. Independent code and final evidence review returned **zero
+findings**. The no-trailer commit is on the writable copy's `lane-970-thinexe`
+branch and delivered in `/private/tmp/thinexe-round5/thinexe-round5.bundle`;
+the original shared lane ref remains at b078c582 because its metadata is
+read-only here. No push was performed.
+
+**SHIP for the launch-lock repair candidate**, with the first gate's unrelated
+startup failures retained above and the final unchanged-tree gate green.
+Native Linux/Windows execution remains by inspection until CI.
+
+VERIFIER: findings=0 real=0 noise=0 — no findings
+SHIP
