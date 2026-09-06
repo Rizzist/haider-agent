@@ -143,9 +143,17 @@ pub fn prompt_fork_available(welcome: &Welcome) -> bool {
 /// hold without another read.
 #[must_use]
 pub fn forkable_prompts_in(envelopes: &[RawEnvelope]) -> Vec<ForkablePrompt> {
+    let retracted: std::collections::HashSet<u64> = envelopes
+        .iter()
+        .filter_map(|envelope| {
+            haider_protocol::retraction::PromptRetractedV1::from_payload_value(&envelope.payload)
+                .map(|fact| fact.prompt_seq)
+        })
+        .collect();
     envelopes
         .iter()
         .filter(|envelope| envelope.agent_id.is_none())
+        .filter(|envelope| !retracted.contains(&envelope.seq))
         .filter_map(|envelope| match envelope.payload.decode_event() {
             Ok(EventPayload::UserMessage { text, .. }) => Some(ForkablePrompt {
                 seq: envelope.seq,
@@ -180,13 +188,19 @@ pub async fn forkable_prompts(
     )
     .await?;
     let mut found: Vec<ForkablePrompt> = Vec::new();
+    let mut retracted = std::collections::HashSet::new();
     let mut end_seq = head_seq;
     while found.len() < limit && end_seq >= 1 {
         let start_seq = end_seq.saturating_sub(FORKABLE_PROMPT_PAGE - 1).max(1);
         let (_, envelopes) =
             read_page(client, &session_id, SeqRange { start_seq, end_seq }).await?;
+        retracted.extend(envelopes.iter().filter_map(|envelope| {
+            haider_protocol::retraction::PromptRetractedV1::from_payload_value(&envelope.payload)
+                .map(|fact| fact.prompt_seq)
+        }));
         // The page is journal order; the roster is newest first.
         let mut page = forkable_prompts_in(&envelopes);
+        page.retain(|prompt| !retracted.contains(&prompt.seq));
         page.reverse();
         found.extend(page);
         found.truncate(limit);

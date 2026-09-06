@@ -1012,8 +1012,15 @@ impl PromptHistoryCache {
             let retained_append_prefixes = std::mem::take(&mut cached.append_prefixes);
             cached = replay_cached_session(store, session_id, head_seq).await?;
             cached.saved_boundaries = saved_boundaries;
-            cached.projections = retained_projections;
-            cached.append_prefixes = retained_append_prefixes;
+            if !cached.envelopes.iter().any(|envelope| {
+                haider_protocol::retraction::PromptRetractedV1::from_payload_value(
+                    &envelope.payload,
+                )
+                .is_some()
+            }) {
+                cached.projections = retained_projections;
+                cached.append_prefixes = retained_append_prefixes;
+            }
         }
 
         // A checkpoint truncates only ONE exact branch+agent timeline. A
@@ -1053,12 +1060,20 @@ impl PromptHistoryCache {
         let previous_compaction_epochs = cached.compaction_epochs.clone();
         let mut cursor = cached.head_seq;
         let mut compaction_after_checkpoint = false;
-        while cursor < head_seq {
+        'read_suffix: while cursor < head_seq {
             let page = store.read(session_id, cursor, HISTORY_PAGE).await?;
             let before = cached.envelopes.len();
             for envelope in page {
                 if envelope.seq > head_seq {
                     break;
+                }
+                if haider_protocol::retraction::PromptRetractedV1::from_payload_value(
+                    &envelope.payload,
+                )
+                .is_some_and(|fact| fact.prompt_seq <= cached.head_seq)
+                {
+                    cached = replay_cached_session(store, session_id, head_seq).await?;
+                    break 'read_suffix;
                 }
                 cursor = envelope.seq;
                 let affects_checkpoint_timeline = envelope.branch_id == timeline.branch_id
@@ -1670,6 +1685,13 @@ impl CachedPromptSession {
         if is_compaction {
             self.note_compaction(&envelope);
         }
+        let is_retraction =
+            haider_protocol::retraction::PromptRetractedV1::from_payload_value(&envelope.payload)
+                .is_some();
+        if is_retraction {
+            self.append_prefixes.clear();
+            self.projections.clear();
+        }
         let is_context_savings = payload.as_ref().is_some_and(|payload| {
             let EventPayload::Item(ItemEvent::Completed { item, .. }) = payload else {
                 return false;
@@ -1694,7 +1716,7 @@ impl CachedPromptSession {
         let rows = self.boundary_projector.push(&envelope);
         self.envelopes.push(envelope);
         self.note_boundary_rows(rows);
-        is_compaction || is_context_savings
+        is_compaction || is_context_savings || is_retraction
     }
 
     /// Keeps reply ranges canonical while prompt history crosses its 256-event
@@ -4038,6 +4060,7 @@ struct JournalFacts {
     continued_partial_items: HashSet<haider_protocol::ids::ItemId>,
     user_command_origins: HashMap<haider_protocol::ids::ItemId, UserCommandOriginV1>,
     user_command_savings: HashMap<haider_protocol::ids::ItemId, OutputSavings>,
+    retracted_prompts: HashSet<u64>,
 }
 
 impl JournalFactsIndex {
@@ -4053,6 +4076,7 @@ impl JournalFactsIndex {
                     .saturating_add(state.facts.continued_partial_items.len())
                     .saturating_add(state.facts.user_command_origins.len())
                     .saturating_add(state.facts.user_command_savings.len())
+                    .saturating_add(state.facts.retracted_prompts.len())
             })
             .fold(0_usize, usize::saturating_add)
     }
@@ -4123,6 +4147,12 @@ impl JournalFacts {
         envelope: &RawEnvelope,
         payload: Option<&EventPayload>,
     ) -> Result<(), HaiderError> {
+        if let Some(fact) =
+            haider_protocol::retraction::PromptRetractedV1::from_payload_value(&envelope.payload)
+        {
+            self.retracted_prompts.insert(fact.prompt_seq);
+            return Ok(());
+        }
         let Some(run_id) = envelope.run_id.clone() else {
             return Ok(());
         };
@@ -4259,6 +4289,9 @@ fn render_journal_with_facts(
     let mut current_user_seen = false;
     let mut current_user_start = None;
     for envelope in selected {
+        if facts.retracted_prompts.contains(&envelope.seq) {
+            continue;
+        }
         if !scoped(envelope, branch_id, agent_id) {
             continue;
         }

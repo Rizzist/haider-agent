@@ -576,6 +576,9 @@ impl SessionProjection {
     /// Decode one admitted payload into this projection; an undecodable kind
     /// is counted, never fatal (forward-compat law).
     pub fn apply_payload_json(&mut self, payload: &serde_json::Value) {
+        if self.apply_prompt_retraction(payload) {
+            return;
+        }
         if let Some(payload) = WorkspaceEventPayload::from_payload_value(payload) {
             self.apply_workspace_event(&payload);
             return;
@@ -584,6 +587,42 @@ impl SessionProjection {
             Ok(payload) => self.apply(&payload),
             Err(_) => self.unknown_payloads += 1,
         }
+    }
+
+    /// Remove the exact committed prompt's display row. The node identity is
+    /// durable; equal text in another turn must never hide the wrong prompt.
+    pub fn apply_prompt_retraction(&mut self, payload: &serde_json::Value) -> bool {
+        if payload.get("type").and_then(serde_json::Value::as_str) != Some("prompt_retracted") {
+            return false;
+        }
+        let Some(node) = payload
+            .get("prompt_node_id")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return false;
+        };
+        let Some(index) = self.entry_of_node(&NodeId::new(node)) else {
+            return true;
+        };
+        if !matches!(self.entries.get(index), Some(TranscriptEntry::User { .. })) {
+            return true;
+        }
+        self.entries.remove(index);
+        self.user_entries.retain(|entry| *entry != index);
+        for entry in &mut self.user_entries {
+            if *entry > index {
+                *entry -= 1;
+            }
+        }
+        self.node_entries.retain(|(entry, _)| *entry != index);
+        for (entry, _) in &mut self.node_entries {
+            if *entry > index {
+                *entry -= 1;
+            }
+        }
+        self.render_revision = self.render_revision.wrapping_add(1);
+        self.entry_mutation_revision = self.entry_mutation_revision.wrapping_add(1);
+        true
     }
 
     /// Count one payload this build cannot decode (forward-compat law) —

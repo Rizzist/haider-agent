@@ -3077,6 +3077,20 @@ impl ProviderStream {
     pub async fn recv(&mut self) -> Option<ProviderStreamItem> {
         self.receiver.recv().await
     }
+
+    /// Stop production and return only the already-buffered cancellation tail.
+    /// The snapshot bounds the work by the existing queue length; no network
+    /// wait or new deadline is introduced while the caller journals a discard.
+    pub fn take_ready_on_cancel(&mut self) -> Vec<ProviderStreamItem> {
+        if let Some(producer) = self.producer.take() {
+            producer.abort();
+        }
+        self.receiver.close();
+        let buffered = self.receiver.len();
+        (0..buffered)
+            .filter_map(|_| self.receiver.try_recv().ok())
+            .collect()
+    }
 }
 
 impl From<mpsc::Receiver<ProviderStreamItem>> for ProviderStream {

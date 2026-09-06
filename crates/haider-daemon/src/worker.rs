@@ -9237,6 +9237,7 @@ async fn start_turn(
         event_ids: Arc::clone(&event_ids),
     }));
     config.supervisor_commits_cancelled = true;
+    config.prompt_retraction_enabled = true;
     if let Some(check) = budget_check.as_ref()
         && let Some(exhausted) = check_budget_context(check).await?
     {

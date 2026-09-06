@@ -370,3 +370,48 @@ The adapter-manifest declaration, including its workspace template, is supplied
 in [ceilingdecl evidence](testing/v0.0.970/ceilingdecl.md). Only typed terminal
 evidence or the manifest-declared code may establish an internal cap; free-text
 messages and a soft-tranche warning do not.
+
+## Prompt retraction before response (v0.0.970)
+
+`turn.retract`, negotiated as `turn_retract_v1`, retracts one accepted, active
+turn before its first semantic provider response. It uses the same durable
+cancellation intent and worker drain as `turn.cancel`. Acceptance atomically
+commits `run_state: cancelling`, the receipt, and a new prompt-omitted fact:
+
+```json
+{"type":"prompt_retracted","prompt_seq":42,"prompt_node_id":"node-user-event","text":"editable prompt","attachments":[]}
+```
+
+`prompt_seq` names the original accepted `user_message` envelope;
+`prompt_node_id` names its committed history node. `text` and the complete
+attachment blocks retain the exact draft, including CAS artifact references.
+The journal and original prompt stay append-only. Transcript and provider
+history projections hide that prompt; raw JSONL and replay retain both the
+original and the retraction fact in their original cursor order. Attachments
+remain in CAS for composer restoration. The sole terminal is `run_state` with
+`state: cancelled`, `terminal_kind: cancellation`, and additive `reason: retracted`.
+The fact and terminal survive restart and replay with their retained bytes.
+
+The session writer serializes retraction with a prompt-omitted
+`response_started` envelope, whose `delta` is the first normalized provider
+`StreamEvent`. This boundary precedes response item publication and delta
+coalescing and does not depend on optional timing traces. Text, reasoning,
+refusal, tool, opaque response, and source events cross it; empty deltas, finish, usage and
+network-control events alone do not. If retraction commits first, an observed
+response racing into this boundary becomes `response_delta_discarded`, retaining
+`delta` plus `prompt_seq`, and is never applied to response items or history.
+Unobserved bytes from the cancelled transport do not invent discarded facts.
+If response commits first, RPC returns typed `too_late` without retracting;
+the client falls back to one ordinary cancel of the same pinned run.
+
+Request reservations and observed usage retain ordinary cancellation
+accounting. A sent request with no final usage remains usage-unavailable under
+the existing budget contract. No new request is issued by retract or replay.
+SIGINT continues to mean ordinary durable `turn.cancel` with exit 130.
+
+Native `.pipe` sidecars are materialized transcript views: retraction rebuilds
+the view into a new generation and replaces the stable root, including crash
+reconciliation. A reader retaining an old sidecar handle must reopen the root
+to see this change. Full transcript exports omit the hidden prompt; incremental
+exports cannot undo already-consumed display rows, so retraction-aware automation
+uses raw journal replay and applies the fact to its own projection.

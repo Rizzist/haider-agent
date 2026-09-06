@@ -801,3 +801,63 @@ fn empty_plan_completed_clears_the_pinned_panel_and_closes_the_id() {
     assert!(panel.pinned);
     assert_eq!(panel.items[0].text, "reborn");
 }
+
+#[test]
+fn retraction_hides_only_its_node_and_preserves_replay_and_later_anchors() {
+    use haider_protocol::history::{NodeKind, TreeNode};
+    use haider_protocol::ids::NodeId;
+    let mut events = Vec::new();
+    for n in 0..3 {
+        events.push(envelope(
+            n * 2 + 1,
+            serde_json::to_value(EventPayload::UserMessage {
+                text: "equal text".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Steer,
+            })
+            .expect("user"),
+        ));
+        events.push(envelope(
+            n * 2 + 2,
+            serde_json::to_value(EventPayload::NodeCommitted(TreeNode {
+                node: NodeId::new(format!("node-{n}")),
+                parent: None,
+                kind: NodeKind::UserTurn {
+                    text: "equal text".into(),
+                    attachments: Vec::new(),
+                },
+            }))
+            .expect("node"),
+        ));
+    }
+    let fact = haider_protocol::retraction::PromptRetractedV1 {
+        prompt_seq: 3,
+        prompt_node_id: NodeId::new("node-1"),
+        text: "equal text".into(),
+        attachments: Vec::new(),
+    };
+    events.push(envelope(7, fact.to_payload_value().expect("retraction")));
+    let mut live = SessionProjection::default();
+    for event in &events {
+        assert_eq!(live.apply_raw(event), RawOutcome::Applied);
+    }
+    assert_eq!(live.entries().len(), 2);
+    assert_eq!(live.entry_of_node(&NodeId::new("node-0")), Some(0));
+    assert_eq!(live.entry_of_node(&NodeId::new("node-1")), None);
+    assert_eq!(live.entry_of_node(&NodeId::new("node-2")), Some(1));
+    assert_eq!(live.apply_raw(&events[6]), RawOutcome::Duplicate);
+    let mut replay = SessionProjection::default();
+    for event in &events {
+        replay.apply_raw(event);
+    }
+    assert_eq!(live.entries(), replay.entries());
+    let mut routed = SessionProjection::default();
+    for event in &events[..6] {
+        routed.apply_raw(event);
+    }
+    assert!(haider_tui::session::route_workspace_event(
+        &mut routed,
+        &events[6]
+    ));
+    assert_eq!(routed.entries(), live.entries());
+}

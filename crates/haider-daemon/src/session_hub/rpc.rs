@@ -4759,6 +4759,42 @@ impl HubConnection {
                 )
                 .await
             }
+            RequestBody::TurnRetract {
+                command_id,
+                session_id,
+                worker_generation,
+                run_id,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "turn retraction requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.turn_retract(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    run_id,
+                )
+                .await
+            }
             RequestBody::RunRetry {
                 command_id,
                 session_id,
@@ -15331,6 +15367,84 @@ impl HubConnection {
         })
     }
 
+    async fn turn_retract(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        run_id: haider_protocol::ids::RunId,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "turn-retract command id must not be empty",
+                false,
+                None,
+            );
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": worker_generation,
+            "run_id": &run_id,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!("cannot encode turn-retract coordinates: {error}"))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        let receipt = self
+            .hub
+            .inner
+            .store
+            .turn_retract_receipt(
+                command_id.0.clone(),
+                request_digest.clone(),
+                request_json.clone(),
+            )
+            .await;
+        let retracted = match receipt {
+            Ok(Some(retracted)) => retracted,
+            Ok(None) => {
+                let command = haider_store::TurnRetractCommand {
+                    cancel: TurnCancelCommand {
+                        command_id: command_id.0,
+                        request_digest,
+                        request_json,
+                        session_id,
+                        worker_generation,
+                        run_id,
+                        cancelling_event_id: EventId::new(random_id("turn-cancelling")?),
+                        device_id: self.hub.inner.device_id.clone(),
+                    },
+                    retracted_event_id: EventId::new(random_id("prompt-retracted")?),
+                };
+                match self.hub.retract_turn(command).await {
+                    Ok(haider_store::TurnRetractOutcome::Committed { retracted, .. })
+                    | Ok(haider_store::TurnRetractOutcome::IdempotentReplay { retracted }) => {
+                        retracted
+                    }
+                    Err(SessionHubError::Store(error)) => {
+                        return self.respond_turn_error(request_id, error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::TurnRetract {
+                session_id: retracted.session_id,
+                run_id: retracted.run_id,
+                prompt_seq: retracted.prompt_seq,
+                retracted_seq: retracted.retracted_seq,
+                text: retracted.text,
+                attachments: retracted.attachments,
+            },
+        })
+    }
+
     async fn find_headless_run(
         &self,
         run_id: &haider_protocol::ids::RunId,
@@ -15686,6 +15800,7 @@ impl HubConnection {
             ErrorCode::SingleWriterViolation => ERROR_CODE_STALE_GENERATION,
             ErrorCode::SessionNotFound => ERROR_CODE_NOT_FOUND,
             ErrorCode::RunNotActive => ERROR_CODE_RUN_NOT_ACTIVE,
+            ErrorCode::TooLate => haider_rpc::ERROR_CODE_TOO_LATE,
             ErrorCode::Busy => ERROR_CODE_OVERLOADED,
             ErrorCode::VisionUnsupported => ERROR_CODE_VISION_UNSUPPORTED,
             _ => ERROR_CODE_INVALID_ARGUMENT,

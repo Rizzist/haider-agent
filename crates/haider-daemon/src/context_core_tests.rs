@@ -326,10 +326,26 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
     let mut saw_done = false;
     let mut saw_effect = false;
     let mut saw_tool_result = false;
+    let mut saw_response_started = false;
     for event in events
         .iter()
         .filter(|event| event.run_id.as_ref() == Some(&branch_run))
     {
+        if event
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            == Some("response_started")
+        {
+            assert_eq!(event.branch_id, Some(branch_id.clone()));
+            let delta: haider_protocol::provider::StreamEvent =
+                serde_json::from_value(event.payload["delta"].clone())
+                    .expect("typed branch response boundary");
+            assert!(haider_protocol::retraction::is_response_delta(&delta));
+            assert!(!saw_response_started, "one first-response boundary per run");
+            saw_response_started = true;
+            continue;
+        }
         let payload = event.payload.decode_event().expect("typed branch event");
         if matches!(&payload, EventPayload::SessionState(_)) {
             assert_eq!(event.branch_id, None);
@@ -344,6 +360,7 @@ async fn accepted_branch_reaches_worker_history_items_nodes_and_terminal_state()
         saw_tool_result |= matches!(&payload, EventPayload::ToolResult { .. });
     }
     assert!(saw_user && saw_item && saw_node && saw_done && saw_effect && saw_tool_result);
+    assert!(saw_response_started);
 
     // MUTATION CHECK: let pending-receipt journal fallback ignore branch, or
     // fail to finalize a deterministically committed compaction node. Expected

@@ -1,0 +1,46 @@
+[
+  {
+    "v": 1,
+    "kind": "request",
+    "request_id": "request-retract",
+    "body": {
+      "method": "turn.retract",
+      "command_id": "command-retract",
+      "session_id": "session-1",
+      "worker_generation": 7,
+      "run_id": "run-1"
+    }
+  },
+  {
+    "v": 1,
+    "kind": "response",
+    "request_id": "request-retract",
+    "body": {
+      "method": "turn.retract",
+      "session_id": "session-1",
+      "run_id": "run-1",
+      "prompt_seq": 4,
+      "retracted_seq": 9,
+      "text": "edit this prompt\nwith its original attachment",
+      "attachments": [
+        {
+          "kind": "file",
+          "artifact": "blake3:attachment",
+          "name": "notes.txt",
+          "lines": 2
+        }
+      ]
+    }
+  },
+  {
+    "v": 1,
+    "kind": "response",
+    "request_id": "request-retract-too-late",
+    "body": {
+      "method": "error",
+      "code": "too_late",
+      "message": "the accepted turn has already produced a response delta",
+      "retryable": false
+    }
+  }
+]

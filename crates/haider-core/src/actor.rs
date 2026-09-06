@@ -902,6 +902,9 @@ pub struct HarnessConfig {
     /// Daemon supervisors close/reconcile their effect broker before writing
     /// `Cancelled`. Standalone actors retain the direct terminal commit.
     pub supervisor_commits_cancelled: bool,
+    /// Serialize the first semantic provider response with durable prompt
+    /// retraction before any response item or coalesced delta is published.
+    pub prompt_retraction_enabled: bool,
     /// Maximum time a provider-stream delta may remain non-durable. Set this
     /// to `Duration::ZERO` to disable coalescing and restore one durable
     /// envelope per provider delta for a deployment that needs that cadence.
@@ -1016,6 +1019,7 @@ impl HarnessConfig {
             max_continuations_per_turn: DEFAULT_MAX_CONTINUATIONS_PER_TURN,
             deferred_command_capacity: DEFAULT_DEFERRED_COMMAND_CAPACITY,
             supervisor_commits_cancelled: false,
+            prompt_retraction_enabled: false,
             stream_delta_coalesce_window: STREAM_DELTA_COALESCE_WINDOW,
             turn_trace: None,
             event_ids: None,
@@ -3154,6 +3158,7 @@ impl HarnessActor {
         let mut volatile_user_tail = self.config.volatile_user_tail.take();
 
         let mut message: Option<TextAccumulator> = None;
+        let mut response_boundary_seen = false;
         let mut reasoning: Option<TextAccumulator> = None;
         let mut tools: Vec<ToolAccumulator> = Vec::new();
         // Recovery checkpoints carry canonical execution names. Recover the
@@ -4952,6 +4957,26 @@ impl HarnessActor {
                     // command arrival rate cannot starve the active stream.
                     biased;
                     () = cancel.cancelled() => {
+                        if self.config.prompt_retraction_enabled && !response_boundary_seen {
+                            let ready = stream.take_ready_on_cancel();
+                            if let Some(Ok(event)) = ready.iter().find(|item| {
+                                item.as_ref().is_ok_and(haider_protocol::retraction::is_response_delta)
+                            }) {
+                                // Preserve the already-received losing delta,
+                                // even when the cancellation select owns a tie.
+                                if let Err(error) = self.commit_response_boundary(&run_id, event).await {
+                                    let _ = release_provider_budget_request(
+                                        self.config.provider_budget_guard.as_ref(), &run_id,
+                                        &self.config.usage_scope.provider, &self.config.model,
+                                        request_usage.is_some(), &mut provider_budget_permit,
+                                    ).await;
+                                    return self.drive_error_outcome_with_items(
+                                        &run_id, &mut message, &mut reasoning, &mut tools,
+                                        DriveError::from(error),
+                                    ).await;
+                                }
+                            }
+                        }
                         if let Err(error) = release_provider_budget_request(
                             self.config.provider_budget_guard.as_ref(),
                             &run_id,
@@ -5071,6 +5096,40 @@ impl HarnessActor {
                     }
                     }
                 };
+
+                // The session writer arbitrates this boundary against retract
+                // acceptance. Do this before the cancellation check: a response
+                // already received in the race must leave a discarded fact.
+                if self.config.prompt_retraction_enabled
+                    && !response_boundary_seen
+                    && let Some(Ok(event)) = &next
+                    && haider_protocol::retraction::is_response_delta(event)
+                {
+                    match self.commit_response_boundary(&run_id, event).await {
+                        Ok(true) => response_boundary_seen = true,
+                        Ok(false) => cancel.cancel(),
+                        Err(error) => {
+                            let _ = release_provider_budget_request(
+                                self.config.provider_budget_guard.as_ref(),
+                                &run_id,
+                                &self.config.usage_scope.provider,
+                                &self.config.model,
+                                request_usage.is_some(),
+                                &mut provider_budget_permit,
+                            )
+                            .await;
+                            return self
+                                .drive_error_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    DriveError::from(error),
+                                )
+                                .await;
+                        }
+                    }
+                }
 
                 let finish_follows_usage = matches!(&next, Some(Ok(StreamEvent::Finish { .. })));
                 if !finish_follows_usage
@@ -11194,6 +11253,31 @@ impl HarnessActor {
         *pending_usage = None;
         self.state.send_replace(Some(RunState::Done));
         Ok(())
+    }
+
+    async fn commit_response_boundary(
+        &self,
+        run_id: &RunId,
+        event: &StreamEvent,
+    ) -> Result<bool, HaiderError> {
+        let delta = serde_json::to_value(event)
+            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+        let mut envelope = self.uncommitted_envelope(
+            run_id,
+            EventPayload::RunState(RunState::Streaming),
+            prompt_omit_render(),
+        )?;
+        envelope.render.ui = false;
+        envelope.payload = haider_protocol::retraction::response_started_payload(delta).into();
+        let committed = self.append_and_publish_owned(vec![envelope]).await?;
+        let first = committed.first().ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "response boundary append was empty",
+                false,
+            )
+        })?;
+        Ok(!haider_protocol::retraction::response_was_discarded(first))
     }
 
     async fn commit_extension_marker(

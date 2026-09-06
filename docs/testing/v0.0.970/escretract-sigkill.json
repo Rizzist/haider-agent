@@ -1,0 +1,5483 @@
+{
+  "binaries": {
+    "haider": {
+      "path": "/Users/rizzist/haider-run/lane-970-escretract/target/debug/haider",
+      "sha256": "61dda66077914d1d4a7aefffec547a2f4566f3a4ef6f3d0fb60a891b93bc6bd8"
+    },
+    "haiderd": {
+      "path": "/Users/rizzist/haider-run/lane-970-escretract/target/debug/haiderd",
+      "sha256": "976610bdc830fea7badfef68ba9ab76cb5f400286cd2313e1a25d1e48680de96"
+    },
+    "matrix_source_sha256": "4c202a3f49df4c4cbeb35f6d58369f1e1efbabbd86fc4f52e3187ebbdbcc760e",
+    "proxy_source_sha256": "97cd60b404e9f105a5945e0788b950620800a279185b5296ea85cba3ed27677c"
+  },
+  "cases": [
+    {
+      "client_exit": 0,
+      "client_stderr_tail": "",
+      "effect_recovery": {
+        "outcome": "pre_accept_boundary"
+      },
+      "label": "single-journal-1",
+      "new_pid": 28906,
+      "old_pid": 28903,
+      "passed": true,
+      "pre_kill_events": 0,
+      "provider_requests": [
+        {
+          "body_sha256": "44473c4a5879c24d79cee3f9ddd28c44ab083124b969065c921c2fcf9bf0690a",
+          "case_id": 3,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586989117480208,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "single",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-866c91986add714f3f07d1bf43fa8ee7/run-cc2cc63d60efce8529038bd781d78dde/1/1"
+        }
+      ],
+      "replay_events": 25,
+      "settled_state": "idle",
+      "shape": "single",
+      "store_integrity": "ok",
+      "target": [
+        1,
+        1
+      ],
+      "terminal_error_code": null,
+      "terminal_kind": "success",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 0,
+      "client_stderr_tail": "",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "no_recovery",
+            "message": "no crash window to reconcile \u2014 run_state is idle",
+            "retryable": false
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-eb765e1322ac85c0342c05e48b369c32"
+        },
+        "outcome": "not_needed"
+      },
+      "label": "single-journal-2",
+      "new_pid": 28918,
+      "old_pid": 28915,
+      "passed": true,
+      "pre_kill_events": 0,
+      "provider_requests": [
+        {
+          "body_sha256": "1f3f2d8cf65336eb560ec73464ea938422ab5f32ec09342ba3e27ca601745f11",
+          "case_id": 4,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586989352239291,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "single",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-eb765e1322ac85c0342c05e48b369c32/run-d6f7fd84041d31dfd286dd5b5da34a5a/1/1"
+        }
+      ],
+      "replay_events": 25,
+      "settled_state": "idle",
+      "shape": "single",
+      "store_integrity": "ok",
+      "target": [
+        2,
+        7
+      ],
+      "terminal_error_code": null,
+      "terminal_kind": "success",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-f682e1d946860570bf8a99f278e0fbb2"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "single-journal-3",
+      "new_pid": 28935,
+      "old_pid": 28931,
+      "passed": true,
+      "pre_kill_events": 5,
+      "provider_requests": [],
+      "replay_events": 8,
+      "settled_state": "errored",
+      "shape": "single",
+      "store_integrity": "ok",
+      "target": [
+        3,
+        8
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-bb476d31c97ff1f1e9dc0f6d8acd162b"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "single-journal-4",
+      "new_pid": 28948,
+      "old_pid": 28945,
+      "passed": true,
+      "pre_kill_events": 6,
+      "provider_requests": [],
+      "replay_events": 10,
+      "settled_state": "errored",
+      "shape": "single",
+      "store_integrity": "ok",
+      "target": [
+        4,
+        10
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 77,
+      "client_stderr_tail": "haider: run requires interactive input\n",
+      "effect_recovery": {
+        "abandon": {
+          "chosen_option": "abandon",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-cfd0d0870a589c35d5ed4bd43ec08b8a-2-probe-26",
+          "resolution_seq": 29,
+          "resulting_head_seq": 33,
+          "resulting_run_id": "run-cfd0d0870a589c35d5ed4bd43ec08b8a",
+          "resulting_run_state": "errored",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-f7ae1c548466ac06e452a31f892c68ff"
+        },
+        "card": {
+          "body": [
+            "Dispatched effect: provider request attempt 2 admitted before daemon restart"
+          ],
+          "menu_id": "provider-admission-recovery-run-cfd0d0870a589c35d5ed4bd43ec08b8a-2",
+          "options": [
+            {
+              "detail": "Re-check whether the effect completed.",
+              "key": "probe",
+              "label": "Probe"
+            },
+            {
+              "detail": "Record that it completed.",
+              "key": "mark_done",
+              "label": "Mark done"
+            },
+            {
+              "detail": "Settle this attempt and retry once.",
+              "key": "retry",
+              "label": "Retry"
+            },
+            {
+              "detail": "Record it abandoned and close the run.",
+              "key": "abandon",
+              "label": "Abandon"
+            }
+          ],
+          "parked_since": 1788653994804,
+          "run_state": "running",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-f7ae1c548466ac06e452a31f892c68ff",
+          "title": "Effect outcome unknown"
+        },
+        "outcome": "probed_then_abandoned",
+        "probe": {
+          "chosen_option": "probe",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-cfd0d0870a589c35d5ed4bd43ec08b8a-2",
+          "replacement_menu_id": "provider-admission-recovery-run-cfd0d0870a589c35d5ed4bd43ec08b8a-2-probe-26",
+          "resolution_seq": 26,
+          "resulting_head_seq": 28,
+          "resulting_run_id": "run-cfd0d0870a589c35d5ed4bd43ec08b8a",
+          "resulting_run_state": "effect_unknown",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-f7ae1c548466ac06e452a31f892c68ff"
+        },
+        "provider_ledger_unchanged": true
+      },
+      "label": "single-journal-5",
+      "new_pid": 28961,
+      "old_pid": 28958,
+      "passed": true,
+      "pre_kill_events": 8,
+      "provider_requests": [],
+      "replay_events": 30,
+      "settled_state": "errored",
+      "shape": "single",
+      "store_integrity": "ok",
+      "target": [
+        5,
+        18
+      ],
+      "terminal_error_code": "input_required",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 77,
+      "client_stderr_tail": "haider: run requires interactive input\n",
+      "effect_recovery": {
+        "abandon": {
+          "chosen_option": "abandon",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-2638c6aecb6c7d4b72ca5e10c7b7581f-2-probe-27",
+          "resolution_seq": 30,
+          "resulting_head_seq": 34,
+          "resulting_run_id": "run-2638c6aecb6c7d4b72ca5e10c7b7581f",
+          "resulting_run_state": "errored",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-5bc6ed7eb7881e4297da30bd306d3615"
+        },
+        "card": {
+          "body": [
+            "Dispatched effect: provider request attempt 2 admitted before daemon restart"
+          ],
+          "menu_id": "provider-admission-recovery-run-2638c6aecb6c7d4b72ca5e10c7b7581f-2",
+          "options": [
+            {
+              "detail": "Re-check whether the effect completed.",
+              "key": "probe",
+              "label": "Probe"
+            },
+            {
+              "detail": "Record that it completed.",
+              "key": "mark_done",
+              "label": "Mark done"
+            },
+            {
+              "detail": "Settle this attempt and retry once.",
+              "key": "retry",
+              "label": "Retry"
+            },
+            {
+              "detail": "Record it abandoned and close the run.",
+              "key": "abandon",
+              "label": "Abandon"
+            }
+          ],
+          "parked_since": 1788653995073,
+          "run_state": "running",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-5bc6ed7eb7881e4297da30bd306d3615",
+          "title": "Effect outcome unknown"
+        },
+        "outcome": "probed_then_abandoned",
+        "probe": {
+          "chosen_option": "probe",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-2638c6aecb6c7d4b72ca5e10c7b7581f-2",
+          "replacement_menu_id": "provider-admission-recovery-run-2638c6aecb6c7d4b72ca5e10c7b7581f-2-probe-27",
+          "resolution_seq": 27,
+          "resulting_head_seq": 29,
+          "resulting_run_id": "run-2638c6aecb6c7d4b72ca5e10c7b7581f",
+          "resulting_run_state": "effect_unknown",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-5bc6ed7eb7881e4297da30bd306d3615"
+        },
+        "provider_ledger_unchanged": true
+      },
+      "label": "single-journal-6",
+      "new_pid": 28976,
+      "old_pid": 28973,
+      "passed": true,
+      "pre_kill_events": 16,
+      "provider_requests": [
+        {
+          "body_sha256": "aada3eeb529873862b66d002baad1b799778ca1fc75fad5f800fdbbdd1ac6077",
+          "case_id": 8,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586990269511125,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "single",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-5bc6ed7eb7881e4297da30bd306d3615/run-2638c6aecb6c7d4b72ca5e10c7b7581f/1/1"
+        }
+      ],
+      "replay_events": 31,
+      "settled_state": "errored",
+      "shape": "single",
+      "store_integrity": "ok",
+      "target": [
+        6,
+        19
+      ],
+      "terminal_error_code": "input_required",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-4bc2f0d71928bc7e4ecbb0230beb29d2"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "single-journal-7",
+      "new_pid": 28991,
+      "old_pid": 28988,
+      "passed": true,
+      "pre_kill_events": 17,
+      "provider_requests": [
+        {
+          "body_sha256": "0365e5c89ba8019c8e27d976e0a66f5719bc7267d9adc7481d92cb45331bd6cc",
+          "case_id": 9,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586990560693583,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "single",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-4bc2f0d71928bc7e4ecbb0230beb29d2/run-b5f2421edfbda26b51b44c3bef574718/1/1"
+        }
+      ],
+      "replay_events": 20,
+      "settled_state": "errored",
+      "shape": "single",
+      "store_integrity": "ok",
+      "target": [
+        7,
+        20
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-970d2d5d6320256b235a4f663163ecca"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "single-journal-8",
+      "new_pid": 29004,
+      "old_pid": 29001,
+      "passed": true,
+      "pre_kill_events": 18,
+      "provider_requests": [
+        {
+          "body_sha256": "3b4914e81e9f383b5d0a0bd9bdc663e1d27e99fe204db80e03bcec577f76904f",
+          "case_id": 10,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586990806584250,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "single",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-970d2d5d6320256b235a4f663163ecca/run-a073c9c2041ee7f085d3cf1ff3a14fe9/1/1"
+        }
+      ],
+      "replay_events": 22,
+      "settled_state": "errored",
+      "shape": "single",
+      "store_integrity": "ok",
+      "target": [
+        8,
+        21
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-2e8b96c57b9827fc706d4161e2aba03c"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "single-journal-9",
+      "new_pid": 29017,
+      "old_pid": 29014,
+      "passed": true,
+      "pre_kill_events": 19,
+      "provider_requests": [
+        {
+          "body_sha256": "4426cb87c6228ca73ebe3ee8004598745d9618beafe3d48229442ad6aa2d4022",
+          "case_id": 11,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586991057545708,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "single",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-2e8b96c57b9827fc706d4161e2aba03c/run-904d678d0d709e2ebecf4905c6d0783b/1/1"
+        }
+      ],
+      "replay_events": 23,
+      "settled_state": "errored",
+      "shape": "single",
+      "store_integrity": "ok",
+      "target": [
+        9,
+        22
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-9ccba31833d95ec3e8175f8b3dc99f9c"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "single-journal-10",
+      "new_pid": 29030,
+      "old_pid": 29027,
+      "passed": true,
+      "pre_kill_events": 20,
+      "provider_requests": [
+        {
+          "body_sha256": "f488895b4c631dcc153eb14a81314b17b1ccd3acd212666a250eb2b9542f355e",
+          "case_id": 12,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586991313584166,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "single",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-9ccba31833d95ec3e8175f8b3dc99f9c/run-f1780ca238cc088476c8b315b771b850/1/1"
+        }
+      ],
+      "replay_events": 25,
+      "settled_state": "errored",
+      "shape": "single",
+      "store_integrity": "ok",
+      "target": [
+        10,
+        24
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-6083247102a5e8239fa4c9bb4034750e"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "single-journal-11",
+      "new_pid": 29043,
+      "old_pid": 29040,
+      "passed": true,
+      "pre_kill_events": 22,
+      "provider_requests": [
+        {
+          "body_sha256": "4f2a161715e05ebc1834230c36f008cca7c864e56ecaf3fcf4ca1a090d1fcd09",
+          "case_id": 13,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586991587974666,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "single",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-6083247102a5e8239fa4c9bb4034750e/run-ab06f175a832d953e4a869995fd4db9d/1/1"
+        }
+      ],
+      "replay_events": 26,
+      "settled_state": "errored",
+      "shape": "single",
+      "store_integrity": "ok",
+      "target": [
+        11,
+        26
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 0,
+      "client_stderr_tail": "",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "no_recovery",
+            "message": "no crash window to reconcile \u2014 run_state is idle",
+            "retryable": false
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-92ff9093255ab8cf64e25d429b748107"
+        },
+        "outcome": "not_needed"
+      },
+      "label": "single-journal-12",
+      "new_pid": 29056,
+      "old_pid": 29053,
+      "passed": true,
+      "pre_kill_events": 24,
+      "provider_requests": [
+        {
+          "body_sha256": "61f1989851ff376e531cf5e0e3095f9e9a5581244f91ea7b4f4dbde40d523c6e",
+          "case_id": 14,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586991866904291,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "single",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-92ff9093255ab8cf64e25d429b748107/run-c21d6fc3c17b621742f6c918574b72b6/1/1"
+        }
+      ],
+      "replay_events": 25,
+      "settled_state": "idle",
+      "shape": "single",
+      "store_integrity": "ok",
+      "target": [
+        12,
+        27
+      ],
+      "terminal_error_code": null,
+      "terminal_kind": "success",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 0,
+      "client_stderr_tail": "",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "no_recovery",
+            "message": "no crash window to reconcile \u2014 run_state is idle",
+            "retryable": false
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-7397f61fb200d90603a00a0c4bb04e2b"
+        },
+        "outcome": "not_needed"
+      },
+      "label": "single-journal-13",
+      "new_pid": 29072,
+      "old_pid": 29066,
+      "passed": true,
+      "pre_kill_events": 25,
+      "provider_requests": [
+        {
+          "body_sha256": "c0d21acc725e6f71f60f6b0b38d08e4cdef69412e54ad6c6b471df8f58f81cd7",
+          "case_id": 15,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586992163756375,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "single",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-7397f61fb200d90603a00a0c4bb04e2b/run-b0163d07af3e74a5e563ed2db18767b2/1/1"
+        }
+      ],
+      "replay_events": 25,
+      "settled_state": "idle",
+      "shape": "single",
+      "store_integrity": "ok",
+      "target": [
+        13,
+        28
+      ],
+      "terminal_error_code": null,
+      "terminal_kind": "success",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 77,
+      "client_stderr_tail": "haider: run requires interactive input\n",
+      "effect_recovery": {
+        "abandon": {
+          "chosen_option": "abandon",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-a05c13da71c661a1a96f715f9632628c-2-probe-26",
+          "resolution_seq": 29,
+          "resulting_head_seq": 33,
+          "resulting_run_id": "run-a05c13da71c661a1a96f715f9632628c",
+          "resulting_run_state": "errored",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-539a0ffcb1e6c31cc94722b75e1c6397"
+        },
+        "card": {
+          "body": [
+            "Dispatched effect: provider request attempt 2 admitted before daemon restart"
+          ],
+          "menu_id": "provider-admission-recovery-run-a05c13da71c661a1a96f715f9632628c-2",
+          "options": [
+            {
+              "detail": "Re-check whether the effect completed.",
+              "key": "probe",
+              "label": "Probe"
+            },
+            {
+              "detail": "Record that it completed.",
+              "key": "mark_done",
+              "label": "Mark done"
+            },
+            {
+              "detail": "Settle this attempt and retry once.",
+              "key": "retry",
+              "label": "Retry"
+            },
+            {
+              "detail": "Record it abandoned and close the run.",
+              "key": "abandon",
+              "label": "Abandon"
+            }
+          ],
+          "parked_since": 1788653997248,
+          "run_state": "running",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-539a0ffcb1e6c31cc94722b75e1c6397",
+          "title": "Effect outcome unknown"
+        },
+        "outcome": "probed_then_abandoned",
+        "probe": {
+          "chosen_option": "probe",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-a05c13da71c661a1a96f715f9632628c-2",
+          "replacement_menu_id": "provider-admission-recovery-run-a05c13da71c661a1a96f715f9632628c-2-probe-26",
+          "resolution_seq": 26,
+          "resulting_head_seq": 28,
+          "resulting_run_id": "run-a05c13da71c661a1a96f715f9632628c",
+          "resulting_run_state": "effect_unknown",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-539a0ffcb1e6c31cc94722b75e1c6397"
+        },
+        "provider_ledger_unchanged": true
+      },
+      "label": "single-provider-1-after_post",
+      "new_pid": 29087,
+      "old_pid": 29084,
+      "passed": true,
+      "pre_kill_events": 16,
+      "provider_requests": [
+        {
+          "body_sha256": "aac1f5a4773ee7731abef02acfd0e7fbd09f3376818cf186c498311216e63258",
+          "case_id": 16,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586992451784458,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "single",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-539a0ffcb1e6c31cc94722b75e1c6397/run-a05c13da71c661a1a96f715f9632628c/1/1"
+        }
+      ],
+      "replay_events": 30,
+      "settled_state": "errored",
+      "shape": "single",
+      "store_integrity": "ok",
+      "target": [
+        1,
+        "after_post"
+      ],
+      "terminal_error_code": "input_required",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 77,
+      "client_stderr_tail": "haider: run requires interactive input\n",
+      "effect_recovery": {
+        "abandon": {
+          "chosen_option": "abandon",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-d542cf478b10df35ccf8f12e7f66d518-2-probe-26",
+          "resolution_seq": 29,
+          "resulting_head_seq": 33,
+          "resulting_run_id": "run-d542cf478b10df35ccf8f12e7f66d518",
+          "resulting_run_state": "errored",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-46933fc5b6c375970cb549f836e13892"
+        },
+        "card": {
+          "body": [
+            "Dispatched effect: provider request attempt 2 admitted before daemon restart"
+          ],
+          "menu_id": "provider-admission-recovery-run-d542cf478b10df35ccf8f12e7f66d518-2",
+          "options": [
+            {
+              "detail": "Re-check whether the effect completed.",
+              "key": "probe",
+              "label": "Probe"
+            },
+            {
+              "detail": "Record that it completed.",
+              "key": "mark_done",
+              "label": "Mark done"
+            },
+            {
+              "detail": "Settle this attempt and retry once.",
+              "key": "retry",
+              "label": "Retry"
+            },
+            {
+              "detail": "Record it abandoned and close the run.",
+              "key": "abandon",
+              "label": "Abandon"
+            }
+          ],
+          "parked_since": 1788653997493,
+          "run_state": "running",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-46933fc5b6c375970cb549f836e13892",
+          "title": "Effect outcome unknown"
+        },
+        "outcome": "probed_then_abandoned",
+        "probe": {
+          "chosen_option": "probe",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-d542cf478b10df35ccf8f12e7f66d518-2",
+          "replacement_menu_id": "provider-admission-recovery-run-d542cf478b10df35ccf8f12e7f66d518-2-probe-26",
+          "resolution_seq": 26,
+          "resulting_head_seq": 28,
+          "resulting_run_id": "run-d542cf478b10df35ccf8f12e7f66d518",
+          "resulting_run_state": "effect_unknown",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-46933fc5b6c375970cb549f836e13892"
+        },
+        "provider_ledger_unchanged": true
+      },
+      "label": "single-provider-1-before_headers",
+      "new_pid": 29102,
+      "old_pid": 29099,
+      "passed": true,
+      "pre_kill_events": 16,
+      "provider_requests": [
+        {
+          "body_sha256": "dd3f8815add4413d32630ccd099fe14bd2970c89c8d118c31a7490bd96c3f803",
+          "case_id": 17,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586992694809750,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "single",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-46933fc5b6c375970cb549f836e13892/run-d542cf478b10df35ccf8f12e7f66d518/1/1"
+        }
+      ],
+      "replay_events": 30,
+      "settled_state": "errored",
+      "shape": "single",
+      "store_integrity": "ok",
+      "target": [
+        1,
+        "before_headers"
+      ],
+      "terminal_error_code": "input_required",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 77,
+      "client_stderr_tail": "haider: run requires interactive input\n",
+      "effect_recovery": {
+        "abandon": {
+          "chosen_option": "abandon",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-2850b5cd31f388539e6841b3feddda81-2-probe-26",
+          "resolution_seq": 29,
+          "resulting_head_seq": 33,
+          "resulting_run_id": "run-2850b5cd31f388539e6841b3feddda81",
+          "resulting_run_state": "errored",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-b2888380570a9ad29090f55b774a3399"
+        },
+        "card": {
+          "body": [
+            "Dispatched effect: provider request attempt 2 admitted before daemon restart"
+          ],
+          "menu_id": "provider-admission-recovery-run-2850b5cd31f388539e6841b3feddda81-2",
+          "options": [
+            {
+              "detail": "Re-check whether the effect completed.",
+              "key": "probe",
+              "label": "Probe"
+            },
+            {
+              "detail": "Record that it completed.",
+              "key": "mark_done",
+              "label": "Mark done"
+            },
+            {
+              "detail": "Settle this attempt and retry once.",
+              "key": "retry",
+              "label": "Retry"
+            },
+            {
+              "detail": "Record it abandoned and close the run.",
+              "key": "abandon",
+              "label": "Abandon"
+            }
+          ],
+          "parked_since": 1788653997744,
+          "run_state": "running",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-b2888380570a9ad29090f55b774a3399",
+          "title": "Effect outcome unknown"
+        },
+        "outcome": "probed_then_abandoned",
+        "probe": {
+          "chosen_option": "probe",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-2850b5cd31f388539e6841b3feddda81-2",
+          "replacement_menu_id": "provider-admission-recovery-run-2850b5cd31f388539e6841b3feddda81-2-probe-26",
+          "resolution_seq": 26,
+          "resulting_head_seq": 28,
+          "resulting_run_id": "run-2850b5cd31f388539e6841b3feddda81",
+          "resulting_run_state": "effect_unknown",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-b2888380570a9ad29090f55b774a3399"
+        },
+        "provider_ledger_unchanged": true
+      },
+      "label": "single-provider-1-between_chunks",
+      "new_pid": 29118,
+      "old_pid": 29114,
+      "passed": true,
+      "pre_kill_events": 16,
+      "provider_requests": [
+        {
+          "body_sha256": "19db24d5abf71ed8e710ec40e2ea486eec72fe19cd9b9c7b51044f3c51a3e7a0",
+          "case_id": 18,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586992944743875,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "single",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-b2888380570a9ad29090f55b774a3399/run-2850b5cd31f388539e6841b3feddda81/1/1"
+        }
+      ],
+      "replay_events": 30,
+      "settled_state": "errored",
+      "shape": "single",
+      "store_integrity": "ok",
+      "target": [
+        1,
+        "between_chunks"
+      ],
+      "terminal_error_code": "input_required",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 0,
+      "client_stderr_tail": "",
+      "effect_recovery": {
+        "outcome": "pre_accept_boundary"
+      },
+      "label": "tool-journal-1",
+      "new_pid": 29133,
+      "old_pid": 29130,
+      "passed": true,
+      "pre_kill_events": 0,
+      "provider_requests": [
+        {
+          "body_sha256": "5566bb05af50cea3e56788d9816b4f576c39f8d02da92b4d9f18b39fa5105a81",
+          "case_id": 19,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586993246241500,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-814a52704a02ed5605d4c11b50619e66/run-5db71f1239eb43c3ac46052fdb78a7e6/1/1"
+        },
+        {
+          "body_sha256": "9418997bd2f575e45aeace99a92685468d4b84cd58834b47d5208dfcaaa4f466",
+          "case_id": 19,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586993284849500,
+          "request_kind": "primary",
+          "request_number": 2,
+          "request_ordinal": 2,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-814a52704a02ed5605d4c11b50619e66/run-5db71f1239eb43c3ac46052fdb78a7e6/1/2"
+        }
+      ],
+      "replay_events": 57,
+      "settled_state": "idle",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        1,
+        1
+      ],
+      "terminal_error_code": null,
+      "terminal_kind": "success",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 0,
+      "client_stderr_tail": "",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "no_recovery",
+            "message": "no crash window to reconcile \u2014 run_state is idle",
+            "retryable": false
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-e8e56416aff6b6bf2171049de5093660"
+        },
+        "outcome": "not_needed"
+      },
+      "label": "tool-journal-2",
+      "new_pid": 29146,
+      "old_pid": 29143,
+      "passed": true,
+      "pre_kill_events": 0,
+      "provider_requests": [
+        {
+          "body_sha256": "100a961c26fadc88eb7d08df0bcb4ef5e4ddb1f9c80097b600b45e4b3ddcd237",
+          "case_id": 20,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586993519601416,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-e8e56416aff6b6bf2171049de5093660/run-dc2b46bd41467de7ccb13576d7f18a17/1/1"
+        },
+        {
+          "body_sha256": "3a5bb4d58d5c2cae0c7e2fa87a100e4c4a25eb69e8bb3f22705d9856d6c11f13",
+          "case_id": 20,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586993557829083,
+          "request_kind": "primary",
+          "request_number": 2,
+          "request_ordinal": 2,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-e8e56416aff6b6bf2171049de5093660/run-dc2b46bd41467de7ccb13576d7f18a17/1/2"
+        }
+      ],
+      "replay_events": 57,
+      "settled_state": "idle",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        2,
+        7
+      ],
+      "terminal_error_code": null,
+      "terminal_kind": "success",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-50c3790b0990a2f614b61a7dda9ac1cc"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-3",
+      "new_pid": 29161,
+      "old_pid": 29158,
+      "passed": true,
+      "pre_kill_events": 5,
+      "provider_requests": [],
+      "replay_events": 8,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        3,
+        8
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-08df6acd77394e6f6195253261cb3691"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-4",
+      "new_pid": 29174,
+      "old_pid": 29171,
+      "passed": true,
+      "pre_kill_events": 6,
+      "provider_requests": [],
+      "replay_events": 10,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        4,
+        10
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 77,
+      "client_stderr_tail": "haider: run requires interactive input\n",
+      "effect_recovery": {
+        "abandon": {
+          "chosen_option": "abandon",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-296e1ad58689d7b71573965e5db25ae2-2-probe-26",
+          "resolution_seq": 29,
+          "resulting_head_seq": 33,
+          "resulting_run_id": "run-296e1ad58689d7b71573965e5db25ae2",
+          "resulting_run_state": "errored",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-97ed161e855a57e1e49f36dfbf20f2d3"
+        },
+        "card": {
+          "body": [
+            "Dispatched effect: provider request attempt 2 admitted before daemon restart"
+          ],
+          "menu_id": "provider-admission-recovery-run-296e1ad58689d7b71573965e5db25ae2-2",
+          "options": [
+            {
+              "detail": "Re-check whether the effect completed.",
+              "key": "probe",
+              "label": "Probe"
+            },
+            {
+              "detail": "Record that it completed.",
+              "key": "mark_done",
+              "label": "Mark done"
+            },
+            {
+              "detail": "Settle this attempt and retry once.",
+              "key": "retry",
+              "label": "Retry"
+            },
+            {
+              "detail": "Record it abandoned and close the run.",
+              "key": "abandon",
+              "label": "Abandon"
+            }
+          ],
+          "parked_since": 1788653999005,
+          "run_state": "running",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-97ed161e855a57e1e49f36dfbf20f2d3",
+          "title": "Effect outcome unknown"
+        },
+        "outcome": "probed_then_abandoned",
+        "probe": {
+          "chosen_option": "probe",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-296e1ad58689d7b71573965e5db25ae2-2",
+          "replacement_menu_id": "provider-admission-recovery-run-296e1ad58689d7b71573965e5db25ae2-2-probe-26",
+          "resolution_seq": 26,
+          "resulting_head_seq": 28,
+          "resulting_run_id": "run-296e1ad58689d7b71573965e5db25ae2",
+          "resulting_run_state": "effect_unknown",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-97ed161e855a57e1e49f36dfbf20f2d3"
+        },
+        "provider_ledger_unchanged": true
+      },
+      "label": "tool-journal-5",
+      "new_pid": 29187,
+      "old_pid": 29184,
+      "passed": true,
+      "pre_kill_events": 8,
+      "provider_requests": [],
+      "replay_events": 30,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        5,
+        18
+      ],
+      "terminal_error_code": "input_required",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 77,
+      "client_stderr_tail": "haider: run requires interactive input\n",
+      "effect_recovery": {
+        "abandon": {
+          "chosen_option": "abandon",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-ec0678277c79e0103318928b461c986b-2-probe-27",
+          "resolution_seq": 30,
+          "resulting_head_seq": 34,
+          "resulting_run_id": "run-ec0678277c79e0103318928b461c986b",
+          "resulting_run_state": "errored",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-82d0deb35630ccc1b124f21a13adfc90"
+        },
+        "card": {
+          "body": [
+            "Dispatched effect: provider request attempt 2 admitted before daemon restart"
+          ],
+          "menu_id": "provider-admission-recovery-run-ec0678277c79e0103318928b461c986b-2",
+          "options": [
+            {
+              "detail": "Re-check whether the effect completed.",
+              "key": "probe",
+              "label": "Probe"
+            },
+            {
+              "detail": "Record that it completed.",
+              "key": "mark_done",
+              "label": "Mark done"
+            },
+            {
+              "detail": "Settle this attempt and retry once.",
+              "key": "retry",
+              "label": "Retry"
+            },
+            {
+              "detail": "Record it abandoned and close the run.",
+              "key": "abandon",
+              "label": "Abandon"
+            }
+          ],
+          "parked_since": 1788653999269,
+          "run_state": "running",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-82d0deb35630ccc1b124f21a13adfc90",
+          "title": "Effect outcome unknown"
+        },
+        "outcome": "probed_then_abandoned",
+        "probe": {
+          "chosen_option": "probe",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-ec0678277c79e0103318928b461c986b-2",
+          "replacement_menu_id": "provider-admission-recovery-run-ec0678277c79e0103318928b461c986b-2-probe-27",
+          "resolution_seq": 27,
+          "resulting_head_seq": 29,
+          "resulting_run_id": "run-ec0678277c79e0103318928b461c986b",
+          "resulting_run_state": "effect_unknown",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-82d0deb35630ccc1b124f21a13adfc90"
+        },
+        "provider_ledger_unchanged": true
+      },
+      "label": "tool-journal-6",
+      "new_pid": 29202,
+      "old_pid": 29199,
+      "passed": true,
+      "pre_kill_events": 16,
+      "provider_requests": [
+        {
+          "body_sha256": "4e1f8c94ef2c7ae59415d4f635db399a09fc3d64596a7993c43ccf48902aede7",
+          "case_id": 24,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586994465805333,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-82d0deb35630ccc1b124f21a13adfc90/run-ec0678277c79e0103318928b461c986b/1/1"
+        }
+      ],
+      "replay_events": 31,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        6,
+        19
+      ],
+      "terminal_error_code": "input_required",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-fcdf692130129742f3ddcd258b0258f7"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-7",
+      "new_pid": 29217,
+      "old_pid": 29214,
+      "passed": true,
+      "pre_kill_events": 17,
+      "provider_requests": [
+        {
+          "body_sha256": "b2e9e5c967415026d7bf4c26c826b827994ebf1c57a2890c4f76fa7815a2446c",
+          "case_id": 25,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586994728801291,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-fcdf692130129742f3ddcd258b0258f7/run-78ce4e84f19706b6b4dc3e1997267d39/1/1"
+        }
+      ],
+      "replay_events": 20,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        7,
+        20
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-c2180f7eeca3eeba11df8cb4959c4504"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-8",
+      "new_pid": 29230,
+      "old_pid": 29227,
+      "passed": true,
+      "pre_kill_events": 18,
+      "provider_requests": [
+        {
+          "body_sha256": "7252646fd4186546a75f3695a1a6f11672fec3f6ab00111123961ca324f47ccd",
+          "case_id": 26,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586995001439083,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-c2180f7eeca3eeba11df8cb4959c4504/run-c59f0677f2c8b53702f254a572b1dce0/1/1"
+        }
+      ],
+      "replay_events": 22,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        8,
+        21
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-30cf82cedd4e4bf334ee898afb3a1614"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-9",
+      "new_pid": 29243,
+      "old_pid": 29240,
+      "passed": true,
+      "pre_kill_events": 19,
+      "provider_requests": [
+        {
+          "body_sha256": "bb636d0deca90b50dd836900ab2f2656d60ba0016f887f668f8b34aa279418c0",
+          "case_id": 27,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586995253444625,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-30cf82cedd4e4bf334ee898afb3a1614/run-b4ce485303f86bcad21d5cea9f07cb07/1/1"
+        }
+      ],
+      "replay_events": 24,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        9,
+        23
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-1fa7e07839c10a8f569749affa0d227b"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-10",
+      "new_pid": 29256,
+      "old_pid": 29253,
+      "passed": true,
+      "pre_kill_events": 21,
+      "provider_requests": [
+        {
+          "body_sha256": "a8833e39ab95f620d4cadc67d3bf91aeb7169382ba50fce9e70a697e33993900",
+          "case_id": 28,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586995527525958,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-1fa7e07839c10a8f569749affa0d227b/run-db8181c1eb63514486b0e2c936187cc5/1/1"
+        }
+      ],
+      "replay_events": 25,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        10,
+        24
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-aeef837a43e77a4a50b504257ecb9392"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-11",
+      "new_pid": 29269,
+      "old_pid": 29266,
+      "passed": true,
+      "pre_kill_events": 22,
+      "provider_requests": [
+        {
+          "body_sha256": "7f9eec1345992accefe250a03789a6b2a59db84363d67d9a8a35e1edc43e0ff8",
+          "case_id": 29,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586995816218041,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-aeef837a43e77a4a50b504257ecb9392/run-c48d7a451d60e536c51b8e89b2e3643b/1/1"
+        }
+      ],
+      "replay_events": 27,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        11,
+        26
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-319b81fb1413c3839e0dba45564a9d91"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-12",
+      "new_pid": 29282,
+      "old_pid": 29279,
+      "passed": true,
+      "pre_kill_events": 24,
+      "provider_requests": [
+        {
+          "body_sha256": "eaf399a9ea5f0873f153e01c553c3048ffb7979e322cba53472f3366db7ec633",
+          "case_id": 30,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586996085470708,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-319b81fb1413c3839e0dba45564a9d91/run-c8b31dfb20d2413f906c7e131d03a3f4/1/1"
+        }
+      ],
+      "replay_events": 28,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        12,
+        27
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-2eaf188c22c5a1712fa335106780dd45"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-13",
+      "new_pid": 29295,
+      "old_pid": 29292,
+      "passed": true,
+      "pre_kill_events": 25,
+      "provider_requests": [
+        {
+          "body_sha256": "c463662421aa3ddfdfb03c64e766c2366edf0db58d638517ea56178ea005759e",
+          "case_id": 31,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586996365823000,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-2eaf188c22c5a1712fa335106780dd45/run-c9f93bbb1af5222b5935a83ad6fe3597/1/1"
+        }
+      ],
+      "replay_events": 29,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        13,
+        28
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-22953743bd56b17d26ca2ac5fa513368"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-14",
+      "new_pid": 29308,
+      "old_pid": 29305,
+      "passed": true,
+      "pre_kill_events": 26,
+      "provider_requests": [
+        {
+          "body_sha256": "3cd7fabbd69935c9c420c1957de8db24666d4d4b4ffdcab39932a2ef39f91717",
+          "case_id": 32,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586996653161208,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-22953743bd56b17d26ca2ac5fa513368/run-d8d16cbdb47315fac4dffa70ef14dc34/1/1"
+        }
+      ],
+      "replay_events": 30,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        14,
+        29
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 77,
+      "client_stderr_tail": "haider: run requires interactive input\n",
+      "effect_recovery": {
+        "abandon": {
+          "chosen_option": "abandon",
+          "completed": true,
+          "menu_id": "effect-recovery-b32dfb512daf4b248882e0e14d298b596f2bb3b0c471390d876e239804eccdb5-probe-35",
+          "resolution_seq": 38,
+          "resulting_head_seq": 42,
+          "resulting_run_id": "run-44e1f80a988ec95729c7319384d2896f",
+          "resulting_run_state": "errored",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-c0613d41425538d650467ba8335b68e6"
+        },
+        "card": {
+          "body": [
+            "Dispatched effect: effect effect-session-c0613d41425538d650467ba8335b68e6-1-1788654001696-1",
+            "probe: no result committed"
+          ],
+          "menu_id": "effect-recovery-b32dfb512daf4b248882e0e14d298b596f2bb3b0c471390d876e239804eccdb5",
+          "options": [
+            {
+              "detail": "Re-check whether the effect completed.",
+              "key": "probe",
+              "label": "Probe"
+            },
+            {
+              "detail": "Record that it completed.",
+              "key": "mark_done",
+              "label": "Mark done"
+            },
+            {
+              "detail": "Settle this attempt and retry once.",
+              "key": "retry",
+              "label": "Retry"
+            },
+            {
+              "detail": "Record it abandoned and close the run.",
+              "key": "abandon",
+              "label": "Abandon"
+            }
+          ],
+          "parked_since": 1788654001792,
+          "run_state": "running",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-c0613d41425538d650467ba8335b68e6",
+          "title": "Effect outcome unknown"
+        },
+        "outcome": "probed_then_abandoned",
+        "probe": {
+          "chosen_option": "probe",
+          "completed": true,
+          "menu_id": "effect-recovery-b32dfb512daf4b248882e0e14d298b596f2bb3b0c471390d876e239804eccdb5",
+          "replacement_menu_id": "effect-recovery-b32dfb512daf4b248882e0e14d298b596f2bb3b0c471390d876e239804eccdb5-probe-35",
+          "resolution_seq": 35,
+          "resulting_head_seq": 37,
+          "resulting_run_id": "run-44e1f80a988ec95729c7319384d2896f",
+          "resulting_run_state": "effect_unknown",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-c0613d41425538d650467ba8335b68e6"
+        },
+        "provider_ledger_unchanged": true
+      },
+      "label": "tool-journal-15",
+      "new_pid": 29321,
+      "old_pid": 29318,
+      "passed": true,
+      "pre_kill_events": 27,
+      "provider_requests": [
+        {
+          "body_sha256": "86a64ebda1444b9d76fd646c25e7a7af66864e87c0b17fd5d841ef8a0878fd03",
+          "case_id": 33,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586996940372375,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-c0613d41425538d650467ba8335b68e6/run-44e1f80a988ec95729c7319384d2896f/1/1"
+        }
+      ],
+      "replay_events": 39,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        15,
+        30
+      ],
+      "terminal_error_code": "input_required",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-a5e2c0711c5df491e594eb9ca5f5065a"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-16",
+      "new_pid": 29337,
+      "old_pid": 29333,
+      "passed": true,
+      "pre_kill_events": 28,
+      "provider_requests": [
+        {
+          "body_sha256": "539079d90ecb99a83bb346992fc9de6354d8c6f690bacf160c45872e472ff648",
+          "case_id": 34,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586997258621583,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-a5e2c0711c5df491e594eb9ca5f5065a/run-38eb78d7b2c5c5c9191f28c363df42e7/1/1"
+        }
+      ],
+      "replay_events": 32,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        16,
+        31
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 1,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-77a7809480e5304f04bfee8131a92d8d"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-17",
+      "new_pid": 29351,
+      "old_pid": 29347,
+      "passed": true,
+      "pre_kill_events": 29,
+      "provider_requests": [
+        {
+          "body_sha256": "d6890ff95a71de38662742805f6d34ddb243eed3e535b86a9f128cce555149ff",
+          "case_id": 35,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586997598425583,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-77a7809480e5304f04bfee8131a92d8d/run-001e6dd6cc3ceb870558b943f8a304ae/1/1"
+        }
+      ],
+      "replay_events": 33,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        17,
+        32
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 1,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-0558c269f58b0281d6e160e425d698d7"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-18",
+      "new_pid": 29365,
+      "old_pid": 29361,
+      "passed": true,
+      "pre_kill_events": 30,
+      "provider_requests": [
+        {
+          "body_sha256": "c6530cb1d7ff25e0a29fb945182b0d8046af3038b8dccfb94519cd7930e436a6",
+          "case_id": 36,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586997907284416,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-0558c269f58b0281d6e160e425d698d7/run-552b2f10fe2508b353f9fee3fe42b421/1/1"
+        }
+      ],
+      "replay_events": 36,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        18,
+        36
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-b11084b1844f4320b9fe8ce4a9263c26"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-19",
+      "new_pid": 29379,
+      "old_pid": 29375,
+      "passed": true,
+      "pre_kill_events": 34,
+      "provider_requests": [
+        {
+          "body_sha256": "0160067128c3bf6bf936362b6a0d2a8c57f5942897e1e8d6880bd72e0cf29ff7",
+          "case_id": 37,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586998227123125,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-b11084b1844f4320b9fe8ce4a9263c26/run-23445847b59776efa62f2423f7ab1cb5/1/1"
+        }
+      ],
+      "replay_events": 38,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        19,
+        38
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-e9a988aedfcbeee7be448c929f48edbf"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-20",
+      "new_pid": 29393,
+      "old_pid": 29389,
+      "passed": true,
+      "pre_kill_events": 36,
+      "provider_requests": [
+        {
+          "body_sha256": "dfb0f30cb6a72d123f24cff52340b1fbc6af7a3a72ffdd6828b2e47e136c819a",
+          "case_id": 38,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586998541239291,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-e9a988aedfcbeee7be448c929f48edbf/run-811b48812f2af3b6449ce1c37d8f4f33/1/1"
+        }
+      ],
+      "replay_events": 40,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        20,
+        40
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-53b04e4c37c3603abc6f1fb55049b2ec"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-21",
+      "new_pid": 29407,
+      "old_pid": 29403,
+      "passed": true,
+      "pre_kill_events": 38,
+      "provider_requests": [
+        {
+          "body_sha256": "880a8a5f013de241bc674e4aa254948c49fb5a91fc03e06cefe8c36744f70ddb",
+          "case_id": 39,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586998856132250,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-53b04e4c37c3603abc6f1fb55049b2ec/run-77c72ba4c98df8228310c908f4b64811/1/1"
+        }
+      ],
+      "replay_events": 41,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        21,
+        41
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-b114162a68934240e3e8567d849ebe59"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-22",
+      "new_pid": 29421,
+      "old_pid": 29417,
+      "passed": true,
+      "pre_kill_events": 39,
+      "provider_requests": [
+        {
+          "body_sha256": "ce2031a42de9f6f806f20903533905bb93b1671d819d0c4c94945036cf84155f",
+          "case_id": 40,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586999177246875,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-b114162a68934240e3e8567d849ebe59/run-02f5ddd2bb692d51c4909fc08ee3c391/1/1"
+        }
+      ],
+      "replay_events": 43,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        22,
+        43
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-875bd966ffd843e5c33132098d9bde6e"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-23",
+      "new_pid": 29435,
+      "old_pid": 29431,
+      "passed": true,
+      "pre_kill_events": 41,
+      "provider_requests": [
+        {
+          "body_sha256": "dda96d9202ac55a2a3d27eafdee234504e6d6d0ac6787cafcf6fcf1ca2529d12",
+          "case_id": 41,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586999537315291,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-875bd966ffd843e5c33132098d9bde6e/run-21130b1e3f967a89ff60396138ac6cbd/1/1"
+        }
+      ],
+      "replay_events": 51,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        23,
+        51
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-4af261dfa6a66a23b036b34d46aaec4f"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-24",
+      "new_pid": 29449,
+      "old_pid": 29445,
+      "passed": true,
+      "pre_kill_events": 49,
+      "provider_requests": [
+        {
+          "body_sha256": "414e40420ed454f4a28c9ddd6bdb09f5ba98c72095550c42fca6facda9f212a8",
+          "case_id": 42,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586999909824458,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-4af261dfa6a66a23b036b34d46aaec4f/run-ee4b8411a88f4effeb37bbc9f40f29dd/1/1"
+        },
+        {
+          "body_sha256": "020bd7deb494cb9bb295c62d5e7aa90c4b7189253acd05a3ba1f547e5a705e80",
+          "case_id": 42,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587000017364500,
+          "request_kind": "primary",
+          "request_number": 2,
+          "request_ordinal": 2,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-4af261dfa6a66a23b036b34d46aaec4f/run-ee4b8411a88f4effeb37bbc9f40f29dd/1/2"
+        }
+      ],
+      "replay_events": 52,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        24,
+        52
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-d8495e14af5e6bff585780dbd7ec1cdc"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-25",
+      "new_pid": 29466,
+      "old_pid": 29459,
+      "passed": true,
+      "pre_kill_events": 50,
+      "provider_requests": [
+        {
+          "body_sha256": "d38a900623eded5e11054848bcb9ab2b27badfa1d5a6cdd96ea9ac87134b2867",
+          "case_id": 43,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587000298948333,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-d8495e14af5e6bff585780dbd7ec1cdc/run-4059ae57b462134694f68295f873ac4a/1/1"
+        },
+        {
+          "body_sha256": "9b77b08403733c6373bf1457e60e127dd25b55d48f7e206a3ea3115eea7b2bbd",
+          "case_id": 43,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587000403530750,
+          "request_kind": "primary",
+          "request_number": 2,
+          "request_ordinal": 2,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-d8495e14af5e6bff585780dbd7ec1cdc/run-4059ae57b462134694f68295f873ac4a/1/2"
+        }
+      ],
+      "replay_events": 54,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        25,
+        53
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-9be86c837b26697918ca558afcd2373c"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-26",
+      "new_pid": 29482,
+      "old_pid": 29478,
+      "passed": true,
+      "pre_kill_events": 51,
+      "provider_requests": [
+        {
+          "body_sha256": "e05d9f141d43b22dc9dac090cdf363b16aaee04819bf97aa33321805bf248548",
+          "case_id": 44,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587000666017916,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-9be86c837b26697918ca558afcd2373c/run-be663f5a1c16b64f32623739d9a25d5a/1/1"
+        },
+        {
+          "body_sha256": "f1c60cceb6c7cfcdad5fc81d17497265662cbf2fc5d1f412ca9fedd2fbe0e584",
+          "case_id": 44,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587000773541916,
+          "request_kind": "primary",
+          "request_number": 2,
+          "request_ordinal": 2,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-9be86c837b26697918ca558afcd2373c/run-be663f5a1c16b64f32623739d9a25d5a/1/2"
+        }
+      ],
+      "replay_events": 55,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        26,
+        54
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-e5d74cc81a49d773c80b13f174080228"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-27",
+      "new_pid": 29498,
+      "old_pid": 29492,
+      "passed": true,
+      "pre_kill_events": 52,
+      "provider_requests": [
+        {
+          "body_sha256": "a0e727c68cdf16f8c024d1fe357d2af157f211e210cfc9506c6ebc12748b2a4f",
+          "case_id": 45,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587001068498250,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-e5d74cc81a49d773c80b13f174080228/run-cdca2fb66e1d9671b274aa71327b7964/1/1"
+        },
+        {
+          "body_sha256": "d04fdf55a90960f2ed3c4bd4365789cda0d9d1d70ad9ce4028ab22d98ddaf51f",
+          "case_id": 45,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587001175989375,
+          "request_kind": "primary",
+          "request_number": 2,
+          "request_ordinal": 2,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-e5d74cc81a49d773c80b13f174080228/run-cdca2fb66e1d9671b274aa71327b7964/1/2"
+        }
+      ],
+      "replay_events": 57,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        27,
+        56
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-81a989ddbbe0872f9950850e8dc36529"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-journal-28",
+      "new_pid": 29519,
+      "old_pid": 29508,
+      "passed": true,
+      "pre_kill_events": 54,
+      "provider_requests": [
+        {
+          "body_sha256": "32e1d7ef0e30e7d2acd5f28f6cbc50cad98a3a78a4f4e900a9f0dba05e632340",
+          "case_id": 46,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587001481870291,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-81a989ddbbe0872f9950850e8dc36529/run-1bb5da5342b1604f506a5bcfed1adeb3/1/1"
+        },
+        {
+          "body_sha256": "cf7d2ff3002babd466f94de1f6fc4f7bb03b624351803434f5148ed3997e10a1",
+          "case_id": 46,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587001596443291,
+          "request_kind": "primary",
+          "request_number": 2,
+          "request_ordinal": 2,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-81a989ddbbe0872f9950850e8dc36529/run-1bb5da5342b1604f506a5bcfed1adeb3/1/2"
+        }
+      ],
+      "replay_events": 58,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        28,
+        58
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 0,
+      "client_stderr_tail": "",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "no_recovery",
+            "message": "no crash window to reconcile \u2014 run_state is idle",
+            "retryable": false
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-05842bd1ac6177f85caf0c1076c3d2ad"
+        },
+        "outcome": "not_needed"
+      },
+      "label": "tool-journal-29",
+      "new_pid": 29533,
+      "old_pid": 29529,
+      "passed": true,
+      "pre_kill_events": 56,
+      "provider_requests": [
+        {
+          "body_sha256": "e56f21d57a2c4d1f53e28e8da96b7f46e636e0cceaece3284f178fca4a4193b4",
+          "case_id": 47,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587001903155166,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-05842bd1ac6177f85caf0c1076c3d2ad/run-4ddbad32f92f8b67dd25527ba7a5b121/1/1"
+        },
+        {
+          "body_sha256": "4f8f692dc487a0f24b777278167305bcdf007cba0c50b9b68e68874bf981e6bd",
+          "case_id": 47,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587002006785916,
+          "request_kind": "primary",
+          "request_number": 2,
+          "request_ordinal": 2,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-05842bd1ac6177f85caf0c1076c3d2ad/run-4ddbad32f92f8b67dd25527ba7a5b121/1/2"
+        }
+      ],
+      "replay_events": 57,
+      "settled_state": "idle",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        29,
+        59
+      ],
+      "terminal_error_code": null,
+      "terminal_kind": "success",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 0,
+      "client_stderr_tail": "",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "no_recovery",
+            "message": "no crash window to reconcile \u2014 run_state is idle",
+            "retryable": false
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-44e0bbd2c1166c5ee0018081c54631f2"
+        },
+        "outcome": "not_needed"
+      },
+      "label": "tool-journal-30",
+      "new_pid": 29548,
+      "old_pid": 29543,
+      "passed": true,
+      "pre_kill_events": 57,
+      "provider_requests": [
+        {
+          "body_sha256": "cafe63cda291e40cc49b89572979353bef3735ecc938f5213e65cd755a90fda7",
+          "case_id": 48,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587002315554750,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-44e0bbd2c1166c5ee0018081c54631f2/run-7786e1f073f5ab2ff35d6abb29521c52/1/1"
+        },
+        {
+          "body_sha256": "d1798b7c1c2488f43a903a6fddb077091d65077de5e58e92d2d4cc63ad0b02c0",
+          "case_id": 48,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587002425168166,
+          "request_kind": "primary",
+          "request_number": 2,
+          "request_ordinal": 2,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-44e0bbd2c1166c5ee0018081c54631f2/run-7786e1f073f5ab2ff35d6abb29521c52/1/2"
+        }
+      ],
+      "replay_events": 57,
+      "settled_state": "idle",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        30,
+        60
+      ],
+      "terminal_error_code": null,
+      "terminal_kind": "success",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 77,
+      "client_stderr_tail": "haider: run requires interactive input\n",
+      "effect_recovery": {
+        "abandon": {
+          "chosen_option": "abandon",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-d3524173add9a0d003ccbada8a226a44-2-probe-26",
+          "resolution_seq": 29,
+          "resulting_head_seq": 33,
+          "resulting_run_id": "run-d3524173add9a0d003ccbada8a226a44",
+          "resulting_run_state": "errored",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-6f29147f9f4268b9aa164906959289eb"
+        },
+        "card": {
+          "body": [
+            "Dispatched effect: provider request attempt 2 admitted before daemon restart"
+          ],
+          "menu_id": "provider-admission-recovery-run-d3524173add9a0d003ccbada8a226a44-2",
+          "options": [
+            {
+              "detail": "Re-check whether the effect completed.",
+              "key": "probe",
+              "label": "Probe"
+            },
+            {
+              "detail": "Record that it completed.",
+              "key": "mark_done",
+              "label": "Mark done"
+            },
+            {
+              "detail": "Settle this attempt and retry once.",
+              "key": "retry",
+              "label": "Retry"
+            },
+            {
+              "detail": "Record it abandoned and close the run.",
+              "key": "abandon",
+              "label": "Abandon"
+            }
+          ],
+          "parked_since": 1788654007528,
+          "run_state": "running",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-6f29147f9f4268b9aa164906959289eb",
+          "title": "Effect outcome unknown"
+        },
+        "outcome": "probed_then_abandoned",
+        "probe": {
+          "chosen_option": "probe",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-d3524173add9a0d003ccbada8a226a44-2",
+          "replacement_menu_id": "provider-admission-recovery-run-d3524173add9a0d003ccbada8a226a44-2-probe-26",
+          "resolution_seq": 26,
+          "resulting_head_seq": 28,
+          "resulting_run_id": "run-d3524173add9a0d003ccbada8a226a44",
+          "resulting_run_state": "effect_unknown",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-6f29147f9f4268b9aa164906959289eb"
+        },
+        "provider_ledger_unchanged": true
+      },
+      "label": "tool-provider-1-after_post",
+      "new_pid": 29559,
+      "old_pid": 29556,
+      "passed": true,
+      "pre_kill_events": 16,
+      "provider_requests": [
+        {
+          "body_sha256": "e20949316bebc02b6f510c632422b6bf5d5d7d0069e852455ce6ff2ae948e0ab",
+          "case_id": 49,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587002730054541,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-6f29147f9f4268b9aa164906959289eb/run-d3524173add9a0d003ccbada8a226a44/1/1"
+        }
+      ],
+      "replay_events": 30,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        1,
+        "after_post"
+      ],
+      "terminal_error_code": "input_required",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 77,
+      "client_stderr_tail": "haider: run requires interactive input\n",
+      "effect_recovery": {
+        "abandon": {
+          "chosen_option": "abandon",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-53a8f009868414dacbd80519bba6e3f0-2-probe-26",
+          "resolution_seq": 29,
+          "resulting_head_seq": 33,
+          "resulting_run_id": "run-53a8f009868414dacbd80519bba6e3f0",
+          "resulting_run_state": "errored",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-39012c4e43bcbb7c54d549b7a2fb1675"
+        },
+        "card": {
+          "body": [
+            "Dispatched effect: provider request attempt 2 admitted before daemon restart"
+          ],
+          "menu_id": "provider-admission-recovery-run-53a8f009868414dacbd80519bba6e3f0-2",
+          "options": [
+            {
+              "detail": "Re-check whether the effect completed.",
+              "key": "probe",
+              "label": "Probe"
+            },
+            {
+              "detail": "Record that it completed.",
+              "key": "mark_done",
+              "label": "Mark done"
+            },
+            {
+              "detail": "Settle this attempt and retry once.",
+              "key": "retry",
+              "label": "Retry"
+            },
+            {
+              "detail": "Record it abandoned and close the run.",
+              "key": "abandon",
+              "label": "Abandon"
+            }
+          ],
+          "parked_since": 1788654007776,
+          "run_state": "running",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-39012c4e43bcbb7c54d549b7a2fb1675",
+          "title": "Effect outcome unknown"
+        },
+        "outcome": "probed_then_abandoned",
+        "probe": {
+          "chosen_option": "probe",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-53a8f009868414dacbd80519bba6e3f0-2",
+          "replacement_menu_id": "provider-admission-recovery-run-53a8f009868414dacbd80519bba6e3f0-2-probe-26",
+          "resolution_seq": 26,
+          "resulting_head_seq": 28,
+          "resulting_run_id": "run-53a8f009868414dacbd80519bba6e3f0",
+          "resulting_run_state": "effect_unknown",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-39012c4e43bcbb7c54d549b7a2fb1675"
+        },
+        "provider_ledger_unchanged": true
+      },
+      "label": "tool-provider-1-before_headers",
+      "new_pid": 29574,
+      "old_pid": 29571,
+      "passed": true,
+      "pre_kill_events": 16,
+      "provider_requests": [
+        {
+          "body_sha256": "959031aea5d1dd158d6e780c81f0ab838e26226bcab53ab1b444e2723d84f63e",
+          "case_id": 50,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587002976935208,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-39012c4e43bcbb7c54d549b7a2fb1675/run-53a8f009868414dacbd80519bba6e3f0/1/1"
+        }
+      ],
+      "replay_events": 30,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        1,
+        "before_headers"
+      ],
+      "terminal_error_code": "input_required",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 77,
+      "client_stderr_tail": "haider: run requires interactive input\n",
+      "effect_recovery": {
+        "abandon": {
+          "chosen_option": "abandon",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-ef232acf8cbb2ca945ac44de61c42c85-2-probe-26",
+          "resolution_seq": 29,
+          "resulting_head_seq": 33,
+          "resulting_run_id": "run-ef232acf8cbb2ca945ac44de61c42c85",
+          "resulting_run_state": "errored",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-ced18f4b4aaa55544c72ba05e0e6b1ce"
+        },
+        "card": {
+          "body": [
+            "Dispatched effect: provider request attempt 2 admitted before daemon restart"
+          ],
+          "menu_id": "provider-admission-recovery-run-ef232acf8cbb2ca945ac44de61c42c85-2",
+          "options": [
+            {
+              "detail": "Re-check whether the effect completed.",
+              "key": "probe",
+              "label": "Probe"
+            },
+            {
+              "detail": "Record that it completed.",
+              "key": "mark_done",
+              "label": "Mark done"
+            },
+            {
+              "detail": "Settle this attempt and retry once.",
+              "key": "retry",
+              "label": "Retry"
+            },
+            {
+              "detail": "Record it abandoned and close the run.",
+              "key": "abandon",
+              "label": "Abandon"
+            }
+          ],
+          "parked_since": 1788654008025,
+          "run_state": "running",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-ced18f4b4aaa55544c72ba05e0e6b1ce",
+          "title": "Effect outcome unknown"
+        },
+        "outcome": "probed_then_abandoned",
+        "probe": {
+          "chosen_option": "probe",
+          "completed": true,
+          "menu_id": "provider-admission-recovery-run-ef232acf8cbb2ca945ac44de61c42c85-2",
+          "replacement_menu_id": "provider-admission-recovery-run-ef232acf8cbb2ca945ac44de61c42c85-2-probe-26",
+          "resolution_seq": 26,
+          "resulting_head_seq": 28,
+          "resulting_run_id": "run-ef232acf8cbb2ca945ac44de61c42c85",
+          "resulting_run_state": "effect_unknown",
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-ced18f4b4aaa55544c72ba05e0e6b1ce"
+        },
+        "provider_ledger_unchanged": true
+      },
+      "label": "tool-provider-1-between_chunks",
+      "new_pid": 29589,
+      "old_pid": 29586,
+      "passed": true,
+      "pre_kill_events": 16,
+      "provider_requests": [
+        {
+          "body_sha256": "4de8e1789701f5bb648f12c4d96aafc1d71e7b59f2ef8babe4963fabecc787a5",
+          "case_id": 51,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587003227137833,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-ced18f4b4aaa55544c72ba05e0e6b1ce/run-ef232acf8cbb2ca945ac44de61c42c85/1/1"
+        }
+      ],
+      "replay_events": 30,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        1,
+        "between_chunks"
+      ],
+      "terminal_error_code": "input_required",
+      "terminal_kind": "failure",
+      "tool_effects": 0,
+      "tool_results": 0
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-48de6fa039877b55e8c54f9164990a80"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-provider-2-after_post",
+      "new_pid": 29605,
+      "old_pid": 29601,
+      "passed": true,
+      "pre_kill_events": 41,
+      "provider_requests": [
+        {
+          "body_sha256": "998f02b2fb1a1e4a2070a9c51e578321095afb08eca2347e0d1acfc9c353cc82",
+          "case_id": 52,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587003478993333,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-48de6fa039877b55e8c54f9164990a80/run-66ac1b5c5c4d0a1a5ff564c1a31d12bf/1/1"
+        },
+        {
+          "body_sha256": "dc1c44bc73722ed0ceddcee87faa9d5eda967e4d40854bab3c06bbc3c80c3f58",
+          "case_id": 52,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587003513646333,
+          "request_kind": "primary",
+          "request_number": 2,
+          "request_ordinal": 2,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-48de6fa039877b55e8c54f9164990a80/run-66ac1b5c5c4d0a1a5ff564c1a31d12bf/1/2"
+        }
+      ],
+      "replay_events": 51,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        2,
+        "after_post"
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-123712abb759ffb71cab1ca32376788e"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-provider-2-before_headers",
+      "new_pid": 29619,
+      "old_pid": 29615,
+      "passed": true,
+      "pre_kill_events": 41,
+      "provider_requests": [
+        {
+          "body_sha256": "7d52411747a5992dc76dc1eaca9da9f2417a5d1bb9eaa347b44a6280f9f5b37d",
+          "case_id": 53,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587003786549333,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-123712abb759ffb71cab1ca32376788e/run-85eff2570339753520f5d28398b17205/1/1"
+        },
+        {
+          "body_sha256": "ec402b24efa405c07b03965d0b4d57ecd6eb1de17cb61d1edf08ec6903dca6f4",
+          "case_id": 53,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587003825975250,
+          "request_kind": "primary",
+          "request_number": 2,
+          "request_ordinal": 2,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-123712abb759ffb71cab1ca32376788e/run-85eff2570339753520f5d28398b17205/1/2"
+        }
+      ],
+      "replay_events": 51,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        2,
+        "before_headers"
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 1,
+      "tool_results": 1
+    },
+    {
+      "client_exit": 70,
+      "client_stderr_tail": "haider: Interrupted run could not resume \u2014 Haider recovered the journal but could not safely resume this run.\n",
+      "effect_recovery": {
+        "document": {
+          "completed": false,
+          "error": {
+            "code": "recovery_incomplete",
+            "message": "non-terminal recovery state has no durable recovery card (state=errored)",
+            "retryable": true
+          },
+          "schema": "haider.session_recovery.v1",
+          "session_id": "session-71b51b609d4121e9f2beb7ed8b12d3ad"
+        },
+        "outcome": "terminal_without_card"
+      },
+      "label": "tool-provider-2-between_chunks",
+      "new_pid": 29633,
+      "old_pid": 29629,
+      "passed": true,
+      "pre_kill_events": 42,
+      "provider_requests": [
+        {
+          "body_sha256": "9ae910244271af803f463572ff9414fce56cd52151b13e64c26dfed41ad4a444",
+          "case_id": 54,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587004094068833,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-71b51b609d4121e9f2beb7ed8b12d3ad/run-0fadc21f3410e9a1bc0cdd173990387a/1/1"
+        },
+        {
+          "body_sha256": "db56ee248ff70d7d1e28682122dbaa4bd25d5a52a56db1ba1fce6fa04a67b85d",
+          "case_id": 54,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 587004129580625,
+          "request_kind": "primary",
+          "request_number": 2,
+          "request_ordinal": 2,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-71b51b609d4121e9f2beb7ed8b12d3ad/run-0fadc21f3410e9a1bc0cdd173990387a/1/2"
+        }
+      ],
+      "replay_events": 51,
+      "settled_state": "errored",
+      "shape": "tool",
+      "store_integrity": "ok",
+      "target": [
+        2,
+        "between_chunks"
+      ],
+      "terminal_error_code": "internal",
+      "terminal_kind": "failure",
+      "tool_effects": 1,
+      "tool_results": 1
+    }
+  ],
+  "created_at_utc": "2026-09-06T00:20:09.378317+00:00",
+  "discovery": [
+    {
+      "boundaries": [
+        {
+          "event_types": [
+            "session_state"
+          ],
+          "from_seq": 1,
+          "ordinal": 1,
+          "through_seq": 1
+        },
+        {
+          "event_types": [
+            "run_state",
+            "user_message",
+            "node_committed",
+            "session_state",
+            "headless_run_configured",
+            "session_renamed"
+          ],
+          "from_seq": 2,
+          "ordinal": 2,
+          "through_seq": 7
+        },
+        {
+          "event_types": [
+            "run_state"
+          ],
+          "from_seq": 8,
+          "ordinal": 3,
+          "through_seq": 8
+        },
+        {
+          "event_types": [
+            "item",
+            "item"
+          ],
+          "from_seq": 9,
+          "ordinal": 4,
+          "through_seq": 10
+        },
+        {
+          "event_types": [
+            "item",
+            "item",
+            "item",
+            "item",
+            "item",
+            "item",
+            "item",
+            "item"
+          ],
+          "from_seq": 11,
+          "ordinal": 5,
+          "through_seq": 18
+        },
+        {
+          "event_types": [
+            "run_state"
+          ],
+          "from_seq": 19,
+          "ordinal": 6,
+          "through_seq": 19
+        },
+        {
+          "event_types": [
+            "response_started"
+          ],
+          "from_seq": 20,
+          "ordinal": 7,
+          "through_seq": 20
+        },
+        {
+          "event_types": [
+            "item"
+          ],
+          "from_seq": 21,
+          "ordinal": 8,
+          "through_seq": 21
+        },
+        {
+          "event_types": [
+            "item"
+          ],
+          "from_seq": 22,
+          "ordinal": 9,
+          "through_seq": 22
+        },
+        {
+          "event_types": [
+            "item",
+            "item"
+          ],
+          "from_seq": 23,
+          "ordinal": 10,
+          "through_seq": 24
+        },
+        {
+          "event_types": [
+            "item",
+            "node_committed"
+          ],
+          "from_seq": 25,
+          "ordinal": 11,
+          "through_seq": 26
+        },
+        {
+          "event_types": [
+            "run_state"
+          ],
+          "from_seq": 27,
+          "ordinal": 12,
+          "through_seq": 27
+        },
+        {
+          "event_types": [
+            "session_state"
+          ],
+          "from_seq": 28,
+          "ordinal": 13,
+          "through_seq": 28
+        }
+      ],
+      "provider_requests": [
+        {
+          "body_sha256": "9a3eebb628f3a70838c5f6a7d18a1ec704b4c20c9e38211eb70de502cadeee22",
+          "case_id": 1,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586988549521583,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "single",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-e1b8a55b745d8f29ed543d89e41f2853/run-d414c32c33c6e90cbad30c8295df531a/1/1"
+        }
+      ],
+      "shape": "single",
+      "terminal_seq": 27
+    },
+    {
+      "boundaries": [
+        {
+          "event_types": [
+            "session_state"
+          ],
+          "from_seq": 1,
+          "ordinal": 1,
+          "through_seq": 1
+        },
+        {
+          "event_types": [
+            "run_state",
+            "user_message",
+            "node_committed",
+            "session_state",
+            "headless_run_configured",
+            "session_renamed"
+          ],
+          "from_seq": 2,
+          "ordinal": 2,
+          "through_seq": 7
+        },
+        {
+          "event_types": [
+            "run_state"
+          ],
+          "from_seq": 8,
+          "ordinal": 3,
+          "through_seq": 8
+        },
+        {
+          "event_types": [
+            "item",
+            "item"
+          ],
+          "from_seq": 9,
+          "ordinal": 4,
+          "through_seq": 10
+        },
+        {
+          "event_types": [
+            "item",
+            "item",
+            "item",
+            "item",
+            "item",
+            "item",
+            "item",
+            "item"
+          ],
+          "from_seq": 11,
+          "ordinal": 5,
+          "through_seq": 18
+        },
+        {
+          "event_types": [
+            "run_state"
+          ],
+          "from_seq": 19,
+          "ordinal": 6,
+          "through_seq": 19
+        },
+        {
+          "event_types": [
+            "response_started"
+          ],
+          "from_seq": 20,
+          "ordinal": 7,
+          "through_seq": 20
+        },
+        {
+          "event_types": [
+            "item"
+          ],
+          "from_seq": 21,
+          "ordinal": 8,
+          "through_seq": 21
+        },
+        {
+          "event_types": [
+            "item",
+            "item"
+          ],
+          "from_seq": 22,
+          "ordinal": 9,
+          "through_seq": 23
+        },
+        {
+          "event_types": [
+            "item"
+          ],
+          "from_seq": 24,
+          "ordinal": 10,
+          "through_seq": 24
+        },
+        {
+          "event_types": [
+            "item",
+            "item"
+          ],
+          "from_seq": 25,
+          "ordinal": 11,
+          "through_seq": 26
+        },
+        {
+          "event_types": [
+            "run_state"
+          ],
+          "from_seq": 27,
+          "ordinal": 12,
+          "through_seq": 27
+        },
+        {
+          "event_types": [
+            "effect"
+          ],
+          "from_seq": 28,
+          "ordinal": 13,
+          "through_seq": 28
+        },
+        {
+          "event_types": [
+            "effect"
+          ],
+          "from_seq": 29,
+          "ordinal": 14,
+          "through_seq": 29
+        },
+        {
+          "event_types": [
+            "effect"
+          ],
+          "from_seq": 30,
+          "ordinal": 15,
+          "through_seq": 30
+        },
+        {
+          "event_types": [
+            "effect"
+          ],
+          "from_seq": 31,
+          "ordinal": 16,
+          "through_seq": 31
+        },
+        {
+          "event_types": [
+            "process_signal_recorded"
+          ],
+          "from_seq": 32,
+          "ordinal": 17,
+          "through_seq": 32
+        },
+        {
+          "event_types": [
+            "tool_result",
+            "item",
+            "node_committed",
+            "run_state"
+          ],
+          "from_seq": 33,
+          "ordinal": 18,
+          "through_seq": 36
+        },
+        {
+          "event_types": [
+            "item",
+            "item"
+          ],
+          "from_seq": 37,
+          "ordinal": 19,
+          "through_seq": 38
+        },
+        {
+          "event_types": [
+            "item",
+            "item"
+          ],
+          "from_seq": 39,
+          "ordinal": 20,
+          "through_seq": 40
+        },
+        {
+          "event_types": [
+            "run_state"
+          ],
+          "from_seq": 41,
+          "ordinal": 21,
+          "through_seq": 41
+        },
+        {
+          "event_types": [
+            "item",
+            "item"
+          ],
+          "from_seq": 42,
+          "ordinal": 22,
+          "through_seq": 43
+        },
+        {
+          "event_types": [
+            "item",
+            "item",
+            "item",
+            "item",
+            "item",
+            "item",
+            "item",
+            "item"
+          ],
+          "from_seq": 44,
+          "ordinal": 23,
+          "through_seq": 51
+        },
+        {
+          "event_types": [
+            "run_state"
+          ],
+          "from_seq": 52,
+          "ordinal": 24,
+          "through_seq": 52
+        },
+        {
+          "event_types": [
+            "item"
+          ],
+          "from_seq": 53,
+          "ordinal": 25,
+          "through_seq": 53
+        },
+        {
+          "event_types": [
+            "item"
+          ],
+          "from_seq": 54,
+          "ordinal": 26,
+          "through_seq": 54
+        },
+        {
+          "event_types": [
+            "item",
+            "item"
+          ],
+          "from_seq": 55,
+          "ordinal": 27,
+          "through_seq": 56
+        },
+        {
+          "event_types": [
+            "item",
+            "node_committed"
+          ],
+          "from_seq": 57,
+          "ordinal": 28,
+          "through_seq": 58
+        },
+        {
+          "event_types": [
+            "run_state"
+          ],
+          "from_seq": 59,
+          "ordinal": 29,
+          "through_seq": 59
+        },
+        {
+          "event_types": [
+            "session_state"
+          ],
+          "from_seq": 60,
+          "ordinal": 30,
+          "through_seq": 60
+        }
+      ],
+      "provider_requests": [
+        {
+          "body_sha256": "2a704a8eae75b5c752c2480e6662693f74e5a468dc6f9137e156beb508612375",
+          "case_id": 2,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586988778397583,
+          "request_kind": "primary",
+          "request_number": 1,
+          "request_ordinal": 1,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-49912017279ddecdb955b02f96af6c11/run-7b0d59bf0f20a7869f7529704e6a88b1/1/1"
+        },
+        {
+          "body_sha256": "353e07ef915721a08759ef2b5046404c0807663130d6f15283a53f76086a279a",
+          "case_id": 2,
+          "model": "turnperf-model",
+          "path": "/v1/chat/completions",
+          "recorded_monotonic_ns": 586988885817958,
+          "request_kind": "primary",
+          "request_number": 2,
+          "request_ordinal": 2,
+          "shape": "tool",
+          "tool_names": [
+            "list_tools",
+            "todo_write",
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "process_exec"
+          ],
+          "turn_id": "session-49912017279ddecdb955b02f96af6c11/run-7b0d59bf0f20a7869f7529704e6a88b1/1/2"
+        }
+      ],
+      "shape": "tool",
+      "terminal_seq": 59
+    }
+  ],
+  "failures": [],
+  "passed": true,
+  "provider_ledger": [
+    {
+      "body_sha256": "9a3eebb628f3a70838c5f6a7d18a1ec704b4c20c9e38211eb70de502cadeee22",
+      "case_id": 1,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586988549521583,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "single",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-e1b8a55b745d8f29ed543d89e41f2853/run-d414c32c33c6e90cbad30c8295df531a/1/1"
+    },
+    {
+      "body_sha256": "2a704a8eae75b5c752c2480e6662693f74e5a468dc6f9137e156beb508612375",
+      "case_id": 2,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586988778397583,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-49912017279ddecdb955b02f96af6c11/run-7b0d59bf0f20a7869f7529704e6a88b1/1/1"
+    },
+    {
+      "body_sha256": "353e07ef915721a08759ef2b5046404c0807663130d6f15283a53f76086a279a",
+      "case_id": 2,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586988885817958,
+      "request_kind": "primary",
+      "request_number": 2,
+      "request_ordinal": 2,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-49912017279ddecdb955b02f96af6c11/run-7b0d59bf0f20a7869f7529704e6a88b1/1/2"
+    },
+    {
+      "body_sha256": "44473c4a5879c24d79cee3f9ddd28c44ab083124b969065c921c2fcf9bf0690a",
+      "case_id": 3,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586989117480208,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "single",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-866c91986add714f3f07d1bf43fa8ee7/run-cc2cc63d60efce8529038bd781d78dde/1/1"
+    },
+    {
+      "body_sha256": "1f3f2d8cf65336eb560ec73464ea938422ab5f32ec09342ba3e27ca601745f11",
+      "case_id": 4,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586989352239291,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "single",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-eb765e1322ac85c0342c05e48b369c32/run-d6f7fd84041d31dfd286dd5b5da34a5a/1/1"
+    },
+    {
+      "body_sha256": "aada3eeb529873862b66d002baad1b799778ca1fc75fad5f800fdbbdd1ac6077",
+      "case_id": 8,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586990269511125,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "single",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-5bc6ed7eb7881e4297da30bd306d3615/run-2638c6aecb6c7d4b72ca5e10c7b7581f/1/1"
+    },
+    {
+      "body_sha256": "0365e5c89ba8019c8e27d976e0a66f5719bc7267d9adc7481d92cb45331bd6cc",
+      "case_id": 9,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586990560693583,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "single",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-4bc2f0d71928bc7e4ecbb0230beb29d2/run-b5f2421edfbda26b51b44c3bef574718/1/1"
+    },
+    {
+      "body_sha256": "3b4914e81e9f383b5d0a0bd9bdc663e1d27e99fe204db80e03bcec577f76904f",
+      "case_id": 10,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586990806584250,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "single",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-970d2d5d6320256b235a4f663163ecca/run-a073c9c2041ee7f085d3cf1ff3a14fe9/1/1"
+    },
+    {
+      "body_sha256": "4426cb87c6228ca73ebe3ee8004598745d9618beafe3d48229442ad6aa2d4022",
+      "case_id": 11,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586991057545708,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "single",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-2e8b96c57b9827fc706d4161e2aba03c/run-904d678d0d709e2ebecf4905c6d0783b/1/1"
+    },
+    {
+      "body_sha256": "f488895b4c631dcc153eb14a81314b17b1ccd3acd212666a250eb2b9542f355e",
+      "case_id": 12,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586991313584166,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "single",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-9ccba31833d95ec3e8175f8b3dc99f9c/run-f1780ca238cc088476c8b315b771b850/1/1"
+    },
+    {
+      "body_sha256": "4f2a161715e05ebc1834230c36f008cca7c864e56ecaf3fcf4ca1a090d1fcd09",
+      "case_id": 13,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586991587974666,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "single",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-6083247102a5e8239fa4c9bb4034750e/run-ab06f175a832d953e4a869995fd4db9d/1/1"
+    },
+    {
+      "body_sha256": "61f1989851ff376e531cf5e0e3095f9e9a5581244f91ea7b4f4dbde40d523c6e",
+      "case_id": 14,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586991866904291,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "single",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-92ff9093255ab8cf64e25d429b748107/run-c21d6fc3c17b621742f6c918574b72b6/1/1"
+    },
+    {
+      "body_sha256": "c0d21acc725e6f71f60f6b0b38d08e4cdef69412e54ad6c6b471df8f58f81cd7",
+      "case_id": 15,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586992163756375,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "single",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-7397f61fb200d90603a00a0c4bb04e2b/run-b0163d07af3e74a5e563ed2db18767b2/1/1"
+    },
+    {
+      "body_sha256": "aac1f5a4773ee7731abef02acfd0e7fbd09f3376818cf186c498311216e63258",
+      "case_id": 16,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586992451784458,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "single",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-539a0ffcb1e6c31cc94722b75e1c6397/run-a05c13da71c661a1a96f715f9632628c/1/1"
+    },
+    {
+      "body_sha256": "dd3f8815add4413d32630ccd099fe14bd2970c89c8d118c31a7490bd96c3f803",
+      "case_id": 17,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586992694809750,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "single",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-46933fc5b6c375970cb549f836e13892/run-d542cf478b10df35ccf8f12e7f66d518/1/1"
+    },
+    {
+      "body_sha256": "19db24d5abf71ed8e710ec40e2ea486eec72fe19cd9b9c7b51044f3c51a3e7a0",
+      "case_id": 18,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586992944743875,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "single",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-b2888380570a9ad29090f55b774a3399/run-2850b5cd31f388539e6841b3feddda81/1/1"
+    },
+    {
+      "body_sha256": "5566bb05af50cea3e56788d9816b4f576c39f8d02da92b4d9f18b39fa5105a81",
+      "case_id": 19,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586993246241500,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-814a52704a02ed5605d4c11b50619e66/run-5db71f1239eb43c3ac46052fdb78a7e6/1/1"
+    },
+    {
+      "body_sha256": "9418997bd2f575e45aeace99a92685468d4b84cd58834b47d5208dfcaaa4f466",
+      "case_id": 19,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586993284849500,
+      "request_kind": "primary",
+      "request_number": 2,
+      "request_ordinal": 2,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-814a52704a02ed5605d4c11b50619e66/run-5db71f1239eb43c3ac46052fdb78a7e6/1/2"
+    },
+    {
+      "body_sha256": "100a961c26fadc88eb7d08df0bcb4ef5e4ddb1f9c80097b600b45e4b3ddcd237",
+      "case_id": 20,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586993519601416,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-e8e56416aff6b6bf2171049de5093660/run-dc2b46bd41467de7ccb13576d7f18a17/1/1"
+    },
+    {
+      "body_sha256": "3a5bb4d58d5c2cae0c7e2fa87a100e4c4a25eb69e8bb3f22705d9856d6c11f13",
+      "case_id": 20,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586993557829083,
+      "request_kind": "primary",
+      "request_number": 2,
+      "request_ordinal": 2,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-e8e56416aff6b6bf2171049de5093660/run-dc2b46bd41467de7ccb13576d7f18a17/1/2"
+    },
+    {
+      "body_sha256": "4e1f8c94ef2c7ae59415d4f635db399a09fc3d64596a7993c43ccf48902aede7",
+      "case_id": 24,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586994465805333,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-82d0deb35630ccc1b124f21a13adfc90/run-ec0678277c79e0103318928b461c986b/1/1"
+    },
+    {
+      "body_sha256": "b2e9e5c967415026d7bf4c26c826b827994ebf1c57a2890c4f76fa7815a2446c",
+      "case_id": 25,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586994728801291,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-fcdf692130129742f3ddcd258b0258f7/run-78ce4e84f19706b6b4dc3e1997267d39/1/1"
+    },
+    {
+      "body_sha256": "7252646fd4186546a75f3695a1a6f11672fec3f6ab00111123961ca324f47ccd",
+      "case_id": 26,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586995001439083,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-c2180f7eeca3eeba11df8cb4959c4504/run-c59f0677f2c8b53702f254a572b1dce0/1/1"
+    },
+    {
+      "body_sha256": "bb636d0deca90b50dd836900ab2f2656d60ba0016f887f668f8b34aa279418c0",
+      "case_id": 27,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586995253444625,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-30cf82cedd4e4bf334ee898afb3a1614/run-b4ce485303f86bcad21d5cea9f07cb07/1/1"
+    },
+    {
+      "body_sha256": "a8833e39ab95f620d4cadc67d3bf91aeb7169382ba50fce9e70a697e33993900",
+      "case_id": 28,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586995527525958,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-1fa7e07839c10a8f569749affa0d227b/run-db8181c1eb63514486b0e2c936187cc5/1/1"
+    },
+    {
+      "body_sha256": "7f9eec1345992accefe250a03789a6b2a59db84363d67d9a8a35e1edc43e0ff8",
+      "case_id": 29,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586995816218041,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-aeef837a43e77a4a50b504257ecb9392/run-c48d7a451d60e536c51b8e89b2e3643b/1/1"
+    },
+    {
+      "body_sha256": "eaf399a9ea5f0873f153e01c553c3048ffb7979e322cba53472f3366db7ec633",
+      "case_id": 30,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586996085470708,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-319b81fb1413c3839e0dba45564a9d91/run-c8b31dfb20d2413f906c7e131d03a3f4/1/1"
+    },
+    {
+      "body_sha256": "c463662421aa3ddfdfb03c64e766c2366edf0db58d638517ea56178ea005759e",
+      "case_id": 31,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586996365823000,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-2eaf188c22c5a1712fa335106780dd45/run-c9f93bbb1af5222b5935a83ad6fe3597/1/1"
+    },
+    {
+      "body_sha256": "3cd7fabbd69935c9c420c1957de8db24666d4d4b4ffdcab39932a2ef39f91717",
+      "case_id": 32,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586996653161208,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-22953743bd56b17d26ca2ac5fa513368/run-d8d16cbdb47315fac4dffa70ef14dc34/1/1"
+    },
+    {
+      "body_sha256": "86a64ebda1444b9d76fd646c25e7a7af66864e87c0b17fd5d841ef8a0878fd03",
+      "case_id": 33,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586996940372375,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-c0613d41425538d650467ba8335b68e6/run-44e1f80a988ec95729c7319384d2896f/1/1"
+    },
+    {
+      "body_sha256": "539079d90ecb99a83bb346992fc9de6354d8c6f690bacf160c45872e472ff648",
+      "case_id": 34,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586997258621583,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-a5e2c0711c5df491e594eb9ca5f5065a/run-38eb78d7b2c5c5c9191f28c363df42e7/1/1"
+    },
+    {
+      "body_sha256": "d6890ff95a71de38662742805f6d34ddb243eed3e535b86a9f128cce555149ff",
+      "case_id": 35,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586997598425583,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-77a7809480e5304f04bfee8131a92d8d/run-001e6dd6cc3ceb870558b943f8a304ae/1/1"
+    },
+    {
+      "body_sha256": "c6530cb1d7ff25e0a29fb945182b0d8046af3038b8dccfb94519cd7930e436a6",
+      "case_id": 36,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586997907284416,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-0558c269f58b0281d6e160e425d698d7/run-552b2f10fe2508b353f9fee3fe42b421/1/1"
+    },
+    {
+      "body_sha256": "0160067128c3bf6bf936362b6a0d2a8c57f5942897e1e8d6880bd72e0cf29ff7",
+      "case_id": 37,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586998227123125,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-b11084b1844f4320b9fe8ce4a9263c26/run-23445847b59776efa62f2423f7ab1cb5/1/1"
+    },
+    {
+      "body_sha256": "dfb0f30cb6a72d123f24cff52340b1fbc6af7a3a72ffdd6828b2e47e136c819a",
+      "case_id": 38,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586998541239291,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-e9a988aedfcbeee7be448c929f48edbf/run-811b48812f2af3b6449ce1c37d8f4f33/1/1"
+    },
+    {
+      "body_sha256": "880a8a5f013de241bc674e4aa254948c49fb5a91fc03e06cefe8c36744f70ddb",
+      "case_id": 39,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586998856132250,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-53b04e4c37c3603abc6f1fb55049b2ec/run-77c72ba4c98df8228310c908f4b64811/1/1"
+    },
+    {
+      "body_sha256": "ce2031a42de9f6f806f20903533905bb93b1671d819d0c4c94945036cf84155f",
+      "case_id": 40,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586999177246875,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-b114162a68934240e3e8567d849ebe59/run-02f5ddd2bb692d51c4909fc08ee3c391/1/1"
+    },
+    {
+      "body_sha256": "dda96d9202ac55a2a3d27eafdee234504e6d6d0ac6787cafcf6fcf1ca2529d12",
+      "case_id": 41,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586999537315291,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-875bd966ffd843e5c33132098d9bde6e/run-21130b1e3f967a89ff60396138ac6cbd/1/1"
+    },
+    {
+      "body_sha256": "414e40420ed454f4a28c9ddd6bdb09f5ba98c72095550c42fca6facda9f212a8",
+      "case_id": 42,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 586999909824458,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-4af261dfa6a66a23b036b34d46aaec4f/run-ee4b8411a88f4effeb37bbc9f40f29dd/1/1"
+    },
+    {
+      "body_sha256": "020bd7deb494cb9bb295c62d5e7aa90c4b7189253acd05a3ba1f547e5a705e80",
+      "case_id": 42,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587000017364500,
+      "request_kind": "primary",
+      "request_number": 2,
+      "request_ordinal": 2,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-4af261dfa6a66a23b036b34d46aaec4f/run-ee4b8411a88f4effeb37bbc9f40f29dd/1/2"
+    },
+    {
+      "body_sha256": "d38a900623eded5e11054848bcb9ab2b27badfa1d5a6cdd96ea9ac87134b2867",
+      "case_id": 43,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587000298948333,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-d8495e14af5e6bff585780dbd7ec1cdc/run-4059ae57b462134694f68295f873ac4a/1/1"
+    },
+    {
+      "body_sha256": "9b77b08403733c6373bf1457e60e127dd25b55d48f7e206a3ea3115eea7b2bbd",
+      "case_id": 43,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587000403530750,
+      "request_kind": "primary",
+      "request_number": 2,
+      "request_ordinal": 2,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-d8495e14af5e6bff585780dbd7ec1cdc/run-4059ae57b462134694f68295f873ac4a/1/2"
+    },
+    {
+      "body_sha256": "e05d9f141d43b22dc9dac090cdf363b16aaee04819bf97aa33321805bf248548",
+      "case_id": 44,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587000666017916,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-9be86c837b26697918ca558afcd2373c/run-be663f5a1c16b64f32623739d9a25d5a/1/1"
+    },
+    {
+      "body_sha256": "f1c60cceb6c7cfcdad5fc81d17497265662cbf2fc5d1f412ca9fedd2fbe0e584",
+      "case_id": 44,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587000773541916,
+      "request_kind": "primary",
+      "request_number": 2,
+      "request_ordinal": 2,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-9be86c837b26697918ca558afcd2373c/run-be663f5a1c16b64f32623739d9a25d5a/1/2"
+    },
+    {
+      "body_sha256": "a0e727c68cdf16f8c024d1fe357d2af157f211e210cfc9506c6ebc12748b2a4f",
+      "case_id": 45,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587001068498250,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-e5d74cc81a49d773c80b13f174080228/run-cdca2fb66e1d9671b274aa71327b7964/1/1"
+    },
+    {
+      "body_sha256": "d04fdf55a90960f2ed3c4bd4365789cda0d9d1d70ad9ce4028ab22d98ddaf51f",
+      "case_id": 45,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587001175989375,
+      "request_kind": "primary",
+      "request_number": 2,
+      "request_ordinal": 2,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-e5d74cc81a49d773c80b13f174080228/run-cdca2fb66e1d9671b274aa71327b7964/1/2"
+    },
+    {
+      "body_sha256": "32e1d7ef0e30e7d2acd5f28f6cbc50cad98a3a78a4f4e900a9f0dba05e632340",
+      "case_id": 46,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587001481870291,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-81a989ddbbe0872f9950850e8dc36529/run-1bb5da5342b1604f506a5bcfed1adeb3/1/1"
+    },
+    {
+      "body_sha256": "cf7d2ff3002babd466f94de1f6fc4f7bb03b624351803434f5148ed3997e10a1",
+      "case_id": 46,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587001596443291,
+      "request_kind": "primary",
+      "request_number": 2,
+      "request_ordinal": 2,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-81a989ddbbe0872f9950850e8dc36529/run-1bb5da5342b1604f506a5bcfed1adeb3/1/2"
+    },
+    {
+      "body_sha256": "e56f21d57a2c4d1f53e28e8da96b7f46e636e0cceaece3284f178fca4a4193b4",
+      "case_id": 47,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587001903155166,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-05842bd1ac6177f85caf0c1076c3d2ad/run-4ddbad32f92f8b67dd25527ba7a5b121/1/1"
+    },
+    {
+      "body_sha256": "4f8f692dc487a0f24b777278167305bcdf007cba0c50b9b68e68874bf981e6bd",
+      "case_id": 47,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587002006785916,
+      "request_kind": "primary",
+      "request_number": 2,
+      "request_ordinal": 2,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-05842bd1ac6177f85caf0c1076c3d2ad/run-4ddbad32f92f8b67dd25527ba7a5b121/1/2"
+    },
+    {
+      "body_sha256": "cafe63cda291e40cc49b89572979353bef3735ecc938f5213e65cd755a90fda7",
+      "case_id": 48,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587002315554750,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-44e0bbd2c1166c5ee0018081c54631f2/run-7786e1f073f5ab2ff35d6abb29521c52/1/1"
+    },
+    {
+      "body_sha256": "d1798b7c1c2488f43a903a6fddb077091d65077de5e58e92d2d4cc63ad0b02c0",
+      "case_id": 48,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587002425168166,
+      "request_kind": "primary",
+      "request_number": 2,
+      "request_ordinal": 2,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-44e0bbd2c1166c5ee0018081c54631f2/run-7786e1f073f5ab2ff35d6abb29521c52/1/2"
+    },
+    {
+      "body_sha256": "e20949316bebc02b6f510c632422b6bf5d5d7d0069e852455ce6ff2ae948e0ab",
+      "case_id": 49,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587002730054541,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-6f29147f9f4268b9aa164906959289eb/run-d3524173add9a0d003ccbada8a226a44/1/1"
+    },
+    {
+      "body_sha256": "959031aea5d1dd158d6e780c81f0ab838e26226bcab53ab1b444e2723d84f63e",
+      "case_id": 50,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587002976935208,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-39012c4e43bcbb7c54d549b7a2fb1675/run-53a8f009868414dacbd80519bba6e3f0/1/1"
+    },
+    {
+      "body_sha256": "4de8e1789701f5bb648f12c4d96aafc1d71e7b59f2ef8babe4963fabecc787a5",
+      "case_id": 51,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587003227137833,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-ced18f4b4aaa55544c72ba05e0e6b1ce/run-ef232acf8cbb2ca945ac44de61c42c85/1/1"
+    },
+    {
+      "body_sha256": "998f02b2fb1a1e4a2070a9c51e578321095afb08eca2347e0d1acfc9c353cc82",
+      "case_id": 52,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587003478993333,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-48de6fa039877b55e8c54f9164990a80/run-66ac1b5c5c4d0a1a5ff564c1a31d12bf/1/1"
+    },
+    {
+      "body_sha256": "dc1c44bc73722ed0ceddcee87faa9d5eda967e4d40854bab3c06bbc3c80c3f58",
+      "case_id": 52,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587003513646333,
+      "request_kind": "primary",
+      "request_number": 2,
+      "request_ordinal": 2,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-48de6fa039877b55e8c54f9164990a80/run-66ac1b5c5c4d0a1a5ff564c1a31d12bf/1/2"
+    },
+    {
+      "body_sha256": "7d52411747a5992dc76dc1eaca9da9f2417a5d1bb9eaa347b44a6280f9f5b37d",
+      "case_id": 53,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587003786549333,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-123712abb759ffb71cab1ca32376788e/run-85eff2570339753520f5d28398b17205/1/1"
+    },
+    {
+      "body_sha256": "ec402b24efa405c07b03965d0b4d57ecd6eb1de17cb61d1edf08ec6903dca6f4",
+      "case_id": 53,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587003825975250,
+      "request_kind": "primary",
+      "request_number": 2,
+      "request_ordinal": 2,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-123712abb759ffb71cab1ca32376788e/run-85eff2570339753520f5d28398b17205/1/2"
+    },
+    {
+      "body_sha256": "9ae910244271af803f463572ff9414fce56cd52151b13e64c26dfed41ad4a444",
+      "case_id": 54,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587004094068833,
+      "request_kind": "primary",
+      "request_number": 1,
+      "request_ordinal": 1,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-71b51b609d4121e9f2beb7ed8b12d3ad/run-0fadc21f3410e9a1bc0cdd173990387a/1/1"
+    },
+    {
+      "body_sha256": "db56ee248ff70d7d1e28682122dbaa4bd25d5a52a56db1ba1fce6fa04a67b85d",
+      "case_id": 54,
+      "model": "turnperf-model",
+      "path": "/v1/chat/completions",
+      "recorded_monotonic_ns": 587004129580625,
+      "request_kind": "primary",
+      "request_number": 2,
+      "request_ordinal": 2,
+      "shape": "tool",
+      "tool_names": [
+        "list_tools",
+        "todo_write",
+        "fs_read",
+        "fs_glob",
+        "fs_search",
+        "fs_write",
+        "fs_edit",
+        "process_exec"
+      ],
+      "turn_id": "session-71b51b609d4121e9f2beb7ed8b12d3ad/run-0fadc21f3410e9a1bc0cdd173990387a/1/2"
+    }
+  ],
+  "provider_ledger_sha256": "00eb3ad399dfb48da96f8bb5910a3764623bc49c00b5b7a4f05e5274716cfcb4",
+  "schema": "haider.turn-sigkill-matrix.v1",
+  "summary": {
+    "failed": 0,
+    "passed": 52,
+    "total": 52
+  }
+}

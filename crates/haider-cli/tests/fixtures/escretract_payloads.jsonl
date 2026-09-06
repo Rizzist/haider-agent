@@ -1,0 +1,2 @@
+{"attachments":[{"artifact":"<ATTACHMENT_ARTIFACT>","kind":"file","lines":2,"name":"note.txt"}],"prompt_node_id":"<PROMPT_NODE_ID>","prompt_seq":"<PROMPT_SEQ>","text":"escretract original prompt to edit","type":"prompt_retracted"}
+{"reason":"retracted","state":"cancelled","terminal_kind":"cancellation","type":"run_state"}

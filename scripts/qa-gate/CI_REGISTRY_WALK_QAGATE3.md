@@ -477,3 +477,46 @@ Both lane walks are retained verbatim below, ordered by first registry number.
 - #23-#28/#31/#32/#34-#37/#39/#40/#43/#45-#48/#50-#53/#55-#63/#65/#66/#68-#70/#73/#77-#80/#82-#91: no additional affected surface; full-gate coverage remains applicable. #93 has no class in the supplied registry.
 - #94/#95/#96: no deadline, connection wait, retry budget, durable transaction boundary, or timing claim changes. The old fake proxy, adapter, and normalizer remain unchanged.
 - The malformed attempt already uses `item.status: failed`; round 2 pins it in live JSONL and byte-identical replay beside a distinct completed corrected call, exit 0, and no run-level failure. The old adapter's declared projection cannot synthesize `failed: true`; an executable projection proof and independent verifier confirm the release acceptance blocker. Corrected acceptance is 18 PASS / 1 timeout FAIL / 2 platform SKIP. No raw result is relabeled.
+
+### v0.0.970 escretract — durable pre-response prompt retraction
+
+- #1–#18 checked — additive protocol/RPC types, owned cancellation transaction,
+  source-compatible defaults, and typed too_late handling; scoped Clippy uses
+  `-D warnings`, with no new production lint suppressions or unwraps.
+- #19/#20 checked — new tests live in separate files, rustfmt/diff checks and
+  authoritative `xtask test-count --update` are part of the final gate. The
+  original baseline 5,033 rises to 5,049 (+16 lane source markers).
+- #21/#41/#42/#44/#54/#64/#67/#71/#72/#74/#81/#92 checked — full lane ENV LAW,
+  two Cargo jobs, four test threads, disk floor checked before build gates,
+  fresh CLI/daemon siblings and SIBLINGS_PREBUILT; daemon size 202,285,344 bytes.
+  No lane test was ignored or platform-gated. Windows/Linux are by inspection.
+- #94 checked — no new production time deadline. Cancellation-tail work is
+  bounded by the already-buffered receiver length and never waits for network
+  state. The new CLI subprocess test derives 560s from two connections times
+  (30s startup + 10s handshake + four 60s request budgets), with the arithmetic
+  beside its constant. Actor/store race tests use deterministic gates.
+- #95 checked — turn.retract/too_late fallback use the existing RpcClient with
+  independent negotiated heartbeat servicing; the transient CLI attachment is
+  drained while receipt/RPC waits run.
+- Durable authority checked — Cancelling, retraction and receipt share one
+  transaction; first-response arbitration precedes item buffering; a losing
+  delta is retained as discarded; terminal reason is stamped before commit.
+  Usage/permit settlement stays on the existing cancellation path. Raw replay
+  equality, CAS restoration, projection/cache/fork behavior and sidecar crash
+  repair have named regression pins.
+- Final results and merge-forward details are retained in
+  `docs/testing/v0.0.970/escretract.md` and `escretract-sigkill.json`. The matrix
+  script is unchanged and the final-binary sweep passes 52/52, zero failures.
+  Four unique verifier observations were fixed; the duplicate fork observation
+  is counted once. There are no rejected/noise findings.
+- Final merged Rust gates: all 17 scoped crate suites pass (5,484 summed
+  libtest passes, zero failures, 13 unchanged pre-existing ignores); strict
+  Clippy covers all targets in eleven affected/merged crates. Authoritative
+  source count is 5,049/5,049; format and whitespace checks pass. The
+  instruct-pipe invariant pin remains 5,592 → 5,592 (POSIX total 5,670).
+  One-shot, turnhygiene and retraction goldens are generated through test
+  tooling and pass without update mode; the provider-request fixture is
+  unchanged. Initial stale feature/example pins and strict supplemental-event
+  decodes are corrected with explicit validation, with failures retained in
+  the lane gate summary. After the final CLI test build, another unchanged
+  matrix pass is 52/52 with hashes matching the delivered artifacts.

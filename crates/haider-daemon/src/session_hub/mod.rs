@@ -1961,6 +1961,10 @@ enum ActorCommand {
         command: TurnCancelCommand,
         completed: oneshot::Sender<Result<TurnCancelOutcome, HaiderError>>,
     },
+    RetractTurn {
+        command: haider_store::TurnRetractCommand,
+        completed: oneshot::Sender<Result<haider_store::TurnRetractOutcome, HaiderError>>,
+    },
     WorkerAppend {
         lease_id: WorkerLeaseId,
         expected_head: Option<u64>,
@@ -5794,6 +5798,23 @@ impl SessionHub {
         actor
             .commands
             .send(ActorCommand::CancelTurn { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn retract_turn(
+        &self,
+        command: haider_store::TurnRetractCommand,
+    ) -> Result<haider_store::TurnRetractOutcome, SessionHubError> {
+        let actor = self.actor_for(command.cancel.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::RetractTurn { command, completed })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result

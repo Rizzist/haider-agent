@@ -484,8 +484,11 @@ impl PipeNativeWriter {
         let path = self.sidecar_path(session_id)?;
         let state = inspect_sidecar(path.clone(), session_id.clone()).await?;
         let latest_seq = self.journal_head(store, session_id).await?;
+        let (retracted_nodes, retracted_seq) = retracted_prompt_nodes(store, session_id, 0).await?;
         match state {
-            SidecarState::Ready(cursor) if cursor.seq <= latest_seq => {
+            SidecarState::Ready(cursor)
+                if cursor.seq <= latest_seq && cursor.seq >= retracted_seq =>
+            {
                 let prewarm_start = cursor.seq.saturating_sub(JOIN_PREWARM_ENVELOPES);
                 let active_path = segment_path(&path, cursor.generation, cursor.segment)?;
                 let file = open_append(active_path).await?;
@@ -499,7 +502,9 @@ impl PipeNativeWriter {
                         file: Some(file),
                         segment: cursor.segment,
                         sealed_root: None,
-                        projector: TranscriptProjector::default(),
+                        projector: TranscriptProjector::with_retracted_prompt_nodes(
+                            retracted_nodes,
+                        ),
                     },
                 })
             }
@@ -520,7 +525,9 @@ impl PipeNativeWriter {
                         file: Some(file),
                         segment: 0,
                         sealed_root: None,
-                        projector: TranscriptProjector::default(),
+                        projector: TranscriptProjector::with_retracted_prompt_nodes(
+                            retracted_nodes,
+                        ),
                         temporary,
                     },
                 })
@@ -685,6 +692,16 @@ impl PipeNativeWriter {
                 // Their queue entries are acknowledgements, not cursor gaps,
                 // and must not append duplicate coverage watermarks.
                 state
+            } else if committed.iter().any(|event| {
+                event.seq > state.cursor.pending_seq
+                    && haider_protocol::retraction::PromptRetractedV1::from_payload_value(
+                        &event.payload,
+                    )
+                    .is_some()
+            }) {
+                let generation = state.cursor.generation;
+                drop(state);
+                self.rebuild(store, session_id, path, generation).await?
             } else if !directly_follows {
                 let latest_seq = self.journal_head(store, session_id).await?;
                 let cursor = state.cursor;
@@ -770,6 +787,15 @@ impl PipeNativeWriter {
         path: PathBuf,
         cursor: SidecarCursor,
     ) -> Result<ReconciledSidecar, PipeNativeError> {
+        if retracted_prompt_nodes(store, session_id, cursor.seq)
+            .await?
+            .1
+            > cursor.seq
+        {
+            return self
+                .rebuild(store, session_id, path, cursor.generation)
+                .await;
+        }
         let mut projector = prewarm_projector(store, session_id, cursor.seq).await?;
         let mut read_cursor = cursor.seq;
         let active_path = segment_path(&path, cursor.generation, cursor.segment)?;
@@ -858,7 +884,8 @@ impl PipeNativeWriter {
         let mut segment = 0;
         let mut sealed_root = None;
         let mut read_cursor = 0;
-        let mut projector = TranscriptProjector::default();
+        let (retracted_nodes, _) = retracted_prompt_nodes(store, session_id, 0).await?;
+        let mut projector = TranscriptProjector::with_retracted_prompt_nodes(retracted_nodes);
         loop {
             let page = store
                 .read_reducer_page_with_boundary(
@@ -956,6 +983,42 @@ impl PipeNativeWriter {
         };
         Ok(pipe_dir.join(format!("{id}.pipe")))
     }
+}
+
+/// This projection may replace its files; the journal remains append-only.
+/// Read only indexed retraction facts, including those beyond a page whose
+/// user row is about to be materialized during cold reconstruction.
+async fn retracted_prompt_nodes(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    since_seq: u64,
+) -> Result<(HashSet<String>, u64), PipeNativeError> {
+    let mut nodes = HashSet::new();
+    let mut cursor = since_seq;
+    loop {
+        let page = store
+            .read_reducer_page(
+                session_id,
+                cursor,
+                RECONCILE_PAGE_ENVELOPES,
+                RECONCILE_PAGE_BYTES,
+                &["prompt_retracted"],
+            )
+            .await
+            .map_err(|error| PipeNativeError::store("retraction projection read failed", error))?;
+        if page.is_empty() {
+            break;
+        }
+        for envelope in page {
+            cursor = cursor.max(envelope.seq);
+            if let Some(fact) = haider_protocol::retraction::PromptRetractedV1::from_payload_value(
+                &envelope.payload,
+            ) {
+                nodes.insert(fact.prompt_node_id.as_str().to_owned());
+            }
+        }
+    }
+    Ok((nodes, cursor))
 }
 
 async fn prewarm_projector(

@@ -255,6 +255,7 @@ pub struct TranscriptJoiner {
 
 #[derive(Default)]
 pub struct TranscriptProjector {
+    retracted_prompt_nodes: std::collections::HashSet<String>,
     joiner: TranscriptJoiner,
     last_observed_seq: Option<u64>,
     buffered: VecDeque<BufferedRow>,
@@ -283,6 +284,15 @@ enum ReasoningFact {
 }
 
 impl TranscriptProjector {
+    /// Seed append-only retraction facts before rebuilding a materialized
+    /// transcript, whose earlier user rows have already been emitted.
+    pub fn with_retracted_prompt_nodes(nodes: std::collections::HashSet<String>) -> Self {
+        Self {
+            retracted_prompt_nodes: nodes,
+            ..Self::default()
+        }
+    }
+
     /// Rebuild join state through a cursor without projecting rows that are
     /// already durable. Rows after that cursor still enter through [`Self::push`]
     /// and may wait for a later result as usual.
@@ -314,6 +324,20 @@ impl TranscriptProjector {
     /// without reordering the transcript. The fact bound makes corruption or
     /// an absent result degrade to an args-only row with bounded memory.
     pub fn push(&mut self, envelope: &RawEnvelope) -> Vec<SidecarRow> {
+        if envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            == Some("node_committed")
+            && envelope
+                .payload
+                .get("node")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|node| self.retracted_prompt_nodes.contains(node))
+        {
+            self.last_observed_seq = Some(envelope.seq);
+            return Vec::new();
+        }
         let elapsed = self
             .last_observed_seq
             .map_or(1, |seq| envelope.seq.saturating_sub(seq).max(1));

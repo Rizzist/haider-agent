@@ -2078,6 +2078,45 @@ pub fn transcript() -> Vec<WireFrame> {
 }
 
 /// Additive provider-route request/receipt pair, separate from frozen history.
+pub fn turn_retract_transcript() -> Vec<WireFrame> {
+    vec![
+        WireFrame::Request {
+            request_id: RequestId::new("request-retract"),
+            body: RequestBody::TurnRetract {
+                command_id: CommandId::new("command-retract"),
+                session_id: SessionId::new("session-1"),
+                worker_generation: 7,
+                run_id: RunId::new("run-1"),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-retract"),
+            body: ResponseBody::TurnRetract {
+                session_id: SessionId::new("session-1"),
+                run_id: RunId::new("run-1"),
+                prompt_seq: 4,
+                retracted_seq: 9,
+                text: "edit this prompt\nwith its original attachment".into(),
+                attachments: vec![AttachmentBlock::File {
+                    artifact: ArtifactRef::new("blake3:attachment"),
+                    name: "notes.txt".into(),
+                    lines: 2,
+                }],
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-retract-too-late"),
+            body: ResponseBody::Error {
+                code: haider_rpc::ERROR_CODE_TOO_LATE.into(),
+                message: "the accepted turn has already produced a response delta".into(),
+                retryable: false,
+                data: None,
+            },
+        },
+    ]
+}
+
+/// Additive provider-route request/receipt pair, separate from frozen history.
 pub fn provider_rebind_transcript() -> Vec<WireFrame> {
     vec![
         WireFrame::Request {

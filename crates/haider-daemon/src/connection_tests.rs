@@ -362,8 +362,8 @@ fn welcome_features_pin_served_management_families() {
     );
     assert_eq!(
         welcome_features().len(),
-        117,
-        "public agent CLI extends the merged 116-feature set"
+        118,
+        "prompt retraction extends the merged 117-feature set"
     );
     assert_eq!(
         welcome_features(),
@@ -477,6 +477,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_MONITOR_DELIVERY_V1.to_owned(),
             haider_rpc::FEATURE_TRANSCRIPTION_V1.to_owned(),
             FEATURE_TURN_CONTROL_V1.to_owned(),
+            haider_rpc::FEATURE_TURN_RETRACT_V1.to_owned(),
             haider_rpc::FEATURE_USAGE_REPORT_V1.to_owned(),
             haider_rpc::FEATURE_USAGE_HISTORY_V1.to_owned(),
             haider_rpc::FEATURE_QUEUE_CONTROL_V1.to_owned(),
