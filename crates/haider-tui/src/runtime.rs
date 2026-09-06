@@ -1710,6 +1710,15 @@ impl DemoDriver {
                     meters.clear();
                 }
             }
+            // escretract: retraction is a DAEMON round trip — it hands back
+            // the exact accepted draft the journal holds. The demo twin has no
+            // such journal, and inventing a restored prompt here would be the
+            // fabrication this reducer refuses everywhere else, so the demo
+            // reducer never asks for one ([`AppModel::can_retract_prompt`]
+            // requires a non-fabricating mode). Reaching this arm at all means
+            // that gate moved, so the guard is lifted rather than silently
+            // stranding the composer's send.
+            AppRequest::RetractPrompt { .. } => model.retract_settled(),
             AppRequest::Interrupt { .. } => {
                 // Esc mid-turn cancels THIS session's turn (sim
                 // tui.js:1551-1567 touches only the run token, the queue and

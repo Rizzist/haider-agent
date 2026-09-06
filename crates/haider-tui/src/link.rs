@@ -508,6 +508,13 @@ async fn issue(
                 | LiveCommand::CheckpointRollbackTurn { .. }
                 | LiveCommand::ProviderSetTrust { .. }
                 | LiveCommand::WorkspaceSet { .. }
+                // escretract: a retract MUST be answered. Falling through to
+                // the bare `return false` would leave the durable command in
+                // the outbox with nothing to retire it — resent and re-dropped
+                // on every reconnect — while Esc silently did nothing. The
+                // typed failure reaches the driver's retract fallback, which
+                // turns it into the plain cancel an older daemon does serve.
+                | LiveCommand::Retract { .. }
         ) {
             let _ = replies
                 .send(LiveReply::Failed {
@@ -630,6 +637,7 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
         }
         LiveCommand::LoomInstallStatus { .. } => &[haider_rpc::FEATURE_TYPED_AGENT_INSTALL_V1],
         LiveCommand::AgentCancel { .. } => &[haider_rpc::FEATURE_AGENT_CANCEL_V1],
+        LiveCommand::Retract { .. } => &[haider_rpc::FEATURE_TURN_RETRACT_V1],
         LiveCommand::CheckpointList { .. }
         | LiveCommand::CheckpointUndo { .. }
         | LiveCommand::CheckpointRedo { .. }
@@ -1077,6 +1085,21 @@ pub fn request_body_for_features(
             // `run_id`, which acceptance already branch-pinned.
             branch: _,
         } => RequestBody::TurnCancel {
+            command_id,
+            session_id: session,
+            worker_generation,
+            run_id,
+        },
+        // escretract: like the cancel above, the branch is a CLIENT-side
+        // capture — `turn.retract` pins the run by `run_id`, which its
+        // acceptance already branch-pinned.
+        LiveCommand::Retract {
+            command_id,
+            session,
+            worker_generation,
+            run_id,
+            branch: _,
+        } => RequestBody::TurnRetract {
             command_id,
             session_id: session,
             worker_generation,
@@ -1893,6 +1916,25 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             .command_id
             .clone()
             .map_or_else(Vec::new, |id| vec![LiveReply::Cancelled { command_id: id }]),
+        // escretract: the receipt carries the EXACT accepted draft. Its
+        // `prompt_seq`/`retracted_seq` are journal coordinates the durable
+        // `prompt_retracted` fact already carries to every projection, so the
+        // reply forwards only what the composer needs to be seeded.
+        ResponseBody::TurnRetract {
+            session_id,
+            run_id,
+            text,
+            attachments,
+            ..
+        } => context.command_id.clone().map_or_else(Vec::new, |id| {
+            vec![LiveReply::PromptRetracted {
+                command_id: id,
+                session: session_id,
+                run_id,
+                text,
+                attachments,
+            }]
+        }),
         ResponseBody::SessionCompact { .. } | ResponseBody::SessionCompactOnBranch { .. } => {
             context
                 .command_id
