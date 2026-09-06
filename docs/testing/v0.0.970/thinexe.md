@@ -743,3 +743,133 @@ and real sibling-binary floor. No protected OAuth file was edited.
 
 VERIFIER: findings=2 real=2 noise=0 — fixed npm redirect socket cleanup with a regression; corrected hash-pass, incumbent-byte and self-test budget accounting
 SHIP
+
+
+## Round 4 — CI on ea0b9a6b
+
+### Claim audit and fixes
+
+Read the five requested GitHub job logs directly (`gh run view --job ID --log`):
+ci 34027146069 / 101470031433; xplat-check 34027146045 /
+101470060402, 101470060185, 101470060348, 101470060479. Local raw logs and
+command/environment/exit records are retained under `/private/tmp/thinexe-round4/`.
+The supplied lane rules and turnperf/turnperf2 evidence were consulted; this
+round repairs the landed R2-08 packaging implementation, without new performance
+claims or changes to durability boundaries. Those supplied files are excluded
+from the commit.
+
+| Claim | Audit | Change |
+| --- | --- | --- |
+| Windows compatibility E0282/E0283 | Correct, `crates/haider-compat/src/lib.rs:18`; Unix alone previously pinned the closure error through `Err(command.exec())`. | Explicit `-> io::Result<i32>` covers the probe and both process-launch cfg branches. |
+| Windows `items_after_test_module` | Correct, `crates/haider-cli/src/lib.rs:432`; also repeated through integration tests importing lib.rs. | Move the intact runtime test module after the Windows console item; no lint allow. |
+| Linux signature-barrier regression | Correct failure; citation drifted from src to `crates/haider-cli/tests/update_tests.rs:1934`. `stage_release` calls macOS-only `compiled_target()` before verification. | Apply the neighboring packaged-staging macOS cfg, explicitly authorized for this round. macOS test body and production signature barrier are unchanged. |
+| Native-pipe generation race | Failure is real, but generation hypothesis is wrong: header and both coverage records have generation 1. Actual assertion is two coverage lines versus one, at `crates/haider-daemon/tests/session_hub_tests.rs:9770`. | Deterministic atomic-batch integration fixture plus direct 255/256 renderer regression, retaining exact generation and coverage assertions. |
+
+The native writer consumes head-only watch notifications in
+`session_hub/actor.rs` and calls `maintain` with an empty envelope slice.
+Unread heads therefore enter `reconcile_from`, which emits a watermark for
+each observed suffix. Separate fixture commits can let it reconcile at 256
+and then 257, producing the exact CI output; coalescing all notifications
+instead produces only 257. Shutdown drains the writer but cannot remove an
+already valid watermark. This is a test scheduling assumption, not evidence
+of a production generation defect.
+
+`native_pipe_atomic_non_row_batch_settles_to_one_coverage_line` now commits
+seed plus 256 deltas atomically and checks exactly one coverage record at 257,
+generation 1, after shutdown. The direct renderer regression retains the name
+`native_pipe_coalesces_255_non_rows_and_covers_the_256th`: real delta envelopes
+prove no bytes at 255, exact pending/covered cursors, and exactly one 257/gen-1
+record at 256. No sleeps, ignores, broader assertions, or production pipe
+changes were introduced. Threshold +/-1 mutations are rejected by these
+assertions by inspection.
+
+### Merge and verification
+
+The worktree's shared Git metadata is read-only. The initial fetch failed on
+FETCH_HEAD, so an owned writable Git copy was created under the evidence
+folder and used with this worktree. `git fetch origin wave-970` followed by
+`git merge --no-commit origin/wave-970` succeeded there and reported already
+up to date at `ea0b9a6b996c1ca8af0a372aa38ad781b8c90833`, before the full gate.
+There were no incoming conflicts, golden changes, or instruct-pipe byte drift.
+The final commit is delivered as a bundle rather than modifying shared Git
+metadata; no push is performed.
+
+Both requested Windows commands used the Rust 1.95.0 rustup bin directory,
+not Homebrew Cargo. `cargo check -p haider-compat --target
+x86_64-pc-windows-msvc` was blocked in blake3 by missing `ml64.exe`.
+`cargo clippy -p haider-cli --all-targets --target x86_64-pc-windows-msvc
+-- -D warnings` was blocked in aws-lc-sys by missing Windows SDK headers
+(`windows.h`). Neither is reported as passing; Windows compatibility and
+console-order fixes and Linux cfg behavior remain **by inspection** until CI.
+
+Full gate results and independent verifier verdict follow below.
+
+
+The dependency-light Windows follow-up passed: `cargo check -p haider-verify
+-p haider-pdf --all-targets --target x86_64-pc-windows-msvc`. Its 526.56-second
+wall time includes waiting behind the native prebuild's Cargo lock.
+Native prebuild of haider, haiderd and haider-tui passed in 530.65 seconds;
+haiderd is 203,365,264 bytes (>10 MiB).
+
+The first full workspace test attempt completed in 1,835.02 seconds including
+fresh test-target compilation: 5,618 summed libtest passes, one failure, and
+13 unchanged ignores. Sole failure: unchanged
+`parent_exit_leaves_the_daemon_running` at autospawn_tests.rs:1064 took
+1.104804958 seconds against its 950 ms bound, the same failure class already
+recorded in Round 3. All other targets passed, including the two coverage
+regressions and macOS signature-barrier test. The 200,000-row shape-test group
+passed in 421.96 seconds. No deadline, assertion, or test body was changed to
+retry this gate. `workspace-test.log` retains the failed first attempt.
+
+
+`cargo clippy --workspace --tests -- -D warnings` passed in 259.74 seconds.
+`cargo run -q -p xtask -- test-count --update` passed and updated 5,135 → 5,136,
+reflecting the additional direct-renderer regression. Formatting and whitespace
+checks passed. A second pre-final-test fetch/merge-forward check again reported
+already up to date at ea0b9a6b. The instruct-pipe pin remains 6,244 → 6,244
+(platform-invariant component 6,166); its existing workspace regression passed.
+No goldens required regeneration because no incoming or local prompt/tool
+surface changed.
+
+Every build/test/count command used a preflight `df -m /` and remained above
+700 MiB free. Environment: `RUST_MIN_STACK=8388608`,
+`HAIDER_DISCOVERY_DISABLED=1`, `HAIDER_TEST_DEVICE_NAME=test-mac`,
+`CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=0`,
+`HAIDER_TEST_SIBLINGS_PREBUILT=1`,
+`CARGO_TARGET_DIR=/private/tmp/haider-thinexe-target`, `CARGO_BUILD_JOBS=2`,
+`RUST_TEST_THREADS=2`, with the requested Rust 1.95.0 rustup bin directory first
+on PATH. The libtest worker limit preserves all internal concurrency tests and
+is unchanged between attempts. No new ignores or deadline relaxations were introduced.
+
+Registry walk: #19/#20 formatting, test-target Clippy and authoritative recount;
+#64 actual prebuilt sibling sizes; #76/#77 unchanged signature-before-smoke and
+bundle integrity assertions; #94 no added deadline; #95 no new negotiated wait;
+#103 scheduling-sensitive native-pipe fixture replaced by atomic journal input
+plus deterministic threshold assertions. The one necessary cross-lane edit is
+test-only native-pipe coverage in daemon tests. Protected oauth.rs/oauth_tests.rs
+and production session-hub/pipe code remain unchanged.
+
+Independent verifier reviewed the final code, cfg branches, original CI logs,
+and writer call path: **zero new findings**, code-review SHIP. Original user
+claims and the audit correction to the generation hypothesis are not counted
+as new verifier findings. A 797-file source/build-input hash manifest confirms
+no code drift between the native gate attempts.
+
+
+### Final Round 4 verdict
+
+The final unchanged-tree `cargo test -q --workspace --no-fail-fast` passed
+(exit 0) in **584.23 seconds**: **5,619 summed libtest passes**, **zero failures**,
+**13 unchanged ignores**, including **5,607 unfiltered passes** plus nested subprocess
+probes. Auto-spawn passed with its original 950 ms bound. Source manifest:
+797 inputs, zero drift. Final test log and exit/environment record are
+`workspace-test-final.log` and `workspace-test-final.json` under the local
+evidence folder. Clippy and the 5,136 baseline are green as recorded above.
+
+**SHIP for landing this CI repair candidate. Acceptance is only proven by
+ci + xplat-check green on wave-970 after landing.** This local verdict does
+not claim Windows execution or post-landing CI acceptance. Deliver the
+no-trailer lane commit via `tmp/thinexe/thinexe-round4.bundle`; no push.
+
+VERIFIER: findings=0 real=0 noise=0 — no new findings
+SHIP
