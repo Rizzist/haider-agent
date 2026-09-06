@@ -1,0 +1,12 @@
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-peermsg/crates/haider-store/src/event_store.rs has 28272 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-peermsg/crates/haider-core/src/actor.rs has 15139 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-peermsg/crates/haider-daemond/tests/live_turn_rpc_tests.rs has 10037 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-peermsg/crates/haider-daemon/tests/session_hub_tests.rs has 10887 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-peermsg/crates/haider-daemon/src/session_hub/rpc.rs has 20274 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-peermsg/crates/haider-daemon/src/accounts.rs has 12170 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-peermsg/crates/haider-daemon/src/worker.rs has 22919 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-peermsg/crates/haider-daemon/src/accounts_tests.rs has 14352 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-peermsg/crates/haider-tui/src/render.rs has 14640 lines (soft cap 10000)
+loc-lint: WARNING /Users/rizzist/haider-run/lane-970-peermsg/crates/haider-tui/src/app.rs has 19578 lines (soft cap 10000)
+loc-lint: 756 files scanned, 10 over the soft cap
+test-count: 5093 tests (baseline 5093) — ok

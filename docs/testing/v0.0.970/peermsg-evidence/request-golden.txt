@@ -1,0 +1,9 @@
+   Compiling haider-tui v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-tui)
+   Compiling haider-cli v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-cli)
+    Finished `test` profile [unoptimized] target(s) in 10.44s
+     Running tests/turnhygiene_pin_tests.rs (/private/tmp/peermsg-target/debug/deps/turnhygiene_pin_tests-5d21b329fd6414d5)
+
+running 1 test
+test provider_request_body_is_budget_independent_and_matches_the_golden_ledger ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 5.33s

@@ -2877,6 +2877,13 @@ pub(crate) struct WorkerManager {
     inject_shutdown_error: bool,
 }
 
+// Preserve the authority of a promoted peer through the normal manager and
+// supervisor handoff. Human nudge/subturn callers retain their existing API.
+enum MidTurnInput {
+    Human(String),
+    Agent(Box<haider_protocol::peer::PeerMessage>),
+}
+
 enum ManagerCommand {
     Submit {
         accepted: AcceptedTurn,
@@ -2900,7 +2907,7 @@ enum ManagerCommand {
         session_id: SessionId,
         run_id: RunId,
         accepted_seq: u64,
-        text: String,
+        text: MidTurnInput,
         mode: DeliveryMode,
         completed: oneshot::Sender<Result<(), HaiderError>>,
     },
@@ -2935,7 +2942,7 @@ enum SupervisorCommand {
     Nudge {
         run_id: RunId,
         accepted_seq: u64,
-        text: String,
+        text: MidTurnInput,
         mode: DeliveryMode,
         completed: oneshot::Sender<Result<(), HaiderError>>,
     },
@@ -3324,8 +3331,31 @@ impl WorkerManagerHandle {
         accepted_seq: u64,
         text: String,
     ) -> Result<(), HaiderError> {
-        self.deliver_mid_turn(session_id, run_id, accepted_seq, text, DeliveryMode::Steer)
-            .await
+        self.deliver_mid_turn(
+            session_id,
+            run_id,
+            accepted_seq,
+            MidTurnInput::Human(text),
+            DeliveryMode::Steer,
+        )
+        .await
+    }
+
+    pub(crate) async fn nudge_peer(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        accepted_seq: u64,
+        message: haider_protocol::peer::PeerMessage,
+    ) -> Result<(), HaiderError> {
+        self.deliver_mid_turn(
+            session_id,
+            run_id,
+            accepted_seq,
+            MidTurnInput::Agent(Box::new(message)),
+            DeliveryMode::Steer,
+        )
+        .await
     }
 
     pub(crate) async fn subturn(
@@ -3339,7 +3369,7 @@ impl WorkerManagerHandle {
             session_id,
             run_id,
             accepted_seq,
-            text,
+            MidTurnInput::Human(text),
             DeliveryMode::Subturn,
         )
         .await
@@ -3350,7 +3380,7 @@ impl WorkerManagerHandle {
         session_id: SessionId,
         run_id: RunId,
         accepted_seq: u64,
-        text: String,
+        text: MidTurnInput,
         mode: DeliveryMode,
     ) -> Result<(), HaiderError> {
         let (completed, response) = oneshot::channel();
@@ -5667,7 +5697,7 @@ fn deliver_mid_turn_to_active(
     delivered_nudges: &mut HashSet<u64>,
     run_id: RunId,
     accepted_seq: u64,
-    text: String,
+    text: MidTurnInput,
     mode: DeliveryMode,
 ) -> Result<(), HaiderError> {
     if &run_id != active_run {
@@ -5680,12 +5710,18 @@ fn deliver_mid_turn_to_active(
     if delivered_nudges.contains(&accepted_seq) {
         return Ok(());
     }
-    let result = match mode {
-        DeliveryMode::Steer => turn.harness.nudge(text),
-        DeliveryMode::Subturn => turn.harness.subturn(text),
-        DeliveryMode::Queue => Err(HaiderError::new(
+    let result = match (mode, text) {
+        (DeliveryMode::Steer, MidTurnInput::Human(text)) => turn.harness.nudge(text),
+        (DeliveryMode::Steer, MidTurnInput::Agent(message)) => turn.harness.nudge_peer(*message),
+        (DeliveryMode::Subturn, MidTurnInput::Human(text)) => turn.harness.subturn(text),
+        (DeliveryMode::Queue, _) => Err(HaiderError::new(
             ErrorCode::InvalidArgument,
             "queue-mode input cannot target an active harness",
+            false,
+        )),
+        _ => Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "input mode cannot target this active harness",
             false,
         )),
     };
@@ -6219,11 +6255,12 @@ async fn durable_user_message_seqs(store: &HubStoreHandle) -> Result<HashSet<u64
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
         for envelope in page {
-            if envelope
-                .payload
-                .decode_event()
-                .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. }))
-            {
+            if envelope.payload.decode_event().is_ok_and(|payload| {
+                matches!(
+                    payload,
+                    EventPayload::UserMessage { .. } | EventPayload::PeerMessage(_)
+                )
+            }) {
                 sequences.insert(envelope.seq);
             }
         }

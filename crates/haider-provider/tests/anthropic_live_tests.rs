@@ -768,6 +768,7 @@ fn tool_request(model: &str) -> TurnRequest {
 fn image_request(model: &str, artifact: ArtifactRef) -> TurnRequest {
     TurnRequest {
         messages: vec![Message {
+            input_origin: None,
             role: MessageRole::User,
             blocks: vec![
                 Block::Attachment(AttachmentBlock::Image {

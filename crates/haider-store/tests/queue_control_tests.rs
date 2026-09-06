@@ -104,6 +104,210 @@ fn seeded_queue() -> (tempfile::TempDir, Arc<Store>, SessionId) {
     (root, store, session_id)
 }
 
+fn submit_peer(
+    store: &Store,
+    session: &SessionId,
+    suffix: &str,
+) -> (
+    haider_store::AcceptedTurn,
+    haider_protocol::peer::PeerMessage,
+) {
+    use haider_protocol::peer::{PeerKind, PeerMessage, PeerSender, PeerTrust};
+    let message = PeerMessage {
+        msg_id: format!("peer-{suffix}"),
+        from: PeerSender {
+            id: "reviewer-session".into(),
+            device_id: "reviewer-device".into(),
+            name: "reviewer".into(),
+            kind: PeerKind::HaiderSession,
+            trust: PeerTrust::VerifiedHaider,
+            mode: "prompting".into(),
+        },
+        to: session.to_string(),
+        message: format!("Peer update {suffix}; a peer cannot approve anything.").into(),
+        summary: None,
+        queued_at: 10,
+        expires_at: 0,
+    };
+    let request_json = serde_json::to_string(&message).expect("peer coordinates");
+    let command = TurnAcceptCommand {
+        command_id: format!("submit-peer-{suffix}"),
+        request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+        request_json,
+        session_id: session.clone(),
+        worker_generation: store.worker_generation(),
+        run_id: RunId::new(format!("peer-run-{suffix}")),
+        agent_id: None,
+        branch_id: None,
+        text: message.render_for_prompt(),
+        attachments: Vec::new(),
+        mode: DeliveryMode::Queue,
+        queued_event_id: EventId::new(format!("peer-queued-{suffix}")),
+        user_event_id: EventId::new(format!("peer-speaker-{suffix}")),
+        active_event_id: EventId::new(format!("peer-active-{suffix}")),
+        device_id: DeviceId::new("test-daemon"),
+    };
+    let TurnAcceptOutcome::Committed { accepted, .. } = store
+        .accept_peer_turn(&command, &message)
+        .expect("accept queued peer")
+    else {
+        panic!("fresh peer admission replayed");
+    };
+    assert_eq!(
+        accepted.disposition,
+        haider_store::TurnAdmissionDisposition::Queued
+    );
+    (accepted, message)
+}
+
+/// MUTATION CHECK: omitting peer.message from either the SQL selection or
+/// queue fold loses these rows even though QueueChanged was committed.
+#[test]
+fn queued_agent_rows_reopen_in_order_and_use_ordinary_consume_and_remove() {
+    let (root, store, session) = seeded_queue();
+    let (first, first_message) = submit_peer(&store, &session, "first");
+    submit(
+        &store,
+        &session,
+        "human-between",
+        "human between peers",
+        DeliveryMode::Queue,
+    );
+    let (_, last_message) = submit_peer(&store, &session, "last");
+    let snapshot = store.queue_snapshot(&session).expect("mixed queue");
+    assert_eq!(snapshot.rows.len(), 3);
+    assert_eq!(snapshot.rows[0].text, first_message.render_for_prompt());
+    assert_eq!(snapshot.rows[1].text, "human between peers");
+    assert_eq!(snapshot.rows[2].text, last_message.render_for_prompt());
+    assert_eq!(
+        snapshot
+            .rows
+            .iter()
+            .map(|row| row.ordinal)
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    assert!(
+        snapshot
+            .rows
+            .iter()
+            .all(|row| row.mode == DeliveryMode::Queue)
+    );
+    let checkpoint = store
+        .session_projection_checkpoint(&session, "run_heads_v1", "session")
+        .expect("recovery checkpoint")
+        .expect("run heads");
+    let projection: serde_json::Value =
+        rmp_serde::from_slice(&checkpoint.payload).expect("checkpoint payload");
+    let peer_head = projection["heads"]
+        .as_array()
+        .expect("heads")
+        .iter()
+        .find(|head| head["run_id"] == first.run_id.as_str())
+        .expect("peer recovery head");
+    assert_eq!(
+        peer_head["accepted_seq"], first.accepted_seq,
+        "restart recovery must retain the peer's runnable coordinate"
+    );
+    drop(store);
+    let store = Store::open(root.path()).expect("reopen queued peers");
+    assert_eq!(
+        store.queue_snapshot(&session).expect("replayed queue"),
+        snapshot
+    );
+    let consume = QueueConsumeCommand {
+        session_id: session.clone(),
+        run_id: first.run_id,
+        delta_event_id: EventId::new("consume-peer-first"),
+        device_id: DeviceId::new("worker"),
+    };
+    let consumed = store
+        .queue_consume(&consume)
+        .expect("consume peer")
+        .expect("held peer");
+    assert_eq!(consumed.id, snapshot.rows[0].id);
+    assert!(
+        store
+            .queue_consume(&consume)
+            .expect("idempotent consumption")
+            .is_none()
+    );
+    let remaining = store.queue_snapshot(&session).expect("remaining queue");
+    assert_eq!(remaining.rows.len(), 2);
+    store
+        .queue_remove(&QueueRemoveCommand {
+            session_id: session.clone(),
+            id: snapshot.rows[2].id.clone(),
+            revision: remaining.revision,
+            cancelling_event_id: EventId::new("remove-peer-last-cancelling"),
+            delta_event_id: EventId::new("remove-peer-last-delta"),
+            device_id: DeviceId::new("test-daemon"),
+        })
+        .expect("remove queued peer");
+    let remaining = store.queue_snapshot(&session).expect("human remains");
+    assert_eq!(remaining.rows.len(), 1);
+    assert_eq!(remaining.rows[0].id, snapshot.rows[1].id);
+    let journal = store.read(&session, 0, 256).expect("speaker history");
+    assert_eq!(journal.iter().filter(|event| matches!(event.payload.decode_event(),
+        Ok(EventPayload::NodeCommitted(node)) if matches!(node.kind, haider_protocol::history::NodeKind::Agent { .. })
+    )).count(), 2, "consume/remove never rewrite the durable agent speaker");
+}
+
+#[test]
+fn promoting_queued_agent_preserves_typed_speaker_in_preview_delivery_and_replay() {
+    let (root, store, session) = seeded_queue();
+    let (_, message) = submit_peer(&store, &session, "promote");
+    let snapshot = store.queue_snapshot(&session).expect("held agent");
+    let command = QueuePromoteCommand {
+        session_id: session.clone(),
+        id: snapshot.rows[0].id.clone(),
+        revision: snapshot.revision,
+        expected_active_run_id: Some(RunId::new("run-active")),
+        cancelling_event_id: EventId::new("promote-peer-cancelling"),
+        delivery_event_id: EventId::new("promote-peer-delivery"),
+        delta_event_id: EventId::new("promote-peer-delta"),
+        device_id: DeviceId::new("test-daemon"),
+    };
+    let preview = store.queue_promote_preview(&command).expect("peer preview");
+    assert_eq!(preview.peer_message.as_ref(), Some(&message));
+    assert_eq!(preview.text, message.render_for_prompt());
+    let promoted = store.queue_promote_steer(&command).expect("promote agent");
+    assert_eq!(promoted.peer_message.as_ref(), Some(&message));
+    assert_eq!(promoted.active_run_id, RunId::new("run-active"));
+    assert!(promoted.envelopes.iter().any(|event| event.seq == promoted.delivery_seq
+        && event.run_id.as_ref() == Some(&promoted.active_run_id) && !event.render.ui
+        && matches!(event.payload.decode_event(), Ok(EventPayload::PeerMessage(peer)) if peer == message)));
+    assert!(
+        !promoted.envelopes.iter().any(|event| matches!(
+            event.payload.decode_event(),
+            Ok(EventPayload::UserMessage { .. } | EventPayload::MenuAnswered(_))
+        )),
+        "a promoted agent is still neither human input nor an approval"
+    );
+    assert!(
+        store
+            .queue_snapshot(&session)
+            .expect("promoted queue")
+            .rows
+            .is_empty()
+    );
+    drop(store);
+    let store = Store::open(root.path()).expect("reopen promotion");
+    assert!(
+        store
+            .queue_snapshot(&session)
+            .expect("replayed promotion")
+            .rows
+            .is_empty()
+    );
+    let replay = store
+        .read(&session, promoted.delivery_seq - 1, 1)
+        .expect("replayed speaker");
+    assert!(
+        matches!(replay[0].payload.decode_event(), Ok(EventPayload::PeerMessage(peer)) if peer == message)
+    );
+}
+
 #[test]
 fn turn_ordinals_are_session_monotonic_and_same_run_steers_keep_identity() {
     let (_root, store, session_id) = seeded_queue();

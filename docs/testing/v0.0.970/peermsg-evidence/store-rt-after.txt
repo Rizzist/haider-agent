@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized] target(s) in 0.15s
+     Running unittests src/lib.rs (/private/tmp/peermsg-target/debug/deps/haider_daemon-a28fe88b6e2f83d6)
+
+running 1 test
+PEER_STORE_RT agents=3 quiet_ms=1200 quiet_rts=0 explicit_list_rts=19
+test session_hub::peer_store_rt_tests::peer_store_round_trip_baseline_probe ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1095 filtered out; finished in 0.08s

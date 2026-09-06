@@ -1,0 +1,16 @@
+   Compiling haider-store v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-store)
+    Finished `test` profile [unoptimized] target(s) in 8.02s
+     Running tests/queue_control_tests.rs (/private/tmp/peermsg-target/debug/deps/queue_control_tests-a403d1b11228ab5a)
+
+running 9 tests
+test two_same_revision_removes_race_to_exactly_one_commit ... ok
+test reserved_queue_changed_payload_without_revision_cannot_commit ... ok
+test promote_preserves_text_as_one_durable_steer_and_cannot_double_deliver ... ok
+test consumed_row_disappears_with_a_revision_bearing_delta ... ok
+test queue_rows_keep_stable_ids_and_render_complete_text_across_lists ... ok
+test turn_ordinals_are_session_monotonic_and_same_run_steers_keep_identity ... ok
+test stale_remove_reports_current_revision_and_mutates_nothing ... ok
+test promoting_queued_agent_preserves_typed_speaker_in_preview_delivery_and_replay ... ok
+test queued_agent_rows_reopen_in_order_and_use_ordinary_consume_and_remove ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s

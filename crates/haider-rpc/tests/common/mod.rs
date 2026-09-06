@@ -2017,6 +2017,7 @@ pub fn transcript() -> Vec<WireFrame> {
             body: ResponseBody::PeerList {
                 agents: vec![PeerDescriptor {
                     id: "session-peer".into(),
+                    device_id: String::new(),
                     name: "workspace-a1b2c3".into(),
                     kind: PeerKind::HaiderSession,
                     workspace: "/tmp/workspace".into(),
@@ -2050,6 +2051,8 @@ pub fn transcript() -> Vec<WireFrame> {
                 msg_id: "msg-peer-1".into(),
                 from: PeerSender {
                     id: "external-fixture".into(),
+                    device_id: String::new(),
+                    mode: "prompting".into(),
                     name: "fixture".into(),
                     kind: PeerKind::External,
                     trust: PeerTrust::UntrustedExternal,
@@ -2612,4 +2615,63 @@ pub fn golden_oauth_descriptor() -> CredentialDescriptor {
         account_identity: None,
         created_at_ms: None,
     }
+}
+
+/// v0.0.970 additive methods, separate from the frozen historical transcript.
+pub fn peer_agent_injection_transcript() -> Vec<WireFrame> {
+    vec![
+        WireFrame::Request {
+            request_id: RequestId::new("request-peer-inject"),
+            body: RequestBody::PeerInject {
+                message: PeerMessage {
+                    msg_id: "message-agent-1".into(),
+                    from: PeerSender {
+                        id: "sender".into(),
+                        device_id: "device-a".into(),
+                        name: "reviewer".into(),
+                        kind: PeerKind::HaiderSession,
+                        trust: PeerTrust::VerifiedHaider,
+                        mode: "working".into(),
+                    },
+                    to: "session:receiver@device-a".into(),
+                    message: "Review the boundary.".into(),
+                    summary: None,
+                    queued_at: 42,
+                    expires_at: 0,
+                },
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-peer-inject"),
+            body: ResponseBody::PeerSend {
+                receipt: PeerReceipt {
+                    msg_id: "message-agent-1".into(),
+                    delivery: PeerDelivery::Delivered,
+                    reason: None,
+                },
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-peer-idle"),
+            body: RequestBody::PeerNotifyWhenIdle {
+                to: "session:receiver@device-a".into(),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-peer-idle"),
+            body: ResponseBody::PeerNotifyWhenIdle {
+                agent: PeerDescriptor {
+                    id: "receiver".into(),
+                    device_id: "device-a".into(),
+                    name: "builder".into(),
+                    kind: PeerKind::HaiderSession,
+                    workspace: "/workspace".into(),
+                    model: "model".into(),
+                    state: PeerState::Idle,
+                    started_at: 10,
+                    last_seen: 43,
+                },
+            },
+        },
+    ]
 }

@@ -201,16 +201,15 @@ pub enum PeerEndpointKind {
     External,
 }
 
-/// Short, profile-scoped paths for one peer endpoint and its durable sidecars.
+/// Short, profile-scoped paths for one peer endpoint and its roster manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerEndpointPaths {
     pub socket: PathBuf,
     pub manifest: PathBuf,
-    pub mailbox: PathBuf,
 }
 
 /// Derives the only peer-artifact names allowed directly under a profile
-/// runtime. All three basenames are 17 bytes (`ph-<12-hex>.<s|j|q>` or the
+/// runtime. Both basenames are 17 bytes (`ph-<12-hex>.<s|j>` or the
 /// external `px-` family), and socket length is checked before any bind.
 pub fn peer_endpoint_paths(
     runtime_dir: &Path,
@@ -226,16 +225,11 @@ pub fn peer_endpoint_paths(
     let stem = format!("{prefix}-{short_digest}");
     let socket = runtime_dir.join(format!("{stem}.s"));
     let manifest = runtime_dir.join(format!("{stem}.j"));
-    let mailbox = runtime_dir.join(format!("{stem}.q"));
-    for path in [&socket, &manifest, &mailbox] {
+    for path in [&socket, &manifest] {
         validate_runtime_artifact_basename(path)?;
     }
     validate_unix_socket_path(&socket)?;
-    Ok(PeerEndpointPaths {
-        socket,
-        manifest,
-        mailbox,
-    })
+    Ok(PeerEndpointPaths { socket, manifest })
 }
 
 /// Fails before filesystem mutation when a runtime artifact name exceeds the

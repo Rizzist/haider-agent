@@ -54,7 +54,7 @@ const PROMPT_CHECKPOINT_SHAPE_VERSION: u32 = 1;
 /// new reducer. Ordinary package releases do not invalidate checkpoints;
 /// payload layout changes are governed separately by
 /// `PROMPT_CHECKPOINT_SHAPE_VERSION`.
-const PROMPT_CHECKPOINT_REDUCER_VERSION: &str = "prompt-history-v2-request-budget";
+const PROMPT_CHECKPOINT_REDUCER_VERSION: &str = "prompt-history-v3-agent-input";
 pub const USER_COMMAND_OUTPUT_PREVIEW_BYTES: usize = 8 * 1024;
 /// Recent provider-message budget retained verbatim across model summaries.
 /// The unit is the same honest provider-neutral bytes/4 estimate used by the
@@ -577,7 +577,11 @@ impl PromptHistoryCompiler {
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
-                matches!(entry.node.kind, NodeKind::UserTurn { .. }).then_some(index)
+                matches!(
+                    entry.node.kind,
+                    NodeKind::UserTurn { .. } | NodeKind::PeerTurn { .. } | NodeKind::Agent { .. }
+                )
+                .then_some(index)
             })
             .collect::<Vec<_>>();
         if prior_user_turns.len() < COMPACTION_MIN_RECENT_PRIOR_TURNS.saturating_add(1) {
@@ -646,15 +650,18 @@ impl PromptHistoryCompiler {
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
-                let NodeKind::UserTurn { attachments, .. } = &entry.node.kind else {
-                    return None;
+                let protected_attachment = match &entry.node.kind {
+                    NodeKind::UserTurn { attachments, .. } => {
+                        attachments.iter().any(|attachment| {
+                            matches!(
+                                attachment,
+                                AttachmentBlock::Image { .. } | AttachmentBlock::Skill { .. }
+                            )
+                        })
+                    }
+                    NodeKind::Agent { .. } | NodeKind::PeerTurn { .. } => false,
+                    _ => return None,
                 };
-                let protected_attachment = attachments.iter().any(|attachment| {
-                    matches!(
-                        attachment,
-                        AttachmentBlock::Image { .. } | AttachmentBlock::Skill { .. }
-                    )
-                });
                 (protected_attachment
                     || entry
                         .run_id
@@ -852,15 +859,18 @@ impl PromptHistoryCompiler {
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
-                let NodeKind::UserTurn { attachments, .. } = &entry.node.kind else {
-                    return None;
+                let protected_attachment = match &entry.node.kind {
+                    NodeKind::UserTurn { attachments, .. } => {
+                        attachments.iter().any(|attachment| {
+                            matches!(
+                                attachment,
+                                AttachmentBlock::Image { .. } | AttachmentBlock::Skill { .. }
+                            )
+                        })
+                    }
+                    NodeKind::Agent { .. } | NodeKind::PeerTurn { .. } => false,
+                    _ => return None,
                 };
-                let protected_attachment = attachments.iter().any(|attachment| {
-                    matches!(
-                        attachment,
-                        AttachmentBlock::Image { .. } | AttachmentBlock::Skill { .. }
-                    )
-                });
                 (protected_attachment
                     || entry
                         .run_id
@@ -4364,6 +4374,7 @@ fn render_journal_with_facts(
                 let mut blocks = vec![Block::Text { text: text.into() }];
                 blocks.extend(attachments.into_iter().map(Block::Attachment));
                 messages.push(Message {
+                    input_origin: None,
                     role: MessageRole::User,
                     blocks,
                 });
@@ -4373,7 +4384,7 @@ fn render_journal_with_facts(
                 }
             }
             EventPayload::PeerMessage(message) => {
-                messages.push(Message::user_text(message.render_for_prompt()));
+                messages.push(Message::peer_input(&message));
                 if is_current {
                     current_user_seen = true;
                     current_user_start.get_or_insert(messages.len().saturating_sub(1));

@@ -1,10 +1,9 @@
-//! Profile-local peer discovery and durable turn-boundary delivery.
+//! Live peer discovery and transcript-journaled turn-boundary injection.
 
 use crate::session_hub::{SessionHub, SessionHubError, WeakSessionHub};
-use haider_core::AcceptedTurn;
 use haider_protocol::ids::SessionId;
 #[cfg(unix)]
-use haider_protocol::peer::{PEER_FRAME_MAX_BYTES, PeerWireBody, PeerWireFrame};
+use haider_protocol::peer::PEER_FRAME_MAX_BYTES;
 use haider_protocol::peer::{
     PEER_ID_MAX_BYTES, PEER_MESSAGE_MAX_BYTES, PEER_MSG_ID_MAX_BYTES, PEER_NAME_MAX_BYTES,
     PEER_SUMMARY_MAX_BYTES, PEER_WIRE_VERSION, PeerCandidate, PeerDelivery, PeerDeliveryReason,
@@ -12,7 +11,6 @@ use haider_protocol::peer::{
     PeerTrust,
 };
 use haider_rpc::{ObserveRunStateWire, SessionSummary, WireFrame};
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 #[cfg(unix)]
@@ -34,8 +32,9 @@ use haider_platform::{BoundEndpoint, Endpoint, PeerEndpointKind, peer_endpoint_p
 #[cfg(windows)]
 use haider_platform::{PeerEndpointKind, peer_endpoint_paths};
 
-const MESSAGE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
-const PEER_ADDRESS_MAX_BYTES: usize = PEER_ID_MAX_BYTES + PEER_NAME_MAX_BYTES + 3;
+// "session:" + full session id + "@" + full device id; this also
+// exceeds the legacy handle + " [" + id-prefix + "]" address ceiling.
+const PEER_ADDRESS_MAX_BYTES: usize = 8 + PEER_ID_MAX_BYTES + 1 + PEER_ID_MAX_BYTES;
 const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(500);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const RECONCILE_AUDIT_INTERVAL: Duration = Duration::from_secs(30);
@@ -121,63 +120,6 @@ impl From<SessionHubError> for PeerError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub(super) enum MailboxRecord {
-    Queued {
-        message: PeerMessage,
-    },
-    /// Target-owned admission claim. This is appended under the mailbox
-    /// lease before touching the target's core store, so a daemon with a
-    /// different store can never expire an ambiguously committed turn.
-    Claimed {
-        msg_id: String,
-    },
-    Accepted {
-        msg_id: String,
-        accepted: AcceptedTurn,
-    },
-    Terminal {
-        receipt: PeerReceipt,
-    },
-    TargetPublished {
-        msg_id: String,
-    },
-    Published {
-        msg_id: String,
-    },
-    Receipt {
-        receipt: PeerReceipt,
-    },
-    #[cfg(unix)]
-    Outbound {
-        msg_id: String,
-        target_id: String,
-        target_kind: PeerKind,
-        expires_at: u64,
-    },
-}
-
-#[derive(Debug)]
-pub(super) struct PendingMessage {
-    pub(super) message: PeerMessage,
-    pub(super) claimed: bool,
-    pub(super) accepted: Option<AcceptedTurn>,
-    pub(super) terminal: Option<PeerReceipt>,
-    pub(super) target_published: bool,
-    pub(super) published: bool,
-}
-
-#[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum OutboundReceiptState {
-    Outstanding {
-        target_kind: PeerKind,
-        expires_at: u64,
-    },
-    Journaled(PeerReceipt),
-}
-
 #[cfg(unix)]
 struct LocalPublication {
     descriptor: PeerDescriptor,
@@ -192,24 +134,14 @@ struct LocalPublication {
     paths: haider_platform::PeerEndpointPaths,
 }
 
-#[cfg(unix)]
-struct MailboxLease {
-    _file: std::fs::File,
-}
-
-#[cfg(windows)]
-struct MailboxLease;
-
-/// One profile daemon's peer registry, socket listeners, and mailbox pump.
+/// One profile daemon's live roster and per-session injection endpoints.
 pub(crate) struct PeerService {
     runtime_dir: PathBuf,
     hub: WeakSessionHub,
     draining: AtomicBool,
-    recovering: AtomicBool,
     wake: Notify,
     reconcile_serial: tokio::sync::Mutex<()>,
-    delivery_serial: tokio::sync::Mutex<()>,
-    mailbox_serial: tokio::sync::Mutex<()>,
+    admissions: Arc<tokio::sync::Semaphore>,
     publications: Mutex<HashMap<String, LocalPublication>>,
     background: Mutex<Option<JoinHandle<()>>>,
     #[cfg(test)]
@@ -227,11 +159,9 @@ impl PeerService {
             runtime_dir,
             hub: hub.downgrade(),
             draining: AtomicBool::new(false),
-            recovering: AtomicBool::new(true),
             wake: Notify::new(),
             reconcile_serial: tokio::sync::Mutex::new(()),
-            delivery_serial: tokio::sync::Mutex::new(()),
-            mailbox_serial: tokio::sync::Mutex::new(()),
+            admissions: Arc::new(tokio::sync::Semaphore::new(32)),
             publications: Mutex::new(HashMap::new()),
             background: Mutex::new(None),
             #[cfg(test)]
@@ -241,7 +171,6 @@ impl PeerService {
         });
         let mut roster_changes = hub.subscribe_peer_reconcile();
         service.reconcile_once().await?;
-        service.recovering.store(false, Ordering::Release);
         let weak = Arc::downgrade(&service);
         let task = tokio::spawn(async move {
             let now = tokio::time::Instant::now();
@@ -400,79 +329,104 @@ impl PeerService {
             .ok_or_else(|| PeerError::Unavailable {
                 message: format!("sender session {from} is not a live peer"),
             })?;
-        let queued_at = now_ms();
-        let msg_id = random_id("msg")?;
-        let target = match resolve_address(&to, &agents) {
-            Ok(target) => target,
-            Err(PeerError::Unavailable { .. }) => {
-                let receipt = receipt(
-                    &msg_id,
-                    PeerDelivery::Refused,
-                    Some(PeerDeliveryReason::TargetUnavailable),
-                );
-                self.record_sender_receipt(&sender.id, receipt.clone())
-                    .await?;
-                return Ok(receipt);
-            }
-            Err(error) => return Err(error),
-        };
+        let target = resolve_address(&to, &agents)?;
         let message = PeerMessage {
-            msg_id: msg_id.clone(),
+            msg_id: random_id("msg")?,
             from: PeerSender {
                 id: sender.id.clone(),
+                device_id: sender.device_id.clone(),
+                mode: match sender.state {
+                    PeerState::Busy => "prompting",
+                    PeerState::Idle => "idle",
+                }
+                .into(),
                 name: sender.name.clone(),
                 kind: PeerKind::HaiderSession,
                 trust: PeerTrust::VerifiedHaider,
             },
             to: target.id.clone(),
-            message,
+            message: message.into(),
             summary,
-            queued_at,
-            expires_at: queued_at.saturating_add(MESSAGE_TTL_MS),
+            queued_at: now_ms(),
+            // Retained solely to decode older journal/wire records. Delivery
+            // lifetime is the live target and its normal transcript queue.
+            expires_at: 0,
         };
         if self.is_local(&target.id)? {
-            let receipt = self.enqueue_local(message).await?;
-            if receipt.delivery == PeerDelivery::Queued {
-                self.record_sender_receipt(&sender.id, receipt.clone())
-                    .await?;
-            }
-            return Ok(receipt);
+            return self.enqueue_local(message).await;
         }
         #[cfg(unix)]
         {
             let path = endpoint_path_for(&self.runtime_dir, &target)?;
-            self.record_outbound(
-                &sender.id,
-                &msg_id,
-                &target.id,
-                target.kind,
-                message.expires_at,
-            )
-            .await?;
-            // A timeout is deliberately not converted into Refused: the
-            // remote may already have durably queued the delivery.
-            let receipt = exchange_delivery(&path, PeerWireFrame::deliver(message)).await?;
-            if receipt.delivery == PeerDelivery::Queued {
-                self.record_sender_receipt(&sender.id, receipt.clone())
-                    .await?;
-            } else {
-                // Terminal replies compete with the expiry pump and must use
-                // its correlated, single-terminal journal transition.
-                self.accept_wire_receipt(&sender.id, receipt.clone())
-                    .await?;
-            }
-            Ok(receipt)
+            exchange_delivery(&path, message).await
         }
         #[cfg(windows)]
-        {
-            let receipt = receipt(
-                &msg_id,
-                PeerDelivery::Refused,
-                Some(PeerDeliveryReason::TargetUnavailable),
-            );
-            self.record_sender_receipt(&sender.id, receipt.clone())
-                .await?;
-            Ok(receipt)
+        Err(PeerError::Unavailable {
+            message: "peer is not live on this device".into(),
+        })
+    }
+
+    /// A one-shot subscription. Subscribe before the authoritative snapshot,
+    /// so an idle transition between those two operations cannot be lost.
+    pub(crate) async fn notify_when_idle(
+        self: &Arc<Self>,
+        to: String,
+    ) -> Result<PeerDescriptor, PeerError> {
+        self.ensure_running()?;
+        let mut changes = self.hub()?.subscribe_peer_reconcile();
+        let target = resolve_address(&to, &self.list().await?)?;
+        if !self.is_local(&target.id)? {
+            #[cfg(unix)]
+            {
+                let path = endpoint_path_for(&self.runtime_dir, &target)?;
+                let connected = connect_peer(&path).await?;
+                let peers = haider_client::peer_messaging(&connected.client).ok_or_else(|| {
+                    PeerError::Unavailable {
+                        message: "target lacks peer messaging".into(),
+                    }
+                })?;
+                let result = peers
+                    .notify_when_idle(target.address())
+                    .await
+                    .map_err(|error| PeerError::Unavailable {
+                        message: error.to_string(),
+                    });
+                let _ = connected.client.close();
+                return result;
+            }
+            #[cfg(windows)]
+            return Err(PeerError::Unavailable {
+                message: "target device transport unavailable".into(),
+            });
+        }
+        loop {
+            self.ensure_running()?;
+            let agent = self
+                .hub()?
+                .peer_session_summary(&SessionId::new(target.id.clone()))
+                .await?
+                .map(|summary| descriptor_from_summary(summary, now_ms(), &target.device_id))
+                .ok_or_else(|| PeerError::Unavailable {
+                    message: "target is no longer live".into(),
+                })?;
+            if agent.state == PeerState::Idle {
+                return Ok(agent);
+            }
+            tokio::select! {
+                _ = self.wake.notified() => self.ensure_running()?,
+                event = async {
+                    loop {
+                        match changes.recv().await {
+                            Ok(id) if id.as_str() != target.id => continue,
+                            event => break event,
+                        }
+                    }
+                } => {
+                    if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                        return Err(PeerError::Unavailable { message: "peer roster closed".into() });
+                    }
+                }
+            }
         }
     }
 
@@ -510,10 +464,11 @@ impl PeerService {
         self.reconcile_count.fetch_add(1, Ordering::Relaxed);
         let summaries = self.hub()?.peer_session_summaries().await?;
         let now = now_ms();
+        let device_id = self.hub()?.device_id().to_string();
         let desired = summaries
             .into_iter()
             .map(|summary| {
-                let descriptor = descriptor_from_summary(summary, now);
+                let descriptor = descriptor_from_summary(summary, now, &device_id);
                 (descriptor.id.clone(), descriptor)
             })
             .collect::<HashMap<_, _>>();
@@ -579,8 +534,6 @@ impl PeerService {
             .cloned()
             .collect::<Vec<_>>();
         for id in removed {
-            self.expire_target(&id, PeerDeliveryReason::TargetUnavailable)
-                .await?;
             let publication = self
                 .publications
                 .lock()
@@ -595,7 +548,7 @@ impl PeerService {
                 remove_manifest(&publication.paths.manifest).await;
             }
         }
-        self.process_mailboxes().await
+        Ok(())
     }
 
     async fn heartbeat_once(&self) -> Result<(), PeerError> {
@@ -623,6 +576,23 @@ impl PeerService {
         for (paths, descriptor) in due {
             write_manifest(&paths, &descriptor, MANIFEST_HEARTBEAT_SYNC_POLICY).await?;
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn active_admissions_for_test(&self) -> usize {
+        32 - self.admissions.available_permits()
+    }
+
+    #[cfg(test)]
+    pub(super) async fn wait_for_admissions_idle_for_test(&self) -> Result<(), PeerError> {
+        let _permits =
+            self.admissions
+                .acquire_many(32)
+                .await
+                .map_err(|_| PeerError::Unavailable {
+                    message: "peer admission budget closed".into(),
+                })?;
         Ok(())
     }
 
@@ -705,65 +675,51 @@ impl PeerService {
         self: &Arc<Self>,
         mut message: PeerMessage,
     ) -> Result<PeerReceipt, PeerError> {
-        let _delivery = self.delivery_serial.lock().await;
+        self.ensure_running()?;
         normalize_incoming_message(&mut message)?;
         if !self.is_local(&message.to)? {
-            let receipt = receipt(
-                &message.msg_id,
-                PeerDelivery::Refused,
-                Some(PeerDeliveryReason::TargetUnavailable),
-            );
-            if self.is_local(&message.from.id)? {
-                self.record_sender_receipt(&message.from.id, receipt.clone())
-                    .await?;
-            }
-            return Ok(receipt);
+            return Err(PeerError::Unavailable {
+                message: "target is no longer live".into(),
+            });
         }
-        let paths = peer_endpoint_paths(&self.runtime_dir, &message.to, PeerEndpointKind::Haider)?;
-        let lease = self.lock_mailbox(&paths.mailbox).await?;
-        if let Some(existing) = self
-            .load_pending_repairing(&paths.mailbox)
-            .await?
-            .get(&message.msg_id)
-        {
-            if !same_delivery(&existing.message, &message) {
-                return Err(PeerError::Invalid {
-                    message: format!(
-                        "peer message id {:?} was reused with different content",
-                        message.msg_id
-                    ),
-                });
-            }
-            return Ok(existing
-                .terminal
-                .clone()
-                .unwrap_or_else(|| receipt(&message.msg_id, PeerDelivery::Queued, None)));
-        }
-        self.append_record(
-            &paths.mailbox,
-            MailboxRecord::Queued {
+        let hub = self.hub()?;
+        let permit = Arc::clone(&self.admissions)
+            .try_acquire_owned()
+            .map_err(|_| PeerError::Unavailable {
+                message: "peer admission capacity is full".into(),
+            })?;
+        let admitted_message = message.clone();
+        let admitting_hub = hub.clone();
+        // Once handed to the actor, acceptance can commit independently of
+        // the requester. Own the whole acceptance -> worker handoff so a
+        // disconnected sender cannot strand a committed run. The service-
+        // wide permit stays with the task, bounding even disconnected callers.
+        let accepted = tokio::spawn(async move {
+            let _permit = permit;
+            admitting_hub.inject_peer_message(&admitted_message).await
+        })
+        .await
+        .map_err(|error| PeerError::Unavailable {
+            message: format!("peer admission task failed: {error}"),
+        })??;
+        // Optional compatibility notification, derived only after transcript
+        // admission. It has no publication marker or separate durability.
+        hub.publish_peer_event(
+            &SessionId::new(message.to.clone()),
+            WireFrame::PeerMessageReceived {
                 message: message.clone(),
             },
-        )
-        .await?;
-        match self
-            .process_one_locked(&paths.mailbox, message.clone(), lease)
-            .await
-        {
-            Ok(receipt) => Ok(receipt),
-            Err(error) => {
-                // The queue append is already durable. A transient hub or
-                // shutdown race must not turn that committed state into a
-                // false refusal at the sender.
-                tracing::warn!(
-                    target: "haider.peer",
-                    msg_id = %message.msg_id,
-                    %error,
-                    "durable peer delivery remains queued for retry"
-                );
-                Ok(receipt(&message.msg_id, PeerDelivery::Queued, None))
-            }
-        }
+        );
+        // This is only the legacy-shaped synchronous admission answer, not
+        // a delivery journal or retry protocol. The transcript is authoritative.
+        Ok(receipt(
+            &message.msg_id,
+            match accepted.disposition {
+                haider_core::TurnAdmissionDisposition::Started => PeerDelivery::Delivered,
+                _ => PeerDelivery::Queued,
+            },
+            None,
+        ))
     }
 
     #[cfg(unix)]
@@ -784,728 +740,33 @@ impl PeerService {
         Ok(wire_sender_from_descriptor(descriptor))
     }
 
-    async fn process_mailboxes(self: &Arc<Self>) -> Result<(), PeerError> {
-        let _delivery = self.delivery_serial.lock().await;
-        let live_publications = self
-            .publications
-            .lock()
-            .map_err(|_| PeerError::Unavailable {
-                message: "peer publication registry is poisoned".into(),
-            })?
-            .values()
-            .map(|publication| {
-                (
-                    publication.descriptor.id.clone(),
-                    publication.paths.mailbox.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let live_mailboxes = live_publications
-            .iter()
-            .map(|(_, mailbox)| mailbox.clone())
-            .collect::<HashSet<_>>();
-        let live_peer_ids = self
-            .discover()
-            .await?
-            .into_iter()
-            .map(|peer| peer.id)
-            .collect::<HashSet<_>>();
-        for (sender_id, mailbox) in &live_publications {
-            self.expire_outbound(sender_id, mailbox).await?;
-        }
-        let runtime_dir = self.runtime_dir.clone();
-        let mut mailboxes =
-            tokio::task::spawn_blocking(move || mailbox_candidates_blocking(&runtime_dir))
-                .await
-                .map_err(|error| PeerError::Unavailable {
-                    message: format!("peer mailbox scan task failed: {error}"),
-                })??;
-        mailboxes.extend(live_mailboxes.iter().cloned());
-        for mailbox in mailboxes {
-            let pending = self.load_pending(&mailbox).await?;
-            for pending in pending.into_values() {
-                let target_is_local = live_mailboxes.contains(&mailbox);
-                if pending.published {
-                    if target_is_local
-                        && pending.claimed
-                        && pending.accepted.is_none()
-                        && pending
-                            .terminal
-                            .as_ref()
-                            .is_some_and(|receipt| receipt.delivery == PeerDelivery::Delivered)
-                    {
-                        let _ = self.process_one(&mailbox, pending.message).await?;
-                    }
-                    continue;
-                }
-                if pending.terminal.is_some() {
-                    if target_is_local
-                        && pending.claimed
-                        && pending.accepted.is_none()
-                        && pending
-                            .terminal
-                            .as_ref()
-                            .is_some_and(|receipt| receipt.delivery == PeerDelivery::Delivered)
-                    {
-                        let _ = self.process_one(&mailbox, pending.message).await?;
-                        continue;
-                    }
-                    let _lease = self.lock_mailbox(&mailbox).await?;
-                    let refreshed = self.load_pending_repairing(&mailbox).await?;
-                    if let Some(refreshed) = refreshed.get(&pending.message.msg_id)
-                        && let Some(receipt) = refreshed.terminal.clone()
-                    {
-                        self.retry_terminal(
-                            &mailbox,
-                            &refreshed.message,
-                            receipt,
-                            refreshed.target_published,
-                        )
-                        .await;
-                    }
-                    continue;
-                }
-                if !target_is_local && live_peer_ids.contains(&pending.message.to) {
-                    continue;
-                }
-                if pending.claimed && !target_is_local {
-                    let _lease = self.lock_mailbox(&mailbox).await?;
-                    let refreshed = self.load_pending_repairing(&mailbox).await?;
-                    let Some(refreshed) = refreshed.get(&pending.message.msg_id) else {
-                        continue;
-                    };
-                    if let Some(receipt) = refreshed.terminal.clone() {
-                        self.retry_terminal(
-                            &mailbox,
-                            &refreshed.message,
-                            receipt,
-                            refreshed.target_published,
-                        )
-                        .await;
-                        continue;
-                    }
-                    if !refreshed.claimed {
-                        continue;
-                    }
-                    // `Claimed` is shared proof that the target reached an
-                    // idle boundary before touching its private core store.
-                    // Delivery is therefore durable even when the claimant
-                    // crashes before recording its private acceptance.
-                    let delivered =
-                        receipt(&refreshed.message.msg_id, PeerDelivery::Delivered, None);
-                    self.append_record(
-                        &mailbox,
-                        MailboxRecord::Terminal {
-                            receipt: delivered.clone(),
-                        },
-                    )
-                    .await?;
-                    self.retry_terminal(&mailbox, &refreshed.message, delivered, false)
-                        .await;
-                    continue;
-                }
-                if pending.accepted.is_some() {
-                    if target_is_local {
-                        let _lease = self.lock_mailbox(&mailbox).await?;
-                        let refreshed = self.load_pending_repairing(&mailbox).await?;
-                        if let Some(refreshed) = refreshed.get(&pending.message.msg_id) {
-                            if let Some(receipt) = refreshed.terminal.clone() {
-                                self.retry_terminal(
-                                    &mailbox,
-                                    &refreshed.message,
-                                    receipt,
-                                    refreshed.target_published,
-                                )
-                                .await;
-                            } else if let Some(accepted) = refreshed.accepted.clone() {
-                                let _ = self
-                                    .finish_accepted_turn(&mailbox, &refreshed.message, accepted)
-                                    .await?;
-                            }
-                        }
-                    }
-                    continue;
-                }
-                if !target_is_local && expiration_receipt(&pending.message, now_ms()).is_some() {
-                    let lease = self.lock_mailbox(&mailbox).await?;
-                    self.finish_foreign_expiry(&mailbox, &pending.message.msg_id, lease)
-                        .await?;
-                    continue;
-                }
-                if !target_is_local {
-                    continue;
-                }
-                let _ = self.process_one(&mailbox, pending.message).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Re-folds under the cross-process mailbox lease before a foreign daemon
-    /// expires a Haider target. A claim appended after the scanner's first
-    /// observation is durable target ownership and must win over the stale
-    /// expiry decision.
-    async fn finish_foreign_expiry(
-        &self,
-        mailbox: &Path,
-        msg_id: &str,
-        _lease: MailboxLease,
-    ) -> Result<(), PeerError> {
-        let refreshed = self.load_pending_repairing(mailbox).await?;
-        let Some(refreshed) = refreshed.get(msg_id) else {
-            return Ok(());
-        };
-        if let Some(receipt) = refreshed.terminal.clone() {
-            self.retry_terminal(
-                mailbox,
-                &refreshed.message,
-                receipt,
-                refreshed.target_published,
-            )
-            .await;
-            return Ok(());
-        }
-        if refreshed.claimed {
-            let delivered = receipt(&refreshed.message.msg_id, PeerDelivery::Delivered, None);
-            self.append_record(
-                mailbox,
-                MailboxRecord::Terminal {
-                    receipt: delivered.clone(),
-                },
-            )
-            .await?;
-            self.retry_terminal(mailbox, &refreshed.message, delivered, false)
-                .await;
-            return Ok(());
-        }
-        if refreshed.accepted.is_some() {
-            return Ok(());
-        }
-        if let Some(accepted) = self.hub()?.peer_turn_receipt(&refreshed.message).await? {
-            self.append_record(
-                mailbox,
-                MailboxRecord::Accepted {
-                    msg_id: refreshed.message.msg_id.clone(),
-                    accepted,
-                },
-            )
-            .await?;
-            let delivered = receipt(&refreshed.message.msg_id, PeerDelivery::Delivered, None);
-            self.append_record(
-                mailbox,
-                MailboxRecord::Terminal {
-                    receipt: delivered.clone(),
-                },
-            )
-            .await?;
-            self.retry_terminal(mailbox, &refreshed.message, delivered, false)
-                .await;
-            return Ok(());
-        }
-        let Some(receipt) = expiration_receipt(&refreshed.message, now_ms()) else {
-            return Ok(());
-        };
-        self.append_record(
-            mailbox,
-            MailboxRecord::Terminal {
-                receipt: receipt.clone(),
-            },
-        )
-        .await?;
-        self.retry_terminal(mailbox, &refreshed.message, receipt, false)
-            .await;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(super) async fn finish_foreign_expiry_after_snapshot_for_test(
-        &self,
-        mailbox: &Path,
-        msg_id: &str,
-    ) -> Result<(), PeerError> {
-        let lease = self.lock_mailbox(mailbox).await?;
-        self.finish_foreign_expiry(mailbox, msg_id, lease).await
-    }
-
-    async fn process_one(
-        self: &Arc<Self>,
-        mailbox: &Path,
-        message: PeerMessage,
-    ) -> Result<PeerReceipt, PeerError> {
-        let lease = self.lock_mailbox(mailbox).await?;
-        self.process_one_locked(mailbox, message, lease).await
-    }
-
-    async fn process_one_locked(
-        &self,
-        mailbox: &Path,
-        message: PeerMessage,
-        _lease: MailboxLease,
-    ) -> Result<PeerReceipt, PeerError> {
-        let mut claimed = false;
-        if let Some(pending) = self
-            .load_pending_repairing(mailbox)
-            .await?
-            .get(&message.msg_id)
-        {
-            claimed = pending.claimed;
-            if let Some(accepted) = pending.accepted.clone() {
-                let finished = self
-                    .finish_accepted_turn(mailbox, &pending.message, accepted)
-                    .await?;
-                return Ok(if finished {
-                    receipt(&message.msg_id, PeerDelivery::Delivered, None)
-                } else {
-                    receipt(&message.msg_id, PeerDelivery::Queued, None)
-                });
-            }
-            if let Some(receipt) = pending.terminal.clone()
-                && (receipt.delivery != PeerDelivery::Delivered || !claimed)
-            {
-                return Ok(receipt);
-            }
-        }
-        if let Some(accepted) = self.hub()?.peer_turn_receipt(&message).await? {
-            self.append_record(
-                mailbox,
-                MailboxRecord::Accepted {
-                    msg_id: message.msg_id.clone(),
-                    accepted: accepted.clone(),
-                },
-            )
-            .await?;
-            let finished = self
-                .finish_accepted_turn(mailbox, &message, accepted)
-                .await?;
-            return Ok(if finished {
-                receipt(&message.msg_id, PeerDelivery::Delivered, None)
-            } else {
-                receipt(&message.msg_id, PeerDelivery::Queued, None)
-            });
-        }
-        if !claimed && let Some(receipt) = expiration_receipt(&message, now_ms()) {
-            self.append_record(
-                mailbox,
-                MailboxRecord::Terminal {
-                    receipt: receipt.clone(),
-                },
-            )
-            .await?;
-            self.retry_terminal(mailbox, &message, receipt.clone(), false)
-                .await;
-            return Ok(receipt);
-        }
-        let Some(claim) = self.hub()?.begin_peer_turn_claim(&message).await? else {
-            return Ok(receipt(&message.msg_id, PeerDelivery::Queued, None));
-        };
-        if !claimed {
-            if let Some(receipt) = expiration_receipt(&message, now_ms()) {
-                self.append_record(
-                    mailbox,
-                    MailboxRecord::Terminal {
-                        receipt: receipt.clone(),
-                    },
-                )
-                .await?;
-                self.retry_terminal(mailbox, &message, receipt.clone(), false)
-                    .await;
-                return Ok(receipt);
-            }
-            self.append_record(
-                mailbox,
-                MailboxRecord::Claimed {
-                    msg_id: message.msg_id.clone(),
-                },
-            )
-            .await?;
-        }
-        let (accepted, fresh) = self
-            .hub()?
-            .accept_claimed_peer_turn(&message, claim)
-            .await?;
-        self.append_record(
-            mailbox,
-            MailboxRecord::Accepted {
-                msg_id: message.msg_id.clone(),
-                accepted: accepted.clone(),
-            },
-        )
-        .await?;
-        // Startup recovery handed only pre-existing core receipts to the
-        // manager before PeerService started. A Claim with no core receipt is
-        // admitted here as fresh work and must still be handed off while the
-        // mailbox reconciliation flag is set.
-        if (!self.recovering.load(Ordering::Acquire) || fresh)
-            && let Err(error) = self.hub()?.handoff_peer_turn(accepted).await
-        {
-            tracing::warn!(
-                target: "haider.peer",
-                msg_id = %message.msg_id,
-                %error,
-                "accepted peer turn remains queued for manager handoff retry"
-            );
-            return Ok(receipt(&message.msg_id, PeerDelivery::Queued, None));
-        }
-        let delivered = receipt(&message.msg_id, PeerDelivery::Delivered, None);
-        self.append_record(
-            mailbox,
-            MailboxRecord::Terminal {
-                receipt: delivered.clone(),
-            },
-        )
-        .await?;
-        self.retry_terminal(mailbox, &message, delivered.clone(), false)
-            .await;
-        Ok(delivered)
-    }
-
-    async fn finish_accepted_turn(
-        &self,
-        mailbox: &Path,
-        message: &PeerMessage,
-        accepted: AcceptedTurn,
-    ) -> Result<bool, PeerError> {
-        if !self.recovering.load(Ordering::Acquire)
-            && let Err(error) = self.hub()?.handoff_peer_turn(accepted).await
-        {
-            tracing::warn!(
-                target: "haider.peer",
-                msg_id = %message.msg_id,
-                %error,
-                "accepted peer turn remains queued for manager handoff retry"
-            );
-            return Ok(false);
-        }
-        let receipt = receipt(&message.msg_id, PeerDelivery::Delivered, None);
-        self.append_record(
-            mailbox,
-            MailboxRecord::Terminal {
-                receipt: receipt.clone(),
-            },
-        )
-        .await?;
-        self.retry_terminal(mailbox, message, receipt, false).await;
-        Ok(true)
-    }
-
-    async fn retry_terminal(
-        &self,
-        mailbox: &Path,
-        message: &PeerMessage,
-        receipt: PeerReceipt,
-        target_published: bool,
-    ) {
-        if let Err(error) = self
-            .publish_terminal(mailbox, message, receipt, target_published)
-            .await
-        {
-            tracing::warn!(
-                target: "haider.peer",
-                msg_id = %message.msg_id,
-                %error,
-                "terminal peer receipt remains durable for retry"
-            );
-        }
-    }
-
-    async fn publish_terminal(
-        &self,
-        mailbox: &Path,
-        message: &PeerMessage,
-        receipt: PeerReceipt,
-        target_published: bool,
-    ) -> Result<(), PeerError> {
-        if receipt.delivery == PeerDelivery::Delivered && !target_published {
-            if let Ok(hub) = self.hub() {
-                hub.publish_peer_event(
-                    &SessionId::new(message.to.clone()),
-                    WireFrame::PeerMessageReceived {
-                        message: message.clone(),
-                    },
-                );
-            }
-            self.append_record(
-                mailbox,
-                MailboxRecord::TargetPublished {
-                    msg_id: message.msg_id.clone(),
-                },
-            )
-            .await?;
-        }
-        self.publish_delivery(message, receipt).await?;
-        self.append_record(
-            mailbox,
-            MailboxRecord::Published {
-                msg_id: message.msg_id.clone(),
-            },
-        )
-        .await
-    }
-
-    async fn publish_delivery(
-        &self,
-        message: &PeerMessage,
-        receipt: PeerReceipt,
-    ) -> Result<(), PeerError> {
-        let hub = self.hub().ok();
-        if message.from.kind == PeerKind::HaiderSession
-            && message.from.trust == PeerTrust::VerifiedHaider
-            && self.is_local(&message.from.id)?
-        {
-            self.record_sender_receipt(&message.from.id, receipt.clone())
-                .await?;
-            if let Some(hub) = hub {
-                hub.publish_peer_event(
-                    &SessionId::new(message.from.id.clone()),
-                    WireFrame::PeerDeliveryChanged {
-                        receipt: receipt.clone(),
-                    },
-                );
-            }
-            return Ok(());
-        }
-        #[cfg(unix)]
-        if let Ok(agents) = self.discover().await
-            && let Some(sender) = agents.iter().find(|agent| agent.id == message.from.id)
-            && let Ok(path) = endpoint_path_for(&self.runtime_dir, sender)
-        {
-            return send_receipt(&path, receipt).await;
-        }
-        Err(PeerError::Unavailable {
-            message: format!(
-                "peer receipt sender {} is not currently reachable",
-                message.from.id
-            ),
-        })
-    }
-
-    pub(crate) async fn expire_target(
-        &self,
-        target_id: &str,
-        reason: PeerDeliveryReason,
-    ) -> Result<(), PeerError> {
-        let _delivery = self.delivery_serial.lock().await;
-        let paths = peer_endpoint_paths(&self.runtime_dir, target_id, PeerEndpointKind::Haider)?;
-        for pending in self.load_pending(&paths.mailbox).await?.into_values() {
-            let _lease = self.lock_mailbox(&paths.mailbox).await?;
-            let refreshed = self.load_pending_repairing(&paths.mailbox).await?;
-            let Some(pending) = refreshed.get(&pending.message.msg_id) else {
-                continue;
-            };
-            if let Some(receipt) = pending.terminal.clone() {
-                self.retry_terminal(
-                    &paths.mailbox,
-                    &pending.message,
-                    receipt,
-                    pending.target_published,
-                )
-                .await;
-            } else if let Some(accepted) = pending.accepted.clone() {
-                let _ = self
-                    .finish_accepted_turn(&paths.mailbox, &pending.message, accepted)
-                    .await?;
-            } else if let Some(accepted) = self.hub()?.peer_turn_receipt(&pending.message).await? {
-                self.append_record(
-                    &paths.mailbox,
-                    MailboxRecord::Accepted {
-                        msg_id: pending.message.msg_id.clone(),
-                        accepted: accepted.clone(),
-                    },
-                )
-                .await?;
-                let _ = self
-                    .finish_accepted_turn(&paths.mailbox, &pending.message, accepted)
-                    .await?;
-            } else {
-                let receipt = receipt(&pending.message.msg_id, PeerDelivery::Expired, Some(reason));
-                self.append_record(
-                    &paths.mailbox,
-                    MailboxRecord::Terminal {
-                        receipt: receipt.clone(),
-                    },
-                )
-                .await?;
-                self.retry_terminal(&paths.mailbox, &pending.message, receipt, false)
-                    .await;
-            }
-        }
-        Ok(())
-    }
-
-    async fn append_record(&self, path: &Path, record: MailboxRecord) -> Result<(), PeerError> {
-        let _serial = self.mailbox_serial.lock().await;
-        let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || append_record_blocking(&path, &record))
-            .await
-            .map_err(|error| PeerError::Unavailable {
-                message: format!("peer mailbox writer task failed: {error}"),
-            })?
-    }
-
-    async fn lock_mailbox(&self, path: &Path) -> Result<MailboxLease, PeerError> {
-        let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || lock_mailbox_blocking(&path))
-            .await
-            .map_err(|error| PeerError::Unavailable {
-                message: format!("peer mailbox lock task failed: {error}"),
-            })?
-    }
-
-    async fn record_sender_receipt(
-        &self,
-        sender_id: &str,
-        receipt: PeerReceipt,
-    ) -> Result<(), PeerError> {
-        let paths = peer_endpoint_paths(&self.runtime_dir, sender_id, PeerEndpointKind::Haider)?;
-        self.append_record(&paths.mailbox, MailboxRecord::Receipt { receipt })
-            .await
-    }
-
     #[cfg(unix)]
-    async fn record_outbound(
-        &self,
-        sender_id: &str,
-        msg_id: &str,
-        target_id: &str,
-        target_kind: PeerKind,
-        expires_at: u64,
-    ) -> Result<(), PeerError> {
-        let paths = peer_endpoint_paths(&self.runtime_dir, sender_id, PeerEndpointKind::Haider)?;
-        self.append_record(
-            &paths.mailbox,
-            MailboxRecord::Outbound {
-                msg_id: msg_id.to_owned(),
-                target_id: target_id.to_owned(),
-                target_kind,
-                expires_at,
-            },
-        )
-        .await
-    }
-
-    #[cfg(unix)]
-    async fn accept_wire_receipt(
-        &self,
-        sender_id: &str,
-        receipt: PeerReceipt,
-    ) -> Result<(), PeerError> {
-        let paths = peer_endpoint_paths(&self.runtime_dir, sender_id, PeerEndpointKind::Haider)?;
-        let mailbox = paths.mailbox;
-        let _serial = self.mailbox_serial.lock().await;
-        tokio::task::spawn_blocking(move || journal_wire_receipt_blocking(&mailbox, receipt))
-            .await
-            .map_err(|error| PeerError::Unavailable {
-                message: format!("peer receipt writer task failed: {error}"),
-            })?
-    }
-
-    async fn load_pending(
-        &self,
-        path: &Path,
-    ) -> Result<HashMap<String, PendingMessage>, PeerError> {
-        let _serial = self.mailbox_serial.lock().await;
-        let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || load_pending_observing_blocking(&path))
-            .await
-            .map_err(|error| PeerError::Unavailable {
-                message: format!("peer mailbox reader task failed: {error}"),
-            })?
-    }
-
-    async fn load_pending_repairing(
-        &self,
-        path: &Path,
-    ) -> Result<HashMap<String, PendingMessage>, PeerError> {
-        let _serial = self.mailbox_serial.lock().await;
-        let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || load_pending_blocking(&path))
-            .await
-            .map_err(|error| PeerError::Unavailable {
-                message: format!("peer mailbox repair task failed: {error}"),
-            })?
-    }
-
-    #[cfg(unix)]
-    async fn expire_outbound(&self, sender_id: &str, mailbox: &Path) -> Result<(), PeerError> {
-        let path = mailbox.to_path_buf();
-        let now = now_ms();
-        let receipts = {
-            let _serial = self.mailbox_serial.lock().await;
-            tokio::task::spawn_blocking(move || expire_outbound_blocking(&path, now))
-                .await
-                .map_err(|error| PeerError::Unavailable {
-                    message: format!("peer outbound expiry task failed: {error}"),
-                })??
-        };
-        for receipt in receipts {
-            if let Ok(hub) = self.hub() {
-                hub.publish_peer_event(
-                    &SessionId::new(sender_id.to_owned()),
-                    WireFrame::PeerDeliveryChanged { receipt },
-                );
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    async fn expire_outbound(&self, _sender_id: &str, _mailbox: &Path) -> Result<(), PeerError> {
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    async fn receive_wire(
+    async fn receive_request(
         self: &Arc<Self>,
         target_id: &str,
-        frame: PeerWireFrame,
-    ) -> Result<Option<PeerWireFrame>, PeerError> {
-        if frame.v != PEER_WIRE_VERSION {
-            return Err(PeerError::Invalid {
-                message: format!("unsupported peer wire version {}", frame.v),
-            });
-        }
-        match frame.body {
-            PeerWireBody::Deliver { mut message } => {
-                let msg_id = message.msg_id.clone();
+        body: haider_rpc::RequestBody,
+    ) -> Result<haider_rpc::ResponseBody, PeerError> {
+        match body {
+            haider_rpc::RequestBody::PeerInject { mut message } => {
                 if message.to != target_id {
-                    return Ok(Some(PeerWireFrame::receipt(receipt(
-                        &msg_id,
-                        PeerDelivery::Refused,
-                        Some(PeerDeliveryReason::InvalidMessage),
-                    ))));
+                    return Err(PeerError::Invalid { message: "wrong peer endpoint target".into() });
                 }
-                // Same-UID proves the OS account, not the claimed identity.
-                // Bind attribution to the canonical live manifest. External
-                // px registrations are always untrusted; remote ph peers are
-                // Haider sessions, while a socket may never claim a session
-                // that this daemon owns in process.
                 message.from = self.registered_wire_sender(&message.from.id).await?;
-                let receipt = match self.enqueue_local(message).await {
-                    Ok(receipt) => receipt,
-                    Err(PeerError::Invalid { .. }) => receipt(
-                        &msg_id,
-                        PeerDelivery::Refused,
-                        Some(PeerDeliveryReason::InvalidMessage),
-                    ),
-                    Err(error) => return Err(error),
-                };
-                Ok(Some(PeerWireFrame::receipt(receipt)))
+                let receipt = self.enqueue_local(message).await?;
+                Ok(haider_rpc::ResponseBody::PeerSend { receipt })
             }
-            PeerWireBody::Receipt { receipt } => {
-                validate_receipt(&receipt)?;
-                self.accept_wire_receipt(target_id, receipt.clone()).await?;
-                if let Ok(hub) = self.hub() {
-                    hub.publish_peer_event(
-                        &SessionId::new(target_id.to_owned()),
-                        WireFrame::PeerDeliveryChanged {
-                            receipt: receipt.clone(),
-                        },
-                    );
+            haider_rpc::RequestBody::PeerNotifyWhenIdle { to } => {
+                // The endpoint may observe only its own resident session.
+                let target = resolve_address(&to, &self.list().await?)?;
+                if target.id != target_id {
+                    return Err(PeerError::Invalid { message: "wrong idle subscription endpoint".into() });
                 }
-                // This echo acknowledges that the sender durably journaled
-                // the terminal receipt; the target retries until it sees it.
-                Ok(Some(PeerWireFrame::receipt(receipt)))
+                let agent = self.notify_when_idle(to).await?;
+                Ok(haider_rpc::ResponseBody::PeerNotifyWhenIdle { agent })
             }
+            _ => Err(PeerError::Invalid {
+                message: "a peer endpoint accepts only injection or an idle subscription; a peer cannot approve anything".into(),
+            }),
         }
     }
 }
@@ -1529,7 +790,7 @@ impl Drop for PeerService {
     }
 }
 
-fn descriptor_from_summary(summary: SessionSummary, now: u64) -> PeerDescriptor {
+fn descriptor_from_summary(summary: SessionSummary, now: u64, device_id: &str) -> PeerDescriptor {
     let workspace = sanitize_peer_scalar(
         &summary.workspace_cwd.unwrap_or_default(),
         MANIFEST_SCALAR_MAX_BYTES,
@@ -1572,6 +833,7 @@ fn descriptor_from_summary(summary: SessionSummary, now: u64) -> PeerDescriptor 
     };
     PeerDescriptor {
         id,
+        device_id: device_id.into(),
         name,
         kind: PeerKind::HaiderSession,
         workspace,
@@ -1609,6 +871,12 @@ fn sanitize_peer_scalar(value: &str, max_bytes: usize) -> String {
 pub(super) fn wire_sender_from_descriptor(descriptor: PeerDescriptor) -> PeerSender {
     PeerSender {
         id: descriptor.id,
+        device_id: descriptor.device_id,
+        mode: match descriptor.state {
+            PeerState::Busy => "prompting",
+            PeerState::Idle => "idle",
+        }
+        .into(),
         name: descriptor.name,
         kind: descriptor.kind,
         // A same-UID local socket authenticates the OS account, not the
@@ -1651,7 +919,10 @@ pub(super) fn resolve_address(
     address: &str,
     agents: &[PeerDescriptor],
 ) -> Result<PeerDescriptor, PeerError> {
-    if let Some(agent) = agents.iter().find(|agent| agent.id == address) {
+    if let Some(agent) = agents
+        .iter()
+        .find(|agent| agent.id == address || agent.address() == address)
+    {
         return Ok(agent.clone());
     }
     let (name, prefix) = parse_qualified_address(address);
@@ -1720,12 +991,15 @@ fn normalize_incoming_message(message: &mut PeerMessage) -> Result<(), PeerError
         false,
     )?;
     validate_text("peer target id", &message.to, PEER_ID_MAX_BYTES, false)?;
-    validate_text(
-        "peer message",
-        &message.message,
-        PEER_MESSAGE_MAX_BYTES,
-        false,
-    )?;
+    let mut has_content = false;
+    message
+        .message
+        .visit_strs(|text| has_content |= !text.trim().is_empty());
+    if !has_content || message.message.len() > PEER_MESSAGE_MAX_BYTES {
+        return Err(PeerError::Invalid {
+            message: "peer message is empty or exceeds the byte limit".into(),
+        });
+    }
     if let Some(summary) = message.summary.as_deref() {
         validate_text("peer summary", summary, PEER_SUMMARY_MAX_BYTES, true)?;
     }
@@ -1737,23 +1011,21 @@ fn normalize_incoming_message(message: &mut PeerMessage) -> Result<(), PeerError
     ] {
         validate_header(field, value)?;
     }
-    let queued_at = now_ms();
-    // Preserve a normal sender deadline exactly so the target can never
-    // deliver after the sender has already expired the same message. A
-    // future-skewed/unbounded external deadline is shortened, never extended.
-    message.expires_at = message
-        .expires_at
-        .min(queued_at.saturating_add(MESSAGE_TTL_MS));
-    message.queued_at = queued_at;
+    validate_header("peer sender device", &message.from.device_id)?;
+    validate_text(
+        "peer sender device",
+        &message.from.device_id,
+        PEER_ID_MAX_BYTES,
+        true,
+    )?;
+    validate_header("peer sender mode", &message.from.mode)?;
+    validate_text(
+        "peer sender mode",
+        &message.from.mode,
+        PEER_NAME_MAX_BYTES,
+        false,
+    )?;
     Ok(())
-}
-
-fn same_delivery(left: &PeerMessage, right: &PeerMessage) -> bool {
-    left.msg_id == right.msg_id
-        && left.from == right.from
-        && left.to == right.to
-        && left.message == right.message
-        && left.summary == right.summary
 }
 
 fn validate_header(field: &'static str, value: &str) -> Result<(), PeerError> {
@@ -1775,42 +1047,6 @@ fn receipt(
         msg_id: msg_id.to_owned(),
         delivery,
         reason,
-    }
-}
-
-#[cfg(unix)]
-fn validate_receipt(receipt: &PeerReceipt) -> Result<(), PeerError> {
-    validate_text(
-        "peer receipt message id",
-        &receipt.msg_id,
-        PEER_MSG_ID_MAX_BYTES,
-        false,
-    )?;
-    validate_header("peer receipt message id", &receipt.msg_id)?;
-    let reason_is_valid = match receipt.delivery {
-        PeerDelivery::Queued | PeerDelivery::Delivered => receipt.reason.is_none(),
-        PeerDelivery::Expired | PeerDelivery::Refused => receipt.reason.is_some(),
-    };
-    if !reason_is_valid {
-        return Err(PeerError::Invalid {
-            message: format!(
-                "peer receipt {} has an invalid reason for {:?}",
-                receipt.msg_id, receipt.delivery
-            ),
-        });
-    }
-    Ok(())
-}
-
-pub(super) fn expiration_receipt(message: &PeerMessage, now: u64) -> Option<PeerReceipt> {
-    if now < message.expires_at {
-        None
-    } else {
-        Some(receipt(
-            &message.msg_id,
-            PeerDelivery::Expired,
-            Some(PeerDeliveryReason::TargetNeverReturned),
-        ))
     }
 }
 
@@ -1840,355 +1076,6 @@ fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn lock_mailbox_blocking(path: &Path) -> Result<MailboxLease, PeerError> {
-    ensure_peer_artifact_parent(path)?;
-    lock_mailbox_platform_blocking(path)
-}
-
-#[cfg(unix)]
-fn lock_mailbox_platform_blocking(path: &Path) -> Result<MailboxLease, PeerError> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    let mut options = OpenOptions::new();
-    options
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
-    let file = options
-        .open(path)
-        .map_err(|error| PeerError::io("open peer mailbox lock", path, error))?;
-    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
-        .map_err(|error| PeerError::io("lock peer mailbox", path, error.into()))?;
-    Ok(MailboxLease { _file: file })
-}
-
-#[cfg(windows)]
-fn lock_mailbox_platform_blocking(_path: &Path) -> Result<MailboxLease, PeerError> {
-    Ok(MailboxLease)
-}
-
-pub(super) fn append_record_blocking(path: &Path, record: &MailboxRecord) -> Result<(), PeerError> {
-    ensure_peer_artifact_parent(path)?;
-    let mut bytes = serde_json::to_vec(record).map_err(|error| PeerError::Invalid {
-        message: format!("cannot encode peer mailbox record: {error}"),
-    })?;
-    bytes.push(b'\n');
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options
-            .mode(0o600)
-            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|error| PeerError::io("open peer mailbox", path, error))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|error| PeerError::io("secure peer mailbox", path, error))?;
-    }
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| PeerError::io("append durable peer mailbox", path, error))?;
-    // The first queue append creates the directory entry. Syncing only the
-    // file is not sufficient to promise survival across a host crash.
-    sync_parent(path)
-}
-
-pub(super) fn load_pending_blocking(
-    path: &Path,
-) -> Result<HashMap<String, PendingMessage>, PeerError> {
-    load_pending_blocking_impl(path, true)
-}
-
-fn load_pending_observing_blocking(
-    path: &Path,
-) -> Result<HashMap<String, PendingMessage>, PeerError> {
-    load_pending_blocking_impl(path, false)
-}
-
-fn load_pending_blocking_impl(
-    path: &Path,
-    repair_torn_suffix: bool,
-) -> Result<HashMap<String, PendingMessage>, PeerError> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
-        Err(error) => return Err(PeerError::io("open peer mailbox", path, error)),
-    };
-    let mut pending = HashMap::<String, PendingMessage>::new();
-    // Each append ends with LF and syncs. A process crash can leave only the
-    // final append torn; ignore that unterminated suffix while treating every
-    // malformed completed record as corruption.
-    let complete_len = if bytes.ends_with(b"\n") {
-        bytes.len()
-    } else {
-        bytes
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |index| index + 1)
-    };
-    if repair_torn_suffix && complete_len < bytes.len() {
-        let file = OpenOptions::new()
-            .write(true)
-            .open(path)
-            .map_err(|error| PeerError::io("open torn peer mailbox", path, error))?;
-        let complete_len = u64::try_from(complete_len).map_err(|_| PeerError::Invalid {
-            message: format!("peer mailbox {} is too large to repair", path.display()),
-        })?;
-        file.set_len(complete_len)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| PeerError::io("truncate torn peer mailbox", path, error))?;
-    }
-    for line in bytes[..complete_len].split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let record =
-            serde_json::from_slice::<MailboxRecord>(line).map_err(|error| PeerError::Invalid {
-                message: format!("invalid peer mailbox record in {}: {error}", path.display()),
-            })?;
-        match record {
-            MailboxRecord::Queued { message } => {
-                pending.insert(
-                    message.msg_id.clone(),
-                    PendingMessage {
-                        message,
-                        claimed: false,
-                        accepted: None,
-                        terminal: None,
-                        target_published: false,
-                        published: false,
-                    },
-                );
-            }
-            MailboxRecord::Claimed { msg_id } => {
-                if let Some(message) = pending.get_mut(&msg_id) {
-                    message.claimed = true;
-                }
-            }
-            MailboxRecord::Accepted { msg_id, accepted } => {
-                if let Some(message) = pending.get_mut(&msg_id) {
-                    message.accepted = Some(accepted);
-                }
-            }
-            MailboxRecord::Terminal { receipt } => {
-                if let Some(message) = pending.get_mut(&receipt.msg_id) {
-                    message.terminal = Some(receipt);
-                }
-            }
-            MailboxRecord::TargetPublished { msg_id } => {
-                if let Some(message) = pending.get_mut(&msg_id) {
-                    message.target_published = true;
-                }
-            }
-            MailboxRecord::Published { msg_id } => {
-                if let Some(message) = pending.get_mut(&msg_id) {
-                    message.published = true;
-                }
-            }
-            MailboxRecord::Receipt { receipt } => {
-                if receipt.msg_id.is_empty() {
-                    return Err(PeerError::Invalid {
-                        message: format!(
-                            "peer mailbox {} contains an empty receipt message id",
-                            path.display()
-                        ),
-                    });
-                }
-            }
-            #[cfg(unix)]
-            MailboxRecord::Outbound {
-                msg_id,
-                target_id,
-                expires_at,
-                ..
-            } => {
-                if msg_id.is_empty() || target_id.is_empty() || expires_at == 0 {
-                    return Err(PeerError::Invalid {
-                        message: format!(
-                            "peer mailbox {} contains an invalid outbound expectation",
-                            path.display()
-                        ),
-                    });
-                }
-            }
-        }
-    }
-    Ok(pending)
-}
-
-#[cfg(unix)]
-pub(super) fn load_outbound_receipts_blocking(
-    path: &Path,
-) -> Result<HashMap<String, OutboundReceiptState>, PeerError> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
-        Err(error) => return Err(PeerError::io("read peer receipt expectations", path, error)),
-    };
-    let mut outstanding = HashMap::new();
-    for line in bytes.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let record =
-            serde_json::from_slice::<MailboxRecord>(line).map_err(|error| PeerError::Invalid {
-                message: format!("invalid peer mailbox record in {}: {error}", path.display()),
-            })?;
-        match record {
-            MailboxRecord::Outbound {
-                msg_id,
-                target_id,
-                target_kind,
-                expires_at,
-            } => {
-                if msg_id.is_empty() || target_id.is_empty() || expires_at == 0 {
-                    return Err(PeerError::Invalid {
-                        message: format!(
-                            "peer mailbox {} contains an invalid outbound expectation",
-                            path.display()
-                        ),
-                    });
-                }
-                outstanding.insert(
-                    msg_id,
-                    OutboundReceiptState::Outstanding {
-                        target_kind,
-                        expires_at,
-                    },
-                );
-            }
-            MailboxRecord::Receipt { receipt } if receipt.delivery != PeerDelivery::Queued => {
-                if let Some(state) = outstanding.get_mut(&receipt.msg_id) {
-                    *state = OutboundReceiptState::Journaled(receipt);
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(outstanding)
-}
-
-#[cfg(unix)]
-pub(super) fn expire_outbound_blocking(
-    mailbox: &Path,
-    now: u64,
-) -> Result<Vec<PeerReceipt>, PeerError> {
-    // Repair any torn final append before folding the outbound state. The
-    // caller holds the mailbox serializer across this check-and-append, so a
-    // concurrent Delivered receipt cannot race an Expired terminal state.
-    let _ = load_pending_blocking(mailbox)?;
-    let expectations = load_outbound_receipts_blocking(mailbox)?;
-    let mut expired = Vec::new();
-    for (msg_id, state) in expectations {
-        let OutboundReceiptState::Outstanding {
-            target_kind: PeerKind::External,
-            expires_at,
-        } = state
-        else {
-            continue;
-        };
-        if now < expires_at {
-            continue;
-        }
-        let receipt = receipt(
-            &msg_id,
-            PeerDelivery::Expired,
-            Some(PeerDeliveryReason::TargetNeverReturned),
-        );
-        append_record_blocking(
-            mailbox,
-            &MailboxRecord::Receipt {
-                receipt: receipt.clone(),
-            },
-        )?;
-        expired.push(receipt);
-    }
-    Ok(expired)
-}
-
-#[cfg(unix)]
-pub(super) fn journal_wire_receipt_blocking(
-    mailbox: &Path,
-    receipt: PeerReceipt,
-) -> Result<(), PeerError> {
-    // Loading repairs a torn final append before the correlation scan and
-    // preserves strict completed-record validation.
-    let _ = load_pending_blocking(mailbox)?;
-    let expectations = load_outbound_receipts_blocking(mailbox)?;
-    let msg_id = &receipt.msg_id;
-    match expectations.get(msg_id) {
-        Some(OutboundReceiptState::Outstanding { .. }) => {
-            append_record_blocking(mailbox, &MailboxRecord::Receipt { receipt })
-        }
-        Some(OutboundReceiptState::Journaled(previous)) if previous == &receipt => {
-            // The first acknowledgement may have been lost after the journal
-            // sync. Echoing an exact retry is idempotent.
-            Ok(())
-        }
-        Some(OutboundReceiptState::Journaled(_)) => Err(PeerError::Invalid {
-            message: format!("peer receipt {msg_id:?} conflicts with its durable state"),
-        }),
-        None => Err(PeerError::Invalid {
-            message: format!("peer receipt {msg_id:?} has no outbound delivery"),
-        }),
-    }
-}
-
-fn mailbox_candidates_blocking(runtime_dir: &Path) -> Result<HashSet<PathBuf>, PeerError> {
-    #[cfg(unix)]
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-    #[cfg(unix)]
-    let owner_uid = rustix::process::geteuid().as_raw();
-    let mut candidates = HashSet::new();
-    let entries = match std::fs::read_dir(runtime_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidates),
-        Err(error) => return Err(PeerError::io("scan peer mailboxes", runtime_dir, error)),
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !is_mailbox_name(name) {
-            continue;
-        }
-        let path = entry.path();
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !metadata.file_type().is_file() {
-            continue;
-        }
-        #[cfg(unix)]
-        if metadata.uid() != owner_uid || metadata.permissions().mode() & 0o077 != 0 {
-            continue;
-        }
-        candidates.insert(path);
-    }
-    Ok(candidates)
-}
-
-fn is_mailbox_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    bytes.len() == 17
-        && name.starts_with("ph-")
-        && name.ends_with(".q")
-        && bytes[3..15].iter().all(u8::is_ascii_hexdigit)
-}
-
 async fn write_manifest(
     paths: &haider_platform::PeerEndpointPaths,
     descriptor: &PeerDescriptor,
@@ -2205,10 +1092,11 @@ async fn write_manifest(
     let manifest = PeerManifest {
         version: PEER_WIRE_VERSION,
         id: descriptor.id.clone(),
+        device_id: descriptor.device_id.clone(),
         name: descriptor.name.clone(),
         kind: descriptor.kind,
         socket,
-        capabilities: vec!["deliver".into(), "receipt".into()],
+        capabilities: vec![haider_rpc::FEATURE_PEER_AGENT_INJECTION_V1.into()],
         workspace: descriptor.workspace.clone(),
         model: descriptor.model.clone(),
         state: descriptor.state,
@@ -2385,35 +1273,31 @@ async fn listener_loop(
     target_id: String,
     mut cancelled: watch::Receiver<bool>,
 ) {
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             changed = cancelled.changed() => {
-                if changed.is_err() || *cancelled.borrow() {
-                    break;
-                }
+                if changed.is_err() || *cancelled.borrow() { break; }
             }
+            _ = connections.join_next(), if !connections.is_empty() => {},
             accepted = endpoint.accept() => {
-                let Ok((mut stream, _)) = accepted else { break };
-                let Ok(owner) = haider_platform::peer_is_owner(&stream, endpoint.owner_uid()) else {
-                    continue;
-                };
-                if !owner {
+                let Ok((stream, _)) = accepted else { break };
+                if !haider_platform::peer_is_owner(&stream, endpoint.owner_uid()).unwrap_or(false) {
                     continue;
                 }
+                // Bounded live subscriptions and handshakes, with no sender timers.
+                if connections.len() >= 32 { continue; }
                 let Some(service) = service.upgrade() else { break };
-                let handled = tokio::time::timeout(WIRE_TIMEOUT, async {
-                    let frame = read_frame(&mut stream).await?;
-                    if let Some(reply) = service.receive_wire(&target_id, frame).await? {
-                        write_frame(&mut stream, &reply).await?;
+                let target = target_id.clone();
+                connections.spawn(async move {
+                    if let Err(error) = serve_peer_connection(stream, service, target).await {
+                        tracing::debug!(target: "haider.peer", %error, "peer connection closed");
                     }
-                    Ok::<(), PeerError>(())
-                }).await;
-                if let Ok(Err(error)) = handled {
-                    tracing::debug!(target: "haider.peer", %error, "peer socket frame refused");
-                }
+                });
             }
         }
     }
+    connections.shutdown().await;
     endpoint.close_listener();
     let _ = endpoint.cleanup();
 }
@@ -2434,6 +1318,7 @@ pub(super) async fn discover_unix(runtime_dir: &Path) -> Result<Vec<PeerDescript
         {
             agents.push(PeerDescriptor {
                 id: manifest.id,
+                device_id: manifest.device_id,
                 name: manifest.name,
                 kind: manifest.kind,
                 workspace: manifest.workspace,
@@ -2525,6 +1410,7 @@ fn manifest_candidates(runtime_dir: &Path) -> Result<Vec<(PeerManifest, PathBuf)
             || manifest.id.len() > PEER_ID_MAX_BYTES
             || manifest.name.is_empty()
             || manifest.name.len() > PEER_NAME_MAX_BYTES
+            || !manifest_scalar_safe(&manifest.device_id, PEER_ID_MAX_BYTES)
             || !manifest_scalar_safe(&manifest.id, PEER_ID_MAX_BYTES)
             || !manifest_scalar_safe(&manifest.name, PEER_NAME_MAX_BYTES)
             || !manifest_scalar_safe(&manifest.workspace, MANIFEST_SCALAR_MAX_BYTES)
@@ -2587,160 +1473,248 @@ fn endpoint_path_for(
 }
 
 #[cfg(unix)]
-pub(super) async fn exchange_delivery(
-    path: &Path,
-    frame: PeerWireFrame,
-) -> Result<PeerReceipt, PeerError> {
-    let expected_msg_id = match &frame.body {
-        PeerWireBody::Deliver { message } => message.msg_id.clone(),
-        PeerWireBody::Receipt { .. } => {
-            return Err(PeerError::Invalid {
-                message: "peer delivery exchange requires a delivery frame".into(),
-            });
-        }
-    };
-    let result = tokio::time::timeout(WIRE_TIMEOUT, async {
-        let mut stream = tokio::net::UnixStream::connect(path)
-            .await
-            .map_err(|error| PeerError::io("connect peer socket", path, error))?;
-        write_frame(&mut stream, &frame).await?;
-        let reply = read_frame(&mut stream).await?;
-        if reply.v != PEER_WIRE_VERSION {
-            return Err(PeerError::Invalid {
-                message: format!("unsupported peer wire version {}", reply.v),
-            });
-        }
-        match reply.body {
-            PeerWireBody::Receipt { receipt } => {
-                validate_receipt(&receipt)?;
-                if receipt.msg_id != expected_msg_id {
-                    return Err(PeerError::Invalid {
-                        message: format!(
-                            "peer receipt message id {:?} does not match {:?}",
-                            receipt.msg_id, expected_msg_id
-                        ),
-                    });
-                }
-                Ok(receipt)
-            }
-            PeerWireBody::Deliver { .. } => Err(PeerError::Invalid {
-                message: "peer target replied with a delivery frame".into(),
-            }),
-        }
-    })
-    .await;
-    match result {
-        Ok(result) => result,
-        Err(_) => Err(PeerError::Unavailable {
-            message: format!(
-                "peer delivery to {} exceeded the wire deadline",
-                path.display()
-            ),
-        }),
-    }
-}
-
-#[cfg(unix)]
-pub(super) async fn send_receipt(path: &Path, receipt: PeerReceipt) -> Result<(), PeerError> {
-    validate_receipt(&receipt)?;
-    let expected = receipt.clone();
-    tokio::time::timeout(WIRE_TIMEOUT, async {
-        let mut stream = tokio::net::UnixStream::connect(path)
-            .await
-            .map_err(|error| PeerError::io("connect peer receipt socket", path, error))?;
-        write_frame(&mut stream, &PeerWireFrame::receipt(receipt)).await?;
-        let acknowledgement = read_frame(&mut stream).await?;
-        if acknowledgement.v != PEER_WIRE_VERSION {
-            return Err(PeerError::Invalid {
-                message: format!("unsupported peer wire version {}", acknowledgement.v),
-            });
-        }
-        match acknowledgement.body {
-            PeerWireBody::Receipt { receipt } if receipt == expected => Ok(()),
-            PeerWireBody::Receipt { .. } => Err(PeerError::Invalid {
-                message: "peer receipt acknowledgement does not match".into(),
-            }),
-            PeerWireBody::Deliver { .. } => Err(PeerError::Invalid {
-                message: "peer receipt acknowledgement is a delivery frame".into(),
-            }),
-        }
-    })
+async fn connect_peer(path: &Path) -> Result<haider_client::Connected, PeerError> {
+    let connected = haider_client::connect(
+        path,
+        haider_client::ClientConfig {
+            client_name: "haider-peer".into(),
+            capabilities: Default::default(),
+            frame_limit: PEER_FRAME_MAX_BYTES,
+            ..Default::default()
+        },
+    )
     .await
-    .map_err(|_| PeerError::Unavailable {
-        message: format!(
-            "peer receipt to {} exceeded the wire deadline",
-            path.display()
-        ),
-    })?
-}
-
-#[cfg(unix)]
-pub(super) async fn read_frame<R>(reader: &mut R) -> Result<PeerWireFrame, PeerError>
-where
-    R: AsyncRead + Unpin,
-{
-    let length = reader.read_u32().await.map_err(|error| PeerError::Io {
-        operation: "read peer frame length",
-        path: PathBuf::from("<peer socket>"),
-        source: error,
-    })? as usize;
-    if length == 0 || length > PEER_FRAME_MAX_BYTES {
-        return Err(PeerError::Invalid {
-            message: format!("peer frame is {length} bytes; limit is {PEER_FRAME_MAX_BYTES}"),
+    .map_err(|error| PeerError::Unavailable {
+        message: error.to_string(),
+    })?;
+    if !connected
+        .welcome
+        .features
+        .contains(haider_rpc::FEATURE_PEER_AGENT_INJECTION_V1)
+    {
+        let _ = connected.client.close();
+        return Err(PeerError::Unavailable {
+            message: "target lacks peer_agent_injection_v1".into(),
         });
     }
-    let mut bytes = vec![0_u8; length];
+    Ok(connected)
+}
+
+#[cfg(unix)]
+pub(super) async fn exchange_delivery(
+    path: &Path,
+    message: PeerMessage,
+) -> Result<PeerReceipt, PeerError> {
+    let connected = connect_peer(path).await?;
+    let response = connected
+        .client
+        .request(haider_rpc::RequestBody::PeerInject { message })
+        .await;
+    let _ = connected.client.close();
+    let response = response.map_err(|error| PeerError::Unavailable {
+        message: error.to_string(),
+    })?;
+    haider_client::peer::peer_send_response(response).map_err(|error| PeerError::Unavailable {
+        message: error.to_string(),
+    })
+}
+
+#[cfg(unix)]
+type PeerConnectionFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), PeerError>> + Send>>;
+
+#[cfg(unix)]
+fn serve_peer_connection(
+    mut stream: haider_platform::IpcStream,
+    service: Arc<PeerService>,
+    target: String,
+) -> PeerConnectionFuture {
+    Box::pin(async move {
+        use haider_rpc::{LifecyclePhase, ResponseBody, Welcome};
+        // Reuse the ordinary RPC client's negotiated handshake budget. The
+        // subscription itself has no timeout; its reader services every Ping.
+        let hello = tokio::time::timeout(
+            haider_client::ClientConfig::default().handshake_timeout,
+            read_frame(&mut stream),
+        )
+        .await
+        .map_err(|_| PeerError::Unavailable {
+            message: "peer handshake deadline elapsed".into(),
+        })??;
+        let WireFrame::Hello(hello) = hello else {
+            return Err(PeerError::Invalid {
+                message: "peer connection requires Hello".into(),
+            });
+        };
+        let negotiated = haider_rpc::negotiate(
+            &hello,
+            &haider_rpc::ServerRange {
+                protocol_min: haider_rpc::WIRE_PROTOCOL_VERSION,
+                protocol_max: haider_rpc::WIRE_PROTOCOL_VERSION,
+                capabilities: Default::default(),
+                supports_msgpack: false,
+            },
+        )
+        .map_err(|error| PeerError::Invalid {
+            message: error.message,
+        })?;
+        let frame_limit = (hello.max_receive_frame as usize).min(PEER_FRAME_MAX_BYTES);
+        let hub = service.hub()?;
+        write_frame_limited(
+            &mut stream,
+            &WireFrame::Welcome(Welcome {
+                protocol: negotiated.protocol,
+                instance_id: target.clone(),
+                daemon_generation: 0,
+                frame_limit: frame_limit as u32,
+                profile_id: hub.device_id().to_string(),
+                daemon_version: env!("CARGO_PKG_VERSION").into(),
+                lifecycle_phase: LifecyclePhase::Ready,
+                capabilities_granted: Default::default(),
+                features: [
+                    haider_rpc::FEATURE_PEER_AGENT_INJECTION_V1.into(),
+                    haider_rpc::FEATURE_PEER_MESSAGING_V1.into(),
+                ]
+                .into(),
+                user_command_withheld: false,
+                encoding: None,
+            }),
+            frame_limit,
+        )
+        .await?;
+        let (request_id, body) = loop {
+            match read_frame_limited(&mut stream, frame_limit).await? {
+                WireFrame::Ping { nonce } => {
+                    write_frame_limited(&mut stream, &WireFrame::Pong { nonce }, frame_limit)
+                        .await?
+                }
+                WireFrame::Request { request_id, body } => break (request_id, body),
+                WireFrame::MenuAnswer { request_id, .. } => {
+                    let message =
+                        "a peer cannot approve anything or launder permissions".to_owned();
+                    let frame = match request_id {
+                        Some(request_id) => WireFrame::Response {
+                            request_id,
+                            body: ResponseBody::Error {
+                                code: haider_rpc::ERROR_CODE_PEER_INVALID.into(),
+                                message,
+                                retryable: false,
+                                data: None,
+                            },
+                        },
+                        None => WireFrame::ProtocolError(haider_rpc::ProtocolError {
+                            code: haider_rpc::ERROR_CODE_PEER_INVALID.into(),
+                            message,
+                            fatal: true,
+                            presentation: None,
+                            failed_write_ids: Vec::new(),
+                        }),
+                    };
+                    return write_frame_limited(&mut stream, &frame, frame_limit).await;
+                }
+                _ => {
+                    return Err(PeerError::Invalid {
+                        message: "expected peer RPC request".into(),
+                    });
+                }
+            }
+        };
+        let request = service.receive_request(&target, body);
+        tokio::pin!(request);
+        // Keep the future intact across keepalive frames. In particular a Ping
+        // neither restarts an admission nor changes the target's run deadline.
+        let result = loop {
+            tokio::select! {
+                result = &mut request => break result,
+                frame = read_frame_limited(&mut stream, frame_limit) => match frame? {
+                    WireFrame::Ping { nonce } => write_frame_limited(&mut stream, &WireFrame::Pong { nonce }, frame_limit).await?,
+                    WireFrame::Pong { .. } => {},
+                    _ => return Err(PeerError::Invalid { message: "one peer request per connection".into() }),
+                }
+            }
+        };
+        let body = result.unwrap_or_else(|error| ResponseBody::Error {
+            code: match error {
+                PeerError::Invalid { .. } => haider_rpc::ERROR_CODE_PEER_INVALID,
+                PeerError::Ambiguous { .. } => haider_rpc::ERROR_CODE_PEER_AMBIGUOUS,
+                _ => haider_rpc::ERROR_CODE_PEER_UNAVAILABLE,
+            }
+            .into(),
+            message: error.to_string(),
+            retryable: false,
+            data: None,
+        });
+        write_frame_limited(
+            &mut stream,
+            &WireFrame::Response { request_id, body },
+            frame_limit,
+        )
+        .await?;
+        // A one-shot response ends this endpoint connection and drops its watch.
+        Ok(())
+    })
+}
+
+#[cfg(unix)]
+pub(super) async fn read_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<WireFrame, PeerError> {
+    read_frame_limited(reader, PEER_FRAME_MAX_BYTES).await
+}
+
+#[cfg(unix)]
+async fn read_frame_limited<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    frame_limit: usize,
+) -> Result<WireFrame, PeerError> {
+    // The shared RPC decoder owns framing, bounds, poison semantics and the
+    // protocol union. BytesMut freezes the completed socket body once.
+    let length = reader
+        .read_u32()
+        .await
+        .map_err(|error| PeerError::io("read peer RPC length", "<peer>", error))?
+        as usize;
+    if length == 0 || length > frame_limit {
+        return Err(PeerError::Invalid {
+            message: "peer RPC frame exceeds negotiated bound".into(),
+        });
+    }
+    let mut bytes = bytes::BytesMut::zeroed(length);
     reader
         .read_exact(&mut bytes)
         .await
-        .map_err(|error| PeerError::Io {
-            operation: "read peer frame body",
-            path: PathBuf::from("<peer socket>"),
-            source: error,
-        })?;
-    serde_json::from_slice(&bytes).map_err(|error| PeerError::Invalid {
-        message: format!("invalid peer JSON frame: {error}"),
+        .map_err(|error| PeerError::io("read peer RPC body", "<peer>", error))?;
+    haider_rpc::uds_codec::decode_owned_json(bytes.freeze(), frame_limit).map_err(|error| {
+        PeerError::Invalid {
+            message: error.to_string(),
+        }
     })
 }
 
 #[cfg(unix)]
-pub(super) async fn write_frame<W>(writer: &mut W, frame: &PeerWireFrame) -> Result<(), PeerError>
-where
-    W: AsyncWrite + Unpin,
-{
-    let bytes = serde_json::to_vec(frame).map_err(|error| PeerError::Invalid {
-        message: format!("cannot encode peer JSON frame: {error}"),
-    })?;
-    if bytes.len() > PEER_FRAME_MAX_BYTES {
-        return Err(PeerError::Invalid {
-            message: format!(
-                "encoded peer frame is {} bytes; limit is {PEER_FRAME_MAX_BYTES}",
-                bytes.len()
-            ),
-        });
-    }
-    let length = u32::try_from(bytes.len()).map_err(|_| PeerError::Invalid {
-        message: "peer frame length does not fit the v1 prefix".into(),
+async fn write_frame_limited<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &WireFrame,
+    limit: usize,
+) -> Result<(), PeerError> {
+    let encoded = haider_rpc::uds_codec::encode_zeroizing_parts_with(
+        frame,
+        limit,
+        haider_rpc::WireEncoding::Json,
+    )
+    .map_err(|error| PeerError::Invalid {
+        message: error.to_string(),
     })?;
     writer
-        .write_u32(length)
+        .write_all(encoded.prefix())
         .await
-        .map_err(|error| PeerError::Io {
-            operation: "write peer frame length",
-            path: PathBuf::from("<peer socket>"),
-            source: error,
-        })?;
+        .map_err(|error| PeerError::io("write peer RPC prefix", "<peer>", error))?;
     writer
-        .write_all(&bytes)
+        .write_all(encoded.body())
         .await
-        .map_err(|error| PeerError::Io {
-            operation: "write peer frame body",
-            path: PathBuf::from("<peer socket>"),
-            source: error,
-        })?;
-    writer.flush().await.map_err(|error| PeerError::Io {
-        operation: "flush peer frame",
-        path: PathBuf::from("<peer socket>"),
-        source: error,
-    })
+        .map_err(|error| PeerError::io("write peer RPC body", "<peer>", error))?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| PeerError::io("flush peer RPC", "<peer>", error))
 }

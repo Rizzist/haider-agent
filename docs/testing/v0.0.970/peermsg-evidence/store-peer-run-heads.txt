@@ -1,0 +1,8 @@
+   Compiling haider-store v0.0.969 (/Users/rizzist/haider-run/lane-970-peermsg/crates/haider-store)
+    Finished `test` profile [unoptimized] target(s) in 8.41s
+     Running unittests src/lib.rs (/private/tmp/peermsg-target/debug/deps/haider_store-c68dd39813e094a0)
+
+running 1 test
+test event_store::run_head_projection_tests::peer_run_heads_match_independent_fold_and_repair_legacy_missing_acceptance ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 69 filtered out; finished in 0.04s

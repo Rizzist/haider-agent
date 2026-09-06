@@ -1202,6 +1202,7 @@ fn gemini_request_json_with_boundary_inner(
             last_parts: 0,
         });
 
+    let mut last_content_is_agent_input = false;
     for (message_index, message) in request.messages.iter().enumerate() {
         let role = match message.role {
             MessageRole::Assistant => "model",
@@ -1391,7 +1392,19 @@ fn gemini_request_json_with_boundary_inner(
                 }
             }
         }
-        append_content(&mut contents, role, parts)?;
+        let agent_input = message.input_origin == Some(crate::MessageInputOrigin::Agent);
+        let emits_content = !parts.is_empty();
+        append_content(
+            &mut contents,
+            role,
+            parts,
+            !agent_input && !last_content_is_agent_input,
+        )?;
+        // Empty normalized messages emit no Gemini content and cannot reset
+        // the speaker boundary of the last content that actually exists.
+        if emits_content {
+            last_content_is_agent_input = agent_input;
+        }
         if message_index.saturating_add(1) == stable_history_end {
             history_boundary = Some(crate::PreparedHistoryBoundary {
                 items: contents.len(),
@@ -1658,11 +1671,13 @@ fn append_content(
     contents: &mut Vec<serde_json::Value>,
     role: &str,
     parts: Vec<serde_json::Value>,
+    merge_previous: bool,
 ) -> Result<(), ProviderError> {
     if parts.is_empty() {
         return Ok(());
     }
     if let Some(previous) = contents.last_mut()
+        && merge_previous
         && previous.get("role").and_then(serde_json::Value::as_str) == Some(role)
     {
         let previous_parts = previous

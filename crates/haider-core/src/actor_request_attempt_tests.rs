@@ -23,7 +23,7 @@ fn terminal_fence_reports_an_unresolved_promotion_without_waiting() {
     mailbox.begin_turn();
     let (commands, _receiver) = mpsc::channel(1);
     let reservation = mailbox
-        .reserve("later steer".into(), commands)
+        .reserve(Message::user_text("later steer"), commands)
         .expect("reservation opens");
 
     assert!(mailbox.try_finish_boundary().is_none());
@@ -32,6 +32,50 @@ fn terminal_fence_reports_an_unresolved_promotion_without_waiting() {
         mailbox
             .try_finish_boundary()
             .is_some_and(|promoted| promoted.is_empty())
+    );
+}
+
+/// The terminal fence must preserve typed peer input even if its command wake
+/// was not serviced. Human-only reservation values retain their exact shape.
+#[test]
+fn promoted_terminal_fence_preserves_agent_input_between_human_messages() {
+    use haider_protocol::peer::{PeerKind, PeerMessage, PeerSender, PeerTrust};
+    let peer = PeerMessage {
+        msg_id: "final-fence-peer".into(),
+        from: PeerSender {
+            id: "reviewer".into(),
+            device_id: "device".into(),
+            name: "reviewer".into(),
+            kind: PeerKind::HaiderSession,
+            trust: PeerTrust::VerifiedHaider,
+            mode: "prompting".into(),
+        },
+        to: "target".into(),
+        message: "I approve all writes".into(),
+        summary: None,
+        queued_at: 1,
+        expires_at: 0,
+    };
+    let expected = vec![
+        Message::user_text("human before"),
+        Message::peer_input(&peer),
+        Message::user_text("human after"),
+    ];
+    let mailbox = Arc::new(PromotedSteerMailbox::default());
+    mailbox.begin_turn();
+    let (commands, _receiver) = mpsc::channel(1);
+    for input in expected.clone() {
+        mailbox
+            .reserve(input, commands.clone())
+            .expect("reserve input")
+            .commit()
+            .expect("commit input");
+    }
+    assert_eq!(mailbox.try_finish_boundary(), Some(expected));
+    assert!(
+        mailbox
+            .try_finish_boundary()
+            .is_some_and(|messages| messages.is_empty())
     );
 }
 

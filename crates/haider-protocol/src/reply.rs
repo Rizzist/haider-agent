@@ -672,6 +672,16 @@ impl From<String> for ReplyText {
     }
 }
 
+impl ReplyText {
+    /// Adopts a validated immutable transport range without copying its bytes.
+    pub fn from_utf8_bytes(bytes: Bytes) -> Result<Self, std::str::Utf8Error> {
+        std::str::from_utf8(&bytes)?;
+        let mut writer = ReplyArenaWriter::new();
+        let _ = writer.append_bytes(bytes);
+        Ok(writer.seal())
+    }
+}
+
 impl From<&str> for ReplyText {
     fn from(text: &str) -> Self {
         Self::from(text.to_owned())
@@ -862,5 +872,18 @@ mod tests {
             weak.upgrade().is_none(),
             "the last handle releases the reply allocation"
         );
+    }
+
+    #[test]
+    fn transport_utf8_range_is_adopted_without_copying() {
+        let frame = bytes::Bytes::from_static(b"prefix peer body suffix");
+        let body = frame.slice(7..16);
+        let text = ReplyText::from_utf8_bytes(body.clone()).expect("UTF-8 peer body");
+        assert_eq!(text, "peer body");
+        assert_eq!(
+            text.contiguous_bytes().expect("adopted bytes").as_ptr(),
+            body.as_ptr()
+        );
+        assert!(ReplyText::from_utf8_bytes(bytes::Bytes::from_static(&[0xff])).is_err());
     }
 }

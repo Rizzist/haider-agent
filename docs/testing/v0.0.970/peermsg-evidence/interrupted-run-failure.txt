@@ -1,0 +1,13 @@
+---- peer_tool_images_survive_automatic_and_idle_compaction_boundaries stdout ----
+
+thread 'peer_tool_images_survive_automatic_and_idle_compaction_boundaries' (40315962) panicked at crates/haider-core/tests/prompt_history_tests.rs:6782:13:
+the image-bearing tool result remains in the verbatim suffix
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    peer_tool_images_survive_automatic_and_idle_compaction_boundaries
+
+test result: FAILED. 41 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+error: test failed, to rerun pass `-p haider-core --test prompt_history_tests`
