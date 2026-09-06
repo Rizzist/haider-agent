@@ -1931,6 +1931,7 @@ dependencies = [
 name = "haider-rpc"
 version = "0.0.969"
 dependencies = [
+ "bytes",
  "haider-protocol",
  "rmp-serde",
  "serde",

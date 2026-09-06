@@ -6770,13 +6770,32 @@ impl HubConnection {
                     );
                 }
                 self.hub.enable_peer_events(&self.connection_id)?;
-                match self.hub.peer_service()?.list().await {
-                    Ok(agents) => self.send(WireFrame::Response {
+                let service = self.hub.peer_service()?;
+                self.defer_peer_request(request_id, async move {
+                    service
+                        .list()
+                        .await
+                        .map(|agents| ResponseBody::PeerList { agents })
+                })
+            }
+            RequestBody::PeerInject { .. } => self.respond_error(
+                request_id,
+                ERROR_CODE_PEER_INVALID,
+                "peer.inject is accepted only by the target session's peer endpoint",
+                false,
+                None,
+            ),
+            RequestBody::PeerNotifyWhenIdle { to } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
                         request_id,
-                        body: ResponseBody::PeerList { agents },
-                    }),
-                    Err(error) => self.respond_peer_error(request_id, error),
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
                 }
+                self.peer_notify_when_idle(request_id, to)
             }
             RequestBody::PeerSend {
                 to,
@@ -6803,18 +6822,14 @@ impl HubConnection {
                     );
                 };
                 self.hub.enable_peer_events(&self.connection_id)?;
-                match self
-                    .hub
-                    .peer_service()?
-                    .send(session_id, to, message, summary)
-                    .await
-                {
-                    Ok(receipt) => self.send(WireFrame::Response {
-                        request_id,
-                        body: ResponseBody::PeerSend { receipt },
-                    }),
-                    Err(error) => self.respond_peer_error(request_id, error),
-                }
+                let service = self.hub.peer_service()?;
+                let session_id = session_id.clone();
+                self.defer_peer_request(request_id, async move {
+                    service
+                        .send(&session_id, to, message, summary)
+                        .await
+                        .map(|receipt| ResponseBody::PeerSend { receipt })
+                })
             }
             RequestBody::PeerName { name } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
@@ -7489,25 +7504,71 @@ impl HubConnection {
         request_id: RequestId,
         error: crate::peer::PeerError,
     ) -> Result<(), SessionHubError> {
-        match error {
-            crate::peer::PeerError::Ambiguous { candidates } => self.respond_error(
+        self.send(WireFrame::Response {
+            request_id,
+            body: peer_error_response(error),
+        })
+    }
+
+    fn peer_notify_when_idle(
+        &self,
+        request_id: RequestId,
+        to: String,
+    ) -> Result<(), SessionHubError> {
+        let service = self.hub.peer_service()?;
+        self.defer_peer_request(request_id, async move {
+            service
+                .notify_when_idle(to)
+                .await
+                .map(|agent| ResponseBody::PeerNotifyWhenIdle { agent })
+        })
+    }
+
+    fn defer_peer_request<F>(
+        &self,
+        request_id: RequestId,
+        operation: F,
+    ) -> Result<(), SessionHubError>
+    where
+        F: std::future::Future<Output = Result<ResponseBody, crate::peer::PeerError>>
+            + Send
+            + 'static,
+    {
+        // Discovery, handshake, admission, and idle subscriptions may wait on
+        // external state. Share one bounded connection-owned budget and keep
+        // the primary dispatcher available for Ping throughout those waits.
+        let Ok(permit) = Arc::clone(&self.identity_lease.peer_requests).try_acquire_owned() else {
+            return self.respond_error(
                 request_id,
-                ERROR_CODE_PEER_AMBIGUOUS,
-                "peer address is ambiguous; qualify it with an id prefix",
-                false,
-                Some(ErrorData::PeerAmbiguous { candidates }),
-            ),
-            crate::peer::PeerError::Invalid { message } => {
-                self.respond_error(request_id, ERROR_CODE_PEER_INVALID, &message, false, None)
-            }
-            error => self.respond_error(
-                request_id,
-                ERROR_CODE_PEER_UNAVAILABLE,
-                &error.to_string(),
+                ERROR_CODE_OVERLOADED,
+                "too many pending peer requests on this connection",
                 true,
                 None,
-            ),
-        }
+            );
+        };
+        let sink = Arc::clone(&self.sink);
+        let mut cancel = self.identity_lease.loom_author_cancel.subscribe();
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            // No sender retry, additional timer, or run deadline is installed.
+            let result = tokio::select! {
+                biased;
+                _ = cancel.wait_for(|closed| *closed) => return,
+                result = operation => result,
+            };
+            if *cancel.borrow() {
+                return;
+            }
+            let body = result.unwrap_or_else(peer_error_response);
+            if sink
+                .try_send(WireFrame::Response { request_id, body })
+                .is_err()
+            {
+                sink.close_after_required_delivery_failure();
+            }
+        });
+        drop(task);
+        Ok(())
     }
 
     /// `peer.name` is the peer-shaped view of the existing durable session
@@ -14599,19 +14660,33 @@ impl HubConnection {
             }
             Err(error) => return Err(error),
         };
-        if !live_delivered
-            && let Err(error) = self
-                .hub
-                .worker_manager()?
-                .nudge(
-                    session_id.clone(),
-                    outcome.active_run_id,
-                    outcome.delivery_seq,
-                    outcome.text,
-                )
-                .await
-        {
-            return self.respond_queue_error(request_id, error);
+        if !live_delivered {
+            let manager = self.hub.worker_manager()?;
+            let delivered = match outcome.peer_message {
+                Some(message) => {
+                    manager
+                        .nudge_peer(
+                            session_id.clone(),
+                            outcome.active_run_id,
+                            outcome.delivery_seq,
+                            message,
+                        )
+                        .await
+                }
+                None => {
+                    manager
+                        .nudge(
+                            session_id.clone(),
+                            outcome.active_run_id,
+                            outcome.delivery_seq,
+                            outcome.text,
+                        )
+                        .await
+                }
+            };
+            if let Err(error) = delivered {
+                return self.respond_queue_error(request_id, error);
+            }
         }
         self.send(WireFrame::Response {
             request_id,
@@ -18566,6 +18641,27 @@ impl HubConnection {
         }
         self.clear_resident_binding();
         self.hub.detach_connection(&self.connection_id).await
+    }
+}
+
+fn peer_error_response(error: crate::peer::PeerError) -> ResponseBody {
+    let (code, message, retryable, data) = match error {
+        crate::peer::PeerError::Ambiguous { candidates } => (
+            ERROR_CODE_PEER_AMBIGUOUS,
+            "peer address is ambiguous; qualify it with an id prefix".to_owned(),
+            false,
+            Some(ErrorData::PeerAmbiguous { candidates }),
+        ),
+        crate::peer::PeerError::Invalid { message } => {
+            (ERROR_CODE_PEER_INVALID, message, false, None)
+        }
+        error => (ERROR_CODE_PEER_UNAVAILABLE, error.to_string(), false, None),
+    };
+    ResponseBody::Error {
+        code: code.to_owned(),
+        message,
+        retryable,
+        data,
     }
 }
 

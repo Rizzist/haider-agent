@@ -11,6 +11,7 @@ use haider_provider::{
 fn request() -> TurnRequest {
     TurnRequest {
         messages: vec![Message {
+            input_origin: None,
             role: MessageRole::User,
             blocks: vec![Block::Text {
                 text: "hello".into(),

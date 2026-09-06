@@ -44,6 +44,7 @@ fn pdf_fixture(content: &str) -> Vec<u8> {
 
 fn pdf_message(artifact: ArtifactRef, delivery: PdfDeliveryMode) -> Message {
     Message {
+        input_origin: None,
         role: haider_provider::MessageRole::User,
         blocks: vec![Block::Attachment(AttachmentBlock::Pdf {
             artifact,

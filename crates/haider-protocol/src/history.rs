@@ -37,6 +37,11 @@ pub enum NodeKind {
     PeerTurn {
         message: PeerMessage,
     },
+    /// An injected agent speaker. The paired `peer.message` journal event
+    /// supplies a separate, explicitly untrusted provider input message.
+    Agent {
+        message: PeerMessage,
+    },
     AssistantCommit {
         text: ReplyText,
         /// The turn's verification verdict — never an absence (§9.2).

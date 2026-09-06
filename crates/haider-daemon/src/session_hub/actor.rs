@@ -1077,7 +1077,11 @@ pub(super) async fn run_session_actor(
                         if let Some(harness) =
                             worker.as_ref().and_then(|worker| worker.harness.as_ref())
                         {
-                            match harness.reserve_promoted_steer(preview.text) {
+                            let reservation = match preview.peer_message {
+                                Some(message) => harness.reserve_promoted_peer_steer(message),
+                                None => harness.reserve_promoted_steer(preview.text),
+                            };
+                            match reservation {
                                 Ok(reservation) => match store.queue_promote_steer(command).await {
                                     Ok(outcome) => {
                                         // Durable-before-delivery: only a

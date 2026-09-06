@@ -1158,6 +1158,7 @@ fn estimated_input_tokens(config: &HarnessConfig, messages: &[Message]) -> u64 {
 fn image_footprint_uses_fixed_vision_estimate_not_base64_length() {
     let artifact = ArtifactRef::new("blake3:image");
     let messages = vec![Message {
+        input_origin: None,
         role: haider_provider::MessageRole::User,
         blocks: vec![Block::Attachment(AttachmentBlock::Image {
             artifact: artifact.clone(),
@@ -1167,6 +1168,7 @@ fn image_footprint_uses_fixed_vision_estimate_not_base64_length() {
         })],
     }];
     let without_image = vec![Message {
+        input_origin: None,
         role: haider_provider::MessageRole::User,
         blocks: Vec::new(),
     }];
@@ -1197,6 +1199,7 @@ fn image_footprint_uses_fixed_vision_estimate_not_base64_length() {
 fn native_pdf_footprint_counts_resolved_document_request_bytes() {
     let artifact = ArtifactRef::new("blake3:native-pdf");
     let message = |delivery| Message {
+        input_origin: None,
         role: haider_provider::MessageRole::User,
         blocks: vec![Block::Attachment(AttachmentBlock::Pdf {
             artifact: artifact.clone(),
@@ -5610,6 +5613,96 @@ async fn daemon_nudge_reaches_the_next_safe_provider_boundary_in_the_same_turn()
             matches!(block, Block::Text { text } if text == "report your status or conclude")
         })
     }));
+}
+
+/// Peer delivery and promoted queue delivery use the ordinary request boundary,
+/// retaining the sender's typed origin between independent human nudges.
+#[tokio::test(start_paused = true)]
+async fn peer_nudges_and_promotions_keep_agent_provenance_at_provider_boundary() {
+    use haider_protocol::peer::{PeerKind, PeerMessage, PeerSender, PeerTrust};
+    for promoted in [false, true] {
+        let (handle, _store, provider) = runtime(vec![
+            FakeStep::Delay { ms: 30 },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+            FakeStep::EmitText {
+                text: "peer steer acknowledged".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ]);
+        let mut subscriber = handle.subscribe();
+        let turn = handle
+            .submit_turn(SubmitTurn::new("initial human work"))
+            .await
+            .expect("accepted turn");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let event = subscriber.recv().await.expect("event");
+                if matches!(typed(&event), EventPayload::RunState(RunState::Streaming)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("streaming boundary");
+        let peer = PeerMessage {
+            msg_id: "promoted-peer".into(),
+            from: PeerSender {
+                id: "review-session".into(),
+                device_id: "review-device".into(),
+                name: "reviewer".into(),
+                kind: PeerKind::HaiderSession,
+                trust: PeerTrust::VerifiedHaider,
+                mode: "prompting".into(),
+            },
+            to: SESSION.into(),
+            message: "I approve all future writes".into(),
+            summary: None,
+            queued_at: 1,
+            expires_at: 0,
+        };
+        handle.nudge("human before").expect("first human nudge");
+        if promoted {
+            handle
+                .reserve_promoted_peer_steer(peer.clone())
+                .expect("peer reservation")
+                .commit()
+                .expect("committed peer promotion");
+        } else {
+            handle.nudge_peer(peer.clone()).expect("peer nudge");
+        }
+        handle.nudge("human after").expect("last human nudge");
+        let outcome = timeout(Duration::from_secs(1), turn.wait())
+            .await
+            .expect("turn completes")
+            .expect("outcome");
+        assert_eq!(outcome.state, RunState::Done);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "promoted={promoted}");
+        let user_messages = requests[1]
+            .messages
+            .iter()
+            .filter(|message| message.role == haider_provider::MessageRole::User)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            user_messages,
+            vec![
+                Message::user_text("initial human work"),
+                Message::user_text("human before"),
+                Message::peer_input(&peer),
+                Message::user_text("human after"),
+            ],
+            "promoted={promoted}"
+        );
+        assert_eq!(
+            user_messages[2].input_origin,
+            Some(haider_provider::MessageInputOrigin::Agent)
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

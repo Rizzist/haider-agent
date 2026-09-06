@@ -278,7 +278,7 @@ pub const ERROR_CODE_CHECKPOINT_CONFLICT: &str = "checkpoint_conflict";
 pub const ERROR_CODE_CHECKPOINT_BRANCH_MISMATCH: &str = "checkpoint_branch_mismatch";
 /// A bare peer name matched more than one live identity.
 pub const ERROR_CODE_PEER_AMBIGUOUS: &str = "peer_ambiguous";
-/// A peer target or its durable mailbox could not be reached.
+/// A peer target is not live or cannot be reached.
 pub const ERROR_CODE_PEER_UNAVAILABLE: &str = "peer_unavailable";
 /// A peer message exceeded a field bound or otherwise failed admission.
 pub const ERROR_CODE_PEER_INVALID: &str = "peer_invalid";
@@ -615,9 +615,12 @@ pub const FEATURE_LOOM_REGISTRY_WATCH_V1: &str = "loom_registry_watch_v1";
 pub const FEATURE_ACCOUNT_IDENTITY_V1: &str = "account_identity_v1";
 /// Durable bounded workspace pre-images plus receipted undo/redo/rollback.
 pub const FEATURE_CHECKPOINT_V1: &str = "checkpoint_v1";
-/// Daemon implements owner-private cross-session/external peer discovery,
-/// durable mailbox delivery, and additive delivery events.
+/// Daemon implements owner-private cross-session/external peer discovery
+/// and the original additive peer methods and event shapes.
 pub const FEATURE_PEER_MESSAGING_V1: &str = "peer_messaging_v1";
+/// Live peer messages enter the transcript as agent speakers at the receiver
+/// queue/steer boundary. Also enables one-shot idle notifications.
+pub const FEATURE_PEER_AGENT_INJECTION_V1: &str = "peer_agent_injection_v1";
 /// Daemon implements profile-scoped SSH profile management, session scope,
 /// and remote shell execution without exposing stored authentication data.
 pub const FEATURE_SSH_PROFILES_V1: &str = "ssh_profiles_v1";
@@ -4422,7 +4425,8 @@ pub enum RequestBody {
     /// Lists every currently live Haider session and registered external peer.
     #[serde(rename = "peer.list")]
     PeerList {},
-    /// Durably queues one attributable message before returning its receipt.
+    /// Admits one attributable message to a live receiver boundary.
+    /// The legacy receipt shape acknowledges this request synchronously.
     /// The sender is the connection's unique control-attached session.
     #[serde(rename = "peer.send")]
     PeerSend {
@@ -4435,6 +4439,13 @@ pub enum RequestBody {
     /// returns its refreshed peer descriptor.
     #[serde(rename = "peer.name")]
     PeerName { name: String },
+    /// Per-session daemon endpoint injection, carried by ordinary RPC framing.
+    /// Sender identity is validated by the receiving daemon, never authority.
+    #[serde(rename = "peer.inject")]
+    PeerInject { message: PeerMessage },
+    /// Returns once when the live target is idle. No message or file is queued.
+    #[serde(rename = "peer.notify_when_idle")]
+    PeerNotifyWhenIdle { to: String },
     /// Lists saved SSH profiles. When `session_id` is present, each
     /// administrative row carries that session's `in_scope` decision. The
     /// model-facing tool separately omits false rows.
@@ -4536,6 +4547,9 @@ impl RequestBody {
                 Some(FEATURE_AGENT_CLI_V1)
             }
             Self::ProviderModelsProbe { .. } => Some(FEATURE_PROVIDER_MODELS_PROBE_V1),
+            Self::PeerInject { .. } | Self::PeerNotifyWhenIdle { .. } => {
+                Some(FEATURE_PEER_AGENT_INJECTION_V1)
+            }
             Self::SessionFork {
                 prompt: Some(_), ..
             } => Some(FEATURE_SESSION_PROMPT_FORK_V1),
@@ -5454,6 +5468,9 @@ pub enum ResponseBody {
     PeerSend { receipt: PeerReceipt },
     #[serde(rename = "peer.name")]
     PeerName { agent: PeerDescriptor },
+    /// One-shot response containing the target's idle roster identity.
+    #[serde(rename = "peer.notify_when_idle")]
+    PeerNotifyWhenIdle { agent: PeerDescriptor },
     #[serde(rename = "ssh.list")]
     SshList { profiles: Vec<SshProfileWire> },
     #[serde(rename = "ssh.add")]
@@ -6004,7 +6021,7 @@ pub enum WireFrame {
     },
     /// A peer message crossed the durable target-session turn boundary.
     PeerMessageReceived { message: PeerMessage },
-    /// A sender-visible transition after the initial `peer.send` receipt.
+    /// Legacy event retained for wire decoding; agent injection emits no delivery updates.
     PeerDeliveryChanged { receipt: PeerReceipt },
     /// A local or SSH-backed terminal entered the unified registry.
     ShellOpened { shell: ShellWire },

@@ -1228,9 +1228,9 @@ async fn run_inner(
         }
     }
     states.mark_recovery_done();
-    // Peer mailboxes start only after ordinary turn recovery has handed every
-    // previously accepted run back to the worker. This makes an Accepted
-    // mailbox record a recovery observation, never a duplicate admission.
+    // Publish the live peer roster only after ordinary turn recovery has
+    // handed previously accepted runs back to their workers. New peer input
+    // then enters the same admission boundary as other live session input.
     let peer_service = match crate::peer::PeerService::start(config.runtime_dir.clone(), &hub).await
     {
         Ok(service) => service,

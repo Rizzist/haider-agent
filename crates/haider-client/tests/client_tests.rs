@@ -1265,3 +1265,151 @@ fn assert_spawned_daemon_inherits_no_descriptors_beyond_stdio(root: &Path) {
         "daemon holds a leaked descriptor: {outcome:?}"
     );
 }
+
+/// MUTATION CHECK: move the additive gate after begin_request. The legacy
+/// daemon would see an unsupported idle subscription, violating absence.
+#[tokio::test]
+async fn peer_idle_feature_absence_sends_no_request() {
+    let dir = short_dir();
+    let endpoint = dir.path().join("peer-old.sock");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&requests);
+    let daemon = spawn_fake_daemon(
+        &endpoint,
+        Arc::new(AtomicUsize::new(0)),
+        HelloReply::Welcome(welcome(
+            "profile-x",
+            BTreeSet::from([haider_rpc::FEATURE_PEER_MESSAGING_V1.into()]),
+        )),
+        move |mut stream, mut decoder| {
+            let requests = Arc::clone(&observed);
+            async move {
+                loop {
+                    let frames = read_frames(&mut stream, &mut decoder).await;
+                    if frames.is_empty() {
+                        return;
+                    }
+                    for frame in frames {
+                        match frame {
+                            WireFrame::Request { .. } => {
+                                requests.fetch_add(1, Ordering::SeqCst);
+                            }
+                            WireFrame::Ping { nonce } => {
+                                write_frame(&mut stream, &WireFrame::Pong { nonce }).await
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        },
+    );
+    let connected = connect(&endpoint, ClientConfig::default())
+        .await
+        .expect("connect legacy peer");
+    let result = haider_client::peer_messaging(&connected.client)
+        .expect("legacy peer surface")
+        .notify_when_idle("session:target@device")
+        .await;
+    assert!(matches!(
+        result,
+        Err(haider_client::PeerClientError::Client(
+            haider_client::ClientError::MissingFeature(haider_rpc::FEATURE_PEER_AGENT_INJECTION_V1)
+        ))
+    ));
+    tokio::task::yield_now().await;
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert_live_peer_notified(connected.client.close());
+    daemon.abort();
+}
+
+/// Idle notification is a live one-shot subscription, not a bounded ordinary
+/// request. The daemon keeps ping/pong active while its target remains busy.
+#[tokio::test]
+async fn peer_idle_wait_outlives_request_timeout_and_services_keepalive() {
+    const REQUEST_BUDGET: Duration = Duration::from_millis(50);
+    // The target waits three ordinary request budgets before idle. Keepalive
+    // runs five times per request budget, proving it stays active in the wait.
+    const IDLE_DELAY: Duration = REQUEST_BUDGET.saturating_mul(3);
+    let dir = short_dir();
+    let endpoint = dir.path().join("peer-idle.sock");
+    let pings = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&pings);
+    let daemon = spawn_fake_daemon(
+        &endpoint,
+        Arc::new(AtomicUsize::new(0)),
+        HelloReply::Welcome(welcome(
+            "profile-x",
+            BTreeSet::from([
+                haider_rpc::FEATURE_PEER_MESSAGING_V1.into(),
+                haider_rpc::FEATURE_PEER_AGENT_INJECTION_V1.into(),
+            ]),
+        )),
+        move |mut stream, mut decoder| {
+            let pings = Arc::clone(&observed);
+            async move {
+                let mut pending = None;
+                let idle = tokio::time::sleep(IDLE_DELAY);
+                tokio::pin!(idle);
+                loop {
+                    tokio::select! {
+                        () = &mut idle, if pending.is_some() => {
+                            let request_id = pending.take().expect("pending idle request");
+                            write_frame(&mut stream, &WireFrame::Response {
+                                request_id,
+                                body: ResponseBody::PeerNotifyWhenIdle { agent: haider_client::PeerDescriptor {
+                                    id: "target".into(), device_id: "device".into(), name: "builder".into(),
+                                    kind: haider_client::PeerKind::HaiderSession, workspace: "/work".into(),
+                                    model: "model".into(), state: haider_client::PeerState::Idle,
+                                    started_at: 1, last_seen: 2,
+                                } },
+                            }).await;
+                        }
+                        frames = read_frames(&mut stream, &mut decoder) => {
+                            if frames.is_empty() { return; }
+                            for frame in frames {
+                                match frame {
+                                    WireFrame::Request { request_id, body: RequestBody::PeerNotifyWhenIdle { to } } => {
+                                        assert_eq!(to, "session:target@device");
+                                        assert!(pending.is_none(), "one subscription only");
+                                        pending = Some(request_id);
+                                        idle.as_mut().reset(tokio::time::Instant::now() + IDLE_DELAY);
+                                    }
+                                    WireFrame::Ping { nonce } => {
+                                        pings.fetch_add(1, Ordering::SeqCst);
+                                        write_frame(&mut stream, &WireFrame::Pong { nonce }).await;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    );
+    let connected = connect(
+        &endpoint,
+        ClientConfig {
+            request_timeout: REQUEST_BUDGET,
+            ping_interval: REQUEST_BUDGET / 5,
+            pong_deadline: REQUEST_BUDGET,
+            ..ClientConfig::default()
+        },
+    )
+    .await
+    .expect("connect idle peer");
+    let agent = haider_client::peer_messaging(&connected.client)
+        .expect("peer surface")
+        .notify_when_idle("session:target@device")
+        .await
+        .expect("notice after normal request timeout");
+    assert_eq!(agent.state, haider_client::PeerState::Idle);
+    assert_eq!(agent.address(), "session:target@device");
+    assert!(
+        pings.load(Ordering::SeqCst) >= 2,
+        "keepalive continued during target work"
+    );
+    assert_live_peer_notified(connected.client.close());
+    daemon.abort();
+}

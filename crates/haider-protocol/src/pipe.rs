@@ -887,18 +887,22 @@ struct TextRow {
     compat: bool,
 }
 
-/// Self-sufficient peer row: an ADE can render this record later without
-/// reopening the mailbox or joining it to an unsolicited live frame.
+/// Self-sufficient agent speaker row, sourced solely from the transcript.
 #[derive(Serialize)]
 struct PeerMessageRow {
     kind: &'static str,
+    role: &'static str,
+    authority: &'static str,
     msg_id: String,
     sender_id: String,
+    sender_device_id: String,
+    sender_address: String,
+    sender_mode: String,
     sender: String,
     sender_kind: PeerKind,
     sender_trust: PeerTrust,
     to: String,
-    text: String,
+    text: ReplyText,
     #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
     queued_at: u64,
@@ -1176,7 +1180,7 @@ impl SidecarRow {
                 row.seq,
                 row.at_ms,
                 escape_pipe_field(&row.sender),
-                escape_pipe_field(&row.text),
+                escape_pipe_field(&row.text.to_owned_string()),
                 peer_sender_kind_name(row.sender_kind),
                 peer_trust_name(row.sender_trust),
                 escape_pipe_field(&row.msg_id),
@@ -1460,8 +1464,13 @@ fn sidecar_projection(
         EventPayload::PeerMessage(message) => Some(SidecarProjection {
             row: SidecarRow(SidecarRowKind::PeerMessage(PeerMessageRow {
                 kind: "peer_message",
+                role: "agent",
+                authority: crate::peer::PEER_AUTHORITY_STATEMENT,
+                sender_address: message.from.address(),
                 msg_id: message.msg_id,
                 sender_id: message.from.id,
+                sender_device_id: message.from.device_id,
+                sender_mode: message.from.mode,
                 sender: message.from.name,
                 sender_kind: message.from.kind,
                 sender_trust: message.from.trust,
@@ -1911,9 +1920,11 @@ mod tests {
                 msg_id: "peer-msg-11".into(),
                 from: crate::peer::PeerSender {
                     id: "peer-agent-7".into(),
+                    device_id: "device-7".into(),
                     name: "reviewer".into(),
                     kind: crate::peer::PeerKind::External,
                     trust: crate::peer::PeerTrust::UntrustedExternal,
+                    mode: "prompting".into(),
                 },
                 to: "session-safe".into(),
                 message: "inspect | this\ncarefully".into(),
@@ -1925,8 +1936,13 @@ mod tests {
         let json = sidecar_row_line(&event).expect("peer sidecar row");
         let row: serde_json::Value = serde_json::from_str(&json).expect("peer row JSON");
         assert_eq!(row["kind"], "peer_message");
+        assert_eq!(row["role"], "agent");
+        assert_eq!(row["authority"], crate::peer::PEER_AUTHORITY_STATEMENT);
         assert_eq!(row["msg_id"], "peer-msg-11");
         assert_eq!(row["sender_id"], "peer-agent-7");
+        assert_eq!(row["sender_device_id"], "device-7");
+        assert_eq!(row["sender_address"], "session:peer-agent-7@device-7");
+        assert_eq!(row["sender_mode"], "prompting");
         assert_eq!(row["sender"], "reviewer");
         assert_eq!(row["sender_kind"], "external");
         assert_eq!(row["sender_trust"], "untrusted_external");

@@ -884,6 +884,7 @@ fn encrypted_reasoning_continuation_reconstructs_exact_next_responses_input() {
         messages: vec![
             Message::user_text("first"),
             Message {
+                input_origin: None,
                 role: MessageRole::Assistant,
                 blocks: vec![Block::ProviderOpaque {
                     provider: opaque.0,

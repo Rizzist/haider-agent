@@ -9,7 +9,8 @@ pub use haider_rpc::haider_protocol::peer::{
     PeerSender, PeerState, PeerTrust,
 };
 use haider_rpc::{
-    ErrorData, FEATURE_PEER_MESSAGING_V1, RequestBody, ResponseBody, Welcome, WireFrame,
+    ErrorData, FEATURE_PEER_AGENT_INJECTION_V1, FEATURE_PEER_MESSAGING_V1, RequestBody,
+    ResponseBody, Welcome, WireFrame,
 };
 use tokio::sync::mpsc;
 
@@ -100,7 +101,29 @@ pub fn peer_messaging_available(welcome: &Welcome) -> bool {
     welcome.features.contains(FEATURE_PEER_MESSAGING_V1)
 }
 
+/// Whether agent injection and the one-shot idle method are negotiated.
+#[must_use]
+pub fn peer_agent_injection_available(welcome: &Welcome) -> bool {
+    welcome.features.contains(FEATURE_PEER_AGENT_INJECTION_V1)
+}
+
 impl PeerMessaging<'_> {
+    /// Waits for the next idle boundary (or returns immediately if already idle).
+    /// This is a one-shot subscription, so the ordinary response timeout does
+    /// not apply after admission. Connection liveness and cancellation still do.
+    pub async fn notify_when_idle(
+        &self,
+        to: impl Into<String>,
+    ) -> Result<PeerDescriptor, PeerClientError> {
+        peer_notify_when_idle_response(
+            self.client
+                .begin_request(RequestBody::PeerNotifyWhenIdle { to: to.into() })
+                .await?
+                .wait_notification()
+                .await?,
+        )
+    }
+
     pub async fn list(&self) -> Result<Vec<PeerDescriptor>, PeerClientError> {
         peer_list_response(self.client.request(RequestBody::PeerList {}).await?)
     }
@@ -184,6 +207,27 @@ pub fn peer_send_response(body: ResponseBody) -> Result<PeerReceipt, PeerClientE
 pub fn peer_name_response(body: ResponseBody) -> Result<PeerDescriptor, PeerClientError> {
     match body {
         ResponseBody::PeerName { agent } => Ok(agent),
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => Err(PeerClientError::Refused {
+            code,
+            message,
+            retryable,
+            data,
+        }),
+        _ => Err(PeerClientError::UnexpectedBody),
+    }
+}
+
+/// Decodes the correlated one-shot idle notice, preserving typed refusals.
+pub fn peer_notify_when_idle_response(
+    body: ResponseBody,
+) -> Result<PeerDescriptor, PeerClientError> {
+    match body {
+        ResponseBody::PeerNotifyWhenIdle { agent } => Ok(agent),
         ResponseBody::Error {
             code,
             message,

@@ -518,6 +518,7 @@ async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
     covered_messages.insert(
         0,
         Message {
+            input_origin: None,
             role: MessageRole::User,
             blocks: vec![
                 Block::Text {
@@ -669,6 +670,7 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
         .expect("store fallback image");
     let covered_messages = vec![
         Message {
+            input_origin: None,
             role: MessageRole::User,
             blocks: vec![
                 Block::Text {

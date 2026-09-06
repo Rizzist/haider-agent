@@ -13867,7 +13867,7 @@ fn peer_entry_lines<'a>(
         Span::styled("@ ", theme.gold_style().add_modifier(Modifier::BOLD)),
         Span::styled(sender, theme.bright_style().add_modifier(Modifier::BOLD)),
         Span::styled("›", theme.gold_style().add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" · {sender_kind}"), theme.dim_style()),
+        Span::styled(format!(" · agent · {sender_kind}"), theme.dim_style()),
         Span::styled(" · UNTRUSTED PEER INPUT", theme.maroon_style()),
     ]));
     let body_width = usize::from(width).saturating_sub(3).max(1);
@@ -13876,6 +13876,12 @@ fn peer_entry_lines<'a>(
             Span::raw(" "),
             Span::styled("▏ ", theme.rail_style()),
             Span::styled(row, theme.text_style()),
+        ]));
+    }
+    for row in wrap_body(haider_protocol::peer::PEER_AUTHORITY_STATEMENT, body_width) {
+        lines.push(Line::from(vec![
+            Span::raw("   "),
+            Span::styled(row, theme.dim_style()),
         ]));
     }
     if let Some(receipt) = receipt {

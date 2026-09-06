@@ -1071,6 +1071,16 @@ pub struct PendingResponse {
 }
 
 impl PendingResponse {
+    /// A one-shot notification has no remote completion deadline: the receiver
+    /// may stay busy for any duration. Admission already consumed the ordinary
+    /// request budget; the independent reader/writer tasks continue servicing
+    /// negotiated keepalive, and disconnect clears this correlation.
+    pub(crate) async fn wait_notification(self) -> Result<ResponseBody, ClientError> {
+        self.receiver
+            .await
+            .map_err(|_| ClientError::Disconnected(self.shared.disconnect_reason()))
+    }
+
     /// Awaits the daemon's answer.
     ///
     /// A correlation dropped by a dying connection resolves as the typed

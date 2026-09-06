@@ -166,9 +166,10 @@ const SESSION_FORK_MAX_RESIDENT_BYTES: usize = 128 * 1_024 * 1_024;
 const SESSION_FORK_STORAGE_RESERVE_BYTES: u64 = 8 * 1_024 * 1_024;
 const USAGE_REDUCER_PAYLOAD_KINDS: &[&str] =
     &["usage", "agent_spawned", "run_failed", "session_forked"];
-const QUEUE_REDUCER_PAYLOAD_KINDS: &[&str] = &["user_message", "queue_changed"];
-const RUN_PROMPT_SOURCE_PAYLOAD_KINDS: &[&str] = &["user_message", "run_retried"];
-const FAILED_TURN_REDUCER_PAYLOAD_KINDS: &[&str] = &["user_message", "run_failed", "run_retried"];
+const QUEUE_REDUCER_PAYLOAD_KINDS: &[&str] = &["user_message", "queue_changed", "peer.message"];
+const RUN_PROMPT_SOURCE_PAYLOAD_KINDS: &[&str] = &["user_message", "run_retried", "peer.message"];
+const FAILED_TURN_REDUCER_PAYLOAD_KINDS: &[&str] =
+    &["user_message", "run_failed", "run_retried", "peer.message"];
 const TREE_HEAD_REDUCER_PAYLOAD_KINDS: &[&str] = &["node_committed"];
 const USAGE_REPLAY_PAGE_BYTES: usize = 4 * 1_024 * 1_024;
 const USAGE_CHECKPOINT_PROJECTION: &str = "usage_history";
@@ -1933,6 +1934,7 @@ pub struct QueuePromoteCommand {
 pub struct QueuePromotePreview {
     pub active_run_id: RunId,
     pub text: String,
+    pub peer_message: Option<PeerMessage>,
 }
 
 /// Worker-owned transition from held to delivery-attempted.
@@ -1959,6 +1961,7 @@ pub struct QueuePromoteOutcome {
     pub active_run_id: RunId,
     pub delivery_seq: u64,
     pub text: String,
+    pub peer_message: Option<PeerMessage>,
     pub envelopes: Vec<RawEnvelope>,
 }
 
@@ -10994,7 +10997,7 @@ impl Store {
         if let Some(message) = peer_message
             && (command.text != message.render_for_prompt()
                 || !command.attachments.is_empty()
-                || command.mode != DeliveryMode::Queue)
+                || command.mode == DeliveryMode::Subturn)
         {
             return Err(store_error(
                 ErrorCode::InvalidArgument,
@@ -11227,7 +11230,8 @@ impl Store {
         // node is exactly the one committed with no tree parent on the
         // main lane (a named branch forks from an existing node; a steer
         // and a subagent turn always have ancestry).
-        let first_user_turn = command.agent_id.is_none()
+        let first_user_turn = peer_message.is_none()
+            && command.agent_id.is_none()
             && command.branch_id.is_none()
             && !same_run_delivery
             && parent.is_none();
@@ -11235,7 +11239,7 @@ impl Store {
             node: NodeId::new(format!("node-{}", command.user_event_id)),
             parent,
             kind: match peer_message {
-                Some(message) => NodeKind::PeerTurn {
+                Some(message) => NodeKind::Agent {
                     message: message.clone(),
                 },
                 None => NodeKind::UserTurn {
@@ -11565,6 +11569,7 @@ impl Store {
         Ok(QueuePromotePreview {
             active_run_id,
             text: entry.row.text,
+            peer_message: entry.peer_message,
         })
     }
 
@@ -11588,14 +11593,17 @@ impl Store {
             Some(active_run_id.clone()),
             command.device_id.clone(),
             self.worker_generation,
-            EventPayload::UserMessage {
-                text: entry.row.text.clone(),
-                attachments: Vec::new(),
-                mode: DeliveryMode::Steer,
+            match entry.peer_message.clone() {
+                Some(message) => EventPayload::PeerMessage(message),
+                None => EventPayload::UserMessage {
+                    text: entry.row.text.clone(),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Steer,
+                },
             },
             PromptRender::Verbatim,
         )?;
-        // The original user event is the sole visible rendering. This second
+        // The original speaker event is the sole visible rendering. This second
         // fact is durable delivery truth for crash recovery and deduplication.
         delivery.render.ui = false;
         let mut envelopes = vec![
@@ -11635,6 +11643,7 @@ impl Store {
             active_run_id,
             delivery_seq,
             text: entry.row.text,
+            peer_message: entry.peer_message,
             envelopes,
         })
     }
@@ -17974,7 +17983,7 @@ fn apply_run_head_envelope(
         head.accepted_seq = Some(envelope.seq);
         return Ok(());
     }
-    if !matches!(kind, "run_state" | "user_message") {
+    if !matches!(kind, "run_state" | "user_message" | "peer.message") {
         return Ok(());
     }
     let Ok(payload) = decode_payload::<EventPayload>(&envelope.payload) else {
@@ -17999,7 +18008,7 @@ fn apply_run_head_envelope(
             head.state = state;
             head.state_seq = Some(envelope.seq);
         }
-        EventPayload::UserMessage { .. } => {
+        EventPayload::UserMessage { .. } | EventPayload::PeerMessage(_) => {
             let head = heads
                 .entry(run_id.clone())
                 .or_insert_with(|| ProjectedRunHead {
@@ -18192,7 +18201,13 @@ fn update_run_head_projection_after_append(
                 .payload
                 .get("type")
                 .and_then(serde_json::Value::as_str),
-            Some("run_retried" | "run_state" | "user_message" | "provider_operation_reserved")
+            Some(
+                "run_retried"
+                    | "run_state"
+                    | "user_message"
+                    | "peer.message"
+                    | "provider_operation_reserved"
+            )
         );
         if !changes_projection {
             continue;
@@ -18251,6 +18266,9 @@ fn update_run_head_projection_after_append(
 }
 
 fn backfill_run_head_projections(connection: &mut Connection) -> StoreResult<()> {
+    // Pre-agent reducers could have a current watermark yet omit the peer's
+    // accepted sequence. Repair those nonterminal projections from journal
+    // truth before worker recovery consumes the run-head checkpoint.
     let session_ids = {
         let mut statement = connection
             .prepare(
@@ -18263,6 +18281,18 @@ fn backfill_run_head_projections(connection: &mut Connection) -> StoreResult<()>
                         (SELECT MAX(event.seq) FROM events AS event
                          WHERE event.session_id = session.id),
                         0
+                    )
+                    OR (
+                        EXISTS (
+                            SELECT 1 FROM run_heads AS head
+                            WHERE head.session_id = session.id
+                              AND head.terminal = 0 AND head.accepted_seq IS NULL
+                        )
+                        AND EXISTS (
+                            SELECT 1 FROM events AS event
+                            WHERE event.session_id = session.id
+                              AND (event.payload_kind = 'peer.message' OR event.payload_kind IS NULL)
+                        )
                     )
                  ORDER BY session.id",
             )
@@ -18350,6 +18380,7 @@ struct QueuedEntry {
     run_id: RunId,
     branch_id: Option<BranchId>,
     accepted_seq: u64,
+    peer_message: Option<PeerMessage>,
 }
 
 fn queue_entries(
@@ -18363,7 +18394,7 @@ fn queue_entries(
              FROM events INDEXED BY events_payload_kind_session_seq
              WHERE session_id = ?1
                AND (
-                   payload_kind IN (?2, ?3)
+                   payload_kind IN (?2, ?3, ?4)
                    OR payload_kind IS NULL
                )
              ORDER BY seq ASC",
@@ -18373,7 +18404,8 @@ fn queue_entries(
         .query(params![
             session_id.as_str(),
             QUEUE_REDUCER_PAYLOAD_KINDS[0],
-            QUEUE_REDUCER_PAYLOAD_KINDS[1]
+            QUEUE_REDUCER_PAYLOAD_KINDS[1],
+            QUEUE_REDUCER_PAYLOAD_KINDS[2]
         ])
         .map_err(map_sqlite_error)?;
     let mut revision = 0_u64;
@@ -18386,7 +18418,10 @@ fn queue_entries(
                 "invalid queue envelope for session {session_id}, seq {seq}: {error}"
             ))
         })?;
-        match decode_payload::<EventPayload>(&envelope.payload) {
+        // Peer text can live in RawPayload's shared reply arena rather than
+        // its stripped JSON header. Decode the envelope-owned event so queue
+        // rendering and typed promotion retain that body without flattening.
+        match envelope.payload.decode_event() {
             Ok(EventPayload::UserMessage { text, mode, .. }) => {
                 let Some(run_id) = envelope.run_id.clone() else {
                     continue;
@@ -18406,6 +18441,30 @@ fn queue_entries(
                         run_id,
                         branch_id: envelope.branch_id,
                         accepted_seq: seq,
+                        peer_message: None,
+                    });
+                }
+            }
+            Ok(EventPayload::PeerMessage(message)) => {
+                let Some(run_id) = envelope.run_id.clone() else {
+                    continue;
+                };
+                if states
+                    .get(&run_id)
+                    .is_some_and(|(state, _, _)| *state == RunState::Queued)
+                {
+                    messages.entry(run_id.clone()).or_insert(QueuedEntry {
+                        row: QueueRow {
+                            id: envelope.event_id,
+                            text: message.render_for_prompt(),
+                            mode: DeliveryMode::Queue,
+                            ordinal: 0,
+                            created_at_ms: envelope.committed_at_ms,
+                        },
+                        run_id,
+                        branch_id: envelope.branch_id,
+                        accepted_seq: seq,
+                        peer_message: Some(message),
                     });
                 }
             }
@@ -18413,6 +18472,13 @@ fn queue_entries(
                 revision = revision.max(delta.revision.max(seq));
                 match delta.change {
                     QueueChange::Enqueued { row } => {
+                        // PeerMessage retains speaker identity, while the
+                        // ordinary queue delta owns its delivery mode.
+                        if let Some(entry) =
+                            messages.values_mut().find(|entry| entry.row.id == row.id)
+                        {
+                            entry.row.mode = row.mode;
+                        }
                         held_ids.insert(row.id);
                     }
                     QueueChange::Removed { id }
@@ -18566,7 +18632,7 @@ fn main_timeline_run_prompt_source(
             "SELECT seq, envelope_json
              FROM events INDEXED BY events_payload_kind_session_seq
              WHERE session_id = ?1
-               AND (payload_kind IN (?2, ?3) OR payload_kind IS NULL)
+               AND (payload_kind IN (?2, ?3, ?4) OR payload_kind IS NULL)
              ORDER BY seq ASC",
         )
         .map_err(map_sqlite_error)?;
@@ -18574,7 +18640,8 @@ fn main_timeline_run_prompt_source(
         .query(params![
             session_id.as_str(),
             RUN_PROMPT_SOURCE_PAYLOAD_KINDS[0],
-            RUN_PROMPT_SOURCE_PAYLOAD_KINDS[1]
+            RUN_PROMPT_SOURCE_PAYLOAD_KINDS[1],
+            RUN_PROMPT_SOURCE_PAYLOAD_KINDS[2]
         ])
         .map_err(map_sqlite_error)?;
     let mut source = None;
@@ -18596,14 +18663,18 @@ fn main_timeline_run_prompt_source(
         // type fence before decoding them into either supported union.
         if !matches!(
             payload.get("type").and_then(serde_json::Value::as_str),
-            Some("user_message" | "run_retried")
+            Some("user_message" | "peer.message" | "run_retried")
         ) {
             continue;
         }
         match payload.get("type").and_then(serde_json::Value::as_str) {
-            Some("user_message")
-                if decode_payload::<EventPayload>(payload)
-                    .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. })) =>
+            Some("user_message" | "peer.message")
+                if decode_payload::<EventPayload>(payload).is_ok_and(|payload| {
+                    matches!(
+                        payload,
+                        EventPayload::UserMessage { .. } | EventPayload::PeerMessage(_)
+                    )
+                }) =>
             {
                 source = Some((target_run_id.clone(), seq));
             }
@@ -18637,7 +18708,7 @@ fn latest_main_timeline_failed_turn(
             "SELECT seq, envelope_json
              FROM events INDEXED BY events_payload_kind_session_seq
              WHERE session_id = ?1
-               AND (payload_kind IN (?2, ?3, ?4) OR payload_kind IS NULL)
+               AND (payload_kind IN (?2, ?3, ?4, ?5) OR payload_kind IS NULL)
              ORDER BY seq ASC",
         )
         .map_err(map_sqlite_error)?;
@@ -18646,7 +18717,8 @@ fn latest_main_timeline_failed_turn(
             session_id.as_str(),
             FAILED_TURN_REDUCER_PAYLOAD_KINDS[0],
             FAILED_TURN_REDUCER_PAYLOAD_KINDS[1],
-            FAILED_TURN_REDUCER_PAYLOAD_KINDS[2]
+            FAILED_TURN_REDUCER_PAYLOAD_KINDS[2],
+            FAILED_TURN_REDUCER_PAYLOAD_KINDS[3]
         ])
         .map_err(map_sqlite_error)?;
     let mut latest_user = None::<(RunId, u64)>;
@@ -18668,15 +18740,18 @@ fn latest_main_timeline_failed_turn(
         // type fence before decoding them into either supported union.
         if !matches!(
             payload.get("type").and_then(serde_json::Value::as_str),
-            Some("user_message" | "run_failed" | "run_retried")
+            Some("user_message" | "peer.message" | "run_failed" | "run_retried")
         ) {
             continue;
         }
         match payload.get("type").and_then(serde_json::Value::as_str) {
-            Some("user_message")
+            Some("user_message" | "peer.message")
                 if main_timeline
                     && decode_payload::<EventPayload>(payload).is_ok_and(|payload| {
-                        matches!(payload, EventPayload::UserMessage { .. })
+                        matches!(
+                            payload,
+                            EventPayload::UserMessage { .. } | EventPayload::PeerMessage(_)
+                        )
                     }) =>
             {
                 latest_user = Some((run_id, seq));
@@ -26893,7 +26968,7 @@ mod run_head_projection_tests {
                     head.state = state;
                     head.state_seq = Some(envelope.seq);
                 }
-                EventPayload::UserMessage { .. } => {
+                EventPayload::UserMessage { .. } | EventPayload::PeerMessage(_) => {
                     let head = runs
                         .entry(run_id.clone())
                         .or_insert_with(|| ProjectedRunHead {
@@ -26941,6 +27016,74 @@ mod run_head_projection_tests {
             projected_states,
             legacy_run_states(journal).expect("legacy state reduction")
         );
+    }
+
+    #[test]
+    fn peer_run_heads_match_independent_fold_and_repair_legacy_missing_acceptance() {
+        use haider_protocol::peer::{PeerKind, PeerSender, PeerTrust};
+        let root = tempfile::tempdir().expect("peer projection profile");
+        let message = PeerMessage {
+            msg_id: "peer-recovery-message".into(),
+            from: PeerSender {
+                id: "sender".into(),
+                device_id: "device".into(),
+                name: "reviewer".into(),
+                kind: PeerKind::HaiderSession,
+                trust: PeerTrust::VerifiedHaider,
+                mode: "prompting".into(),
+            },
+            to: "run-head-session".into(),
+            message: "Recover this teammate input.".into(),
+            summary: None,
+            queued_at: 1,
+            expires_at: 0,
+        };
+        let mut journal = vec![
+            state(1, "peer-recovery-run", None, RunState::Queued),
+            event(
+                2,
+                Some("peer-recovery-run"),
+                None,
+                EventPayload::PeerMessage(message),
+            ),
+        ];
+        assert_projection_equivalent(&journal);
+        let session = journal[0].session_id.clone();
+        let run = RunId::new("peer-recovery-run");
+        let expected = legacy_durable_runs(&journal).expect("independent peer fold");
+        assert_eq!(expected[&run].accepted_seq, Some(2));
+        {
+            let store = Store::open(root.path()).expect("store");
+            store.append(&mut journal).expect("append peer facts");
+            let connection = store.connection().expect("projection connection");
+            assert_eq!(
+                load_projected_run_heads(&connection, &session).expect("live projection"),
+                expected
+            );
+            assert_eq!(
+                main_timeline_run_prompt_source(&connection, &session, &run)
+                    .expect("peer prompt source"),
+                Some((run.clone(), 2))
+            );
+            // Model the shipped omission with an otherwise valid checksum and
+            // current watermark; ordinary corruption checks cannot repair it.
+            let mut legacy = expected[&run].clone();
+            legacy.accepted_seq = None;
+            write_projected_run_head(&connection, &session, &run, &legacy)
+                .expect("legacy incomplete projection");
+        }
+        let store = Store::open(root.path()).expect("reopen legacy peer projection");
+        let connection = store.connection().expect("repaired connection");
+        assert_eq!(
+            load_projected_run_heads(&connection, &session).expect("repaired projection"),
+            expected
+        );
+        let checkpoint =
+            run_heads_projection_checkpoint(&connection, &session).expect("recovery checkpoint");
+        let checkpoint: RunHeadsCheckpointPayload =
+            rmp_serde::from_slice(&checkpoint.payload).expect("checkpoint payload");
+        assert_eq!(checkpoint.heads.len(), 1);
+        assert_eq!(checkpoint.heads[0].accepted_seq, Some(2));
     }
 
     fn representative_journal() -> Vec<RawEnvelope> {

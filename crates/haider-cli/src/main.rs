@@ -519,7 +519,7 @@ async fn dispatch(args: &[String]) -> ExitCode {
                  graph abandon <session-id> [why], \
                  export <session-id> [--format markdown|json|codex|claude-code|opencode|pipe] [--out PATH] [--masked] [--confirm], \
                  hooks list [--json], hooks trust <digest>, hooks revoke <digest>, \
-                 peer list [--json], peer send <name> <message|->, peer name <new-name>, peer watch, \
+                 peer list [--json], peer send [--session <id>] <address> <message|->, peer name [--session <id>] <new-name>, peer watch, peer wait-idle <address>, \
                  update [--check], \
                  tui [--theme system|light|dark|desert|oasis] [--session <id>] [--no-update-check], tui --demo [--plain], \
                  import [codex|claude-code], [--session <id>] [--no-update-check], --ready)"

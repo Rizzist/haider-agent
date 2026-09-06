@@ -1404,6 +1404,17 @@ pub const CRATE_NAME: &str = "haider-provider";
 pub struct Message {
     pub role: MessageRole,
     pub blocks: Vec<Block>,
+    /// Typed input provenance retained by cached prompt projections. Provider
+    /// adapters use it only to preserve a speaker boundary; it grants no
+    /// instruction or approval authority and is never emitted as an API role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_origin: Option<MessageInputOrigin>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageInputOrigin {
+    Agent,
 }
 
 /// Provider-neutral, bounded record of a shell command initiated directly by
@@ -1423,9 +1434,17 @@ pub struct UserCommandRecord {
 }
 
 impl Message {
+    #[must_use]
+    pub fn peer_input(message: &haider_protocol::peer::PeerMessage) -> Self {
+        let mut input = Self::user_text(message.render_for_prompt());
+        input.input_origin = Some(MessageInputOrigin::Agent);
+        input
+    }
+
     pub fn user_text(text: impl Into<String>) -> Self {
         Self {
             role: MessageRole::User,
+            input_origin: None,
             blocks: vec![Block::Text {
                 text: text.into().into(),
             }],
@@ -1435,6 +1454,7 @@ impl Message {
     pub fn assistant(blocks: Vec<Block>) -> Self {
         Self {
             role: MessageRole::Assistant,
+            input_origin: None,
             blocks,
         }
     }
@@ -1498,6 +1518,7 @@ impl Message {
         let call_id = call_id.into();
         Self {
             role: MessageRole::Tool,
+            input_origin: None,
             blocks: vec![Block::ToolResult {
                 call_id,
                 preview: preview.into(),
