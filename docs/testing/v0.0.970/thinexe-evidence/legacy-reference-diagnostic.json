@@ -1,0 +1,55 @@
+{
+  "actual_installed": {
+    "basename": "haider",
+    "bytes": 49307952,
+    "codesign": "Executable=/private/tmp/htlu-wrxgqdjm/positive/bin/haider\nIdentifier=haider-55554944ab1eed2266fd3af79c39b40b61c3fbb8\nFormat=Mach-O thin (arm64)\nCodeDirectory v=20400 size=96296 flags=0x2(adhoc) hashes=3003+2 location=embedded\nVersionPlatform=1\nVersionMin=720896\nVersionSDK=1705216\nHash type=sha256 size=32\nCandidateCDHash sha256=33ab01eb1680f4ac8dd57416ebfe09f6e3e0c4ff\nCandidateCDHashFull sha256=33ab01eb1680f4ac8dd57416ebfe09f6e3e0c4ff9354f4e0cb87ee60c87b5461\nHash choices=sha256\nCMSDigest=33ab01eb1680f4ac8dd57416ebfe09f6e3e0c4ff9354f4e0cb87ee60c87b5461\nCMSDigestType=2\nExecutable Segment base=0\nExecutable Segment limit=49152000\nExecutable Segment flags=0x1\nPage size=16384\nCDHash=33ab01eb1680f4ac8dd57416ebfe09f6e3e0c4ff\nSignature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\nInternal requirements count=0 size=12\n",
+    "inode": 241270628,
+    "mode": 448,
+    "path": "/private/tmp/htlu-wrxgqdjm/positive/bin/haider",
+    "sha256": "3881c6f58b3a34672772e3812ba09dc48b0b4201b5123bbf58c258383967c3f9"
+  },
+  "cause": "Frozen969 force-signing derives the default code identifier from the archive member basename haider; signing a reference named compat changes the code directory and exact SHA-256.",
+  "corrected_matches_actual": true,
+  "corrected_reference": {
+    "basename": "haider",
+    "bytes": 49307952,
+    "codesign": "Executable=/private/tmp/htlu-canonical-reference-q1t3t88b/haider\nIdentifier=haider-55554944ab1eed2266fd3af79c39b40b61c3fbb8\nFormat=Mach-O thin (arm64)\nCodeDirectory v=20400 size=96296 flags=0x2(adhoc) hashes=3003+2 location=embedded\nVersionPlatform=1\nVersionMin=720896\nVersionSDK=1705216\nHash type=sha256 size=32\nCandidateCDHash sha256=33ab01eb1680f4ac8dd57416ebfe09f6e3e0c4ff\nCandidateCDHashFull sha256=33ab01eb1680f4ac8dd57416ebfe09f6e3e0c4ff9354f4e0cb87ee60c87b5461\nHash choices=sha256\nCMSDigest=33ab01eb1680f4ac8dd57416ebfe09f6e3e0c4ff9354f4e0cb87ee60c87b5461\nCMSDigestType=2\nExecutable Segment base=0\nExecutable Segment limit=49152000\nExecutable Segment flags=0x1\nPage size=16384\nCDHash=33ab01eb1680f4ac8dd57416ebfe09f6e3e0c4ff\nSignature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\nInternal requirements count=0 size=12\n",
+    "inode": 241301619,
+    "mode": 448,
+    "path": "/private/tmp/htlu-canonical-reference-q1t3t88b/haider",
+    "sha256": "3881c6f58b3a34672772e3812ba09dc48b0b4201b5123bbf58c258383967c3f9"
+  },
+  "corrected_sign_command": [
+    "/usr/bin/codesign",
+    "--force",
+    "--sign",
+    "-",
+    "--timestamp=none",
+    "/private/tmp/htlu-canonical-reference-q1t3t88b/haider"
+  ],
+  "frozen_source_unchanged": true,
+  "raw_attempts_preserved": [
+    "legacy-upgrade.json",
+    "legacy-upgrade-rerun.json"
+  ],
+  "schema": "haider.thinexe.legacy-reference-diagnostic.v1",
+  "source": {
+    "basename": "haider-compat",
+    "bytes": 49578096,
+    "codesign": "Executable=/private/tmp/thinexe-after/haider-compat\nIdentifier=haider_compat-d6af1e35caa358c8\nFormat=Mach-O thin (arm64)\nCodeDirectory v=20400 size=384472 flags=0x20002(adhoc,linker-signed) hashes=12011+0 location=embedded\nVersionPlatform=1\nVersionMin=720896\nVersionSDK=1705216\nHash type=sha256 size=32\nCandidateCDHash sha256=da9bfe15e1f83ef0a7187a1c495b1b2b837c7ee6\nCandidateCDHashFull sha256=da9bfe15e1f83ef0a7187a1c495b1b2b837c7ee6078958212f5ede48c9d03572\nHash choices=sha256\nCMSDigest=da9bfe15e1f83ef0a7187a1c495b1b2b837c7ee6078958212f5ede48c9d03572\nCMSDigestType=2\nExecutable Segment base=0\nExecutable Segment limit=49152000\nExecutable Segment flags=0x1\nPage size=4096\nCDHash=da9bfe15e1f83ef0a7187a1c495b1b2b837c7ee6\nSignature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\nInternal requirements=none\n",
+    "inode": 241185940,
+    "mode": 493,
+    "path": "/private/tmp/thinexe-after/haider-compat",
+    "sha256": "3bdcac2018959477026d637b384843f02501d629c6fbc4470c1457b3b66e8f20"
+  },
+  "wrong_matches_actual": false,
+  "wrong_reference": {
+    "basename": "compat",
+    "bytes": 49307952,
+    "codesign": "Executable=/private/tmp/htlu-wrxgqdjm/references/compat\nIdentifier=compat-55554944ab1eed2266fd3af79c39b40b61c3fbb8\nFormat=Mach-O thin (arm64)\nCodeDirectory v=20400 size=96296 flags=0x2(adhoc) hashes=3003+2 location=embedded\nVersionPlatform=1\nVersionMin=720896\nVersionSDK=1705216\nHash type=sha256 size=32\nCandidateCDHash sha256=589e6de9b1b3a34ca6c70ddbaa113f438b6a343b\nCandidateCDHashFull sha256=589e6de9b1b3a34ca6c70ddbaa113f438b6a343b6222097e6e24554cd89f17e7\nHash choices=sha256\nCMSDigest=589e6de9b1b3a34ca6c70ddbaa113f438b6a343b6222097e6e24554cd89f17e7\nCMSDigestType=2\nExecutable Segment base=0\nExecutable Segment limit=49152000\nExecutable Segment flags=0x1\nPage size=16384\nCDHash=589e6de9b1b3a34ca6c70ddbaa113f438b6a343b\nSignature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\nInternal requirements count=0 size=12\n",
+    "inode": 241268433,
+    "mode": 448,
+    "path": "/private/tmp/htlu-wrxgqdjm/references/compat",
+    "sha256": "4894f0b139edc15f8dc1c7cae54a23da2edcd22874809d97b4f3b197c368b610"
+  }
+}

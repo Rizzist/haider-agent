@@ -33,7 +33,11 @@ if ($env:PROCESSOR_ARCHITECTURE -notin @('AMD64', 'x86_64')) {
 }
 
 $Target = 'x86_64-pc-windows-msvc'
-$Artifact = "haider-$Tag-$Target.zip"
+# Historical releases have neither split archives nor --install-bundle.
+$NumericVersion = ($VersionNumber -split '[-+]')[0]
+$LegacyBundle = [version]$NumericVersion -lt [version]'0.0.970'
+$BundleSuffix = if ($LegacyBundle) { '' } else { '-split' }
+$Artifact = "haider-$Tag-$Target$BundleSuffix.zip"
 $BaseUrl = "https://github.com/$Repo/releases/download/$Tag"
 $Temp = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $Temp | Out-Null
@@ -66,14 +70,13 @@ try {
   }
 
   Expand-Archive -Path $Zip -DestinationPath $Temp -Force
-  $BundleDir = Join-Path $Temp "haider-$Tag-$Target"
-  $Haider = Join-Path $BundleDir 'haider.exe'
-  $Daemon = Join-Path $BundleDir 'haiderd.exe'
-  if (!(Test-Path $Haider)) {
-    throw 'Archive did not contain haider.exe'
-  }
-  if (!(Test-Path $Daemon)) {
-    throw 'Archive did not contain haiderd.exe'
+  $BundleDir = Join-Path $Temp "haider-$Tag-$Target$BundleSuffix"
+  $Binaries = @('haiderd.exe', 'haider.exe')
+  if (!$LegacyBundle) { $Binaries = @('haider-tui.exe') + $Binaries }
+  foreach ($Binary in $Binaries) {
+    if (!(Test-Path (Join-Path $BundleDir $Binary) -PathType Leaf)) {
+      throw "Archive did not contain $Binary"
+    }
   }
 
   if (![string]::IsNullOrWhiteSpace($env:HAIDER_INSTALL_DIR)) {
@@ -82,9 +85,22 @@ try {
     $InstallDir = Join-Path $env:LOCALAPPDATA 'haider\bin'
   }
 
-  New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-  Copy-Item $Haider (Join-Path $InstallDir 'haider.exe') -Force
-  Copy-Item $Daemon (Join-Path $InstallDir 'haiderd.exe') -Force
+  if ($LegacyBundle) {
+    if (Test-Path (Join-Path $InstallDir '.haider-update-transaction.json')) {
+      throw 'Finish the pending bundle transaction before installing a historical release'
+    }
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    foreach ($Binary in $Binaries) {
+      Copy-Item (Join-Path $BundleDir $Binary) (Join-Path $InstallDir $Binary) -Force
+    }
+  } else {
+    # Delegate publication to the same durable transaction used by self-update.
+    # Its marker/backup state lives under InstallDir, outside extraction cleanup.
+    & (Join-Path $BundleDir 'haider.exe') --install-bundle $BundleDir $InstallDir
+    if ($LASTEXITCODE -ne 0) {
+      throw "Bundle installation failed with exit code $LASTEXITCODE"
+    }
+  }
 
   $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   $PathParts = @($UserPath -split ';' | Where-Object { $_ -ne '' })
@@ -94,7 +110,7 @@ try {
     Write-Host "Added $InstallDir to your user PATH. Open a new terminal before running haider."
   }
 
-  Write-Host "Installed haider $VersionNumber and haiderd to $InstallDir"
+  Write-Host "Installed haider $VersionNumber bundle to $InstallDir"
   Write-Host 'Note: Windows binaries are currently unsigned; the release SHA-256 was verified.'
   Write-Host 'If SmartScreen appears, choose More info, then Run anyway.'
   Write-Host 'Run: haider'

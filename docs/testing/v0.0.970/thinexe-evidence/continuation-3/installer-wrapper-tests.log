@@ -1,0 +1,22 @@
+test_budget_scales_with_member_count_and_bytes (scripts.tests.test_install_budget.InstallBudgetTests.test_budget_scales_with_member_count_and_bytes) ... ok
+test_linux_budget_includes_required_portal_bytes (scripts.tests.test_install_budget.InstallBudgetTests.test_linux_budget_includes_required_portal_bytes) ... ok
+test_shell_npm_and_qa_share_capacity_derived_fetch_budgets (scripts.tests.test_install_budget.InstallBudgetTests.test_shell_npm_and_qa_share_capacity_derived_fetch_budgets) ... ok
+test_watchdog_kills_nested_helper_and_preserves_diagnostics (scripts.tests.test_install_budget.InstallBudgetTests.test_watchdog_kills_nested_helper_and_preserves_diagnostics) ... ok
+test_npm_stalled_body_and_redirects_share_each_attempt_deadline (scripts.tests.test_install_bundle.DownloadBudgetTests.test_npm_stalled_body_and_redirects_share_each_attempt_deadline) ... ok
+test_shell_retry_discards_partial_body_and_fetches_resources_concurrently (scripts.tests.test_install_bundle.DownloadBudgetTests.test_shell_retry_discards_partial_body_and_fetches_resources_concurrently) ... ok
+test_historical_pin_installs_original_members_without_executing_legacy_cli (scripts.tests.test_install_bundle.HistoricalBundleTests.test_historical_pin_installs_original_members_without_executing_legacy_cli) ... ok
+test_historical_pin_refuses_missing_member_bad_checksum_and_pending_recovery (scripts.tests.test_install_bundle.HistoricalBundleTests.test_historical_pin_refuses_missing_member_bad_checksum_and_pending_recovery) ... ok
+test_helper_failure_retains_vendor_recovery_state (scripts.tests.test_install_bundle.NpmBundleTests.test_helper_failure_retains_vendor_recovery_state) ... ok
+test_missing_payload_never_calls_helper_or_changes_vendor (scripts.tests.test_install_bundle.NpmBundleTests.test_missing_payload_never_calls_helper_or_changes_vendor) ... ok
+test_zip_and_tar_delegate_complete_source_and_exact_destination (scripts.tests.test_install_bundle.NpmBundleTests.test_zip_and_tar_delegate_complete_source_and_exact_destination) ... ok
+test_automatic_split_prefix_falls_back_without_changing_legacy_selection (scripts.tests.test_install_bundle.ShellBundleTests.test_automatic_split_prefix_falls_back_without_changing_legacy_selection) ... ok
+test_bad_checksum_leaves_old_install_exact (scripts.tests.test_install_bundle.ShellBundleTests.test_bad_checksum_leaves_old_install_exact) ... ok
+test_explicit_shared_writable_prefix_is_refused_with_actionable_error (scripts.tests.test_install_bundle.ShellBundleTests.test_explicit_shared_writable_prefix_is_refused_with_actionable_error) ... ok
+test_helper_failure_retains_existing_install (scripts.tests.test_install_bundle.ShellBundleTests.test_helper_failure_retains_existing_install) ... ok
+test_missing_payload_leaves_old_install_exact (scripts.tests.test_install_bundle.ShellBundleTests.test_missing_payload_leaves_old_install_exact) ... ok
+test_verified_archive_delegates_to_staged_helper (scripts.tests.test_install_bundle.ShellBundleTests.test_verified_archive_delegates_to_staged_helper) ... ok
+
+----------------------------------------------------------------------
+Ran 17 tests in 15.888s
+
+OK

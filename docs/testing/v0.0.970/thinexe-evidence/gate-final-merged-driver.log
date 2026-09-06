@@ -1,0 +1,12 @@
+START prebuild-recovered-3: cargo build --locked -p haider-cli -p haider-daemond -p haider-tui-exe -p haider-tools --bins
+END prebuild-recovered-3: PASS exit=0
+START regenerate-goldens-final-3: cargo test -q -p haider-cli --test turnhygiene_pin_tests golden -- --test-threads=1
+END regenerate-goldens-final-3: PASS exit=0
+START instruct-pipe-pin-final-3: cargo test -q -p haider-daemon --lib instruct_pipe_shrinks_the_advertised_wire_pack -- --nocapture
+END instruct-pipe-pin-final-3: PASS exit=0
+START workspace-tests-retry-3: cargo test -q --workspace --no-fail-fast
+END workspace-tests-retry-3: PASS exit=0
+START workspace-clippy-3: cargo clippy --workspace --tests -- -D warnings
+END workspace-clippy-3: PASS exit=0
+START test-count-final-3: cargo run -q -p xtask -- test-count --update
+END test-count-final-3: PASS exit=0

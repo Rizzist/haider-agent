@@ -58,6 +58,47 @@ struct SshShowDocument<'a> {
 }
 
 pub(crate) async fn ssh_command(rest: &[String]) -> ExitCode {
+    ssh_command_with_terminal(rest, &NoTerminal).await
+}
+
+pub fn is_interactive_shell(rest: &[String]) -> bool {
+    matches!(parse(rest), Ok(SshCommand::Shell { command: None, .. }))
+}
+
+pub enum TerminalError {
+    Client(haider_client::SshProfilesClientError),
+    Io(io::Error),
+    Other(String),
+}
+
+pub trait InteractiveTerminal {
+    fn run<'a>(
+        &'a self,
+        client: &'a haider_client::RpcClient,
+        name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<i32>, TerminalError>> + 'a>>;
+}
+
+struct NoTerminal;
+impl InteractiveTerminal for NoTerminal {
+    fn run<'a>(
+        &'a self,
+        _client: &'a haider_client::RpcClient,
+        _name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<i32>, TerminalError>> + 'a>>
+    {
+        Box::pin(async {
+            Err(TerminalError::Other(
+                "interactive shell requires the haider-tui payload".into(),
+            ))
+        })
+    }
+}
+
+pub async fn ssh_command_with_terminal(
+    rest: &[String],
+    terminal: &impl InteractiveTerminal,
+) -> ExitCode {
     let command = match parse(rest) {
         Ok(command) => command,
         Err(message) => {
@@ -83,7 +124,7 @@ pub(crate) async fn ssh_command(rest: &[String]) -> ExitCode {
             return ExitCode::from(EX_UNAVAILABLE);
         }
     };
-    let result = execute(&ensured.client, command).await;
+    let result = execute_with_terminal(&ensured.client, command, terminal).await;
     let _ = ensured.client.close();
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -161,9 +202,10 @@ fn exit_code_for_refusal(code: &str) -> u8 {
     }
 }
 
-async fn execute(
+async fn execute_with_terminal(
     client: &haider_client::RpcClient,
     command: SshCommand,
+    terminal: &impl InteractiveTerminal,
 ) -> Result<(), CliSshError> {
     let profiles = ssh_profiles(client).ok_or(CliSshError::FeatureAbsent)?;
     match command {
@@ -217,12 +259,13 @@ async fn execute(
             name,
             command: None,
         } => {
-            let exit_code = haider_tui::ssh_terminal::run_ssh_terminal(client, &name)
+            let exit_code = terminal
+                .run(client, &name)
                 .await
                 .map_err(|error| match error {
-                    haider_tui::ssh_terminal::SshTerminalError::Client(error) => error.into(),
-                    haider_tui::ssh_terminal::SshTerminalError::Io(error) => CliSshError::Io(error),
-                    other => CliSshError::Interactive(other.to_string()),
+                    TerminalError::Client(error) => error.into(),
+                    TerminalError::Io(error) => CliSshError::Io(error),
+                    TerminalError::Other(message) => CliSshError::Interactive(message),
                 })?;
             if let Some(code) = exit_code
                 && code != 0

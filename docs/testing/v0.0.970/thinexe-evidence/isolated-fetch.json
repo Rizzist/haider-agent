@@ -1,0 +1,60 @@
+[
+  {
+    "command": [
+      "git",
+      "clone",
+      "--shared",
+      "--no-checkout",
+      "/Users/rizzist/haider-run/lane-970-thinexe",
+      "/Users/rizzist/haider-run/lane-970-thinexe/target/thinexe-merge"
+    ],
+    "exit": 0,
+    "stdout": "",
+    "stderr": "Cloning into '/Users/rizzist/haider-run/lane-970-thinexe/target/thinexe-merge'...\ndone.\n"
+  },
+  {
+    "command": [
+      "git",
+      "remote",
+      "set-url",
+      "origin",
+      "<same upstream as lane>"
+    ],
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "git",
+      "checkout",
+      "-B",
+      "thinexe-merged",
+      "14750e312a0189caba3420a5ff845ae7aba50abf"
+    ],
+    "exit": 0,
+    "stdout": "",
+    "stderr": "Switched to a new branch 'thinexe-merged'\n"
+  },
+  {
+    "command": [
+      "git",
+      "fetch",
+      "origin",
+      "wave-970"
+    ],
+    "exit": 0,
+    "stdout": "",
+    "stderr": "From https://github.com/Rizzist/haider-agent\n * branch              wave-970   -> FETCH_HEAD\n"
+  },
+  {
+    "command": [
+      "git",
+      "rev-parse",
+      "FETCH_HEAD"
+    ],
+    "exit": 0,
+    "stdout": "b8635f88edc8c8a3f720b2f00adf026804666691\n",
+    "stderr": ""
+  }
+]

@@ -1,0 +1,22 @@
+........................1/4 A exec: starting
+1/4 A one_shot: starting
+1/4 A warm: starting
+1/4 A conformance: starting
+2/4 B exec: starting
+2/4 B one_shot: starting
+2/4 B warm: starting
+2/4 B conformance: starting
+3/4 B exec: starting
+3/4 B one_shot: starting
+3/4 B warm: starting
+3/4 B conformance: starting
+4/4 A exec: starting
+4/4 A one_shot: starting
+4/4 A warm: starting
+4/4 A conformance: starting
+FAIL: /private/var/folders/y2/zrvhkfz54lj3gsw2czwxdmsh0000gn/T/tmphyv2k93l/results/abba.json
+...................................
+----------------------------------------------------------------------
+Ran 59 tests in 17.840s
+
+OK

@@ -1131,7 +1131,7 @@ pub(crate) fn fleet_candidates(
 }
 
 pub(crate) fn fleet_human_text(snapshot: &SessionFleetSnapshot) -> String {
-    use haider_tui::fleet;
+    use haider_client::fleet;
     let mut text = fleet::header_line(&fleet::rollup(&snapshot.roots));
     text.push('\n');
     for row in fleet::flatten(&snapshot.roots) {
@@ -1172,7 +1172,7 @@ pub(crate) fn fleet_list_human_text(entries: &[FleetListEntry]) -> String {
             "{} · {} · {}\n",
             entry.id,
             entry.title.replace('\n', " "),
-            haider_tui::fleet::header_line(&haider_tui::fleet::rollup(&entry.snapshot.roots))
+            haider_client::fleet::header_line(&haider_client::fleet::rollup(&entry.snapshot.roots))
         ));
     }
     text

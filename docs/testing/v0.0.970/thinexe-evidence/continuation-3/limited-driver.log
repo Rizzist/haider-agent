@@ -1,0 +1,5 @@
+Previous no-fail-fast run finished; complete final gate uses two independent libtest harness workers, unchanged tests/assertions.
+START workspace-tests
+END {'name': 'workspace-tests', 'argv': ['cargo', 'test', '-q', '--workspace', '--no-fail-fast'], 'elapsed_seconds': 694.9060147920391, 'exit_code': 0, 'env': {'CARGO_BUILD_JOBS': '2', 'CARGO_INCREMENTAL': '0', 'RUST_MIN_STACK': '8388608', 'HAIDER_DISCOVERY_DISABLED': '1', 'HAIDER_TEST_DEVICE_NAME': 'test-mac', 'CARGO_PROFILE_DEV_DEBUG': '0', 'HAIDER_TEST_SIBLINGS_PREBUILT': '1', 'CARGO_TARGET_DIR': '/private/tmp/haider-thinexe-target', 'RUST_TEST_THREADS': '2'}}
+START clippy
+END {'name': 'clippy', 'argv': ['cargo', 'clippy', '--workspace', '--tests', '--', '-D', 'warnings'], 'elapsed_seconds': 15.292936958023347, 'exit_code': 0, 'env': {'CARGO_BUILD_JOBS': '2', 'CARGO_INCREMENTAL': '0', 'RUST_MIN_STACK': '8388608', 'HAIDER_DISCOVERY_DISABLED': '1', 'HAIDER_TEST_DEVICE_NAME': 'test-mac', 'CARGO_PROFILE_DEV_DEBUG': '0', 'HAIDER_TEST_SIBLINGS_PREBUILT': '1', 'CARGO_TARGET_DIR': '/private/tmp/haider-thinexe-target', 'RUST_TEST_THREADS': '2'}}

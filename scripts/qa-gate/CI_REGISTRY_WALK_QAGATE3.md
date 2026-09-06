@@ -545,3 +545,89 @@ Full class 1–102 applicability and evidence walk:
   temporary tools, and binaries. No push; adopt with a literal branch refspec.
 - Verifier totals: 15 findings, 13 real, 2 rejected with reasons documented in
   the report. The final gate is independent of those inspection verdicts.
+
+### v0.0.970 thinexe — thin control executable and sibling payload (HOLD-OUT)
+
+- #1–#18/#22/#29/#30/#33/#38/#49/#75/#76: one typed command grammar,
+  exhaustive headless/payload dispatch, shared client display/validation seams,
+  protocol-owned subagent validation and trace ordinal. The normal dependency
+  graph excludes TUI/STT/image/core/store/provider/tools/accounts; final native
+  artifact inspection also passes. The moved-seam projection ledger is in
+  `docs/testing/v0.0.970/thinexe.md`; no split-owned wire/JSONL schema change.
+- #19/#20/#21/#41/#42/#44/#54/#64/#67/#71/#72/#74/#81/#92: ENV LAW, real
+  prebuilt daemon/CLI/payload, >10 MiB daemon, scratch profiles, authoritative
+  test recount and generated goldens. Disk dropped below 700 MiB during the
+  first full gate, which failed ENOSPC and was stopped; failed evidence remains.
+  After recovery, builds run serially with one Cargo job. Final gate results
+  after merging wave `6c42fc02`: full workspace PASS (5,604 summed libtest passes,
+  zero failures, 13 unchanged pre-existing ignores), exact workspace/tests Clippy
+  PASS, source count 5,109, four regenerated goldens PASS, and instruct-pipe
+  6,244→6,244 bytes PASS. The actual prebuilt daemon is 202,614,624 bytes.
+  Commands/env/disk checks remain in `thinexe-evidence/gates-resumed.json`.
+- #52/#57/#76: user-facing interactive verbs keep the TUI surface; headless
+  controls stay in the thin process. Native routing, optional Wayland member,
+  installation rollback/recovery, legacy pins and signature preservation have
+  regression coverage. Windows/Linux/Android workflow execution is by inspection
+  here; their build/package/live-probe paths include the payload. The per-crate
+  CI runner explicitly builds ordinary runtime siblings before asserting prebuilt
+  proof, clears inherited proof on failure, and retains failure aggregation.
+- #77: no ignored tests, raised acceptance thresholds or raw FAIL relabeling.
+  The native macOS release installer suite passes 5/5. Official store upgrade
+  passes; public install.paths fails HTTP404 for the unpublished 970 split asset.
+  The persistent 969 migration and strict-archive negative pass; the auto-spawn 969
+  post-commit drain failure remains raw evidence and keeps the overall probe FAIL.
+- #94: version probes use the shared 30-second VERSION_QUERY. The native
+  install fixture retains its original 120-second watchdog, whose derivation
+  is unproven (six staged/installed version allowances already total 180s).
+  This is an explicit hold-out issue; no invented phase arithmetic or increased
+  cap is used. #95: no new negotiated RPC wait is introduced by thin dispatch.
+- #96: frozen before/after artifact hashes and exact commands are retained.
+  haider 35,543,584→23,144,352 bytes; installed runtime total
+  90,909,552→105,262,336 bytes. The final runtime and embedded compatibility
+  builds pass with stable source manifests (wave `6c42fc02` + thinexe). Final
+  ABBA exited 75 before sampling at load 3.2476, above the unchanged 3.0 ceiling;
+  a quiet retry reached process inventory and failed EPERM before any binary
+  launch. The earlier 4.5298 rejection remains recorded. Frozen A/B hashes are
+  unchanged after the final probes. No accepted RSS/CPU pair exists. NO_SHIP.
+- Remaining registry entries were reviewed for the changed surface; no additional
+  platform, provider or wire-policy behavior is claimed. The report records
+  21 unique accepted independent reviewer findings, zero noise, and every
+  remaining acceptance blocker. The shared serde authority preserves historical
+  error names, and the auto-spawn fixture warms all three sibling inodes before
+  its unchanged limit and forbids nested Cargo builds.
+
+
+### v0.0.970 thinexe continuation 3 — installer watchdog
+
+- #94 corrected: the old native 120-second fixture literal interrupted a
+  progressing real install (175.241s, exit 0 without retries). Installer fixture
+  budgets now sum member-count, incoming/incumbent bytes, seven SHA passes,
+  I/O, signature, version and one staged self-test allowance. The policy
+  service rates are explicit harness assumptions, not fictional enforced
+  product deadlines. Independent member verification overlaps safely, with
+  all signatures checked before any smoke and all workers joined before
+  cleanup; durable publication remains serial. Fetch retries have separate
+  resource deadlines, discard partial bytes, and clean redirect sockets.
+- #76/#77: thin/payload/daemon remain in every current split installer and
+  post-pack gate; Linux's portal also contributes to the resource budget.
+  No identity, signature, digest, rollback/recovery assertion or platform
+  coverage was removed. Timeout cleanup regression runs on every platform;
+  native Linux/Windows execution is by inspection on this macOS host.
+- #20/#64: test-count regenerated to 5,135; rebuilt daemon remains above 10 MiB
+  (exact byte count and final gate results in continuation-3 evidence).
+- #95: no negotiated RPC wait was introduced by private file verification.
+- Repeated merge-forward fetch still returns 5468dec1; original resolved merge
+  files are preserved and the orchestrator owns staging/commit. Detailed
+  timings, initial and final attempts, and the final gate verdict are in
+  docs/testing/v0.0.970/thinexe.md and thinexe-evidence/continuation-3/.
+
+- Final thinexe continuation-3 gate: workspace 5,618 summed passes, zero
+  failures, 13 unchanged ignores in 694.906014792s; strict workspace/tests
+  Clippy PASS 15.292936958s. Complete ENV LAW plus RUST_TEST_THREADS=2 retains
+  every assertion while avoiding independent-test oversubscription. Initial
+  autospawn and subsequent protected-OAuth polling failures remain recorded;
+  no protected file or threshold changed. Native 5/5 PASS, 603.651s, shell
+  173.097302s and npm 169.278014s; candidate T1 paths 171.446399917s and pinned
+  previous-release upgrade 35.947909291s PASS, no watchdog hit. Public 970
+  unpublished-asset 404 remains explicitly separate. Source baseline 5,135;
+  1,057-file final source manifest unchanged; formatter/diff checks PASS.

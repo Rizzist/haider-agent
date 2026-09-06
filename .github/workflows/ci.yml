@@ -57,11 +57,11 @@ jobs:
         run: bash scripts/release/tests/require-evidence-test.sh
       - name: self-test
         env:
-          # The CLI-only self-test embeds the same deep actor future that
-          # production haiderd runs on explicit 8 MiB Tokio workers.
+          # The CLI dispatches its offline actor self-test to the daemon and
+          # validates the matching TUI payload before reporting success.
           RUST_MIN_STACK: 8388608
         run: |
-          cargo build -p haider-cli --locked
+          cargo build -p haider-cli -p haider-daemond -p haider-tui-exe --locked
           ./target/debug/haider self-test | grep '"ok":true'
 
   test:

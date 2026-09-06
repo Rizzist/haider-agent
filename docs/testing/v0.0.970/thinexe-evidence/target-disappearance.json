@@ -1,0 +1,7 @@
+{
+  "observed": "Clippy failed creating target/debug/deps/rmetapoIGd0 with ENOENT; afterward debug siblings, target/release and target/thinexe-merge were absent",
+  "cause": "unknown; no lane command requested deletion",
+  "preserved": "source tree, evidence, /private/tmp/thinexe-before and /private/tmp/thinexe-after",
+  "replacement_merge_checkout": "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/merged-checkout",
+  "merged_base": "229122b552e6c1583cf930b47923bb05e2ab0def"
+}

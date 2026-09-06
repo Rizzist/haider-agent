@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "/Users/rizzist/haider-run/lane-970-thinexe/target/debug/haider",
+    "--install-bundle",
+    "/Users/rizzist/haider-run/lane-970-thinexe/target/debug",
+    "/private/tmp/thnx-install-i23of1ef/bin"
+  ],
+  "exit_code": 0,
+  "timed_out": false,
+  "stdout": "",
+  "stderr": "",
+  "profile_created": false
+}

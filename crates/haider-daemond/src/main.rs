@@ -21,6 +21,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod client_self_test;
 mod telemetry;
 
 /// TEST-ONLY seam, OFF by default (W3c3 M3).
@@ -157,6 +158,33 @@ fn prepare_dispatch() -> Result<Option<ParsedArgs>, ExitCode> {
     if matches!(args.as_slice(), [argument] if argument == "--version") {
         println!("haiderd {}", env!("CARGO_PKG_VERSION"));
         return Ok(None);
+    }
+    if matches!(args.as_slice(), [argument] if argument == "--client-self-test")
+        || matches!(args.as_slice(), [argument, flag, _] if argument == "--client-self-test" && flag == "--payload")
+    {
+        let payload = args.get(2).map(std::path::PathBuf::from);
+        let launched = std::thread::Builder::new()
+            .name("haider-self-test".into())
+            .stack_size(DAEMON_THREAD_STACK_BYTES)
+            .spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(client_self_test::self_test(payload)),
+                    Err(error) => {
+                        eprintln!("haider self-test: runtime failed: {error}");
+                        ExitCode::from(EX_SOFTWARE)
+                    }
+                }
+            });
+        return match launched {
+            Ok(thread) => Err(thread.join().unwrap_or(ExitCode::from(EX_SOFTWARE))),
+            Err(error) => {
+                eprintln!("haider self-test: thread failed: {error}");
+                Err(ExitCode::from(EX_SOFTWARE))
+            }
+        };
     }
     let parsed = match parse_args(args.into_iter()) {
         Ok(parsed) => parsed,

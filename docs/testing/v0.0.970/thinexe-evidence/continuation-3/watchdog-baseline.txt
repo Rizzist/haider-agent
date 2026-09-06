@@ -1,0 +1,29 @@
+Direct baseline execution (existing debug binary, before concurrency rebuild):
+/private/tmp/haider-thinexe-target/debug/haider --install-bundle /private/tmp/haider-thinexe-target/debug <unique temporary install directory>
+Elapsed monotonic: 175.24119245808106 seconds; exit 0; no stdout/stderr; no retry loop.
+Directory included required thin/payload/daemon plus optional Wayland portal.
+Observed progression: private extracted files -> immutable staged members -> canonical published members with transaction marker -> success/marker removal.
+A 120-second whole-fixture timeout therefore interrupted a progressing successful install.
+
+Standalone SHA-256 benchmark linked to existing sha2-0.10.9 a7e9108f23c53ace artifact:
+haider bytes=68787648 elapsed=1.997s
+haider-tui bytes=95756464 elapsed=2.795s
+haiderd bytes=203235680 elapsed=7.342s
+One sum=12.134s for 367779792 bytes. This standalone dependency-artifact benchmark is exploratory, not the exact production-function timing and not evidence of the baseline process binary identity.
+Fresh installation performs SEVEN full-member digest passes: source/copy two, freeze one, immutable after stage one, immutable at transaction entry one, installed canonical one, finalization canonical one (finalize -> verify_target_pair -> matches_target). Existing-install backup hashing adds a pass of old members. An independent verifier corrected the initial six-pass count by identifying finalization.
+Other existing debug sha2 artifact 6aa72feff8137f5b: thin 69054128 bytes in 4.665s; linker/profile matters.
+
+Native process sample was denied by OS privileges; no elevated execution attempted.
+
+Production verifier function calibration, linked to haider_cli-8b34b031a45cc7ce.rlib (public staging functions), measured under overlapping host/build work:
+haiderd hash 13.601s; signature 0.299s; smoke --version 0.015s
+haider-tui hash 6.418s; signature 0.145s; smoke --version 1.646s
+haider hash 4.680s; signature 0.106s; smoke --version + actual self-test 1.845s
+Measured sum of one hash call per member = 24.699s; seven such passes extrapolate 172.893s. This is calibrated work-cost arithmetic, NOT an exact attribution or reconstructed wall-time sum for the separate baseline run: host load, binary bytes, linker profiles, filesystem cache, and concurrency differ between observations. Signature/smoke calls were much shorter than hash calls in this calibration. The no-deadline baseline independently passed in 175.241s without retry. Repeated debug SHA-256 hashing is the observed expensive mechanism; no retry stall is needed to explain the obsolete 120-second cap.
+
+Identity/provenance limits:
+The initial standalone benchmark recorded these source-file SHA-256 values before later rebuilds:
+haider (68787648 bytes): ac83557be927d1c3b3b872b42a228e18268db8d398076525a219f95eb363b16f
+haider-tui (95756464 bytes): dbdafbabd23a6079aa8097582f04e85887c7894f019b19f33bebc60010cc82e0
+haiderd (203235680 bytes): 82be75a325899df6287141ee9144d5e53d859a98d38e47accee9df9a37aadb55
+These hashes are NOT a retained atomic manifest of the baseline process image or its installed source bundle. The baseline source directory was also used by overlapping focused builds; a staged directory listing later showed a 69054128-byte thin executable. The temporary installation was removed on successful completion, so exact staged final digests were not retained. The later production-function calibration used subsequently rebuilt files and does not establish baseline-byte identity.

@@ -3,7 +3,7 @@
 //! flag vocabulary, feature preconditions, and the provider/model selector.
 #![allow(dead_code)]
 
-#[path = "../src/main.rs"]
+#[path = "../src/lib.rs"]
 mod cli_main;
 
 use cli_main::models::{auth_state, availability_name};

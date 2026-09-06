@@ -1,0 +1,3 @@
+t1.install.paths PASS 171.44639991701115
+{'label': 'install_paths', 'status': 'PASS', 'evidence_line': 'installer_exit=0 scratch_home=true prefix=/private/tmp/haider-probe-qa-hmzspx37/install-prefix/bin pair_present=true version=0.0.970 ready_exit=0 status_ready=true daemon_pid=53257 stop=stopped_cleanly pid_gone=true', 'artefacts': []}
+{'label': 'no_orphan_daemons', 'status': 'PASS', 'evidence_line': 'no_orphan_daemons pids=53257 stop=not_running alive_after=false', 'artefacts': []}

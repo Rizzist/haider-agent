@@ -56,7 +56,7 @@ jobs:
           # Journal rows are msgpack blobs since v0.0.931; without the module
           # the reader skips every row.
           python3 -m pip install --break-system-packages msgpack
-          cargo build --profile ci -p haider-cli -p haider-daemond --locked
+          cargo build --profile ci -p haider-cli -p haider-daemond -p haider-tui-exe --locked
           NO_COLOR=1 CLICOLOR=0 HAIDER_TEST_DEVICE_NAME=test-mac \
             scripts/tui-probes/ladder.sh \
               "$GITHUB_WORKSPACE/target/ci/haider" \
@@ -151,7 +151,7 @@ jobs:
           HAIDER_DISCOVERY_DISABLED: 1
           HAIDER_TEST_DEVICE_NAME: test-mac
         run: |
-          cargo build --release -p haider-cli -p haider-daemond --locked
+          cargo build --release -p haider-cli -p haider-daemond -p haider-tui-exe --locked
           test "$(stat -f %z target/release/haiderd)" -gt 10485760
       - name: calibrate and enforce settled client footprint budgets (N=5)
         run: |

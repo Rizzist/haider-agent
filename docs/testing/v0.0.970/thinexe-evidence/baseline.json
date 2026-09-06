@@ -1,0 +1,19 @@
+{
+  "commit": "14750e312a0189caba3420a5ff845ae7aba50abf",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "build_command": "RUST_MIN_STACK=8388608 HAIDER_DISCOVERY_DISABLED=1 HAIDER_TEST_DEVICE_NAME=test-mac CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo build --release --locked -p haider-cli -p haider-daemond",
+  "build_exit": 0,
+  "build_elapsed": "38m35s",
+  "files": {
+    "haider": {
+      "bytes": 35543584,
+      "sha256": "352bbde7010f0a9e80e91aa134f34c28602f9fa6cc1f7898058ed9b0bca0c566",
+      "version": "haider 0.0.969"
+    },
+    "haiderd": {
+      "bytes": 55365968,
+      "sha256": "ae892f70a8191758f1b9c449e7522dd1a73b3b29ad62b2a8a1b380cd1c36464d",
+      "version": "haiderd 0.0.969"
+    }
+  }
+}

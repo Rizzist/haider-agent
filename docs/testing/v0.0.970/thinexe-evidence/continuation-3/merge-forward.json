@@ -1,0 +1,9 @@
+{
+  "checked_at_utc": "2026-09-06T08:37:57.630798+00:00",
+  "remote_fetch": "success in existing writable temporary checkout; original metadata EPERM",
+  "remote_wave": "5468dec1fd4d7b09c2f704d5d408c3f9e19a4374",
+  "original_merge_head": "5468dec1fd4d7b09c2f704d5d408c3f9e19a4374",
+  "incoming_delta": [],
+  "packaging_installers_present": false,
+  "resolution": "temporary merge source conflicts replaced by existing resolved working files; original index remains orchestrator-owned"
+}

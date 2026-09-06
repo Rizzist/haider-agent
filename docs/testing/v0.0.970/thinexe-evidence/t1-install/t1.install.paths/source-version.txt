@@ -1,0 +1,5 @@
+argv=['/Users/rizzist/haider-run/lane-970-thinexe/target/release/haider', '--version']
+returncode=0 timed_out=False wall_ms=750
+--- stdout ---
+haider 0.0.970
+--- stderr ---

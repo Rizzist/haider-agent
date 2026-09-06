@@ -1,0 +1,65 @@
+   Compiling rustix v1.1.4
+    Checking x11rb-protocol v0.13.2
+    Checking haider-protocol v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-protocol)
+    Checking haider-platform v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-platform)
+    Checking tempfile v3.27.0
+    Checking haider-accounts v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-accounts)
+    Checking haider-provider v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-provider)
+    Checking haider-client v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-client)
+    Checking crossterm v0.29.0
+    Checking ratatui-crossterm v0.1.2
+    Checking ratatui v0.30.2
+    Checking ratatui-image v11.0.6
+    Checking haider-stt v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-stt)
+    Checking haider-tools v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-tools)
+    Checking haider-tui v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-tui)
+    Checking haider-store v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-store)
+    Checking haider-cli v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli)
+    Checking haider-core v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-core)
+    Checking gethostname v1.1.0
+    Checking x11rb v0.13.2
+    Checking haider-daemon v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-daemon)
+    Checking haider-tui-exe v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-tui-exe)
+error[E0432]: unresolved import `super::super::discovery::CurlRequestObservation`
+  --> crates/haider-tui-exe/src/update/tui_tests.rs:5:5
+   |
+ 5 |     CurlRequestObservation, CurlTransport, ReleaseSource, UPDATE_CHECK_EXIT_BUDGET, UpdateTransport,
+   |     ^^^^^^^^^^^^^^^^^^^^^^ no `CurlRequestObservation` in `update::discovery`
+   |
+note: found an item that was configured out
+  --> crates/haider-cli/src/update/discovery.rs:28:10
+   |
+26 | #[cfg(test)]
+   |       ---- the item is gated here
+27 | #[derive(Debug, PartialEq, Eq)]
+28 | pub enum CurlRequestObservation {
+   |          ^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no function or associated item named `without_token` found for struct `CurlTransport` in the current scope
+  --> crates/haider-tui-exe/src/update/tui_tests.rs:80:52
+   |
+80 |                 let mut transport = CurlTransport::without_token()
+   |                                                    ^^^^^^^^^^^^^ function or associated item not found in `CurlTransport`
+   |
+note: if you're trying to build a new `CurlTransport`, consider using `CurlTransport::from_environment` which returns `CurlTransport`
+  --> crates/haider-cli/src/update/discovery.rs:82:5
+   |
+82 |     pub fn from_environment() -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no function or associated item named `without_token` found for struct `CurlTransport` in the current scope
+   --> crates/haider-tui-exe/src/update/tui_tests.rs:190:40
+    |
+190 |     let mut transport = CurlTransport::without_token()
+    |                                        ^^^^^^^^^^^^^ function or associated item not found in `CurlTransport`
+    |
+note: if you're trying to build a new `CurlTransport`, consider using `CurlTransport::from_environment` which returns `CurlTransport`
+   --> crates/haider-cli/src/update/discovery.rs:82:5
+    |
+ 82 |     pub fn from_environment() -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Some errors have detailed explanations: E0432, E0599.
+For more information about an error, try `rustc --explain E0432`.
+error: could not compile `haider-tui-exe` (bin "haider-tui" test) due to 3 previous errors
+warning: build failed, waiting for other jobs to finish...

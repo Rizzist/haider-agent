@@ -1,0 +1,21 @@
+{
+  "archive": "haider-v0.0.970-aarch64-apple-darwin-split.tar.xz",
+  "archive_sha256": "12c153d6265f0906dd97679fd5f5f733709e862262a1857fa3b2d0fce9a8aca1",
+  "members": [
+    {
+      "name": "haider-v0.0.970-aarch64-apple-darwin-split/haider",
+      "size": 69006688,
+      "sha256": "be5b72d4514193ec0ed1f11e0facf35d5edfe7b604cfc6ca40fc2553394542bd"
+    },
+    {
+      "name": "haider-v0.0.970-aarch64-apple-darwin-split/haider-tui",
+      "size": 95949344,
+      "sha256": "97c1bb368188e3b7951a07958ad40f43b688b3f6eb2d7eb10adf69b943585b62"
+    },
+    {
+      "name": "haider-v0.0.970-aarch64-apple-darwin-split/haiderd",
+      "size": 203235680,
+      "sha256": "82be75a325899df6287141ee9144d5e53d859a98d38e47accee9df9a37aadb55"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+historical updater failed exit=70: haider update: active turns on this profile may be cancelled by drain; daemons for other profiles are outside this update and are not restarted
+haider update: daemon disconnected without a drain notice; recovery assets remain
+
+FAIL: docs/testing/v0.0.970/thinexe-evidence/legacy-upgrade.json

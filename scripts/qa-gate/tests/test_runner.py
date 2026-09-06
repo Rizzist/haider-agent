@@ -198,7 +198,7 @@ class LoaderContractTests(unittest.TestCase):
             "t0.tui.three_door_parity": 5_332_500,
             "t1.daemon.kill9_midturn": 751_000,
             "t1.daemon.lifecycle_triad": 298_000,
-            "t1.install.paths": 408_000,
+            "t1.install.paths": 2_560_000,
             "t1.store.previous_release_upgrade": 901_000,
             "t1.turn.one_shot_budget": 3_384_000,
             "t1.turn.wall_budget": 6_142_000,
@@ -210,7 +210,7 @@ class LoaderContractTests(unittest.TestCase):
         self.assertEqual(
             {check.id: check.budget.milliseconds for check in checks}, expected
         )
-        self.assertEqual(sum(check.budget.milliseconds for check in checks), 29_892_500)
+        self.assertEqual(sum(check.budget.milliseconds for check in checks), 32_044_500)
         by_id = {check.id: check for check in checks}
         for check_id in (
             "t0.budget.max_cost_binds_before_request",

@@ -1,46 +1,56 @@
-//! Durable two-path commit, rollback, and crash recovery.
+//! Durable executable-bundle commit, rollback, and v1/v2 crash recovery.
 
 use super::UpdateError;
-use super::staging::{VerifiedStagedPair, bounded_command_output, sha256_file, sync_dir};
+use super::members::{ALL_BUNDLE_MEMBERS, BUNDLE_MEMBERS, BundleMember};
+use super::staging::{
+    StageVerifier, SystemStageVerifier, VerifiedStagedPair, bounded_command_output, sha256_file,
+    sync_dir,
+};
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LOCK_NAME: &str = ".haider-update.lock";
 const MARKER_NAME: &str = ".haider-update-transaction.json";
-const CODESIGN: &str = "/usr/bin/codesign";
 
 #[derive(Debug, Clone)]
-pub(crate) struct InstallLayout {
+pub struct InstallLayout {
     pub dir: PathBuf,
     pub haider: PathBuf,
     pub haiderd: PathBuf,
+    pub haider_tui: PathBuf,
+    pub wayland_portal: PathBuf,
 }
 
 impl InstallLayout {
     pub fn running() -> Result<Self, UpdateError> {
-        let haider = std::env::current_exe()
+        let running = std::env::current_exe()
             .map_err(|error| UpdateError::io("resolve running executable", error))?;
-        if haider.file_name().and_then(|name| name.to_str()) != Some("haider") {
+        Self::from_executable(&running)
+    }
+
+    fn from_executable(running: &Path) -> Result<Self, UpdateError> {
+        if ![BundleMember::Cli.file_name(), BundleMember::Tui.file_name()].contains(
+            &running
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default(),
+        ) {
             return Err(UpdateError::Refused(format!(
-                "running executable is not an expected `haider` installation: {}",
-                haider.display()
+                "running executable is not an expected haider installation: {}",
+                running.display()
             )));
         }
-        let dir = haider
+        let dir = running
             .parent()
             .ok_or_else(|| {
                 UpdateError::Refused("running executable has no install directory".into())
             })?
             .to_path_buf();
-        let layout = Self {
-            haider,
-            haiderd: dir.join("haiderd"),
-            dir,
-        };
+        let layout = Self::in_directory(dir);
         if layout.dir.join(MARKER_NAME).exists() {
             layout.validate_for_recovery()?;
         } else {
@@ -49,11 +59,39 @@ impl InstallLayout {
         Ok(layout)
     }
 
+    fn in_directory(dir: PathBuf) -> Self {
+        Self {
+            haider: dir.join(BundleMember::Cli.file_name()),
+            haiderd: dir.join(BundleMember::Daemon.file_name()),
+            haider_tui: dir.join(BundleMember::Tui.file_name()),
+            wayland_portal: dir.join(BundleMember::WaylandPortal.file_name()),
+            dir,
+        }
+    }
+
+    pub fn path(&self, member: BundleMember) -> &Path {
+        match member {
+            BundleMember::Daemon => &self.haiderd,
+            BundleMember::Tui => &self.haider_tui,
+            BundleMember::Cli => &self.haider,
+            BundleMember::WaylandPortal => &self.wayland_portal,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), UpdateError> {
         self.validate_for_recovery()?;
-        for (path, name) in [(&self.haider, "haider"), (&self.haiderd, "haiderd")] {
-            let metadata = fs::metadata(path)
-                .map_err(|error| UpdateError::io("inspect installed binary link count", error))?;
+        let cli_present = installed_metadata(&self.haider, BundleMember::Cli)?.is_some();
+        let daemon_present = installed_metadata(&self.haiderd, BundleMember::Daemon)?.is_some();
+        let tui_present = installed_metadata(&self.haider_tui, BundleMember::Tui)?.is_some();
+        if cli_present != daemon_present || (!cli_present && tui_present) {
+            return Err(UpdateError::Refused("installation is incomplete: CLI and daemon must both exist, or the entire bundle must be absent".into()));
+        }
+        for member in ALL_BUNDLE_MEMBERS {
+            let path = self.path(member);
+            let name = member.name();
+            let Some(metadata) = installed_metadata(path, member)? else {
+                continue;
+            };
             if haider_platform::metadata_mode(&metadata) & 0o200 == 0 {
                 return Err(UpdateError::Refused(format!(
                     "installed `{name}` is read-only"
@@ -70,19 +108,49 @@ impl InstallLayout {
 
     fn validate_for_recovery(&self) -> Result<(), UpdateError> {
         validate_real_directory(&self.dir)?;
-        validate_recoverable_binary(&self.haider, "haider")?;
-        validate_recoverable_binary(&self.haiderd, "haiderd")?;
+        for member in ALL_BUNDLE_MEMBERS {
+            if installed_metadata(self.path(member), member)?.is_some() {
+                validate_recoverable_binary(self.path(member), member.name())?;
+            }
+        }
         Ok(())
+    }
+
+    /// A fresh directory is admitted only when all executable paths are absent;
+    /// an existing historic pair may omit only the new payload.
+    pub fn for_install_directory(dir: PathBuf) -> Result<Self, UpdateError> {
+        let layout = Self::in_directory(dir);
+        if layout.dir.join(MARKER_NAME).exists() {
+            layout.validate_for_recovery()?;
+        } else {
+            layout.validate()?;
+        }
+        Ok(layout)
     }
 
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn for_test(dir: PathBuf) -> Self {
-        Self {
-            haider: dir.join("haider"),
-            haiderd: dir.join("haiderd"),
-            dir,
-        }
+        Self::in_directory(dir)
+    }
+
+    #[cfg(test)]
+    pub fn from_executable_for_test(running: &Path) -> Result<Self, UpdateError> {
+        Self::from_executable(running)
+    }
+}
+
+/// The first migration starts from the historic CLI/daemon pair. Absence of
+/// its new payload is recorded explicitly in v2 and restored as absence on
+/// rollback. Existing payloads still receive every ownership/link/mode check.
+fn installed_metadata(
+    path: &Path,
+    _member: BundleMember,
+) -> Result<Option<fs::Metadata>, UpdateError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(UpdateError::io("inspect installed binary", error)),
     }
 }
 
@@ -142,7 +210,7 @@ impl Drop for UpdateLock {
     }
 }
 
-pub(crate) struct PreparedTransaction {
+pub struct PreparedTransaction {
     layout: InstallLayout,
     _lock: UpdateLock,
 }
@@ -216,22 +284,28 @@ impl PreparedTransaction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CommitBoundary {
+pub enum CommitBoundary {
     BackupDaemon,
+    BackupTui,
+    BackupPortal,
     BackupCli,
     RenameDaemon,
+    RenameTui,
+    RenamePortal,
     RenameCli,
     ChmodDaemon,
+    ChmodTui,
+    ChmodPortal,
     ChmodCli,
     InstallDirFsync,
     InstalledPairVerify,
 }
 
-pub(crate) trait FaultInjector {
+pub trait FaultInjector {
     fn after(&self, boundary: CommitBoundary) -> Result<(), UpdateError>;
 }
 
-pub(crate) struct NoFaults;
+pub struct NoFaults;
 
 impl FaultInjector for NoFaults {
     fn after(&self, _boundary: CommitBoundary) -> Result<(), UpdateError> {
@@ -239,58 +313,52 @@ impl FaultInjector for NoFaults {
     }
 }
 
-pub(crate) trait InstalledPairVerifier {
+pub trait InstalledPairVerifier {
     fn verify(&self, layout: &InstallLayout, pair: &VerifiedStagedPair) -> Result<(), UpdateError>;
 }
 
-pub(crate) struct SystemInstalledPairVerifier;
+pub struct SystemInstalledPairVerifier;
 
 impl InstalledPairVerifier for SystemInstalledPairVerifier {
     fn verify(&self, layout: &InstallLayout, pair: &VerifiedStagedPair) -> Result<(), UpdateError> {
-        if sha256_file(&layout.haider)? != pair.haider_digest()
-            || sha256_file(&layout.haiderd)? != pair.haiderd_digest()
-        {
-            return Err(UpdateError::Refused(
-                "canonical binaries do not match the verified staged pair".into(),
-            ));
-        }
-        for binary in [&layout.haider, &layout.haiderd] {
-            let status = Command::new(CODESIGN)
-                .args(["--verify", "--strict"])
-                .arg(binary)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map_err(|error| UpdateError::io("verify installed signature", error))?;
-            if !status.success() {
-                return Err(UpdateError::Refused(
-                    "installed signature verification failed".into(),
-                ));
+        for member in pair.members() {
+            let binary = layout.path(member);
+            let name = member.name();
+            if sha256_file(binary)? != pair.digest(member) {
+                return Err(UpdateError::Refused(format!(
+                    "canonical {name} does not match its verified staged digest"
+                )));
             }
-        }
-        let version = bounded_command_output(
-            Command::new(&layout.haider).arg("--version"),
-            4096,
-            "verify installed haider version",
-        )?;
-        if version != format!("haider {}\n", pair.version()).as_bytes() {
-            return Err(UpdateError::Refused(
-                "installed haider version does not match the target".into(),
-            ));
+            SystemStageVerifier.verify_signature(binary)?;
+            let version = bounded_command_output(
+                Command::new(binary).arg("--version"),
+                4096,
+                "verify installed executable version",
+            )?;
+            if version != format!("{name} {}\n", pair.version()).as_bytes() {
+                return Err(UpdateError::Refused(format!(
+                    "installed {name} version does not match the target"
+                )));
+            }
         }
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TransactionPhase {
+pub enum TransactionPhase {
     Prepared,
     BackupDaemon,
+    BackupTui,
+    BackupPortal,
     BackupsReady,
     DaemonInstalled,
+    TuiInstalled,
+    PortalInstalled,
     PairInstalled,
     DaemonWritable,
+    TuiWritable,
+    PortalWritable,
     PairWritable,
     PairSynced,
     PairVerified,
@@ -307,10 +375,16 @@ impl TransactionPhase {
         match self {
             Self::Prepared => "prepared",
             Self::BackupDaemon => "backup_daemon",
+            Self::BackupTui => "backup_tui",
+            Self::BackupPortal => "backup_portal",
             Self::BackupsReady => "backups_ready",
             Self::DaemonInstalled => "daemon_installed",
+            Self::TuiInstalled => "tui_installed",
+            Self::PortalInstalled => "portal_installed",
             Self::PairInstalled => "pair_installed",
             Self::DaemonWritable => "daemon_writable",
+            Self::TuiWritable => "tui_writable",
+            Self::PortalWritable => "portal_writable",
             Self::PairWritable => "pair_writable",
             Self::PairSynced => "pair_synced",
             Self::PairVerified => "pair_verified",
@@ -327,10 +401,16 @@ impl TransactionPhase {
         Some(match value {
             "prepared" => Self::Prepared,
             "backup_daemon" => Self::BackupDaemon,
+            "backup_tui" => Self::BackupTui,
+            "backup_portal" => Self::BackupPortal,
             "backups_ready" => Self::BackupsReady,
             "daemon_installed" => Self::DaemonInstalled,
+            "tui_installed" => Self::TuiInstalled,
+            "portal_installed" => Self::PortalInstalled,
             "pair_installed" => Self::PairInstalled,
             "daemon_writable" => Self::DaemonWritable,
+            "tui_writable" => Self::TuiWritable,
+            "portal_writable" => Self::PortalWritable,
             "pair_writable" => Self::PairWritable,
             "pair_synced" => Self::PairSynced,
             "pair_verified" => Self::PairVerified,
@@ -346,21 +426,53 @@ impl TransactionPhase {
 }
 
 #[derive(Debug, Clone)]
+struct MarkerMember {
+    member: BundleMember,
+    old_digest: Option<String>,
+    target_digest: String,
+    backup: String,
+}
+
+#[derive(Debug, Clone)]
 struct Marker {
+    legacy: bool,
     transaction_id: String,
     old_version: String,
     target_version: String,
-    old_haider_digest: String,
-    old_haiderd_digest: String,
-    target_haider_digest: String,
-    target_haiderd_digest: String,
     source_archive_digest: String,
-    backup_haider: String,
-    backup_haiderd: String,
+    members: Vec<MarkerMember>,
     phase: TransactionPhase,
 }
 
-pub(crate) struct CommittedUpdate {
+impl Marker {
+    fn matches_target(&self, layout: &InstallLayout) -> bool {
+        self.members.iter().all(|entry| {
+            sha256_file(layout.path(entry.member)).is_ok_and(|hash| hash == entry.target_digest)
+        })
+    }
+
+    fn matches_old(&self, layout: &InstallLayout) -> bool {
+        self.members.iter().all(|entry| match &entry.old_digest {
+            Some(digest) => {
+                sha256_file(layout.path(entry.member)).is_ok_and(|hash| hash == *digest)
+            }
+            None => fs::symlink_metadata(layout.path(entry.member))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        })
+    }
+
+    fn remove_backups(&self, layout: &InstallLayout) -> Result<(), UpdateError> {
+        for entry in &self.members {
+            remove_if_exists(
+                &layout.dir.join(&entry.backup),
+                "remove update recovery backup",
+            )?;
+        }
+        sync_dir(&layout.dir)
+    }
+}
+
+pub struct CommittedUpdate {
     layout: InstallLayout,
     marker: Marker,
     _lock: UpdateLock,
@@ -379,16 +491,14 @@ impl CommittedUpdate {
         &self.marker.old_version
     }
 
-    /// Re-reads both live paths. Restart calls this as its first operation,
+    /// Re-reads every live bundle member. Restart calls this as its first operation,
     /// making entry impossible for a one-swap or failed-verification state.
     pub fn verify_target_pair(&self) -> Result<(), UpdateError> {
-        if sha256_file(&self.layout.haider)? == self.marker.target_haider_digest
-            && sha256_file(&self.layout.haiderd)? == self.marker.target_haiderd_digest
-        {
+        if self.marker.matches_target(&self.layout) {
             Ok(())
         } else {
             Err(UpdateError::Internal(
-                "restart entry did not observe the exact verified target pair".into(),
+                "restart entry did not observe the exact verified target bundle".into(),
             ))
         }
     }
@@ -398,7 +508,7 @@ impl CommittedUpdate {
         write_marker(&self.layout, &self.marker)
     }
 
-    /// Restores both old hard-linked inodes by rename.
+    /// Restores old hard-linked inodes and any recorded payload absence.
     ///
     /// MUTATION SAFETY: runtime failures retain the marker and any remaining
     /// backup. Success fsyncs the exact old pair before removing the marker.
@@ -409,7 +519,7 @@ impl CommittedUpdate {
 
     /// Commits health success through a durable finalizing phase.
     ///
-    /// MUTATION SAFETY: recovery recognizes this phase only when both
+    /// MUTATION SAFETY: recovery recognizes this phase only when all
     /// canonical paths still match the target digests, and can finish deleting
     /// any remaining backups before removing the marker. Thus no crash window
     /// leaves anonymous hard links that poison a later layout validation.
@@ -417,20 +527,7 @@ impl CommittedUpdate {
         self.verify_target_pair()?;
         self.set_phase(TransactionPhase::Finalizing)?;
         let marker_path = self.layout.dir.join(MARKER_NAME);
-        for backup in [
-            self.marker.backup_haiderd.clone(),
-            self.marker.backup_haider.clone(),
-        ] {
-            let path = self.layout.dir.join(backup);
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(UpdateError::io("remove successful update backup", error));
-                }
-            }
-        }
-        sync_dir(&self.layout.dir)?;
+        self.marker.remove_backups(&self.layout)?;
         fs::remove_file(&marker_path)
             .map_err(|error| UpdateError::io("remove successful update marker", error))?;
         sync_dir(&self.layout.dir)?;
@@ -441,17 +538,18 @@ impl CommittedUpdate {
     #[allow(dead_code)]
     pub fn recovery_assets_exist(&self) -> bool {
         self.layout.dir.join(MARKER_NAME).exists()
-            && self.layout.dir.join(&self.marker.backup_haider).exists()
-            && self.layout.dir.join(&self.marker.backup_haiderd).exists()
+            && self.marker.members.iter().all(|entry| {
+                entry.old_digest.is_none() || self.layout.dir.join(&entry.backup).exists()
+            })
     }
 }
 
-/// Performs the daemon-first, CLI-second rename transaction.
+/// Publishes daemon, payload, then CLI using one descriptor-driven transaction.
 ///
 /// MUTATION SAFETY: every runtime failure before restart calls rollback while
 /// the old daemon remains unsignaled. Each named durability boundary invokes
 /// the fault hook only after its operation and marker are durable.
-pub(crate) fn commit_pair<F: FaultInjector, V: InstalledPairVerifier>(
+pub fn commit_pair<F: FaultInjector, V: InstalledPairVerifier>(
     prepared: PreparedTransaction,
     pair: VerifiedStagedPair,
     faults: &F,
@@ -463,54 +561,116 @@ pub(crate) fn commit_pair<F: FaultInjector, V: InstalledPairVerifier>(
     // canonical path and rely on post-swap rollback for detection.
     pair.verify_immutable()?;
     let PreparedTransaction { layout, _lock } = prepared;
+    // Keep an existing install's access policy, including a newly introduced
+    // payload alongside an owner-only historic CLI. Fresh package installs
+    // retain the installers' public executable mode. Private staging, lock
+    // and marker permissions are independent of these canonical file modes.
+    let new_member_mode = installed_metadata(&layout.haider, BundleMember::Cli)?
+        .map_or(0o755, |metadata| {
+            haider_platform::metadata_mode(&metadata) & 0o777
+        });
+    let publication_modes = pair
+        .members()
+        .map(|member| {
+            let mode = installed_metadata(layout.path(member), member)?
+                .map_or(new_member_mode, |metadata| {
+                    haider_platform::metadata_mode(&metadata) & 0o777
+                });
+            Ok((member, mode))
+        })
+        .collect::<Result<Vec<_>, UpdateError>>()?;
     let transaction_id = transaction_id();
+    let members = pair
+        .members()
+        .map(|member| {
+            let old_digest = installed_metadata(layout.path(member), member)?
+                .map(|_| sha256_file(layout.path(member)))
+                .transpose()?;
+            Ok(MarkerMember {
+                member,
+                old_digest,
+                target_digest: pair.digest(member).to_owned(),
+                backup: format!("{}{transaction_id}", member.backup_prefix()),
+            })
+        })
+        .collect::<Result<Vec<_>, UpdateError>>()?;
     let mut marker = Marker {
-        transaction_id: transaction_id.clone(),
+        legacy: false,
+        transaction_id,
         old_version: old_version.to_owned(),
         target_version: pair.version().to_owned(),
-        old_haider_digest: sha256_file(&layout.haider)?,
-        old_haiderd_digest: sha256_file(&layout.haiderd)?,
-        target_haider_digest: pair.haider_digest().to_owned(),
-        target_haiderd_digest: pair.haiderd_digest().to_owned(),
         source_archive_digest: pair.source_digest().to_owned(),
-        backup_haider: format!(".haider-old-{transaction_id}"),
-        backup_haiderd: format!(".haiderd-old-{transaction_id}"),
+        members,
         phase: TransactionPhase::Prepared,
     };
     write_marker(&layout, &marker)?;
 
     let result = (|| {
-        make_backup(&layout.haiderd, &layout.dir.join(&marker.backup_haiderd))?;
-        marker.phase = TransactionPhase::BackupDaemon;
-        write_marker(&layout, &marker)?;
-        faults.after(CommitBoundary::BackupDaemon)?;
+        for member in pair.members() {
+            let entry = marker
+                .members
+                .iter()
+                .find(|entry| entry.member == member)
+                .ok_or_else(|| {
+                    UpdateError::Internal("verified member missing from transaction".into())
+                })?;
+            if entry.old_digest.is_some() {
+                make_backup(layout.path(member), &layout.dir.join(&entry.backup))?;
+            }
+            let (phase, boundary) = match member {
+                BundleMember::Daemon => {
+                    (TransactionPhase::BackupDaemon, CommitBoundary::BackupDaemon)
+                }
+                BundleMember::Tui => (TransactionPhase::BackupTui, CommitBoundary::BackupTui),
+                BundleMember::WaylandPortal => {
+                    (TransactionPhase::BackupPortal, CommitBoundary::BackupPortal)
+                }
+                BundleMember::Cli => (TransactionPhase::BackupsReady, CommitBoundary::BackupCli),
+            };
+            marker.phase = phase;
+            write_marker(&layout, &marker)?;
+            faults.after(boundary)?;
+        }
 
-        make_backup(&layout.haider, &layout.dir.join(&marker.backup_haider))?;
-        marker.phase = TransactionPhase::BackupsReady;
-        write_marker(&layout, &marker)?;
-        faults.after(CommitBoundary::BackupCli)?;
+        for member in pair.members() {
+            fs::rename(pair.path(member), layout.path(member)).map_err(|error| {
+                UpdateError::io("rename staged bundle executable into place", error)
+            })?;
+            let (phase, boundary) = match member {
+                BundleMember::Daemon => (
+                    TransactionPhase::DaemonInstalled,
+                    CommitBoundary::RenameDaemon,
+                ),
+                BundleMember::Tui => (TransactionPhase::TuiInstalled, CommitBoundary::RenameTui),
+                BundleMember::WaylandPortal => (
+                    TransactionPhase::PortalInstalled,
+                    CommitBoundary::RenamePortal,
+                ),
+                BundleMember::Cli => (TransactionPhase::PairInstalled, CommitBoundary::RenameCli),
+            };
+            marker.phase = phase;
+            write_marker(&layout, &marker)?;
+            faults.after(boundary)?;
+        }
 
-        fs::rename(pair.haiderd_path(), &layout.haiderd)
-            .map_err(|error| UpdateError::io("rename staged haiderd into place", error))?;
-        marker.phase = TransactionPhase::DaemonInstalled;
-        write_marker(&layout, &marker)?;
-        faults.after(CommitBoundary::RenameDaemon)?;
-
-        fs::rename(pair.haider_path(), &layout.haider)
-            .map_err(|error| UpdateError::io("rename staged haider into place", error))?;
-        marker.phase = TransactionPhase::PairInstalled;
-        write_marker(&layout, &marker)?;
-        faults.after(CommitBoundary::RenameCli)?;
-
-        make_owner_writable(&layout.haiderd)?;
-        marker.phase = TransactionPhase::DaemonWritable;
-        write_marker(&layout, &marker)?;
-        faults.after(CommitBoundary::ChmodDaemon)?;
-
-        make_owner_writable(&layout.haider)?;
-        marker.phase = TransactionPhase::PairWritable;
-        write_marker(&layout, &marker)?;
-        faults.after(CommitBoundary::ChmodCli)?;
+        for &(member, mode) in &publication_modes {
+            set_installed_mode(layout.path(member), mode)?;
+            let (phase, boundary) = match member {
+                BundleMember::Daemon => (
+                    TransactionPhase::DaemonWritable,
+                    CommitBoundary::ChmodDaemon,
+                ),
+                BundleMember::Tui => (TransactionPhase::TuiWritable, CommitBoundary::ChmodTui),
+                BundleMember::WaylandPortal => (
+                    TransactionPhase::PortalWritable,
+                    CommitBoundary::ChmodPortal,
+                ),
+                BundleMember::Cli => (TransactionPhase::PairWritable, CommitBoundary::ChmodCli),
+            };
+            marker.phase = phase;
+            write_marker(&layout, &marker)?;
+            faults.after(boundary)?;
+        }
 
         sync_dir(&layout.dir)?;
         marker.phase = TransactionPhase::PairSynced;
@@ -542,10 +702,12 @@ pub(crate) fn commit_pair<F: FaultInjector, V: InstalledPairVerifier>(
     })
 }
 
-fn make_owner_writable(path: &Path) -> Result<(), UpdateError> {
-    haider_platform::set_mode(path, 0o700)
+fn set_installed_mode(path: &Path, mode: u32) -> Result<(), UpdateError> {
+    haider_platform::set_mode(path, mode)
         .map_err(|error| UpdateError::io("make installed binary owner-writable", error))?;
-    File::open(path)
+    OpenOptions::new()
+        .write(true)
+        .open(path)
         .and_then(|file| file.sync_all())
         .map_err(|error| UpdateError::io("fsync installed binary permissions", error))
 }
@@ -553,6 +715,11 @@ fn make_owner_writable(path: &Path) -> Result<(), UpdateError> {
 fn make_backup(source: &Path, backup: &Path) -> Result<(), UpdateError> {
     fs::hard_link(source, backup)
         .map_err(|error| UpdateError::io("create same-filesystem binary backup", error))?;
+    // Existing backup bytes were already installed; Unix additionally flushes
+    // their inode here. Windows cannot obtain a writable flush handle to an
+    // executing image. Its directory-entry durability remains the documented
+    // platform sync_directory limitation, and needs native crash testing.
+    #[cfg(unix)]
     File::open(backup)
         .and_then(|file| file.sync_all())
         .map_err(|error| UpdateError::io("fsync binary backup", error))?;
@@ -560,48 +727,81 @@ fn make_backup(source: &Path, backup: &Path) -> Result<(), UpdateError> {
 }
 
 fn rollback_marker(layout: &InstallLayout, marker: &mut Marker) -> Result<(), UpdateError> {
-    // Validate both restore sources before the first rename. A corrupt second
-    // backup must not turn a recoverable new/new pair into daemon-old/CLI-new.
-    verify_restore_source(
-        &layout.haiderd,
-        &layout.dir.join(&marker.backup_haiderd),
-        &marker.old_haiderd_digest,
-    )?;
-    verify_restore_source(
-        &layout.haider,
-        &layout.dir.join(&marker.backup_haider),
-        &marker.old_haider_digest,
-    )?;
+    // Validate ALL restore sources before changing any canonical path. For a
+    // migrated payload that previously did not exist, only our exact target
+    // bytes may be removed; a changed file retains the marker for recovery.
+    for entry in &marker.members {
+        if let Some(old_digest) = &entry.old_digest {
+            verify_restore_source(
+                layout.path(entry.member),
+                &layout.dir.join(&entry.backup),
+                old_digest,
+            )?;
+        } else {
+            verify_new_member_removable(layout, entry)?;
+        }
+    }
     marker.phase = TransactionPhase::RollingBack;
     let _ = write_marker(layout, marker);
-    restore_one(
-        &layout.haiderd,
-        &layout.dir.join(&marker.backup_haiderd),
-        &marker.old_haiderd_digest,
-    )?;
-    restore_one(
-        &layout.haider,
-        &layout.dir.join(&marker.backup_haider),
-        &marker.old_haider_digest,
-    )?;
+    for entry in &marker.members {
+        if let Some(old_digest) = &entry.old_digest {
+            restore_one(
+                layout.path(entry.member),
+                &layout.dir.join(&entry.backup),
+                old_digest,
+            )?;
+        } else {
+            remove_installed_member(layout.path(entry.member))?;
+        }
+    }
     sync_dir(&layout.dir)?;
-    if sha256_file(&layout.haider)? != marker.old_haider_digest
-        || sha256_file(&layout.haiderd)? != marker.old_haiderd_digest
-    {
+    if !marker.matches_old(layout) {
         return Err(UpdateError::Internal(
-            "rollback did not restore the exact old binary pair".into(),
+            "rollback did not restore the exact old executable bundle".into(),
         ));
     }
+    // Backups are cleaned and synced while the marker still names them.
+    marker.remove_backups(layout)?;
     remove_if_exists(&layout.dir.join(MARKER_NAME), "remove rollback marker")?;
-    remove_if_exists(
-        &layout.dir.join(&marker.backup_haider),
-        "remove consumed CLI backup",
-    )?;
-    remove_if_exists(
-        &layout.dir.join(&marker.backup_haiderd),
-        "remove consumed daemon backup",
-    )?;
     sync_dir(&layout.dir)
+}
+
+fn remove_installed_member(path: &Path) -> Result<(), UpdateError> {
+    // Windows refuses deletion/replacement of a read-only staged file. This is
+    // called only after all recovery sources and introduced bytes are checked.
+    #[cfg(windows)]
+    if path.exists() {
+        set_installed_mode(path, 0o700)?;
+    }
+    remove_if_exists(path, "remove introduced executable during rollback")
+}
+
+fn verify_new_member_removable(
+    layout: &InstallLayout,
+    entry: &MarkerMember,
+) -> Result<(), UpdateError> {
+    let path = layout.path(entry.member);
+    if fs::symlink_metadata(layout.dir.join(&entry.backup)).is_ok() {
+        return Err(UpdateError::Internal(
+            "unexpected backup for a previously absent executable".into(),
+        ));
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(UpdateError::io("inspect introduced executable", error)),
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && haider_platform::metadata_is_current_user(&metadata)
+                && sha256_file(path)? == entry.target_digest =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(UpdateError::Internal(
+            "introduced executable no longer matches the transaction; recovery assets retained"
+                .into(),
+        )),
+    }
 }
 
 fn verify_restore_source(
@@ -646,6 +846,10 @@ fn restore_one(canonical: &Path, backup: &Path, expected: &str) -> Result<(), Up
                 backup.display()
             )));
         }
+        #[cfg(windows)]
+        if canonical.exists() {
+            set_installed_mode(canonical, 0o700)?;
+        }
         fs::rename(backup, canonical)
             .map_err(|error| UpdateError::io("restore binary backup by rename", error))?;
         return Ok(());
@@ -664,37 +868,11 @@ fn recover_pending(layout: &InstallLayout) -> Result<(), UpdateError> {
     let Some(mut marker) = read_marker(&marker_path)? else {
         return Ok(());
     };
-    if marker.phase == TransactionPhase::Finalizing {
-        let cli_target =
-            sha256_file(&layout.haider).is_ok_and(|hash| hash == marker.target_haider_digest);
-        let daemon_target =
-            sha256_file(&layout.haiderd).is_ok_and(|hash| hash == marker.target_haiderd_digest);
-        if cli_target && daemon_target {
-            remove_if_exists(
-                &layout.dir.join(&marker.backup_haider),
-                "finish successful CLI backup cleanup",
-            )?;
-            remove_if_exists(
-                &layout.dir.join(&marker.backup_haiderd),
-                "finish successful daemon backup cleanup",
-            )?;
-            remove_if_exists(&marker_path, "finish successful marker cleanup")?;
-            return sync_dir(&layout.dir);
-        }
-    }
-    let cli_old = sha256_file(&layout.haider).is_ok_and(|hash| hash == marker.old_haider_digest);
-    let daemon_old =
-        sha256_file(&layout.haiderd).is_ok_and(|hash| hash == marker.old_haiderd_digest);
-    if cli_old && daemon_old {
-        remove_if_exists(
-            &layout.dir.join(&marker.backup_haider),
-            "remove recovered CLI backup",
-        )?;
-        remove_if_exists(
-            &layout.dir.join(&marker.backup_haiderd),
-            "remove recovered daemon backup",
-        )?;
-        remove_if_exists(&marker_path, "remove recovered update marker")?;
+    if (marker.phase == TransactionPhase::Finalizing && marker.matches_target(layout))
+        || marker.matches_old(layout)
+    {
+        marker.remove_backups(layout)?;
+        remove_if_exists(&marker_path, "finish recovered update marker cleanup")?;
         return sync_dir(&layout.dir);
     }
     rollback_marker(layout, &mut marker)
@@ -705,20 +883,39 @@ fn write_marker(layout: &InstallLayout, marker: &Marker) -> Result<(), UpdateErr
     let part = layout
         .dir
         .join(format!(".{MARKER_NAME}.{}.part", marker.transaction_id));
-    let value = json!({
-        "schema": "haider.update.transaction.v1",
+    let mut value = json!({
+        "schema": if marker.legacy { "haider.update.transaction.v1" } else { "haider.update.transaction.v2" },
         "transaction_id": marker.transaction_id,
         "old_version": marker.old_version,
         "target_version": marker.target_version,
-        "old_haider_digest": marker.old_haider_digest,
-        "old_haiderd_digest": marker.old_haiderd_digest,
-        "target_haider_digest": marker.target_haider_digest,
-        "target_haiderd_digest": marker.target_haiderd_digest,
         "source_archive_digest": marker.source_archive_digest,
-        "backup_haider": marker.backup_haider,
-        "backup_haiderd": marker.backup_haiderd,
         "phase": marker.phase.as_str(),
     });
+    if marker.legacy {
+        // Preserve v1 if rollback itself crashes: historical two-member markers
+        // remain readable, and never acquire a fictitious payload dependency.
+        for entry in &marker.members {
+            let name = entry.member.name();
+            value[format!("old_{name}_digest")] = json!(entry.old_digest);
+            value[format!("target_{name}_digest")] = json!(entry.target_digest);
+            value[format!("backup_{name}")] = json!(entry.backup);
+        }
+    } else {
+        value["members"] = Value::Array(
+            marker
+                .members
+                .iter()
+                .map(|entry| {
+                    json!({
+                        "name": entry.member.name(),
+                        "old_digest": entry.old_digest,
+                        "target_digest": entry.target_digest,
+                        "backup": entry.backup,
+                    })
+                })
+                .collect(),
+        );
+    }
     let mut bytes = serde_json::to_vec(&value)
         .map_err(|error| UpdateError::Internal(format!("encode update marker: {error}")))?;
     bytes.push(b'\n');
@@ -766,11 +963,15 @@ fn read_marker(path: &Path) -> Result<Option<Marker>, UpdateError> {
     let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
         UpdateError::Internal(format!("invalid update recovery marker: {error}"))
     })?;
-    if value.get("schema").and_then(Value::as_str) != Some("haider.update.transaction.v1") {
-        return Err(UpdateError::Internal(
-            "unknown update recovery marker schema".into(),
-        ));
-    }
+    let legacy = match value.get("schema").and_then(Value::as_str) {
+        Some("haider.update.transaction.v1") => true,
+        Some("haider.update.transaction.v2") => false,
+        _ => {
+            return Err(UpdateError::Internal(
+                "unknown update recovery marker schema".into(),
+            ));
+        }
+    };
     let field = |name: &str| -> Result<String, UpdateError> {
         value
             .get(name)
@@ -778,15 +979,6 @@ fn read_marker(path: &Path) -> Result<Option<Marker>, UpdateError> {
             .map(str::to_owned)
             .ok_or_else(|| UpdateError::Internal(format!("update marker lacks `{name}`")))
     };
-    let backup_haider = field("backup_haider")?;
-    let backup_haiderd = field("backup_haiderd")?;
-    if !safe_backup_name(&backup_haider, ".haider-old-")
-        || !safe_backup_name(&backup_haiderd, ".haiderd-old-")
-    {
-        return Err(UpdateError::Internal(
-            "update marker contains an unsafe backup name".into(),
-        ));
-    }
     let phase_text = field("phase")?;
     let phase = TransactionPhase::parse(&phase_text)
         .ok_or_else(|| UpdateError::Internal("update marker has an unknown phase".into()))?;
@@ -801,17 +993,112 @@ fn read_marker(path: &Path) -> Result<Option<Marker>, UpdateError> {
             "update marker contains an unsafe transaction id".into(),
         ));
     }
+    let members = if legacy {
+        [BundleMember::Daemon, BundleMember::Cli]
+            .into_iter()
+            .map(|member| {
+                let name = member.name();
+                Ok(MarkerMember {
+                    member,
+                    old_digest: Some(digest_field(&field(&format!("old_{name}_digest"))?)?),
+                    target_digest: digest_field(&field(&format!("target_{name}_digest"))?)?,
+                    backup: field(&format!("backup_{name}"))?,
+                })
+            })
+            .collect::<Result<Vec<_>, UpdateError>>()?
+    } else {
+        let entries = value
+            .get("members")
+            .and_then(Value::as_array)
+            .ok_or_else(|| UpdateError::Internal("update marker lacks bundle members".into()))?;
+        if !(BUNDLE_MEMBERS.len()..=ALL_BUNDLE_MEMBERS.len()).contains(&entries.len()) {
+            return Err(UpdateError::Internal(
+                "update marker has incomplete bundle membership".into(),
+            ));
+        }
+        ALL_BUNDLE_MEMBERS
+            .into_iter()
+            .filter(|member| {
+                *member != BundleMember::WaylandPortal
+                    || entries.iter().any(|entry| {
+                        entry.get("name").and_then(Value::as_str) == Some(member.name())
+                    })
+            })
+            .map(|member| {
+                let matching = entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.get("name").and_then(Value::as_str) == Some(member.name())
+                    })
+                    .collect::<Vec<_>>();
+                if matching.len() != 1 {
+                    return Err(UpdateError::Internal(
+                        "update marker has missing or duplicate bundle members".into(),
+                    ));
+                }
+                let entry = matching[0];
+                let entry_field = |key: &str| {
+                    entry.get(key).and_then(Value::as_str).ok_or_else(|| {
+                        UpdateError::Internal(format!("update member lacks `{key}`"))
+                    })
+                };
+                let old_digest = match entry.get("old_digest") {
+                    Some(Value::Null) => None,
+                    Some(Value::String(value)) => Some(digest_field(value)?),
+                    _ => {
+                        return Err(UpdateError::Internal(
+                            "update member has invalid old digest".into(),
+                        ));
+                    }
+                };
+                Ok(MarkerMember {
+                    member,
+                    old_digest,
+                    target_digest: digest_field(entry_field("target_digest")?)?,
+                    backup: entry_field("backup")?.to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>, UpdateError>>()?
+    };
+    if !legacy && members.len() != value["members"].as_array().map_or(0, Vec::len) {
+        return Err(UpdateError::Internal(
+            "update marker contains unknown optional members".into(),
+        ));
+    }
+    if !legacy {
+        let cli_old = members
+            .iter()
+            .find(|entry| entry.member == BundleMember::Cli)
+            .is_some_and(|entry| entry.old_digest.is_some());
+        let daemon_old = members
+            .iter()
+            .find(|entry| entry.member == BundleMember::Daemon)
+            .is_some_and(|entry| entry.old_digest.is_some());
+        if cli_old != daemon_old
+            || (!cli_old
+                && members
+                    .iter()
+                    .any(|entry| entry.member == BundleMember::Tui && entry.old_digest.is_some()))
+        {
+            return Err(UpdateError::Internal(
+                "update marker records an incomplete old installation".into(),
+            ));
+        }
+    }
+    for entry in &members {
+        if !safe_backup_name(&entry.backup, &entry.member.backup_prefix()) {
+            return Err(UpdateError::Internal(
+                "update marker contains an unsafe backup name".into(),
+            ));
+        }
+    }
     let marker = Marker {
+        legacy,
         transaction_id,
         old_version: field("old_version")?,
         target_version: field("target_version")?,
-        old_haider_digest: digest_field(&field("old_haider_digest")?)?,
-        old_haiderd_digest: digest_field(&field("old_haiderd_digest")?)?,
-        target_haider_digest: digest_field(&field("target_haider_digest")?)?,
-        target_haiderd_digest: digest_field(&field("target_haiderd_digest")?)?,
         source_archive_digest: digest_field(&field("source_archive_digest")?)?,
-        backup_haider,
-        backup_haiderd,
+        members,
         phase,
     };
     Ok(Some(marker))
@@ -853,6 +1140,6 @@ fn transaction_id() -> String {
 
 #[cfg(test)]
 #[allow(dead_code)]
-pub(crate) fn marker_path(layout: &InstallLayout) -> PathBuf {
+pub fn marker_path(layout: &InstallLayout) -> PathBuf {
     layout.dir.join(MARKER_NAME)
 }

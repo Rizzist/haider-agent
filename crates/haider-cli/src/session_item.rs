@@ -3,6 +3,7 @@
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+use haider_client::notify::mask_text;
 use haider_client::{ObserveClient, ProfileEnv, resolve_profile};
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
@@ -10,7 +11,6 @@ use haider_protocol::history::NodeKind;
 use haider_protocol::ids::SessionId;
 use haider_protocol::pipe::{ToolExchangeJoin, TranscriptJoiner};
 use haider_protocol::tool::BoundedResult;
-use haider_tui::notify::mask_text;
 use serde_json::{Map, Value, json};
 
 use super::run::{EX_IOERR, EX_PROTOCOL, EX_UNAVAILABLE, EX_USAGE};

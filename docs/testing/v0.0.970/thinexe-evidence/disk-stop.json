@@ -1,0 +1,12 @@
+{
+  "observed_available_mib": 592,
+  "recovered_available_mib": 6508,
+  "stopped_sessions": [
+    47029,
+    73283,
+    56020,
+    80080
+  ],
+  "recovery_policy": "one build at a time, one Cargo job; preserve failed evidence",
+  "time": 1788661000.5272908
+}

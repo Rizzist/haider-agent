@@ -527,7 +527,7 @@ async fn spawn(
     if syntax.provider.is_some() && syntax.model.is_none() {
         syntax.model = Some("daemon-default".into());
     }
-    haider_tools::SpawnSubagent::from_tool_args(json!(&syntax))
+    haider_protocol::spawn_subagent::SpawnSubagentArguments::from_tool_args(json!(&syntax))
         .map_err(|error| Failure::new("invalid_argument", error, 2))?;
     let cwd = options
         .flag("--cwd")

@@ -26,7 +26,7 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}"
 export HAIDER_TEST_DEVICE_NAME=test-mac
 
 crates="haider-platform haider-protocol haider-accounts haider-core haider-pdf \
-haider-provider haider-daemon haider-daemond haider-rpc haider-tui haider-cli \
+haider-provider haider-daemon haider-daemond haider-rpc haider-tui haider-tui-exe haider-cli haider-compat \
 haider-store haider-tools haider-client haider-verify haider-stt xtask"
 
 log_dir="${HAIDER_CI_TEST_LOG_DIR:-target/ci-test-logs}"
@@ -122,6 +122,24 @@ run_capped() {
   return "$command_status"
 }
 
+# Build ordinary runtime siblings explicitly: `cargo test --no-run` can build
+# only a unit-test harness for a binary crate without integration tests, so it
+# does not prove that target/debug/haider-tui exists for subprocess fixtures.
+echo "::group::build runtime siblings"
+siblings_log="$log_dir/siblings.log"
+compile_fail=0
+cargo build --locked -p haider-cli -p haider-daemond -p haider-tui-exe -p haider-tools --bins 2>&1 | tee "$siblings_log"
+siblings_status=${PIPESTATUS[0]}
+if [ "$siblings_status" -ne 0 ]; then
+  echo "FAIL: build runtime siblings"
+  compile_fail=1
+  record_failure "workspace" "build runtime siblings" "$siblings_log"
+  unset HAIDER_TEST_SIBLINGS_PREBUILT
+else
+  export HAIDER_TEST_SIBLINGS_PREBUILT=1
+fi
+echo "::endgroup::"
+
 # Compile phase first, uncapped — compilation cannot deadlock, and folding it
 # out lets the per-crate EXECUTION cap below be tight. A hanging test then
 # fails its crate in minutes with the crate named, instead of burning the
@@ -129,7 +147,6 @@ run_capped() {
 # for hours exactly this way).
 echo "::group::compile all test binaries"
 compile_log="$log_dir/compile.log"
-compile_fail=0
 cargo test --workspace --no-run --locked 2>&1 | tee "$compile_log"
 compile_status=${PIPESTATUS[0]}
 if [ "$compile_status" -ne 0 ]; then
@@ -138,9 +155,6 @@ if [ "$compile_status" -ne 0 ]; then
   record_failure "workspace" "compile all test binaries" "$compile_log"
 fi
 echo "::endgroup::"
-# Subprocess-based CLI tests may now trust the sibling next to the freshly
-# compiled CLI without recursively entering Cargo from a running test binary.
-export HAIDER_TEST_SIBLINGS_PREBUILT=1
 
 # Per-crate execution cap (15 min — generous for RUNNING tests).
 T="$(command -v timeout || command -v gtimeout || true)"

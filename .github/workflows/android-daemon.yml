@@ -55,13 +55,14 @@ jobs:
           echo "CXX_aarch64_linux_android=$toolchain/aarch64-linux-android21-clang++" >> "$GITHUB_ENV"
           echo "AR_aarch64_linux_android=$toolchain/llvm-ar" >> "$GITHUB_ENV"
           echo "RANLIB_aarch64_linux_android=$toolchain/llvm-ranlib" >> "$GITHUB_ENV"
-      - name: build release daemon + CLI for Android
-        run: cargo build --release --locked --target aarch64-linux-android -p haider-cli -p haider-daemond
+      - name: build release daemon + CLI + TUI payload for Android
+        run: cargo build --release --locked --target aarch64-linux-android -p haider-cli -p haider-daemond -p haider-tui-exe
       - name: stage binaries
         run: |
           mkdir -p dist-android
           cp target/aarch64-linux-android/release/haiderd dist-android/haiderd-aarch64-linux-android
           cp target/aarch64-linux-android/release/haider dist-android/haider-aarch64-linux-android
+          cp target/aarch64-linux-android/release/haider-tui dist-android/haider-tui-aarch64-linux-android
           (cd dist-android && sha256sum * > SHA256SUMS)
       - name: upload Android daemon artifact
         uses: actions/upload-artifact@v4

@@ -1,0 +1,16 @@
+native install BudgetSum=782.810596s bytes=(69006688, 95949344, 203235680)
+test_direct_installer_fresh_prefix_contains_matching_runtime_siblings (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_direct_installer_fresh_prefix_contains_matching_runtime_siblings) ... native install shell/complete: 173.097302s
+ok
+test_direct_installer_missing_payload_preserves_existing_binaries (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_direct_installer_missing_payload_preserves_existing_binaries) ... native install shell/missing: 6.167959s
+ok
+test_direct_installer_rejects_wrong_payload_identity_before_publication (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_direct_installer_rejects_wrong_payload_identity_before_publication) ... native install shell/mixed: 49.022647s
+ok
+test_npm_installs_with_real_shared_helper (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_npm_installs_with_real_shared_helper) ... native install npm/complete: 169.278014s
+ok
+test_npm_refusal_keeps_existing_recovery_marker_and_binaries (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_npm_refusal_keeps_existing_recovery_marker_and_binaries) ... native install npm/complete: 155.138027s
+ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 603.651s
+
+OK

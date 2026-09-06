@@ -1,0 +1,7 @@
+Filesystem     1M-blocks   Used Available Capacity iused     ifree %iused  Mounted on
+/dev/disk3s1s1    233752  12062     21434    37%  458732 219493560    0%   /
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 6.75s
+

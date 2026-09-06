@@ -19,46 +19,80 @@ const RELEASE = `https://github.com/Rizzist/haider-agent/releases/download/v${VE
 function artifactForCurrentPlatform() {
   const key = `${process.platform}-${process.arch}`;
   const artifacts = {
-    "darwin-arm64": `haider-v${VERSION}-aarch64-apple-darwin.tar.xz`,
-    "darwin-x64": `haider-v${VERSION}-x86_64-apple-darwin.tar.xz`,
-    "linux-x64": `haider-v${VERSION}-x86_64-unknown-linux-gnu.tar.xz`,
-    "linux-arm64": `haider-v${VERSION}-aarch64-unknown-linux-gnu.tar.xz`,
-    "win32-x64": `haider-v${VERSION}-x86_64-pc-windows-msvc.zip`
+    "darwin-arm64": `haider-v${VERSION}-aarch64-apple-darwin-split.tar.xz`,
+    "darwin-x64": `haider-v${VERSION}-x86_64-apple-darwin-split.tar.xz`,
+    "linux-x64": `haider-v${VERSION}-x86_64-unknown-linux-gnu-split.tar.xz`,
+    "linux-arm64": `haider-v${VERSION}-aarch64-unknown-linux-gnu-split.tar.xz`,
+    "win32-x64": `haider-v${VERSION}-x86_64-pc-windows-msvc-split.zip`
   };
   return artifacts[key] || null;
 }
 
-function download(url, redirects = 0) {
-  return new Promise((resolve, reject) => {
-    const request = https.get(
-      url,
-      { headers: { "User-Agent": `HaiderNpmInstaller/${VERSION}` } },
-      (response) => {
-        const location = response.headers.location;
-        if (
-          response.statusCode >= 300 &&
-          response.statusCode < 400 &&
-          location &&
-          redirects < 5
-        ) {
-          response.resume();
-          resolve(download(new URL(location, url).toString(), redirects + 1));
-          return;
-        }
+// Match install.sh and the shared updater capacities. A 1 MiB/s transfer
+// floor plus connection setup gives each attempt its own finite wall budget;
+// redirects/body trickles never restart it or consume the installer watchdog.
+const FETCH_ATTEMPTS = 2;
+const FETCH_CONNECT_SECONDS = 30;
+const FETCH_TRANSFER_BYTES_PER_SECOND = 1024 * 1024;
+const FETCH_ARCHIVE_BYTES = 128 * 1024 * 1024;
+const FETCH_CHECKSUM_BYTES = 16 * 1024;
+function downloadAttemptMs(maxBytes) {
+  return (FETCH_CONNECT_SECONDS + Math.ceil(maxBytes / FETCH_TRANSFER_BYTES_PER_SECOND)) * 1000;
+}
 
-        if (response.statusCode !== 200) {
-          response.resume();
-          reject(new Error(`HTTP ${response.statusCode} for ${url}`));
-          return;
-        }
-
-        const chunks = [];
-        response.on("data", (chunk) => chunks.push(chunk));
-        response.on("end", () => resolve(Buffer.concat(chunks)));
-      }
-    );
-    request.on("error", reject);
-  });
+async function download(url, { maxBytes = FETCH_ARCHIVE_BYTES, attemptMs = downloadAttemptMs(maxBytes), get = https.get } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt < FETCH_ATTEMPTS; attempt++) {
+    try {
+      return await new Promise((resolve, reject) => {
+        let activeRequest;
+        let activeResponse;
+        const resources = new Set();
+        let settled = false;
+        const finish = (error, value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          // Includes every redirect body, even when it never ends. Replacing
+          // only the latest request would leave earlier sockets alive.
+          for (const resource of resources) resource.destroy();
+          if (error) reject(error);
+          else resolve(value);
+        };
+        const timer = setTimeout(() => finish(new Error(`Download attempt timed out for ${url}`)), attemptMs);
+        const visit = (currentUrl, redirects) => {
+          if (settled) return;
+          try {
+            activeRequest = get(currentUrl, {
+              headers: { "User-Agent": `HaiderNpmInstaller/${VERSION}` }
+            }, (response) => {
+              activeResponse = response;
+              resources.add(activeResponse);
+              response.on("error", (error) => finish(error));
+              response.on("aborted", () => finish(new Error(`Download aborted for ${currentUrl}`)));
+              const location = response.headers.location;
+              if (response.statusCode >= 300 && response.statusCode < 400 && location && redirects < 5) {
+                response.resume();
+                visit(new URL(location, currentUrl).toString(), redirects + 1);
+                return;
+              }
+              if (response.statusCode !== 200) {
+                finish(new Error(`HTTP ${response.statusCode} for ${currentUrl}`));
+                return;
+              }
+              const chunks = [];
+              response.on("data", (chunk) => chunks.push(chunk));
+              response.on("end", () => finish(null, Buffer.concat(chunks)));
+            });
+            resources.add(activeRequest);
+            activeRequest.on("error", (error) => finish(error));
+          } catch (error) { finish(error); }
+        };
+        visit(url, 0);
+      });
+    } catch (error) { lastError = error; }
+  }
+  throw lastError;
 }
 
 function sha256(buffer) {
@@ -95,7 +129,7 @@ function findEndOfCentralDirectory(buffer) {
 }
 
 function extractZipBinaries(archiveBuffer, destDir) {
-  const wanted = new Set(["haider.exe", "haiderd.exe"]);
+  const wanted = new Set(["haider.exe", "haider-tui.exe", "haiderd.exe"]);
   const extracted = new Set();
   const eocd = findEndOfCentralDirectory(archiveBuffer);
   const entries = archiveBuffer.readUInt16LE(eocd + 10);
@@ -120,6 +154,9 @@ function extractZipBinaries(archiveBuffer, destDir) {
     const basename = name.replace(/\\/g, "/").split("/").pop();
 
     if (wanted.has(basename)) {
+      if (extracted.has(basename)) {
+        throw new Error(`Archive contains duplicate ${basename}`);
+      }
       if (archiveBuffer.readUInt32LE(localOffset) !== 0x04034b50) {
         throw new Error("Invalid zip: local file header not found");
       }
@@ -172,7 +209,7 @@ function extractTarXzBinaries(archiveBuffer, artifact, destDir) {
     }
 
     const bundleDir = path.join(unpackDir, artifact.slice(0, -".tar.xz".length));
-    const binaries = ["haider", "haiderd"];
+    const binaries = ["haider", "haider-tui", "haiderd"];
     if (process.platform === "linux") {
       binaries.push("haider-wayland-portal");
     }
@@ -185,6 +222,29 @@ function extractTarXzBinaries(archiveBuffer, artifact, destDir) {
     }
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+// Archive checksum validation precedes this call. The extracted thin binary
+// owns all publication, locking, verification and durable recovery. Never erase
+// vendor or its recovery marker when the helper refuses or is interrupted.
+function installArchive(archive, artifact, vendorDir, runInstaller = spawnSync) {
+  const stage = fs.mkdtempSync(path.join(os.tmpdir(), "haider-npm-stage-"));
+  try {
+    if (artifact.endsWith(".zip")) {
+      extractZipBinaries(archive, stage);
+    } else {
+      extractTarXzBinaries(archive, artifact, stage);
+    }
+    for (const binary of fs.readdirSync(stage)) {
+      fs.chmodSync(path.join(stage, binary), 0o755);
+    }
+    const binary = path.join(stage, artifact.endsWith(".zip") ? "haider.exe" : "haider");
+    const result = runInstaller(binary, ["--install-bundle", stage, vendorDir], { stdio: "inherit" });
+    if (result.error) throw new Error(`Could not start bundle installer: ${result.error.message}`);
+    if (result.status !== 0) throw new Error(`Bundle installation failed with exit code ${result.status}`);
+  } finally {
+    fs.rmSync(stage, { recursive: true, force: true });
   }
 }
 
@@ -203,7 +263,7 @@ async function main() {
 
   const [archive, sidecar] = await Promise.all([
     download(artifactUrl),
-    download(sidecarUrl)
+    download(sidecarUrl, { maxBytes: FETCH_CHECKSUM_BYTES })
   ]);
   const expected = expectedHash(sidecar, artifact);
   if (!expected) {
@@ -214,24 +274,12 @@ async function main() {
     throw new Error(`Checksum mismatch for ${artifact}: expected ${expected}, got ${actual}`);
   }
 
-  fs.rmSync(VENDOR_DIR, { recursive: true, force: true });
-  fs.mkdirSync(VENDOR_DIR, { recursive: true });
-
-  if (artifact.endsWith(".zip")) {
-    extractZipBinaries(archive, VENDOR_DIR);
-  } else {
-    extractTarXzBinaries(archive, artifact, VENDOR_DIR);
-  }
-
-  for (const binary of fs.readdirSync(VENDOR_DIR)) {
-    fs.chmodSync(path.join(VENDOR_DIR, binary), 0o755);
-  }
+  installArchive(archive, artifact, VENDOR_DIR);
   console.log(`Installed Haider binaries to ${VENDOR_DIR}`);
 }
 
 if (require.main === module) {
   main().catch((error) => {
-    fs.rmSync(VENDOR_DIR, { recursive: true, force: true });
     console.error(`Failed to install haider: ${error.message}`);
     console.error(
       "GitHub releases are public and do not require GITHUB_TOKEN. " +
@@ -242,6 +290,10 @@ if (require.main === module) {
 }
 
 module.exports = {
+  download,
+  downloadAttemptMs,
+  installArchive,
+  artifactForCurrentPlatform,
   expectedHash,
   extractTarXzBinaries,
   extractZipBinaries

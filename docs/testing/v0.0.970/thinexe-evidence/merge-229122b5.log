@@ -1,0 +1,6 @@
+Updating b8635f88..229122b5
+Fast-forward
+ packaging/chocolatey/haider.nuspec      |  2 +-
+ scripts/release_packaging.py            | 16 ++++++----------
+ scripts/tests/test_release_packaging.py |  2 +-
+ 3 files changed, 8 insertions(+), 12 deletions(-)

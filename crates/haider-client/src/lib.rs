@@ -20,15 +20,20 @@
 //!
 //! This crate owns no TUI, daemon lifecycle, or persistence.
 
+pub mod agent_metrics;
 pub mod checkpoint;
 pub mod client;
+pub mod display;
+pub mod fleet;
 pub mod graph;
 pub mod headless;
 pub mod lockdown;
+pub mod notify;
 pub mod observe;
 pub mod peer;
 pub mod permission;
 pub mod profile;
+pub mod profile_lock;
 pub mod provider_rounds;
 pub mod retraction;
 pub mod session_fork;
@@ -157,3 +162,5 @@ mod shell_tests;
 #[cfg(test)]
 #[path = "ssh_profiles_tests.rs"]
 mod ssh_profiles_tests;
+
+pub mod payload_identity;

@@ -13,6 +13,10 @@
       "production": 0,
       "test": 0
     },
+    "haider-compat": {
+      "production": 0,
+      "test": 0
+    },
     "haider-core": {
       "production": 0,
       "test": 0
@@ -60,6 +64,10 @@
     "haider-tui": {
       "production": 0,
       "test": 4
+    },
+    "haider-tui-exe": {
+      "production": 0,
+      "test": 0
     },
     "haider-verify": {
       "production": 0,

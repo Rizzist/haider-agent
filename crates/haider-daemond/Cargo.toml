@@ -14,6 +14,13 @@ path = "src/main.rs"
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
+haider-core = { path = "../haider-core" }
+haider-store = { path = "../haider-store" }
+haider-tools = { path = "../haider-tools" }
+haider-verify = { path = "../haider-verify" }
+haider-accounts = { path = "../haider-accounts" }
+haider-rpc = { path = "../haider-rpc" }
+serde_json.workspace = true
 async-trait.workspace = true
 haider-client = { path = "../haider-client" }
 haider-daemon = { path = "../haider-daemon" }

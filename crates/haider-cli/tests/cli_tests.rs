@@ -23,7 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[allow(dead_code)]
-#[path = "../src/main.rs"]
+#[path = "../src/lib.rs"]
 mod cli_main;
 
 use cli_main::account::{AccountCommand, parse_account_command};
@@ -139,6 +139,12 @@ fn ensure_haiderd_present() {
         .parent()
         .expect("haider binary parent")
         .join(format!("haiderd{}", std::env::consts::EXE_SUFFIX));
+    let payload = sibling.with_file_name(format!("haider-tui{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        payload.is_file(),
+        "haider-tui sibling missing at {}; prebuild haider-tui-exe",
+        payload.display()
+    );
     assert!(
         sibling.is_file(),
         "haiderd sibling missing at {}; prebuild with `cargo build -p haider-daemond --bin haiderd`",

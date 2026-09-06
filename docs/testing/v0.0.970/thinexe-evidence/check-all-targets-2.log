@@ -1,0 +1,9 @@
+    Checking haider-cli v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli)
+    Checking haider-daemond v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-daemond)
+    Checking haider-compat v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-compat)
+    Checking haider-tui-exe v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-tui-exe)
+    Checking haider-core v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-core)
+    Checking haider-tools v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-tools)
+    Checking haider-tui v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-tui)
+    Checking haider-client v0.0.970 (/Users/rizzist/haider-run/lane-970-thinexe/crates/haider-client)
+    Finished `release` profile [optimized + debuginfo] target(s) in 56.51s

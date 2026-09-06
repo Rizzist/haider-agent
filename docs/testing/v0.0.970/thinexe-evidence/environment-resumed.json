@@ -1,0 +1,10 @@
+{
+  "load": [
+    31.85498046875,
+    25.21142578125,
+    18.7568359375
+  ],
+  "tcp": "bind succeeded",
+  "uds": "bind succeeded",
+  "process_inventory": "[Errno 1] Operation not permitted: '/bin/ps'"
+}

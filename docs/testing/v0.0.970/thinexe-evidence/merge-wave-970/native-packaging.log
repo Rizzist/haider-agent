@@ -1,0 +1,82 @@
+test_direct_installer_fresh_prefix_contains_matching_runtime_siblings (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_direct_installer_fresh_prefix_contains_matching_runtime_siblings) ... ERROR
+test_direct_installer_missing_payload_preserves_existing_binaries (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_direct_installer_missing_payload_preserves_existing_binaries) ... ok
+test_direct_installer_rejects_wrong_payload_identity_before_publication (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_direct_installer_rejects_wrong_payload_identity_before_publication) ... ok
+test_npm_installs_with_real_shared_helper (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_npm_installs_with_real_shared_helper) ... ERROR
+test_npm_refusal_keeps_existing_recovery_marker_and_binaries (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_npm_refusal_keeps_existing_recovery_marker_and_binaries) ... ERROR
+
+======================================================================
+ERROR: test_direct_installer_fresh_prefix_contains_matching_runtime_siblings (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_direct_installer_fresh_prefix_contains_matching_runtime_siblings)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/rizzist/haider-run/lane-970-thinexe/scripts/tests/test_install_bundle_native.py", line 68, in test_direct_installer_fresh_prefix_contains_matching_runtime_siblings
+    result = self.direct_install(root, prefix, "complete")
+  File "/Users/rizzist/haider-run/lane-970-thinexe/scripts/tests/test_install_bundle_native.py", line 131, in direct_install
+    return subprocess.run(["sh", str(ROOT / "scripts/install.sh")], env=env, capture_output=True, text=True, timeout=INSTALL_WATCHDOG_SECONDS)
+           ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 557, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 1221, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 2154, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 1268, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['sh', '/Users/rizzist/haider-run/lane-970-thinexe/scripts/install.sh']' timed out after 120 seconds
+
+======================================================================
+ERROR: test_npm_installs_with_real_shared_helper (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_npm_installs_with_real_shared_helper)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/rizzist/haider-run/lane-970-thinexe/scripts/tests/test_install_bundle_native.py", line 81, in test_npm_installs_with_real_shared_helper
+    result = self.npm_install(prefix, "complete")
+  File "/Users/rizzist/haider-run/lane-970-thinexe/scripts/tests/test_install_bundle_native.py", line 124, in npm_install
+    return subprocess.run(["node", "-e", code, str(ROOT / "packaging/npm/install.js"), str(self.archives[variant]), str(prefix)], capture_output=True, text=True, timeout=INSTALL_WATCHDOG_SECONDS)
+           ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 557, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 1221, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 2154, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 1268, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['node', '-e', "\nconst fs = require('fs');\nconst path = require('path');\nconst installer = require(process.argv[1]);\ninstaller.installArchive(fs.readFileSync(process.argv[2]), path.basename(process.argv[2]), process.argv[3]);\n", '/Users/rizzist/haider-run/lane-970-thinexe/packaging/npm/install.js', '/var/folders/y2/zrvhkfz54lj3gsw2czwxdmsh0000gn/T/haider-native-install-ow8uet72/complete/haider-v0.0.970-aarch64-apple-darwin-split.tar.xz', '/var/folders/y2/zrvhkfz54lj3gsw2czwxdmsh0000gn/T/tmp_wh4h1on/vendor with spaces']' timed out after 120 seconds
+
+======================================================================
+ERROR: test_npm_refusal_keeps_existing_recovery_marker_and_binaries (scripts.tests.test_install_bundle_native.NativeBundleInstallationTests.test_npm_refusal_keeps_existing_recovery_marker_and_binaries)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/rizzist/haider-run/lane-970-thinexe/scripts/tests/test_install_bundle_native.py", line 92, in test_npm_refusal_keeps_existing_recovery_marker_and_binaries
+    result = self.npm_install(prefix, "complete")
+  File "/Users/rizzist/haider-run/lane-970-thinexe/scripts/tests/test_install_bundle_native.py", line 124, in npm_install
+    return subprocess.run(["node", "-e", code, str(ROOT / "packaging/npm/install.js"), str(self.archives[variant]), str(prefix)], capture_output=True, text=True, timeout=INSTALL_WATCHDOG_SECONDS)
+           ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 557, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 1221, in communicate
+    stdout, stderr = self._communicate(input, endtime, timeout)
+                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 2154, in _communicate
+    self._check_timeout(endtime, orig_timeout, stdout, stderr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 1268, in _check_timeout
+    raise TimeoutExpired(
+    ...<2 lines>...
+            stderr=b''.join(stderr_seq) if stderr_seq else None)
+subprocess.TimeoutExpired: Command '['node', '-e', "\nconst fs = require('fs');\nconst path = require('path');\nconst installer = require(process.argv[1]);\ninstaller.installArchive(fs.readFileSync(process.argv[2]), path.basename(process.argv[2]), process.argv[3]);\n", '/Users/rizzist/haider-run/lane-970-thinexe/packaging/npm/install.js', '/var/folders/y2/zrvhkfz54lj3gsw2czwxdmsh0000gn/T/haider-native-install-ow8uet72/complete/haider-v0.0.970-aarch64-apple-darwin-split.tar.xz', '/var/folders/y2/zrvhkfz54lj3gsw2czwxdmsh0000gn/T/tmp87iqsydv/vendor']' timed out after 120 seconds
+
+----------------------------------------------------------------------
+Ran 5 tests in 458.578s
+
+FAILED (errors=3)

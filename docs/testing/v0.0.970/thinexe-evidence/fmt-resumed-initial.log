@@ -1,0 +1,713 @@
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/src/lib.rs:466:
+     let _ = io::stderr().flush();
+     let _ = console.wait_for_keypress();
+ }
+[31m-
+(B[m 
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/src/payload.rs:30:
+         || !haider_platform::metadata_is_current_user(&metadata)
+         || haider_platform::metadata_mode(&metadata) & 0o077 != 0
+     {
+[31m-        return Err(io::Error::other("update lock is not an owner-only regular file"));
+(B[m[32m+        return Err(io::Error::other(
+(B[m[32m+            "update lock is not an owner-only regular file",
+(B[m[32m+        ));
+(B[m     }
+     file.lock_shared()?;
+     Ok(Some(file))
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/src/payload.rs:123:
+     fn launch_lock_is_compatible_with_the_updater_owner_only_contract() {
+         let dir = tempfile::tempdir().expect("temp dir");
+         let lock = install_read_lock(&dir.path().join("haider-tui"))
+[31m-            .expect("launch lock").expect("writable install");
+(B[m[32m+            .expect("launch lock")
+(B[m[32m+            .expect("writable install");
+(B[m         let metadata = lock.metadata().expect("lock metadata");
+         assert!(metadata.is_file());
+         assert_eq!(haider_platform::metadata_mode(&metadata) & 0o077, 0);
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/src/payload.rs:130:
+         drop(lock);
+[31m-        let exclusive = OpenOptions::new().read(true).write(true)
+(B[m[31m-            .open(dir.path().join(".haider-update.lock")).expect("updater open");
+(B[m[32m+        let exclusive = OpenOptions::new()
+(B[m[32m+            .read(true)
+(B[m[32m+            .write(true)
+(B[m[32m+            .open(dir.path().join(".haider-update.lock"))
+(B[m[32m+            .expect("updater open");
+(B[m         exclusive.try_lock().expect("launch lock released");
+     }
+ }
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/src/update/discovery.rs:587:
+     fn spawn(
+         mut child: RequestChild,
+         cancellation: DiscoveryCancellation,
+[31m-        #[cfg(any(test, feature = "test-support"))] observer: Option<Arc<dyn Fn(CurlRequestObservation) + Send + Sync>>,
+(B[m[32m+        #[cfg(any(test, feature = "test-support"))] observer: Option<
+(B[m[32m+            Arc<dyn Fn(CurlRequestObservation) + Send + Sync>,
+(B[m[32m+        >,
+(B[m     ) -> Result<Self, UpdateError> {
+         let (stop, stopped) = mpsc::channel();
+         let worker = std::thread::Builder::new()
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/lib.rs:466:
+     let _ = io::stderr().flush();
+     let _ = console.wait_for_keypress();
+ }
+[31m-
+(B[m 
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:30:
+         || !haider_platform::metadata_is_current_user(&metadata)
+         || haider_platform::metadata_mode(&metadata) & 0o077 != 0
+     {
+[31m-        return Err(io::Error::other("update lock is not an owner-only regular file"));
+(B[m[32m+        return Err(io::Error::other(
+(B[m[32m+            "update lock is not an owner-only regular file",
+(B[m[32m+        ));
+(B[m     }
+     file.lock_shared()?;
+     Ok(Some(file))
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:123:
+     fn launch_lock_is_compatible_with_the_updater_owner_only_contract() {
+         let dir = tempfile::tempdir().expect("temp dir");
+         let lock = install_read_lock(&dir.path().join("haider-tui"))
+[31m-            .expect("launch lock").expect("writable install");
+(B[m[32m+            .expect("launch lock")
+(B[m[32m+            .expect("writable install");
+(B[m         let metadata = lock.metadata().expect("lock metadata");
+         assert!(metadata.is_file());
+         assert_eq!(haider_platform::metadata_mode(&metadata) & 0o077, 0);
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:130:
+         drop(lock);
+[31m-        let exclusive = OpenOptions::new().read(true).write(true)
+(B[m[31m-            .open(dir.path().join(".haider-update.lock")).expect("updater open");
+(B[m[32m+        let exclusive = OpenOptions::new()
+(B[m[32m+            .read(true)
+(B[m[32m+            .write(true)
+(B[m[32m+            .open(dir.path().join(".haider-update.lock"))
+(B[m[32m+            .expect("updater open");
+(B[m         exclusive.try_lock().expect("launch lock released");
+     }
+ }
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/update/discovery.rs:587:
+     fn spawn(
+         mut child: RequestChild,
+         cancellation: DiscoveryCancellation,
+[31m-        #[cfg(any(test, feature = "test-support"))] observer: Option<Arc<dyn Fn(CurlRequestObservation) + Send + Sync>>,
+(B[m[32m+        #[cfg(any(test, feature = "test-support"))] observer: Option<
+(B[m[32m+            Arc<dyn Fn(CurlRequestObservation) + Send + Sync>,
+(B[m[32m+        >,
+(B[m     ) -> Result<Self, UpdateError> {
+         let (stop, stopped) = mpsc::channel();
+         let worker = std::thread::Builder::new()
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/lib.rs:466:
+     let _ = io::stderr().flush();
+     let _ = console.wait_for_keypress();
+ }
+[31m-
+(B[m 
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:30:
+         || !haider_platform::metadata_is_current_user(&metadata)
+         || haider_platform::metadata_mode(&metadata) & 0o077 != 0
+     {
+[31m-        return Err(io::Error::other("update lock is not an owner-only regular file"));
+(B[m[32m+        return Err(io::Error::other(
+(B[m[32m+            "update lock is not an owner-only regular file",
+(B[m[32m+        ));
+(B[m     }
+     file.lock_shared()?;
+     Ok(Some(file))
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:123:
+     fn launch_lock_is_compatible_with_the_updater_owner_only_contract() {
+         let dir = tempfile::tempdir().expect("temp dir");
+         let lock = install_read_lock(&dir.path().join("haider-tui"))
+[31m-            .expect("launch lock").expect("writable install");
+(B[m[32m+            .expect("launch lock")
+(B[m[32m+            .expect("writable install");
+(B[m         let metadata = lock.metadata().expect("lock metadata");
+         assert!(metadata.is_file());
+         assert_eq!(haider_platform::metadata_mode(&metadata) & 0o077, 0);
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:130:
+         drop(lock);
+[31m-        let exclusive = OpenOptions::new().read(true).write(true)
+(B[m[31m-            .open(dir.path().join(".haider-update.lock")).expect("updater open");
+(B[m[32m+        let exclusive = OpenOptions::new()
+(B[m[32m+            .read(true)
+(B[m[32m+            .write(true)
+(B[m[32m+            .open(dir.path().join(".haider-update.lock"))
+(B[m[32m+            .expect("updater open");
+(B[m         exclusive.try_lock().expect("launch lock released");
+     }
+ }
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/update/discovery.rs:587:
+     fn spawn(
+         mut child: RequestChild,
+         cancellation: DiscoveryCancellation,
+[31m-        #[cfg(any(test, feature = "test-support"))] observer: Option<Arc<dyn Fn(CurlRequestObservation) + Send + Sync>>,
+(B[m[32m+        #[cfg(any(test, feature = "test-support"))] observer: Option<
+(B[m[32m+            Arc<dyn Fn(CurlRequestObservation) + Send + Sync>,
+(B[m[32m+        >,
+(B[m     ) -> Result<Self, UpdateError> {
+         let (stop, stopped) = mpsc::channel();
+         let worker = std::thread::Builder::new()
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/lib.rs:466:
+     let _ = io::stderr().flush();
+     let _ = console.wait_for_keypress();
+ }
+[31m-
+(B[m 
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:30:
+         || !haider_platform::metadata_is_current_user(&metadata)
+         || haider_platform::metadata_mode(&metadata) & 0o077 != 0
+     {
+[31m-        return Err(io::Error::other("update lock is not an owner-only regular file"));
+(B[m[32m+        return Err(io::Error::other(
+(B[m[32m+            "update lock is not an owner-only regular file",
+(B[m[32m+        ));
+(B[m     }
+     file.lock_shared()?;
+     Ok(Some(file))
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:123:
+     fn launch_lock_is_compatible_with_the_updater_owner_only_contract() {
+         let dir = tempfile::tempdir().expect("temp dir");
+         let lock = install_read_lock(&dir.path().join("haider-tui"))
+[31m-            .expect("launch lock").expect("writable install");
+(B[m[32m+            .expect("launch lock")
+(B[m[32m+            .expect("writable install");
+(B[m         let metadata = lock.metadata().expect("lock metadata");
+         assert!(metadata.is_file());
+         assert_eq!(haider_platform::metadata_mode(&metadata) & 0o077, 0);
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:130:
+         drop(lock);
+[31m-        let exclusive = OpenOptions::new().read(true).write(true)
+(B[m[31m-            .open(dir.path().join(".haider-update.lock")).expect("updater open");
+(B[m[32m+        let exclusive = OpenOptions::new()
+(B[m[32m+            .read(true)
+(B[m[32m+            .write(true)
+(B[m[32m+            .open(dir.path().join(".haider-update.lock"))
+(B[m[32m+            .expect("updater open");
+(B[m         exclusive.try_lock().expect("launch lock released");
+     }
+ }
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/update/discovery.rs:587:
+     fn spawn(
+         mut child: RequestChild,
+         cancellation: DiscoveryCancellation,
+[31m-        #[cfg(any(test, feature = "test-support"))] observer: Option<Arc<dyn Fn(CurlRequestObservation) + Send + Sync>>,
+(B[m[32m+        #[cfg(any(test, feature = "test-support"))] observer: Option<
+(B[m[32m+            Arc<dyn Fn(CurlRequestObservation) + Send + Sync>,
+(B[m[32m+        >,
+(B[m     ) -> Result<Self, UpdateError> {
+         let (stop, stopped) = mpsc::channel();
+         let worker = std::thread::Builder::new()
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/payload_routing_tests.rs:9:
+ 
+ fn command(cli: &Path, home: &Path) -> Command {
+     let mut command = Command::new(cli);
+[31m-    command.current_dir(home).env("HOME", home).env("USERPROFILE", home)
+(B[m[32m+    command
+(B[m[32m+        .current_dir(home)
+(B[m[32m+        .env("HOME", home)
+(B[m[32m+        .env("USERPROFILE", home)
+(B[m         .env("HAIDER_PROFILE_DIR", home.join("profile"))
+         .env("HAIDER_DISCOVERY_DISABLED", "1")
+[31m-        .env_remove("HAIDER_MODEL").env_remove("HAIDER_RUNTIME_DIR")
+(B[m[31m-        .env_remove("XDG_RUNTIME_DIR").env_remove("HAIDER_TUI_LAUNCH_VERSION")
+(B[m[31m-        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+(B[m[32m+        .env_remove("HAIDER_MODEL")
+(B[m[32m+        .env_remove("HAIDER_RUNTIME_DIR")
+(B[m[32m+        .env_remove("XDG_RUNTIME_DIR")
+(B[m[32m+        .env_remove("HAIDER_TUI_LAUNCH_VERSION")
+(B[m[32m+        .stdin(Stdio::null())
+(B[m[32m+        .stdout(Stdio::piped())
+(B[m[32m+        .stderr(Stdio::piped());
+(B[m     command
+ }
+ 
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/payload_routing_tests.rs:22:
+     let source = directory.join("payload_probe.rs");
+     // Native on every CI runner; no shell emulation or payload instrumentation.
+     // This tiny fixture has no workspace dependencies and invokes no Cargo build.
+[31m-    std::fs::write(&source, format!(r#"
+(B[m[32m+    std::fs::write(
+(B[m[32m+        &source,
+(B[m[32m+        format!(
+(B[m[32m+            r#"
+(B[m fn main() {{
+     std::hint::black_box({marker:?});
+     println!("payload-pid:{{}}", std::process::id());
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/payload_routing_tests.rs:30:
+     println!("launch-version:{{}}", std::env::var("HAIDER_TUI_LAUNCH_VERSION").unwrap());
+     std::process::exit(37);
+ }}
+[31m-"#, marker = String::from_utf8(haider_client::payload_identity::marker_for_version(env!("CARGO_PKG_VERSION"))).expect("marker UTF-8"))).expect("fixture source");
+(B[m[32m+"#,
+(B[m[32m+            marker = String::from_utf8(haider_client::payload_identity::marker_for_version(env!(
+(B[m[32m+                "CARGO_PKG_VERSION"
+(B[m[32m+            )))
+(B[m[32m+            .expect("marker UTF-8")
+(B[m[32m+        ),
+(B[m[32m+    )
+(B[m[32m+    .expect("fixture source");
+(B[m     let executable = directory.join(binary("haider-tui"));
+     let output = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+[31m-        .arg("--edition=2024").arg(&source).arg("-o").arg(&executable)
+(B[m[31m-        .output().expect("compile native payload probe");
+(B[m[31m-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+(B[m[32m+        .arg("--edition=2024")
+(B[m[32m+        .arg(&source)
+(B[m[32m+        .arg("-o")
+(B[m[32m+        .arg(&executable)
+(B[m[32m+        .output()
+(B[m[32m+        .expect("compile native payload probe");
+(B[m[32m+    assert!(
+(B[m[32m+        output.status.success(),
+(B[m[32m+        "{}",
+(B[m[32m+        String::from_utf8_lossy(&output.stderr)
+(B[m[32m+    );
+(B[m     executable
+ }
+ 
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/payload_routing_tests.rs:47:
+     std::fs::copy(env!("CARGO_BIN_EXE_haider"), &cli).expect("thin client");
+     probe(directory.path());
+     for args in [
+[31m-        vec![], vec!["tui"], vec!["talk"], vec!["tui", "--demo", "--plain"],
+(B[m[31m-        vec!["resume"], vec!["resume", "session α"], vec!["--resume"],
+(B[m[32m+        vec![],
+(B[m[32m+        vec!["tui"],
+(B[m[32m+        vec!["talk"],
+(B[m[32m+        vec!["tui", "--demo", "--plain"],
+(B[m[32m+        vec!["resume"],
+(B[m[32m+        vec!["resume", "session α"],
+(B[m[32m+        vec!["--resume"],
+(B[m         vec!["--session", "session α", "--no-update-check"],
+         vec!["ssh", "shell", "host"],
+     ] {
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/payload_routing_tests.rs:55:
+[31m-        let child = command(&cli, home.path()).args(&args).spawn().expect("launch thin client");
+(B[m[32m+        let child = command(&cli, home.path())
+(B[m[32m+            .args(&args)
+(B[m[32m+            .spawn()
+(B[m[32m+            .expect("launch thin client");
+(B[m         let pid = child.id();
+         let output = child.wait_with_output().expect("payload output");
+         assert_eq!(output.status.code(), Some(37), "{args:?}: {output:?}");
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/payload_routing_tests.rs:67:
+             directory.path().join(binary("haider-tui"))
+         };
+         let expected: Vec<_> = std::iter::once(expected_arg0.into_os_string())
+[31m-            .chain(args.iter().map(std::ffi::OsString::from)).collect();
+(B[m[31m-        assert!(text.contains(&format!("payload-argv:{expected:?}")), "{text}");
+(B[m[32m+            .chain(args.iter().map(std::ffi::OsString::from))
+(B[m[32m+            .collect();
+(B[m[32m+        assert!(
+(B[m[32m+            text.contains(&format!("payload-argv:{expected:?}")),
+(B[m[32m+            "{text}"
+(B[m[32m+        );
+(B[m         #[cfg(unix)]
+[31m-        assert!(text.contains(&format!("payload-pid:{pid}")), "Unix must exec: {text}");
+(B[m[32m+        assert!(
+(B[m[32m+            text.contains(&format!("payload-pid:{pid}")),
+(B[m[32m+            "Unix must exec: {text}"
+(B[m[32m+        );
+(B[m         #[cfg(not(unix))]
+         let _ = pid;
+[31m-        assert!(!home.path().join("profile").exists(), "routing must not resolve a profile");
+(B[m[32m+        assert!(
+(B[m[32m+            !home.path().join("profile").exists(),
+(B[m[32m+            "routing must not resolve a profile"
+(B[m[32m+        );
+(B[m     }
+ }
+ 
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/payload_routing_tests.rs:84:
+     std::fs::copy(env!("CARGO_BIN_EXE_haider"), &cli).expect("thin client");
+     probe(directory.path());
+     for args in [
+[31m-        vec!["--version"], vec!["-V"], vec!["version"], vec!["self-test"],
+(B[m[31m-        vec!["--ready", "invalid"], vec!["--install-bundle", "missing", "missing-destination"],
+(B[m[31m-        vec!["run", "--invalid"], vec!["agent", "invalid"], vec!["workflow", "invalid"],
+(B[m[31m-        vec!["status", "--invalid"], vec!["sessions", "--invalid"],
+(B[m[31m-        vec!["sessions", "wait-ready", "--invalid"], vec!["daemon", "invalid"],
+(B[m[31m-        vec!["session", "id", "config", "invalid"], vec!["session", "id", "recover", "--invalid"],
+(B[m[31m-        vec!["session", "id", "seen", "--invalid"], vec!["session", "workspace", "invalid"],
+(B[m[31m-        vec!["session", "id", "workspace", "invalid"], vec!["session", "id", "item", "bad"],
+(B[m[31m-        vec!["session", "provider", "rebind", "--invalid"], vec!["session", "retract", "--invalid"],
+(B[m[31m-        vec!["session", "id", "--invalid"], vec!["account", "invalid"],
+(B[m[31m-        vec!["provider", "invalid"], vec!["lockdown", "invalid"], vec!["models", "--invalid"],
+(B[m[31m-        vec!["fleet", "--invalid"], vec!["events", "--invalid"], vec!["graph", "--invalid"],
+(B[m[31m-        vec!["export", "--invalid"], vec!["hooks", "invalid"], vec!["peer", "invalid"],
+(B[m[31m-        vec!["ssh", "invalid"], vec!["ssh", "shell", "host", "--", "echo hi"],
+(B[m[31m-        vec!["shell", "invalid"], vec!["update", "--invalid"],
+(B[m[31m-        vec!["resume", "--json", "--invalid"], vec!["import", "invalid"], vec!["unknown"],
+(B[m[32m+        vec!["--version"],
+(B[m[32m+        vec!["-V"],
+(B[m[32m+        vec!["version"],
+(B[m[32m+        vec!["self-test"],
+(B[m[32m+        vec!["--ready", "invalid"],
+(B[m[32m+        vec!["--install-bundle", "missing", "missing-destination"],
+(B[m[32m+        vec!["run", "--invalid"],
+(B[m[32m+        vec!["agent", "invalid"],
+(B[m[32m+        vec!["workflow", "invalid"],
+(B[m[32m+        vec!["status", "--invalid"],
+(B[m[32m+        vec!["sessions", "--invalid"],
+(B[m[32m+        vec!["sessions", "wait-ready", "--invalid"],
+(B[m[32m+        vec!["daemon", "invalid"],
+(B[m[32m+        vec!["session", "id", "config", "invalid"],
+(B[m[32m+        vec!["session", "id", "recover", "--invalid"],
+(B[m[32m+        vec!["session", "id", "seen", "--invalid"],
+(B[m[32m+        vec!["session", "workspace", "invalid"],
+(B[m[32m+        vec!["session", "id", "workspace", "invalid"],
+(B[m[32m+        vec!["session", "id", "item", "bad"],
+(B[m[32m+        vec!["session", "provider", "rebind", "--invalid"],
+(B[m[32m+        vec!["session", "retract", "--invalid"],
+(B[m[32m+        vec!["session", "id", "--invalid"],
+(B[m[32m+        vec!["account", "invalid"],
+(B[m[32m+        vec!["provider", "invalid"],
+(B[m[32m+        vec!["lockdown", "invalid"],
+(B[m[32m+        vec!["models", "--invalid"],
+(B[m[32m+        vec!["fleet", "--invalid"],
+(B[m[32m+        vec!["events", "--invalid"],
+(B[m[32m+        vec!["graph", "--invalid"],
+(B[m[32m+        vec!["export", "--invalid"],
+(B[m[32m+        vec!["hooks", "invalid"],
+(B[m[32m+        vec!["peer", "invalid"],
+(B[m[32m+        vec!["ssh", "invalid"],
+(B[m[32m+        vec!["ssh", "shell", "host", "--", "echo hi"],
+(B[m[32m+        vec!["shell", "invalid"],
+(B[m[32m+        vec!["update", "--invalid"],
+(B[m[32m+        vec!["resume", "--json", "--invalid"],
+(B[m[32m+        vec!["import", "invalid"],
+(B[m[32m+        vec!["unknown"],
+(B[m     ] {
+         let home = tempfile::tempdir().expect("headless home");
+[31m-        let output = command(&cli, home.path()).args(&args).output().expect("headless output");
+(B[m[32m+        let output = command(&cli, home.path())
+(B[m[32m+            .args(&args)
+(B[m[32m+            .output()
+(B[m[32m+            .expect("headless output");
+(B[m         assert_ne!(output.status.code(), Some(37), "{args:?}");
+[31m-        assert!(!String::from_utf8_lossy(&output.stdout).contains("payload-pid:"), "{args:?}");
+(B[m[31m-        assert!(!String::from_utf8_lossy(&output.stderr).contains("cannot start matching interactive payload"), "{args:?}");
+(B[m[32m+        assert!(
+(B[m[32m+            !String::from_utf8_lossy(&output.stdout).contains("payload-pid:"),
+(B[m[32m+            "{args:?}"
+(B[m[32m+        );
+(B[m[32m+        assert!(
+(B[m[32m+            !String::from_utf8_lossy(&output.stderr)
+(B[m[32m+                .contains("cannot start matching interactive payload"),
+(B[m[32m+            "{args:?}"
+(B[m[32m+        );
+(B[m     }
+ }
+ 
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/payload_routing_tests.rs:116:
+     let cli = directory.path().join(binary("haider"));
+     std::fs::copy(env!("CARGO_BIN_EXE_haider"), &cli).expect("thin client");
+     for present in [false, true] {
+[31m-        if present { std::fs::write(directory.path().join(binary("haider-tui")), b"wrong version").expect("mismatch"); }
+(B[m[31m-        let version = command(&cli, home.path()).arg("--version").output().expect("version");
+(B[m[32m+        if present {
+(B[m[32m+            std::fs::write(
+(B[m[32m+                directory.path().join(binary("haider-tui")),
+(B[m[32m+                b"wrong version",
+(B[m[32m+            )
+(B[m[32m+            .expect("mismatch");
+(B[m[32m+        }
+(B[m[32m+        let version = command(&cli, home.path())
+(B[m[32m+            .arg("--version")
+(B[m[32m+            .output()
+(B[m[32m+            .expect("version");
+(B[m         assert!(version.status.success());
+[31m-        assert_eq!(version.stdout, format!("haider {}\n", env!("CARGO_PKG_VERSION")).as_bytes());
+(B[m[31m-        let launch = command(&cli, home.path()).arg("talk").output().expect("launch");
+(B[m[32m+        assert_eq!(
+(B[m[32m+            version.stdout,
+(B[m[32m+            format!("haider {}\n", env!("CARGO_PKG_VERSION")).as_bytes()
+(B[m[32m+        );
+(B[m[32m+        let launch = command(&cli, home.path())
+(B[m[32m+            .arg("talk")
+(B[m[32m+            .output()
+(B[m[32m+            .expect("launch");
+(B[m         assert_eq!(launch.status.code(), Some(69));
+         assert!(!home.path().join("profile").exists());
+     }
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/payload_routing_tests.rs:130:
+ fn payload_version_probe_ignores_previous_tui_launch_version() {
+     let payload = Path::new(env!("CARGO_BIN_EXE_haider")).with_file_name(binary("haider-tui"));
+     assert!(payload.is_file(), "prebuild haider-tui alongside haider");
+[31m-    let output = Command::new(payload).arg("--version")
+(B[m[31m-        .env("HAIDER_TUI_LAUNCH_VERSION", "0.0.969").output().expect("staged version probe");
+(B[m[32m+    let output = Command::new(payload)
+(B[m[32m+        .arg("--version")
+(B[m[32m+        .env("HAIDER_TUI_LAUNCH_VERSION", "0.0.969")
+(B[m[32m+        .output()
+(B[m[32m+        .expect("staged version probe");
+(B[m     assert!(output.status.success(), "{output:?}");
+[31m-    assert_eq!(output.stdout, format!("haider-tui {}\n", env!("CARGO_PKG_VERSION")).as_bytes());
+(B[m[32m+    assert_eq!(
+(B[m[32m+        output.stdout,
+(B[m[32m+        format!("haider-tui {}\n", env!("CARGO_PKG_VERSION")).as_bytes()
+(B[m[32m+    );
+(B[m }
+ 
+ #[test]
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/payload_routing_tests.rs:140:
+ fn only_the_actual_payload_contains_its_complete_build_identity() {
+     let cli = Path::new(env!("CARGO_BIN_EXE_haider"));
+[31m-    assert!(haider_client::payload_identity::verify_payload(cli).is_err(), "thin cannot impersonate payload");
+(B[m[32m+    assert!(
+(B[m[32m+        haider_client::payload_identity::verify_payload(cli).is_err(),
+(B[m[32m+        "thin cannot impersonate payload"
+(B[m[32m+    );
+(B[m     let daemon = cli.with_file_name(binary("haiderd"));
+     assert!(daemon.is_file(), "prebuild haiderd");
+[31m-    assert!(haider_client::payload_identity::verify_payload(&daemon).is_err(), "daemon cannot impersonate payload");
+(B[m[31m-    assert!(haider_client::payload_identity::verify_payload(&cli.with_file_name(binary("haider-tui"))).is_ok());
+(B[m[32m+    assert!(
+(B[m[32m+        haider_client::payload_identity::verify_payload(&daemon).is_err(),
+(B[m[32m+        "daemon cannot impersonate payload"
+(B[m[32m+    );
+(B[m[32m+    assert!(
+(B[m[32m+        haider_client::payload_identity::verify_payload(&cli.with_file_name(binary("haider-tui")))
+(B[m[32m+            .is_ok()
+(B[m[32m+    );
+(B[m }
+ 
+ #[test]
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/payload_routing_tests.rs:154:
+     std::fs::copy(env!("CARGO_BIN_EXE_haider"), &cli).expect("thin client");
+     let payload = probe(directory.path());
+     std::fs::rename(&payload, directory.path().join(binary("haiderd"))).expect("observable daemon");
+[31m-    std::fs::write(payload, haider_client::payload_identity::marker_for_version("0.0.999"))
+(B[m[31m-        .expect("future payload");
+(B[m[31m-    let output = command(&cli, home.path()).arg("self-test").output().expect("self-test");
+(B[m[32m+    std::fs::write(
+(B[m[32m+        payload,
+(B[m[32m+        haider_client::payload_identity::marker_for_version("0.0.999"),
+(B[m[32m+    )
+(B[m[32m+    .expect("future payload");
+(B[m[32m+    let output = command(&cli, home.path())
+(B[m[32m+        .arg("self-test")
+(B[m[32m+        .output()
+(B[m[32m+        .expect("self-test");
+(B[m     assert_eq!(output.status.code(), Some(69), "{output:?}");
+[31m-    assert!(output.stdout.is_empty(), "mixed bundle must not run the daemon fixture");
+(B[m[32m+    assert!(
+(B[m[32m+        output.stdout.is_empty(),
+(B[m[32m+        "mixed bundle must not run the daemon fixture"
+(B[m[32m+    );
+(B[m     assert!(!home.path().join("profile").exists());
+ }
+ 
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/lib.rs:466:
+     let _ = io::stderr().flush();
+     let _ = console.wait_for_keypress();
+ }
+[31m-
+(B[m 
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:30:
+         || !haider_platform::metadata_is_current_user(&metadata)
+         || haider_platform::metadata_mode(&metadata) & 0o077 != 0
+     {
+[31m-        return Err(io::Error::other("update lock is not an owner-only regular file"));
+(B[m[32m+        return Err(io::Error::other(
+(B[m[32m+            "update lock is not an owner-only regular file",
+(B[m[32m+        ));
+(B[m     }
+     file.lock_shared()?;
+     Ok(Some(file))
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:123:
+     fn launch_lock_is_compatible_with_the_updater_owner_only_contract() {
+         let dir = tempfile::tempdir().expect("temp dir");
+         let lock = install_read_lock(&dir.path().join("haider-tui"))
+[31m-            .expect("launch lock").expect("writable install");
+(B[m[32m+            .expect("launch lock")
+(B[m[32m+            .expect("writable install");
+(B[m         let metadata = lock.metadata().expect("lock metadata");
+         assert!(metadata.is_file());
+         assert_eq!(haider_platform::metadata_mode(&metadata) & 0o077, 0);
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:130:
+         drop(lock);
+[31m-        let exclusive = OpenOptions::new().read(true).write(true)
+(B[m[31m-            .open(dir.path().join(".haider-update.lock")).expect("updater open");
+(B[m[32m+        let exclusive = OpenOptions::new()
+(B[m[32m+            .read(true)
+(B[m[32m+            .write(true)
+(B[m[32m+            .open(dir.path().join(".haider-update.lock"))
+(B[m[32m+            .expect("updater open");
+(B[m         exclusive.try_lock().expect("launch lock released");
+     }
+ }
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/update/discovery.rs:587:
+     fn spawn(
+         mut child: RequestChild,
+         cancellation: DiscoveryCancellation,
+[31m-        #[cfg(any(test, feature = "test-support"))] observer: Option<Arc<dyn Fn(CurlRequestObservation) + Send + Sync>>,
+(B[m[32m+        #[cfg(any(test, feature = "test-support"))] observer: Option<
+(B[m[32m+            Arc<dyn Fn(CurlRequestObservation) + Send + Sync>,
+(B[m[32m+        >,
+(B[m     ) -> Result<Self, UpdateError> {
+         let (stop, stopped) = mpsc::channel();
+         let worker = std::thread::Builder::new()
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/lib.rs:466:
+     let _ = io::stderr().flush();
+     let _ = console.wait_for_keypress();
+ }
+[31m-
+(B[m 
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:30:
+         || !haider_platform::metadata_is_current_user(&metadata)
+         || haider_platform::metadata_mode(&metadata) & 0o077 != 0
+     {
+[31m-        return Err(io::Error::other("update lock is not an owner-only regular file"));
+(B[m[32m+        return Err(io::Error::other(
+(B[m[32m+            "update lock is not an owner-only regular file",
+(B[m[32m+        ));
+(B[m     }
+     file.lock_shared()?;
+     Ok(Some(file))
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:123:
+     fn launch_lock_is_compatible_with_the_updater_owner_only_contract() {
+         let dir = tempfile::tempdir().expect("temp dir");
+         let lock = install_read_lock(&dir.path().join("haider-tui"))
+[31m-            .expect("launch lock").expect("writable install");
+(B[m[32m+            .expect("launch lock")
+(B[m[32m+            .expect("writable install");
+(B[m         let metadata = lock.metadata().expect("lock metadata");
+         assert!(metadata.is_file());
+         assert_eq!(haider_platform::metadata_mode(&metadata) & 0o077, 0);
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:130:
+         drop(lock);
+[31m-        let exclusive = OpenOptions::new().read(true).write(true)
+(B[m[31m-            .open(dir.path().join(".haider-update.lock")).expect("updater open");
+(B[m[32m+        let exclusive = OpenOptions::new()
+(B[m[32m+            .read(true)
+(B[m[32m+            .write(true)
+(B[m[32m+            .open(dir.path().join(".haider-update.lock"))
+(B[m[32m+            .expect("updater open");
+(B[m         exclusive.try_lock().expect("launch lock released");
+     }
+ }
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/update/discovery.rs:587:
+     fn spawn(
+         mut child: RequestChild,
+         cancellation: DiscoveryCancellation,
+[31m-        #[cfg(any(test, feature = "test-support"))] observer: Option<Arc<dyn Fn(CurlRequestObservation) + Send + Sync>>,
+(B[m[32m+        #[cfg(any(test, feature = "test-support"))] observer: Option<
+(B[m[32m+            Arc<dyn Fn(CurlRequestObservation) + Send + Sync>,
+(B[m[32m+        >,
+(B[m     ) -> Result<Self, UpdateError> {
+         let (stop, stopped) = mpsc::channel();
+         let worker = std::thread::Builder::new()
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/lib.rs:466:
+     let _ = io::stderr().flush();
+     let _ = console.wait_for_keypress();
+ }
+[31m-
+(B[m 
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:30:
+         || !haider_platform::metadata_is_current_user(&metadata)
+         || haider_platform::metadata_mode(&metadata) & 0o077 != 0
+     {
+[31m-        return Err(io::Error::other("update lock is not an owner-only regular file"));
+(B[m[32m+        return Err(io::Error::other(
+(B[m[32m+            "update lock is not an owner-only regular file",
+(B[m[32m+        ));
+(B[m     }
+     file.lock_shared()?;
+     Ok(Some(file))
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:123:
+     fn launch_lock_is_compatible_with_the_updater_owner_only_contract() {
+         let dir = tempfile::tempdir().expect("temp dir");
+         let lock = install_read_lock(&dir.path().join("haider-tui"))
+[31m-            .expect("launch lock").expect("writable install");
+(B[m[32m+            .expect("launch lock")
+(B[m[32m+            .expect("writable install");
+(B[m         let metadata = lock.metadata().expect("lock metadata");
+         assert!(metadata.is_file());
+         assert_eq!(haider_platform::metadata_mode(&metadata) & 0o077, 0);
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:130:
+         drop(lock);
+[31m-        let exclusive = OpenOptions::new().read(true).write(true)
+(B[m[31m-            .open(dir.path().join(".haider-update.lock")).expect("updater open");
+(B[m[32m+        let exclusive = OpenOptions::new()
+(B[m[32m+            .read(true)
+(B[m[32m+            .write(true)
+(B[m[32m+            .open(dir.path().join(".haider-update.lock"))
+(B[m[32m+            .expect("updater open");
+(B[m         exclusive.try_lock().expect("launch lock released");
+     }
+ }
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/update/discovery.rs:587:
+     fn spawn(
+         mut child: RequestChild,
+         cancellation: DiscoveryCancellation,
+[31m-        #[cfg(any(test, feature = "test-support"))] observer: Option<Arc<dyn Fn(CurlRequestObservation) + Send + Sync>>,
+(B[m[32m+        #[cfg(any(test, feature = "test-support"))] observer: Option<
+(B[m[32m+            Arc<dyn Fn(CurlRequestObservation) + Send + Sync>,
+(B[m[32m+        >,
+(B[m     ) -> Result<Self, UpdateError> {
+         let (stop, stopped) = mpsc::channel();
+         let worker = std::thread::Builder::new()
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/lib.rs:466:
+     let _ = io::stderr().flush();
+     let _ = console.wait_for_keypress();
+ }
+[31m-
+(B[m 
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:30:
+         || !haider_platform::metadata_is_current_user(&metadata)
+         || haider_platform::metadata_mode(&metadata) & 0o077 != 0
+     {
+[31m-        return Err(io::Error::other("update lock is not an owner-only regular file"));
+(B[m[32m+        return Err(io::Error::other(
+(B[m[32m+            "update lock is not an owner-only regular file",
+(B[m[32m+        ));
+(B[m     }
+     file.lock_shared()?;
+     Ok(Some(file))
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:123:
+     fn launch_lock_is_compatible_with_the_updater_owner_only_contract() {
+         let dir = tempfile::tempdir().expect("temp dir");
+         let lock = install_read_lock(&dir.path().join("haider-tui"))
+[31m-            .expect("launch lock").expect("writable install");
+(B[m[32m+            .expect("launch lock")
+(B[m[32m+            .expect("writable install");
+(B[m         let metadata = lock.metadata().expect("lock metadata");
+         assert!(metadata.is_file());
+         assert_eq!(haider_platform::metadata_mode(&metadata) & 0o077, 0);
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/payload.rs:130:
+         drop(lock);
+[31m-        let exclusive = OpenOptions::new().read(true).write(true)
+(B[m[31m-            .open(dir.path().join(".haider-update.lock")).expect("updater open");
+(B[m[32m+        let exclusive = OpenOptions::new()
+(B[m[32m+            .read(true)
+(B[m[32m+            .write(true)
+(B[m[32m+            .open(dir.path().join(".haider-update.lock"))
+(B[m[32m+            .expect("updater open");
+(B[m         exclusive.try_lock().expect("launch lock released");
+     }
+ }
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-cli/tests/../src/update/discovery.rs:587:
+     fn spawn(
+         mut child: RequestChild,
+         cancellation: DiscoveryCancellation,
+[31m-        #[cfg(any(test, feature = "test-support"))] observer: Option<Arc<dyn Fn(CurlRequestObservation) + Send + Sync>>,
+(B[m[32m+        #[cfg(any(test, feature = "test-support"))] observer: Option<
+(B[m[32m+            Arc<dyn Fn(CurlRequestObservation) + Send + Sync>,
+(B[m[32m+        >,
+(B[m     ) -> Result<Self, UpdateError> {
+         let (stop, stopped) = mpsc::channel();
+         let worker = std::thread::Builder::new()
+Diff in /Users/rizzist/haider-run/lane-970-thinexe/crates/haider-tui-exe/src/main.rs:600:
+     #[test]
+     fn interactive_payload_keeps_the_two_worker_multithread_runtime() {
+         let runtime = build_runtime().unwrap_or_else(|error| panic!("runtime: {error}"));
+[31m-        assert_eq!(runtime.handle().runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread);
+(B[m[32m+        assert_eq!(
+(B[m[32m+            runtime.handle().runtime_flavor(),
+(B[m[32m+            tokio::runtime::RuntimeFlavor::MultiThread
+(B[m[32m+        );
+(B[m         assert_eq!(runtime.metrics().num_workers(), 2);
+     }
+ 

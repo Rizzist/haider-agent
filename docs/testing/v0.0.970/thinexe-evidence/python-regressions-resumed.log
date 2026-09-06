@@ -1,0 +1,29 @@
+................EE
+======================================================================
+ERROR: test_thinexe_abba (unittest.loader._FailedTest.test_thinexe_abba)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_thinexe_abba
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/loader.py", line 141, in loadTestsFromName
+    module = __import__(module_name)
+  File "/Users/rizzist/haider-run/lane-970-thinexe/scripts/qa-gate/tests/test_thinexe_abba.py", line 11, in <module>
+    import thinexe_abba as thin
+ModuleNotFoundError: No module named 'thinexe_abba'
+
+
+======================================================================
+ERROR: test_thinexe_legacy_upgrade (unittest.loader._FailedTest.test_thinexe_legacy_upgrade)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_thinexe_legacy_upgrade
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/loader.py", line 141, in loadTestsFromName
+    module = __import__(module_name)
+  File "/Users/rizzist/haider-run/lane-970-thinexe/scripts/qa-gate/tests/test_thinexe_legacy_upgrade.py", line 12, in <module>
+    import thinexe_legacy_upgrade as legacy
+ModuleNotFoundError: No module named 'thinexe_legacy_upgrade'
+
+
+----------------------------------------------------------------------
+Ran 18 tests in 8.526s
+
+FAILED (errors=2)

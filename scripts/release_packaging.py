@@ -44,7 +44,7 @@ def _sha256(value: str, label: str) -> str:
 
 
 def _windows_artifact(version: str) -> str:
-    return f"haider-v{version}-{WINDOWS_TARGET}.zip"
+    return f"haider-v{version}-{WINDOWS_TARGET}-split.zip"
 
 
 def _windows_url(version: str) -> str:
@@ -362,7 +362,7 @@ def _unique_line(
 
 
 def _homebrew_url(version: str, target: str) -> str:
-    artifact = f"haider-v{version}-{target}.tar.xz"
+    artifact = f"haider-v{version}-{target}-split.tar.xz"
     return f"{REPOSITORY}/releases/download/v{version}/{artifact}"
 
 
@@ -376,7 +376,7 @@ def _homebrew_fields(formula: str, source: Path) -> tuple[str, dict[str, tuple[s
         index, url_match = _unique_line(
             lines,
             re.compile(
-                rf'(?P<indent>\s*)url "([^"]*haider-v[^"]*-{re.escape(target)}\.tar\.xz)"\s*'
+                rf'(?P<indent>\s*)url "([^"]*haider-v[^"]*-{re.escape(target)}(?:-split)?\.tar\.xz)"\s*'
             ),
             source,
             f"Homebrew URL for {target}",
@@ -440,7 +440,7 @@ def verify_homebrew_scoop(
     )
     _assert_equal(
         str(windows.get("extract_dir")),
-        f"haider-v{version}-{WINDOWS_TARGET}",
+        f"haider-v{version}-{WINDOWS_TARGET}-split",
         str(scoop_path),
         "Scoop extract directory",
     )
@@ -464,7 +464,7 @@ def repin_homebrew_scoop(
         index, url_match = _unique_line(
             lines,
             re.compile(
-                rf'(?P<indent>\s*)url "[^"]*haider-v[^"]*-{re.escape(target)}\.tar\.xz"\s*'
+                rf'(?P<indent>\s*)url "[^"]*haider-v[^"]*-{re.escape(target)}(?:-split)?\.tar\.xz"\s*'
             ),
             formula_path,
             f"Homebrew URL for {target}",
@@ -507,7 +507,7 @@ def repin_homebrew_scoop(
         {
             "url": _windows_url(version),
             "hash": shas[WINDOWS_TARGET],
-            "extract_dir": f"haider-v{version}-{WINDOWS_TARGET}",
+            "extract_dir": f"haider-v{version}-{WINDOWS_TARGET}-split",
         }
     )
     scoop_path.write_text(json.dumps(scoop, indent=2) + "\n", encoding="utf-8", newline="\n")
@@ -564,9 +564,77 @@ def _release_shas(args: argparse.Namespace) -> dict[str, str]:
     }
 
 
+def verify_split_bundle(artifact: Path, target: str) -> None:
+    """Check the actual release payload and sidecar before any manager sees it."""
+    _verify_release_bundle(artifact, target, legacy=False)
+
+
+def verify_legacy_bundle(artifact: Path, target: str) -> None:
+    """Keep canonical macOS compatibility archives readable by old updaters."""
+    if target not in ("aarch64-apple-darwin", "x86_64-apple-darwin"):
+        raise PackagingError(f"legacy compatibility bundle is macOS-only: {target}")
+    _verify_release_bundle(artifact, target, legacy=True)
+
+
+def _verify_release_bundle(artifact: Path, target: str, *, legacy: bool) -> None:
+    windows = target == WINDOWS_TARGET
+    extension = ".zip" if windows else ".tar.xz"
+    flavor = "" if legacy else "-split"
+    if not artifact.name.endswith(f"-{target}{flavor}{extension}"):
+        raise PackagingError(f"{artifact}: wrong bundle format for {target}")
+    top = artifact.name.removesuffix(extension)
+    suffix = ".exe" if windows else ""
+    members = ("haider", "haiderd") if legacy else ("haider", "haider-tui", "haiderd")
+    required = {f"{top}/{name}{suffix}" for name in members}
+    if "linux" in target:
+        required.add(f"{top}/haider-wayland-portal")
+    if windows:
+        required.update((f"{top}/haider.cmd", f"{top}/README.txt"))
+        with zipfile.ZipFile(artifact) as archive:
+            entries = [(item.filename.rstrip("/"), item.is_dir(), item.file_size) for item in archive.infolist()]
+    else:
+        with tarfile.open(artifact, "r:xz") as archive:
+            entries = []
+            for item in archive.getmembers():
+                if not (item.isdir() or item.isfile()):
+                    raise PackagingError(f"{artifact}: non-regular archive member {item.name}")
+                if item.isfile() and item.mode & 0o100 == 0:
+                    raise PackagingError(f"{artifact}: non-executable sibling {item.name}")
+                entries.append((item.name.rstrip("/"), item.isdir(), item.size))
+    seen = set()
+    for name, directory, size in entries:
+        if name in seen:
+            raise PackagingError(f"{artifact}: duplicate archive member {name}")
+        seen.add(name)
+        if directory:
+            if name != top:
+                raise PackagingError(f"{artifact}: unexpected archive directory {name}")
+        elif name not in required or size == 0:
+            raise PackagingError(f"{artifact}: unexpected or empty archive member {name}")
+    if (not windows and top not in seen) or seen - {top} != required:
+        raise PackagingError(f"{artifact}: missing sibling or launcher: {sorted(required - seen)}")
+    sidecar = artifact.with_name(artifact.name + ".sha256")
+    fields = sidecar.read_text().strip().split()
+    if len(fields) != 2 or Path(fields[1].lstrip("*")).name != artifact.name:
+        raise PackagingError(f"{sidecar}: expected exact archive checksum record")
+    expected = _sha256(fields[0], str(sidecar))
+    digest = hashlib.sha256()
+    with artifact.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if expected != actual:
+        raise PackagingError(f"{sidecar}: archive checksum mismatch")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+
+    for name in ("verify-bundle", "verify-legacy-bundle"):
+        bundle = commands.add_parser(name)
+        bundle.add_argument("--artifact", type=Path, required=True)
+        bundle.add_argument("--target", required=True)
 
     render = commands.add_parser("render-chocolatey")
     render.add_argument("--source", type=Path, required=True)
@@ -597,7 +665,11 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        if args.command == "render-chocolatey":
+        if args.command == "verify-bundle":
+            verify_split_bundle(args.artifact, args.target)
+        elif args.command == "verify-legacy-bundle":
+            verify_legacy_bundle(args.artifact, args.target)
+        elif args.command == "render-chocolatey":
             render_chocolatey_from_artifact(
                 args.source, args.output, args.version, args.artifact
             )
@@ -613,7 +685,7 @@ def main(argv: list[str] | None = None) -> int:
             verify_npm_archive(args.package, args.version)
         else:  # pragma: no cover - argparse makes this unreachable.
             raise PackagingError(f"unknown command: {args.command}")
-    except (OSError, PackagingError) as error:
+    except (OSError, PackagingError, tarfile.TarError, zipfile.BadZipFile) as error:
         print(f"release-packaging: FAIL: {error}", file=sys.stderr)
         return 1
     print(f"release-packaging: {args.command} passed")

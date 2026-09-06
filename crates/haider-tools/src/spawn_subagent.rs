@@ -5,9 +5,9 @@ use haider_protocol::tool::{DispatchMode, ToolManifest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const MAX_TASK_BYTES: usize = 80;
-const MAX_PROMPT_BYTES: usize = 32 * 1024;
-const MAX_SELECTOR_BYTES: usize = 128;
+use haider_protocol::spawn_subagent::{
+    MAX_PROMPT_BYTES, MAX_SELECTOR_BYTES, MAX_TASK_BYTES, SpawnSubagentArguments,
+};
 
 /// Validated arguments for the depth-capped local-subagent tool.
 ///
@@ -50,54 +50,30 @@ pub struct SpawnSubagent {
 
 impl SpawnSubagent {
     pub fn from_tool_args(args: Value) -> ToolResult<Self> {
-        let request: Self = serde_json::from_value(args).map_err(|error| {
-            ToolError::invalid_argument(format!("invalid spawn_subagent arguments: {error}"))
-        })?;
-        let task = request.task.trim();
-        let prompt = request.prompt.trim();
-        if task.is_empty() || task.len() > MAX_TASK_BYTES {
-            return Err(ToolError::invalid_argument(format!(
-                "spawn_subagent task must contain 1..={MAX_TASK_BYTES} bytes"
-            )));
-        }
-        if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES {
-            return Err(ToolError::invalid_argument(format!(
-                "spawn_subagent prompt must contain 1..={MAX_PROMPT_BYTES} bytes"
-            )));
-        }
-        let selector = |value: Option<String>, name: &str| -> ToolResult<Option<String>> {
-            let Some(value) = value else { return Ok(None) };
-            let value = value.trim();
-            if value.is_empty() || value.len() > MAX_SELECTOR_BYTES {
-                return Err(ToolError::invalid_argument(format!(
-                    "spawn_subagent {name} must contain 1..={MAX_SELECTOR_BYTES} bytes when given"
-                )));
-            }
-            Ok(Some(value.to_owned()))
-        };
-        let model = selector(request.model, "model")?;
-        let provider = selector(request.provider, "provider")?;
-        if provider.is_some() && model.is_none() {
-            return Err(ToolError::invalid_argument(
-                "spawn_subagent `provider` only disambiguates a `model` — name the model"
-                    .to_owned(),
-            ));
-        }
-        let parent_slot = selector(request.parent_slot, "parent_slot")?;
-        let agent_type = selector(request.agent_type, "agent_type")?;
-        if let Some(budget) = request.request_budget {
-            budget.validate().map_err(ToolError::invalid_argument)?;
-        }
-        Ok(Self {
-            task: task.to_owned(),
-            prompt: prompt.to_owned(),
-            request_budget: request.request_budget,
+        // Exhaustive destructuring and construction keep the tool projection
+        // complete when either argument type gains a field (registry #76).
+        let SpawnSubagentArguments {
+            task,
+            prompt,
+            request_budget,
             model,
             provider,
-            workflow: request.workflow,
-            workflow_trigger: request.workflow_trigger,
+            workflow,
+            workflow_trigger,
             parent_slot,
-            workflow_author: request.workflow_author,
+            workflow_author,
+            agent_type,
+        } = SpawnSubagentArguments::from_tool_args(args).map_err(ToolError::invalid_argument)?;
+        Ok(Self {
+            task,
+            prompt,
+            request_budget,
+            model,
+            provider,
+            workflow,
+            workflow_trigger,
+            parent_slot,
+            workflow_author,
             agent_type,
         })
     }

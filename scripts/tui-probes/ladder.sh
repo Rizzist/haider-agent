@@ -2,7 +2,8 @@
 # The probe ladder — 14 DEMO runs plus the 2 LIVE runs that gate the swap.
 #
 # Usage: scripts/tui-probes/ladder.sh [path-to-haider-binary] [path-to-haiderd]
-# Defaults: target/release/{haider,haiderd} (build them first).
+# Defaults: target/release/{haider,haiderd}, with haider-tui beside haider
+# (build all three first).
 #
 # The live rows boot a REAL haiderd on a throwaway profile with the
 # test-only FakeProvider seam — no network, no credentials. They are the
@@ -25,9 +26,14 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 bin="${1:-$root/target/release/haider}"
 daemon_bin="${2:-$root/target/release/haiderd}"
+payload_bin="$(dirname "$bin")/haider-tui"
 
 if [[ ! -x "$bin" ]]; then
   echo "ladder: no binary at $bin (cargo build --release -p haider-cli)" >&2
+  exit 2
+fi
+if [[ ! -x "$payload_bin" ]]; then
+  echo "ladder: no TUI payload at $payload_bin (cargo build --release -p haider-tui-exe)" >&2
   exit 2
 fi
 if [[ ! -x "$daemon_bin" ]]; then

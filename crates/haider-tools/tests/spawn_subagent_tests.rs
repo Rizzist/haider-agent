@@ -179,3 +179,99 @@ fn agent_type_rides_the_spawn_args() {
         .is_err()
     );
 }
+
+/// Registry #76: every populated argument survives the shared-validator/tool
+/// projection and the inverse serde projection. Omitting any field from either
+/// type's serialized surface changes the exact expected document below.
+#[test]
+fn shared_spawn_validation_projects_every_field_without_changing_legacy_bytes() {
+    use haider_protocol::spawn_subagent::SpawnSubagentArguments;
+
+    for expected in [
+        serde_json::json!({"task": "tests", "prompt": "run them"}),
+        serde_json::json!({
+            "task": "tests",
+            "prompt": "run them",
+            "request_budget": {"tranche": 40, "hard_cap": 96},
+            "model": "model-a",
+            "provider": "provider-a",
+            "workflow": "deeper",
+            "workflow_trigger": "dependent_phases",
+            "parent_slot": "implementation",
+            "workflow_author": true,
+            "agent_type": "verifier"
+        }),
+    ] {
+        let protocol = SpawnSubagentArguments::from_tool_args(expected.clone())
+            .expect("shared arguments validate");
+        let tool = SpawnSubagent::from_tool_args(expected.clone()).expect("tool validates");
+        assert_eq!(
+            serde_json::to_value(&protocol).expect("protocol value"),
+            expected
+        );
+        assert_eq!(tool.arguments().expect("tool value"), expected);
+        let inverse: SpawnSubagentArguments =
+            serde_json::from_value(tool.arguments().expect("tool value")).expect("inverse");
+        assert_eq!(inverse, protocol);
+    }
+}
+
+#[test]
+fn shared_spawn_validation_preserves_serde_error_names_and_tool_error_class() {
+    use haider_protocol::spawn_subagent::SpawnSubagentArguments;
+    use haider_tools::ToolError;
+
+    // The public tool type is still the old serde vocabulary. In particular,
+    // malformed sequences must not expose the shared struct's Rust name.
+    for invalid in [
+        serde_json::Value::Null,
+        serde_json::json!(true),
+        serde_json::json!("invalid"),
+        serde_json::json!([]),
+        serde_json::json!({"task": "tests"}),
+        serde_json::json!({"task": 7, "prompt": "run"}),
+        serde_json::json!({"task": "tests", "prompt": "run", "workflow": "invalid"}),
+    ] {
+        let old_serde_error = serde_json::from_value::<SpawnSubagent>(invalid.clone())
+            .expect_err("the tool's serde vocabulary rejects this input");
+        let expected = format!("invalid spawn_subagent arguments: {old_serde_error}");
+        assert_eq!(
+            SpawnSubagentArguments::from_tool_args(invalid.clone()).expect_err("protocol rejects"),
+            expected,
+        );
+        assert_eq!(
+            SpawnSubagent::from_tool_args(invalid).expect_err("tool rejects"),
+            ToolError::InvalidArgument { message: expected },
+        );
+    }
+
+    for (invalid, expected) in [
+        (
+            serde_json::json!({"task": " ", "prompt": "run"}),
+            "spawn_subagent task must contain 1..=80 bytes",
+        ),
+        (
+            serde_json::json!({"task": "tests", "prompt": " "}),
+            "spawn_subagent prompt must contain 1..=32768 bytes",
+        ),
+        (
+            serde_json::json!({"task": "tests", "prompt": "run", "provider": "p"}),
+            "spawn_subagent `provider` only disambiguates a `model` — name the model",
+        ),
+        (
+            serde_json::json!({"task": "tests", "prompt": "run", "agent_type": " "}),
+            "spawn_subagent agent_type must contain 1..=128 bytes when given",
+        ),
+    ] {
+        assert_eq!(
+            SpawnSubagentArguments::from_tool_args(invalid.clone()).expect_err("protocol rejects"),
+            expected,
+        );
+        assert_eq!(
+            SpawnSubagent::from_tool_args(invalid).expect_err("tool rejects"),
+            ToolError::InvalidArgument {
+                message: expected.into()
+            },
+        );
+    }
+}

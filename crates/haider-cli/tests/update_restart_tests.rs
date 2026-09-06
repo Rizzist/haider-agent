@@ -3,11 +3,12 @@
 #![allow(clippy::expect_used)]
 #![allow(dead_code)]
 
-#[path = "../src/main.rs"]
+#[path = "../src/lib.rs"]
 mod cli_main;
 
 use cli_main::update::UpdateError;
 use cli_main::update::discovery::{CurlTransport, ReleaseSelection, SemVersion};
+use cli_main::update::members::BUNDLE_MEMBERS;
 use cli_main::update::restart::{
     RestartHooks, detect_incumbent, restart_committed, restart_committed_for_test,
 };
@@ -52,9 +53,9 @@ impl InstalledPairVerifier for DigestVerifier {
         layout: &InstallLayout,
         pair: &cli_main::update::staging::VerifiedStagedPair,
     ) -> Result<(), UpdateError> {
-        if sha256_file(&layout.haider)? == pair.haider_digest()
-            && sha256_file(&layout.haiderd)? == pair.haiderd_digest()
-        {
+        if BUNDLE_MEMBERS.into_iter().all(|member| {
+            sha256_file(layout.path(member)).is_ok_and(|digest| digest == pair.digest(member))
+        }) {
             Ok(())
         } else {
             Err(UpdateError::Internal("fixture pair digest mismatch".into()))
@@ -76,7 +77,9 @@ impl RestartHooks for SpyRestartHooks {
             .map_err(|error| UpdateError::io("restart spy read daemon", error))?;
         let cli = fs::read(&committed.layout().haider)
             .map_err(|error| UpdateError::io("restart spy read CLI", error))?;
-        if daemon != b"new-daemon" || cli != b"new-cli" {
+        let tui = fs::read(&committed.layout().haider_tui)
+            .map_err(|error| UpdateError::io("restart spy read payload", error))?;
+        if daemon != b"new-daemon" || cli != b"new-cli" || tui != b"new-tui" {
             return Err(UpdateError::Internal(
                 "restart spy observed anything other than the new pair".into(),
             ));
@@ -208,9 +211,9 @@ async fn truncated_archive_http_leaves_pair_and_live_daemon_unchanged() {
     let target = fixture_target();
     let selection = ReleaseSelection {
         version: SemVersion::parse("9.0.0").expect("target version"),
-        archive_name: format!("haider-v9.0.0-{target}.tar.xz"),
+        archive_name: format!("haider-v9.0.0-{target}-split.tar.xz"),
         archive_url: format!("http://{address}/archive"),
-        checksum_name: format!("haider-v9.0.0-{target}.tar.xz.sha256"),
+        checksum_name: format!("haider-v9.0.0-{target}-split.tar.xz.sha256"),
         checksum_url: format!("http://{address}/checksum"),
     };
     let mut transport = CurlTransport::without_token();
@@ -263,6 +266,7 @@ async fn real_daemon_drains_once_releases_lock_and_restarts_exact_version() {
     let pair = verified_pair_for_test(
         &fixture.layout.dir,
         &fixture.source_haider,
+        &fixture.source_haider_tui,
         &fixture.source_haiderd,
         env!("CARGO_PKG_VERSION"),
     )
@@ -314,6 +318,7 @@ async fn no_daemon_case_commits_and_remains_stopped() {
     let pair = verified_pair_for_test(
         &fixture.layout.dir,
         &fixture.source_haider,
+        &fixture.source_haider_tui,
         &fixture.source_haiderd,
         env!("CARGO_PKG_VERSION"),
     )
@@ -350,6 +355,7 @@ async fn health_version_mismatch_stops_child_rolls_back_pair_and_restarts_old() 
     let pair = verified_pair_for_test(
         &fixture.layout.dir,
         &fixture.source_haider,
+        &fixture.source_haider_tui,
         &fixture.source_haiderd,
         "9.0.0",
     )
@@ -391,6 +397,7 @@ struct RestartFixture {
     layout: InstallLayout,
     profile: ResolvedProfile,
     source_haider: PathBuf,
+    source_haider_tui: PathBuf,
     source_haiderd: PathBuf,
 }
 
@@ -402,9 +409,15 @@ impl RestartFixture {
         fs::set_permissions(&install, fs::Permissions::from_mode(0o700)).expect("chmod install");
         let source_haider = PathBuf::from(env!("CARGO_BIN_EXE_haider"));
         let source_haiderd = ensure_haiderd_built();
+        // Only the real daemon is executed by these restart fixtures. Payload
+        // byte identity is independently tracked through commit and rollback;
+        // its exact version smoke is covered by the staging tests.
+        let source_haider_tui = root.path().join("source-haider-tui");
+        write_executable_bytes(&source_haider_tui, b"fixture-tui");
         let layout = InstallLayout::for_test(install);
         copy_executable(&source_haider, &layout.haider);
         copy_executable(&source_haiderd, &layout.haiderd);
+        copy_executable(&source_haider_tui, &layout.haider_tui);
         let profile = haider_client::resolve_profile(&haider_client::ProfileEnv {
             profile_dir: Some(root.path().join("profile")),
             home: None,
@@ -419,6 +432,7 @@ impl RestartFixture {
             layout,
             profile,
             source_haider,
+            source_haider_tui,
             source_haiderd,
         }
     }
@@ -764,15 +778,18 @@ fn install_fixture_bytes() -> tempfile::TempDir {
     let install = tempfile::tempdir().expect("byte install fixture");
     write_executable_bytes(&install.path().join("haider"), b"old-cli");
     write_executable_bytes(&install.path().join("haiderd"), b"old-daemon");
+    write_executable_bytes(&install.path().join("haider-tui"), b"old-tui");
     install
 }
 
 fn verified_pair_bytes(install: &Path) -> cli_main::update::staging::VerifiedStagedPair {
     let source_cli = install.join("source-haider");
     let source_daemon = install.join("source-haiderd");
+    let source_tui = install.join("source-haider-tui");
     write_executable_bytes(&source_cli, b"new-cli");
     write_executable_bytes(&source_daemon, b"new-daemon");
-    verified_pair_for_test(install, &source_cli, &source_daemon, "9.0.0")
+    write_executable_bytes(&source_tui, b"new-tui");
+    verified_pair_for_test(install, &source_cli, &source_tui, &source_daemon, "9.0.0")
         .expect("verified byte pair")
 }
 
@@ -864,12 +881,14 @@ async fn read_fake_frames(
 struct PairSnapshot {
     cli: (Vec<u8>, u32, u64),
     daemon: (Vec<u8>, u32, u64),
+    tui: (Vec<u8>, u32, u64),
 }
 
 fn pair_snapshot(layout: &InstallLayout) -> PairSnapshot {
     PairSnapshot {
         cli: file_snapshot(&layout.haider),
         daemon: file_snapshot(&layout.haiderd),
+        tui: file_snapshot(&layout.haider_tui),
     }
 }
 

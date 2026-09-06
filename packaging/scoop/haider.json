@@ -23,13 +23,24 @@
   "autoupdate": {
     "architecture": {
       "64bit": {
-        "url": "https://github.com/Rizzist/haider-agent/releases/download/v$version/haider-v$version-x86_64-pc-windows-msvc.zip",
-        "extract_dir": "haider-v$version-x86_64-pc-windows-msvc"
+        "url": "https://github.com/Rizzist/haider-agent/releases/download/v$version/haider-v$version-x86_64-pc-windows-msvc-split.zip",
+        "extract_dir": "haider-v$version-x86_64-pc-windows-msvc-split"
       }
     },
     "hash": {
       "url": "$url.sha256",
       "regex": "([a-fA-F0-9]{64})"
     }
-  }
+  },
+  "pre_install": [
+    "$binaries = @('haider.exe', 'haiderd.exe')",
+    "if ($manifest.architecture.'64bit'.url -match '-split\\.zip$') { $binaries += 'haider-tui.exe' }",
+    "foreach ($binary in $binaries) {",
+    "    $path = Join-Path $dir $binary",
+    "    if (!(Test-Path $path -PathType Leaf)) { throw \"Release archive did not contain $binary\" }",
+    "    $actual = (& $path --version | Out-String).Trim()",
+    "    $product = $binary -replace '\\.exe$', ''",
+    "    if ($LASTEXITCODE -ne 0 -or $actual -cne \"$product $version\") { throw \"Release sibling version mismatch: $binary reported $actual\" }",
+    "}"
+  ]
 }

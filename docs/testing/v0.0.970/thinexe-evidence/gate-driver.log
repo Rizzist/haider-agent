@@ -1,0 +1,32 @@
+START prebuild-siblings: cargo build --locked -p haider-cli -p haider-daemond -p haider-tui-exe -p haider-tools --bins
+END prebuild-siblings: PASS exit=0
+START test-count: cargo run -q -p xtask -- test-count --update
+END test-count: PASS exit=0
+START regenerate-goldens: cargo test -q -p haider-cli --test turnhygiene_pin_tests golden -- --test-threads=1
+END regenerate-goldens: PASS exit=0
+START instruct-pipe-pin: cargo test -q -p haider-daemon --lib instruct_pipe_shrinks_the_advertised_wire_pack -- --nocapture
+END instruct-pipe-pin: PASS exit=0
+START workspace-tests: cargo test -q --workspace --no-fail-fast
+Traceback (most recent call last):
+  File "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/run-gates.py", line 58, in <module>
+    run("workspace-tests", ["cargo", "test", "-q", "--workspace", "--no-fail-fast"])
+    ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/rizzist/haider-run/lane-970-thinexe/tmp/thinexe/run-gates.py", line 34, in run
+    result = subprocess.run(command, cwd=ROOT, env=dict(ENV, **(extra or {})),
+                            stdout=log, stderr=subprocess.STDOUT)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 557, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 1213, in communicate
+    self.wait()
+    ~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 1279, in wait
+    return self._wait(timeout=timeout)
+           ~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 2084, in _wait
+    (pid, sts) = self._try_wait(0)
+                 ~~~~~~~~~~~~~~^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 2042, in _try_wait
+    (pid, sts) = os.waitpid(self.pid, wait_flags)
+                 ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

@@ -1,0 +1,11 @@
+Auto-merging Cargo.lock
+Auto-merging crates/haider-cli/src/export.rs
+Auto-merging crates/haider-cli/src/main.rs
+CONFLICT (content): Merge conflict in crates/haider-cli/src/main.rs
+Auto-merging crates/haider-client/src/lib.rs
+Auto-merging crates/haider-core/src/actor.rs
+Auto-merging scripts/qa-gate/CI_REGISTRY_WALK_QAGATE3.md
+CONFLICT (content): Merge conflict in scripts/qa-gate/CI_REGISTRY_WALK_QAGATE3.md
+Auto-merging test-baseline.txt
+CONFLICT (content): Merge conflict in test-baseline.txt
+Automatic merge failed; fix conflicts and then commit the result.
