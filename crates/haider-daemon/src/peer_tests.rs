@@ -165,6 +165,7 @@ fn descriptor(id: &str, name: &str) -> PeerDescriptor {
     }
 }
 
+#[cfg(unix)]
 fn message(trust: PeerTrust) -> PeerMessage {
     let queued_at: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
