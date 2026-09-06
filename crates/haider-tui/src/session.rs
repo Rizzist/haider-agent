@@ -836,6 +836,9 @@ pub fn route_permission_event(projection: &mut SessionProjection, envelope: &Raw
 /// Route the additive workspace event union without treating it as a client /
 /// daemon compatibility mismatch.
 pub fn route_workspace_event(projection: &mut SessionProjection, envelope: &RawEnvelope) -> bool {
+    if projection.apply_prompt_retraction(&envelope.payload) {
+        return true;
+    }
     let Some(payload) =
         haider_protocol::workspace::WorkspaceEventPayload::from_payload_value(&envelope.payload)
     else {

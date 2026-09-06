@@ -200,6 +200,13 @@ impl SessionExport {
     /// not a raw journal dump). Envelopes are read in `seq` order.
     #[must_use]
     pub fn project(meta: ExportMeta, events: &[RawEnvelope]) -> Self {
+        let hidden_nodes: std::collections::HashSet<_> = events
+            .iter()
+            .filter_map(|event| {
+                haider_protocol::retraction::PromptRetractedV1::from_payload_value(&event.payload)
+                    .map(|fact| fact.prompt_node_id)
+            })
+            .collect();
         let mut ordered: Vec<&RawEnvelope> = events.iter().collect();
         ordered.sort_by_key(|envelope| envelope.seq);
         let head_seq = ordered.last().map_or(0, |envelope| envelope.seq);
@@ -215,44 +222,46 @@ impl SessionExport {
             let at_ms = envelope.committed_at_ms;
             let seq = envelope.seq;
             match payload {
-                EventPayload::NodeCommitted(node) => match node.kind {
-                    NodeKind::UserTurn { text, .. } => {
-                        turns.push(Turn::User { text, at_ms, seq });
-                    }
-                    NodeKind::AssistantCommit { text, .. } => {
-                        turns.push(Turn::Assistant { text, at_ms, seq });
-                    }
-                    NodeKind::ToolExchange { tool, summary, .. } => {
-                        let pending_key = tool_join.as_ref().and_then(|join| {
-                            join.result.is_none().then(|| {
-                                (
-                                    envelope
-                                        .branch_id
-                                        .as_ref()
-                                        .map(|branch| branch.as_str().to_owned()),
-                                    envelope.run_id.as_ref().map(|run| run.as_str().to_owned()),
-                                    join.call_id.clone(),
-                                )
-                            })
-                        });
-                        turns.push(Turn::Tool {
-                            name: tool,
-                            summary,
-                            args_preview: tool_join
-                                .as_ref()
-                                .and_then(haider_protocol::pipe::ToolExchangeJoin::args_preview),
-                            result_preview: tool_join
-                                .as_ref()
-                                .and_then(haider_protocol::pipe::ToolExchangeJoin::result_preview),
-                            at_ms,
-                            seq,
-                        });
-                        if let Some(key) = pending_key {
-                            pending_tools.insert(key, turns.len() - 1);
+                EventPayload::NodeCommitted(node) if !hidden_nodes.contains(&node.node) => {
+                    match node.kind {
+                        NodeKind::UserTurn { text, .. } => {
+                            turns.push(Turn::User { text, at_ms, seq });
                         }
+                        NodeKind::AssistantCommit { text, .. } => {
+                            turns.push(Turn::Assistant { text, at_ms, seq });
+                        }
+                        NodeKind::ToolExchange { tool, summary, .. } => {
+                            let pending_key = tool_join.as_ref().and_then(|join| {
+                                join.result.is_none().then(|| {
+                                    (
+                                        envelope
+                                            .branch_id
+                                            .as_ref()
+                                            .map(|branch| branch.as_str().to_owned()),
+                                        envelope.run_id.as_ref().map(|run| run.as_str().to_owned()),
+                                        join.call_id.clone(),
+                                    )
+                                })
+                            });
+                            turns.push(Turn::Tool {
+                                name: tool,
+                                summary,
+                                args_preview: tool_join.as_ref().and_then(
+                                    haider_protocol::pipe::ToolExchangeJoin::args_preview,
+                                ),
+                                result_preview: tool_join.as_ref().and_then(
+                                    haider_protocol::pipe::ToolExchangeJoin::result_preview,
+                                ),
+                                at_ms,
+                                seq,
+                            });
+                            if let Some(key) = pending_key {
+                                pending_tools.insert(key, turns.len() - 1);
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                },
+                }
                 EventPayload::Item(ItemEvent::Completed {
                     item: TurnItem::IncompleteAgentMessage { text, interruption },
                     ..
@@ -309,6 +318,18 @@ impl SessionExport {
             .title
             .as_deref()
             .map(|title| apply_mask(title, masked))
+    }
+
+    fn transcript_projector(&self) -> TranscriptProjector {
+        let hidden_nodes = self
+            .envelopes
+            .iter()
+            .filter_map(|event| {
+                haider_protocol::retraction::PromptRetractedV1::from_payload_value(&event.payload)
+                    .map(|fact| fact.prompt_node_id.as_str().to_owned())
+            })
+            .collect();
+        TranscriptProjector::with_retracted_prompt_nodes(hidden_nodes)
     }
 
     fn text<T: std::fmt::Display + ?Sized>(&self, raw: &T, masked: bool) -> String {
@@ -380,7 +401,7 @@ impl SessionExport {
             escape_pipe_field(&self.title(masked).unwrap_or_default()),
         ));
         if !masked {
-            let mut projector = TranscriptProjector::default();
+            let mut projector = self.transcript_projector();
             for envelope in &self.envelopes {
                 lines.extend(
                     projector
@@ -559,7 +580,7 @@ impl SessionExport {
                 turns: T,
             }
 
-            let mut projector = TranscriptProjector::default();
+            let mut projector = self.transcript_projector();
             let mut turns = Vec::new();
             for envelope in &self.envelopes {
                 turns.extend(

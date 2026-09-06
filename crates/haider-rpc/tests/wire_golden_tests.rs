@@ -8,7 +8,10 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use common::{TEST_FRAME_LIMIT, account_source_transcript, provider_rebind_transcript, transcript};
+use common::{
+    TEST_FRAME_LIMIT, account_source_transcript, provider_rebind_transcript, transcript,
+    turn_retract_transcript,
+};
 use haider_protocol::session::SessionPermissionOverridesV1;
 use haider_rpc::{
     AccountAddMethod, CancelStatus, DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED,
@@ -800,6 +803,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "transcription.secret_get",
         "transcription.secret_set",
         "turn.cancel",
+        "turn.retract",
         "turn.submit",
         "turn.submit_from_cli",
         "turn.submit_with_hook_trust",
@@ -818,8 +822,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        133,
-        "126 pre-v0.0.970 methods plus four account source registry methods, monitor.mutate, provider rebind and custom model probes"
+        134,
+        "126 pre-v0.0.970 methods plus four account source registry methods, monitor.mutate, provider rebind, custom model probes and turn.retract"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -833,6 +837,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .into_iter()
         .chain(account_source_transcript())
         .chain(provider_rebind_transcript())
+        .chain(turn_retract_transcript())
     {
         match frame {
             WireFrame::Request { request_id, body } => {
@@ -857,8 +862,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     }
     assert_eq!(
         covered.len(),
-        65,
-        "60 pre-v0.0.970 request pairs plus four account source registry pairs and provider rebind"
+        66,
+        "60 pre-v0.0.970 request pairs plus four account source registry pairs, provider rebind and turn.retract"
     );
 
     let fixture: ContractMethodFixture = serde_json::from_str(
@@ -6075,4 +6080,29 @@ fn customprov_models_probe_is_feature_gated_and_has_no_durable_or_secret_fields(
     assert_eq!(encoded["method"], "provider.models_probe");
     assert!(encoded.get("revision").is_none());
     assert!(encoded.get("secret").is_none());
+}
+
+#[test]
+fn turn_retract_request_receipt_and_too_late_are_golden() {
+    let frames = turn_retract_transcript();
+    let mut actual = serde_json::to_string_pretty(&frames).expect("serialize retract frames");
+    actual.push('\n');
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/turn_retract_wire.json");
+    if std::env::var("UPDATE_FIXTURES").is_ok() {
+        std::fs::write(&path, &actual).expect("write retract fixture");
+    }
+    let golden = std::fs::read_to_string(path)
+        .expect("generate retract fixture with UPDATE_FIXTURES=1")
+        .replace("\r\n", "\n");
+    assert_eq!(actual, golden);
+    let decoded: Vec<WireFrame> = serde_json::from_str(&golden).expect("decode retract fixture");
+    assert_eq!(decoded, frames);
+    let WireFrame::Request { body, .. } = &frames[0] else {
+        panic!("first frame must be request");
+    };
+    assert_eq!(
+        body.additive_shape_feature(),
+        Some(haider_rpc::FEATURE_TURN_RETRACT_V1)
+    );
 }

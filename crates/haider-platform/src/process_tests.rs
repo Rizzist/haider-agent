@@ -225,29 +225,93 @@ fn timed_out_child_wait_does_not_pin_runtime_shutdown() {
     );
 }
 
-/// MUTATION CHECK: replace the armed kqueue wait with a 50 ms polling
-/// backoff. Expected RUNTIME failure: a five-millisecond command cannot be
-/// observed before this bound, producing the forbidden tenfold wall delay.
+/// MUTATION CHECK: replace either armed kqueue wait with a 50 ms Tokio
+/// polling backoff. The observer must deliver the exit without advancing the
+/// paused clock, so that mutation cannot reach even its first poll.
 #[cfg(target_os = "macos")]
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn armed_kqueue_observes_a_short_command_without_coarse_backoff() {
-    let mut child = tokio::process::Command::new("/bin/sleep")
-        .arg("0.005")
+    use std::future::{Future as _, poll_fn};
+    use std::task::Poll;
+
+    // EOF releases a single short-lived child only after both observers are
+    // armed. Unlike `sleep 0.005`, this cannot exit during fixture setup on a
+    // loaded runner, or let an already-exited probe bypass the kqueue path.
+    let mut child = tokio::process::Command::new("/bin/cat")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .expect("spawn short kqueue fixture");
+    let gate = child.stdin.take().expect("retain child exit gate");
     let pid = super::process_id(child.id()).expect("short fixture pid");
     let retained = super::ProcessExitMonitor::capture(pid)
         .expect("arm retained process identity while child is live");
-    tokio::time::timeout(
-        std::time::Duration::from_millis(50),
-        super::observe_process_leader_exit(pid),
-    )
-    .await
-    .expect("armed kqueue must beat a 50 ms replacement backoff")
-    .expect("observe short fixture exit");
-    tokio::time::timeout(std::time::Duration::from_millis(50), retained.wait())
-        .await
-        .expect("retained kqueue must observe the same short exit")
-        .expect("wait for retained short fixture exit");
-    child.wait().await.expect("reap short kqueue fixture");
+
+    // Registry #94: watchdog = 30s notification-repair interval / 2 = 15s.
+    // It bounds OS scheduling and event delivery strictly before the first
+    // kernel repair poll; it is not a command-latency claim. Start it before
+    // polling either future, so a late waiter thread cannot earn extra time.
+    let watchdog = super::NOTIFICATION_REPAIR_INTERVAL / 2;
+    let wall_started = std::time::Instant::now();
+    let virtual_started = tokio::time::Instant::now();
+    let mut observer = std::pin::pin!(super::observe_process_leader_exit(pid));
+    let mut retained = std::pin::pin!(retained.wait());
+    poll_fn(|cx| {
+        assert!(observer.as_mut().poll(cx).is_pending(), "leader is gated");
+        assert!(retained.as_mut().poll(cx).is_pending(), "peer is gated");
+        Poll::Ready(())
+    })
+    .await;
+    drop(gate);
+
+    let mut observed = None;
+    let mut retained_observed = None;
+    let delivered = poll_fn(|cx| {
+        if wall_started.elapsed() >= watchdog {
+            return Poll::Ready(false);
+        }
+        if observed.is_none()
+            && let Poll::Ready(result) = observer.as_mut().poll(cx)
+        {
+            observed = Some(result);
+        }
+        if retained_observed.is_none()
+            && let Poll::Ready(result) = retained.as_mut().poll(cx)
+        {
+            retained_observed = Some(result);
+        }
+        if observed.is_some() && retained_observed.is_some() {
+            return Poll::Ready(true);
+        }
+        // A runnable task prevents Tokio's paused clock from auto-advancing.
+        // Real kernel notifications still wake the two oneshot receivers;
+        // any timer-based fallback remains pending, including the 50ms mutant.
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await;
+    let virtual_elapsed = virtual_started.elapsed();
+    let wall_elapsed = wall_started.elapsed();
+    // A deschedule inside the poll closure must not let a later kernel repair
+    // satisfy the event-delivery proof after the watchdog was last checked.
+    let delivered = delivered && wall_elapsed < watchdog;
+    if !delivered {
+        child.start_kill().expect("kill stalled kqueue fixture");
+    }
+    let status = child.wait().await.expect("reap short kqueue fixture");
+    assert!(
+        delivered,
+        "kqueue delivery before repair: leader={observed:?}, retained={retained_observed:?}, \
+         child={status}, wall={wall_elapsed:?}, virtual={virtual_elapsed:?}, watchdog={watchdog:?}"
+    );
+    assert!(status.success(), "EOF child must exit successfully");
+    observed
+        .expect("leader delivery")
+        .expect("leader exit event");
+    retained_observed
+        .expect("retained delivery")
+        .expect("retained exit event");
+    assert_eq!(virtual_elapsed, std::time::Duration::ZERO);
 }

@@ -121,7 +121,7 @@ impl CurlTransport {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn with_request_observer_for_test(
         mut self,
         observer: Arc<dyn Fn(CurlRequestObservation) + Send + Sync>,

@@ -340,6 +340,7 @@ pub enum ErrorCode {
     // session / run lifecycle
     SessionNotFound,
     RunNotActive,
+    TooLate,
     MenuNotFound,
     MenuAlreadyAnswered,
     SingleWriterViolation,
@@ -392,6 +393,7 @@ impl ErrorCode {
             Self::CredentialLimited => "credential_limited",
             Self::SessionNotFound => "session_not_found",
             Self::RunNotActive => "run_not_active",
+            Self::TooLate => "too_late",
             Self::MenuNotFound => "menu_not_found",
             Self::MenuAlreadyAnswered => "menu_already_answered",
             Self::SingleWriterViolation => "single_writer_violation",
@@ -433,6 +435,7 @@ impl ErrorCode {
             Self::CredentialLimited => "credential-limited",
             Self::SessionNotFound => "session-not-found",
             Self::RunNotActive => "run-not-active",
+            Self::TooLate => "too-late",
             Self::MenuNotFound => "menu-not-found",
             Self::MenuAlreadyAnswered => "menu-already-answered",
             Self::SingleWriterViolation => "single-writer-violation",

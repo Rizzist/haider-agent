@@ -434,3 +434,126 @@ async fn idle_compaction_keeps_cross_run_prefix_and_replays_only_the_new_suffix(
         })
     }));
 }
+
+/// MUTATION: omit the retraction fact index or preserve a pre-retraction
+/// compiled prefix. The next request must never resurrect the editable draft,
+/// including after the cache evicts the original journal bodies.
+#[tokio::test]
+async fn retracted_prompt_is_excluded_from_cold_warm_compacted_and_evicted_history() {
+    use haider_protocol::retraction::PromptRetractedV1;
+    for cache_mode in ["cold", "warm", "compacted", "evicted"] {
+        let store = MemoryStore::new();
+        let session = SessionId::new(format!("retraction-history-{cache_mode}"));
+        let first_run = RunId::new("retraction-history-first");
+        let next_run = RunId::new("retraction-history-next");
+        let mut user = pressure_envelope(&session, 1);
+        user.run_id = Some(first_run.clone());
+        user.render.prompt = PromptRender::Verbatim;
+        *user.payload = serde_json::to_value(EventPayload::UserMessage {
+            text: "draft that must leave history".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+        })
+        .expect("first user");
+        let mut user_node = pressure_envelope(&session, 2);
+        user_node.run_id = Some(first_run.clone());
+        *user_node.payload = serde_json::to_value(EventPayload::NodeCommitted(TreeNode {
+            node: NodeId::new("retract-user-node"),
+            parent: None,
+            kind: NodeKind::UserTurn {
+                text: "draft that must leave history".into(),
+                attachments: Vec::new(),
+            },
+        }))
+        .expect("first node");
+        let mut accepted = [user, user_node];
+        store.append(&mut accepted).await.expect("accepted prompt");
+        let cache = PromptHistoryCache::default();
+        if cache_mode != "cold" {
+            let initial = cache
+                .compile_provider_projection_with_artifacts(
+                    &store,
+                    &NoArtifacts,
+                    &session,
+                    None,
+                    None,
+                    &first_run,
+                )
+                .await
+                .expect("initial history");
+            assert_eq!(initial.messages.len(), 1);
+            if cache_mode == "compacted" {
+                cache.compact_session_history(&session).await;
+            }
+            if cache_mode == "evicted" {
+                cache.evict_session_bodies(&session).await;
+            }
+        }
+        let mut fact = pressure_envelope(&session, 3);
+        fact.run_id = Some(first_run.clone());
+        *fact.payload = PromptRetractedV1 {
+            prompt_seq: accepted[0].seq,
+            prompt_node_id: NodeId::new("retract-user-node"),
+            text: "draft that must leave history".into(),
+            attachments: Vec::new(),
+        }
+        .to_payload_value()
+        .expect("retraction fact");
+        let mut terminal = pressure_envelope(&session, 4);
+        terminal.run_id = Some(first_run.clone());
+        *terminal.payload =
+            serde_json::json!({"type":"run_state", "state":"cancelled", "reason":"retracted"});
+        let mut next_user = pressure_envelope(&session, 5);
+        next_user.run_id = Some(next_run.clone());
+        next_user.render.prompt = PromptRender::Verbatim;
+        *next_user.payload = serde_json::to_value(EventPayload::UserMessage {
+            text: "edited replacement".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+        })
+        .expect("replacement user");
+        let mut next_node = pressure_envelope(&session, 6);
+        next_node.run_id = Some(next_run.clone());
+        *next_node.payload = serde_json::to_value(EventPayload::NodeCommitted(TreeNode {
+            node: NodeId::new("replacement-user-node"),
+            parent: Some(NodeId::new("retract-user-node")),
+            kind: NodeKind::UserTurn {
+                text: "edited replacement".into(),
+                attachments: Vec::new(),
+            },
+        }))
+        .expect("replacement node");
+        store
+            .append(&mut [fact, terminal, next_user, next_node])
+            .await
+            .expect("retract and replace");
+        let projection = cache
+            .compile_provider_projection_with_artifacts(
+                &store,
+                &NoArtifacts,
+                &session,
+                None,
+                None,
+                &next_run,
+            )
+            .await
+            .expect("replacement history");
+        assert_eq!(
+            projection.messages,
+            vec![Message::user_text("edited replacement")],
+            "{cache_mode}"
+        );
+        let cold = PromptHistoryCache::default()
+            .compile_provider_projection_with_artifacts(
+                &store,
+                &NoArtifacts,
+                &session,
+                None,
+                None,
+                &next_run,
+            )
+            .await
+            .expect("cold parity");
+        assert_eq!(projection, cold, "{cache_mode}");
+    }
+}

@@ -1,0 +1,210 @@
+{
+  "merged_head": "620fc1ce2faf0344c2d27c172fabe2c2f99bd253",
+  "libtest_summaries": 341,
+  "summed_passes": 5463,
+  "failures": 0,
+  "ignored": 13,
+  "source_test_baseline": 5033,
+  "commands": {
+    "workspace-test": {
+      "command": [
+        "cargo",
+        "test",
+        "-q",
+        "--workspace",
+        "--no-fail-fast"
+      ],
+      "env": {
+        "RUST_MIN_STACK": "8388608",
+        "HAIDER_DISCOVERY_DISABLED": "1",
+        "HAIDER_TEST_DEVICE_NAME": "test-mac",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_BUILD_JOBS": "2",
+        "TMPDIR": "/tmp",
+        "RUST_TEST_THREADS": "4",
+        "HAIDER_TEST_SIBLINGS_PREBUILT": "1"
+      },
+      "exit": 0,
+      "elapsed_s": 3232.938328027725,
+      "disk_mib_before": 13108
+    },
+    "workspace-clippy": {
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--tests",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "env": {
+        "RUST_MIN_STACK": "8388608",
+        "HAIDER_DISCOVERY_DISABLED": "1",
+        "HAIDER_TEST_DEVICE_NAME": "test-mac",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_BUILD_JOBS": "2",
+        "TMPDIR": "/tmp",
+        "RUST_TEST_THREADS": "4",
+        "HAIDER_TEST_SIBLINGS_PREBUILT": "1"
+      },
+      "exit": 0,
+      "elapsed_s": 2427.4260289669037,
+      "disk_mib_before": 11692
+    },
+    "windows-cli-clippy-sdk-writable": {
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "haider-cli",
+        "--all-targets",
+        "--target",
+        "x86_64-pc-windows-msvc",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "env": {
+        "RUST_MIN_STACK": "8388608",
+        "HAIDER_DISCOVERY_DISABLED": "1",
+        "HAIDER_TEST_DEVICE_NAME": "test-mac",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_BUILD_JOBS": "2",
+        "TMPDIR": "/tmp",
+        "RUST_TEST_THREADS": "4",
+        "HAIDER_TEST_SIBLINGS_PREBUILT": "1"
+      },
+      "exit": 0,
+      "elapsed_s": 295.3267879486084,
+      "disk_mib_before": 12533
+    },
+    "windows-workspace-check": {
+      "command": [
+        "cargo",
+        "check",
+        "--workspace",
+        "--all-targets",
+        "--target",
+        "x86_64-pc-windows-msvc"
+      ],
+      "env": {
+        "RUST_MIN_STACK": "8388608",
+        "HAIDER_DISCOVERY_DISABLED": "1",
+        "HAIDER_TEST_DEVICE_NAME": "test-mac",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_BUILD_JOBS": "2",
+        "TMPDIR": "/tmp",
+        "RUST_TEST_THREADS": "4",
+        "HAIDER_TEST_SIBLINGS_PREBUILT": "1"
+      },
+      "exit": 0,
+      "elapsed_s": 484.00609827041626,
+      "disk_mib_before": 11856
+    },
+    "windows-workspace-clippy": {
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--target",
+        "x86_64-pc-windows-msvc",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "env": {
+        "RUST_MIN_STACK": "8388608",
+        "HAIDER_DISCOVERY_DISABLED": "1",
+        "HAIDER_TEST_DEVICE_NAME": "test-mac",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_BUILD_JOBS": "2",
+        "TMPDIR": "/tmp",
+        "RUST_TEST_THREADS": "4",
+        "HAIDER_TEST_SIBLINGS_PREBUILT": "1"
+      },
+      "exit": 0,
+      "elapsed_s": 234.65564608573914,
+      "disk_mib_before": 4106
+    },
+    "test-count-update": {
+      "command": [
+        "cargo",
+        "run",
+        "-q",
+        "-p",
+        "xtask",
+        "--",
+        "test-count",
+        "--update"
+      ],
+      "env": {
+        "RUST_MIN_STACK": "8388608",
+        "HAIDER_DISCOVERY_DISABLED": "1",
+        "HAIDER_TEST_DEVICE_NAME": "test-mac",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_BUILD_JOBS": "2",
+        "TMPDIR": "/tmp",
+        "RUST_TEST_THREADS": "4",
+        "HAIDER_TEST_SIBLINGS_PREBUILT": "1"
+      },
+      "exit": 0,
+      "elapsed_s": 0.8964149951934814,
+      "disk_mib_before": 12682
+    },
+    "test-count-verify": {
+      "command": [
+        "cargo",
+        "run",
+        "-q",
+        "-p",
+        "xtask",
+        "--",
+        "test-count"
+      ],
+      "env": {
+        "RUST_MIN_STACK": "8388608",
+        "HAIDER_DISCOVERY_DISABLED": "1",
+        "HAIDER_TEST_DEVICE_NAME": "test-mac",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_BUILD_JOBS": "2",
+        "TMPDIR": "/tmp",
+        "RUST_TEST_THREADS": "4",
+        "HAIDER_TEST_SIBLINGS_PREBUILT": "1"
+      },
+      "exit": 0,
+      "elapsed_s": 3.4770619869232178,
+      "disk_mib_before": 12687
+    },
+    "instruct-pipe-pin": {
+      "command": [
+        "target/debug/deps/haider_daemon-1ae2dc3c343c19a1",
+        "--exact",
+        "permissions_core_tests::instruct_pipe_shrinks_the_advertised_wire_pack",
+        "--nocapture"
+      ],
+      "env": {
+        "RUST_MIN_STACK": "8388608",
+        "HAIDER_DISCOVERY_DISABLED": "1",
+        "HAIDER_TEST_DEVICE_NAME": "test-mac",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_BUILD_JOBS": "2",
+        "TMPDIR": "/tmp",
+        "RUST_TEST_THREADS": "4",
+        "HAIDER_TEST_SIBLINGS_PREBUILT": "1"
+      },
+      "exit": 0,
+      "elapsed_s": 0.10946512222290039,
+      "disk_mib_before": 12689
+    }
+  }
+}

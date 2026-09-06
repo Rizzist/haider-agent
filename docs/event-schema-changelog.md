@@ -527,3 +527,27 @@ new error codes retain the established forward-compatibility behavior.
   and durable replay. Dedicated request-ceiling exit 78 replaces shared 77.
   The prompt-omitted `turn_workspace_before_v1` extension is committed before
   first dispatch. `schema_version` remains 1; legacy events omit these fields.
+
+### v0.0.970 — append-only prompt retraction
+
+- Additive feature `turn_retract_v1` gates receipt-backed RPC `turn.retract`.
+  Its request has the same command/session/run/generation coordinates as
+  `turn.cancel`; the response adds `prompt_seq`, `retracted_seq`, exact `text`,
+  and complete `attachments` for draft restoration. Typed error `too_late`
+  means response began before acceptance; clients fall back to plain cancel
+  on the same run. Existing cancellation methods and SIGINT behavior stay intact.
+- New prompt-omitted supplemental payload `prompt_retracted` carries
+  `prompt_seq` (accepted user-message seq), `prompt_node_id`, `text`, and
+  `attachments`. It commits with the ordinary durable cancelling intent and
+  retraction receipt. The original journal row and attachment CAS objects
+  remain retained. Display and prompt history omit the referenced prompt.
+- New prompt-omitted supplemental `response_started` records the first
+  normalized semantic response in `delta` before item/delta buffering. Empty deltas, finish, usage
+  and network-control events alone do not qualify. If accepted retraction
+  precedes this writer boundary, the same attempted append instead retains
+  `response_delta_discarded` with `delta` and the retracted `prompt_seq`.
+  Discarded content is not response text or provider history.
+- Additive `reason: retracted` on that run's cancelled terminal. The existing
+  terminal discriminator remains `cancellation`; no new terminal kind is added.
+  All these fields are durable and replay byte-for-byte; `schema_version`
+  remains 1. Unknown supplemental payloads retain the raw-envelope law.

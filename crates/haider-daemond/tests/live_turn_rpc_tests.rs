@@ -712,6 +712,25 @@ async fn attach_existing(
     replay
 }
 
+/// The response fence is an additive raw fact outside the closed core union.
+/// Validate its complete semantic boundary before omitting it from helpers
+/// whose return value intentionally contains only core turn-state payloads.
+fn response_boundary_fact(envelope: &RawEnvelope) -> bool {
+    if envelope.payload["type"] != "response_started" {
+        return false;
+    }
+    let delta: haider_protocol::provider::StreamEvent =
+        serde_json::from_value(envelope.payload["delta"].clone())
+            .expect("response boundary retains a typed provider event");
+    assert!(haider_protocol::retraction::is_response_delta(&delta));
+    assert!(envelope.run_id.is_some());
+    assert_eq!(envelope.schema_version, SCHEMA_VERSION);
+    assert!(envelope.render.durable);
+    assert!(!envelope.render.ui);
+    assert_eq!(envelope.render.prompt, PromptRender::Omit);
+    true
+}
+
 async fn events_until_terminal(
     client: &mut UdsClient,
     run_id: &haider_protocol::ids::RunId,
@@ -722,10 +741,11 @@ async fn events_until_terminal(
             if envelope.run_id.as_ref() != Some(run_id) {
                 continue;
             }
-            // Hook-engine facts are documented additive journal extensions,
-            // not turn-state payloads. Ignore only that named family while
-            // retaining strict decoding for every other run-scoped frame.
-            if HookEventPayload::is_engine_fact(&envelope.payload) {
+            // These named additive families are not core turn-state payloads;
+            // retain strict decoding for every other run-scoped frame.
+            if HookEventPayload::is_engine_fact(&envelope.payload)
+                || response_boundary_fact(&envelope)
+            {
                 continue;
             }
             let payload = serde_json::from_value::<EventPayload>(envelope.payload.into())
@@ -2942,6 +2962,7 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
     .await;
 
     let mut events = Vec::new();
+    let mut response_boundaries = Vec::new();
     let mut accepted = None;
     loop {
         match client.next().await {
@@ -2956,10 +2977,13 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
             } => accepted = Some((run_id, accepted_seq)),
             WireFrame::Event { envelope, .. } => {
                 let seq = envelope.seq;
-                // G2: the first accept interleaves ONE additive
-                // session-config fact (the auto-title `session_renamed`),
-                // which is NOT core-EventPayload vocabulary by design.
-                // Everything else must still decode strictly typed.
+                // The auto-title and first-response boundary are documented
+                // additive facts outside the closed core EventPayload union.
+                // Keep them in cursor order and strictly validate the fence.
+                let response_boundary = response_boundary_fact(&envelope);
+                if response_boundary {
+                    response_boundaries.push(envelope.clone());
+                }
                 let payload = match serde_json::from_value::<EventPayload>(
                     envelope.payload.clone().into(),
                 ) {
@@ -2969,8 +2993,8 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
                                 haider_protocol::session::SessionConfigEventPayload::session_renamed_from_value(
                                     &envelope.payload
                                 )
-                                .is_some(),
-                                "only the additive session-config fact may be non-core: {:?}",
+                                .is_some() || response_boundary,
+                                "only the named additive session-config/response facts may be non-core: {:?}",
                                 envelope.payload
                             );
                         None
@@ -2987,6 +3011,11 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
     }
     let (run_id, accepted_seq) = accepted.expect("correlated submit response");
     assert_eq!(accepted_seq, 3);
+    assert_eq!(
+        response_boundaries.len(),
+        1,
+        "one first-response fence per turn"
+    );
     assert_eq!(fake.requests().len(), 1);
     assert_eq!(
         inspections.load(Ordering::SeqCst),
@@ -3065,6 +3094,15 @@ async fn scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds() {
         "natural completion settles non-interrupted Idle"
     );
     let durable = read_session(&mut client, &config, session_id, "full-turn-read").await;
+    assert_eq!(
+        durable
+            .iter()
+            .filter(|envelope| response_boundary_fact(envelope))
+            .cloned()
+            .collect::<Vec<_>>(),
+        response_boundaries,
+        "the additive first-response fence replays without changing any durable field"
+    );
     assert!(durable.iter().enumerate().all(|(index, envelope)| {
         envelope.seq == u64::try_from(index).expect("test index") + 1
     }));
@@ -3195,6 +3233,7 @@ async fn vanished_workspace_degrades_plain_turn_and_workspace_set_replays() {
     let (second_run, _) = next_submit_response(&mut client).await;
     let mut notices = Vec::new();
     let mut core = Vec::new();
+    let mut response_boundaries = 0;
     loop {
         let WireFrame::Event { envelope, .. } = client.next().await else {
             continue;
@@ -3214,14 +3253,22 @@ async fn vanished_workspace_degrades_plain_turn_and_workspace_set_replays() {
             Some("project_instructions_loaded"),
             "unavailable workspace must not journal an empty instruction transition"
         );
+        if response_boundary_fact(&envelope) {
+            response_boundaries += 1;
+            continue;
+        }
         let payload = serde_json::from_value::<EventPayload>(envelope.payload.into())
-            .expect("non-workspace turn event remains core typed");
+            .expect("non-workspace/non-boundary turn event remains core typed");
         let done = payload == EventPayload::RunState(RunState::Done);
         core.push(payload);
         if done {
             break;
         }
     }
+    assert_eq!(
+        response_boundaries, 1,
+        "one response boundary for plain chat"
+    );
     assert_eq!(notices.len(), 1, "exactly one workspace notice per turn");
     let (notice_envelope, WorkspaceEventPayload::WorkspaceUnavailable(unavailable)) = &notices[0]
     else {
@@ -4021,6 +4068,9 @@ async fn scenario_8_wire_cancel_closes_open_items_and_cancelled_is_run_terminal(
         if let WireFrame::Event { envelope, .. } = client.next().await
             && envelope.run_id.as_ref() == Some(&run_id)
         {
+            if response_boundary_fact(&envelope) {
+                continue;
+            }
             let payload = serde_json::from_value::<EventPayload>(envelope.payload.into())
                 .expect("typed event");
             let has_delta = matches!(
@@ -4057,6 +4107,9 @@ async fn scenario_8_wire_cancel_closes_open_items_and_cancelled_is_run_terminal(
                 ..
             } => response_seen = true,
             WireFrame::Event { envelope, .. } if envelope.run_id.as_ref() == Some(&run_id) => {
+                if response_boundary_fact(&envelope) {
+                    continue;
+                }
                 let payload = serde_json::from_value::<EventPayload>(envelope.payload.into())
                     .expect("typed event");
                 let terminal = payload == EventPayload::RunState(RunState::Cancelled);

@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const AUTOMATION_CONTRACT: &str = include_str!("../../../docs/automation-contract-v1.md");
 const CLIENT_CONTRACT: &str = include_str!("../../../docs/client-contract-v1.md");
 const WIRE_TRANSCRIPT: &str = include_str!("fixtures/wire_transcript.json");
+const RETRACTION_WIRE: &str = include_str!("fixtures/turn_retract_wire.json");
 const METHOD_MATRIX: &str = include_str!("fixtures/client_contract_methods_v1.json");
 const CLI_STATUS: &str = include_str!("../../haider-cli/tests/fixtures/observe_status.json");
 const CLI_AGENT_SPAWN: &str = include_str!("../../haider-cli/tests/fixtures/agent_spawn.json");
@@ -58,6 +59,7 @@ fn wire_fixture_values() -> Vec<Value> {
             )
             .expect("wire transcript frame JSON")
         })
+        .chain(serde_json::from_str::<Vec<Value>>(RETRACTION_WIRE).expect("retraction wire JSON"))
         .collect()
 }
 
@@ -122,6 +124,7 @@ fn assert_catalog_coverage(
         "session.diagnostic",
         "turn.submit",
         "turn.cancel",
+        "turn.retract",
         "agent.message",
         "agent.cancel",
         "session.observe",
@@ -168,6 +171,7 @@ fn assert_correlated_wire_examples(
         "session.fork",
         "turn.submit",
         "turn.cancel",
+        "turn.retract",
         "agent.message",
         "agent.cancel",
         "session.observe",
@@ -185,7 +189,7 @@ fn every_automation_contract_json_example_decodes_and_matches_a_golden() {
     let examples = json_examples();
     assert_eq!(
         examples.len(),
-        41,
+        43,
         "the method catalog JSON example inventory changed"
     );
 
@@ -241,7 +245,7 @@ fn every_automation_contract_json_example_decodes_and_matches_a_golden() {
                 assert_wire_variant(tag, &frame, line);
                 assert!(
                     wire_goldens.contains(&value),
-                    "{tag} fence at line {line} is not copied from wire_transcript.json"
+                    "{tag} fence at line {line} is not copied from a wire golden"
                 );
             }
             "body.request" => {

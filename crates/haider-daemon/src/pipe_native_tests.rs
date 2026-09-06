@@ -283,3 +283,105 @@ fn missing_sidecar_does_not_hide_a_non_directory_parent_or_other_io_error() {
     .expect("other I/O failures propagate");
     assert!(error.to_string().contains("denied sentinel"));
 }
+
+#[tokio::test]
+async fn retraction_rebuilds_hot_cold_and_crash_reconciled_transcripts() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let writer = PipeNativeWriter::new(root.path());
+    let session_id = SessionId::new("pipe-retraction");
+    let mut original = Vec::new();
+    for (ordinal, text) in [(1, "remove this draft"), (3, "keep this draft")] {
+        let mut user = state_envelope(&session_id, ordinal);
+        user.payload = serde_json::to_value(EventPayload::UserMessage {
+            text: text.into(),
+            attachments: Vec::new(),
+            mode: haider_protocol::DeliveryMode::Steer,
+        })
+        .expect("user")
+        .into();
+        original.push(user);
+        let mut node = state_envelope(&session_id, ordinal + 1);
+        node.payload = serde_json::to_value(EventPayload::NodeCommitted(TreeNode {
+            node: NodeId::new(format!("node-{ordinal}")),
+            parent: None,
+            kind: NodeKind::UserTurn {
+                text: text.into(),
+                attachments: Vec::new(),
+            },
+        }))
+        .expect("node")
+        .into();
+        original.push(node);
+    }
+    store.append(&mut original).await.expect("original journal");
+    writer
+        .maintain(&store, &session_id, &original, 4)
+        .await
+        .expect("initial view");
+    let path = writer.sidecar_path(&session_id).expect("path");
+    assert!(
+        std::fs::read_to_string(&path)
+            .expect("view")
+            .contains("remove this draft")
+    );
+    let mut fact = state_envelope(&session_id, 5);
+    fact.payload = haider_protocol::retraction::PromptRetractedV1 {
+        prompt_seq: 1,
+        prompt_node_id: NodeId::new("node-1"),
+        text: "remove this draft".into(),
+        attachments: Vec::new(),
+    }
+    .to_payload_value()
+    .expect("fact")
+    .into();
+    let mut facts = [fact];
+    store.append(&mut facts).await.expect("durable retraction");
+    // Simulate a crash after journal commit, before the old writer's wake.
+    let boot_writer = PipeNativeWriter::new(root.path());
+    let mut boot = boot_writer
+        .begin_boot_session(&store, &session_id)
+        .await
+        .expect("boot");
+    let replay = store
+        .read(&session_id, boot.scan_start(), 20)
+        .await
+        .expect("replay");
+    boot.fold_page(&replay).await.expect("boot fold");
+    boot_writer
+        .finish_boot_session(&session_id, boot)
+        .await
+        .expect("adopt");
+    let boot_text = std::fs::read_to_string(&path).expect("boot view");
+    assert!(!boot_text.contains("remove this draft"));
+    assert!(boot_text.contains("keep this draft"));
+    // The old in-memory cursor must also recognize the late retraction wake.
+    writer
+        .maintain(&store, &session_id, &facts, 5)
+        .await
+        .expect("hot retract");
+    let hot_text = std::fs::read_to_string(&path).expect("hot view");
+    assert!(!hot_text.contains("remove this draft"));
+    assert!(hot_text.contains("keep this draft"));
+    std::fs::remove_file(&path).expect("discard derived view");
+    let cold_writer = PipeNativeWriter::new(root.path());
+    cold_writer
+        .maintain(&store, &session_id, &[], 5)
+        .await
+        .expect("cold rebuild");
+    let cold_text = std::fs::read_to_string(&path).expect("cold view");
+    assert!(!cold_text.contains("remove this draft"));
+    assert!(cold_text.contains("keep this draft"));
+    assert_eq!(
+        store
+            .read(&session_id, 0, 20)
+            .await
+            .expect("raw retained")
+            .len(),
+        5
+    );
+    drop(cold_writer);
+    drop(boot_writer);
+    drop(writer);
+    store.close().await.expect("close");
+}

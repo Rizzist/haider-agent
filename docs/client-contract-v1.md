@@ -3679,3 +3679,24 @@ initial wait requires both the exact child's terminal and the parent's
 completed `ChildResult`; fleet state alone is insufficient. Negotiated
 connections continue servicing keepalive during observation. Command timeout
 or disconnect does not transfer daemon work ownership to the client.
+
+### v0.0.970: `turn_retract_v1` / `turn.retract`
+
+The additive `turn_retract_v1` Welcome feature advertises `turn.retract`.
+Request fields are `command_id`, `session_id`, `worker_generation`, `run_id`.
+The method requires Control and a control attachment. Success repeats the
+method/session/run and carries `prompt_seq`, `retracted_seq`, exact `text` and
+complete `attachments`; transport retries retain the same command and run
+identity and recover the durable receipt before live generation routing.
+
+Before the first semantic response, cancellation intent, `prompt_retracted`,
+and its receipt commit atomically. The ordinary worker cancellation drain
+then terminalizes as cancelled with `reason: retracted`. Typed `too_late`
+means the response won the durable writer race. The client retries as one
+ordinary `turn.cancel` for that same run, leaving its transcript intact.
+`haider-client::retraction::TurnRetraction` retains both command identities
+and fallback state across reconnect. Prompt text and attachment CAS references
+are restored from the receipt/fact; transcript and provider-history projections
+omit the referenced original prompt. Raw events are never deleted.
+The [JSONL contract](jsonl-run-contract-v1.md#prompt-retraction-before-response-v00970)
+specifies the additive facts, race, terminal, replay and budget behavior.

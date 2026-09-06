@@ -1272,6 +1272,43 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
+            ActorCommand::RetractTurn { command, completed } => {
+                // The store arbitrates response/retract order and commits
+                // the ordinary cancellation intent plus restoration fact in
+                // one transaction before this existing worker wake fires.
+                let result = store.retract_turn(command).await;
+                if let Ok(haider_store::TurnRetractOutcome::Committed { envelopes, .. }) = &result {
+                    pipe_sidecar.enqueue(envelopes);
+                    if let Some(last) = envelopes.last() {
+                        head = last.seq;
+                        authority_epoch = last.authority_epoch;
+                    }
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    publish(
+                        &mut attachments,
+                        envelopes,
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    if let Some(wake) = worker
+                        .as_ref()
+                        .and_then(|worker| worker.cancellation_wake.as_ref())
+                    {
+                        wake.send_modify(|generation| {
+                            *generation = generation.saturating_add(1);
+                        });
+                    }
+                }
+                let _ = completed.send(result);
+            }
             ActorCommand::WorkerAppend {
                 lease_id,
                 expected_head,

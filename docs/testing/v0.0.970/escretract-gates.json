@@ -1,0 +1,282 @@
+{
+  "schema": "escretract-gates-v1",
+  "recorded_at_utc": "2026-09-06T00:22:12.639886+00:00",
+  "merge_forward": "022ccde3583f5eb3807d084ae69ab33b7af68b16",
+  "host": "macOS arm64",
+  "test_command": "cargo test -p <crate> --no-fail-fast (each of all 17 workspace crates)",
+  "environment": {
+    "RUST_MIN_STACK": "8388608",
+    "HAIDER_DISCOVERY_DISABLED": "1",
+    "HAIDER_TEST_DEVICE_NAME": "test-mac",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_BUILD_JOBS": "2",
+    "HAIDER_TEST_SIBLINGS_PREBUILT": "1",
+    "RUST_TEST_THREADS": "4"
+  },
+  "crates": [
+    {
+      "crate": "haider-platform",
+      "exit_code": 0,
+      "passed": 42,
+      "failed": 0,
+      "ignored": 0,
+      "log_sha256": "86e3bc78a3a3ef40e85bb3792fafdfaae1a0dabe2ff384d272782b3ce69d3398"
+    },
+    {
+      "crate": "haider-protocol",
+      "exit_code": 0,
+      "passed": 178,
+      "failed": 0,
+      "ignored": 0,
+      "log_sha256": "1590315ca7613944d087b52df97a4a457743c66b33696aaa9ee6571391efad4d"
+    },
+    {
+      "crate": "haider-accounts",
+      "exit_code": 0,
+      "passed": 37,
+      "failed": 0,
+      "ignored": 1,
+      "log_sha256": "46dec51393aff81add1403c3b84b00c072a26c50538b7887a19027c10e172123"
+    },
+    {
+      "crate": "haider-core",
+      "exit_code": 0,
+      "passed": 304,
+      "failed": 0,
+      "ignored": 1,
+      "log_sha256": "d9fc0c824c41c65ca40101984e8a1a22f6783edce1d064667a7d52498c6aff35"
+    },
+    {
+      "crate": "haider-pdf",
+      "exit_code": 0,
+      "passed": 11,
+      "failed": 0,
+      "ignored": 0,
+      "log_sha256": "c8e8bab4c06e674eaf9447e33e9a53a87f37ff5f31429a58ca77a8b4efa61a40"
+    },
+    {
+      "crate": "haider-provider",
+      "exit_code": 0,
+      "passed": 403,
+      "failed": 0,
+      "ignored": 7,
+      "log_sha256": "58bad529f7aec4d7ab8c164face7698fbae0c85e1592f5684fe89962ff6aad94"
+    },
+    {
+      "crate": "haider-daemon",
+      "exit_code": 0,
+      "passed": 1201,
+      "failed": 0,
+      "ignored": 3,
+      "log_sha256": "94246c556340c758d000027b97e9dd58dc7326099554e91d8f9a470b539f5f9d",
+      "initial_attempt": {
+        "exit_code": 101,
+        "passed": 1199,
+        "failed": 2,
+        "ignored": 3,
+        "log_sha256": "23f458dd09faeba28db467d96d42579baea827512395329321bf6b963b701614",
+        "failed_tests": [
+          "connection::connection_tests::welcome_features_pin_served_management_families",
+          "context_core_tests::accepted_branch_reaches_worker_history_items_nodes_and_terminal_state"
+        ]
+      }
+    },
+    {
+      "crate": "haider-daemond",
+      "exit_code": 0,
+      "passed": 154,
+      "failed": 0,
+      "ignored": 0,
+      "log_sha256": "a18ae014dcd4f7f44bd38ebd4ac0a5e2a00ffc246a079a1596a18250b3cdb2d1",
+      "initial_attempt": {
+        "exit_code": 101,
+        "passed": 140,
+        "failed": 14,
+        "ignored": 0,
+        "log_sha256": "648fe337552043802112ffd2e12942d0c314359bdbc370e7be60001d61dc297e",
+        "failed_tests": [
+          "file_attachment_is_inlined_with_header_and_never_reaches_the_provider",
+          "compaction_summary_request_carries_no_image_attachments",
+          "injected_fake_turn_runs_through_the_openai_provider_name",
+          "held_effect_reconciles_unknown_before_cancelled",
+          "graceful_drain_parks_a_request_input_checkpoint_for_recovery",
+          "panicked_supervisor_terminalizes_run_and_fresh_incarnation_is_usable",
+          "scenario_12_reasoning_safe_follow_up_cumulative_usage_and_durable_failure",
+          "scenario_10_restart_replays_request_input_without_reexecuting_prior_request",
+          "scenario_3_submit_streams_one_contiguous_durable_turn_over_real_uds",
+          "scenario_5_second_turn_contains_prior_completed_conversation",
+          "scenario_8_wire_cancel_closes_open_items_and_cancelled_is_run_terminal",
+          "vanished_workspace_degrades_plain_turn_and_workspace_set_replays",
+          "w4a1_fs_write_requires_committed_cas_and_session_grant_survives_restart",
+          "w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape"
+        ]
+      },
+      "second_attempt": {
+        "passed": 153,
+        "failed": 1,
+        "ignored": 0,
+        "log_sha256": "5b8754c03fe3b0b2553508859165ddae4a66caaff774e7e57a4d3b5002fa5171",
+        "failed_tests": [
+          "vanished_workspace_degrades_plain_turn_and_workspace_set_replays"
+        ]
+      }
+    },
+    {
+      "crate": "haider-rpc",
+      "exit_code": 0,
+      "passed": 168,
+      "failed": 0,
+      "ignored": 0,
+      "log_sha256": "57259be36df741419978a643edb43760646a8dee13ba4ece909d2f4758742c48",
+      "initial_attempt": {
+        "exit_code": 101,
+        "passed": 167,
+        "failed": 1,
+        "ignored": 0,
+        "log_sha256": "74cd646252aa519d445d553ff0952ae5f9d05a61d0e4ed8fb02beb84c845d79d",
+        "failed_tests": [
+          "every_automation_contract_json_example_decodes_and_matches_a_golden"
+        ]
+      }
+    },
+    {
+      "crate": "haider-tui",
+      "exit_code": 0,
+      "passed": 1455,
+      "failed": 0,
+      "ignored": 0,
+      "log_sha256": "a963806aea275fc7e9869a224fff5ffab01b6da6877aa4dcff4021c11f18eea2"
+    },
+    {
+      "crate": "haider-cli",
+      "exit_code": 0,
+      "passed": 759,
+      "failed": 0,
+      "ignored": 0,
+      "log_sha256": "f57850d797181021530187ed6d5b8b5577403c0f1099e92fa7014aeb7d0de5d3",
+      "initial_attempt": {
+        "exit_code": 101,
+        "passed": 758,
+        "failed": 1,
+        "ignored": 0,
+        "log_sha256": "2ca0eb3d8abba8a91bd46d4d98781180c63fcbceab61868eb2d91474686a3605",
+        "failed_tests": [
+          "one_shot_jsonl_stream_matches_the_normalized_golden"
+        ]
+      }
+    },
+    {
+      "crate": "haider-store",
+      "exit_code": 0,
+      "passed": 301,
+      "failed": 0,
+      "ignored": 0,
+      "log_sha256": "10b15a3df1b284f30425eecf4bf18a21506b9c8150e9da60a902860cd5d9415f"
+    },
+    {
+      "crate": "haider-tools",
+      "exit_code": 0,
+      "passed": 238,
+      "failed": 0,
+      "ignored": 1,
+      "log_sha256": "aefd48ae88d3c9704796a45f169208665c901b94a77274b15a5529dc360802e2"
+    },
+    {
+      "crate": "haider-client",
+      "exit_code": 0,
+      "passed": 152,
+      "failed": 0,
+      "ignored": 0,
+      "log_sha256": "d82d7d0bf9250bf3b853b1944526c581f5e10299b7ac090580c4dbe68b1142ed"
+    },
+    {
+      "crate": "haider-verify",
+      "exit_code": 0,
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "log_sha256": "28751ef857199c9880bfedc477394d3d9422840c0ed67af27d600e5229e50601"
+    },
+    {
+      "crate": "haider-stt",
+      "exit_code": 0,
+      "passed": 78,
+      "failed": 0,
+      "ignored": 0,
+      "log_sha256": "1b460639efd7e2f8a8019ae5342969940a5b4b46d521f2572d7e2e2f457838a4"
+    },
+    {
+      "crate": "xtask",
+      "exit_code": 0,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "log_sha256": "a21d3af65d94d12279f583641b7d1a853ea1bb289eb352a753ff613f77d962ce"
+    }
+  ],
+  "all_17_crates_complete": true,
+  "all_crate_gates_passed": true,
+  "summed_libtest_results": {
+    "passed": 5484,
+    "failed": 0,
+    "ignored": 13
+  },
+  "source_test_count": 5049,
+  "qa_gate_unit_tests": {
+    "command": "bash scripts/qa-gate/run.sh test",
+    "passed": 77,
+    "failed": 0
+  },
+  "sigkill": {
+    "failed": 0,
+    "passed": 52,
+    "total": 52
+  },
+  "final_checks": {
+    "clippy": 0,
+    "fmt": 0,
+    "count-update": 0,
+    "count-verify": 0,
+    "diff-check": 0,
+    "rerun-final": 0
+  },
+  "clippy_command": "cargo clippy -p haider-platform -p haider-protocol -p haider-provider -p haider-store -p haider-core -p haider-rpc -p haider-client -p haider-tui -p haider-daemon -p haider-cli -p haider-daemond --all-targets -- -D warnings",
+  "instruct_pipe_bytes": {
+    "platform_invariant_old": 5592,
+    "platform_invariant_new": 5592,
+    "measured_posix": 5670
+  },
+  "verifier": {
+    "findings": 4,
+    "real": 4,
+    "noise": 0,
+    "verdict": "SHIP by inspection"
+  },
+  "fixtures": {
+    "crates/haider-cli/tests/fixtures/oneshot_run_golden.jsonl": "10063f48836e6ab94fa48737593d3a4f1f5c2c89f92b519a1624d9b2cdd12f5c",
+    "crates/haider-rpc/tests/fixtures/turn_retract_wire.json": "951245b96999088b3780eb171f1f2349fec2a9fea2ae92068a81e4cb033c0e31",
+    "crates/haider-cli/tests/fixtures/escretract_payloads.jsonl": "d33a80dbd6bd17ea26c463d2b673f10d72b48878a88e91b16cbb2b0668c6a4a3",
+    "crates/haider-cli/tests/fixtures/turnhygiene/provider_request_no_budget.json": "2a9a5ec7569e2229e95bcb290c7a9f6cce200c286838a74178048577c6a623bb",
+    "crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_text_turn.jsonl": "cac742824d93a4900e0c3ed037f580e2719d9723a29995d29f631b3cf340ec75",
+    "crates/haider-cli/tests/fixtures/turnhygiene/run_jsonl_tool_turn.jsonl": "20a32134f0521c10a46daf7478a63062eec99de79a865079929b21c15bd97394"
+  },
+  "sigkill_binary_identity": {
+    "haider": {
+      "path": "/Users/rizzist/haider-run/lane-970-escretract/target/debug/haider",
+      "sha256": "61dda66077914d1d4a7aefffec547a2f4566f3a4ef6f3d0fb60a891b93bc6bd8"
+    },
+    "haiderd": {
+      "path": "/Users/rizzist/haider-run/lane-970-escretract/target/debug/haiderd",
+      "sha256": "976610bdc830fea7badfef68ba9ab76cb5f400286cd2313e1a25d1e48680de96"
+    },
+    "matrix_source_sha256": "4c202a3f49df4c4cbeb35f6d58369f1e1efbabbd86fc4f52e3187ebbdbcc760e",
+    "proxy_source_sha256": "97cd60b404e9f105a5945e0788b950620800a279185b5296ea85cba3ed27677c"
+  },
+  "current_binary_sha256": {
+    "haider": "61dda66077914d1d4a7aefffec547a2f4566f3a4ef6f3d0fb60a891b93bc6bd8",
+    "haiderd": "976610bdc830fea7badfef68ba9ab76cb5f400286cd2313e1a25d1e48680de96"
+  },
+  "sigkill_matches_current_binaries": true,
+  "gates_complete": true
+}

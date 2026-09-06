@@ -33,6 +33,7 @@ pub(crate) mod session_config;
 pub(crate) mod session_item;
 pub(crate) mod session_provider;
 pub(crate) mod session_recover;
+pub(crate) mod session_retract;
 pub(crate) mod session_seen;
 pub(crate) mod session_workspace;
 pub(crate) mod shell_registry;
@@ -432,6 +433,9 @@ async fn dispatch(args: &[String]) -> ExitCode {
         {
             session_provider::command(rest).await
         }
+        [command, action, rest @ ..] if command == "session" && action == "retract" => {
+            session_retract::command(rest).await
+        }
         [command, rest @ ..] if command == "session" => observe::session_command(rest).await,
         [command, rest @ ..] if command == "account" => account::account_command(rest).await,
         [command, rest @ ..] if command == "provider" => provider::provider_command(rest).await,
@@ -500,6 +504,7 @@ async fn dispatch(args: &[String]) -> ExitCode {
                  session <id> seen, session <id> recover [--json] [--probe|--mark-done|--retry|--abandon], \
                  session provider rebind --session <id> --provider <id> [--base-url <url>] [--account <name>], \
                  session workspace set <path>, session <id> workspace set <path>, \
+                 session retract --session <id> [--json], \
                  session <id> item <seq> --json [--masked] [--no-spawn], \
                  account list [--json], account use <alias> [--confirm], account source list [--json], account source add <codex|claude_file|grok|kimi_code_home> <root> [--label <label>], account source remove <source-id>, account source scan [--json], account import <codex|claude-code> [--confirm], account refresh <alias>, account remove <alias> --confirm, \
                  account add <alias> --base-url <url> [--api-key <key>|--api-key-env <VAR>|--api-key-stdin|--no-auth] [--api-family openai|anthropic] [--response-open-timeout <dur>] [--chunk-idle-timeout <dur>] [--semantic-progress-timeout <dur>] [--json], \

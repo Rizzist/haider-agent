@@ -168,6 +168,8 @@ pub const ERROR_CODE_STALE_GENERATION: &str = "stale_generation";
 pub const ERROR_CODE_FORK_CUT_UNSTABLE: &str = "fork_cut_unstable";
 /// Stable code for a command that requires an active/nonterminal run.
 pub const ERROR_CODE_RUN_NOT_ACTIVE: &str = "run_not_active";
+/// Retraction lost the race against the accepted turn's first response delta.
+pub const ERROR_CODE_TOO_LATE: &str = "too_late";
 /// Stable code for a session resource that is already occupied.
 ///
 /// RESERVED in W3c1: golden-pinned per the report's R7 taxonomy but not yet
@@ -285,6 +287,8 @@ pub const ERROR_CODE_PEER_INVALID: &str = "peer_invalid";
 pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
 /// Daemon implements durable submit/cancel turn control.
 pub const FEATURE_TURN_CONTROL_V1: &str = "turn_control_v1";
+/// Durable prompt retraction before the accepted turn's first response delta.
+pub const FEATURE_TURN_RETRACT_V1: &str = "turn_retract_v1";
 /// Daemon implements durable detached headless start/status/stop and replay
 /// pins on the ordinary journal event stream.
 pub const FEATURE_HEADLESS_RUN_V1: &str = "headless_run_v1";
@@ -3768,6 +3772,16 @@ pub enum RequestBody {
         worker_generation: u64,
         run_id: RunId,
     },
+    /// Cancels and retains an editable prompt restoration fact before the
+    /// accepted run has produced its first response delta. Retries reuse the
+    /// same command identity and exact run coordinates.
+    #[serde(rename = "turn.retract")]
+    TurnRetract {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        run_id: RunId,
+    },
     /// Starts a fresh run from the latest failed main-timeline user turn, or
     /// wakes the exact current automatic provider backoff. No new
     /// `UserMessage` is committed in either case.
@@ -4517,6 +4531,7 @@ impl RequestBody {
     #[must_use]
     pub const fn additive_shape_feature(&self) -> Option<&'static str> {
         match self {
+            Self::TurnRetract { .. } => Some(FEATURE_TURN_RETRACT_V1),
             Self::HeadlessRunStart { spec, .. } if spec.agent_spawn.is_some() => {
                 Some(FEATURE_AGENT_CLI_V1)
             }
@@ -4920,6 +4935,18 @@ pub enum ResponseBody {
         status: CancelStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal_seq: Option<u64>,
+    },
+    /// Durable prompt restoration coordinates and original accepted content.
+    /// The retraction receipt confirms intent; the ordinary cancellation
+    /// terminal follows on the session's raw-envelope stream.
+    #[serde(rename = "turn.retract")]
+    TurnRetract {
+        session_id: SessionId,
+        run_id: RunId,
+        prompt_seq: u64,
+        retracted_seq: u64,
+        text: String,
+        attachments: Vec<AttachmentBlock>,
     },
     /// Durable coordinates of manual retry acceptance. For terminal failure,
     /// `run_id` is fresh and `accepted_seq` names its committed `run_retried`

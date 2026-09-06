@@ -1032,3 +1032,43 @@ stdin to answer a child menu.
   warm resident daemon; a clean result continues to require
   `outcome: "stopped_cleanly"`, `daemon.process_exited: true`, and no surviving
   authenticated PID.
+
+## Prompt retraction (v0.0.970, additive)
+
+`haider session retract --session <id> [--json]` acquires a control attachment
+and pins the active run and worker generation. It invokes feature-gated
+`turn.retract`; this method requires the same control authority as `turn.cancel`:
+
+```json wire.request
+{"v":1,"kind":"request","request_id":"request-retract","body":{"method":"turn.retract","command_id":"command-retract","session_id":"session-1","worker_generation":7,"run_id":"run-1"}}
+```
+
+```json wire.response
+{"v":1,"kind":"response","request_id":"request-retract","body":{"method":"turn.retract","session_id":"session-1","run_id":"run-1","prompt_seq":4,"retracted_seq":9,"text":"edit this prompt\nwith its original attachment","attachments":[{"kind":"file","artifact":"blake3:attachment","name":"notes.txt","lines":2}]}}
+```
+
+The durable response repeats the method, session and run plus `prompt_seq`,
+`retracted_seq`, `text`, and full `attachments`. Receipt retries reuse the same
+command identity and replay the original restoration draft even after restart.
+A successful receipt proves the cancellation intent and `prompt_retracted`
+fact committed together; worker draining then yields exactly one cancelled
+terminal with `reason: retracted`. Consumers can restore text and attachment
+CAS references to their composer using the response or replayed fact.
+
+Retraction is valid only for an accepted nonterminal prompt before semantic
+response begins. Typed `too_late` leaves the prompt and partial reply intact.
+The reusable client and CLI then issue one ordinary `turn.cancel` for the same
+pinned run, using a separate stable cancellation command id. They never cancel
+a replacement run found after reconnect. Lack of an active accepted prompt is
+`run_not_active`; missing capability/attachment retains existing typed errors.
+
+CLI JSON has `schema: haider.session_retract.v1`. Success adds
+`status: retracted`, the session/run, `prompt_seq`, `retracted_seq`, `text` and
+`attachments`. The plain-cancel fallback adds `status: cancelled`,
+`reason: too_late`, `cancel_status` and nullable `terminal_seq` instead.
+Raw run JSONL and `--replay` still emit the original prompt, retraction fact,
+and terminal with contiguous durable cursors. Display/history projections
+hide the retracted prompt and future provider history excludes it.
+The existing SIGINT/exit-130 contract is unchanged. See the
+[JSONL contract](jsonl-run-contract-v1.md#prompt-retraction-before-response-v00970)
+for the response/retraction race and accounting boundaries.

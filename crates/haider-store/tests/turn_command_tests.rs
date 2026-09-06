@@ -953,3 +953,341 @@ fn budget_continuation_survives_reopen_and_is_consumed_once_at_admission() {
         "second allowance cannot queue behind the resumed run"
     );
 }
+
+fn retract_command(
+    store: &Store,
+    session_id: &SessionId,
+    run_id: &str,
+) -> haider_store::TurnRetractCommand {
+    haider_store::TurnRetractCommand {
+        cancel: TurnCancelCommand {
+            command_id: format!("retract-{run_id}"),
+            request_digest: format!("retract-digest-{run_id}"),
+            request_json: format!(r#"{{"session_id":"{session_id}","run_id":"{run_id}"}}"#),
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            run_id: RunId::new(run_id),
+            cancelling_event_id: EventId::new(format!("retract-cancelling-{run_id}")),
+            device_id: DeviceId::new("test-daemon"),
+        },
+        retracted_event_id: EventId::new(format!("retracted-{run_id}")),
+    }
+}
+
+fn retract_worker_envelope(
+    store: &Store,
+    session: &SessionId,
+    run: &str,
+    id: &str,
+    payload: serde_json::Value,
+) -> haider_protocol::envelope::RawEnvelope {
+    EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(id),
+        seq: 0,
+        session_id: session.clone(),
+        branch_id: None,
+        run_id: Some(RunId::new(run)),
+        agent_id: None,
+        device_id: DeviceId::new("worker"),
+        authority_epoch: 0,
+        worker_generation: store.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: false,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: payload.into(),
+    }
+}
+
+/// MUTATION: split cancellation and restoration commits, discard attachment
+/// refs, or rebuild terminal reason at read time. Exact replay and restart
+/// restoration below must fail.
+#[test]
+fn retract_preserves_append_only_prompt_attachments_receipt_and_terminal_replay() {
+    use haider_protocol::retraction::PromptRetractedV1;
+    use haider_store::{Cas, TurnRetractOutcome};
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    let session = SessionId::new("retract-attachment-session");
+    create(&store, &session);
+    let bytes = b"restorable attachment\n";
+    let artifact = store.put(bytes).expect("CAS attachment");
+    let mut command = submit(
+        &store,
+        "retract-attachment-submit",
+        &session,
+        "retract-attachment-run",
+    );
+    command.attachments = vec![AttachmentBlock::File {
+        artifact: artifact.clone(),
+        name: "notes.txt".into(),
+        lines: 1,
+    }];
+    let TurnAcceptOutcome::Committed {
+        accepted,
+        envelopes: accepted_events,
+    } = store.accept_turn(&command).expect("accept")
+    else {
+        panic!("new acceptance")
+    };
+    let retract = retract_command(&store, &session, "retract-attachment-run");
+    let TurnRetractOutcome::Committed {
+        retracted,
+        envelopes,
+    } = store.retract_turn(&retract).expect("retract")
+    else {
+        panic!("new retract")
+    };
+    assert_eq!(envelopes.len(), 2);
+    assert_eq!(envelopes[0].payload["state"], "cancelling");
+    let fact = PromptRetractedV1::from_payload_value(&envelopes[1].payload)
+        .expect("durable restoration fact");
+    assert_eq!(fact.prompt_seq, accepted.accepted_seq);
+    assert_eq!(fact.text, command.text);
+    assert_eq!(fact.attachments, command.attachments);
+    assert_eq!(retracted.retracted_seq, envelopes[1].seq);
+    let mut terminal = [retract_worker_envelope(
+        &store,
+        &session,
+        "retract-attachment-run",
+        "retract-attachment-terminal",
+        serde_json::json!({"type":"run_state","state":"cancelled"}),
+    )];
+    store
+        .append_worker(&mut terminal)
+        .expect("cancellation terminal");
+    assert_eq!(terminal[0].payload["reason"], "retracted");
+    let replay = store.read(&session, 0, 100).expect("replay");
+    for live in accepted_events.iter().chain(&envelopes).chain(&terminal) {
+        let replayed = replay
+            .iter()
+            .find(|row| row.seq == live.seq)
+            .expect("same replay cursor");
+        assert_eq!(
+            serde_json::to_vec(replayed).expect("replay JSON"),
+            serde_json::to_vec(live).expect("live JSON")
+        );
+    }
+    let head = store.latest_seq(&session).expect("head");
+    assert!(
+        matches!(store.retract_turn(&retract).expect("receipt replay"), TurnRetractOutcome::IdempotentReplay { retracted: original } if original == retracted)
+    );
+    assert_eq!(store.latest_seq(&session).expect("unchanged head"), head);
+    drop(store);
+    let reopened = Store::open(root.path()).expect("restart");
+    assert_eq!(reopened.get(&artifact).expect("restored bytes"), bytes);
+    assert_eq!(
+        reopened
+            .turn_retract_receipt(
+                &retract.cancel.command_id,
+                &retract.cancel.request_digest,
+                &retract.cancel.request_json
+            )
+            .expect("cross-generation receipt"),
+        Some(retracted)
+    );
+    assert_eq!(
+        reopened.read(&session, 0, 100).expect("restart replay"),
+        replay
+    );
+}
+
+/// MUTATION: accept retract after the response fence, or publish a response
+/// fence after retract without recording its discarded content.
+#[test]
+fn retract_first_response_serialization_proves_both_race_orders() {
+    use haider_protocol::retraction::{response_started_payload, response_was_discarded};
+    for retract_first in [true, false] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(root.path()).expect("store");
+        let session = SessionId::new("retract-race-session");
+        create(&store, &session);
+        store
+            .accept_turn(&submit(&store, "race-submit", &session, "race-run"))
+            .expect("accept");
+        let command = retract_command(&store, &session, "race-run");
+        let delta = serde_json::json!({"type":"text_delta","text":"racing response"});
+        let mut first = [retract_worker_envelope(
+            &store,
+            &session,
+            "race-run",
+            "race-first-response",
+            response_started_payload(delta.clone()),
+        )];
+        if retract_first {
+            store.retract_turn(&command).expect("retract wins");
+            store
+                .append_worker(&mut first)
+                .expect("losing response is durably discarded");
+            assert!(response_was_discarded(&first[0]));
+            assert_eq!(first[0].payload["delta"], delta);
+            assert!(first[0].payload["prompt_seq"].as_u64().is_some());
+        } else {
+            store
+                .append_worker(&mut first)
+                .expect("first response wins");
+            let head = store.latest_seq(&session).expect("before too late");
+            assert_eq!(
+                store
+                    .retract_turn(&command)
+                    .expect_err("typed too late")
+                    .code,
+                haider_protocol::error::ErrorCode::TooLate
+            );
+            assert_eq!(store.latest_seq(&session).expect("after too late"), head);
+            assert!(!response_was_discarded(&first[0]));
+            let mut plain_cancel = command.cancel.clone();
+            plain_cancel.command_id = "fallback-cancel".into();
+            store
+                .cancel_turn(&plain_cancel)
+                .expect("plain cancellation fallback");
+        }
+    }
+}
+
+#[test]
+fn fork_rejects_hidden_prompt_boundary_and_remaps_retained_retraction_cursor() {
+    use haider_protocol::history::NodeKind;
+    use haider_protocol::retraction::PromptRetractedV1;
+    use haider_store::{SessionForkCommand, SessionForkOutcome};
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    let session = SessionId::new("retract-fork-source");
+    create(&store, &session);
+    // Forks omit this parent-owned operation, shifting every later cursor.
+    let mut operation = [retract_worker_envelope(
+        &store,
+        &session,
+        "support-operation",
+        "support-reserved",
+        serde_json::json!({"type":"provider_operation_reserved","request_kind":"side"}),
+    )];
+    store
+        .append(&mut operation)
+        .expect("parent-owned operation");
+    let TurnAcceptOutcome::Committed {
+        envelopes: first, ..
+    } = store
+        .accept_turn(&submit(
+            &store,
+            "fork-first-submit",
+            &session,
+            "fork-first-run",
+        ))
+        .expect("first prompt")
+    else {
+        panic!("new acceptance")
+    };
+    let first_node = first
+        .iter()
+        .find_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::NodeCommitted(node))
+                if matches!(node.kind, NodeKind::UserTurn { .. }) =>
+            {
+                Some((node.node, event.seq))
+            }
+            _ => None,
+        })
+        .expect("first node");
+    store
+        .retract_turn(&retract_command(&store, &session, "fork-first-run"))
+        .expect("retract");
+    let fork = |child: &str, node, seq| SessionForkCommand {
+        command_id: format!("fork-{child}"),
+        request_digest: format!("fork-digest-{child}"),
+        request_json: format!(r#"{{"child":"{child}"}}"#),
+        source_session_id: session.clone(),
+        session_id: SessionId::new(child),
+        worker_generation: store.worker_generation(),
+        source_branch_id: None,
+        fork_node_id: node,
+        fork_seq: seq,
+        name: None,
+        metafork: None,
+        audit_event_id: EventId::new(format!("fork-audit-{child}")),
+        device_id: DeviceId::new("test-daemon"),
+    };
+    let mut terminal = [retract_worker_envelope(
+        &store,
+        &session,
+        "fork-first-run",
+        "fork-first-terminal",
+        serde_json::json!({"type":"run_state","state":"cancelled"}),
+    )];
+    store.append_worker(&mut terminal).expect("cancelled");
+    let hidden_error = store
+        .fork_session(&fork("retract-hidden-child", first_node.0, first_node.1))
+        .expect_err("hidden boundary");
+    assert_eq!(
+        hidden_error.code,
+        haider_protocol::error::ErrorCode::InvalidArgument
+    );
+    assert!(hidden_error.message.contains("retracted prompt"));
+    let TurnAcceptOutcome::Committed {
+        envelopes: next, ..
+    } = store
+        .accept_turn(&submit(
+            &store,
+            "fork-next-submit",
+            &session,
+            "fork-next-run",
+        ))
+        .expect("next prompt")
+    else {
+        panic!("new acceptance")
+    };
+    let next_node = next
+        .iter()
+        .find_map(|event| match event.payload.decode_event() {
+            Ok(EventPayload::NodeCommitted(node))
+                if matches!(node.kind, NodeKind::UserTurn { .. }) =>
+            {
+                Some((node.node, event.seq))
+            }
+            _ => None,
+        })
+        .expect("next node");
+    let mut next_terminal = [retract_worker_envelope(
+        &store,
+        &session,
+        "fork-next-run",
+        "fork-next-terminal",
+        serde_json::json!({"type":"run_state","state":"done"}),
+    )];
+    store
+        .append_worker(&mut next_terminal)
+        .expect("terminal next turn permits a fork");
+    let SessionForkOutcome::Committed {
+        envelopes: child, ..
+    } = store
+        .fork_session(&fork("retract-visible-child", next_node.0, next_node.1))
+        .expect("later history fork")
+    else {
+        panic!("new fork")
+    };
+    let source_fact = store
+        .read(&session, 0, 100)
+        .expect("source replay")
+        .iter()
+        .find_map(|event| PromptRetractedV1::from_payload_value(&event.payload))
+        .expect("source fact");
+    let child_fact = child
+        .iter()
+        .find_map(|event| PromptRetractedV1::from_payload_value(&event.payload))
+        .expect("copied fact");
+    assert_eq!(child_fact.prompt_seq, source_fact.prompt_seq - 1);
+    let child_prompt = child
+        .iter()
+        .find(|event| event.seq == child_fact.prompt_seq)
+        .expect("child target cursor");
+    assert!(matches!(
+        child_prompt.payload.decode_event(),
+        Ok(EventPayload::UserMessage { .. })
+    ));
+    assert_eq!(child_fact.prompt_node_id, source_fact.prompt_node_id);
+}

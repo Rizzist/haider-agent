@@ -30,6 +30,7 @@ pub mod peer;
 pub mod permission;
 pub mod profile;
 pub mod provider_rounds;
+pub mod retraction;
 pub mod session_fork;
 pub mod shell;
 pub mod shell_registry;
@@ -95,6 +96,7 @@ pub use profile::{
     canonicalize_path_allow_missing, effective_uid, endpoint_path_for, resolve_default_model_for,
     resolve_profile, resolve_profile_read_only, resolve_profile_with_runtime_resolution,
 };
+pub use retraction::{TurnRetraction, TurnRetractionError, TurnRetractionOutcome};
 pub use session_fork::{
     FORKABLE_PROMPT_PAGE, ForkablePrompt, PromptFork, SessionForkClientError, fork_at_prompt,
     forkable_prompts, forkable_prompts_in, prompt_fork_available, prompt_fork_response,

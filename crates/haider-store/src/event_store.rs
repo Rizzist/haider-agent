@@ -1514,6 +1514,24 @@ pub struct TurnCancelCommand {
     pub device_id: DeviceId,
 }
 
+/// A retraction shares the durable cancellation authority and transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnRetractCommand {
+    pub cancel: TurnCancelCommand,
+    pub retracted_event_id: EventId,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnRetractOutcome {
+    Committed {
+        retracted: haider_protocol::retraction::RetractedTurn,
+        envelopes: Vec<RawEnvelope>,
+    },
+    IdempotentReplay {
+        retracted: haider_protocol::retraction::RetractedTurn,
+    },
+}
+
 /// Durable cancellation status stored in a committed receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -8647,6 +8665,25 @@ impl Store {
             )?,
         };
 
+        let cut_envelope = load_envelope(
+            &transaction,
+            command.source_session_id,
+            resolved_cut.fork_seq,
+        )?;
+        if let Some(run_id) = cut_envelope
+            .as_ref()
+            .and_then(|event| event.run_id.as_ref())
+            && let Some(fact) =
+                retracted_prompt_for_run(&transaction, command.source_session_id, run_id)?
+            && fact.prompt_node_id == resolved_cut.fork_node_id
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "a retracted prompt cannot be selected as a fork boundary",
+                false,
+            ));
+        }
+
         let now = now_ms()?;
         claim_pending_receipt(
             &transaction,
@@ -8781,6 +8818,17 @@ impl Store {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let child_seqs = source_envelopes
+            .iter()
+            .enumerate()
+            .map(|(index, envelope)| {
+                u64::try_from(index)
+                    .ok()
+                    .and_then(|index| index.checked_add(1))
+                    .map(|child_seq| (envelope.seq, child_seq))
+                    .ok_or_else(|| corrupt("forked journal sequence space is exhausted"))
+            })
+            .collect::<StoreResult<HashMap<_, _>>>()?;
         let source_resident_bytes = source_envelopes
             .iter()
             .map(envelope_weight_bytes)
@@ -8835,6 +8883,28 @@ impl Store {
                 .correlation_id
                 .as_ref()
                 .and_then(|event_id| event_ids.get(event_id).cloned());
+
+            // These are new child envelopes: map the prompt cursor through
+            // the same copied-prefix selection that allocates child seqs.
+            // Tree node ids are preserved by session forks.
+            if matches!(
+                payload_kind(source),
+                "prompt_retracted" | "response_delta_discarded"
+            ) {
+                let source_prompt_seq = source
+                    .payload
+                    .get("prompt_seq")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| corrupt("fork retraction fact has no prompt cursor"))?;
+                let child_prompt_seq = child_seqs.get(&source_prompt_seq).ok_or_else(|| {
+                    corrupt("fork retraction target is outside the copied prefix")
+                })?;
+                child
+                    .payload
+                    .as_object_mut()
+                    .ok_or_else(|| corrupt("fork retraction payload is not an object"))?
+                    .insert("prompt_seq".into(), (*child_prompt_seq).into());
+            }
 
             if let Some(proposal) = &model_proposal {
                 for (removal_index, removal) in proposal.removals.iter().enumerate() {
@@ -11685,48 +11755,14 @@ impl Store {
             now,
         )?;
 
-        let (cancelled, envelope) = if state.is_terminal() {
-            (
-                CancelledTurn {
-                    session_id: command.session_id.clone(),
-                    run_id: command.run_id.clone(),
-                    status: TurnCancellationStatus::AlreadyTerminal,
-                    terminal_seq: Some(state_seq),
-                },
-                None,
-            )
-        } else if state == RunState::Cancelling {
-            (
-                CancelledTurn {
-                    session_id: command.session_id.clone(),
-                    run_id: command.run_id.clone(),
-                    status: TurnCancellationStatus::Accepted,
-                    terminal_seq: None,
-                },
-                None,
-            )
-        } else {
-            let mut envelopes = vec![unstamped_command_envelope(
-                command.cancelling_event_id.clone(),
-                &command.session_id,
-                branch_id,
-                Some(command.run_id.clone()),
-                command.device_id.clone(),
-                self.worker_generation,
-                EventPayload::RunState(RunState::Cancelling),
-                PromptRender::Omit,
-            )?];
-            append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
-            (
-                CancelledTurn {
-                    session_id: command.session_id.clone(),
-                    run_id: command.run_id.clone(),
-                    status: TurnCancellationStatus::Accepted,
-                    terminal_seq: None,
-                },
-                envelopes.pop().map(Box::new),
-            )
-        };
+        let (cancelled, envelope) = cancellation_intent_in_transaction(
+            &transaction,
+            command,
+            state,
+            state_seq,
+            branch_id,
+            now,
+        )?;
         finalize_command_receipt(
             &transaction,
             &command.command_id,
@@ -11741,6 +11777,180 @@ impl Store {
         Ok(TurnCancelOutcome::Committed {
             cancelled,
             envelope,
+        })
+    }
+
+    /// Unfenced receipt lookup, before live actor routing or generation checks.
+    pub fn turn_retract_receipt(
+        &self,
+        command_id: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<haider_protocol::retraction::RetractedTurn>> {
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_turn_retract_receipt(&connection, command_id, request_digest, request_json)
+    }
+
+    /// Commit cancellation and the restoration fact in one append-only write.
+    /// The first-response writer takes this same SQLite write lock, so exactly
+    /// one side wins even when provider delivery and RPC acceptance race.
+    pub fn retract_turn(&self, command: &TurnRetractCommand) -> StoreResult<TurnRetractOutcome> {
+        use haider_protocol::retraction::{PromptRetractedV1, RetractedTurn};
+        let cancel = &command.cancel;
+        validate_command_identity(
+            &cancel.command_id,
+            &cancel.request_digest,
+            &cancel.request_json,
+        )?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(retracted) = lookup_turn_retract_receipt(
+            &transaction,
+            &cancel.command_id,
+            &cancel.request_digest,
+            &cancel.request_json,
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(TurnRetractOutcome::IdempotentReplay { retracted });
+        }
+        if cancel.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                cancel.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        require_session(&transaction, &cancel.session_id)?;
+        let (state, state_seq, branch_id) =
+            latest_run_state(&transaction, &cancel.session_id, &cancel.run_id)?.ok_or_else(
+                || store_error(ErrorCode::RunNotActive, "run has no accepted turn", false),
+            )?;
+        if state.is_terminal() {
+            return Err(store_error(
+                ErrorCode::RunNotActive,
+                "run is already terminal",
+                false,
+            ));
+        }
+        let events = retraction_run_envelopes(&transaction, &cancel.session_id, &cancel.run_id)?;
+        if events.iter().any(response_has_started) {
+            return Err(store_error(
+                ErrorCode::TooLate,
+                "the accepted turn has already produced a response; cancel it instead",
+                false,
+            ));
+        }
+        if events
+            .iter()
+            .any(|event| PromptRetractedV1::from_payload_value(&event.payload).is_some())
+        {
+            return Err(store_error(
+                ErrorCode::RunNotActive,
+                "prompt is already retracted",
+                false,
+            ));
+        }
+        let prompt = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.payload.decode_event(),
+                    Ok(EventPayload::UserMessage { .. })
+                )
+            })
+            .ok_or_else(|| {
+                store_error(
+                    ErrorCode::RunNotActive,
+                    "run has no accepted user prompt",
+                    false,
+                )
+            })?;
+        let accepted = prompt_turn_acceptance(&transaction, &cancel.session_id, prompt.seq)?
+            .ok_or_else(|| corrupt("retract target has no durable acceptance receipt"))?;
+        if accepted.run_id != cancel.run_id || accepted.accepted_seq != prompt.seq {
+            return Err(corrupt(
+                "retract target disagrees with its acceptance receipt",
+            ));
+        }
+        let EventPayload::UserMessage {
+            text, attachments, ..
+        } = prompt
+            .payload
+            .decode_event()
+            .map_err(|error| corrupt(format!("invalid accepted prompt: {error}")))?
+        else {
+            return Err(corrupt("retract target is not a user prompt"));
+        };
+        let fact = PromptRetractedV1 {
+            prompt_seq: prompt.seq,
+            prompt_node_id: NodeId::new(format!("node-{}", prompt.event_id)),
+            text: text.clone(),
+            attachments: attachments.clone(),
+        };
+        let now = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &cancel.command_id,
+            "turn.retract",
+            &cancel.request_digest,
+            &cancel.request_json,
+            now,
+        )?;
+        let (_, cancelling) = cancellation_intent_in_transaction(
+            &transaction,
+            cancel,
+            state,
+            state_seq,
+            branch_id,
+            now,
+        )?;
+        let mut retract_envelopes = [unstamped_raw_command_envelope(
+            command.retracted_event_id.clone(),
+            &cancel.session_id,
+            prompt.branch_id.clone(),
+            Some(cancel.run_id.clone()),
+            cancel.device_id.clone(),
+            self.worker_generation,
+            fact.to_payload_value()
+                .map_err(|error| corrupt(format!("cannot encode retraction: {error}")))?,
+            PromptRender::Omit,
+        )?];
+        retract_envelopes[0].agent_id = prompt.agent_id.clone();
+        append_transaction_envelopes(
+            &transaction,
+            &cancel.session_id,
+            now,
+            &mut retract_envelopes,
+        )?;
+        let retracted = RetractedTurn {
+            session_id: cancel.session_id.clone(),
+            run_id: cancel.run_id.clone(),
+            prompt_seq: prompt.seq,
+            retracted_seq: retract_envelopes[0].seq,
+            text,
+            attachments,
+        };
+        finalize_command_receipt(
+            &transaction,
+            &cancel.command_id,
+            cancel.session_id.as_str(),
+            Some(cancel.run_id.as_str()),
+            Some(retracted.retracted_seq),
+            &retracted,
+            now,
+            "turn-retract",
+        )?;
+        let mut envelopes = cancelling
+            .into_iter()
+            .map(|envelope| *envelope)
+            .collect::<Vec<_>>();
+        envelopes.extend(retract_envelopes);
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(TurnRetractOutcome::Committed {
+            retracted,
+            envelopes,
         })
     }
 
@@ -13943,6 +14153,152 @@ fn lookup_run_retry_receipt(
                 })?;
     }
     Ok(accepted)
+}
+
+fn cancellation_intent_in_transaction(
+    transaction: &Connection,
+    command: &TurnCancelCommand,
+    state: RunState,
+    state_seq: u64,
+    branch_id: Option<BranchId>,
+    now: u64,
+) -> StoreResult<(CancelledTurn, Option<Box<RawEnvelope>>)> {
+    let outcome = if state.is_terminal() {
+        (
+            CancelledTurn {
+                session_id: command.session_id.clone(),
+                run_id: command.run_id.clone(),
+                status: TurnCancellationStatus::AlreadyTerminal,
+                terminal_seq: Some(state_seq),
+            },
+            None,
+        )
+    } else if state == RunState::Cancelling {
+        (
+            CancelledTurn {
+                session_id: command.session_id.clone(),
+                run_id: command.run_id.clone(),
+                status: TurnCancellationStatus::Accepted,
+                terminal_seq: None,
+            },
+            None,
+        )
+    } else {
+        let mut envelopes = vec![unstamped_command_envelope(
+            command.cancelling_event_id.clone(),
+            &command.session_id,
+            branch_id,
+            Some(command.run_id.clone()),
+            command.device_id.clone(),
+            command.worker_generation,
+            EventPayload::RunState(RunState::Cancelling),
+            PromptRender::Omit,
+        )?];
+        append_transaction_envelopes(transaction, &command.session_id, now, &mut envelopes)?;
+        (
+            CancelledTurn {
+                session_id: command.session_id.clone(),
+                run_id: command.run_id.clone(),
+                status: TurnCancellationStatus::Accepted,
+                terminal_seq: None,
+            },
+            envelopes.pop().map(Box::new),
+        )
+    };
+    Ok(outcome)
+}
+
+fn lookup_turn_retract_receipt(
+    connection: &Connection,
+    command_id: &str,
+    request_digest: &str,
+    request_json: &str,
+) -> StoreResult<Option<haider_protocol::retraction::RetractedTurn>> {
+    lookup_command_response(
+        connection,
+        command_id,
+        "turn.retract",
+        request_digest,
+        request_json,
+        "turn-retract",
+    )
+}
+
+fn retraction_run_envelopes(
+    connection: &Connection,
+    session_id: &SessionId,
+    run_id: &RunId,
+) -> StoreResult<Vec<RawEnvelope>> {
+    let first_seq: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MIN(accepted_seq), 0) FROM command_receipts
+         WHERE session_id = ?1 AND run_id = ?2 AND method = 'turn.submit' AND state = 'committed'",
+            params![session_id.as_str(), run_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_error)?;
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT envelope_json FROM events WHERE session_id = ?1 AND seq >= ?2 ORDER BY seq",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query(params![session_id.as_str(), first_seq])
+        .map_err(map_sqlite_error)?;
+    let mut envelopes = Vec::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let envelope = decode_envelope_column(connection, row, 0)
+            .map_err(|error| corrupt(format!("invalid retraction event: {error}")))?;
+        if envelope.run_id.as_ref() == Some(run_id) {
+            envelopes.push(envelope);
+        }
+    }
+    Ok(envelopes)
+}
+
+fn retracted_prompt_for_run(
+    connection: &Connection,
+    session_id: &SessionId,
+    run_id: &RunId,
+) -> StoreResult<Option<haider_protocol::retraction::PromptRetractedV1>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT envelope_json FROM events WHERE session_id = ?1 AND payload_kind = 'prompt_retracted' ORDER BY seq DESC",
+    ).map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let envelope = decode_envelope_column(connection, row, 0)
+            .map_err(|error| corrupt(format!("invalid retraction fact: {error}")))?;
+        if envelope.run_id.as_ref() == Some(run_id) {
+            return haider_protocol::retraction::PromptRetractedV1::from_payload_value(
+                &envelope.payload,
+            )
+            .map(Some)
+            .ok_or_else(|| corrupt("invalid durable prompt retraction"));
+        }
+    }
+    Ok(None)
+}
+
+fn response_has_started(envelope: &RawEnvelope) -> bool {
+    if envelope
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        == Some("response_started")
+    {
+        return true;
+    }
+    matches!(
+        envelope.payload.decode_event(),
+        Ok(EventPayload::Item(ItemEvent::Delta {
+            delta: ItemDelta::Text { .. }
+                | ItemDelta::Reasoning { .. }
+                | ItemDelta::ToolArgs { .. },
+            ..
+        }))
+    )
 }
 
 fn lookup_turn_cancel_receipt(
@@ -19739,6 +20095,7 @@ fn append_transaction_envelopes(
     envelopes: &mut [RawEnvelope],
 ) -> StoreResult<()> {
     ensure_run_head_projection(transaction, session_id)?;
+    arbitrate_prompt_retraction(transaction, session_id, envelopes)?;
     stamp_headless_terminal_payloads(transaction, session_id, committed_at_ms, envelopes)?;
     let latest: i64 = transaction
         .query_row(
@@ -20961,6 +21318,7 @@ fn append_envelopes_in_transaction(
         })
         .map_err(map_sqlite_error)?;
     let run_head_metadata = ensure_run_head_projection(transaction, &session)?;
+    arbitrate_prompt_retraction(transaction, &session, envelopes)?;
     if validate_worker_transitions {
         validate_worker_run_transitions(
             transaction,
@@ -21687,6 +22045,57 @@ fn durable_headless_run_facts(
 /// Stamps the automation discriminator into the journal record itself. Live
 /// subscribers and replay readers then receive the same retained envelope by
 /// construction instead of independently rebuilding its durable payload.
+/// The same write transaction arbitrates first response, retract and terminal
+/// reason. Transforming a losing response before insertion preserves replay
+/// bytes and never rewrites a previously committed provider fact.
+fn arbitrate_prompt_retraction(
+    transaction: &Connection,
+    session_id: &SessionId,
+    envelopes: &mut [RawEnvelope],
+) -> StoreResult<()> {
+    use haider_protocol::retraction::PromptRetractedV1;
+    let mut retracted = HashMap::<RunId, u64>::new();
+    for envelope in envelopes {
+        let Some(run_id) = envelope.run_id.as_ref() else {
+            continue;
+        };
+        if let Some(fact) = PromptRetractedV1::from_payload_value(&envelope.payload) {
+            retracted.insert(run_id.clone(), fact.prompt_seq);
+            continue;
+        }
+        let kind = envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str);
+        let first_response = kind == Some("response_started");
+        let cancelled = matches!(
+            envelope.payload.decode_event(),
+            Ok(EventPayload::RunState(RunState::Cancelled))
+        );
+        if !first_response && !cancelled {
+            continue;
+        }
+        if !retracted.contains_key(run_id)
+            && let Some(fact) = retracted_prompt_for_run(transaction, session_id, run_id)?
+        {
+            retracted.insert(run_id.clone(), fact.prompt_seq);
+        }
+        if let Some(prompt_seq) = retracted.get(run_id) {
+            let payload = envelope
+                .payload
+                .as_object_mut()
+                .ok_or_else(|| corrupt("response fact is not an object"))?;
+            if first_response {
+                payload.insert("type".into(), "response_delta_discarded".into());
+                payload.insert("prompt_seq".into(), (*prompt_seq).into());
+            } else {
+                payload.insert("reason".into(), "retracted".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn stamp_headless_terminal_payloads(
     transaction: &Connection,
     session_id: &SessionId,
@@ -21949,6 +22358,9 @@ fn validate_worker_run_transitions(
             .payload
             .get("type")
             .and_then(serde_json::Value::as_str);
+        let supplemental_response =
+            matches!(kind, Some("response_started" | "response_delta_discarded"))
+                && envelope.payload.get("delta").is_some();
         let supplemental_project_instructions = kind == Some("project_instructions_loaded")
             && decode_payload::<ProjectInstructionsEventPayload>(&envelope.payload).is_ok();
         let supplemental_workspace_unavailable = kind == Some("workspace_unavailable")
@@ -21980,6 +22392,7 @@ fn validate_worker_run_transitions(
                 || supplemental_run_budget
                 || supplemental_run_deadline
                 || supplemental_context_compaction
+                || supplemental_response
             {
                 return Err(store_error(
                     ErrorCode::InvalidArgument,
@@ -21994,7 +22407,8 @@ fn validate_worker_run_transitions(
             || supplemental_computer_permission
             || supplemental_run_budget
             || supplemental_run_deadline
-            || supplemental_context_compaction)
+            || supplemental_context_compaction
+            || supplemental_response)
             && (!envelope.render.durable || envelope.render.prompt != PromptRender::Omit)
         {
             return Err(store_error(
@@ -22053,7 +22467,8 @@ fn validate_worker_run_transitions(
                     || supplemental_workspace_unavailable
                     || supplemental_computer_permission
                     || supplemental_run_budget
-                    || supplemental_context_compaction =>
+                    || supplemental_context_compaction
+                    || supplemental_response =>
             {
                 None
             }
@@ -22835,6 +23250,16 @@ fn resolve_prompt_fork_cut(
         return Err(corrupt(format!(
             "turn-admission receipt disagrees with prompt {session_id}:{prompt_seq}"
         )));
+    }
+    if retracted_prompt_for_run(connection, session_id, prompt_run_id)?
+        .is_some_and(|fact| fact.prompt_seq == prompt_seq)
+    {
+        return Err(prompt_fork_invalid_cut(
+            session_id,
+            prompt_seq,
+            SessionForkInvalidCutReason::Unknown,
+            "a retracted prompt cannot be selected as a fork boundary",
+        ));
     }
     if accepted.disposition != TurnAdmissionDisposition::Started {
         return Err(prompt_fork_unstable(

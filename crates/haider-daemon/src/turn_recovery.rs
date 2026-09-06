@@ -82,6 +82,7 @@ const PAGE_SIZE: usize = 512;
 const PAGE_BYTES: usize = 4 * 1_024 * 1_024;
 const RUN_STATE_PAYLOAD_KINDS: &[&str] = &["run_state"];
 pub(crate) const STARTUP_HYDRATION_PAYLOAD_KINDS: &[&str] = &[
+    "response_started",
     "agent_report",
     "effect",
     "graph_finalization_deferred",
@@ -1286,6 +1287,22 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
     let Some(run_id) = envelope.run_id.clone() else {
         return;
     };
+    if envelope
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        == Some("response_started")
+    {
+        let reduction = reductions.entry(run_id).or_default();
+        if reduction.branch_observed && reduction.branch_id != envelope.branch_id {
+            reduction.branch_mismatch = true;
+        } else if !reduction.branch_observed {
+            reduction.branch_id = envelope.branch_id.clone();
+            reduction.branch_observed = true;
+        }
+        reduction.latest_provider_response_seq = Some(envelope.seq);
+        return;
+    }
     let payload = envelope.payload.decode_event().ok();
     let retry_payload =
         RunRetryEventPayload::from_payload_value(envelope.payload.to_json_value()).ok();
