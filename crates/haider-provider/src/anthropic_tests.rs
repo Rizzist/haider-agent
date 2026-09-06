@@ -1341,6 +1341,10 @@ fn native_computer_action_translation_covers_supported_anthropic_vocabulary() {
             serde_json::json!({"action": "double_click"}),
         ),
         (
+            serde_json::json!({"action": "triple_click"}),
+            serde_json::json!({"action": "triple_click"}),
+        ),
+        (
             serde_json::json!({"action": "left_mouse_down"}),
             serde_json::json!({"action": "left_mouse_down"}),
         ),
@@ -2168,4 +2172,10 @@ async fn completed_anthropic_5xx_with_reset_body_keeps_http_status_not_network_c
         error.presentation.provider_request_id.as_deref(),
         Some("req-503")
     );
+}
+
+#[test]
+fn native_computer_replay_never_silently_drops_region() {
+    let input = serde_json::json!({"action": "screenshot", "region": {"x": 1, "y": 2, "width": 3, "height": 4, "reference_width": 100, "reference_height": 100}});
+    assert!(crate::wire::anthropic_computer_input_from_neutral(&input).is_err());
 }

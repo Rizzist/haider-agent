@@ -427,8 +427,8 @@ mod linux {
                     self.button(BUTTON_MIDDLE, true).await?;
                     self.button(BUTTON_MIDDLE, false).await
                 }
-                ComputerAction::DoubleClick => {
-                    for _ in 0..2 {
+                ComputerAction::DoubleClick | ComputerAction::TripleClick => {
+                    for _ in 0..action.click_count().unwrap_or(2) {
                         self.button(BUTTON_LEFT, true).await?;
                         self.button(BUTTON_LEFT, false).await?;
                     }
@@ -964,8 +964,15 @@ mod linux {
                 .filter(|value| *value > 0)
                 .ok_or_else(|| HelperError::error(format!("viewport omitted valid {field}")))
         };
-        let display_width = read("display_width")?;
-        let display_height = read("display_height")?;
+        let logical = |field: &str| {
+            viewport
+                .get(field)
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .ok_or_else(|| HelperError::error(format!("viewport omitted valid {field}")))
+        };
+        let display_width = logical("display_width")?;
+        let display_height = logical("display_height")?;
         let image_width = read("image_width")?;
         let image_height = read("image_height")?;
         if x >= image_width || y >= image_height {
@@ -974,8 +981,16 @@ mod linux {
             ));
         }
         Ok((
-            f64::from(x) * f64::from(display_width) / f64::from(image_width),
-            f64::from(y) * f64::from(display_height) / f64::from(image_height),
+            viewport
+                .get("origin_x")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                + f64::from(x) * display_width / f64::from(image_width),
+            viewport
+                .get("origin_y")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                + f64::from(y) * display_height / f64::from(image_height),
         ))
     }
 
@@ -1035,6 +1050,7 @@ mod linux {
             ComputerAction::RightClick => "right_click",
             ComputerAction::MiddleClick => "middle_click",
             ComputerAction::DoubleClick => "double_click",
+            ComputerAction::TripleClick => "triple_click",
             ComputerAction::LeftMouseDown => "left_mouse_down",
             ComputerAction::LeftMouseUp => "left_mouse_up",
             ComputerAction::MouseMove { .. } => "mouse_move",

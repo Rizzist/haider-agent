@@ -1643,22 +1643,19 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
                     .len()
         })
         .sum();
-    // Full authorized manifest comparison: macOS 19_962 -> 20_770, measured
-    // by this test. +808 = +337 list_tools +153 parameter prose +318 net
-    // graph_evidence evidence_from/schema prose. This is the full catalog,
-    // distinct from the default nine-tool provider pack measured below.
-    // Other hosts are derived from unchanged platform deltas: Linux +49;
-    // Windows computer +2 and process command -3 = -1; other Unix -6.
-    // Thus Linux 20_011 -> 20_819, Windows 19_961 -> 20_769, other
-    // Unix 19_956 -> 20_764. Only macOS was executed for this merge.
+    // Computer parity adds 771 full-schema bytes for triple_click, region crops,
+    // and key-chord descriptions: macOS 20_770 -> 21_541.
+    // Other hosts retain platform deltas: Linux +49, Windows -1, Unix -6.
+    // Computer remains a stub in the default pipe: invariant 6_166 -> 6_166;
+    // manual bytes remain zero. Full schema growth cannot waive the pipe gate.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 20_819;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_590;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 20_770;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_541;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 20_769;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_540;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 20_764;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 21_535;
     config.tools = authorized;
     config.enable_tool_discovery(Vec::new());
     let tools = config.tool_definitions();

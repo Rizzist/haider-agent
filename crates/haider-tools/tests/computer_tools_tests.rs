@@ -75,6 +75,15 @@ fn computer_manifest_matches_additive_golden_and_parameter_schemas_are_live() {
         manifest
     };
     let serialized = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
+    if std::env::var_os("UPDATE_FIXTURES").is_some() {
+        std::fs::write(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/computer_manifest.json"),
+            format!("{serialized}\n"),
+        )
+        .expect("regenerate computer manifest fixture");
+        return;
+    }
     // `include_str!` embeds the fixture with its on-disk line endings; a
     // Windows autocrlf checkout gives it CRLF while serde emits LF. Compare
     // on normalized endings so the golden is content, not whitespace.
@@ -272,4 +281,83 @@ async fn ordinary_close_does_not_fabricate_computer_cancellation() {
             }) if effect == &intent.effect
         )
     }));
+}
+
+#[test]
+fn triple_click_is_additive_control_gated_and_rejects_coordinates() {
+    let operation = ComputerOperation::from_tool_args(serde_json::json!({"action":"triple_click"}))
+        .expect("triple click parses");
+    assert_eq!(operation.action(), &ComputerAction::TripleClick);
+    assert_eq!(operation.action().click_count(), Some(3));
+    assert_eq!(ComputerAction::DoubleClick.click_count(), Some(2));
+    assert_eq!(ComputerAction::Screenshot.click_count(), None);
+    assert_eq!(
+        operation.action().effect_class(),
+        EffectClass::ScreenControl
+    );
+    for invalid in [
+        serde_json::json!({"action":"triple_click", "x": 1, "y": 2}),
+        serde_json::json!({"action":"triple_click", "count": 4}),
+    ] {
+        assert!(ComputerOperation::from_tool_args(invalid).is_err());
+    }
+    let encoded = serde_json::to_value(operation.action()).expect("encode action");
+    assert_eq!(encoded, serde_json::json!({"action":"triple_click"}));
+}
+
+#[test]
+fn key_chords_keep_modifier_combos_in_the_neutral_contract() {
+    for keys in ["cmd+shift+4", "ctrl+alt+delete", "alt+tab", "shift+left"] {
+        let operation =
+            ComputerOperation::from_tool_args(serde_json::json!({"action":"key", "keys":keys}))
+                .expect("modifier chord parses");
+        assert_eq!(
+            operation.action(),
+            &ComputerAction::Key { keys: keys.into() }
+        );
+        assert_eq!(
+            operation.action().effect_class(),
+            EffectClass::ScreenControl
+        );
+    }
+    for invalid in [
+        serde_json::json!({"action":"key", "keys":" "}),
+        serde_json::json!({"action":"key", "keys":"cmd++a"}),
+        serde_json::json!({"action":"key", "keys":"unknown+a"}),
+        serde_json::json!({"action":"key", "keys":"cmd+"}),
+        serde_json::json!({"action":"key", "keys":["cmd", "a"]}),
+        serde_json::json!({"action":"key"}),
+    ] {
+        assert!(ComputerOperation::from_tool_args(invalid).is_err());
+    }
+}
+
+#[test]
+fn screenshot_region_arguments_validate_and_broker_roundtrip() {
+    use haider_tools::EffectOperation;
+    let args = serde_json::json!({"action":"screenshot","region":{"x":10,"y":20,"width":30,"height":40,"reference_width":100,"reference_height":100}});
+    let operation = ComputerOperation::from_tool_args(args.clone()).expect("region");
+    assert_eq!(operation.arguments().expect("broker arguments"), args);
+    assert_eq!(operation.action(), &ComputerAction::Screenshot);
+    assert!(operation.region().is_some());
+    for field in ["width", "height", "reference_width", "reference_height"] {
+        let mut invalid = args.clone();
+        invalid["region"][field] = serde_json::json!(0);
+        assert!(
+            ComputerOperation::from_tool_args(invalid).is_err(),
+            "{field}"
+        );
+    }
+    for invalid_region in [
+        serde_json::json!({"x":0}),
+        serde_json::json!(null),
+        serde_json::json!({"x":0,"y":0,"width":1,"height":1,"reference_width":1,"reference_height":1,"extra":true}),
+    ] {
+        let mut invalid = args.clone();
+        invalid["region"] = invalid_region;
+        assert!(ComputerOperation::from_tool_args(invalid).is_err());
+    }
+    let mut invalid = args;
+    invalid["action"] = serde_json::json!("cursor_position");
+    assert!(ComputerOperation::from_tool_args(invalid).is_err());
 }

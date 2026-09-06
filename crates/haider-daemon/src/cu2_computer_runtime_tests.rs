@@ -82,6 +82,7 @@ struct FakeComputerBackend {
     inspect_screenshot: Vec<u8>,
     actions: Mutex<Vec<ComputerAction>>,
     viewports: Mutex<Vec<(u32, u32)>>,
+    crops: Mutex<Vec<Option<haider_tools::ComputerScreenshotCrop>>>,
     block_wait: bool,
     entered: Notify,
     active_cancel: Mutex<Option<ComputerCancelToken>>,
@@ -95,6 +96,7 @@ impl FakeComputerBackend {
             inspect_screenshot: inspect_png_fixture(),
             actions: Mutex::new(Vec::new()),
             viewports: Mutex::new(Vec::new()),
+            crops: Mutex::new(Vec::new()),
             block_wait: false,
             entered: Notify::new(),
             active_cancel: Mutex::new(None),
@@ -159,6 +161,16 @@ impl ComputerBackend for FakeComputerBackend {
             .expect("viewport lock")
             .push((width, height));
         Ok(())
+    }
+
+    fn set_viewport_region(
+        &self,
+        width: u32,
+        height: u32,
+        crop: Option<haider_tools::ComputerScreenshotCrop>,
+    ) -> ComputerResult<()> {
+        self.crops.lock().expect("crop lock").push(crop);
+        self.set_viewport(width, height)
     }
 
     async fn emergency_stop(&self) -> ComputerResult<()> {
@@ -1543,5 +1555,102 @@ async fn turn_cancel_emergency_stops_backend_and_journals_computer_cancelled() {
     assert_eq!(
         backend.actions.lock().expect("actions lock").as_slice(),
         &[ComputerAction::Wait { ms: 60_000 }]
+    );
+}
+
+#[tokio::test]
+async fn screenshot_region_redacts_before_crop_and_installs_delivered_mapping() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "cu2-region".into(), name: "computer".into(),
+            args: serde_json::json!({"action":"screenshot","region":{"x":100,"y":100,"width":200,"height":100,"reference_width":1500,"reference_height":500}}),
+        },
+        FakeStep::Finish { reason: FinishReason::ToolUse },
+        FakeStep::ExpectToolResult { call_id: "cu2-region".into() },
+        FakeStep::EmitText { text: "region complete".into() },
+        FakeStep::Finish { reason: FinishReason::EndTurn },
+    ]).with_vision_native());
+    let backend = Arc::new(FakeComputerBackend::new(large_png_fixture()));
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let factory: Arc<dyn TurnToolFactory> =
+        Arc::new(BrokerToolFactory::with_computer_backend_and_redaction(
+            Arc::clone(&backend) as Arc<dyn ComputerBackend>,
+            Arc::new(
+                ExcludeRegionScreenshotRedaction::new(vec![ScreenshotRedactionRegion {
+                    x: 200,
+                    y: 200,
+                    width: 10,
+                    height: 10,
+                }])
+                .expect("redaction"),
+            ),
+        ));
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: factory,
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("manager");
+    let session_id = SessionId::new("cu2-region-session");
+    let run_id = RunId::new("cu2-region-run");
+    let device_id = DeviceId::new("cu2-region-device");
+    create_session(&hub, &session_id, &device_id).await;
+    append_screen_control_grant(&store, &session_id).await;
+    submit_turn(
+        &hub,
+        &manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id,
+    )
+    .await;
+    let events = wait_for_run_state(&store, &session_id, &run_id, RunState::Done).await;
+    let image = events
+        .iter()
+        .find_map(|event| match event.payload.decode_event().ok()? {
+            EventPayload::ToolResult { result, .. } => result.images.first().cloned(),
+            _ => None,
+        })
+        .expect("region image admitted");
+    assert_eq!((image.width, image.height), (400, 200));
+    let cas = store.get(&image.artifact).await.expect("region CAS");
+    let decoded = image::load_from_memory(&cas)
+        .expect("region PNG")
+        .into_rgba8();
+    assert_eq!(decoded.get_pixel(0, 0).0, [0, 0, 0, 255]);
+    assert_ne!(decoded.get_pixel(10, 0).0, [0, 0, 0, 255]);
+    assert_eq!(
+        backend.viewports.lock().expect("viewport").as_slice(),
+        &[(image.width, image.height)]
+    );
+    assert_eq!(
+        backend.crops.lock().expect("crop").as_slice(),
+        &[Some(haider_tools::ComputerScreenshotCrop {
+            x: 200,
+            y: 200,
+            width: 400,
+            height: 200,
+            source_width: 3000,
+            source_height: 1000,
+        })]
+    );
+    let requests = provider.requests();
+    assert!(
+        requests[1]
+            .attachments
+            .iter()
+            .any(|attachment| attachment.artifact == image.artifact)
     );
 }

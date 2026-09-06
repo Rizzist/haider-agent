@@ -1302,7 +1302,10 @@ fn resize_to_fit(image: &DynamicImage, max_dimension: u32) -> DynamicImage {
     if image.width() <= max_dimension && image.height() <= max_dimension {
         image.clone()
     } else {
-        image.resize(max_dimension, max_dimension, FilterType::Triangle)
+        // Desktop glyphs and captured pointers need a sharper reconstruction
+        // than bilinear/Triangle when the CU-1 dimension/byte cap requires it.
+        // Resize once from the original backing pixels on every size attempt.
+        image.resize(max_dimension, max_dimension, FilterType::Lanczos3)
     }
 }
 

@@ -13,7 +13,7 @@
   "input_schema": {
     "properties": {
       "action": {
-        "description": "Computer action to perform",
+        "description": "Computer action to perform; right/middle/double/triple click at current cursor (mouse_move first)",
         "enum": [
           "screenshot",
           "cursor_position",
@@ -22,6 +22,7 @@
           "right_click",
           "middle_click",
           "double_click",
+          "triple_click",
           "left_mouse_down",
           "left_mouse_up",
           "mouse_move",
@@ -63,12 +64,44 @@
         "type": "object"
       },
       "keys": {
-        "description": "Shortcut such as cmd+shift+4",
+        "description": "Key chord: modifiers joined with + then a key, e.g. cmd+shift+4 or ctrl+alt+delete; issue sequential key actions for multi-step shortcuts",
         "type": "string"
       },
       "ms": {
         "description": "Wait duration from 0 through 60000 milliseconds",
         "type": "integer"
+      },
+      "region": {
+        "description": "Optional screenshot crop/zoom. Coordinates use a FULL-display reference screenshot; supply its width/height as reference_width/reference_height. Crops retain native detail. Subsequent input coordinates use the returned crop. Omit to restore full-display coordinates.",
+        "properties": {
+          "height": {
+            "type": "integer"
+          },
+          "reference_height": {
+            "type": "integer"
+          },
+          "reference_width": {
+            "type": "integer"
+          },
+          "width": {
+            "type": "integer"
+          },
+          "x": {
+            "type": "integer"
+          },
+          "y": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "x",
+          "y",
+          "width",
+          "height",
+          "reference_width",
+          "reference_height"
+        ],
+        "type": "object"
       },
       "text": {
         "description": "Text to type",

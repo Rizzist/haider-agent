@@ -1705,6 +1705,32 @@ retry, or restart. Opening settings does not resolve the menu. Retry/decision
 still uses the separately fenced menu answer coordinates, and the daemon
 rechecks the OS. Clients must not treat a successful open action as a grant.
 
+### 10.3.1 Computer observation and input coordinates
+
+The discovered `computer` tool uses top-left-origin pixels in its latest
+successfully delivered image. Native backends map those pixels to screen points
+using the actual delivered dimensions; clients/models must not assume a Retina
+scale of 1 or 2. `inspect` hit-tests the preceding image and returns accessibility
+bounds in its accompanying newly delivered screenshot.
+
+`{"action":"screenshot"}` remains the full-display form. An optional `region`
+object contains integer `x`, `y`, `width`, `height`, `reference_width`, and
+`reference_height`: the nonempty rectangle and dimensions of a full-display
+reference screenshot. It crops a fresh native capture before image admission,
+providing zoom detail. Redaction applies to the full native image before the
+crop. Following clicks, cursor positions, scrolling, drags and inspection inputs
+use the resulting crop's image coordinates. A subsequent full screenshot resets
+the coordinate space. The generic schema advertises this extension; a provider's
+native computer schema may not, and unsupported native replay fails explicitly.
+
+`triple_click` adds three left-button clicks at the current cursor, alongside
+existing `double_click`, `right_click` and `middle_click`. Use `mouse_move` first
+to position current-cursor actions. `key.keys` accepts modifier chords joined by
+`+` (for example `cmd+shift+4` or `ctrl+alt+delete`); multi-step shortcuts use
+successive key actions. Existing left clicks, drag/held-button actions, Unicode
+typing, directional scrolling with a positive amount, cursor position and
+bounded cancellable waits retain their forms and permission classes.
+
 ### 10.4 Autonomous session interaction policy
 
 `autonomous_interaction_v1` adds no new method. It gates one additive field on

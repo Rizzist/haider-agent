@@ -131,8 +131,8 @@ unsafe extern "C" {
         color_space: CGColorSpaceRef,
         bitmap_info: u32,
     ) -> CGContextRef;
-    fn CGContextTranslateCTM(context: CGContextRef, tx: f64, ty: f64);
-    fn CGContextScaleCTM(context: CGContextRef, sx: f64, sy: f64);
+    #[cfg(test)]
+    fn CGBitmapContextCreateImage(context: CGContextRef) -> CGImageRef;
     fn CGContextDrawImage(context: CGContextRef, rect: CGRect, image: CGImageRef);
     fn CGContextRelease(context: CGContextRef);
     fn CGEventCreate(source: *const c_void) -> CGEventRef;
@@ -222,6 +222,7 @@ struct Viewport {
 #[derive(Debug, Default)]
 struct BackendState {
     pending_display_bounds: Option<CGRect>,
+    pending_inspection_bounds: Option<CGRect>,
     viewport: Option<Viewport>,
     left_button_down: bool,
 }
@@ -349,6 +350,16 @@ impl MacOsComputerBackend {
                 message: "macOS granted Screen Recording, but this haiderd process cannot capture until it restarts".into(),
             });
         }
+        let png = Self::encode_capture_image(image, cancel)?;
+        Ok((png, bounds))
+    }
+
+    /// Consumes a retained CGImage, normalizes its pixels and encodes PNG.
+    /// Shared by actual display capture and permission-free synthetic tests.
+    fn encode_capture_image(
+        image: CGImageRef,
+        cancel: &ComputerCancelToken,
+    ) -> ComputerResult<Vec<u8>> {
         // SAFETY: `image` remains live until the guarded release below.
         let (width, height) = unsafe { (CGImageGetWidth(image), CGImageGetHeight(image)) };
         let Some(byte_len) = width
@@ -406,10 +417,10 @@ impl MacOsComputerBackend {
             });
         }
         // SAFETY: all retained objects are live and the target rect is within
-        // the allocated bitmap. The transform yields top-left image rows.
+        // the allocated bitmap. CGImage drawing into an untransformed bitmap
+        // preserves its scanline order. Applying a UIKit-style flipped CTM here
+        // reverses rows a second time: PNG then puts the menu bar at the bottom.
         unsafe {
-            CGContextTranslateCTM(context, 0.0, height as f64);
-            CGContextScaleCTM(context, 1.0, -1.0);
             CGContextDrawImage(
                 context,
                 CGRect {
@@ -438,7 +449,7 @@ impl MacOsComputerBackend {
                 message: format!("could not encode macOS screenshot as PNG: {error}"),
             })?;
         cancel.check()?;
-        Ok((encoded.into_inner(), bounds))
+        Ok(encoded.into_inner())
     }
 
     async fn capture_png(&self, cancel: &ComputerCancelToken) -> ComputerResult<Vec<u8>> {
@@ -520,6 +531,7 @@ impl MacOsComputerBackend {
         y: u32,
         cancel: &ComputerCancelToken,
     ) -> ComputerResult<ComputerInspection> {
+        self.discard_inspection()?;
         cancel.check()?;
         self.preflight_accessibility()?;
         let viewport = self.viewport()?;
@@ -568,14 +580,19 @@ impl MacOsComputerBackend {
 
         let inspection = (|| {
             cancel.check()?;
-            Ok(ComputerInspection {
+            let bounds = copy_ax_bounds(element)?;
+            let inspection = ComputerInspection {
                 role: copy_ax_text_attribute(element, c"AXRole")?,
                 label: copy_ax_text_attribute(element, c"AXDescription")?,
                 title: copy_ax_text_attribute(element, c"AXTitle")?,
-                bounds: copy_ax_bounds(element)?
-                    .and_then(|bounds| map_accessibility_bounds(viewport, bounds)),
+                // The paired full screenshot may replace a cropped viewport,
+                // and CU-1 can resize it. Map only after its admission.
+                bounds: None,
                 value: copy_ax_text_attribute(element, c"AXValue")?,
-            })
+            };
+            cancel.check()?;
+            self.lock_state()?.pending_inspection_bounds = bounds;
+            Ok(inspection)
         })();
         // SAFETY: the successful copy-at-position call returned this retained
         // accessibility element exactly once.
@@ -755,7 +772,7 @@ impl MacOsComputerBackend {
         let mut flags = 0_u64;
         for modifier in parts {
             flags |= match modifier.to_ascii_lowercase().as_str() {
-                "cmd" | "command" | "meta" => CG_FLAG_COMMAND,
+                "cmd" | "command" | "meta" | "super" => CG_FLAG_COMMAND,
                 "shift" => CG_FLAG_SHIFT,
                 "ctrl" | "control" => CG_FLAG_CONTROL,
                 "alt" | "option" => CG_FLAG_OPTION,
@@ -909,15 +926,15 @@ impl MacOsComputerBackend {
                 1,
                 cancel,
             )?,
-            ComputerAction::DoubleClick => {
+            ComputerAction::DoubleClick | ComputerAction::TripleClick => {
                 let point = current()?;
-                for click_state in [1, 2] {
+                for click_state in 1..=action.click_count().unwrap_or(2) {
                     self.click(
                         point,
                         CG_MOUSE_LEFT,
                         CG_EVENT_LEFT_DOWN,
                         CG_EVENT_LEFT_UP,
-                        click_state,
+                        i64::from(click_state),
                         cancel,
                     )?;
                 }
@@ -1004,6 +1021,35 @@ fn mouse_move_event_type(left_held: bool) -> u32 {
     } else {
         CG_EVENT_MOUSE_MOVED
     }
+}
+
+fn crop_display_bounds(
+    bounds: CGRect,
+    crop: super::ComputerScreenshotCrop,
+) -> ComputerResult<CGRect> {
+    if crop.source_width == 0
+        || crop.source_height == 0
+        || crop.width == 0
+        || crop.height == 0
+        || u64::from(crop.x) + u64::from(crop.width) > u64::from(crop.source_width)
+        || u64::from(crop.y) + u64::from(crop.height) > u64::from(crop.source_height)
+    {
+        return Err(ComputerError::InvalidAction {
+            message: "invalid screenshot crop bounds".into(),
+        });
+    }
+    let sx = bounds.size.width / f64::from(crop.source_width);
+    let sy = bounds.size.height / f64::from(crop.source_height);
+    Ok(CGRect {
+        origin: CGPoint {
+            x: bounds.origin.x + f64::from(crop.x) * sx,
+            y: bounds.origin.y + f64::from(crop.y) * sy,
+        },
+        size: CGSize {
+            width: f64::from(crop.width) * sx,
+            height: f64::from(crop.height) * sy,
+        },
+    })
 }
 
 fn map_delivered_pixel(viewport: Viewport, point: ScreenPoint) -> ComputerResult<CGPoint> {
@@ -1235,6 +1281,7 @@ impl ComputerBackend for MacOsComputerBackend {
             | ComputerAction::LeftClick { .. }
             | ComputerAction::RightClick
             | ComputerAction::MiddleClick
+            | ComputerAction::TripleClick
             | ComputerAction::DoubleClick
             | ComputerAction::LeftMouseDown
             | ComputerAction::LeftMouseUp
@@ -1251,6 +1298,7 @@ impl ComputerBackend for MacOsComputerBackend {
         action: &ComputerAction,
         cancel: &ComputerCancelToken,
     ) -> ComputerResult<ComputerOutput> {
+        self.discard_inspection()?;
         cancel.check()?;
         match action {
             ComputerAction::Screenshot => self
@@ -1263,7 +1311,13 @@ impl ComputerBackend for MacOsComputerBackend {
             }
             ComputerAction::Inspect { x, y } => {
                 let inspection = self.inspect(*x, *y, cancel)?;
-                let screenshot_png = self.capture_png(cancel).await?;
+                let screenshot_png = match self.capture_png(cancel).await {
+                    Ok(png) => png,
+                    Err(error) => {
+                        self.discard_inspection()?;
+                        return Err(error);
+                    }
+                };
                 Ok(ComputerOutput::Inspection {
                     inspection,
                     screenshot_png,
@@ -1324,6 +1378,15 @@ impl ComputerBackend for MacOsComputerBackend {
     }
 
     fn set_viewport(&self, width: u32, height: u32) -> ComputerResult<()> {
+        self.set_viewport_region(width, height, None)
+    }
+
+    fn set_viewport_region(
+        &self,
+        width: u32,
+        height: u32,
+        crop: Option<super::ComputerScreenshotCrop>,
+    ) -> ComputerResult<()> {
         if width == 0 || height == 0 {
             return Err(ComputerError::InvalidAction {
                 message: "CU-1 returned an empty computer screenshot viewport".into(),
@@ -1335,6 +1398,10 @@ impl ComputerBackend for MacOsComputerBackend {
             .ok_or_else(|| ComputerError::Backend {
                 message: "CU-1 viewport arrived without a matching macOS capture".into(),
             })?;
+        let bounds = match crop {
+            Some(crop) => crop_display_bounds(bounds, crop)?,
+            None => bounds,
+        };
         state.viewport = Some(Viewport {
             display_bounds: bounds,
             image_width: width,
@@ -1343,7 +1410,26 @@ impl ComputerBackend for MacOsComputerBackend {
         Ok(())
     }
 
+    fn finalize_inspection(&self, inspection: &mut ComputerInspection) -> ComputerResult<()> {
+        let mut state = self.lock_state()?;
+        let bounds = state.pending_inspection_bounds.take();
+        inspection.bounds = bounds.and_then(|bounds| {
+            state
+                .viewport
+                .and_then(|viewport| map_accessibility_bounds(viewport, bounds))
+        });
+        Ok(())
+    }
+
+    fn discard_inspection(&self) -> ComputerResult<()> {
+        self.lock_state()?.pending_inspection_bounds = None;
+        Ok(())
+    }
+
     async fn emergency_stop(&self) -> ComputerResult<()> {
+        // AX cleanup must never prevent the existing emergency input release,
+        // even if the local state lock was poisoned by an earlier failure.
+        let _ = self.discard_inspection();
         let _input_gate = INPUT_GATE.lock().await;
         // The global owner is authoritative even if a local-state update
         // failed after the physical down event crossed into WindowServer.
@@ -1370,6 +1456,7 @@ fn action_name(action: &ComputerAction) -> &'static str {
         ComputerAction::RightClick => "right_click",
         ComputerAction::MiddleClick => "middle_click",
         ComputerAction::DoubleClick => "double_click",
+        ComputerAction::TripleClick => "triple_click",
         ComputerAction::LeftMouseDown => "left_mouse_down",
         ComputerAction::LeftMouseUp => "left_mouse_up",
         ComputerAction::MouseMove { .. } => "mouse_move",
@@ -1446,6 +1533,90 @@ fn virtual_key_code(key: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthetic_cgimage_png_preserves_orientation_edges_and_accessibility_coordinates() {
+        let (width, height) = (16, 12);
+        let mut rgba = vec![255_u8; width * height * 4];
+        rgba[..4].copy_from_slice(&[255, 0, 0, 255]);
+        rgba[(width * height - 1) * 4..].copy_from_slice(&[0, 0, 255, 255]);
+        // A hard black/white edge must survive the backing-pixel conversion.
+        for y in 2..10 {
+            for x in 4..8 {
+                rgba[(y * width + x) * 4..(y * width + x + 1) * 4].copy_from_slice(&[0, 0, 0, 255]);
+            }
+        }
+        // A pixel-aligned arrow-shaped marker models captured pointer pixels;
+        // this backend itself does not composite a cursor overlay.
+        for y in 2..7 {
+            for x in 10..=10 + (y - 2) / 2 {
+                rgba[(y * width + x) * 4..(y * width + x + 1) * 4]
+                    .copy_from_slice(&[0, 128, 0, 255]);
+            }
+        }
+        // SAFETY: the owned buffer covers the bitmap stride and stays alive
+        // until context release; all create-rule references are balanced.
+        let image = unsafe {
+            let color = CGColorSpaceCreateDeviceRGB();
+            assert!(!color.is_null());
+            let context = CGBitmapContextCreate(
+                rgba.as_mut_ptr().cast(),
+                width,
+                height,
+                8,
+                width * 4,
+                color,
+                CG_IMAGE_ALPHA_PREMULTIPLIED_LAST | CG_BITMAP_BYTE_ORDER_32_BIG,
+            );
+            assert!(!context.is_null());
+            let image = CGBitmapContextCreateImage(context);
+            CGContextRelease(context);
+            CGColorSpaceRelease(color);
+            assert!(!image.is_null());
+            image
+        };
+        let png = MacOsComputerBackend::encode_capture_image(image, &ComputerCancelToken::new())
+            .unwrap_or_else(|error| panic!("synthetic capture: {error}"));
+        let decoded = image::load_from_memory(&png)
+            .unwrap_or_else(|error| panic!("decode: {error}"))
+            .into_rgba8();
+        assert_eq!(decoded.as_raw(), &rgba);
+        assert_eq!(decoded.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(decoded.get_pixel(15, 11).0, [0, 0, 255, 255]);
+        let viewport = Viewport {
+            display_bounds: CGRect {
+                origin: CGPoint { x: 100.0, y: 50.0 },
+                size: CGSize {
+                    width: 8.0,
+                    height: 6.0,
+                },
+            },
+            image_width: 16,
+            image_height: 12,
+        };
+        for (x, y) in [(0, 0), (15, 11)] {
+            let point = map_delivered_pixel(viewport, ScreenPoint { x, y })
+                .unwrap_or_else(|error| panic!("map: {error}"));
+            assert_eq!(
+                map_accessibility_bounds(
+                    viewport,
+                    CGRect {
+                        origin: point,
+                        size: CGSize {
+                            width: 0.5,
+                            height: 0.5
+                        }
+                    }
+                ),
+                Some(ComputerInspectionBounds {
+                    x,
+                    y,
+                    width: 1,
+                    height: 1
+                })
+            );
+        }
+    }
 
     #[test]
     fn delivered_cu1_pixels_map_to_quartz_points_without_hardcoded_retina_scale() {
@@ -1527,6 +1698,70 @@ mod tests {
     }
 
     #[test]
+    fn region_viewport_maps_zoom_pixels_and_ax_bounds_to_exact_retina_crop() {
+        let backend = MacOsComputerBackend::new();
+        backend
+            .lock_state()
+            .unwrap_or_else(|error| panic!("state: {error}"))
+            .pending_display_bounds = Some(CGRect {
+            origin: CGPoint { x: 100.0, y: 50.0 },
+            size: CGSize {
+                width: 1440.0,
+                height: 900.0,
+            },
+        });
+        let crop = super::super::ComputerScreenshotCrop {
+            x: 400,
+            y: 200,
+            width: 800,
+            height: 600,
+            source_width: 2880,
+            source_height: 1800,
+        };
+        backend
+            .set_viewport_region(800, 600, Some(crop))
+            .unwrap_or_else(|error| panic!("viewport: {error}"));
+        let point = backend
+            .map_point(ScreenPoint { x: 200, y: 100 })
+            .unwrap_or_else(|error| panic!("map: {error}"));
+        assert_eq!((point.x, point.y), (400.0, 200.0));
+        assert_eq!(
+            map_accessibility_bounds(
+                backend
+                    .viewport()
+                    .unwrap_or_else(|error| panic!("viewport: {error}")),
+                CGRect {
+                    origin: point,
+                    size: CGSize {
+                        width: 10.0,
+                        height: 10.0
+                    }
+                }
+            ),
+            Some(ComputerInspectionBounds {
+                x: 200,
+                y: 100,
+                width: 20,
+                height: 20
+            })
+        );
+        assert!(backend.map_point(ScreenPoint { x: 800, y: 0 }).is_err());
+        assert!(backend.set_viewport_region(0, 600, Some(crop)).is_err());
+        assert!(
+            backend
+                .set_viewport_region(
+                    800,
+                    600,
+                    Some(super::super::ComputerScreenshotCrop {
+                        source_width: 0,
+                        ..crop
+                    })
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn held_left_button_only_allows_drag_motion_or_release() {
         assert!(action_allowed_while_left_held(&ComputerAction::MouseMove {
             x: 1,
@@ -1556,3 +1791,7 @@ mod tests {
         assert!(matches!(output, ComputerOutput::ScreenshotPng(bytes) if !bytes.is_empty()));
     }
 }
+
+#[cfg(test)]
+#[path = "macos_inspection_tests.rs"]
+mod inspection_tests;
