@@ -140,7 +140,13 @@ try:
     # paths independently of HAIDER_PROFILE_DIR. Keep every root private,
     # matching the QA harness: no chmod/read of the invoking user's ~/.haider.
     probe_home = os.path.join(profile, "home")
-    probe_runtime = os.path.join(profile, "runtime")
+    # The daemon's Unix socket lives under the runtime root; macOS TMPDIR
+    # (/var/folders/.../T/, ~49 chars) plus the throwaway profile path pushes
+    # that socket past the 104-byte sun_path limit, and an explicit
+    # HAIDER_RUNTIME_DIR that exceeds it fails loudly (client profile.rs).
+    # Keep the runtime root short and still throwaway.
+    probe_runtime = tempfile.mkdtemp(prefix="haider-live-rt-", dir="/tmp")
+    assert len(probe_runtime) < 60, f"runtime root too long for sun_path: {probe_runtime}"
     env_extra = {
         "HOME": probe_home,
         "USERPROFILE": probe_home,
@@ -593,6 +599,7 @@ finally:
         print(f"live-probe: preserving profile after failed cleanup: {profile}", file=sys.stderr)
     if cleanup_ok and not os.environ.get("LIVE_PROBE_PROFILE"):
         shutil.rmtree(profile, ignore_errors=True)
+        shutil.rmtree(probe_runtime, ignore_errors=True)
 
 # The half of "exactly once" no terminal can show: the daemon's ledger. Keep
 # these as five separately reported facts. Menu facts are scoped to the
