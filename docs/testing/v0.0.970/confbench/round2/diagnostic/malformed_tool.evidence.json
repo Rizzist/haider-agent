@@ -1,0 +1,78 @@
+{
+  "scenario": "malformed_tool",
+  "exit_code": 0,
+  "timed_out": false,
+  "requests": [
+    {
+      "path": "/v1/chat/completions",
+      "model": "deepseek-v4-flash"
+    },
+    {
+      "path": "/v1/chat/completions",
+      "model": "deepseek-v4-flash"
+    }
+  ],
+  "auxiliary_tool_name": null,
+  "proxy_tool_call_ids": [
+    "call-1"
+  ],
+  "normalized_events": [
+    {
+      "type": "harness_started",
+      "raw_index": 0,
+      "rule": "accepted",
+      "evidence_origin": "harness"
+    },
+    {
+      "type": "tool_started",
+      "raw_index": 20,
+      "rule": "tool-start",
+      "tool_call_id": "call-1",
+      "tool_name": "process_exec",
+      "arguments": {},
+      "evidence_origin": "harness"
+    },
+    {
+      "type": "tool_finished",
+      "raw_index": 27,
+      "rule": "tool-finish",
+      "tool_call_id": "call-1",
+      "tool_name": "process_exec",
+      "status": "failed",
+      "evidence_origin": "harness"
+    },
+    {
+      "type": "message",
+      "raw_index": 49,
+      "rule": "agent-message",
+      "message": "conformance complete",
+      "evidence_origin": "harness"
+    },
+    {
+      "type": "harness_finished",
+      "raw_index": 51,
+      "rule": "run-done",
+      "status": "success",
+      "evidence_origin": "harness"
+    },
+    {
+      "type": "model_request_observed",
+      "raw_index": 53,
+      "rule": "proxy-request",
+      "request_id": "proxy-1",
+      "model": "deepseek-v4-flash",
+      "path": "/v1/chat/completions",
+      "evidence_origin": "runner"
+    },
+    {
+      "type": "model_request_observed",
+      "raw_index": 54,
+      "rule": "proxy-request",
+      "request_id": "proxy-2",
+      "model": "deepseek-v4-flash",
+      "path": "/v1/chat/completions",
+      "evidence_origin": "runner"
+    }
+  ],
+  "jsonl_sha256": "49a96f2a69754c3b8005b7081c129ab0017dd540a8097d12c3790b84cba16f8c"
+}

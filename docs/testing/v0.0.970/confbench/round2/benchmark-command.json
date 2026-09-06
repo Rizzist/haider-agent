@@ -1,0 +1,28 @@
+{
+  "args": [
+    "python3",
+    "-m",
+    "bench.conformance",
+    "--adapter",
+    "haider-agent",
+    "--executable",
+    "/Users/rizzist/haider-run/lane-970-confbench/target/release/haider",
+    "--model",
+    "deepseek-v4-flash",
+    "--context-window",
+    "131072",
+    "--max-output-tokens",
+    "8192",
+    "--max-turns",
+    "20",
+    "--process-timeout",
+    "15",
+    "--proxy-timeout",
+    "20",
+    "--json-report",
+    "/Users/rizzist/haider-run/lane-970-confbench/docs/testing/v0.0.970/confbench/round2/haider-970-round2.json"
+  ],
+  "cwd": "/Users/rizzist/Documents/CODING/haidercode-web",
+  "exit_code": 1,
+  "repeat_reason": "Second run moved the unrelated outside-state failure to streamed_text; final unchanged repeat to measure the interference, with all reports retained."
+}

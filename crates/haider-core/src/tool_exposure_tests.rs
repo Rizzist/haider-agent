@@ -27,6 +27,7 @@ fn config() -> HarnessConfig {
         "fs_write",
         "fs_edit",
         "process_exec",
+        "spawn_subagent",
         "computer",
         "monitor",
         "plan",
@@ -48,6 +49,172 @@ fn names(config: &HarnessConfig) -> Vec<&str> {
         .collect()
 }
 
+fn full_spawn_definition() -> ToolDefinition {
+    let manifest = haider_tools::spawn_subagent_manifest();
+    ToolDefinition {
+        name: manifest.name,
+        description: manifest.description,
+        input_schema: manifest.input_schema,
+    }
+}
+
+fn spawn_config(promoted: Vec<String>) -> HarnessConfig {
+    let mut config = HarnessConfig::for_session(
+        SessionId::new("spawn-discovery"),
+        DeviceId::new("discovery-device"),
+        1,
+        1,
+    );
+    config.tools = vec![
+        definition("list_tools"),
+        full_spawn_definition(),
+        definition("web_fetch"),
+    ];
+    config.enable_tool_discovery(promoted);
+    config
+}
+
+fn advertised_spawn(config: &HarnessConfig) -> &ToolDefinition {
+    config
+        .tool_definitions()
+        .iter()
+        .find(|tool| tool.name == "spawn_subagent")
+        .expect("advertised spawn")
+}
+
+#[test]
+fn default_spawn_preserves_required_contract_and_full_discovery() {
+    let mut config = spawn_config(Vec::new());
+    let full = full_spawn_definition();
+    let default = advertised_spawn(&config).clone();
+    assert_eq!(
+        default.input_schema["properties"]
+            .as_object()
+            .expect("required properties")
+            .len(),
+        2
+    );
+    for name in ["task", "prompt"] {
+        assert_eq!(
+            default.input_schema["properties"][name],
+            full.input_schema["properties"][name]
+        );
+    }
+    for key in ["type", "required", "additionalProperties"] {
+        assert_eq!(default.input_schema[key], full.input_schema[key]);
+    }
+    for guidance in [
+        "depth-capped",
+        "AgentSpawn policy",
+        "waits for child report",
+        "Inherits the current model/provider",
+        "list_tools(filter=\"spawn_subagent\")",
+        "workflow, specialist, and request-budget controls",
+    ] {
+        assert!(default.description.contains(guidance));
+    }
+    assert!(tool_call_within_advertised_ceiling(
+        &config,
+        "spawn_subagent"
+    ));
+    let old_digest = config.canonical_tool_pack_digest();
+    let result = config.discovered_tool_result(serde_json::json!({"filter": "spawn_subagent"}));
+    let payload: serde_json::Value = serde_json::from_str(&result.preview).expect("discovery JSON");
+    let discovered: ToolDefinition =
+        serde_json::from_value(payload["tools"][0].clone()).expect("full discovered definition");
+    assert_eq!(discovered, full);
+    assert_eq!(
+        advertised_spawn(&config),
+        &default,
+        "discovery is not yet committed"
+    );
+    let mut rejected = result.clone();
+    rejected.status = ToolResultStatus::Rejected;
+    config.promote_committed_tools(&rejected);
+    assert_eq!(advertised_spawn(&config), &default);
+    config.promote_committed_tools(&result);
+    assert_eq!(advertised_spawn(&config), &full);
+    assert_ne!(config.canonical_tool_pack_digest(), old_digest);
+    let promoted_digest = config.canonical_tool_pack_digest();
+    config.promote_committed_tools(&result);
+    assert_eq!(config.canonical_tool_pack_digest(), promoted_digest);
+    let restored = spawn_config(vec!["spawn_subagent".into()]);
+    assert_eq!(restored.tool_definitions(), config.tool_definitions());
+    assert_eq!(restored.canonical_tool_pack_digest(), promoted_digest);
+}
+
+#[test]
+fn spawn_projection_survives_owned_refresh_and_provider_fallback() {
+    for promoted in [false, true] {
+        let mut config = spawn_config(if promoted {
+            vec!["spawn_subagent".into()]
+        } else {
+            Vec::new()
+        });
+        let expected = advertised_spawn(&config).clone();
+        config.install_provider_derived_request_state(&ProviderDerivedRequestState::default());
+        assert_eq!(advertised_spawn(&config), &expected);
+        let full = config
+            .tool_exposure
+            .as_ref()
+            .expect("exposure")
+            .current
+            .clone();
+        assert_eq!(
+            full.iter().find(|tool| tool.name == "spawn_subagent"),
+            Some(&full_spawn_definition())
+        );
+        let current: Arc<[ToolDefinition]> = full
+            .iter()
+            .filter(|tool| tool.name != "web_fetch")
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        let state = ProviderDerivedRequestState {
+            tool_result_images_supported: false,
+            local_web_tool_names: Vec::new(),
+            provider_fallback_local_web_tool_names: vec!["web_fetch".into()],
+        };
+        config.install_shared_tool_packs(
+            SharedToolPacks {
+                base: full.clone(),
+                local_web_tool_names: vec!["web_fetch".into()].into(),
+                current_digest: canonical_tool_definitions_digest(&current),
+                current,
+                fallback: Some((full.clone(), canonical_tool_definitions_digest(&full))),
+                variants: Arc::default(),
+            },
+            &state,
+        );
+        config.install_provider_derived_request_state(&state);
+        assert_eq!(advertised_spawn(&config), &expected);
+        config.activate_provider_tool_fallback();
+        assert_eq!(advertised_spawn(&config), &expected);
+        let discovery =
+            config.discovered_tool_result(serde_json::json!({"filter": "spawn_subagent"}));
+        config.promote_committed_tools(&discovery);
+        assert_eq!(advertised_spawn(&config), &full_spawn_definition());
+    }
+}
+
+#[test]
+fn default_spawn_projection_keeps_unfamiliar_schemas_intact() {
+    assert!(default_delegation_definition(&definition("spawn_subagent")).is_none());
+    let mut missing = full_spawn_definition();
+    missing.input_schema["properties"]
+        .as_object_mut()
+        .expect("properties")
+        .remove("prompt");
+    assert!(default_delegation_definition(&missing).is_none());
+    let mut additional_required = full_spawn_definition();
+    additional_required.input_schema["required"] = serde_json::json!(["task", "prompt", "model"]);
+    assert!(default_delegation_definition(&additional_required).is_none());
+    let mut conditional = full_spawn_definition();
+    conditional.input_schema["if"] = serde_json::json!({"required": ["provider"]});
+    conditional.input_schema["then"] = serde_json::json!({"required": ["model"]});
+    assert!(default_delegation_definition(&conditional).is_none());
+}
+
 #[test]
 fn default_coding_surface_and_catalog_read_do_not_promote() {
     let config = config();
@@ -62,6 +229,7 @@ fn default_coding_surface_and_catalog_read_do_not_promote() {
             "fs_write",
             "fs_edit",
             "process_exec",
+            "spawn_subagent",
         ]
     );
     let before = config.canonical_tool_pack_digest();
@@ -77,6 +245,10 @@ fn default_coding_surface_and_catalog_read_do_not_promote() {
     assert_eq!(before, config.canonical_tool_pack_digest());
     assert!(!tool_call_within_advertised_ceiling(&config, "monitor"));
     assert!(tool_call_within_advertised_ceiling(&config, "exec"));
+    assert!(tool_call_within_advertised_ceiling(
+        &config,
+        "spawn_subagent"
+    ));
 }
 
 #[test]
@@ -197,12 +369,33 @@ fn provider_refresh_and_fallback_preserve_the_discovery_tier() {
     config.install_provider_derived_request_state(&state);
     assert!(names(&config).contains(&"monitor"));
     assert!(!names(&config).contains(&"computer"));
+    assert!(names(&config).contains(&"spawn_subagent"));
     config.activate_provider_tool_fallback();
     let result = config.discovered_tool_result(serde_json::json!({"filter": "web_fetch"}));
     config.promote_committed_tools(&result);
     assert!(names(&config).contains(&"web_fetch"));
     assert!(names(&config).contains(&"monitor"));
     assert!(!names(&config).contains(&"computer"));
+    assert!(names(&config).contains(&"spawn_subagent"));
+}
+
+#[test]
+fn default_delegation_does_not_restore_a_tool_removed_by_provider_refresh() {
+    let mut config = config();
+    assert!(tool_call_within_advertised_ceiling(
+        &config,
+        "spawn_subagent"
+    ));
+    config.tools = vec![definition("list_tools"), definition("fs_read")];
+    config.shared_tools = None;
+    config.refresh_tool_exposure();
+    let result = config.discovered_tool_result(serde_json::json!({"filter": "spawn_subagent"}));
+    config.promote_committed_tools(&result);
+    assert_eq!(names(&config), ["list_tools", "fs_read"]);
+    assert!(!tool_call_within_advertised_ceiling(
+        &config,
+        "spawn_subagent"
+    ));
 }
 
 /// VERIFIER F3: the standalone owned tools vector becomes a shared filtered

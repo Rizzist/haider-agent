@@ -734,6 +734,7 @@ fn invalid_tool_call_data_has_a_typed_round_trip_without_changing_legacy_results
     let data = ToolResultData::InvalidToolCall {
         tool: "edit".into(),
         message: "expected a JSON object".into(),
+        repaired: None,
     };
     let wire = serde_json::json!({
         "kind": "invalid_tool_call",
@@ -751,6 +752,23 @@ fn invalid_tool_call_data_has_a_typed_round_trip_without_changing_legacy_results
     let legacy = serde_json::json!({"preview": "legacy", "truncated": false});
     let result: BoundedResult = serde_json::from_value(legacy.clone()).expect("decode legacy");
     assert_eq!(serde_json::to_value(result).expect("encode legacy"), legacy);
+}
+
+#[test]
+fn invalid_tool_call_repair_metadata_is_additive_and_round_trips() {
+    for repaired in [false, true] {
+        let data = ToolResultData::InvalidToolCall {
+            tool: "edit".into(),
+            message: "expected a JSON object".into(),
+            repaired: Some(repaired),
+        };
+        let wire = serde_json::to_value(&data).expect("encode repair metadata");
+        assert_eq!(wire["repaired"], repaired);
+        assert_eq!(
+            serde_json::from_value::<ToolResultData>(wire).expect("decode repair metadata"),
+            data
+        );
+    }
 }
 
 /// MUTATION CHECK: rename `run_retried` or omit any source coordinate.

@@ -1,0 +1,101 @@
+{
+  "scenario": "auxiliary_probe",
+  "exit_code": 0,
+  "timed_out": false,
+  "requests": [
+    {
+      "path": "/v1/chat/completions",
+      "model": "deepseek-v4-flash"
+    },
+    {
+      "path": "/v1/chat/completions",
+      "model": "deepseek-v4-flash"
+    },
+    {
+      "path": "/v1/chat/completions",
+      "model": "deepseek-v4-flash"
+    }
+  ],
+  "auxiliary_tool_name": "spawn_subagent",
+  "proxy_tool_call_ids": [
+    "call-1"
+  ],
+  "normalized_events": [
+    {
+      "type": "harness_started",
+      "raw_index": 0,
+      "rule": "accepted",
+      "evidence_origin": "harness"
+    },
+    {
+      "type": "tool_started",
+      "raw_index": 20,
+      "rule": "tool-start",
+      "tool_call_id": "call-1",
+      "tool_name": "spawn_subagent",
+      "arguments": {},
+      "evidence_origin": "harness"
+    },
+    {
+      "type": "tool_finished",
+      "raw_index": 51,
+      "rule": "tool-finish",
+      "tool_call_id": "call-1",
+      "tool_name": "spawn_subagent",
+      "status": "completed",
+      "evidence_origin": "harness"
+    },
+    {
+      "type": "message",
+      "raw_index": 69,
+      "rule": "agent-message",
+      "message": "conformance complete",
+      "evidence_origin": "harness"
+    },
+    {
+      "type": "harness_finished",
+      "raw_index": 71,
+      "rule": "run-done",
+      "status": "success",
+      "evidence_origin": "harness"
+    },
+    {
+      "type": "model_request_observed",
+      "raw_index": 73,
+      "rule": "proxy-request",
+      "request_id": "proxy-1",
+      "model": "deepseek-v4-flash",
+      "path": "/v1/chat/completions",
+      "evidence_origin": "runner"
+    },
+    {
+      "type": "model_request_observed",
+      "raw_index": 74,
+      "rule": "proxy-request",
+      "request_id": "proxy-2",
+      "model": "deepseek-v4-flash",
+      "path": "/v1/chat/completions",
+      "evidence_origin": "runner"
+    },
+    {
+      "type": "model_request_observed",
+      "raw_index": 75,
+      "rule": "proxy-request",
+      "request_id": "proxy-3",
+      "model": "deepseek-v4-flash",
+      "path": "/v1/chat/completions",
+      "evidence_origin": "runner"
+    },
+    {
+      "type": "workspace_changed",
+      "raw_index": 76,
+      "rule": "workspace-delta",
+      "patch_sha256": "73aac73a3d8fbdc6c020cd1760fbb91226dbfbc0c279ed2f2262566ce009d9e5",
+      "changed_paths": [
+        ".haider/handoff/52cb1d6f98c6e1b8/.gitignore"
+      ],
+      "evidence_origin": "runner"
+    }
+  ],
+  "jsonl_sha256": "82a96aa0ef9c30a43383db8bc765e36beb9b5d4dcb0c4d8f2bc84c893e8fd31f"
+}

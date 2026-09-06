@@ -21,7 +21,7 @@ struct Profile {
     runtime: PathBuf,
     workspace: PathBuf,
     script: String,
-    tool_exposure: &'static str,
+    tool_exposure: Option<&'static str>,
 }
 
 impl Profile {
@@ -58,7 +58,7 @@ impl Profile {
             runtime,
             workspace,
             script: script.to_string(),
-            tool_exposure: "spawn_subagent",
+            tool_exposure: Some("spawn_subagent"),
         }
     }
 
@@ -81,11 +81,12 @@ impl Profile {
             .env("HAIDER_NO_UPDATE_CHECK", "1")
             .env("HAIDER_TEST_DEVICE_NAME", "test-mac")
             .env("HAIDER_TEST_FAKE_PROVIDER", &self.script)
-            // Direct CLI delegation still obeys the daemon's tool ceiling.
-            .env("HAIDER_TOOL_EXPOSURE", self.tool_exposure)
             .env("RUST_MIN_STACK", "8388608")
             .env("NO_COLOR", "1")
             .stdin(Stdio::null());
+        if let Some(exposure) = self.tool_exposure {
+            command.env("HAIDER_TOOL_EXPOSURE", exposure);
+        }
         command
     }
 
@@ -323,53 +324,44 @@ fn provider_requests(events: &[Value]) -> usize {
 }
 
 #[test]
-fn agent_spawn_without_tool_exposure_retains_native_refusal() {
-    let mut profile = Profile::new(report_script("MUST_NOT_REACH_PROVIDER"));
-    profile.tool_exposure = "";
-    let rejected = profile.json(
-        &[
-            "agent",
-            "spawn",
-            "not exposed",
-            "--provider",
-            "fake",
-            "--model",
-            "fake-model",
-            "--json",
-            "--timeout",
-            "10s",
-        ],
-        "haider.agent.spawn.v1",
-        70,
-    );
-    assert_eq!(rejected["error"]["code"], "spawn_failed");
-    assert_eq!(rejected["error"]["retryable"], false);
+fn agent_spawn_without_tool_exposure_completes_the_actual_child() {
+    let mut profile = Profile::new(report_script("DEFAULT_DELEGATION_REPORT"));
+    // env_clear plus None proves the ordinary daemon default, with no
+    // exposure override on either the initial CLI or its daemon sibling.
+    profile.tool_exposure = None;
+    let spawned = profile.spawn();
+    let waited = profile.wait(&spawned, 0);
+    assert_eq!(waited["result"]["state"], "done");
     assert_eq!(
-        rejected["error"]["message"],
-        "grant ceiling violation: session is not allowed to use `spawn_subagent`; call list_tools with a matching filter to discover and enable authorized tools"
+        waited["result"]["report"]["summary"],
+        "DEFAULT_DELEGATION_REPORT"
     );
-    let parent = &rejected["result"];
-    let _ = field(parent, "run_id");
-    assert!(parent.get("agent_id").is_none());
-    let events = profile.journal(field(parent, "session_id"));
-    assert_eq!(provider_requests(&events), 0);
+    assert_eq!(
+        provider_requests(&profile.journal(field(&spawned, "session_id"))),
+        0,
+        "the CLI coordinator does not make a provider request"
+    );
+    assert_eq!(
+        provider_requests(&profile.journal(field(&spawned, "child_session_id"))),
+        1,
+        "the actual child completes one provider request"
+    );
     let listed = profile.json(
         &[
             "agent",
             "list",
-            field(parent, "session_id"),
+            field(&spawned, "session_id"),
             "--json",
             "--no-spawn",
         ],
         "haider.agent.list.v1",
         0,
     );
-    assert!(
-        listed["result"]["roots"]
-            .as_array()
-            .expect("native fleet roots")
-            .is_empty()
-    );
+    let roots = listed["result"]["roots"]
+        .as_array()
+        .expect("native fleet roots");
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0]["agent_id"], spawned["agent_id"]);
     profile.stop();
 }
 

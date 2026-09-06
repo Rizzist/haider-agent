@@ -1,0 +1,22 @@
+{
+  "gate/core-exposure.log": {
+    "original_sha256": "529567e9f3b35e93d9b1c9e34d8822cd04268312fa9d47edc40b64c5de1f3787",
+    "committed_sha256": "1a25ca8e96f730c98c2545bcea12d5f258e768c7d4aa77c273ed4a8b6942a4f1",
+    "change": "redundant blank line at EOF removed; all log content retained"
+  },
+  "gate/golden.log": {
+    "original_sha256": "146c6dca97f1ecbdba89c2f47d5b89910634c4e2777f74a46c05dc1a9a91981d",
+    "committed_sha256": "f30eaf00fe4786400df6689d6d0dc5ba9170584831e8824820610fba32da72d6",
+    "change": "redundant blank line at EOF removed; all log content retained"
+  },
+  "gate/malformed.log": {
+    "original_sha256": "1ea2593dc13b61855a896ede6251c0545aede2e367cb0e212b37f4ca59d86789",
+    "committed_sha256": "fa51f7d0eb91215026b43ca410c62d27ec3d41ab32030d20b40ecf722dbb210e",
+    "change": "redundant blank line at EOF removed; all log content retained"
+  },
+  "gate/protocol.log": {
+    "original_sha256": "9282fae1d977bc660f7c3d79796088595d6d9780e4a1b76c6795f13626a0c3cc",
+    "committed_sha256": "a8dfd3abf63c04c138a3ac99bb3b254c28c5260bba1f9d4578017256df81ca96",
+    "change": "redundant blank line at EOF removed; all log content retained"
+  }
+}

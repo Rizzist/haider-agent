@@ -1,0 +1,18 @@
+{
+  "recorded_at": "2026-09-05T23:12:38.227327+00:00",
+  "merged_upstream": "620fc1ce2faf0344c2d27c172fabe2c2f99bd253",
+  "source": "round2 lane diff atop 72364f34; final bundle commit identifies tested source",
+  "executables": {
+    "haider": {
+      "bytes": 35543584,
+      "sha256": "fdb64a9e109e11e29d9c673880676caf7edb701f99d5fa356934318cb707e112",
+      "version": "haider 0.0.969"
+    },
+    "haiderd": {
+      "bytes": 55365968,
+      "sha256": "492281bb599c3b72d4803c74e219178ce5caa42d0b476b47b19b0058e55a96ae",
+      "version": "haiderd 0.0.969"
+    }
+  },
+  "unchanged_through_all_three_bench_runs": true
+}

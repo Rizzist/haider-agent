@@ -1,0 +1,206 @@
+[
+  {
+    "schema_version": 1,
+    "event_id": "worker-event-session-c80005bbc395e47bf79fb62d7f4fa963-1-6b3fa6311f9a918ddb45b4ce483b6b5e-24",
+    "seq": 31,
+    "session_id": "session-c80005bbc395e47bf79fb62d7f4fa963",
+    "run_id": "run-c8bcb763d68d06e6f55d7db337c97cc8",
+    "device_id": "worker-session-c80005bbc395e47bf79fb62d7f4fa963-1-6b3fa6311f9a918ddb45b4ce483b6b5e",
+    "authority_epoch": 0,
+    "worker_generation": 1,
+    "committed_at_ms": 1788649982841,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "agent": "agent-36905dec2018e91eae339afce732cc9fb6a443d3115b213307edcad8da76258d",
+      "attempt": 0,
+      "budget_tokens": 4096,
+      "callsign": "gold-gull-905dec",
+      "coordinates": {
+        "auto_hermetic": false,
+        "call_id": "call-1",
+        "child_session_id": "session-child-36905dec2018e91eae339afce732cc9fb6a443d3115b213307edcad8da76258d",
+        "handoff_dir": "/private/var/folders/y2/zrvhkfz54lj3gsw2czwxdmsh0000gn/T/bench-haider-agent-auxiliary_probe-5tpxzvco/workspace/.haider/handoff/ac56abc43c8b5ba2",
+        "lockdown": false,
+        "parent_run_id": "run-c8bcb763d68d06e6f55d7db337c97cc8",
+        "parent_session_id": "session-c80005bbc395e47bf79fb62d7f4fa963",
+        "provider": "bench-proxy",
+        "tool_item_id": "item-session-c80005bbc395e47bf79fb62d7f4fa963-1-1788649982820-6"
+      },
+      "fencing_epoch": 1,
+      "grant": {
+        "effect_ceiling": [
+          {
+            "class": "fs_read"
+          },
+          {
+            "class": "fs_write"
+          },
+          {
+            "class": "process_exec"
+          },
+          {
+            "class": "remote_execution"
+          },
+          {
+            "class": "agent_spawn"
+          },
+          {
+            "class": "network",
+            "host": ""
+          },
+          {
+            "class": "peer_message"
+          }
+        ],
+        "tools": [
+          "list_tools",
+          "request_input",
+          "fs_read",
+          "fs_glob",
+          "fs_search",
+          "fs_write",
+          "fs_edit",
+          "write",
+          "edit",
+          "fs_path",
+          "process_exec",
+          "spawn_subagent",
+          "message_subagent",
+          "task_output",
+          "task_kill",
+          "web_fetch",
+          "web_search",
+          "monitor",
+          "list_models",
+          "peer_list",
+          "peer_send",
+          "ssh_list",
+          "ssh_shell"
+        ]
+      },
+      "lease": "lease-child-36905dec2018e91eae339afce732cc9fb6a443d3115b213307edcad8da76258d",
+      "model_profile": "deepseek-v4-flash",
+      "placement": {
+        "placement": "local"
+      },
+      "provider_request": {
+        "request_kind": "primary",
+        "request_ordinal": 1,
+        "run_id": "run-c8bcb763d68d06e6f55d7db337c97cc8",
+        "session_id": "session-c80005bbc395e47bf79fb62d7f4fa963",
+        "turn_ordinal": 1
+      },
+      "role": "subagent",
+      "task": "printf 'one\\n' > tool-one.txt",
+      "type": "agent_spawned"
+    }
+  },
+  {
+    "schema_version": 1,
+    "event_id": "worker-event-session-c80005bbc395e47bf79fb62d7f4fa963-1-6b3fa6311f9a918ddb45b4ce483b6b5e-37",
+    "seq": 49,
+    "session_id": "session-c80005bbc395e47bf79fb62d7f4fa963",
+    "run_id": "run-c8bcb763d68d06e6f55d7db337c97cc8",
+    "device_id": "worker-session-c80005bbc395e47bf79fb62d7f4fa963-1-6b3fa6311f9a918ddb45b4ce483b6b5e",
+    "authority_epoch": 0,
+    "worker_generation": 1,
+    "committed_at_ms": 1788649982915,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "verbatim"
+    },
+    "payload": {
+      "event": "completed",
+      "item": {
+        "item": "child_result",
+        "report": {
+          "agent": "agent-36905dec2018e91eae339afce732cc9fb6a443d3115b213307edcad8da76258d",
+          "summary": "conformance complete",
+          "verified": "unverified"
+        }
+      },
+      "item_id": "item-session-c80005bbc395e47bf79fb62d7f4fa963-1-1788649982820-12",
+      "provider_request": {
+        "request_kind": "primary",
+        "request_ordinal": 1,
+        "run_id": "run-c8bcb763d68d06e6f55d7db337c97cc8",
+        "session_id": "session-c80005bbc395e47bf79fb62d7f4fa963",
+        "turn_ordinal": 1
+      },
+      "type": "item"
+    }
+  },
+  {
+    "schema_version": 1,
+    "event_id": "worker-event-session-c80005bbc395e47bf79fb62d7f4fa963-1-6b3fa6311f9a918ddb45b4ce483b6b5e-39",
+    "seq": 51,
+    "session_id": "session-c80005bbc395e47bf79fb62d7f4fa963",
+    "run_id": "run-c8bcb763d68d06e6f55d7db337c97cc8",
+    "device_id": "worker-session-c80005bbc395e47bf79fb62d7f4fa963-1-6b3fa6311f9a918ddb45b4ce483b6b5e",
+    "authority_epoch": 0,
+    "worker_generation": 1,
+    "committed_at_ms": 1788649982917,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "verbatim"
+    },
+    "payload": {
+      "event": "completed",
+      "item": {
+        "args": {
+          "prompt": "benchmark",
+          "task": "printf 'one\\n' > tool-one.txt"
+        },
+        "call_id": "call-1",
+        "item": "tool_call",
+        "name": "spawn_subagent",
+        "status": "completed"
+      },
+      "item_id": "item-session-c80005bbc395e47bf79fb62d7f4fa963-1-1788649982820-6",
+      "provider_finish_reason": "tool_use",
+      "provider_request": {
+        "request_kind": "primary",
+        "request_ordinal": 1,
+        "run_id": "run-c8bcb763d68d06e6f55d7db337c97cc8",
+        "session_id": "session-c80005bbc395e47bf79fb62d7f4fa963",
+        "turn_ordinal": 1
+      },
+      "type": "item"
+    }
+  },
+  {
+    "schema_version": 1,
+    "event_id": "worker-event-session-c80005bbc395e47bf79fb62d7f4fa963-1-6b3fa6311f9a918ddb45b4ce483b6b5e-59",
+    "seq": 71,
+    "session_id": "session-c80005bbc395e47bf79fb62d7f4fa963",
+    "run_id": "run-c8bcb763d68d06e6f55d7db337c97cc8",
+    "device_id": "worker-session-c80005bbc395e47bf79fb62d7f4fa963-1-6b3fa6311f9a918ddb45b4ce483b6b5e",
+    "authority_epoch": 0,
+    "worker_generation": 1,
+    "committed_at_ms": 1788649982931,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "provider_finish_reason": "end_turn",
+      "provider_request": {
+        "request_kind": "primary",
+        "request_ordinal": 2,
+        "run_id": "run-c8bcb763d68d06e6f55d7db337c97cc8",
+        "session_id": "session-c80005bbc395e47bf79fb62d7f4fa963",
+        "turn_ordinal": 1
+      },
+      "state": "done",
+      "terminal_kind": "success",
+      "type": "run_state"
+    }
+  }
+]

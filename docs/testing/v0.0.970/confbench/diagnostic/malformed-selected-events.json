@@ -1,0 +1,175 @@
+[
+  {
+    "schema_version": 1,
+    "event_id": "worker-event-session-32a82753e5aa49bab3e1b70898fa0ccc-1-66b2acbfdbe6e820da5626a06adcca35-19",
+    "seq": 26,
+    "session_id": "session-32a82753e5aa49bab3e1b70898fa0ccc",
+    "run_id": "run-6d7039818b3a5ee0f4eff9fdd2158140",
+    "device_id": "worker-session-32a82753e5aa49bab3e1b70898fa0ccc-1-66b2acbfdbe6e820da5626a06adcca35",
+    "authority_epoch": 0,
+    "worker_generation": 1,
+    "committed_at_ms": 1788645330230,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "verbatim"
+    },
+    "payload": {
+      "call_id": "call-1",
+      "provider_request": {
+        "request_kind": "primary",
+        "request_ordinal": 1,
+        "run_id": "run-6d7039818b3a5ee0f4eff9fdd2158140",
+        "session_id": "session-32a82753e5aa49bab3e1b70898fa0ccc",
+        "turn_ordinal": 1
+      },
+      "result": {
+        "data": {
+          "kind": "invalid_tool_call",
+          "message": "tool call `call-1` ended with malformed JSON arguments: EOF while parsing a value at line 1 column 11",
+          "repaired": true,
+          "tool": "process_exec"
+        },
+        "presentation": {
+          "allowed_actions": [
+            "none"
+          ],
+          "detail": "tool call `call-1` ended with malformed JSON arguments: EOF while parsing a value at line 1 column 11",
+          "scope": "tool",
+          "subcode": "invalid-tool-call",
+          "title": "Invalid tool call"
+        },
+        "preview": "{\"error\":{\"kind\":\"invalid_tool_call\",\"message\":\"tool call `call-1` ended with malformed JSON arguments: EOF while parsing a value at line 1 column 11\",\"repair\":\"Resend the tool call with valid JSON object arguments matching its schema. A second consecutive malformed call terminates the run.\",\"tool\":\"process_exec\"},\"status\":\"failed\"}",
+        "reason": "tool call `call-1` ended with malformed JSON arguments: EOF while parsing a value at line 1 column 11",
+        "status": "failed",
+        "truncated": false
+      },
+      "type": "tool_result"
+    }
+  },
+  {
+    "schema_version": 1,
+    "event_id": "worker-event-session-32a82753e5aa49bab3e1b70898fa0ccc-1-66b2acbfdbe6e820da5626a06adcca35-20",
+    "seq": 27,
+    "session_id": "session-32a82753e5aa49bab3e1b70898fa0ccc",
+    "run_id": "run-6d7039818b3a5ee0f4eff9fdd2158140",
+    "device_id": "worker-session-32a82753e5aa49bab3e1b70898fa0ccc-1-66b2acbfdbe6e820da5626a06adcca35",
+    "authority_epoch": 0,
+    "worker_generation": 1,
+    "committed_at_ms": 1788645330230,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "verbatim"
+    },
+    "payload": {
+      "event": "completed",
+      "failed": true,
+      "item": {
+        "args": "{\"command\":",
+        "call_id": "call-1",
+        "item": "tool_call",
+        "name": "process_exec",
+        "status": "failed"
+      },
+      "item_id": "item-session-32a82753e5aa49bab3e1b70898fa0ccc-1-1788645330217-6",
+      "provider_request": {
+        "request_kind": "primary",
+        "request_ordinal": 1,
+        "run_id": "run-6d7039818b3a5ee0f4eff9fdd2158140",
+        "session_id": "session-32a82753e5aa49bab3e1b70898fa0ccc",
+        "turn_ordinal": 1
+      },
+      "reason": "malformed_tool_call",
+      "repaired": true,
+      "type": "item"
+    }
+  },
+  {
+    "schema_version": 1,
+    "event_id": "worker-event-session-32a82753e5aa49bab3e1b70898fa0ccc-1-66b2acbfdbe6e820da5626a06adcca35-31",
+    "seq": 38,
+    "session_id": "session-32a82753e5aa49bab3e1b70898fa0ccc",
+    "run_id": "run-6d7039818b3a5ee0f4eff9fdd2158140",
+    "device_id": "worker-session-32a82753e5aa49bab3e1b70898fa0ccc-1-66b2acbfdbe6e820da5626a06adcca35",
+    "authority_epoch": 0,
+    "worker_generation": 1,
+    "committed_at_ms": 1788645330241,
+    "render": {
+      "ui": false,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "event": "started",
+      "item": {
+        "data": {
+          "correlation": {
+            "request_kind": "primary",
+            "request_ordinal": 2,
+            "run_id": "run-6d7039818b3a5ee0f4eff9fdd2158140",
+            "session_id": "session-32a82753e5aa49bab3e1b70898fa0ccc",
+            "turn_ordinal": 1
+          },
+          "diagnostic": {
+            "breakpoint_hashes": {
+              "history": "blake3-keyed:0f4db4f9a873b255ac25ae9238f764c817f583c43d2540a68a26eccadd7e5f2b",
+              "system": "blake3-keyed:d46dcd86a5032f098b939c81a51be5a9ee00484602a1434c1f11c37b2bbd306b",
+              "tools": "blake3-keyed:7d7947f348eec162ef9482ef87ecc62a7e87dc4b7cf42a582b4136dde2ab3041"
+            },
+            "cache_domain_hash": "blake3-keyed:b8c0a75922a3ebafca73877f300f409758adbf942fab0d6a980ee6c4a456763b",
+            "control": {
+              "state": "emitted"
+            },
+            "history_message_count": 4,
+            "prefix_match": {
+              "state": "unavailable"
+            },
+            "stable_prefix_tokens": 2485
+          },
+          "ordinal": 2
+        },
+        "item": "extension",
+        "kind": "cache_request_attempt_v1"
+      },
+      "item_id": "item-session-32a82753e5aa49bab3e1b70898fa0ccc-1-1788645330217-13",
+      "provider_request": {
+        "request_kind": "primary",
+        "request_ordinal": 2,
+        "run_id": "run-6d7039818b3a5ee0f4eff9fdd2158140",
+        "session_id": "session-32a82753e5aa49bab3e1b70898fa0ccc",
+        "turn_ordinal": 1
+      },
+      "type": "item"
+    }
+  },
+  {
+    "schema_version": 1,
+    "event_id": "worker-event-session-32a82753e5aa49bab3e1b70898fa0ccc-1-66b2acbfdbe6e820da5626a06adcca35-44",
+    "seq": 51,
+    "session_id": "session-32a82753e5aa49bab3e1b70898fa0ccc",
+    "run_id": "run-6d7039818b3a5ee0f4eff9fdd2158140",
+    "device_id": "worker-session-32a82753e5aa49bab3e1b70898fa0ccc-1-66b2acbfdbe6e820da5626a06adcca35",
+    "authority_epoch": 0,
+    "worker_generation": 1,
+    "committed_at_ms": 1788645330249,
+    "render": {
+      "ui": true,
+      "durable": true,
+      "prompt": "omit"
+    },
+    "payload": {
+      "provider_finish_reason": "end_turn",
+      "provider_request": {
+        "request_kind": "primary",
+        "request_ordinal": 2,
+        "run_id": "run-6d7039818b3a5ee0f4eff9fdd2158140",
+        "session_id": "session-32a82753e5aa49bab3e1b70898fa0ccc",
+        "turn_ordinal": 1
+      },
+      "state": "done",
+      "terminal_kind": "success",
+      "type": "run_state"
+    }
+  }
+]
